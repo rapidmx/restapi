@@ -1,0 +1,7 @@
+///////////////////////////////////////////////////////////////////////////////
+// Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
+// SPDX-License-Identifier: MPL-2.0
+///////////////////////////////////////////////////////////////////////////////
+export * from "./MailTransport.js";
+export * from "./PostfixSendmailTransport.js";
+export * from "./MTAIngestAdapter.js";

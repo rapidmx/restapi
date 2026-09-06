@@ -1,0 +1,52 @@
+# This folder is cached between builds
+# http://docs.gitlab.com/ce/ci/yaml/README.html#cache
+default:
+    cache: &global_cachecache
+        paths:
+            - node_modules/
+            - dist/
+        policy: pull
+.job_template: &job_configuration
+    image: node:lts-bookworm-slim
+    before_script:
+        - corepack enable
+
+build:
+    stage: build
+    <<: *job_configuration
+    cache:
+        <<: *global_cachecache
+        policy: pull-push
+    script:
+        - yarn install
+        - yarn build
+        - yarn docs
+
+test:
+    stage: test
+    <<: *job_configuration
+    script:
+        - yarn test --ci --forceExit
+    artifacts:
+        when: always
+        reports:
+            junit:
+                - junit.xml
+# Validation step
+validate:
+    stage: test
+    <<: *job_configuration
+    allow_failure:
+        exit_codes:
+            - 101
+    script:
+        - set +e
+        - bash ./validate.sh
+
+publish:
+    stage: deploy
+    only:
+        - tags
+    <<: *job_configuration
+    script:
+        - yarn npm publish --access public

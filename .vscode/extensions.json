@@ -1,0 +1,11 @@
+{
+    "recommendations": [
+        "editorconfig.editorconfig",
+        "eamodio.gitlens",
+        "esbenp.prettier-vscode",
+        "ghmcadams.lintlens",
+        "redhat.vscode-yaml",
+        "vitest.explorer"
+    ],
+    "unwantedRecommendations": []
+}

@@ -1,0 +1,122 @@
+{
+    "name": "@rapidmx/restapi",
+    "version": "0.1.0",
+    "description": "Core data model and standard REST API for building a mail server on RapidREST.",
+    "repository": "https://github.com/RapidMX/restapi.git",
+    "author": "RapidREST <rapidrests@gmail.com>",
+    "license": "MPL-2.0",
+    "contributors": [
+        "Jean-Philippe Steinmetz"
+    ],
+    "scripts": {
+        "build": "yarn lint && rimraf dist && tsc",
+        "lint": "eslint ./src ./test",
+        "local-audit": "yarn install && yarn npm audit -A -R \"$@\"",
+        "checkup": "yarn dlx @yarnpkg/doctor \"$@\"",
+        "dependency-check": "yarn dlx depcheck \"$@\"",
+        "report-coverage": "cat ./coverage/lcov.info | coveralls",
+        "test": "vitest run",
+        "test:prod": "npm run lint && vitest run --coverage",
+        "test:watch": "vitest",
+        "release": "rapidrest release"
+    },
+    "peerDependencies": {
+        "@opensearch-project/opensearch": ">=3.0.0",
+        "@rapidrest/core": "5.x",
+        "@rapidrest/service-core": "1.x",
+        "mammoth": ">=1.8.0",
+        "pdf-parse": ">=1.1.1"
+    },
+    "peerDependenciesMeta": {
+        "@opensearch-project/opensearch": {
+            "optional": true
+        },
+        "mammoth": {
+            "optional": true
+        },
+        "pdf-parse": {
+            "optional": true
+        }
+    },
+    "dependencies": {
+        "html-to-text": "^9.0.5",
+        "mailparser": "^3.7.2",
+        "nodemailer": "^7.0.3",
+        "sanitize-html": "^2.14.0"
+    },
+    "devDependencies": {
+        "@opensearch-project/opensearch": "^3.5.1",
+        "@rapidrest/cli": "^1.0.1",
+        "@rapidrest/core": "^5.1.0",
+        "@rapidrest/service-core": "^1.3.0",
+        "@swc/core": "^1.16.1",
+        "@types/html-to-text": "^9.0.4",
+        "@types/mailparser": "^3.4.6",
+        "@types/nconf": "^0.10.7",
+        "@types/node": "^26.2.0",
+        "@types/nodemailer": "^7.0.2",
+        "@types/sanitize-html": "^2.16.0",
+        "@typescript-eslint/eslint-plugin": "^8.67.0",
+        "@typescript-eslint/parser": "^8.67.0",
+        "@vitest/coverage-v8": "^4.1.11",
+        "better-sqlite3": "^13.0.3",
+        "eslint": "^10.9.0",
+        "eslint-config-prettier": "^10.1.8",
+        "eslint-plugin-import": "^2.32.0",
+        "eslint-plugin-jsdoc": "^64.2.1",
+        "globals": "^17.11.0",
+        "lodash-es": "^4.18.1",
+        "mammoth": "^1.9.1",
+        "mongodb": "^7.5.0",
+        "mongodb-memory-server": "^11.2.0",
+        "nconf": "^0.13.0",
+        "openapi3-ts": "^4.6.1",
+        "pdf-parse": "^1.1.1",
+        "prom-client": "^15.1.3",
+        "redis": "^6.2.1",
+        "reflect-metadata": "^0.2.2",
+        "rimraf": "^6.1.3",
+        "ts-node": "^10.9.2",
+        "tsx": "^4.23.12",
+        "typeorm": "^1.1.0",
+        "typescript": "^6.0.3",
+        "unplugin-swc": "^1.5.11",
+        "vitest": "^4.1.11",
+        "winston": "^3.19.0"
+    },
+    "packageManager": "yarn@4.5.3",
+    "engines": {
+        "node": ">=24.0.0"
+    },
+    "publishConfig": {
+        "registry": "https://registry.npmjs.org/"
+    },
+    "type": "module",
+    "main": "dist/lib/index.js",
+    "exports": {
+        ".": {
+            "import": "./dist/lib/index.js",
+            "types": "./dist/types/index.d.ts"
+        },
+        "./mongo": {
+            "import": "./dist/lib/mongo.js",
+            "types": "./dist/types/mongo.d.ts"
+        },
+        "./sql": {
+            "import": "./dist/lib/sql.js",
+            "types": "./dist/types/sql.d.ts"
+        },
+        "./search": {
+            "import": "./dist/lib/search/index.js",
+            "types": "./dist/types/search/index.d.ts"
+        },
+        "./scan": {
+            "import": "./dist/lib/scan/index.js",
+            "types": "./dist/types/scan/index.d.ts"
+        }
+    },
+    "typings": "dist/types/index.d.ts",
+    "files": [
+        "dist"
+    ]
+}
