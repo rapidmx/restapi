@@ -57,6 +57,20 @@ export interface Mailbox extends BaseEntity {
 
     /** The current total size, in bytes, of all messages/attachments stored in this mailbox. */
     usedBytes: number;
+
+    /** `true` if this mailbox's out-of-office auto-reply (MS-ASSettings `Oof`) is currently enabled. */
+    oofEnabled: boolean;
+
+    /** The out-of-office auto-reply message body. A single combined message rather than the spec's three
+     * audience-specific variants (internal/external-known/external-unknown) - a deliberate pragmatic-subset
+     * simplification, matching this library's existing single-slot precedent elsewhere. */
+    oofMessage: string;
+
+    /** When set together with `oofEndTime`, the auto-reply is only active within this window rather than
+     * indefinitely while `oofEnabled` is `true`. */
+    oofStartTime?: Date;
+
+    oofEndTime?: Date;
 }
 
 /**
@@ -686,7 +700,24 @@ export interface DeviceSyncState extends BaseEntity {
     /** The per-folder EAS `SyncKey` cursor, keyed by `Folder.uid`. */
     folderSyncKeys: Record<string, string>;
 
+    /** The EAS `Class` (`"Email"`, `"Contacts"`, ...) most recently synced for a folder, keyed by `Folder.uid` -
+     * lets a `Sync` request omit `Class` after its first request for a collection, per [MS-ASCMD], without the
+     * server losing track of which entity type that collection holds. */
+    folderCollectionClasses: Record<string, string>;
+
     lastSyncAt?: Date;
 
     provisioned: boolean;
+
+    /** `true` once an administrator has requested this device be remotely wiped (MS-ASPROV `RemoteWipe`). Set
+     * back to `false` once the device acknowledges the wipe. */
+    remoteWipeRequested?: boolean;
+
+    /** `true` if the pending/most recent remote wipe request was scoped to this account only (vs. a full device
+     * wipe) - recorded for administrative record-keeping; the wire directive sent to the device is the same
+     * either way in this library's pragmatic subset. */
+    remoteWipeAccountOnly?: boolean;
+
+    /** When the device most recently acknowledged a remote wipe request. */
+    remoteWipeAcknowledgedAt?: Date;
 }

@@ -70,6 +70,27 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     @Description("The current total size, in bytes, of all messages/attachments stored in this mailbox.")
     public usedBytes: number = 0;
 
+    @Column()
+    @Description("`true` if this mailbox's out-of-office auto-reply (MS-ASSettings `Oof`) is currently enabled.")
+    public oofEnabled: boolean = false;
+
+    @Column({ type: "text" })
+    @Description("The out-of-office auto-reply message body.")
+    // `ObjectUtils.validate()` treats an empty string the same as null/undefined for any non-`@Nullable`
+    // field ("Property oofMessage cannot be null.") - this field's natural default (no OOF message configured
+    // yet) is legitimately "", so it must be `@Nullable` even though the type itself is always a `string`.
+    @Nullable
+    public oofMessage: string = "";
+
+    @Column({ nullable: true })
+    @Description("When set together with `oofEndTime`, the auto-reply is only active within this window.")
+    @Nullable
+    public oofStartTime?: Date;
+
+    @Column({ nullable: true })
+    @Nullable
+    public oofEndTime?: Date;
+
     constructor(other?: Partial<MailboxSQL>) {
         super(other);
 
@@ -82,6 +103,10 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
             this.timezone = other.timezone !== undefined ? other.timezone : this.timezone;
             this.quotaBytes = other.quotaBytes !== undefined ? other.quotaBytes : this.quotaBytes;
             this.usedBytes = other.usedBytes !== undefined ? other.usedBytes : this.usedBytes;
+            this.oofEnabled = other.oofEnabled !== undefined ? other.oofEnabled : this.oofEnabled;
+            this.oofMessage = other.oofMessage !== undefined ? other.oofMessage : this.oofMessage;
+            this.oofStartTime = "oofStartTime" in other ? other.oofStartTime : this.oofStartTime;
+            this.oofEndTime = "oofEndTime" in other ? other.oofEndTime : this.oofEndTime;
         }
     }
 }

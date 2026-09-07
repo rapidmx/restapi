@@ -59,6 +59,10 @@ export class DeviceSyncStateMongo extends BaseMongoEntity implements DeviceSyncS
     public folderSyncKeys: Record<string, string> = {};
 
     @Column()
+    @Description("The EAS `Class` most recently synced for a folder, keyed by `Folder.uid`.")
+    public folderCollectionClasses: Record<string, string> = {};
+
+    @Column()
     @Description("The date and time of the device's last successful sync.")
     @Nullable
     public lastSyncAt?: Date;
@@ -66,6 +70,21 @@ export class DeviceSyncStateMongo extends BaseMongoEntity implements DeviceSyncS
     @Column()
     @Description("`true` if the device has completed EAS provisioning.")
     public provisioned: boolean = false;
+
+    @Column()
+    @Description("`true` once an administrator has requested this device be remotely wiped.")
+    @Nullable
+    public remoteWipeRequested?: boolean;
+
+    @Column()
+    @Description("`true` if the pending/most recent remote wipe request was scoped to this account only.")
+    @Nullable
+    public remoteWipeAccountOnly?: boolean;
+
+    @Column()
+    @Description("When the device most recently acknowledged a remote wipe request.")
+    @Nullable
+    public remoteWipeAcknowledgedAt?: Date;
 
     constructor(other?: Partial<DeviceSyncStateMongo>) {
         super(other);
@@ -76,8 +95,15 @@ export class DeviceSyncStateMongo extends BaseMongoEntity implements DeviceSyncS
             this.deviceType = other.deviceType !== undefined ? other.deviceType : this.deviceType;
             this.policyKey = "policyKey" in other ? other.policyKey : this.policyKey;
             this.folderSyncKeys = other.folderSyncKeys !== undefined ? other.folderSyncKeys : this.folderSyncKeys;
+            this.folderCollectionClasses =
+                other.folderCollectionClasses !== undefined ? other.folderCollectionClasses : this.folderCollectionClasses;
             this.lastSyncAt = "lastSyncAt" in other ? other.lastSyncAt : this.lastSyncAt;
             this.provisioned = other.provisioned !== undefined ? other.provisioned : this.provisioned;
+            this.remoteWipeRequested = "remoteWipeRequested" in other ? other.remoteWipeRequested : this.remoteWipeRequested;
+            this.remoteWipeAccountOnly =
+                "remoteWipeAccountOnly" in other ? other.remoteWipeAccountOnly : this.remoteWipeAccountOnly;
+            this.remoteWipeAcknowledgedAt =
+                "remoteWipeAcknowledgedAt" in other ? other.remoteWipeAcknowledgedAt : this.remoteWipeAcknowledgedAt;
         }
     }
 }

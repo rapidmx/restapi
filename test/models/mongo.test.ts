@@ -46,9 +46,15 @@ describe("Mongo model default construction", () => {
         expect(obj.timezone).toBe("");
         expect(obj.quotaBytes).toBe(0);
         expect(obj.usedBytes).toBe(0);
+        expect(obj.oofEnabled).toBe(false);
+        expect(obj.oofMessage).toBe("");
+        expect(obj.oofStartTime).toBeUndefined();
+        expect(obj.oofEndTime).toBeUndefined();
     });
 
     it("MailboxMongo applies provided overrides when constructed with data.", () => {
+        const oofStartTime = new Date("2026-01-20T00:00:00Z");
+        const oofEndTime = new Date("2026-01-27T00:00:00Z");
         const obj = new MailboxMongo({
             ownerUserUid: "user-1",
             primarySmtpAddress: "user@example.com",
@@ -57,6 +63,10 @@ describe("Mongo model default construction", () => {
             timezone: "America/Los_Angeles",
             quotaBytes: 1000,
             usedBytes: 500,
+            oofEnabled: true,
+            oofMessage: "I am out of office.",
+            oofStartTime,
+            oofEndTime,
         });
 
         expect(obj.ownerUserUid).toBe("user-1");
@@ -66,6 +76,19 @@ describe("Mongo model default construction", () => {
         expect(obj.timezone).toBe("America/Los_Angeles");
         expect(obj.quotaBytes).toBe(1000);
         expect(obj.usedBytes).toBe(500);
+        expect(obj.oofEnabled).toBe(true);
+        expect(obj.oofMessage).toBe("I am out of office.");
+        expect(obj.oofStartTime).toBe(oofStartTime);
+        expect(obj.oofEndTime).toBe(oofEndTime);
+    });
+
+    it("MailboxMongo preserves class defaults for fields omitted from a partial override object.", () => {
+        const obj = new MailboxMongo({});
+
+        expect(obj.oofEnabled).toBe(false);
+        expect(obj.oofMessage).toBe("");
+        expect(obj.oofStartTime).toBeUndefined();
+        expect(obj.oofEndTime).toBeUndefined();
     });
 
     it("FolderMongo falls back to class defaults when constructed with no data.", () => {
@@ -650,20 +673,29 @@ describe("Mongo model default construction", () => {
         expect(obj.deviceType).toBe("");
         expect(obj.policyKey).toBeUndefined();
         expect(obj.folderSyncKeys).toEqual({});
+        expect(obj.folderCollectionClasses).toEqual({});
         expect(obj.lastSyncAt).toBeUndefined();
         expect(obj.provisioned).toBe(false);
+        expect(obj.remoteWipeRequested).toBeUndefined();
+        expect(obj.remoteWipeAccountOnly).toBeUndefined();
+        expect(obj.remoteWipeAcknowledgedAt).toBeUndefined();
     });
 
     it("DeviceSyncStateMongo applies provided overrides when constructed with data.", () => {
         const lastSyncAt = new Date("2026-01-20T00:00:00Z");
+        const remoteWipeAcknowledgedAt = new Date("2026-01-21T00:00:00Z");
         const obj = new DeviceSyncStateMongo({
             mailboxUid: "mailbox-1",
             deviceId: "device-1",
             deviceType: "iPhone",
             policyKey: "policy-1",
             folderSyncKeys: { "folder-1": "synckey-1" },
+            folderCollectionClasses: { "folder-1": "Email" },
             lastSyncAt,
             provisioned: true,
+            remoteWipeRequested: true,
+            remoteWipeAccountOnly: true,
+            remoteWipeAcknowledgedAt,
         });
 
         expect(obj.mailboxUid).toBe("mailbox-1");
@@ -671,8 +703,12 @@ describe("Mongo model default construction", () => {
         expect(obj.deviceType).toBe("iPhone");
         expect(obj.policyKey).toBe("policy-1");
         expect(obj.folderSyncKeys).toEqual({ "folder-1": "synckey-1" });
+        expect(obj.folderCollectionClasses).toEqual({ "folder-1": "Email" });
         expect(obj.lastSyncAt).toBe(lastSyncAt);
         expect(obj.provisioned).toBe(true);
+        expect(obj.remoteWipeRequested).toBe(true);
+        expect(obj.remoteWipeAccountOnly).toBe(true);
+        expect(obj.remoteWipeAcknowledgedAt).toBe(remoteWipeAcknowledgedAt);
     });
 
     it("DeviceSyncStateMongo preserves class defaults for fields omitted from a partial override object.", () => {
@@ -683,7 +719,11 @@ describe("Mongo model default construction", () => {
         expect(obj.deviceType).toBe("");
         expect(obj.policyKey).toBeUndefined();
         expect(obj.folderSyncKeys).toEqual({});
+        expect(obj.folderCollectionClasses).toEqual({});
         expect(obj.lastSyncAt).toBeUndefined();
         expect(obj.provisioned).toBe(false);
+        expect(obj.remoteWipeRequested).toBeUndefined();
+        expect(obj.remoteWipeAccountOnly).toBeUndefined();
+        expect(obj.remoteWipeAcknowledgedAt).toBeUndefined();
     });
 });

@@ -85,7 +85,11 @@ describe("Route:MailboxSQL Tests", () => {
             if (SERVER_ASSIGNED_FIELDS.includes(key)) {
                 continue;
             }
-            expect(actual[key]).toEqual(expected[key]);
+            // A nullable SQL column left unset round-trips as `null`, not `undefined` (unlike the in-memory
+            // object literal, whose class field declares the property with value `undefined` but never
+            // assigns it) - normalize both to `undefined` so this is treated as "no value" either way, rather
+            // than a real mismatch.
+            expect(actual[key] ?? undefined).toEqual(expected[key] ?? undefined);
         }
         expect(actual.uid).toBeDefined();
         expect(new Date(actual.dateCreated).getTime()).not.toBeNaN();
