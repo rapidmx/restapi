@@ -105,6 +105,16 @@ export class ContactSQL extends RecoverableBaseEntity implements Contact {
     @Nullable
     public sourceUid?: string;
 
+    @Column({ nullable: true })
+    @Description("Whether the caller has starred/favorited this contact.")
+    @Nullable
+    public favorite?: boolean;
+
+    @Column({ type: "simple-json", nullable: true })
+    @Description("Free-form category labels (e.g. Outlook-style colored categories) applied to this contact, if any.")
+    @Nullable
+    public categories?: string[];
+
     constructor(other?: Partial<ContactSQL>) {
         super(other);
 
@@ -123,6 +133,8 @@ export class ContactSQL extends RecoverableBaseEntity implements Contact {
             this.notes = "notes" in other ? other.notes : this.notes;
             this.photoBlobKey = "photoBlobKey" in other ? other.photoBlobKey : this.photoBlobKey;
             this.sourceUid = "sourceUid" in other ? other.sourceUid : this.sourceUid;
+            this.favorite = "favorite" in other ? other.favorite : this.favorite;
+            this.categories = "categories" in other ? other.categories : this.categories;
         }
     }
 }

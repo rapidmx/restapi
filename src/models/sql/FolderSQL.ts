@@ -78,6 +78,14 @@ export class FolderSQL extends RecoverableBaseEntity implements Folder {
     )
     public syncKeyVersion: number = 0;
 
+    @Column({ nullable: true })
+    @Description(
+        "An optional display color hint (e.g. a hex code), primarily used to distinguish multiple `CALENDAR`-" +
+            "type folders within the same mailbox in a client's UI.",
+    )
+    @Nullable
+    public color?: string;
+
     constructor(other?: Partial<FolderSQL>) {
         super(other);
 
@@ -89,6 +97,7 @@ export class FolderSQL extends RecoverableBaseEntity implements Folder {
             this.unreadCount = other.unreadCount !== undefined ? other.unreadCount : this.unreadCount;
             this.totalCount = other.totalCount !== undefined ? other.totalCount : this.totalCount;
             this.syncKeyVersion = other.syncKeyVersion !== undefined ? other.syncKeyVersion : this.syncKeyVersion;
+            this.color = "color" in other ? other.color : this.color;
         }
     }
 }

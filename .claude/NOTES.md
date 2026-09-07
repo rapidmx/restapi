@@ -247,3 +247,53 @@ for the full diagnostic trail.
   `fetch` is never even called, not just that the right aliases come back.
 - Full suite: 859/859 passing, restored to 100% statement/function/line coverage (branches still
   held to the 95% floor) after this addition.
+
+### 2026-09-07 — Phase 0 of an Outlook-parity redesign: new `TaskList` entity, `Contact`/`Task`/
+`Folder` field additions
+
+First phase of a large, multi-phase `@rapidmx/server` UX overhaul (see that repo's own NOTES.md for
+the full plan) — this session only touched backend surface, no frontend.
+
+- **New entity `TaskList`** (`{mailboxUid, name}`) — a direct structural copy of `ContactList`:
+  `src/models/{mongo,sql}/TaskList{Mongo,SQL}.ts`, `src/routes/{mongo,sql}/TaskListRoute{Mongo,SQL}.ts`
+  (each just an 11-line `BaseScopedChildRoute<TaskListX>` subclass with `scopeProperty: "mailboxUid"`),
+  plus barrel-export lines in all four `index.ts` files. Full CRUD + permission test coverage mirrored
+  1:1 from `ContactListRoute.test.ts` (mongo+sql) into new `TaskListRoute.test.ts` files.
+- **New fields**: `Task.taskListUid?`/`assignedTo?` (both plain optional strings, no migration
+  concerns), `Contact.categories?: string[]` (Mongo: plain array column; SQL: `{type: "simple-json",
+  nullable: true}`, mirroring `Message.references`'s SQL pattern rather than any Mongo-only array
+  column, since those aren't a valid SQL precedent), `Folder.color?: string` (same shape as the
+  pre-existing `Note.color`).
+- **Real bug found and fixed via a genuine SQL schema-migration failure, not just a test artifact**:
+  the first attempt at `Contact.favorite`/`Task.myDay` declared them as required `boolean` fields with
+  a TypeScript-level default (`= false`), the same pattern `completed`/`unreadCount` etc. already use.
+  This compiled and typechecked fine, but **broke real SQL schema sync**: `@rapidrest/service-core`'s
+  own `@Column()` decorator wrapper's `ColumnOptions` type has no `default` option at all (only `name`/
+  `nullable`/`primary`/`isObjectId`/`type` — confirmed by reading `PersistenceDecorators.d.ts`
+  directly), so there's no way to give a new NOT NULL boolean column a SQL-level default through this
+  framework today. Reproduced directly: TypeORM's `synchronize`-driven `ALTER TABLE ADD COLUMN` against
+  an existing (locally persisted, `rrst-test*`) SQLite table failed with `NOT NULL constraint failed`,
+  since old rows have nothing to populate the new column with and no default was declared. **This is a
+  real production-upgrade hazard**, not a local-dev-only quirk — any real SQL deployment upgrading past
+  this change with existing `Contact`/`Task` rows would hit the identical failure. **Fix**: made both
+  fields optional (`favorite?: boolean`, `myDay?: boolean`, `undefined` treated as `false` by
+  consumers) instead of required-with-default — nullable columns don't have this problem, and this
+  matches the codebase's own extensive existing precedent for "absence means the default" optional
+  fields. **Did not** extend `@rapidrest/service-core`'s `ColumnOptions` to add real `default` support
+  (the more "correct" fix, since TypeORM itself supports it natively) — that's a separate sibling-repo
+  change with its own build/patch/test cycle, out of proportion to what this pass needed; worth doing
+  if a future field genuinely can't be modeled as optional.
+- **Removed a small piece of genuinely dead code found while in the area**: `MailboxRouteMongo`/
+  `MailboxRouteSQL`'s `findAccessibleMailboxUids()` had an `if (!this.aclRepo) return [];` guard that
+  was never reachable in practice (`@Repository`-injected, and the `acl` datastore is a hard
+  requirement of the entire library — if it were ever actually missing, every other permission check
+  everywhere else would already be broken first). Simplified to a non-null assertion (`this.aclRepo!`),
+  matching this codebase's own established pattern for the same class of always-injected dependency
+  (`BaseFolderRoute.aclUtils!`) — this closed the `lines` coverage gap this exact branch had been
+  causing across at least two separate sessions now (see the 2026-09-07 "self-service mailbox
+  auto-provisioning" follow-up entry above), though a separate, unrelated, much deeper one-function gap
+  remains in `MailboxRouteSQL.ts` (a `Raw((alias) => ...)` TypeORM query-builder callback whose exact
+  invocation timing wasn't worth chasing further this session — flagged, not fixed).
+- Full suite: 885/885 passing. Coverage: statements 99.93%, functions 99.56% (both just the one
+  pre-existing `Raw()`-callback gap short of 100%), lines 100%, branches 98.52% (comfortably above the
+  95% floor). `yarn build` clean.

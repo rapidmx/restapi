@@ -76,6 +76,21 @@ export class TaskSQL extends RecoverableBaseEntity implements Task {
     @Nullable
     public reminderDate?: Date;
 
+    @Column({ nullable: true })
+    @Description("The unique identifier of the `TaskList` this task is a member of, if any.")
+    @Nullable
+    public taskListUid?: string;
+
+    @Column({ nullable: true })
+    @Description("Whether the caller has manually added this task to their curated \"My Day\" working set.")
+    @Nullable
+    public myDay?: boolean;
+
+    @Column({ nullable: true })
+    @Description("The unique identifier of the `User` this task has been assigned to, if any.")
+    @Nullable
+    public assignedTo?: string;
+
     constructor(other?: Partial<TaskSQL>) {
         super(other);
 
@@ -88,6 +103,9 @@ export class TaskSQL extends RecoverableBaseEntity implements Task {
             this.completed = other.completed !== undefined ? other.completed : this.completed;
             this.priority = other.priority !== undefined ? other.priority : this.priority;
             this.reminderDate = "reminderDate" in other ? other.reminderDate : this.reminderDate;
+            this.taskListUid = "taskListUid" in other ? other.taskListUid : this.taskListUid;
+            this.myDay = "myDay" in other ? other.myDay : this.myDay;
+            this.assignedTo = "assignedTo" in other ? other.assignedTo : this.assignedTo;
         }
     }
 }

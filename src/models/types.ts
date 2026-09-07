@@ -108,6 +108,14 @@ export interface Folder extends RecoverableBaseEntity {
      * derived from this value.
      */
     syncKeyVersion: number;
+
+    /**
+     * An optional display color hint (e.g. a hex code), primarily used to distinguish multiple `CALENDAR`-type
+     * folders within the same mailbox in a client's UI (a mailbox may have more than one — nothing prevents
+     * creating additional named calendars via the ordinary `POST` route, only the well-known-folder
+     * auto-provisioning path is limited to one). Same shape/purpose as `Note.color`.
+     */
+    color?: string;
 }
 
 /** The kind of address a `Recipient` represents on a `Message`. */
@@ -339,6 +347,14 @@ export interface Contact extends RecoverableBaseEntity {
 
     /** The unique identifier of an external directory entry (e.g. GAL) this contact was sourced from, if any. */
     sourceUid?: string;
+
+    /** Whether the caller has starred/favorited this contact. Absent/`undefined` is equivalent to `false` —
+     * optional rather than a defaulted required field so that adding this column never requires backfilling a
+     * NOT NULL value onto every pre-existing row in a SQL deployment. */
+    favorite?: boolean;
+
+    /** Free-form category labels (e.g. Outlook-style colored categories) applied to this contact, if any. */
+    categories?: string[];
 }
 
 /**
@@ -347,6 +363,17 @@ export interface Contact extends RecoverableBaseEntity {
  * @author Jean-Philippe Steinmetz
  */
 export interface ContactList extends BaseEntity {
+    mailboxUid: string;
+
+    name: string;
+}
+
+/**
+ * Defines a named grouping of `Task` records within a `Mailbox` — the `Task` analog of `ContactList`.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface TaskList extends BaseEntity {
     mailboxUid: string;
 
     name: string;
@@ -530,6 +557,19 @@ export interface Task extends RecoverableBaseEntity {
     priority: TaskPriority;
 
     reminderDate?: Date;
+
+    /** The unique identifier of the `TaskList` this task is a member of, if any (undefined = the default flat
+     * task list backed directly by this task's `folderUid`). Same shape/purpose as `Contact.contactListUid`. */
+    taskListUid?: string;
+
+    /** Whether the caller has manually added this task to their curated "My Day" working set — not derived from
+     * `dueDate`, since a task with no due date (or a future one) can still be added to today's list. Absent/
+     * `undefined` is equivalent to `false` — optional rather than a defaulted required field so that adding
+     * this column never requires backfilling a NOT NULL value onto every pre-existing row in a SQL deployment. */
+    myDay?: boolean;
+
+    /** The unique identifier of the `User` this task has been assigned to, if any. */
+    assignedTo?: string;
 }
 
 /**

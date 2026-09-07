@@ -12,4 +12,5 @@ export * from "./NoteSQL.js";
 export * from "./QuarantineEntrySQL.js";
 export * from "./ScanResultSQL.js";
 export * from "./SearchIndexStateSQL.js";
+export * from "./TaskListSQL.js";
 export * from "./TaskSQL.js";

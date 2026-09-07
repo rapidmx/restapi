@@ -12,4 +12,5 @@ export * from "./NoteMongo.js";
 export * from "./QuarantineEntryMongo.js";
 export * from "./ScanResultMongo.js";
 export * from "./SearchIndexStateMongo.js";
+export * from "./TaskListMongo.js";
 export * from "./TaskMongo.js";

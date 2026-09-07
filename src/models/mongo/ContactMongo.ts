@@ -105,6 +105,16 @@ export class ContactMongo extends RecoverableBaseMongoEntity implements Contact 
     @Nullable
     public sourceUid?: string;
 
+    @Column()
+    @Description("Whether the caller has starred/favorited this contact.")
+    @Nullable
+    public favorite?: boolean;
+
+    @Column()
+    @Description("Free-form category labels (e.g. Outlook-style colored categories) applied to this contact, if any.")
+    @Nullable
+    public categories?: string[];
+
     constructor(other?: Partial<ContactMongo>) {
         super(other);
 
@@ -123,6 +133,8 @@ export class ContactMongo extends RecoverableBaseMongoEntity implements Contact 
             this.notes = "notes" in other ? other.notes : this.notes;
             this.photoBlobKey = "photoBlobKey" in other ? other.photoBlobKey : this.photoBlobKey;
             this.sourceUid = "sourceUid" in other ? other.sourceUid : this.sourceUid;
+            this.favorite = "favorite" in other ? other.favorite : this.favorite;
+            this.categories = "categories" in other ? other.categories : this.categories;
         }
     }
 }

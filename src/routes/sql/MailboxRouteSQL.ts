@@ -15,6 +15,11 @@ export class MailboxRouteSQL extends BaseMailboxRoute<MailboxSQL> {
     protected readonly repoUtilsClass: any = RepoUtils;
     protected folderClass: any = FolderSQL;
 
+    // `@Repository`-injected, always present in any functioning deployment (the `acl` datastore is a hard
+    // requirement of this entire library — every permission check everywhere else depends on it too), so an
+    // undefined guard here would be dead/unreachable code in practice; non-null-asserted at the use site
+    // instead, matching this codebase's established pattern for the same class of always-injected dependency
+    // (e.g. `BaseFolderRoute.aclUtils!`).
     @Repository(AccessControlListSQL)
     private aclRepo?: TypeOrmRepository<AccessControlListSQL>;
 
@@ -33,9 +38,6 @@ export class MailboxRouteSQL extends BaseMailboxRoute<MailboxSQL> {
      * reverse-lookup table if this becomes a real bottleneck.
      */
     protected async findAccessibleMailboxUids(user: JWTUser): Promise<string[]> {
-        if (!this.aclRepo) {
-            return [];
-        }
         const candidates: string[] = [user.uid, ...(user.roles ?? [])];
         const where = candidates.map((id) => {
             const escaped: string = id.replace(/[\\%_]/g, (ch) => `\\${ch}`);
@@ -45,7 +47,7 @@ export class MailboxRouteSQL extends BaseMailboxRoute<MailboxSQL> {
                 }),
             };
         });
-        const acls: AccessControlListSQL[] = await this.aclRepo.find({ where });
+        const acls: AccessControlListSQL[] = await this.aclRepo!.find({ where });
         return acls.map((acl) => acl.uid);
     }
 }

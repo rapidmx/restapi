@@ -11,4 +11,5 @@ export * from "./MessageRouteMongo.js";
 export * from "./NoteRouteMongo.js";
 export * from "./QuarantineRouteMongo.js";
 export * from "./SearchRouteMongo.js";
+export * from "./TaskListRouteMongo.js";
 export * from "./TaskRouteMongo.js";
