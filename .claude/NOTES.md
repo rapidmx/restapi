@@ -70,3 +70,43 @@ Keep entries terse — this is a reference, not a transcript.
   `MongoNetworkError: ECONNRESET` in `test/routes/mongo/FolderRoute.test.ts` under load, reproduced passing
   20/20 in isolation immediately after - a `mongodb-memory-server` flakiness issue, not a real regression
   (same pattern the monolith's own NOTES.md already documented for a different test file).
+
+### 2026-09-06 — Fixed: a brand-new mailbox had zero folders, breaking both the webmail inbox and Compose
+
+JP reported (via `@rapidmx/server`'s admin console) that a mailbox he'd just created showed a
+"no mailbox available" error the moment he tried to access it in webmail. Root cause traced here,
+not in `server`.
+
+- **`findOrCreateWellKnownFolder`'s well-known folders (Inbox, Junk, Sent Items, ...) are all
+  provisioned lazily** (see its own doc comment) — the only callers were `ScanQueueJob` (Inbox/Junk,
+  on first delivered message) and `BaseMessageRoute.send()` (Sent Items, on first send).
+  `BaseMailboxRoute.create()` never created any folder at all. A mailbox that has never received or
+  sent mail therefore has **zero** folders, including no Inbox — genuinely correct for Junk/Sent
+  Items (an unused mailbox shouldn't have an empty Junk folder cluttering its tree), but Inbox is
+  load-bearing: any webmail client built expecting `folders.find(f => f.type === "inbox")` to exist
+  (as `@rapidmx/server`'s `MailShell` does) has nothing to select and shows an empty/broken state,
+  even though the mailbox itself was created successfully. Drafts has the identical problem one step
+  later: `server`'s Compose page reads `folders.find(f => f.type === "drafts")` before it will create
+  a new draft at all.
+- **Fix, in `BaseMailboxRoute.create()`**: after creating the mailbox (single or bulk), eagerly call
+  `findOrCreateWellKnownFolder()` for `FolderType.INBOX` and `FolderType.DRAFTS` only — every other
+  well-known folder stays lazy, unchanged. `folderClass` is now an abstract field on
+  `BaseMailboxRoute` (mirroring `BaseMessageRoute`'s existing pattern exactly), supplied by
+  `MailboxRouteMongo`/`MailboxRouteSQL` as `FolderMongo`/`FolderSQL`. Any other subclass of
+  `BaseMailboxRoute` (none exist outside this package today) will fail to compile until it supplies
+  one too — deliberate, not an oversight.
+  New coverage: `test/routes/{mongo,sql}/MailboxRoute.test.ts` each gained a test asserting
+  `GET /folders?mailboxUid=` returns exactly `["drafts", "inbox"]` immediately after `POST
+  /mailboxes`. `test/routes/BaseMailboxRoute.test.ts`'s bare `TestMailboxRoute` needed a dummy
+  `folderClass = Object` added purely to satisfy the new abstract member (its tests never reach
+  `create()` — they're `repoUtils`-guard-clause-only, per that file's own header comment).
+- **Verification**: this package's own `yarn build`/full `yarn vitest run` both clean (820/820). Then
+  verified the actual end-to-end symptom is gone via `@rapidmx/server`: `yarn patch
+  @rapidmx/restapi` + replace the extracted copy's `dist/` with this package's freshly-built one +
+  `yarn patch-commit` (temporary, for verification only — this package's own version was **not**
+  bumped or published; JP still needs to publish a real new version and `server` will then move off
+  the patch back onto a plain registry range), `yarn dev` in `server`, then `curl`'d a real
+  `POST /api/mail/mailboxes` followed by `GET /api/mail/folders?mailboxUid=...` and confirmed both
+  Inbox and Drafts come back immediately, plus `GET /admin/mailboxes/detail?uid=...` and
+  `GET /?mailboxUid=...` both `200`. See `@rapidmx/server`'s own NOTES.md for the patch-application
+  side of this if picking the follow-up (moving off the patch once published) back up later.

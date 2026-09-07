@@ -5,7 +5,7 @@
 import { Raw, type Repository as TypeOrmRepository } from "typeorm";
 import type { JWTUser } from "@rapidrest/core";
 import { AccessControlListSQL, DatabaseDecorators, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { MailboxSQL } from "../../sql.js";
+import { FolderSQL, MailboxSQL } from "../../sql.js";
 import { BaseMailboxRoute } from "../BaseMailboxRoute.js";
 const { Model } = RouteDecorators;
 const { Repository } = DatabaseDecorators;
@@ -13,6 +13,7 @@ const { Repository } = DatabaseDecorators;
 @Model(MailboxSQL)
 export class MailboxRouteSQL extends BaseMailboxRoute<MailboxSQL> {
     protected readonly repoUtilsClass: any = RepoUtils;
+    protected folderClass: any = FolderSQL;
 
     @Repository(AccessControlListSQL)
     private aclRepo?: TypeOrmRepository<AccessControlListSQL>;

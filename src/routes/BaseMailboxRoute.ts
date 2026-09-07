@@ -4,7 +4,9 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import { ACLAction, ApiErrorMessages, ApiErrors, CRUDRoute, HttpRequest, HttpResponse, RouteDecorators } from "@rapidrest/service-core";
-import { Mailbox } from "../models/types.js";
+import { FolderType, Mailbox } from "../models/types.js";
+import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
+import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 const { Param, Query, Request, Response, User: AuthUser } = RouteDecorators;
 const { Config } = ObjectDecorators;
 
@@ -55,6 +57,15 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     protected trustedRoles: string[] = ["admin"];
 
     /**
+     * Supplied by the Mongo/SQL concrete subclasses so `create()` can provision a new mailbox's Inbox/Drafts
+     * folders (see below) without depending on either backend directly — same pattern as
+     * `BaseMessageRoute.folderClass`.
+     */
+    protected abstract folderClass: any;
+
+    private folderRepo?: RecoverableRepoUtils<any>;
+
+    /**
      * Returns the uids of every mailbox this user has any ACL grant on — as owner, as a shared delegate, or
      * (implicitly, via a wildcard/role record) as a trusted caller. Backend-specific because
      * `AccessControlList`'s storage shape differs (a natively queryable embedded array in Mongo vs. a
@@ -62,6 +73,16 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * subclass, each against the exact same `AccessControlList` collection/table `BaseACLRoute` exposes.
      */
     protected abstract findAccessibleMailboxUids(user: JWTUser): Promise<string[]>;
+
+    private async getFolderRepo(): Promise<RecoverableRepoUtils<any>> {
+        if (!this.folderRepo) {
+            this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+                name: this.folderClass.name,
+                args: [this.folderClass],
+            });
+        }
+        return this.folderRepo;
+    }
 
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         if (!user) {
@@ -74,10 +95,24 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 (o as any).ownerUserUid = user.uid;
             }
         }
-        if (Array.isArray(obj)) {
-            return await this.doBulkCreate(objs, { req, user, ignoreACL: true });
+        const created: T[] = Array.isArray(obj)
+            ? await this.doBulkCreate(objs, { req, user, ignoreACL: true })
+            : [await this.doCreateObject(objs[0], { req, user, ignoreACL: true })];
+
+        // A brand-new mailbox with zero folders is unusable the moment its owner opens it: the webmail
+        // client's `MailShell` selects `folders.find(f => f.type === "inbox")` as the default view (with
+        // none found, it shows "No mailbox available" even though the mailbox itself exists), and Compose
+        // needs a `drafts` folder uid in hand before it will create a new draft. Every *other* well-known
+        // folder (Junk, Sent Items, Deleted Items, ...) stays lazily provisioned on first actual use — see
+        // `findOrCreateWellKnownFolder`'s own doc comment — only these two are load-bearing for the client
+        // to render anything at all, so only these two are created eagerly here.
+        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        for (const mailbox of created) {
+            await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.INBOX, user);
+            await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.DRAFTS, user);
         }
-        return await this.doCreateObject(objs[0], { req, user, ignoreACL: true });
+
+        return Array.isArray(obj) ? created : created[0];
     }
 
     public async find(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<T[]> {

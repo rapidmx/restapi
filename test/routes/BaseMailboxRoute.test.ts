@@ -20,6 +20,8 @@ import { Logger } from "@rapidrest/core";
 import { BaseMailboxRoute } from "../../src/routes/BaseMailboxRoute.js";
 
 class TestMailboxRoute extends BaseMailboxRoute<any> {
+    protected folderClass: any = Object;
+
     protected async findAccessibleMailboxUids(): Promise<string[]> {
         return [];
     }

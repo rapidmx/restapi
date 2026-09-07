@@ -10,7 +10,7 @@ import {
     RouteDecorators,
     type MongoRepository,
 } from "@rapidrest/service-core";
-import { MailboxMongo } from "../../mongo.js";
+import { FolderMongo, MailboxMongo } from "../../mongo.js";
 import { BaseMailboxRoute } from "../BaseMailboxRoute.js";
 const { Model } = RouteDecorators;
 const { Repository } = DatabaseDecorators;
@@ -18,6 +18,7 @@ const { Repository } = DatabaseDecorators;
 @Model(MailboxMongo)
 export class MailboxRouteMongo extends BaseMailboxRoute<MailboxMongo> {
     protected readonly repoUtilsClass: any = RepoUtils;
+    protected folderClass: any = FolderMongo;
 
     @Repository(AccessControlListMongo)
     private aclRepo?: MongoRepository<AccessControlListMongo>;

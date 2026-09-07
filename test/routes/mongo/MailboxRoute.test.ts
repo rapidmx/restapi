@@ -428,6 +428,34 @@ describe("Route:MailboxMongo Tests", () => {
         expect(acl?.records ?? []).toEqual([]);
     });
 
+    it("Creating a mailbox eagerly provisions its Inbox and Drafts folders (the webmail client needs both to render anything at all).", async () => {
+        const obj: MailboxMongo = new MailboxMongo({
+            ownerUserUid: owner.uid,
+            primarySmtpAddress: `${uuid.v4()}@example.com`,
+            aliasAddresses: [],
+            displayName: "Fresh Mailbox",
+            timezone: "UTC",
+            quotaBytes: 1_000_000_000,
+            usedBytes: 0,
+        });
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(obj);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+
+        const folders = await request(server.getApplication())
+            .get(`/mongo/folders?mailboxUid=${result.body.uid}`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(folders.status).toBe(200);
+        const types = folders.body.map((f: any) => f.type).sort();
+        expect(types).toEqual(["drafts", "inbox"]);
+    });
+
     it("An admin can still create a mailbox for themselves like any other authenticated user.", async () => {
         const obj: MailboxMongo = new MailboxMongo({
             ownerUserUid: admin.uid,
