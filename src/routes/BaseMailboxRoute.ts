@@ -7,8 +7,21 @@ import { ACLAction, ApiErrorMessages, ApiErrors, CRUDRoute, HttpRequest, HttpRes
 import { FolderType, Mailbox } from "../models/types.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-const { Param, Query, Request, Response, User: AuthUser } = RouteDecorators;
+const { Auth, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 const { Config } = ObjectDecorators;
+
+/** One (name alias, domain) combination the caller could register as their mailbox address — the full
+ * cross product of their auth-server name aliases and this server's configured `mail:domains` list. */
+export interface MailboxAutoProvisionAliasOption {
+    alias: string;
+    domain: string;
+    primarySmtpAddress: string;
+}
+
+export type MailboxAutoProvisionResult<T> =
+    | { status: "created"; mailbox: T }
+    | { status: "existing"; mailbox: T }
+    | { status: "needs_selection"; options: MailboxAutoProvisionAliasOption[] };
 
 /**
  * Extends the standard `CRUDRoute` CRUD scaffolding for `Mailbox` with ACL-driven `find`/`count` overrides,
@@ -57,6 +70,52 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     protected trustedRoles: string[] = ["admin"];
 
     /**
+     * Base URL of the auth-server whose `GET /api/aliases/me?type=name` `autoProvision()` below calls.
+     * Falls back to `""` (rather than leaving this `@Config` field with no default at all) so
+     * instantiating this route never throws in a deployment/test context that hasn't set this key —
+     * `autoProvision()` already treats an empty value the same as "not configured" below, unless
+     * `staticAliases` is set instead (see its own doc comment).
+     */
+    @Config("mail:auth_server_url", "")
+    protected authServerUrl: string = "";
+
+    /**
+     * A fixed alias list to use instead of ever calling auth-server, bypassing `fetchNameAliases()`'s
+     * real HTTP call entirely when non-empty. Exists for a deployment with no real auth-server to call
+     * at all (e.g. local development against a synthetic single-identity session) — a genuine HTTP
+     * round-trip back to *this same process* isn't just unnecessary there, it can outright fail
+     * (confirmed directly: a Node `fetch()` to this server's own listening address, issued from inside
+     * a request handler already running on it, was refused at the TCP level — the underlying HTTP
+     * server apparently doesn't accept a new connection to itself while still mid-request). Not
+     * specific to any notion of "dev mode" from this class's own point of view — just another config
+     * override, same category as every other one here.
+     */
+    @Config("mail:auto_provision:static_aliases", [] as string[])
+    protected staticAliases: string[] = [];
+
+    /** Master switch for `autoProvision()` — off by default, since silently minting mailboxes is a real
+     * behavior change a deployment must opt into, not something safe to default on. */
+    @Config("mail:auto_provision:enabled", false)
+    protected autoProvisionEnabled: boolean = false;
+
+    /**
+     * The single source of truth for every domain this mail server accepts mail for — a deployment
+     * serving more than one domain lists all of them here. Governs *every* mailbox this route creates,
+     * not just auto-provisioned ones: `create()` below rejects a `primarySmtpAddress` on any other
+     * domain once this is non-empty (an empty list is the "unconfigured, no restriction" default, for
+     * backward compatibility with a deployment that hasn't set this up). `autoProvision()` offers the
+     * caller the cross product of their name aliases and this list to choose their own address from.
+     */
+    @Config("mail:domains", [] as string[])
+    protected domains: string[] = [];
+
+    @Config("mail:auto_provision:quota_bytes", 5_000_000_000)
+    protected autoProvisionQuotaBytes: number = 5_000_000_000;
+
+    @Config("mail:auto_provision:timeout_ms", 10_000)
+    protected autoProvisionTimeoutMs: number = 10_000;
+
+    /**
      * Supplied by the Mongo/SQL concrete subclasses so `create()` can provision a new mailbox's Inbox/Drafts
      * folders (see below) without depending on either backend directly — same pattern as
      * `BaseMessageRoute.folderClass`.
@@ -95,6 +154,20 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 (o as any).ownerUserUid = user.uid;
             }
         }
+        // Applies to every caller, trusted or not — `mail:domains` (once configured) is this server's
+        // one source of truth for which domains it accepts mail on at all, not just a self-service guard.
+        if (this.domains.length > 0) {
+            for (const o of objs) {
+                const domain = o.primarySmtpAddress?.split("@")[1];
+                if (!domain || !this.domains.includes(domain)) {
+                    throw new ApiError(
+                        ApiErrors.INVALID_REQUEST,
+                        400,
+                        `Mailbox addresses must be on one of this server's configured domains: ${this.domains.join(", ")}.`,
+                    );
+                }
+            }
+        }
         const created: T[] = Array.isArray(obj)
             ? await this.doBulkCreate(objs, { req, user, ignoreACL: true })
             : [await this.doCreateObject(objs[0], { req, user, ignoreACL: true })];
@@ -117,6 +190,137 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
 
         return Array.isArray(obj) ? created : created[0];
+    }
+
+    /**
+     * Self-service mailbox creation with no `Mailbox` object required from the caller — for a deployment
+     * where users only ever come from an external auth-server and are never manually provisioned a
+     * mailbox first. Disabled unless `mail:auto_provision:enabled` is on and `mail:domains` is non-empty
+     * (see the `@Config` fields above).
+     *
+     * A mailbox needs a `primarySmtpAddress`, which this route has no way to know on its own — the caller
+     * has no email registered anywhere in this system yet by definition. Instead, this derives candidates
+     * from the identity auth-server already has for them: it calls auth-server's own `GET /api/aliases/me?
+     * type=name` (forwarding the caller's own `jwt` cookie, so it only ever sees that user's own aliases)
+     * and offers the caller the full cross product of those aliases against `mail:domains` — a deployment
+     * can serve more than one domain, and the caller should get to pick which (alias, domain) pair they
+     * want, not have one silently chosen for them even when there's only one possible combination. So
+     * with no `body.alias`/`body.domain`, this *always* returns `needs_selection` rather than creating
+     * anything; only a call that supplies both, validated fresh against the real alias list and the
+     * configured domain list (never trusted blindly), actually creates the mailbox.
+     *
+     * Idempotent: a caller who already owns a mailbox gets it back (`status: "existing"`) rather than a
+     * second one, since nothing prevents this being called more than once (e.g. two tabs racing on first
+     * login) — checked before ever contacting auth-server.
+     */
+    @Auth(["jwt"])
+    @Post("/auto-provision")
+    public async autoProvision(
+        @Request req: HttpRequest,
+        body: { alias?: string; domain?: string } | undefined,
+        @AuthUser user?: JWTUser,
+    ): Promise<MailboxAutoProvisionResult<T>> {
+        if (!user) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+        const hasAliasSource = this.staticAliases.length > 0 || !!this.authServerUrl;
+        if (!this.autoProvisionEnabled || this.domains.length === 0 || !hasAliasSource) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, "Automatic mailbox provisioning is not enabled.");
+        }
+        if (!this.repoUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+
+        const existing: T[] = await this.repoUtils.find({ ownerUserUid: user.uid }, {
+            ignoreACL: true,
+            limit: 1,
+        });
+        if (existing.length > 0) {
+            return { status: "existing", mailbox: existing[0] };
+        }
+
+        const aliases: string[] = await this.fetchNameAliases(req);
+        if (aliases.length === 0) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, "No username is registered for this account.");
+        }
+
+        if (!body?.alias || !body?.domain) {
+            return {
+                status: "needs_selection",
+                options: aliases.flatMap((alias) =>
+                    this.domains.map((domain) => ({ alias, domain, primarySmtpAddress: `${alias}@${domain}` })),
+                ),
+            };
+        }
+        if (!aliases.includes(body.alias) || !this.domains.includes(body.domain)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+
+        const mailbox = (await this.create(
+            {
+                primarySmtpAddress: `${body.alias}@${body.domain}`,
+                displayName: body.alias,
+                ownerUserUid: user.uid,
+                timezone: "UTC",
+                quotaBytes: this.autoProvisionQuotaBytes,
+            } as T,
+            req,
+            user,
+        )) as T;
+        return { status: "created", mailbox };
+    }
+
+    /** This server's configured domain list (`mail:domains`) — lets a client (e.g. the admin console's
+     * "New mailbox" form) constrain the domain half of an address to what this server actually accepts,
+     * without hardcoding or duplicating that list client-side. */
+    @Auth(["jwt"])
+    @Get("/domains")
+    public async listDomains(): Promise<string[]> {
+        return this.domains;
+    }
+
+    /** The caller's own auth-server "name" aliases (e.g. usernames), via `GET /api/aliases/me?type=name` —
+     * forwarding their `jwt` cookie is what scopes the call to *their* aliases specifically. Skips that
+     * call entirely (see `staticAliases`'s own doc comment for why) when a fixed list is configured. */
+    private async fetchNameAliases(req: HttpRequest): Promise<string[]> {
+        if (this.staticAliases.length > 0) {
+            return this.staticAliases;
+        }
+
+        const jwtCookie = req.cookies?.["jwt"];
+        if (!jwtCookie) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 502, "Could not verify your identity with the identity service.");
+        }
+
+        const controller = new AbortController();
+        const timeoutHandle = setTimeout(() => controller.abort(), this.autoProvisionTimeoutMs);
+        let response: Response;
+        try {
+            response = await fetch(`${this.authServerUrl}/api/aliases/me?type=name`, {
+                headers: { Cookie: `jwt=${jwtCookie}` },
+                signal: controller.signal,
+            });
+        } catch {
+            throw new ApiError(
+                ApiErrors.INTERNAL_ERROR,
+                502,
+                "Could not reach the identity service to determine your mailbox address.",
+            );
+        } finally {
+            clearTimeout(timeoutHandle);
+        }
+        if (!response.ok) {
+            throw new ApiError(
+                ApiErrors.INTERNAL_ERROR,
+                502,
+                "Could not reach the identity service to determine your mailbox address.",
+            );
+        }
+
+        const data = (await response.json()) as Array<{ value?: string; name?: string }>;
+        return Array.isArray(data)
+            ? data.map((entry) => entry.value ?? entry.name).filter((value): value is string => !!value)
+            : [];
     }
 
     public async find(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<T[]> {

@@ -476,4 +476,39 @@ describe("Route:MailboxMongo Tests", () => {
         expect(result.status).toBeLessThan(300);
         expectMatchingFields(result.body, obj);
     });
+
+    it("An authenticated user with no mailboxes/ACL grants at all sees an empty list, not every mailbox.", async () => {
+        await createMailboxMongo();
+        const freshUser: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
+        const freshToken = JWTUtils.createTokenSync(config.get("auth"), freshUser);
+
+        const result = await request(server.getApplication())
+            .get(baseUrl)
+            .set("Authorization", "jwt " + freshToken);
+
+        expect(result.status).toBe(200);
+        expect(result.body).toEqual([]);
+    });
+
+    it("A count request from an authenticated user with no mailboxes/ACL grants at all returns 0.", async () => {
+        await createMailboxMongo();
+        const freshUser: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
+        const freshToken = JWTUtils.createTokenSync(config.get("auth"), freshUser);
+
+        const result = await request(server.getApplication())
+            .head(baseUrl)
+            .set("Authorization", "jwt " + freshToken);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+        expect(result.headers["content-length"]).toBe("0");
+    });
+
+    it("Auto-provisioning is disabled by default (404) — see MailboxAutoProvision.test.ts for the enabled-config behavior.", async () => {
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/auto-provision`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(404);
+    });
 });

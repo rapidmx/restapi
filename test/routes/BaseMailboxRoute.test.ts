@@ -2,12 +2,13 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-// Isolated unit tests for BaseMailboxRoute, reserved ONLY for the `!this.repoUtils` defensive guard
-// branches that a real wired server can never exercise (DI always populates `repoUtils` before a
-// request can reach a route). Every other behavior (create's `!user` 403, the bulk-array create path,
-// count's `!user` branch, exists' found/not-found and permission outcomes) is exercised via real
-// HTTP+DB requests in test/routes/mongo/MailboxRoute.test.ts (and its sql/ counterpart), matching this
-// library's real-server-integration-test convention.
+// Isolated unit tests for BaseMailboxRoute, reserved ONLY for defensive guard branches a real wired
+// server can never exercise (DI always populates `repoUtils`/an authenticated `user` before a request
+// reaches a route's own body). Every other behavior (create's `!user` 403, the bulk-array create path,
+// count's `!user` branch, exists' found/not-found and permission outcomes, autoProvision's real
+// enabled/alias/domain logic) is exercised via real HTTP+DB requests in
+// test/routes/mongo/MailboxRoute.test.ts + MailboxAutoProvision.test.ts (and their sql/ counterparts),
+// matching this library's real-server-integration-test convention.
 //
 // The route instance itself is still scaffolded through a real `ObjectFactory` (`newInstance(...,
 // { initialize: false })`), not a bare `new TestMailboxRoute()` - this registers the class and tags the
@@ -57,6 +58,27 @@ describe("BaseMailboxRoute Tests (repoUtils guard clauses only)", () => {
         const res = makeRes();
 
         await expect(route.exists("id-1", {}, res, { uid: "user-1" } as any)).rejects.toThrow(
+            /internal error/i,
+        );
+    });
+
+    it("autoProvision() throws AUTH_PERMISSION_FAILURE when no user is given.", async () => {
+        const route = objectFactory.newInstance<TestMailboxRoute>(TestMailboxRoute, { initialize: false });
+
+        await expect(route.autoProvision({} as any, undefined, undefined)).rejects.toThrow(/permission/i);
+    });
+
+    it("autoProvision() throws INTERNAL_ERROR when repoUtils is not set (even though enabled/configured).", async () => {
+        const route = objectFactory.newInstance<TestMailboxRoute>(TestMailboxRoute, { initialize: false });
+        // `initialize: false` also skips the `@Config` injection that a real request always gets, so the
+        // enabled/domains/authServerUrl checks ahead of the `repoUtils` one need setting by hand here —
+        // this test exists specifically to isolate the `repoUtils` guard, not those earlier ones (already
+        // covered for real via test/routes/mongo/MailboxRoute.test.ts's "disabled by default" case).
+        (route as any).autoProvisionEnabled = true;
+        (route as any).domains = ["example.com"];
+        (route as any).authServerUrl = "http://auth.test";
+
+        await expect(route.autoProvision({} as any, undefined, { uid: "user-1" } as any)).rejects.toThrow(
             /internal error/i,
         );
     });

@@ -20,12 +20,18 @@ Keep entries terse — this is a reference, not a transcript.
   races with no concrete external trigger path. Every finding should be able to name the actual
   HTTP route/method or WS message type that reaches the code in question.
 
-- **Commit discipline.** Don't `git commit` unless explicitly asked, even after a full
-  review-and-fix cycle with passing tests. Leave changes staged/unstaged and say so.
+- **Commit discipline.** Don't `git commit` unless explicitly asked for *that specific piece of
+  work*. An autonomous-execution/"commit as you go" approval given for one approved plan (e.g. via
+  plan mode) is scoped to that plan only — it does not carry forward to later, separate requests in
+  the same session, even ones that look similar in kind (a follow-up review-and-fix pass, a
+  refactor, a new feature), and even after a full review-and-fix cycle with passing tests. Default
+  to leaving changes staged/unstaged and saying so; only commit automatically within the exact
+  scope of a plan that was explicitly approved as autonomous. If unsure whether new work falls
+  inside that scope, treat it as outside and ask.
+  
 - **Commit message style: concise, one line per task/bug/feature — no verbose prose.** A commit
-  message is a short list of one-line bullets, one per item. Never a paragraph explaining what was
-  done or why for any single item — that belongs in the diff/code comments/NOTES.md, not the commit
-  message. This mirrors JP's standing convention across his other repos.
+  message is a short list of one-line bullets, one per item. This mirrors JP's standing convention
+  across his other repos.
 
 ## Session Log
 
@@ -138,3 +144,106 @@ folders a permanent nav destination depends on to render anything are eager. Upd
 - **Verification**: this package's own `yarn build`/full `yarn vitest run` both clean (822/822).
   Re-refreshed `@rapidmx/server`'s `yarn patch @rapidmx/restapi` the same way as the entry above
   (still not a real version bump/publish).
+
+### 2026-09-07 — Found (not fixed here): `CalendarEvent.startDate`/`endDate` persist as strings, not `Date`
+
+While finishing the Calendar view in `@rapidmx/server` (see that repo's own NOTES.md, same date),
+smoke-testing against a real running server found that `CalendarEventMongo`'s `startDate`/`endDate`
+— declared `public startDate: Date = new Date();` — are actually stored in Mongo as plain strings.
+Confirmed by inspecting a created document directly via the `mongodb` driver:
+`doc.startDate.constructor.name === "String"`. Consequence: `ModelUtils.getQueryParamValueMongo`'s
+`lte`/`gte` operators build a query against a real `Date` operand (`new Date(matches[2])`), and a
+Mongo range comparison between a `Date` operand and a string-typed field matches nothing — verified
+with `curl`, where even a trivially-true `endDate=gte(1970-01-01T00:00:00.000Z)` (no other filters)
+returned `[]` for a folder that has an event. This isn't calendar-event-specific in principle — it's
+whatever code path handles `create()`/`update()` for `Date`-typed fields not coercing an incoming
+JSON string to a real `Date` before the record is persisted (TS's `Date` type annotation has no
+runtime effect on its own) — but Calendar's date-range querying is the first place in either
+consuming repo that actually exercises `lte`/`gte` against a `Date` field, so nothing else surfaced
+it yet. Likely affects every `Date`-typed column across every model, mongo and SQL both (not
+verified for SQL). **Not investigated further or fixed** — out of scope for the session that found
+it (a `server`-side feature, not a restapi task) and needs someone who knows whether the intended
+fix is in the base entity's `create`/`update` (a general coercion) or somewhere more specific.
+`@rapidmx/server` worked around the *symptom* by dropping server-side date-range filtering for
+calendar events entirely (fetches the flat list, filters client-side) rather than depending on this
+until it's fixed at the source.
+
+### 2026-09-07 — Added self-service mailbox auto-provisioning to `BaseMailboxRoute`
+
+`@rapidmx/server` needed a way for a brand-new auth-server user with no mailbox yet to get one
+without an admin manually creating it first. Started as a `server`-side route; JP redirected it here
+mid-session — general backend capability any consumer of this library might want, same reasoning as
+`create()` itself already living here, not webmail-client-specific glue.
+
+- **`BaseMailboxRoute.autoProvision()`** (`POST .../auto-provision`, `@Auth(["jwt"])`): this system
+  has no email registered anywhere for a brand-new user by definition, so the address has to be
+  derived from identity auth-server already has — calls auth-server's own `GET /api/aliases/me?
+  type=name`, forwarding the caller's `jwt` cookie (so it only ever sees *their* aliases), then
+  offers the full cross product of those aliases against the new `mail:domains` config as the set of
+  addresses the caller could register. A caller can have more than one alias and a deployment can
+  serve more than one domain — deliberately **never auto-creates on the first call**, even when
+  there's only one possible combination; the client always gets a `needs_selection` response to
+  confirm from, and only a follow-up call with an explicit `{alias, domain}` (re-validated against
+  the real alias list and domain list, never trusted blindly) actually creates anything. Idempotent:
+  a caller who already owns a mailbox gets it back (`status: "existing"`) before ever contacting
+  auth-server at all.
+- **`mail:domains` (string[], default `[]`) is new and is *not* auto-provision-specific** — JP's own
+  correction mid-session: this is the one source of truth for every domain this mail server accepts
+  mail on, for a deployment that serves more than one domain. `create()` itself now rejects *any*
+  caller's `primarySmtpAddress` (trusted admin included — "even when explicit by an admin" was JP's
+  exact framing) whose domain isn't in this list, once it's non-empty; empty stays today's
+  unrestricted behavior for backward compatibility. New sibling config:
+  `mail:auto_provision:enabled` (bool, default `false` — deliberately opt-in, silently minting
+  mailboxes is a real behavior change), `mail:auto_provision:quota_bytes`/`timeout_ms`. Reuses the
+  already-existing `mail:auth_server_url` for a genuine server-to-server HTTP call this time (no
+  prior precedent for that in this package — see `RspamdSpamScanProvider.ts` for the only other
+  `fetch`-with-timeout example, followed here for the `AbortController` pattern).
+- **New**: `GET .../domains`, returning the configured list — lets a client (e.g. `server`'s admin
+  "New mailbox" form) constrain the domain half of an address to what this server actually accepts
+  without duplicating the list.
+- **Every `@Config` field here has a real (non-`undefined`) fallback default**, including
+  `authServerUrl` (`""`), unlike the pre-existing `WwwRoute.ts` pattern in `server` that has no
+  default at all — that one gets away with it only because `server`'s own config defaults always set
+  the key. This package's own route classes get instantiated broadly across its test suite without
+  that guarantee: a `@Config` field with no default throws `"No configuration variable is defined at
+  path: ..."` at DI-instantiation time the moment the key is genuinely absent — confirmed the hard
+  way here (broke 28 unrelated test files at once) before adding the fallback.
+- **Verification note for future coverage work**: this route's own two "authenticated user with zero
+  ACL grants" branches in `find()`/`count()` (pre-existing code, present before this session, unowned
+  by this change) turned out uncovered too, confirmed via a controlled before/after comparison (moving
+  the new test files aside and re-running) that it wasn't something this session's own tests caused.
+  Closed anyway with two small additions to `MailboxRoute.test.ts` (mongo + sql) since they were
+  trivial and directly adjacent — not scope creep, just tidying a gap found while already in the file.
+- Full suite: 858/858 passing, 100% coverage on every file this change touched (branches held to this
+  package's own 95% floor — see `vitest.config.ts`'s comment on why, unrelated to this work).
+
+### 2026-09-07 — Follow-up: `mail:auto_provision:static_aliases` bypass, for a consumer with no
+real auth-server to call at all
+
+`@rapidmx/server` needed this feature to also work under its own plain `yarn dev` (no auth-server
+running, no stand-in for one either) — the original design above assumed `mail:auth_server_url`
+always points at a real, separate, reachable HTTP service. Attempting to point it at the *consuming
+server's own address* (a same-process dev-mode shortcut, tried first in `server`) surfaced a real
+uWebSockets.js limitation: a Node `fetch()` call targeting a server's own listening address, issued
+from *inside a request handler already executing on that same process*, is refused at the TCP level
+(`ECONNREFUSED`) — confirmed the identical endpoint works fine called from curl or a separate Node
+process, isolating the failure specifically to same-process self-connection mid-request. Not
+fixable by adjusting the fetch call itself; see `server`'s own NOTES.md (2026-09-07 follow-up entry)
+for the full diagnostic trail.
+
+- **Fix**: new `@Config("mail:auto_provision:static_aliases", [])` field on `BaseMailboxRoute`
+  (`string[]`, default `[]`). When non-empty, `fetchNameAliases()` returns it directly — no
+  `authServerUrl`/`fetch()` call at all, real or otherwise. `autoProvision()`'s enabled-guard
+  (`hasAliasSource = staticAliases.length > 0 || !!authServerUrl`) now accepts either as a valid
+  alias source, so a deployment can use this instead of `authServerUrl` entirely, not just as a
+  dev-only fallback — same category as `mail:domains`, a plain config override, not a "dev mode"
+  concept from this class's own point of view.
+- Covered by a new, separate test file (`test/routes/mongo/MailboxAutoProvisionStatic.test.ts`)
+  rather than added to the existing `MailboxAutoProvision.test.ts` — that file deliberately exercises
+  the *real* `authServerUrl`+mocked-`fetch` path at module-level config, and mutating
+  `mail:auto_provision:static_aliases` in the same file would either conflict with that or need
+  awkward per-test config toggling that this framework's `@Config`-at-DI-time resolution doesn't
+  support anyway (config must be set before the route/`Server` is constructed). The new test asserts
+  `fetch` is never even called, not just that the right aliases come back.
+- Full suite: 859/859 passing, restored to 100% statement/function/line coverage (branches still
+  held to the 95% floor) after this addition.
