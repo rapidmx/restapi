@@ -100,16 +100,20 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             : [await this.doCreateObject(objs[0], { req, user, ignoreACL: true })];
 
         // A brand-new mailbox with zero folders is unusable the moment its owner opens it: the webmail
-        // client's `MailShell` selects `folders.find(f => f.type === "inbox")` as the default view (with
-        // none found, it shows "No mailbox available" even though the mailbox itself exists), and Compose
-        // needs a `drafts` folder uid in hand before it will create a new draft. Every *other* well-known
-        // folder (Junk, Sent Items, Deleted Items, ...) stays lazily provisioned on first actual use — see
-        // `findOrCreateWellKnownFolder`'s own doc comment — only these two are load-bearing for the client
-        // to render anything at all, so only these two are created eagerly here.
+        // client's `MailShell`/`CalendarShell`/`ContactsShell`/`TasksShell` each select a specific
+        // well-known folder as their default view (with none found, they show an empty/broken state even
+        // though the mailbox itself exists), and Compose needs a `drafts` folder uid in hand before it will
+        // create a new draft. Every *other* well-known folder (Junk, Sent Items, Deleted Items, ...) stays
+        // lazily provisioned on first actual use — see `findOrCreateWellKnownFolder`'s own doc comment —
+        // only these five are load-bearing for the client to render anything at all, so only these five are
+        // created eagerly here.
         const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
         for (const mailbox of created) {
             await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.INBOX, user);
             await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.DRAFTS, user);
+            await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.CALENDAR, user);
+            await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.CONTACTS, user);
+            await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.TASKS, user);
         }
 
         return Array.isArray(obj) ? created : created[0];

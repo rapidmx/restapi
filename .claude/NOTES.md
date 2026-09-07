@@ -110,3 +110,31 @@ not in `server`.
   Inbox and Drafts come back immediately, plus `GET /admin/mailboxes/detail?uid=...` and
   `GET /?mailboxUid=...` both `200`. See `@rapidmx/server`'s own NOTES.md for the patch-application
   side of this if picking the follow-up (moving off the patch once published) back up later.
+
+### 2026-09-06 — Extended the same fix to Calendar/Contacts/Tasks folders
+
+`@rapidmx/server` started building real Calendar/Contacts/Tasks views (a persistent nav rail to all
+three, alongside Mail) — each is a permanent, always-visible destination now, not an opt-in feature,
+so the same reasoning from the Inbox/Drafts fix above applies to their well-known folders too.
+`BaseMailboxRoute.create()`'s eager-provisioning loop now also creates `FolderType.CALENDAR`,
+`FolderType.CONTACTS`, and `FolderType.TASKS` (five total: `calendar, contacts, drafts, inbox,
+tasks`). Every *other* well-known folder (Junk, Sent Items, Deleted Items) is still lazy — only
+folders a permanent nav destination depends on to render anything are eager. Updated both
+`test/routes/{mongo,sql}/MailboxRoute.test.ts`'s folder-list assertions to match.
+
+- **Ran into (and ruled out) a red herring while verifying this**: mid-session, `git status` showed
+  unrelated uncommitted changes in this repo — new `oofEnabled`/`oofMessage`/`oofStartTime`/
+  `oofEndTime` fields on `MailboxMongo`/`MailboxSQL` plus `DeviceSyncStateMongo`/`SQL` changes (JP's
+  own in-progress MS-ASSettings Out-of-Office work, unrelated to this session). A full suite run
+  briefly showed `BULK_UPDATE_FAILURE` (`api-022`) on every mailbox-creation test while that work
+  was mid-edit, and a separate run showed 43 failures concentrated in `ContactRoute.test.ts`
+  immediately after. Confirmed both were transient/unrelated to this fix, not caused by it: a
+  same-suite rerun a few minutes later (after JP confirmed he'd finished that work) was clean
+  (822/822), with `git status` back to showing only this session's own three files. **Lesson**: this
+  repo can have a real human actively editing it concurrently with a Claude session — an
+  unexplained failure is worth a `git status` check for surprise unstaged changes before assuming
+  your own edit caused it, and worth a plain rerun before spending time root-causing what might be
+  transient/someone-else's mid-edit state.
+- **Verification**: this package's own `yarn build`/full `yarn vitest run` both clean (822/822).
+  Re-refreshed `@rapidmx/server`'s `yarn patch @rapidmx/restapi` the same way as the entry above
+  (still not a real version bump/publish).

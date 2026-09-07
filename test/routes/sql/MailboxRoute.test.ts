@@ -332,7 +332,7 @@ describe("Route:MailboxSQL Tests", () => {
         expect(acl?.records ?? []).toEqual([]);
     });
 
-    it("Creating a mailbox eagerly provisions its Inbox and Drafts folders (the webmail client needs both to render anything at all).", async () => {
+    it("Creating a mailbox eagerly provisions its Inbox, Drafts, Calendar, Contacts, and Tasks folders (the webmail client needs each to render anything at all).", async () => {
         const obj: MailboxSQL = new MailboxSQL({
             ownerUserUid: owner.uid,
             primarySmtpAddress: `${uuid.v4()}@example.com`,
@@ -357,7 +357,7 @@ describe("Route:MailboxSQL Tests", () => {
 
         expect(folders.status).toBe(200);
         const types = folders.body.map((f: any) => f.type).sort();
-        expect(types).toEqual(["drafts", "inbox"]);
+        expect(types).toEqual(["calendar", "contacts", "drafts", "inbox", "tasks"]);
     });
 
     it("An admin can still create a mailbox for themselves like any other authenticated user.", async () => {
