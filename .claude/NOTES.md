@@ -297,3 +297,65 @@ the full plan) — this session only touched backend surface, no frontend.
 - Full suite: 885/885 passing. Coverage: statements 99.93%, functions 99.56% (both just the one
   pre-existing `Raw()`-callback gap short of 100%), lines 100%, branches 98.52% (comfortably above the
   95% floor). `yarn build` clean.
+
+### 2026-09-07 — Added four new features: mail filters (inbox rules), scheduled send, mail
+signatures, automatic replies (OOF)
+
+Full implementation plan lives at (session-local) `i-d-like-your-help-polymorphic-eagle.md`. All four
+follow this repo's existing structural conventions (interfaces in `types.ts`, paired `*Mongo`/`*SQL`
+entities, `BaseScopedChildRoute` subclasses scoped by `mailboxUid`, `BackgroundService` jobs).
+
+- **`MailFilterRule`** (MAPI inbox-rule pragmatic subset: conditions + ordered actions +
+  `stopProcessingRules`) and **`MailSignature`** (OWA-style roaming signature, resolved via new
+  `resolveDefaultSignature()`) are new mailbox-scoped entities with full CRUD (`BaseScopedChildRoute`,
+  same shape as `ContactList`/`TaskList`) — no custom endpoints needed for either.
+- **Scheduled send**: `Message.scheduledSendTime?: Date` (optional, no SQL migration hazard). `BaseMessageRoute.send()`
+  gained one branch: a future `scheduledSendTime` moves the message to the mailbox's (previously
+  defined but never used) `FolderType.OUTBOX` instead of relaying — no new endpoint, the client just
+  `PUT`s the field first. New `ScheduledSendJob` polls for due messages and relays them via the same
+  `scanAndRelay()` `send()` itself uses.
+- **Automatic replies**: evaluated inline in `ScanQueueJob` (same place mail filters run) for any
+  "deliver"-verdict message. `resolveActiveOof()` (`util/OofUtils.ts`) combines the existing
+  `Mailbox.oofEnabled` toggle with a new, independent trigger — a `CalendarEvent.autoReplyEnabled`/
+  `autoReplyMessage` window (e.g. a vacation) — without merging them into one record; the event's
+  message wins when both are active. `isAutoReplyEligible()` (`util/AutoReplyUtils.ts`) implements RFC
+  3834 loop prevention (refuses on empty envelope-from, a present non-"no" `Auto-Submitted` header, or
+  `Precedence: bulk/list/junk`). A new `OofReplySuppression` entity throttles repeat replies to the same
+  sender within a rolling `mail:oof:resuppress_after_hours` window (a deliberate simplification of
+  Exchange's own per-OOF-period suppression, since this library has no "OOF turned on at" timestamp to
+  reset a cache against) — purged once stale by a new `OofReplySuppressionCleanupJob` (direct structural
+  copy of `QuarantineRetentionJob`).
+- **Necessary prerequisite fix, not scope creep**: `ScanQueueJob` had *always* hardcoded
+  `Message.subject`/`bodyPreview` to `""` on ingestion — `ScanPipeline.run()` already ran `simpleParser()`
+  but only returned `spam`/`av`/`attachments`/`sanitizedHtml`, discarding everything else. Extended
+  `ScanPipelineResult` with `subject`/`bodyPreview`/`parsedFrom`/`autoSubmittedHeader`/
+  `precedenceHeader`/`messageIdHeader`, and `ScanQueueJob` now uses them — both fixes the dormant bug
+  and gives mail filters/auto-replies real data to match against.
+- **Real bug found and fixed via a genuine cross-backend behavior difference, not just a test
+  artifact**: `ScheduledSendJob`'s final `update()` originally tried to clear `scheduledSendTime` by
+  setting it to `undefined` in the update payload (the pattern used elsewhere in this codebase, e.g.
+  `BaseMessageRoute.send()`'s `sanitizedHtmlBlobKey` handling). This works fine on the Mongo backend
+  but **silently does nothing on SQL**: TypeORM's `Repository.update()` skips any property with an
+  `undefined` value (leaving the column unchanged) and only treats an explicit `null` as "set this
+  column to NULL." Confirmed via a real SQLite round-trip test failing with the *old* scheduled time
+  still present after "successful" relay. **Fix**: pass `null` instead of `undefined` when the intent
+  is to clear a nullable field in an `update()` payload — `null` clears reliably on both backends,
+  `undefined` only reliably does so on Mongo. Worth checking any other `update()` call in this codebase
+  that tries to clear an optional field via `undefined` for the same latent bug.
+- Mail filter rule evaluation (`util/MailFilterUtils.ts`) tracks `moveToFolderUid` (last matching
+  `MOVE_TO_FOLDER` wins) separately from `copyToFolderUids[]` (every matching `COPY_TO_FOLDER`
+  accumulates) — a `DELETE` action discards the primary delivery but any `COPY_TO_FOLDER` copies from
+  the same rule set are still created, matching MAPI's per-action (not mutually-exclusive) action-list
+  semantics.
+- Auto-reply composition (a narrow, entirely system-generated exception to "this repo doesn't compose
+  MIME" — see `MailSignature`'s doc comment for why that boundary exists) uses `nodemailer`'s
+  `MailComposer` (`import MailComposer from "nodemailer/lib/mail-composer/index.js"`), the exact same
+  import path/API `@rapidmx/server`'s `BaseMailComposeRoute` already uses — confirmed by reading that
+  file first rather than guessing at nodemailer's API shape.
+- `jsdoc/check-indentation` (this repo's lint config) rejects a JSDoc continuation line with more than
+  one space after the `*` — easy to introduce when hand-aligning multi-line doc comments; `yarn lint`
+  (via `yarn build`) catches it immediately.
+- Full suite: 1022/1022 passing. New code at 100% statement/function/line coverage; the only
+  remaining gap is the same pre-existing `MailboxRouteSQL.ts` one-function gap noted in the entry
+  above (confirmed untouched via `git diff`). `yarn build`/`yarn tsc --noEmit` clean. Not committed —
+  left staged/unstaged per the standing commit-discipline rule.

@@ -122,6 +122,19 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
     @Description("The iTIP revision counter (RFC 5546 `SEQUENCE`), incremented on every scheduling-relevant change.")
     public sequence: number = 0;
 
+    @Column()
+    @Description(
+        "When `true`, this event's own start/end window independently triggers an automatic-reply period for " +
+            "the mailbox, in addition to the mailbox-level `Mailbox.oofEnabled` toggle.",
+    )
+    @Nullable
+    public autoReplyEnabled?: boolean;
+
+    @Column()
+    @Description("The automatic-reply body to use while this event's window is active.")
+    @Nullable
+    public autoReplyMessage?: string;
+
     constructor(other?: Partial<CalendarEventMongo>) {
         super(other);
 
@@ -146,6 +159,8 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
                     : this.reminderMinutesBeforeStart;
             this.icalUid = other.icalUid !== undefined ? other.icalUid : this.icalUid;
             this.sequence = other.sequence !== undefined ? other.sequence : this.sequence;
+            this.autoReplyEnabled = "autoReplyEnabled" in other ? other.autoReplyEnabled : this.autoReplyEnabled;
+            this.autoReplyMessage = "autoReplyMessage" in other ? other.autoReplyMessage : this.autoReplyMessage;
         }
     }
 }

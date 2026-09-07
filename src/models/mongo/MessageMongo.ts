@@ -122,6 +122,14 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     @Nullable
     public searchIndexedAt?: Date;
 
+    @Column()
+    @Description(
+        "When set to a future time, `send()` defers relay until then instead of sending immediately - the " +
+            "message sits in the mailbox's `OUTBOX` folder until `ScheduledSendJob` relays it and clears this field.",
+    )
+    @Nullable
+    public scheduledSendTime?: Date;
+
     constructor(other?: Partial<MessageMongo>) {
         super(other);
 
@@ -144,6 +152,7 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.hasAttachments = other.hasAttachments !== undefined ? other.hasAttachments : this.hasAttachments;
             this.scanResultUid = "scanResultUid" in other ? other.scanResultUid : this.scanResultUid;
             this.searchIndexedAt = "searchIndexedAt" in other ? other.searchIndexedAt : this.searchIndexedAt;
+            this.scheduledSendTime = "scheduledSendTime" in other ? other.scheduledSendTime : this.scheduledSendTime;
         }
     }
 }

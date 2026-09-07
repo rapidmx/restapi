@@ -81,6 +81,21 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
+        // "Do not deliver before" (`PR_DEFERRED_SEND_TIME`) - a future `scheduledSendTime`, set via an ordinary
+        // `PUT` on the draft before calling this endpoint, defers relay instead of sending now. The message sits
+        // in the mailbox's Outbox folder until `ScheduledSendJob` relays it and clears this field. Canceling a
+        // scheduled send is just another ordinary `PUT` (clear the field, or move back to Drafts) - no separate
+        // endpoint for that either.
+        if (message.scheduledSendTime && message.scheduledSendTime > new Date()) {
+            const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+            const outbox: any = await findOrCreateWellKnownFolder(folderRepo, this.folderClass, message.mailboxUid, FolderType.OUTBOX, user);
+            return await this.repoUtils.update(
+                { uid: message.uid, version: (message as any).version, folderUid: outbox.uid } as any,
+                message,
+                { user, ignoreACL: true },
+            );
+        }
+
         // The message's `bodyBlobKey` already holds the fully composed RFC 5322 source (assembled by the
         // webmail compose UI, or an EAS/MAPI "send" handler, before this endpoint is called) — this route's
         // job is scanning and relay, not MIME composition.

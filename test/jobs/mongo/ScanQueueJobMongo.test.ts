@@ -18,7 +18,7 @@ import { ACLUtils, ConnectionManager, MongoConnection, MongoRepository, Notifica
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import config from "../../config.js";
-import { registerTestDoubles } from "../../testDoubles.js";
+import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
 import { ScanQueueJobMongo } from "../../../src/jobs/mongo/ScanQueueJobMongo.js";
 import { IngestQueueEntryMongo } from "../../../src/models/mongo/IngestQueueEntryMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
@@ -26,7 +26,11 @@ import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
 import { AttachmentMongo } from "../../../src/models/mongo/AttachmentMongo.js";
 import { QuarantineEntryMongo } from "../../../src/models/mongo/QuarantineEntryMongo.js";
 import { ScanResultMongo } from "../../../src/models/mongo/ScanResultMongo.js";
-import { FolderType, IngestStatus, QuarantineReason } from "../../../src/models/types.js";
+import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
+import { MailFilterRuleMongo } from "../../../src/models/mongo/MailFilterRuleMongo.js";
+import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
+import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySuppressionMongo.js";
+import { FolderType, IngestStatus, MailFilterActionType, QuarantineReason } from "../../../src/models/types.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
@@ -100,6 +104,10 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
     let attachmentRepo: MongoRepository<AttachmentMongo>;
     let quarantineEntryRepo: MongoRepository<QuarantineEntryMongo>;
     let scanResultRepo: MongoRepository<ScanResultMongo>;
+    let mailboxRepo: MongoRepository<MailboxMongo>;
+    let mailFilterRuleRepo: MongoRepository<MailFilterRuleMongo>;
+    let calendarEventRepo: MongoRepository<CalendarEventMongo>;
+    let oofReplySuppressionRepo: MongoRepository<OofReplySuppressionMongo>;
 
     const mailboxUid = uuid.v4();
 
@@ -113,6 +121,20 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             ...data,
         });
         return await ingestQueueRepo.save(obj);
+    };
+
+    const createMailbox = async (data?: Partial<MailboxMongo>): Promise<MailboxMongo> => {
+        const obj = new MailboxMongo({
+            uid: mailboxUid,
+            primarySmtpAddress: "recipient@example.com",
+            aliasAddresses: [],
+            displayName: "Recipient Mailbox",
+            timezone: "UTC",
+            quotaBytes: 1_000_000_000,
+            usedBytes: 0,
+            ...data,
+        });
+        return await mailboxRepo.save(obj);
     };
 
     beforeAll(async () => {
@@ -131,6 +153,10 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         models.set("AttachmentMongo", AttachmentMongo);
         models.set("QuarantineEntryMongo", QuarantineEntryMongo);
         models.set("ScanResultMongo", ScanResultMongo);
+        models.set("MailboxMongo", MailboxMongo);
+        models.set("MailFilterRuleMongo", MailFilterRuleMongo);
+        models.set("CalendarEventMongo", CalendarEventMongo);
+        models.set("OofReplySuppressionMongo", OofReplySuppressionMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("mongo");
@@ -143,9 +169,14 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         attachmentRepo = conn.getMongoRepository("AttachmentMongo");
         quarantineEntryRepo = conn.getMongoRepository("QuarantineEntryMongo");
         scanResultRepo = conn.getMongoRepository("ScanResultMongo");
+        mailboxRepo = conn.getMongoRepository("MailboxMongo");
+        mailFilterRuleRepo = conn.getMongoRepository("MailFilterRuleMongo");
+        calendarEventRepo = conn.getMongoRepository("CalendarEventMongo");
+        oofReplySuppressionRepo = conn.getMongoRepository("OofReplySuppressionMongo");
 
-        // Constructed once via real ObjectFactory DI: `@Init` builds its six real `RepoUtils` against the live
-        // connection above, and `@Inject("BlobStore")`/`@Inject(ScanPipeline)` resolve to the registered doubles.
+        // Constructed once via real ObjectFactory DI: `@Init` builds its ten real `RepoUtils` against the live
+        // connection above, and `@Inject("BlobStore")`/`@Inject(ScanPipeline)`/`@Inject("MailTransport")` resolve
+        // to the registered doubles.
         job = await objectFactory.newInstance(ScanQueueJobMongo, { name: "default" });
     });
 
@@ -155,7 +186,18 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [ingestQueueRepo, folderRepo, messageRepo, attachmentRepo, quarantineEntryRepo, scanResultRepo]) {
+        for (const repo of [
+            ingestQueueRepo,
+            folderRepo,
+            messageRepo,
+            attachmentRepo,
+            quarantineEntryRepo,
+            scanResultRepo,
+            mailboxRepo,
+            mailFilterRuleRepo,
+            calendarEventRepo,
+            oofReplySuppressionRepo,
+        ]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -164,6 +206,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 }
             }
         }
+        (objectFactory.getInstance<RecordingMailTransport>("MailTransport")!).sent = [];
     });
 
     it("Exposes the configured cron schedule.", () => {
@@ -387,5 +430,375 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             const updated = await ingestQueueRepo.findOne({ uid: entry.uid } as any);
             expect(updated!.status).toBe(IngestStatus.DELIVERED);
         }
+    });
+
+    it("Applies a MOVE_TO_FOLDER rule, filing the message in the target folder instead of Inbox.", async () => {
+        const targetFolder = await folderRepo.save(
+            new FolderMongo({ mailboxUid, name: "Projects", type: FolderType.USER, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+        );
+        await mailFilterRuleRepo.save(
+            new MailFilterRuleMongo({
+                mailboxUid,
+                name: "Move to Projects",
+                enabled: true,
+                sequence: 0,
+                stopProcessingRules: false,
+                conditions: { subjectContains: ["Test message"] },
+                actions: [{ type: MailFilterActionType.MOVE_TO_FOLDER, folderUid: targetFolder.uid }],
+            }),
+        );
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
+        expect(inbox).toBeNull();
+
+        const messages = await messageRepo.find({ folderUid: targetFolder.uid }).toArray();
+        expect(messages.length).toBe(1);
+    });
+
+    it("Applies a DELETE rule, discarding the message entirely (no Message row created).", async () => {
+        await mailFilterRuleRepo.save(
+            new MailFilterRuleMongo({
+                mailboxUid,
+                name: "Delete test messages",
+                enabled: true,
+                sequence: 0,
+                stopProcessingRules: false,
+                conditions: { subjectContains: ["Test message"] },
+                actions: [{ type: MailFilterActionType.DELETE }],
+            }),
+        );
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        const entry = await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const updated = await ingestQueueRepo.findOne({ uid: entry.uid } as any);
+        expect(updated!.status).toBe(IngestStatus.DELIVERED);
+        const messages = await messageRepo.find({ mailboxUid }).toArray();
+        expect(messages.length).toBe(0);
+    });
+
+    it("Applies a MARK_AS_READ rule, delivering the message already read (folder unreadCount stays 0).", async () => {
+        await mailFilterRuleRepo.save(
+            new MailFilterRuleMongo({
+                mailboxUid,
+                name: "Mark newsletters read",
+                enabled: true,
+                sequence: 0,
+                stopProcessingRules: false,
+                conditions: { subjectContains: ["Test message"] },
+                actions: [{ type: MailFilterActionType.MARK_AS_READ }],
+            }),
+        );
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
+        expect(inbox!.unreadCount).toBe(0);
+        expect(inbox!.totalCount).toBe(1);
+        const messages = await messageRepo.find({ folderUid: inbox!.uid }).toArray();
+        expect(messages[0].flags.read).toBe(true);
+    });
+
+    it("Applies a COPY_TO_FOLDER rule, filing a copy in the target folder in addition to the original in Inbox.", async () => {
+        const copyFolder = await folderRepo.save(
+            new FolderMongo({ mailboxUid, name: "Archive", type: FolderType.USER, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+        );
+        await mailFilterRuleRepo.save(
+            new MailFilterRuleMongo({
+                mailboxUid,
+                name: "Copy to Archive",
+                enabled: true,
+                sequence: 0,
+                stopProcessingRules: false,
+                conditions: { subjectContains: ["Test message"] },
+                actions: [{ type: MailFilterActionType.COPY_TO_FOLDER, folderUid: copyFolder.uid }],
+            }),
+        );
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
+        const inboxMessages = await messageRepo.find({ folderUid: inbox!.uid }).toArray();
+        expect(inboxMessages.length).toBe(1);
+
+        const copyMessages = await messageRepo.find({ folderUid: copyFolder.uid }).toArray();
+        expect(copyMessages.length).toBe(1);
+        expect(copyMessages[0].uid).not.toBe(inboxMessages[0].uid);
+
+        const copyAttachments = await attachmentRepo.find({ folderUid: copyFolder.uid }).toArray();
+        expect(copyAttachments.length).toBe(1);
+    });
+
+    it("Applies a FORWARD rule, relaying the original raw message to the forward address via MailTransport.", async () => {
+        await mailFilterRuleRepo.save(
+            new MailFilterRuleMongo({
+                mailboxUid,
+                name: "Forward to assistant",
+                enabled: true,
+                sequence: 0,
+                stopProcessingRules: false,
+                conditions: { subjectContains: ["Test message"] },
+                actions: [{ type: MailFilterActionType.FORWARD, forwardTo: "assistant@example.com" }],
+            }),
+        );
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const forwarded = transport.sent.find((m) => m.envelopeTo.includes("assistant@example.com"));
+        expect(forwarded).toBeDefined();
+        expect(forwarded!.envelopeFrom).toBe("sender@example.com");
+    });
+
+    it("Does not evaluate mail filter rules against junk-verdict mail.", async () => {
+        await mailFilterRuleRepo.save(
+            new MailFilterRuleMongo({
+                mailboxUid,
+                name: "Mark everything read",
+                enabled: true,
+                sequence: 0,
+                stopProcessingRules: false,
+                conditions: {},
+                actions: [{ type: MailFilterActionType.MARK_AS_READ }],
+            }),
+        );
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makePlainRawMessage("X-Test-Force-Spam: true"));
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const junkFolder = await folderRepo.findOne({ mailboxUid, type: FolderType.JUNK } as any);
+        const messages = await messageRepo.find({ folderUid: junkFolder!.uid }).toArray();
+        expect(messages[0].flags.read).toBe(false);
+    });
+
+    it("Sends an automatic reply when the mailbox's oofEnabled toggle is active, and records a suppression entry.", async () => {
+        await createMailbox({ oofEnabled: true, oofMessage: "I'm currently out of office." });
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const reply = transport.sent.find((m) => m.envelopeTo.includes("sender@example.com"));
+        expect(reply).toBeDefined();
+        expect(reply!.raw.toString()).toContain("out of office");
+        expect(reply!.raw.toString().toLowerCase()).toContain("auto-submitted: auto-replied");
+
+        const suppressions = await oofReplySuppressionRepo.find({ mailboxUid, senderAddress: "sender@example.com" }).toArray();
+        expect(suppressions.length).toBe(1);
+    });
+
+    it("Does not send a second automatic reply to the same sender within the resuppression window.", async () => {
+        await createMailbox({ oofEnabled: true, oofMessage: "I'm currently out of office." });
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey1 = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey1, makeRawMessage());
+        await createIngestEntry({ rawBlobKey: rawBlobKey1 });
+        await job.run();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(1);
+
+        const rawBlobKey2 = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey2, makeRawMessage());
+        await createIngestEntry({ rawBlobKey: rawBlobKey2 });
+        await job.run();
+
+        expect(transport.sent.length).toBe(1);
+    });
+
+    it("Sends an automatic reply based on a linked CalendarEvent's autoReplyEnabled window even when the mailbox toggle is off.", async () => {
+        await createMailbox({ oofEnabled: false });
+        const folder = await folderRepo.save(
+            new FolderMongo({ mailboxUid, name: "Calendar", type: FolderType.CALENDAR, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+        );
+        await calendarEventRepo.save(
+            new CalendarEventMongo({
+                folderUid: folder.uid,
+                mailboxUid,
+                title: "Vacation",
+                startDate: new Date(Date.now() - 24 * 60 * 60 * 1000),
+                endDate: new Date(Date.now() + 24 * 60 * 60 * 1000),
+                allDay: true,
+                timezone: "UTC",
+                organizer: { address: "recipient@example.com", type: "to" as any },
+                icalUid: uuid.v4(),
+                autoReplyEnabled: true,
+                autoReplyMessage: "On vacation until next week.",
+            }),
+        );
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const reply = transport.sent.find((m) => m.envelopeTo.includes("sender@example.com"));
+        expect(reply).toBeDefined();
+        expect(reply!.raw.toString()).toContain("On vacation until next week.");
+    });
+
+    it("Does not send an automatic reply to a message carrying an Auto-Submitted header (RFC 3834 loop prevention).", async () => {
+        await createMailbox({ oofEnabled: true, oofMessage: "I'm currently out of office." });
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makePlainRawMessage("Auto-Submitted: auto-replied"));
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(0);
+    });
+
+    it("Skips a COPY_TO_FOLDER rule whose target folder no longer exists, without failing delivery.", async () => {
+        await mailFilterRuleRepo.save(
+            new MailFilterRuleMongo({
+                mailboxUid,
+                name: "Copy to a deleted folder",
+                enabled: true,
+                sequence: 0,
+                stopProcessingRules: false,
+                conditions: { subjectContains: ["Test message"] },
+                actions: [{ type: MailFilterActionType.COPY_TO_FOLDER, folderUid: uuid.v4() }],
+            }),
+        );
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        const entry = await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const updated = await ingestQueueRepo.findOne({ uid: entry.uid } as any);
+        expect(updated!.status).toBe(IngestStatus.DELIVERED);
+        const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
+        const inboxMessages = await messageRepo.find({ folderUid: inbox!.uid }).toArray();
+        expect(inboxMessages.length).toBe(1);
+    });
+
+    it("Logs a warning and continues when relaying a FORWARD action throws.", async () => {
+        await mailFilterRuleRepo.save(
+            new MailFilterRuleMongo({
+                mailboxUid,
+                name: "Forward to assistant",
+                enabled: true,
+                sequence: 0,
+                stopProcessingRules: false,
+                conditions: { subjectContains: ["Test message"] },
+                actions: [{ type: MailFilterActionType.FORWARD, forwardTo: "assistant@example.com" }],
+            }),
+        );
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const sendSpy = vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("simulated transport failure"));
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        const entry = await createIngestEntry({ rawBlobKey });
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        const updated = await ingestQueueRepo.findOne({ uid: entry.uid } as any);
+        expect(updated!.status).toBe(IngestStatus.DELIVERED);
+        sendSpy.mockRestore();
+    });
+
+    it("Does not send an automatic reply when the mailbox exists but is not currently out of office.", async () => {
+        await createMailbox({ oofEnabled: false });
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(0);
+    });
+
+    it("Updates (rather than re-creates) an existing suppression entry once the resuppression window has elapsed.", async () => {
+        await createMailbox({ oofEnabled: true, oofMessage: "I'm currently out of office." });
+        const staleSuppression = await oofReplySuppressionRepo.save(
+            new OofReplySuppressionMongo({
+                mailboxUid,
+                senderAddress: "sender@example.com",
+                lastRepliedAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
+            }),
+        );
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(1);
+
+        const suppressions = await oofReplySuppressionRepo.find({ mailboxUid, senderAddress: "sender@example.com" }).toArray();
+        expect(suppressions.length).toBe(1);
+        expect(suppressions[0].uid).toBe(staleSuppression.uid);
+        expect(suppressions[0].lastRepliedAt.getTime()).toBeGreaterThan(staleSuppression.lastRepliedAt.getTime());
+    });
+
+    it("Logs a warning and does not record a suppression entry when sending an automatic reply throws.", async () => {
+        await createMailbox({ oofEnabled: true, oofMessage: "I'm currently out of office." });
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const sendSpy = vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("simulated transport failure"));
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        await createIngestEntry({ rawBlobKey });
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        const suppressions = await oofReplySuppressionRepo.find({ mailboxUid, senderAddress: "sender@example.com" }).toArray();
+        expect(suppressions.length).toBe(0);
+        sendSpy.mockRestore();
     });
 });

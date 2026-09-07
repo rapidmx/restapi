@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { convert } from "html-to-text";
 import sanitizeHtml from "sanitize-html";
 import { simpleParser, ParsedMail, Attachment as ParsedAttachment } from "mailparser";
 import { ObjectDecorators } from "@rapidrest/core";
@@ -9,6 +10,9 @@ import { AvVerdict, SpamVerdict } from "../models/types.js";
 import { AvScanProvider, AvScanResult } from "./AvScanProvider.js";
 import { ScanEnvelope, SpamScanProvider, SpamScanResult } from "./SpamScanProvider.js";
 const { Config, Inject, Logger } = ObjectDecorators;
+
+/** The maximum length, in characters, of the plain-text body preview `ScanPipeline.run()` derives. */
+const BODY_PREVIEW_MAX_LENGTH = 500;
 
 /** The per-attachment AV outcome, keyed by the attachment's position in the parsed message. */
 export interface ScanPipelineAttachmentResult {
@@ -28,6 +32,24 @@ export interface ScanPipelineResult {
     attachments: ScanPipelineAttachmentResult[];
     /** The message's HTML body with `<script>`/active content stripped, if it had one. */
     sanitizedHtml?: string;
+    /** The message's parsed subject line, used to populate `Message.subject` and to evaluate `MailFilterRule`
+     * subject conditions. */
+    subject?: string;
+    /** A short plain-text preview of the message body (from its plain-text part, or its HTML part converted to
+     * text if it has no plain-text part), truncated to `BODY_PREVIEW_MAX_LENGTH` characters. Used to populate
+     * `Message.bodyPreview` and to evaluate `MailFilterRule` body conditions. */
+    bodyPreview?: string;
+    /** The message's parsed `From` address (e.g. `"Jane Doe <jane@x.com>"`), used to evaluate `MailFilterRule`
+     * from conditions - the envelope-from (`ScanEnvelope.from`) is the SMTP `MAIL FROM`, which can legitimately
+     * differ from this header. */
+    parsedFrom?: string;
+    /** The RFC 5322 `Auto-Submitted` header value, if present - see `isAutoReplyEligible()` (`util/
+     * AutoReplyUtils.ts`). */
+    autoSubmittedHeader?: string;
+    /** The RFC 5322 `Precedence` header value, if present - see `isAutoReplyEligible()`. */
+    precedenceHeader?: string;
+    /** The message's parsed `Message-ID` header, used to set `In-Reply-To`/`References` on an automatic reply. */
+    messageIdHeader?: string;
 }
 
 /** Verdicts ranked worst-to-best, used to combine the raw-message and per-attachment AV results. */
@@ -87,7 +109,43 @@ export class ScanPipeline {
         const sanitizedHtml: string | undefined =
             typeof parsed.html === "string" ? this.sanitize(parsed.html) : undefined;
 
-        return { spam, av: worstAv, attachments: attachmentResults, sanitizedHtml };
+        const bodyPreview: string | undefined = this.derivePreview(parsed);
+        const parsedFrom: string | undefined = parsed.from?.text;
+        const autoSubmittedHeader: string | undefined = this.getHeaderString(parsed, "auto-submitted");
+        const precedenceHeader: string | undefined = this.getHeaderString(parsed, "precedence");
+
+        return {
+            spam,
+            av: worstAv,
+            attachments: attachmentResults,
+            sanitizedHtml,
+            subject: parsed.subject,
+            bodyPreview,
+            parsedFrom,
+            autoSubmittedHeader,
+            precedenceHeader,
+            messageIdHeader: parsed.messageId,
+        };
+    }
+
+    /** Derives a short plain-text body preview from `parsed`'s plain-text part, falling back to its HTML part
+     * (converted to text) if it has none - truncated to `BODY_PREVIEW_MAX_LENGTH` characters. */
+    private derivePreview(parsed: ParsedMail): string | undefined {
+        const text: string | undefined =
+            typeof parsed.text === "string"
+                ? parsed.text
+                : typeof parsed.html === "string"
+                  ? convert(parsed.html, { wordwrap: false })
+                  : undefined;
+        return text?.trim().slice(0, BODY_PREVIEW_MAX_LENGTH);
+    }
+
+    /** Reads a single header value out of mailparser's parsed header map, which normalizes keys to lowercase and
+     * may store a header's value as a plain string or (for structured headers) an object - only a plain string
+     * value is meaningful for the headers this is used for (`Auto-Submitted`/`Precedence`). */
+    private getHeaderString(parsed: ParsedMail, headerName: string): string | undefined {
+        const value = parsed.headers.get(headerName);
+        return typeof value === "string" ? value : undefined;
     }
 
     private async scanAttachments(attachments: ParsedAttachment[]): Promise<ScanPipelineAttachmentResult[]> {

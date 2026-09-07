@@ -225,6 +225,62 @@ describe("Route:MessageSQL Tests", () => {
         expect(transport.sent[0].envelopeTo).toEqual(["recipient@example.com"]);
     });
 
+    it("Sending a draft with a future scheduledSendTime defers relay, moving it to Outbox instead of Sent Items.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+        const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        await blobStore.put(
+            bodyBlobKey,
+            Buffer.from("From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n"),
+        );
+        const futureSendTime = new Date(Date.now() + 60 * 60 * 1000);
+        const message = await createMessage(mailbox.uid, draftsFolder.uid, { bodyBlobKey, scheduledSendTime: futureSendTime });
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/${message.uid}/send`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+
+        const outbox = await folderRepo.findOne({ where: { mailboxUid: mailbox.uid, type: FolderType.OUTBOX } });
+        expect(outbox).toBeDefined();
+        expect(result.body.folderUid).toBe(outbox!.uid);
+
+        const sentFolder = await folderRepo.findOne({ where: { mailboxUid: mailbox.uid, type: FolderType.SENT_ITEMS } });
+        expect(sentFolder).toBeNull();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(0);
+    });
+
+    it("Sending a draft whose scheduledSendTime has already elapsed sends immediately, same as no scheduledSendTime at all.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+        const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        await blobStore.put(
+            bodyBlobKey,
+            Buffer.from("From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n"),
+        );
+        const pastSendTime = new Date(Date.now() - 60 * 60 * 1000);
+        const message = await createMessage(mailbox.uid, draftsFolder.uid, { bodyBlobKey, scheduledSendTime: pastSendTime });
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/${message.uid}/send`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+
+        const sentFolder = await folderRepo.findOne({ where: { mailboxUid: mailbox.uid, type: FolderType.SENT_ITEMS } });
+        expect(result.body.folderUid).toBe(sentFolder!.uid);
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(1);
+    });
+
     it("A different user cannot send a message they don't have access to.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);

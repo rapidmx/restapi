@@ -234,6 +234,11 @@ export interface Message extends RecoverableBaseEntity {
 
     /** The timestamp this message was last (re)indexed for full-text search, if ever. */
     searchIndexedAt?: Date;
+
+    /** When set to a future time, `send()` defers relay until then instead of sending immediately -
+     * mirrors Outlook's "Do not deliver before" (`PR_DEFERRED_SEND_TIME`). The message sits in the mailbox's
+     * `OUTBOX` folder until `ScheduledSendJob` relays it and clears this field. */
+    scheduledSendTime?: Date;
 }
 
 /**
@@ -379,6 +384,105 @@ export interface TaskList extends BaseEntity {
     name: string;
 }
 
+/** The kind of action a `MailFilterRule` performs once its `MailFilterConditions` match - mirrors MAPI's
+ * `PR_RULE_ACTIONS` action types (a pragmatic subset: `OP_MOVE`/`OP_COPY`/`OP_DELETE`/`OP_MARK_AS_READ`/
+ * `OP_FORWARD`). */
+export enum MailFilterActionType {
+    MOVE_TO_FOLDER = "move_to_folder",
+    COPY_TO_FOLDER = "copy_to_folder",
+    DELETE = "delete",
+    MARK_AS_READ = "mark_as_read",
+    FORWARD = "forward",
+}
+
+/** An embedded action on a `MailFilterRule`. */
+export interface MailFilterAction {
+    type: MailFilterActionType;
+
+    /** The unique identifier of the destination `Folder`. Required for `MOVE_TO_FOLDER`/`COPY_TO_FOLDER`. */
+    folderUid?: string;
+
+    /** The address to forward the message to. Required for `FORWARD`. */
+    forwardTo?: string;
+}
+
+/** The embedded match criteria on a `MailFilterRule`. Every populated field must match (AND) for the rule to
+ * fire; each field that holds an array is itself OR-matched against its entries. A pragmatic subset of MAPI's
+ * restriction-based `PR_RULE_CONDITION`, not a general expression tree. */
+export interface MailFilterConditions {
+    /** Matches if the message's From address or display name contains any of these substrings (case-insensitive). */
+    fromContains?: string[];
+
+    /** Matches if the message's subject contains any of these substrings (case-insensitive). */
+    subjectContains?: string[];
+
+    /** Matches if the message's plain-text body preview contains any of these substrings (case-insensitive). */
+    bodyContains?: string[];
+
+    /** Matches if any To/Cc recipient address equals one of these addresses (case-insensitive). */
+    toCcContains?: string[];
+
+    hasAttachment?: boolean;
+
+    importance?: MessageImportance;
+}
+
+/**
+ * Defines a single mailbox-scoped inbox rule (MAPI/Outlook "Rules Wizard" rule, MS-OXORULE) - a set of
+ * conditions matched against newly-delivered mail, and an ordered set of actions to take when they match.
+ * Evaluated by `ScanQueueJob` immediately after a message is verdicted "deliver" (junk-routed mail never runs
+ * inbox rules, matching Exchange's own behavior), before it's filed into the mailbox's Inbox.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface MailFilterRule extends BaseEntity {
+    mailboxUid: string;
+
+    name: string;
+
+    enabled: boolean;
+
+    /** Evaluation order, ascending - mirrors MAPI `PR_RULE_SEQUENCE`. */
+    sequence: number;
+
+    /** Mirrors the Rules Wizard's "stop processing more rules" checkbox / MAPI `ST_EXIT_LEVEL` - when `true` and
+     * this rule matches, no rule with a higher `sequence` is evaluated for the same message. */
+    stopProcessingRules: boolean;
+
+    conditions: MailFilterConditions;
+
+    actions: MailFilterAction[];
+}
+
+/**
+ * Defines a single named, roaming email signature (OWA/New Outlook-style server-side signature, as opposed to
+ * Desktop Outlook's local-only signatures) belonging to a `Mailbox`. This library does not compose message
+ * bodies itself (see `BaseMessageRoute.send()`'s own doc comment - `bodyBlobKey` is always already fully
+ * composed by the caller), so inserting a signature into a drafted message is each composing client's own
+ * responsibility (webmail compose, EAS `SendMail`/`SmartReply`/`SmartForward`, MAPI's submit handler); this
+ * entity plus `resolveDefaultSignature()` (`util/MailSignatureUtils.ts`) exist so that "which signature applies"
+ * logic isn't reimplemented per client.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface MailSignature extends BaseEntity {
+    mailboxUid: string;
+
+    name: string;
+
+    /** `@Nullable` despite being a plain `string` on the concrete entity classes - same reasoning as
+     * `Mailbox.oofMessage`: an empty signature body is a legitimate "not written yet" default. */
+    contentHtml: string;
+
+    /** Applied to new (non-reply/forward) compositions when `true`. At most one signature per mailbox should have
+     * this set - enforced by convention (the composing client toggles the previous default off), not by a DB
+     * constraint, matching this codebase's existing level of cross-record validation elsewhere. */
+    isDefaultForNewMessages: boolean;
+
+    /** Applied to replies/forwards when `true` - mirrors OWA's separate "Replies/forwards" signature selector. */
+    isDefaultForReplyForward: boolean;
+}
+
 export enum AttendeeRole {
     REQUIRED = "required",
     OPTIONAL = "optional",
@@ -486,6 +590,18 @@ export interface CalendarEvent extends RecoverableBaseEntity {
 
     /** The iTIP revision counter (RFC 5546 `SEQUENCE`), incremented on every scheduling-relevant change. */
     sequence: number;
+
+    /** When `true`, this event's own [`startDate`, `endDate`] window independently triggers an automatic-reply
+     * period for the mailbox, in addition to (not instead of) the mailbox-level `Mailbox.oofEnabled` toggle -
+     * lets a "Vacation" calendar event configure its own out-of-office window/message in the same create call,
+     * without touching `Mailbox.oofEnabled`/`oofStartTime`/`oofEndTime` at all. Same shape/precedent as the
+     * existing `reminderMinutesBeforeStart` optional trigger field. See `resolveActiveOof()` (`util/OofUtils.ts`)
+     * for how this combines with the mailbox-level toggle. */
+    autoReplyEnabled?: boolean;
+
+    /** The automatic-reply body to use while this event's window is active. Only meaningful when
+     * `autoReplyEnabled` is `true`. */
+    autoReplyMessage?: string;
 }
 
 /**
@@ -760,4 +876,22 @@ export interface DeviceSyncState extends BaseEntity {
 
     /** When the device most recently acknowledged a remote wipe request. */
     remoteWipeAcknowledgedAt?: Date;
+}
+
+/**
+ * Internal bookkeeping row (not client-manageable - no CRUD route exists for this entity) used by
+ * `ScanQueueJob` to throttle automatic (out-of-office) replies: at most one reply is sent to a given sender per
+ * `mailboxUid` within a rolling `mail:oof:resuppress_after_hours` window, to avoid a reply storm against a busy
+ * sender. A deliberate, documented simplification of Exchange's own per-OOF-period suppression (this library has
+ * no "OOF was turned on at" timestamp to reset a cache against cleanly) in favor of a simple rolling window.
+ * Purged once stale by `OofReplySuppressionCleanupJob`.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface OofReplySuppression extends BaseEntity {
+    mailboxUid: string;
+
+    senderAddress: string;
+
+    lastRepliedAt: Date;
 }

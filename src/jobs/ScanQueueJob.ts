@@ -3,21 +3,30 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
+import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
-import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineResult } from "../scan/ScanPipeline.js";
+import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, ScanPipelineResult } from "../scan/ScanPipeline.js";
+import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
+import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
+import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import {
     Attachment,
     AvVerdict,
+    CalendarEvent,
     Folder,
     FolderType,
     IngestQueueEntry,
     IngestStatus,
+    Mailbox,
+    MailFilterRule,
     Message,
+    MessageFlags,
     MessageImportance,
+    OofReplySuppression,
     QuarantineEntry,
     QuarantineReason,
     RecipientType,
@@ -26,11 +35,33 @@ import {
 } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
+/** An attachment already persisted to the `BlobStore`, ready to be attached to one or more `Message` rows. */
+interface StoredAttachment {
+    filename: string;
+    contentType: string;
+    sizeBytes: number;
+    blobKey: string;
+    contentId?: string;
+    isInline: boolean;
+}
+
 /**
  * Drains `IngestQueueEntry` rows staged by `BaseMailIngestRoute`: runs the `ScanPipeline` against each one's
  * raw message, then either delivers it to the mailbox's Inbox, files it in Junk, or holds it in
  * `QuarantineEntry` — depending on `resolveDeliveryVerdict()`. No client protocol (webmail/EAS/MAPI) ever sees
  * a message before this job has processed it.
+ *
+ * A message verdicted "deliver" additionally passes through two more steps, both pragmatic subsets of their
+ * Exchange/MAPI equivalents:
+ *
+ * - **Mail filter rules** (`MailFilterRule`, MAPI inbox rules / MS-OXORULE): the mailbox's enabled rules are
+ * evaluated in `sequence` order via `evaluateMailFilterRules()`; a matching rule's actions can move/copy the
+ * message to another folder, mark it read, delete it outright, or forward it — never applied to junk-routed
+ * mail, matching Exchange's own behavior.
+ * - **Automatic (out-of-office) replies** (MS-ASSettings `Oof` / MAPI `OP_OOF_REPLY`): if the mailbox (or a
+ * linked `CalendarEvent`, e.g. a vacation) is currently "out of office" per `resolveActiveOof()`, and the
+ * message is eligible per `isAutoReplyEligible()` (RFC 3834 loop prevention), a reply is composed and relayed
+ * directly, throttled to at most one per sender within a rolling window via `OofReplySuppression`.
  *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`ScanQueueJobMongo`/`ScanQueueJobSQL`),
  * following the same multi-entity-type generic pattern `DefaultAccounts` uses.
@@ -44,6 +75,10 @@ export abstract class ScanQueueJob<
     A extends Attachment,
     QE extends QuarantineEntry,
     SR extends ScanResult,
+    X extends Mailbox,
+    MFR extends MailFilterRule,
+    CE extends CalendarEvent,
+    OS extends OofReplySuppression,
 > extends BackgroundService {
     protected abstract ingestQueueClass: any;
     protected abstract folderClass: any;
@@ -51,6 +86,10 @@ export abstract class ScanQueueJob<
     protected abstract attachmentClass: any;
     protected abstract quarantineEntryClass: any;
     protected abstract scanResultClass: any;
+    protected abstract mailboxClass: any;
+    protected abstract mailFilterRuleClass: any;
+    protected abstract calendarEventClass: any;
+    protected abstract oofReplySuppressionClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -61,12 +100,19 @@ export abstract class ScanQueueJob<
     private attachmentRepo?: RepoUtils<A>;
     private quarantineEntryRepo?: RepoUtils<QE>;
     private scanResultRepo?: RepoUtils<SR>;
+    private mailboxRepo?: RepoUtils<X>;
+    private mailFilterRuleRepo?: RepoUtils<MFR>;
+    private calendarEventRepo?: RecoverableRepoUtils<CE>;
+    private oofReplySuppressionRepo?: RepoUtils<OS>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
 
     @Inject(ScanPipeline)
     private scanPipeline?: ScanPipeline;
+
+    @Inject("MailTransport")
+    private mailTransport?: any;
 
     /** Publishes a live-update notification (see `push/MailPushRoute.ts`) once a message is delivered. */
     @Inject(NotificationUtils)
@@ -77,6 +123,9 @@ export abstract class ScanQueueJob<
 
     @Config("mail:jobs:scan_queue:batch_size", 25)
     private batchSize: number = 25;
+
+    @Config("mail:oof:resuppress_after_hours", 24)
+    private resuppressAfterHours: number = 24;
 
     @Logger
     private logger: any;
@@ -110,6 +159,22 @@ export abstract class ScanQueueJob<
         this.scanResultRepo = await this._objectFactory!.newInstance(RepoUtils, {
             name: this.scanResultClass.name,
             args: [this.scanResultClass],
+        });
+        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.mailboxClass.name,
+            args: [this.mailboxClass],
+        });
+        this.mailFilterRuleRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.mailFilterRuleClass.name,
+            args: [this.mailFilterRuleClass],
+        });
+        this.calendarEventRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+            name: this.calendarEventClass.name,
+            args: [this.calendarEventClass],
+        });
+        this.oofReplySuppressionRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.oofReplySuppressionClass.name,
+            args: [this.oofReplySuppressionClass],
         });
     }
 
@@ -200,81 +265,13 @@ export abstract class ScanQueueJob<
                 { ignoreACL: true },
             );
         } else {
-            const folder: F = await findOrCreateWellKnownFolder(
-                this.folderRepo!,
-                this.folderClass,
-                entry.mailboxUid,
-                verdict === "junk" ? FolderType.JUNK : FolderType.INBOX,
-            );
+            await this.deliverMessage(entry, raw, targetUid, scanResult, result, verdict === "junk");
 
-            // `ScanPipeline.run()`'s sanitized HTML (script/active-content stripped) is stored under its own
-            // blob key, separate from `bodyBlobKey`'s raw MIME - `bodyBlobKey` must stay exactly what was
-            // ingested/sent (the send path and any future "view original" feature need the untouched bytes),
-            // so the sanitization pass would otherwise be computed and then silently discarded with no
-            // consumer ever able to read it, leaving the only body representation this library persists
-            // completely unsanitized.
-            let sanitizedHtmlBlobKey: string | undefined;
-            if (result.sanitizedHtml !== undefined) {
-                sanitizedHtmlBlobKey = `sanitized/${crypto.randomUUID()}`;
-                await this.blobStore!.put(sanitizedHtmlBlobKey, Buffer.from(result.sanitizedHtml, "utf-8"), {
-                    contentType: "text/html",
-                });
+            // Mail filter rules and automatic replies only apply to mail actually delivered to the Inbox -
+            // matching Exchange's own behavior, junk-routed mail never runs either.
+            if (verdict === "deliver") {
+                await this.maybeSendAutoReply(entry, raw, result);
             }
-
-            const message: M = await this.messageRepo!.create(
-                new this.messageClass({
-                    uid: targetUid,
-                    folderUid: folder.uid,
-                    mailboxUid: entry.mailboxUid,
-                    messageId: crypto.randomUUID(),
-                    subject: "",
-                    from: { address: entry.envelopeFrom, type: RecipientType.TO },
-                    recipients: entry.envelopeTo.map((address) => ({ address, type: RecipientType.TO })),
-                    sentDate: new Date(),
-                    receivedDate: new Date(),
-                    bodyBlobKey: entry.rawBlobKey,
-                    sanitizedHtmlBlobKey,
-                    bodyPreview: "",
-                    flags: { read: false, flagged: false, answered: false, forwarded: false },
-                    importance: MessageImportance.NORMAL,
-                    references: [],
-                    hasAttachments: result.attachments.length > 0,
-                    scanResultUid: scanResult.uid,
-                }),
-                { ignoreACL: true },
-            );
-            this.notificationUtils?.sendMessage(folder.uid, this.messageClass.name, "create", message);
-
-            for (const attachment of result.attachments) {
-                const blobKey = `attachments/${crypto.randomUUID()}`;
-                await this.blobStore!.put(blobKey, attachment.content, { contentType: attachment.contentType });
-                await this.attachmentRepo!.create(
-                    new this.attachmentClass({
-                        messageUid: message.uid,
-                        folderUid: folder.uid,
-                        mailboxUid: entry.mailboxUid,
-                        filename: attachment.filename ?? "attachment",
-                        mimeType: attachment.contentType,
-                        sizeBytes: attachment.content.length,
-                        blobKey,
-                        contentId: attachment.contentId,
-                        isInline: attachment.isInline,
-                    }),
-                    { ignoreACL: true },
-                );
-            }
-
-            await this.folderRepo!.update(
-                {
-                    uid: folder.uid,
-                    version: (folder as any).version,
-                    unreadCount: folder.unreadCount + 1,
-                    totalCount: folder.totalCount + 1,
-                    syncKeyVersion: folder.syncKeyVersion + 1,
-                } as any,
-                folder,
-                { ignoreACL: true },
-            );
         }
 
         await this.ingestQueueRepo!.update(
@@ -282,5 +279,275 @@ export abstract class ScanQueueJob<
             scanning,
             { ignoreACL: true },
         );
+    }
+
+    /**
+     * Files a "deliver"/"junk"-verdicted message, applying any matching `MailFilterRule`'s actions first (only
+     * for a "deliver" verdict - `isJunk` mail skips rule evaluation entirely).
+     */
+    private async deliverMessage(
+        entry: Q,
+        raw: Buffer,
+        targetUid: string,
+        scanResult: SR,
+        result: ScanPipelineResult,
+        isJunk: boolean,
+    ): Promise<void> {
+        let sanitizedHtmlBlobKey: string | undefined;
+        if (result.sanitizedHtml !== undefined) {
+            sanitizedHtmlBlobKey = `sanitized/${crypto.randomUUID()}`;
+            await this.blobStore!.put(sanitizedHtmlBlobKey, Buffer.from(result.sanitizedHtml, "utf-8"), {
+                contentType: "text/html",
+            });
+        }
+
+        let filterResult: MailFilterEvaluationResult = { copyToFolderUids: [], deleted: false, markRead: false, forwardTo: [] };
+        if (!isJunk) {
+            const rules: MFR[] = await this.mailFilterRuleRepo!.find(
+                { mailboxUid: entry.mailboxUid, enabled: true, sort: "sequence", limit: 500 } as any,
+                { ignoreACL: true, limit: 500 },
+            );
+            const matchContext: MailFilterMatchContext = {
+                from: result.parsedFrom ?? entry.envelopeFrom,
+                subject: result.subject ?? "",
+                bodyPreview: result.bodyPreview ?? "",
+                recipientAddresses: entry.envelopeTo,
+                hasAttachment: result.attachments.length > 0,
+                importance: MessageImportance.NORMAL,
+            };
+            filterResult = evaluateMailFilterRules(rules, matchContext);
+        }
+
+        if (filterResult.deleted && filterResult.copyToFolderUids.length === 0) {
+            // The message is discarded outright and no rule asked for a copy anywhere - nothing further to file.
+            return;
+        }
+
+        const storedAttachments: StoredAttachment[] = await this.storeAttachmentBlobs(result.attachments);
+        const flags: MessageFlags = { read: filterResult.markRead, flagged: false, answered: false, forwarded: false };
+
+        if (!filterResult.deleted) {
+            const defaultFolderType = isJunk ? FolderType.JUNK : FolderType.INBOX;
+            const folder: F = await this.resolveTargetFolder(entry.mailboxUid, filterResult.moveToFolderUid, defaultFolderType);
+
+            const message: M = await this.messageRepo!.create(
+                new this.messageClass({
+                    uid: targetUid,
+                    folderUid: folder.uid,
+                    mailboxUid: entry.mailboxUid,
+                    messageId: result.messageIdHeader ?? crypto.randomUUID(),
+                    subject: result.subject ?? "",
+                    from: { address: entry.envelopeFrom, displayName: result.parsedFrom, type: RecipientType.TO },
+                    recipients: entry.envelopeTo.map((address) => ({ address, type: RecipientType.TO })),
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey: entry.rawBlobKey,
+                    sanitizedHtmlBlobKey,
+                    bodyPreview: result.bodyPreview ?? "",
+                    flags,
+                    importance: MessageImportance.NORMAL,
+                    references: [],
+                    hasAttachments: storedAttachments.length > 0,
+                    scanResultUid: scanResult.uid,
+                }),
+                { ignoreACL: true },
+            );
+            this.notificationUtils?.sendMessage(folder.uid, this.messageClass.name, "create", message);
+            await this.attachRows(storedAttachments, message, folder, entry.mailboxUid);
+            await this.bumpFolderCounters(folder, filterResult.markRead ? 0 : 1);
+        }
+
+        for (const copyFolderUid of filterResult.copyToFolderUids) {
+            const copyFolder: F | undefined = await this.folderRepo!.findOne(copyFolderUid, { ignoreACL: true });
+            if (!copyFolder) {
+                continue;
+            }
+            const copyMessage: M = await this.messageRepo!.create(
+                new this.messageClass({
+                    folderUid: copyFolder.uid,
+                    mailboxUid: entry.mailboxUid,
+                    messageId: result.messageIdHeader ?? crypto.randomUUID(),
+                    subject: result.subject ?? "",
+                    from: { address: entry.envelopeFrom, displayName: result.parsedFrom, type: RecipientType.TO },
+                    recipients: entry.envelopeTo.map((address) => ({ address, type: RecipientType.TO })),
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey: entry.rawBlobKey,
+                    sanitizedHtmlBlobKey,
+                    bodyPreview: result.bodyPreview ?? "",
+                    flags,
+                    importance: MessageImportance.NORMAL,
+                    references: [],
+                    hasAttachments: storedAttachments.length > 0,
+                    scanResultUid: scanResult.uid,
+                }),
+                { ignoreACL: true },
+            );
+            this.notificationUtils?.sendMessage(copyFolder.uid, this.messageClass.name, "create", copyMessage);
+            await this.attachRows(storedAttachments, copyMessage, copyFolder, entry.mailboxUid);
+            await this.bumpFolderCounters(copyFolder, filterResult.markRead ? 0 : 1);
+        }
+
+        for (const forwardTo of filterResult.forwardTo) {
+            try {
+                // The message already passed the scan pipeline this same run, so it's relayed as-is (no
+                // re-scan) - a straight envelope-only forward.
+                await this.mailTransport!.send({ raw, envelopeFrom: entry.envelopeFrom, envelopeTo: [forwardTo] });
+            } catch (err: any) {
+                this.logger?.warn(`ScanQueueJob: failed to forward message to ${forwardTo}: ${err.message}`);
+            }
+        }
+    }
+
+    private async resolveTargetFolder(
+        mailboxUid: string,
+        moveToFolderUid: string | undefined,
+        defaultType: Exclude<FolderType, FolderType.USER>,
+    ): Promise<F> {
+        if (moveToFolderUid) {
+            const moved: F | undefined = await this.folderRepo!.findOne(moveToFolderUid, { ignoreACL: true });
+            if (moved) {
+                return moved;
+            }
+            // The rule's target folder no longer exists (e.g. deleted after the rule was created) - fall back
+            // to the default destination rather than failing delivery outright.
+        }
+        return await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, mailboxUid, defaultType);
+    }
+
+    private async storeAttachmentBlobs(attachments: ScanPipelineAttachmentResult[]): Promise<StoredAttachment[]> {
+        const stored: StoredAttachment[] = [];
+        for (const attachment of attachments) {
+            const blobKey = `attachments/${crypto.randomUUID()}`;
+            await this.blobStore!.put(blobKey, attachment.content, { contentType: attachment.contentType });
+            stored.push({
+                filename: attachment.filename ?? "attachment",
+                contentType: attachment.contentType,
+                sizeBytes: attachment.content.length,
+                blobKey,
+                contentId: attachment.contentId,
+                isInline: attachment.isInline,
+            });
+        }
+        return stored;
+    }
+
+    private async attachRows(stored: StoredAttachment[], message: M, folder: F, mailboxUid: string): Promise<void> {
+        for (const attachment of stored) {
+            await this.attachmentRepo!.create(
+                new this.attachmentClass({
+                    messageUid: message.uid,
+                    folderUid: folder.uid,
+                    mailboxUid,
+                    filename: attachment.filename,
+                    mimeType: attachment.contentType,
+                    sizeBytes: attachment.sizeBytes,
+                    blobKey: attachment.blobKey,
+                    contentId: attachment.contentId,
+                    isInline: attachment.isInline,
+                }),
+                { ignoreACL: true },
+            );
+        }
+    }
+
+    private async bumpFolderCounters(folder: F, unreadIncrement: number): Promise<void> {
+        await this.folderRepo!.update(
+            {
+                uid: folder.uid,
+                version: (folder as any).version,
+                unreadCount: folder.unreadCount + unreadIncrement,
+                totalCount: folder.totalCount + 1,
+                syncKeyVersion: folder.syncKeyVersion + 1,
+            } as any,
+            folder,
+            { ignoreACL: true },
+        );
+    }
+
+    /**
+     * Sends an automatic (out-of-office) reply for a "deliver"-verdicted message, if the mailbox (or a linked
+     * `CalendarEvent`) is currently out of office, the message is eligible per RFC 3834 (`isAutoReplyEligible()`),
+     * and the sender hasn't already received one within the configured resuppression window.
+     */
+    private async maybeSendAutoReply(entry: Q, raw: Buffer, result: ScanPipelineResult): Promise<void> {
+        if (
+            !isAutoReplyEligible(entry.envelopeFrom, {
+                autoSubmittedHeader: result.autoSubmittedHeader,
+                precedenceHeader: result.precedenceHeader,
+            })
+        ) {
+            return;
+        }
+
+        const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            return;
+        }
+
+        const now = new Date();
+        const activeEvents: CE[] = await this.calendarEventRepo!.find(
+            {
+                mailboxUid: entry.mailboxUid,
+                autoReplyEnabled: true,
+                startDate: `lte(${now.toISOString()})`,
+                endDate: `gte(${now.toISOString()})`,
+                limit: 1,
+            } as any,
+            { ignoreACL: true, limit: 1 },
+        );
+
+        const activeOof = resolveActiveOof(mailbox, activeEvents[0]);
+        if (!activeOof) {
+            return;
+        }
+
+        const existing: OS[] = await this.oofReplySuppressionRepo!.find(
+            { mailboxUid: entry.mailboxUid, senderAddress: entry.envelopeFrom, limit: 1 } as any,
+            { ignoreACL: true, limit: 1 },
+        );
+        const suppression: OS | undefined = existing[0];
+        if (suppression) {
+            const resuppressWindowMs = this.resuppressAfterHours * 60 * 60 * 1000;
+            if (now.getTime() - suppression.lastRepliedAt.getTime() < resuppressWindowMs) {
+                return;
+            }
+        }
+
+        try {
+            const subject = result.subject ? `Automatic reply: ${result.subject}` : "Automatic reply";
+            const composed: Buffer = await new MailComposer({
+                from: { name: mailbox.displayName, address: mailbox.primarySmtpAddress },
+                to: entry.envelopeFrom,
+                subject,
+                html: activeOof.message,
+                inReplyTo: result.messageIdHeader,
+                references: result.messageIdHeader,
+                headers: { "Auto-Submitted": "auto-replied" },
+            })
+                .compile()
+                .build();
+
+            await this.mailTransport!.send({
+                raw: composed,
+                envelopeFrom: mailbox.primarySmtpAddress,
+                envelopeTo: [entry.envelopeFrom],
+            });
+
+            if (suppression) {
+                await this.oofReplySuppressionRepo!.update(
+                    { uid: suppression.uid, version: (suppression as any).version, lastRepliedAt: now } as any,
+                    suppression,
+                    { ignoreACL: true },
+                );
+            } else {
+                await this.oofReplySuppressionRepo!.create(
+                    new this.oofReplySuppressionClass({ mailboxUid: entry.mailboxUid, senderAddress: entry.envelopeFrom, lastRepliedAt: now }),
+                    { ignoreACL: true },
+                );
+            }
+        } catch (err: any) {
+            this.logger?.warn(`ScanQueueJob: failed to send automatic reply for mailbox ${entry.mailboxUid}: ${err.message}`);
+        }
     }
 }

@@ -4,6 +4,8 @@ export * from "./EasDeviceStateCleanupJob.js";
 export * from "./ExternalShareExpirationJob.js";
 export * from "./MailboxQuotaRecalcJob.js";
 export * from "./MeetingSchedulingJob.js";
+export * from "./OofReplySuppressionCleanupJob.js";
 export * from "./QuarantineRetentionJob.js";
 export * from "./ScanQueueJob.js";
+export * from "./ScheduledSendJob.js";
 export * from "./SearchIndexJob.js";
