@@ -19,10 +19,60 @@ import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
-import { FolderType, Message, MessageFlags } from "../models/types.js";
-const { Inject } = ObjectDecorators;
+import { FolderType, Message, MessageFlags, Recipient } from "../models/types.js";
+const { Config, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
-const { Get, Param, Post, Request, Response, User: AuthUser } = RouteDecorators;
+const { Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
+
+/** One row of `BaseMessageRoute.conversations()` - a computed summary over every `Message` sharing one
+ * `conversationId`, never persisted on its own (see that method's own doc comment). */
+export interface ConversationSummary {
+    conversationId: string;
+    /** The most recent message's subject line. */
+    subject: string;
+    /** Every message in this conversation, oldest to newest. */
+    messageUids: string[];
+    /** Every folder (deduped) this conversation has a message in - a conversation can span folders, e.g.
+     * an Inbox message and the Sent Items copy of its reply. */
+    folderUids: string[];
+    messageCount: number;
+    unreadCount: number;
+    /** The most recent message's `receivedDate` - what conversations are sorted by (newest first). */
+    latestDate: Date;
+    /** Every distinct participant (deduped by lowercased address) across every message in the
+     * conversation - the union of each message's `from` and `recipients`. */
+    participants: Recipient[];
+    /** `true` if any message in the conversation has an attachment. */
+    hasAttachments: boolean;
+}
+
+/** Builds one `ConversationSummary` from every `Message` sharing `conversationId`. */
+function summarizeConversation(conversationId: string, messages: Message[]): ConversationSummary {
+    const sorted = [...messages].sort((a, b) => a.receivedDate.getTime() - b.receivedDate.getTime());
+    const latest = sorted[sorted.length - 1];
+
+    const participantsByAddress = new Map<string, Recipient>();
+    for (const message of sorted) {
+        for (const participant of [message.from, ...message.recipients]) {
+            const key = participant.address.toLowerCase();
+            if (!participantsByAddress.has(key)) {
+                participantsByAddress.set(key, participant);
+            }
+        }
+    }
+
+    return {
+        conversationId,
+        subject: latest.subject,
+        messageUids: sorted.map((message) => message.uid),
+        folderUids: [...new Set(sorted.map((message) => message.folderUid))],
+        messageCount: sorted.length,
+        unreadCount: sorted.filter((message) => !message.flags.read).length,
+        latestDate: latest.receivedDate,
+        participants: [...participantsByAddress.values()],
+        hasAttachments: sorted.some((message) => message.hasAttachments),
+    };
+}
 
 /**
  * Extends `BaseScopedChildRoute` (scoped by `folderUid` — see the architecture note on `Message.mailboxUid`)
@@ -52,6 +102,11 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     @Inject(ScanPipeline)
     private scanPipeline?: ScanPipeline;
 
+    /** Safety-net cap on how many of a mailbox's messages `conversations()` scans to build its groups - see
+     * that method's own doc comment for why there's no query-time group-by to rely on instead. */
+    @Config("mail:conversations:scan_limit", 500)
+    private conversationScanLimit: number = 500;
+
     private async getFolderRepo(): Promise<RecoverableRepoUtils<any>> {
         if (!this.folderRepo) {
             this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
@@ -60,6 +115,65 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             });
         }
         return this.folderRepo;
+    }
+
+    /**
+     * Groups this mailbox's messages into conversations (RFC 5322 References/In-Reply-To threading, via
+     * `Message.conversationId`) - one summary row per conversation spanning every folder in the mailbox,
+     * newest activity first. Mirrors `BaseFolderRoute.find()`'s own one-mailbox-level-check shape (a
+     * single `ACLAction.LIST` check against `mailboxUid` itself, then an `ignoreACL: true` query) rather
+     * than this route's own base class's folder-scoped `find()` - that is this codebase's own established
+     * pattern for "list this mailbox's children in one call" (see `BaseFolderRoute.find()`'s own doc
+     * comment), and `Message.mailboxUid` is already denormalized for exactly this kind of whole-mailbox
+     * scan.
+     *
+     * Grouping happens in application code over one capped `find()` - there is no query-time group-by/
+     * aggregation available across both backends this library supports (`RepoUtils` has none, and Mongo's
+     * own raw `aggregate()` escape hatch has no SQL equivalent) - so a mailbox busier than
+     * `conversationScanLimit` messages will not group its oldest messages correctly.
+     */
+    @Summary("List conversations")
+    @Description(
+        "Groups this mailbox's messages into conversations (RFC 5322 References/In-Reply-To threading), " +
+            "one summary row per conversation spanning every folder, newest activity first. Scans at most " +
+            "conversationScanLimit messages in the mailbox - a mailbox busier than that will not group its " +
+            "oldest messages correctly.",
+    )
+    @Returns([Object])
+    @Get("/conversations")
+    public async conversations(@Query() query: any, @AuthUser user?: JWTUser): Promise<ConversationSummary[]> {
+        if (!this.repoUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const mailboxUid: string | undefined = query?.mailboxUid;
+        if (!mailboxUid) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        if (!(await this.aclUtils!.hasPermission(user, mailboxUid, ACLAction.LIST))) {
+            return [];
+        }
+
+        const messages: T[] = await this.repoUtils.find(
+            { mailboxUid, limit: this.conversationScanLimit } as any,
+            { limit: this.conversationScanLimit, ignoreACL: true },
+        );
+
+        const groups = new Map<string, T[]>();
+        for (const message of messages) {
+            const key = message.conversationId ?? message.uid;
+            const existing = groups.get(key);
+            if (existing) {
+                existing.push(message);
+            } else {
+                groups.set(key, [message]);
+            }
+        }
+
+        const summaries: ConversationSummary[] = [...groups.entries()].map(([conversationId, group]) =>
+            summarizeConversation(conversationId, group),
+        );
+        summaries.sort((a, b) => b.latestDate.getTime() - a.latestDate.getTime());
+        return summaries;
     }
 
     @Summary("Send message")
@@ -106,6 +220,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const {
             raw: relayedRaw,
             messageId,
+            conversationId,
             sanitizedHtmlBlobKey: scannedHtmlBlobKey,
         } = await scanAndRelay(raw, message.from.address, envelopeTo, this.scanPipeline, this.mailTransport, this.blobStore);
         if (relayedRaw !== raw) {
@@ -137,6 +252,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 flags,
                 sanitizedHtmlBlobKey,
                 messageId,
+                conversationId,
             } as any,
             message,
             { user, ignoreACL: true },

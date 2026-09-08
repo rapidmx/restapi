@@ -113,6 +113,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
         const {
             raw: relayedRaw,
             messageId,
+            conversationId,
             sanitizedHtmlBlobKey: scannedHtmlBlobKey,
         } = await scanAndRelay(raw, message.from.address, envelopeTo, this.scanPipeline!, this.mailTransport, this.blobStore!);
         if (relayedRaw !== raw) {
@@ -138,6 +139,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 flags,
                 sanitizedHtmlBlobKey,
                 messageId,
+                conversationId,
                 // `null`, not `undefined`: TypeORM's `Repository.update()` silently skips an `undefined`
                 // property (leaving the SQL column unchanged) but does set an explicit `null` to NULL - the
                 // Mongo backend's `$set` handles both the same way, so `null` is the one value that reliably

@@ -324,6 +324,46 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         expect(scanResults.length).toBe(1);
     });
 
+    it("Sets conversationId to the message's own resolved messageId when it has no References/In-Reply-To (starts a new conversation).", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(
+            rawBlobKey,
+            Buffer.from("From: sender@example.com\r\nTo: recipient@example.com\r\nMessage-ID: <root@example.com>\r\n\r\nHello.\r\n"),
+        );
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
+        const messages = await messageRepo.find({ folderUid: inbox!.uid }).toArray();
+        expect(messages[0].messageId).toBe("root@example.com");
+        expect(messages[0].conversationId).toBe("root@example.com");
+        expect(messages[0].inReplyTo).toBeUndefined();
+        expect(messages[0].references).toEqual([]);
+    });
+
+    it("Sets conversationId from References/In-Reply-To when the inbound message is a reply.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(
+            rawBlobKey,
+            Buffer.from(
+                "From: sender@example.com\r\nTo: recipient@example.com\r\nMessage-ID: <reply@example.com>\r\n" +
+                    "In-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\n\r\nReply body.\r\n",
+            ),
+        );
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
+        const messages = await messageRepo.find({ folderUid: inbox!.uid }).toArray();
+        expect(messages[0].inReplyTo).toBe("root@example.com");
+        expect(messages[0].references).toEqual(["root@example.com"]);
+        expect(messages[0].conversationId).toBe("root@example.com");
+    });
+
     it("Publishes a live-update notification to the Inbox folder's channel once a message is delivered.", async () => {
         const sendMessageSpy = vi.spyOn(NotificationUtils.prototype, "sendMessage");
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;

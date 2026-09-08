@@ -14,6 +14,8 @@ function makeCleanScanResult(overrides: any = {}) {
         spam: { score: 0, verdict: SpamVerdict.CLEAN, symbols: [] },
         av: { verdict: AvVerdict.CLEAN },
         attachments: [],
+        references: [],
+        inReplyTo: undefined,
         ...overrides,
     };
 }
@@ -117,5 +119,34 @@ describe("scanAndRelay() Tests", () => {
         );
 
         expect(result.sanitizedHtmlBlobKey).toBeUndefined();
+    });
+
+    it("Derives conversationId from the scan result's references (a reply), reusing the same scan - no second parse.", async () => {
+        scanPipeline.run.mockResolvedValue(makeCleanScanResult({ references: ["root@example.com", "second@example.com"], inReplyTo: "second@example.com" }));
+
+        const result = await scanAndRelay(
+            makeRawMessage(),
+            "sender@example.com",
+            ["recipient@example.com"],
+            scanPipeline as any,
+            mailTransport,
+            blobStore,
+        );
+
+        expect(result.conversationId).toBe("root@example.com");
+        expect(scanPipeline.run).toHaveBeenCalledTimes(1);
+    });
+
+    it("Falls back to the message's own (possibly-generated) messageId as conversationId when there's no References/In-Reply-To.", async () => {
+        const result = await scanAndRelay(
+            makeRawMessage(),
+            "sender@example.com",
+            ["recipient@example.com"],
+            scanPipeline as any,
+            mailTransport,
+            blobStore,
+        );
+
+        expect(result.conversationId).toBe(result.messageId);
     });
 });

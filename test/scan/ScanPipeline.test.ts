@@ -237,6 +237,59 @@ describe("ScanPipeline Tests", () => {
         });
     });
 
+    describe("run() - In-Reply-To/References extraction", () => {
+        beforeEach(() => {
+            (pipeline as any).spamScanProvider = spamScanProvider;
+            (pipeline as any).avScanProvider = avScanProvider;
+        });
+
+        it("Extracts inReplyTo and a single-entry references as a one-element array.", async () => {
+            const raw = Buffer.from(
+                [
+                    "From: sender@example.com",
+                    "To: recipient@example.com",
+                    "Subject: Re: Hello",
+                    "In-Reply-To: <parent@example.com>",
+                    "References: <parent@example.com>",
+                    "",
+                    "Reply body.",
+                    "",
+                ].join("\r\n"),
+            );
+
+            const result = await pipeline.run(raw, makeEnvelope());
+
+            expect(result.inReplyTo).toBe("parent@example.com");
+            expect(result.references).toEqual(["parent@example.com"]);
+        });
+
+        it("Extracts a multi-entry References header as an array, oldest first.", async () => {
+            const raw = Buffer.from(
+                [
+                    "From: sender@example.com",
+                    "To: recipient@example.com",
+                    "Subject: Re: Hello",
+                    "In-Reply-To: <second@example.com>",
+                    "References: <root@example.com> <second@example.com>",
+                    "",
+                    "Reply body.",
+                    "",
+                ].join("\r\n"),
+            );
+
+            const result = await pipeline.run(raw, makeEnvelope());
+
+            expect(result.references).toEqual(["root@example.com", "second@example.com"]);
+        });
+
+        it("Defaults inReplyTo to undefined and references to [] for a message with neither header.", async () => {
+            const result = await pipeline.run(makePlainRawMessage(), makeEnvelope());
+
+            expect(result.inReplyTo).toBeUndefined();
+            expect(result.references).toEqual([]);
+        });
+    });
+
     describe("run() - attachment result shape", () => {
         beforeEach(() => {
             (pipeline as any).spamScanProvider = spamScanProvider;

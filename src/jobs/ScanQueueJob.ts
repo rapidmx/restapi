@@ -9,6 +9,7 @@ import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "
 import { BlobStore } from "../blob/BlobStore.js";
 import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, ScanPipelineResult } from "../scan/ScanPipeline.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
+import { deriveConversationId } from "../util/ConversationUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { buildEventIcs, expandOccurrences, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
@@ -368,12 +369,13 @@ export abstract class ScanQueueJob<
             const defaultFolderType = isJunk ? FolderType.JUNK : FolderType.INBOX;
             const folder: F = await this.resolveTargetFolder(entry.mailboxUid, filterResult.moveToFolderUid, defaultFolderType);
 
+            const messageId = result.messageIdHeader ?? crypto.randomUUID();
             const message: M = await this.messageRepo!.create(
                 new this.messageClass({
                     uid: targetUid,
                     folderUid: folder.uid,
                     mailboxUid: entry.mailboxUid,
-                    messageId: result.messageIdHeader ?? crypto.randomUUID(),
+                    messageId,
                     subject: result.subject ?? "",
                     from: { address: entry.envelopeFrom, displayName: result.parsedFrom, type: RecipientType.TO },
                     recipients: entry.envelopeTo.map((address) => ({ address, type: RecipientType.TO })),
@@ -384,7 +386,9 @@ export abstract class ScanQueueJob<
                     bodyPreview: result.bodyPreview ?? "",
                     flags,
                     importance: MessageImportance.NORMAL,
-                    references: [],
+                    inReplyTo: result.inReplyTo,
+                    references: result.references,
+                    conversationId: deriveConversationId(result.references, result.inReplyTo, messageId),
                     hasAttachments: storedAttachments.length > 0,
                     scanResultUid: scanResult.uid,
                 }),
@@ -400,11 +404,12 @@ export abstract class ScanQueueJob<
             if (!copyFolder) {
                 continue;
             }
+            const copyMessageId = result.messageIdHeader ?? crypto.randomUUID();
             const copyMessage: M = await this.messageRepo!.create(
                 new this.messageClass({
                     folderUid: copyFolder.uid,
                     mailboxUid: entry.mailboxUid,
-                    messageId: result.messageIdHeader ?? crypto.randomUUID(),
+                    messageId: copyMessageId,
                     subject: result.subject ?? "",
                     from: { address: entry.envelopeFrom, displayName: result.parsedFrom, type: RecipientType.TO },
                     recipients: entry.envelopeTo.map((address) => ({ address, type: RecipientType.TO })),
@@ -415,7 +420,9 @@ export abstract class ScanQueueJob<
                     bodyPreview: result.bodyPreview ?? "",
                     flags,
                     importance: MessageImportance.NORMAL,
-                    references: [],
+                    inReplyTo: result.inReplyTo,
+                    references: result.references,
+                    conversationId: deriveConversationId(result.references, result.inReplyTo, copyMessageId),
                     hasAttachments: storedAttachments.length > 0,
                     scanResultUid: scanResult.uid,
                 }),

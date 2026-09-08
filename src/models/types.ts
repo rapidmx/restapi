@@ -277,6 +277,12 @@ export interface Message extends RecoverableBaseEntity {
      * either deleting its still-unread copy or not) is reported back to the sender as an ordinary visible
      * email instead of being synced onto this field - see `ScanQueueJob.sendRecallReport()`. */
     recallRequestedAt?: Date;
+
+    /** Groups this message with the rest of its RFC 5322/2822 thread - computed once at creation time via
+     * `util/ConversationUtils.ts`'s `deriveConversationId()`, from this message's own `references`/
+     * `inReplyTo`/`messageId`. Absent on a message written before this field existed - `conversations()`
+     * (`BaseMessageRoute`) falls back to that message's own `uid` as a singleton conversation in that case. */
+    conversationId?: string;
 }
 
 /**

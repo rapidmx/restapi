@@ -142,6 +142,14 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
     @Nullable
     public recallRequestedAt?: Date;
 
+    @Column({ nullable: true })
+    @Description(
+        "Groups this message with the rest of its RFC 5322/2822 thread - computed once at creation time " +
+            "from this message's own references/inReplyTo/messageId.",
+    )
+    @Nullable
+    public conversationId?: string;
+
     constructor(other?: Partial<MessageSQL>) {
         super(other);
 
@@ -166,6 +174,7 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
             this.searchIndexedAt = "searchIndexedAt" in other ? other.searchIndexedAt : this.searchIndexedAt;
             this.scheduledSendTime = "scheduledSendTime" in other ? other.scheduledSendTime : this.scheduledSendTime;
             this.recallRequestedAt = "recallRequestedAt" in other ? other.recallRequestedAt : this.recallRequestedAt;
+            this.conversationId = "conversationId" in other ? other.conversationId : this.conversationId;
         }
     }
 }

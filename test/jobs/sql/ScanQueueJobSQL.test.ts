@@ -309,6 +309,48 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         expect(scanResults.length).toBe(1);
     });
 
+    it("Sets conversationId to the message's own resolved messageId when it has no References/In-Reply-To (starts a new conversation).", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(
+            rawBlobKey,
+            Buffer.from("From: sender@example.com\r\nTo: recipient@example.com\r\nMessage-ID: <root@example.com>\r\n\r\nHello.\r\n"),
+        );
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const inbox = await folderRepo.findOne({ where: { mailboxUid, type: FolderType.INBOX } });
+        const messages = await messageRepo.find({ where: { folderUid: inbox!.uid } });
+        expect(messages[0].messageId).toBe("root@example.com");
+        expect(messages[0].conversationId).toBe("root@example.com");
+        // An unset nullable column round-trips as `null`, not `undefined`, on the SQL backend - `toBeFalsy()`
+        // covers both rather than asserting the exact in-memory representation.
+        expect(messages[0].inReplyTo).toBeFalsy();
+        expect(messages[0].references).toEqual([]);
+    });
+
+    it("Sets conversationId from References/In-Reply-To when the inbound message is a reply.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(
+            rawBlobKey,
+            Buffer.from(
+                "From: sender@example.com\r\nTo: recipient@example.com\r\nMessage-ID: <reply@example.com>\r\n" +
+                    "In-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\n\r\nReply body.\r\n",
+            ),
+        );
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const inbox = await folderRepo.findOne({ where: { mailboxUid, type: FolderType.INBOX } });
+        const messages = await messageRepo.find({ where: { folderUid: inbox!.uid } });
+        expect(messages[0].inReplyTo).toBe("root@example.com");
+        expect(messages[0].references).toEqual(["root@example.com"]);
+        expect(messages[0].conversationId).toBe("root@example.com");
+    });
+
     it("Defaults an attachment's filename to 'attachment' when the message provides none.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const rawBlobKey = `raw/${uuid.v4()}`;

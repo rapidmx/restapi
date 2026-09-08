@@ -6,6 +6,7 @@ import * as crypto from "crypto";
 import { ApiError } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
+import { deriveConversationId } from "./ConversationUtils.js";
 import { extractHeader, prependHeaders } from "./MimeHeaderUtils.js";
 import { resolveDeliveryVerdict, ScanPipeline } from "../scan/ScanPipeline.js";
 
@@ -23,6 +24,11 @@ export interface ScanAndRelayResult {
      * what every recipient's own ingest pipeline stores on their delivered `Message.messageId`). This is the
      * identifier `BaseMessageRoute.recall()` later targets - see its own doc comment. */
     messageId: string;
+
+    /** Groups this message with the rest of its RFC 5322/2822 thread - see `util/ConversationUtils.ts`'s
+     * `deriveConversationId()`, computed from the same scan that already parsed `raw`'s `References`/
+     * `In-Reply-To` headers, so this needs no second parse. */
+    conversationId: string;
 
     /** The blob key `scanResult.sanitizedHtml` (if any) was stored under - see the identical reasoning in
      * `ScanQueueJob.processEntry()`'s own doc comment on why this must never be folded into the raw body key. */
@@ -81,5 +87,7 @@ export async function scanAndRelay(
         await blobStore.put(sanitizedHtmlBlobKey, Buffer.from(scanResult.sanitizedHtml, "utf-8"), { contentType: "text/html" });
     }
 
-    return { raw: finalRaw, messageId, sanitizedHtmlBlobKey };
+    const conversationId = deriveConversationId(scanResult.references, scanResult.inReplyTo, messageId);
+
+    return { raw: finalRaw, messageId, conversationId, sanitizedHtmlBlobKey };
 }

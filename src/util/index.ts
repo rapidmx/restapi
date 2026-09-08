@@ -14,6 +14,7 @@
  */
 export * from "./AddressUtils.js";
 export * from "./AutoReplyUtils.js";
+export * from "./ConversationUtils.js";
 export * from "./DistributionListUtils.js";
 export * from "./FolderUtils.js";
 export * from "./IcsUtils.js";

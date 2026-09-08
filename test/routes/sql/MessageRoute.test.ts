@@ -431,6 +431,107 @@ describe("Route:MessageSQL Tests", () => {
         });
     });
 
+    describe("conversations()", () => {
+        it("Groups a reply (sent via send()) with its parent message, across Inbox and Sent Items.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX);
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+
+            const rootMessage = await createMessage(mailbox.uid, inbox.uid, {
+                messageId: "root@example.com",
+                conversationId: "root@example.com",
+                subject: "Original subject",
+            });
+
+            const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await blobStore.put(
+                bodyBlobKey,
+                Buffer.from(
+                    "From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Re: Original subject\r\n" +
+                        "In-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\n\r\nReply body.\r\n",
+                ),
+            );
+            const draftReply = await createMessage(mailbox.uid, draftsFolder.uid, { bodyBlobKey, subject: "Re: Original subject" });
+
+            const sendResult = await request(server.getApplication())
+                .post(`${baseUrl}/${draftReply.uid}/send`)
+                .set("Authorization", "jwt " + ownerToken);
+            expect(sendResult.status).toBeGreaterThanOrEqual(200);
+            expect(sendResult.status).toBeLessThan(300);
+            expect(sendResult.body.conversationId).toBe("root@example.com");
+
+            const sentFolder = await folderRepo.findOne({ where: { mailboxUid: mailbox.uid, type: FolderType.SENT_ITEMS } });
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/conversations?mailboxUid=${mailbox.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body.length).toBe(1);
+            const conversation = result.body[0];
+            expect(conversation.conversationId).toBe("root@example.com");
+            expect(conversation.messageCount).toBe(2);
+            expect([...conversation.messageUids].sort()).toEqual([rootMessage.uid, sendResult.body.uid].sort());
+            expect([...conversation.folderUids].sort()).toEqual([inbox.uid, sentFolder!.uid].sort());
+            // The root message is still unread (default); the sent copy is always marked read by send().
+            expect(conversation.unreadCount).toBe(1);
+            // The most recently active message's subject (the reply, sent after the root was created).
+            expect(conversation.subject).toBe("Re: Original subject");
+            expect(conversation.hasAttachments).toBe(false);
+        });
+
+        it("A message with no conversationId is its own singleton conversation.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid);
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/conversations?mailboxUid=${mailbox.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body.length).toBe(1);
+            expect(result.body[0].messageCount).toBe(1);
+            expect(result.body[0].messageUids).toEqual([message.uid]);
+        });
+
+        it("Sorts conversations by most recent activity first.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const older = await createMessage(mailbox.uid, folder.uid, { receivedDate: new Date(Date.now() - 60 * 60 * 1000) });
+            const newer = await createMessage(mailbox.uid, folder.uid, { receivedDate: new Date() });
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/conversations?mailboxUid=${mailbox.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body.map((c: any) => c.messageUids[0])).toEqual([newer.uid, older.uid]);
+        });
+
+        it("Rejects a conversations() request with no mailboxUid (400).", async () => {
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/conversations`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Returns an empty array for a caller with no LIST permission on the mailbox.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            await createMessage(mailbox.uid, folder.uid);
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/conversations?mailboxUid=${mailbox.uid}`)
+                .set("Authorization", "jwt " + otherUserToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body).toEqual([]);
+        });
+    });
+
     it("Owner can fetch a message's sanitized HTML content once it has one.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid, FolderType.INBOX);

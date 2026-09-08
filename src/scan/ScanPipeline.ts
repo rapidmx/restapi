@@ -48,7 +48,12 @@ export interface ScanPipelineResult {
     autoSubmittedHeader?: string;
     /** The RFC 5322 `Precedence` header value, if present - see `isAutoReplyEligible()`. */
     precedenceHeader?: string;
-    /** The message's parsed `Message-ID` header, used to set `In-Reply-To`/`References` on an automatic reply. */
+    /** The message's parsed `Message-ID` header, angle brackets stripped (mailparser's own `parsed.messageId`
+     * does NOT strip them, unlike its `parsed.from`/etc. normalization - stripped explicitly here so a value
+     * from this field compares equal to `MailSendUtils.scanAndRelay()`'s own bracket-stripped `messageId`,
+     * which every cross-mailbox `Message-ID`-matching feature (`recall()`, `conversationId`) depends on).
+     * Also used to set `In-Reply-To`/`References` on an automatic reply - `nodemailer`'s `MailComposer`
+     * re-adds brackets on the wire regardless of whether the value passed in already has them. */
     messageIdHeader?: string;
     /** The decoded text of this message's `text/calendar` part (an iTIP `REQUEST`/`REPLY`/`CANCEL`), if it has
      * one - see `IcsUtils.parseIcsEvent()` and `ScanQueueJob.maybeProcessItipMessage()`. */
@@ -57,6 +62,20 @@ export interface ScanPipelineResult {
      * `X-RapidMX-Recall-Of` header - present only on the control message `BaseMessageRoute.recall()`
      * composes, see `ScanQueueJob.processRecall()`. */
     recallOfMessageId?: string;
+    /** The message's parsed `In-Reply-To` header, if it's a reply - used (together with `references`) to
+     * populate `Message.inReplyTo`/`conversationId`, see `util/ConversationUtils.ts`. */
+    inReplyTo?: string;
+    /** The message's parsed `References` header, oldest ancestor first, or `[]` if absent - see
+     * `util/ConversationUtils.ts`'s `deriveConversationId()`. */
+    references: string[];
+}
+
+/** Strips a `Message-ID`-shaped header value's surrounding angle brackets, if present - mailparser
+ * normalizes `parsed.messageId` this way already, but leaves `parsed.inReplyTo`/`parsed.references`
+ * bracketed, so those need the same treatment applied explicitly for a value from either source to
+ * compare equal (`deriveConversationId()`, `util/ConversationUtils.ts`, depends on this). */
+function stripAngleBrackets(value: string): string {
+    return value.replace(/^</, "").replace(/>$/, "");
 }
 
 /** Verdicts ranked worst-to-best, used to combine the raw-message and per-attachment AV results. */
@@ -122,6 +141,17 @@ export class ScanPipeline {
         const precedenceHeader: string | undefined = this.getHeaderString(parsed, "precedence");
         const icsPart: string | undefined = this.deriveIcsPart(parsed);
         const recallOfMessageId: string | undefined = this.getHeaderString(parsed, "x-rapidmx-recall-of");
+        // mailparser types `references` as `string[] | string | undefined` (a single reference collapses to a
+        // bare string rather than a one-element array) - normalize to always an array, oldest ancestor first,
+        // and (unlike `parsed.messageId`) mailparser leaves these bracketed, so strip them here too.
+        const referencesRaw: string[] = Array.isArray(parsed.references)
+            ? parsed.references
+            : parsed.references
+              ? [parsed.references]
+              : [];
+        const references: string[] = referencesRaw.map(stripAngleBrackets);
+        const inReplyTo: string | undefined = parsed.inReplyTo ? stripAngleBrackets(parsed.inReplyTo) : undefined;
+        const messageIdHeader: string | undefined = parsed.messageId ? stripAngleBrackets(parsed.messageId) : undefined;
 
         return {
             spam,
@@ -133,9 +163,11 @@ export class ScanPipeline {
             parsedFrom,
             autoSubmittedHeader,
             precedenceHeader,
-            messageIdHeader: parsed.messageId,
+            messageIdHeader,
             icsPart,
             recallOfMessageId,
+            inReplyTo,
+            references,
         };
     }
 
