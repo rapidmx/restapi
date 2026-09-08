@@ -11,7 +11,8 @@ import { In, Repository } from "typeorm";
 import { DistributionListSQL } from "../../../src/models/sql/DistributionListSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
-import { IngestStatus } from "../../../src/models/types.js";
+import { TransportRuleSQL } from "../../../src/models/sql/TransportRuleSQL.js";
+import { IngestStatus, QuarantineReason, TransportRuleActionType } from "../../../src/models/types.js";
 import { InMemoryBlobStore, RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
 
 describe("Route:MailIngestRouteSQL Tests", () => {
@@ -22,6 +23,7 @@ describe("Route:MailIngestRouteSQL Tests", () => {
     let mailboxRepo: Repository<MailboxSQL>;
     let ingestQueueRepo: Repository<IngestQueueEntrySQL>;
     let distributionListRepo: Repository<DistributionListSQL>;
+    let transportRuleRepo: Repository<TransportRuleSQL>;
 
     const secret = config.get("mail:transport:ingest:secret");
 
@@ -52,6 +54,19 @@ describe("Route:MailIngestRouteSQL Tests", () => {
         return await distributionListRepo.save(obj);
     };
 
+    const createTransportRule = async function (data?: any): Promise<TransportRuleSQL> {
+        const obj: TransportRuleSQL = new TransportRuleSQL({
+            name: "Test Rule",
+            enabled: true,
+            sequence: 0,
+            stopProcessingRules: false,
+            conditions: {},
+            actions: [],
+            ...data,
+        });
+        return await transportRuleRepo.save(obj);
+    };
+
     beforeAll(async () => {
         registerTestDoubles(objectFactory);
         await server.start();
@@ -62,6 +77,7 @@ describe("Route:MailIngestRouteSQL Tests", () => {
             mailboxRepo = conn.getRepository(MailboxSQL);
             ingestQueueRepo = conn.getRepository(IngestQueueEntrySQL);
             distributionListRepo = conn.getRepository(DistributionListSQL);
+            transportRuleRepo = conn.getRepository(TransportRuleSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -76,6 +92,7 @@ describe("Route:MailIngestRouteSQL Tests", () => {
         await ingestQueueRepo.clear();
         await mailboxRepo.clear();
         await distributionListRepo.clear();
+        await transportRuleRepo.clear();
         (objectFactory.getInstance<RecordingMailTransport>("MailTransport")!).sent = [];
     });
 
@@ -356,5 +373,147 @@ describe("Route:MailIngestRouteSQL Tests", () => {
         expect(transport.sent.length).toBe(1);
         expect(transport.sent[0].envelopeTo).toEqual([member.primarySmtpAddress]);
         expect(transport.sent[0].envelopeFrom).toBe(list.primarySmtpAddress);
+    });
+
+    it("A matching reject transport rule drops the entire message for every recipient and sends a rejection notice to the sender.", async () => {
+        const mailbox = await createMailbox();
+        await createTransportRule({
+            conditions: { subjectContains: ["blocked"] },
+            actions: [{ type: TransportRuleActionType.REJECT }],
+        });
+        const raw = Buffer.from(`From: sender@example.com\r\nSubject: blocked topic\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        expect(result.body.results).toEqual([{ rcpt: mailbox.primarySmtpAddress, queued: false }]);
+
+        const entries: IngestQueueEntrySQL[] = await ingestQueueRepo.find({ where: { mailboxUid: mailbox.uid } });
+        expect(entries.length).toBe(0);
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(1);
+        expect(transport.sent[0].envelopeTo).toEqual(["sender@example.com"]);
+    });
+
+    it("Logs a warning (without failing the whole delivery) when sending the transport-rule rejection notice fails.", async () => {
+        const mailbox = await createMailbox();
+        await createTransportRule({
+            conditions: { subjectContains: ["blocked"] },
+            actions: [{ type: TransportRuleActionType.REJECT }],
+        });
+        const raw = Buffer.from(`From: sender@example.com\r\nSubject: blocked topic\r\n\r\nHello\r\n`);
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("simulated transport failure"));
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        expect(result.body.results).toEqual([{ rcpt: mailbox.primarySmtpAddress, queued: false }]);
+    });
+
+    it("A matching add_header transport rule tags the stored copy for a direct mailbox delivery.", async () => {
+        const mailbox = await createMailbox();
+        await createTransportRule({
+            actions: [{ type: TransportRuleActionType.ADD_HEADER, headerName: "X-Policy-Tag", headerValue: "flagged" }],
+        });
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${mailbox.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntrySQL[] = await ingestQueueRepo.find({ where: { mailboxUid: mailbox.uid } });
+        expect(entries.length).toBe(1);
+
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const stored: Buffer = await blobStore.get(entries[0].rawBlobKey);
+        expect(stored.toString()).toContain("X-Policy-Tag: flagged");
+    });
+
+    it("A matching add_header transport rule tags the stored copy for a distribution-list-expanded delivery.", async () => {
+        const m1 = await createMailbox();
+        const list = await createList({ memberAddresses: [m1.primarySmtpAddress] });
+        await createTransportRule({
+            actions: [{ type: TransportRuleActionType.ADD_HEADER, headerName: "X-Policy-Tag", headerValue: "flagged" }],
+        });
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${list.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", list.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntrySQL[] = await ingestQueueRepo.find({ where: { mailboxUid: m1.uid } });
+        expect(entries.length).toBe(1);
+
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const stored: Buffer = await blobStore.get(entries[0].rawBlobKey);
+        const storedText = stored.toString();
+        expect(storedText).toContain("X-Policy-Tag: flagged");
+        expect(storedText).toContain("List-Id:");
+    });
+
+    it("A matching add_recipient transport rule delivers an additional internal copy, resolved like any other recipient.", async () => {
+        const mailbox = await createMailbox();
+        const compliance = await createMailbox();
+        await createTransportRule({
+            actions: [{ type: TransportRuleActionType.ADD_RECIPIENT, recipientAddress: compliance.primarySmtpAddress }],
+        });
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${mailbox.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntrySQL[] = await ingestQueueRepo.find({
+            where: { mailboxUid: In([mailbox.uid, compliance.uid]) },
+        });
+        expect(new Set(entries.map((e) => e.mailboxUid))).toEqual(new Set([mailbox.uid, compliance.uid]));
+    });
+
+    it("A matching quarantine transport rule stamps quarantineReason on every created IngestQueueEntry.", async () => {
+        const mailbox = await createMailbox();
+        await createTransportRule({ actions: [{ type: TransportRuleActionType.QUARANTINE }] });
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${mailbox.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntrySQL[] = await ingestQueueRepo.find({ where: { mailboxUid: mailbox.uid } });
+        expect(entries.length).toBe(1);
+        expect(entries[0].quarantineReason).toBe(QuarantineReason.TRANSPORT_RULE);
     });
 });

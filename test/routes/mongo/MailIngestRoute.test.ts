@@ -10,7 +10,8 @@ import * as uuid from "uuid";
 import { DistributionListMongo } from "../../../src/models/mongo/DistributionListMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { IngestQueueEntryMongo } from "../../../src/models/mongo/IngestQueueEntryMongo.js";
-import { IngestStatus } from "../../../src/models/types.js";
+import { TransportRuleMongo } from "../../../src/models/mongo/TransportRuleMongo.js";
+import { IngestStatus, QuarantineReason, TransportRuleActionType } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { InMemoryBlobStore, RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
 
@@ -29,6 +30,7 @@ describe("Route:MailIngestRouteMongo Tests", () => {
     let mailboxRepo: MongoRepository<MailboxMongo>;
     let ingestQueueRepo: MongoRepository<IngestQueueEntryMongo>;
     let distributionListRepo: MongoRepository<DistributionListMongo>;
+    let transportRuleRepo: MongoRepository<TransportRuleMongo>;
 
     const secret = config.get("mail:transport:ingest:secret");
 
@@ -59,6 +61,19 @@ describe("Route:MailIngestRouteMongo Tests", () => {
         return await distributionListRepo.save(obj);
     };
 
+    const createTransportRule = async function (data?: any): Promise<TransportRuleMongo> {
+        const obj: TransportRuleMongo = new TransportRuleMongo({
+            name: "Test Rule",
+            enabled: true,
+            sequence: 0,
+            stopProcessingRules: false,
+            conditions: {},
+            actions: [],
+            ...data,
+        });
+        return await transportRuleRepo.save(obj);
+    };
+
     beforeAll(async () => {
         await mongod.start();
         registerTestDoubles(objectFactory);
@@ -70,6 +85,7 @@ describe("Route:MailIngestRouteMongo Tests", () => {
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
             ingestQueueRepo = conn.getMongoRepository("IngestQueueEntryMongo");
             distributionListRepo = conn.getMongoRepository("DistributionListMongo");
+            transportRuleRepo = conn.getMongoRepository("TransportRuleMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -82,7 +98,7 @@ describe("Route:MailIngestRouteMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, ingestQueueRepo, distributionListRepo]) {
+        for (const repo of [mailboxRepo, ingestQueueRepo, distributionListRepo, transportRuleRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -377,5 +393,147 @@ describe("Route:MailIngestRouteMongo Tests", () => {
         expect(transport.sent.length).toBe(1);
         expect(transport.sent[0].envelopeTo).toEqual([member.primarySmtpAddress]);
         expect(transport.sent[0].envelopeFrom).toBe(list.primarySmtpAddress);
+    });
+
+    it("A matching reject transport rule drops the entire message for every recipient and sends a rejection notice to the sender.", async () => {
+        const mailbox = await createMailbox();
+        await createTransportRule({
+            conditions: { subjectContains: ["blocked"] },
+            actions: [{ type: TransportRuleActionType.REJECT }],
+        });
+        const raw = Buffer.from(`From: sender@example.com\r\nSubject: blocked topic\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        expect(result.body.results).toEqual([{ rcpt: mailbox.primarySmtpAddress, queued: false }]);
+
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo.find({ mailboxUid: mailbox.uid }).toArray();
+        expect(entries.length).toBe(0);
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(1);
+        expect(transport.sent[0].envelopeTo).toEqual(["sender@example.com"]);
+    });
+
+    it("Logs a warning (without failing the whole delivery) when sending the transport-rule rejection notice fails.", async () => {
+        const mailbox = await createMailbox();
+        await createTransportRule({
+            conditions: { subjectContains: ["blocked"] },
+            actions: [{ type: TransportRuleActionType.REJECT }],
+        });
+        const raw = Buffer.from(`From: sender@example.com\r\nSubject: blocked topic\r\n\r\nHello\r\n`);
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("simulated transport failure"));
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        expect(result.body.results).toEqual([{ rcpt: mailbox.primarySmtpAddress, queued: false }]);
+    });
+
+    it("A matching add_header transport rule tags the stored copy for a direct mailbox delivery.", async () => {
+        const mailbox = await createMailbox();
+        await createTransportRule({
+            actions: [{ type: TransportRuleActionType.ADD_HEADER, headerName: "X-Policy-Tag", headerValue: "flagged" }],
+        });
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${mailbox.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo.find({ mailboxUid: mailbox.uid }).toArray();
+        expect(entries.length).toBe(1);
+
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const stored: Buffer = await blobStore.get(entries[0].rawBlobKey);
+        expect(stored.toString()).toContain("X-Policy-Tag: flagged");
+    });
+
+    it("A matching add_header transport rule tags the stored copy for a distribution-list-expanded delivery.", async () => {
+        const m1 = await createMailbox();
+        const list = await createList({ memberAddresses: [m1.primarySmtpAddress] });
+        await createTransportRule({
+            actions: [{ type: TransportRuleActionType.ADD_HEADER, headerName: "X-Policy-Tag", headerValue: "flagged" }],
+        });
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${list.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", list.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo.find({ mailboxUid: m1.uid }).toArray();
+        expect(entries.length).toBe(1);
+
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const stored: Buffer = await blobStore.get(entries[0].rawBlobKey);
+        const storedText = stored.toString();
+        expect(storedText).toContain("X-Policy-Tag: flagged");
+        expect(storedText).toContain("List-Id:");
+    });
+
+    it("A matching add_recipient transport rule delivers an additional internal copy, resolved like any other recipient.", async () => {
+        const mailbox = await createMailbox();
+        const compliance = await createMailbox();
+        await createTransportRule({
+            actions: [{ type: TransportRuleActionType.ADD_RECIPIENT, recipientAddress: compliance.primarySmtpAddress }],
+        });
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${mailbox.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo
+            .find({ mailboxUid: { $in: [mailbox.uid, compliance.uid] } })
+            .toArray();
+        expect(new Set(entries.map((e) => e.mailboxUid))).toEqual(new Set([mailbox.uid, compliance.uid]));
+    });
+
+    it("A matching quarantine transport rule stamps quarantineReason on every created IngestQueueEntry.", async () => {
+        const mailbox = await createMailbox();
+        await createTransportRule({ actions: [{ type: TransportRuleActionType.QUARANTINE }] });
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${mailbox.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo.find({ mailboxUid: mailbox.uid }).toArray();
+        expect(entries.length).toBe(1);
+        expect(entries[0].quarantineReason).toBe(QuarantineReason.TRANSPORT_RULE);
     });
 });

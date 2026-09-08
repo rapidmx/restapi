@@ -18,6 +18,7 @@ import {
     ScanTargetType,
     SpamVerdict,
     TaskPriority,
+    TransportRuleActionType,
 } from "../../src/models/types.js";
 import { AttachmentMongo } from "../../src/models/mongo/AttachmentMongo.js";
 import { CalendarEventMongo } from "../../src/models/mongo/CalendarEventMongo.js";
@@ -35,6 +36,7 @@ import { QuarantineEntryMongo } from "../../src/models/mongo/QuarantineEntryMong
 import { ScanResultMongo } from "../../src/models/mongo/ScanResultMongo.js";
 import { SearchIndexStateMongo } from "../../src/models/mongo/SearchIndexStateMongo.js";
 import { TaskMongo } from "../../src/models/mongo/TaskMongo.js";
+import { TransportRuleMongo } from "../../src/models/mongo/TransportRuleMongo.js";
 
 describe("Mongo model default construction", () => {
     it("MailboxMongo falls back to class defaults when constructed with no data.", () => {
@@ -667,6 +669,7 @@ describe("Mongo model default construction", () => {
         expect(obj.rawBlobKey).toBe("");
         expect(obj.status).toBe(IngestStatus.PENDING);
         expect(obj.errorMessage).toBeUndefined();
+        expect(obj.quarantineReason).toBeUndefined();
     });
 
     it("IngestQueueEntryMongo applies provided overrides when constructed with data.", () => {
@@ -677,6 +680,7 @@ describe("Mongo model default construction", () => {
             rawBlobKey: "blob-1",
             status: IngestStatus.FAILED,
             errorMessage: "parse error",
+            quarantineReason: QuarantineReason.TRANSPORT_RULE,
         });
 
         expect(obj.mailboxUid).toBe("mailbox-1");
@@ -685,6 +689,7 @@ describe("Mongo model default construction", () => {
         expect(obj.rawBlobKey).toBe("blob-1");
         expect(obj.status).toBe(IngestStatus.FAILED);
         expect(obj.errorMessage).toBe("parse error");
+        expect(obj.quarantineReason).toBe(QuarantineReason.TRANSPORT_RULE);
     });
 
     it("IngestQueueEntryMongo preserves class defaults for fields omitted from a partial override object.", () => {
@@ -696,6 +701,36 @@ describe("Mongo model default construction", () => {
         expect(obj.rawBlobKey).toBe("");
         expect(obj.status).toBe(IngestStatus.PENDING);
         expect(obj.errorMessage).toBeUndefined();
+        expect(obj.quarantineReason).toBeUndefined();
+    });
+
+    it("TransportRuleMongo falls back to class defaults when constructed with no data.", () => {
+        const obj = new TransportRuleMongo();
+
+        expect(obj.name).toBe("");
+        expect(obj.enabled).toBe(true);
+        expect(obj.sequence).toBe(0);
+        expect(obj.stopProcessingRules).toBe(false);
+        expect(obj.conditions).toEqual({});
+        expect(obj.actions).toEqual([]);
+    });
+
+    it("TransportRuleMongo applies provided overrides when constructed with data.", () => {
+        const obj = new TransportRuleMongo({
+            name: "Block competitor mentions",
+            enabled: false,
+            sequence: 5,
+            stopProcessingRules: true,
+            conditions: { subjectContains: ["confidential"] },
+            actions: [{ type: TransportRuleActionType.REJECT }],
+        });
+
+        expect(obj.name).toBe("Block competitor mentions");
+        expect(obj.enabled).toBe(false);
+        expect(obj.sequence).toBe(5);
+        expect(obj.stopProcessingRules).toBe(true);
+        expect(obj.conditions).toEqual({ subjectContains: ["confidential"] });
+        expect(obj.actions).toEqual([{ type: TransportRuleActionType.REJECT }]);
     });
 
     it("DeviceSyncStateMongo falls back to class defaults when constructed with no data.", () => {

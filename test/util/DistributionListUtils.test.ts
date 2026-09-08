@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { extractHeader, rewriteHeadersForList } from "../../src/util/DistributionListUtils.js";
+import { rewriteHeadersForList } from "../../src/util/DistributionListUtils.js";
 import { DistributionList } from "../../src/models/types.js";
 
 function makeList(overrides?: Partial<DistributionList>): DistributionList {
@@ -21,28 +21,6 @@ function makeList(overrides?: Partial<DistributionList>): DistributionList {
 }
 
 describe("DistributionListUtils Tests", () => {
-    describe("extractHeader()", () => {
-        it("Finds a simple top-level header, case-insensitively.", () => {
-            const raw = Buffer.from("From: a@example.com\r\nSubject: Hello\r\n\r\nBody\r\n");
-            expect(extractHeader(raw, "subject")).toBe("Hello");
-        });
-
-        it("Returns undefined when the header isn't present.", () => {
-            const raw = Buffer.from("From: a@example.com\r\n\r\nBody\r\n");
-            expect(extractHeader(raw, "Subject")).toBeUndefined();
-        });
-
-        it("Unfolds a continuation line onto a single value joined by a space.", () => {
-            const raw = Buffer.from("From: a@example.com\r\nSubject: Hello\r\n World\r\n\r\nBody\r\n");
-            expect(extractHeader(raw, "Subject")).toBe("Hello World");
-        });
-
-        it("Treats a message with no blank-line separator as having no body, still finding headers.", () => {
-            const raw = Buffer.from("From: a@example.com\r\nSubject: NoBody");
-            expect(extractHeader(raw, "Subject")).toBe("NoBody");
-        });
-    });
-
     describe("rewriteHeadersForList()", () => {
         it("Drops an existing Reply-To and adds Reply-To/List-Id/List-Unsubscribe, preserving the body.", () => {
             const raw = Buffer.from(

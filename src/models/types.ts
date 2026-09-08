@@ -492,6 +492,94 @@ export interface MailFilterRule extends BaseEntity {
     actions: MailFilterAction[];
 }
 
+/** The kind of action a `TransportRule` performs once its `TransportRuleConditions` match. Unlike
+ * `MailFilterActionType` (which only ever affects one already-resolved mailbox's own copy), these act on the
+ * whole SMTP transaction - see the `TransportRule` doc comment. */
+export enum TransportRuleActionType {
+    /** Drops the message entirely (no recipient receives it) and sends a rejection notice to the sender. */
+    REJECT = "reject",
+
+    /** Routes every resolved recipient's copy to the existing quarantine mechanism instead of normal
+     * delivery/relay - see `IngestQueueEntry.quarantineReason`. */
+    QUARANTINE = "quarantine",
+
+    /** Tags the message with an additional header - e.g. for downstream compliance tooling. Only adding a
+     * header is supported, not modifying/removing an existing one. */
+    ADD_HEADER = "add_header",
+
+    /** Delivers an additional copy of the message to a configured address (e.g. BCC to a compliance
+     * mailbox), resolved through the exact same mailbox/distribution-list/external logic as any other
+     * recipient. */
+    ADD_RECIPIENT = "add_recipient",
+}
+
+/** An embedded action on a `TransportRule`. */
+export interface TransportRuleAction {
+    type: TransportRuleActionType;
+
+    /** The header name to add. Required for `ADD_HEADER`. */
+    headerName?: string;
+
+    /** The header value to add. Required for `ADD_HEADER`. */
+    headerValue?: string;
+
+    /** The address to also deliver a copy to. Required for `ADD_RECIPIENT`. */
+    recipientAddress?: string;
+}
+
+/** The embedded match criteria on a `TransportRule`, evaluated once against the whole SMTP transaction (all
+ * recipients at once) rather than per-mailbox - see `MailFilterConditions` for the analogous per-mailbox
+ * shape this pragmatic subset mirrors. Every populated field must match (AND); a field holding an array of
+ * strings is itself OR-matched against its entries. */
+export interface TransportRuleConditions {
+    /** Matches if the message's From address contains any of these substrings (case-insensitive). */
+    fromContains?: string[];
+
+    /** Matches if the message's subject contains any of these substrings (case-insensitive). */
+    subjectContains?: string[];
+
+    /** Matches if the message's plain-text body preview contains any of these substrings (case-insensitive). */
+    bodyContains?: string[];
+
+    /** Matches if any envelope recipient address contains any of these substrings (case-insensitive). */
+    recipientContains?: string[];
+
+    /** Matches if any envelope recipient's domain is not one of this server's configured `mail:domains`. */
+    anyRecipientExternal?: boolean;
+
+    hasAttachment?: boolean;
+
+    /** Matches if any attachment's filename contains any of these substrings (case-insensitive). */
+    attachmentNameContains?: string[];
+}
+
+/**
+ * Defines a single org-wide, admin-managed mail-flow rule (Exchange "transport rule" / Google Workspace
+ * "content compliance rule") - a set of conditions matched against every message crossing this mail system,
+ * and an ordered set of actions to take when they match. Evaluated once per SMTP transaction by
+ * `BaseMailIngestRoute.deliver()`, before that message is resolved/fanned out to any individual mailbox -
+ * unlike `MailFilterRule`, which is per-mailbox and evaluated only after that fan-out and AV/spam scanning
+ * have already happened. Admin-managed only (no per-record ACL - see `BaseTransportRuleRoute`).
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface TransportRule extends BaseEntity {
+    name: string;
+
+    enabled: boolean;
+
+    /** Evaluation order, ascending - same convention as `MailFilterRule.sequence`. */
+    sequence: number;
+
+    /** When `true` and this rule matches, no rule with a higher `sequence` is evaluated for the same message -
+     * same convention as `MailFilterRule.stopProcessingRules`. */
+    stopProcessingRules: boolean;
+
+    conditions: TransportRuleConditions;
+
+    actions: TransportRuleAction[];
+}
+
 /**
  * Defines a single named, roaming email signature (OWA/New Outlook-style server-side signature, as opposed to
  * Desktop Outlook's local-only signatures) belonging to a `Mailbox`. This library does not compose message
@@ -803,6 +891,7 @@ export interface ScanResult extends BaseEntity {
 export enum QuarantineReason {
     INFECTED = "infected",
     SPAM_POLICY = "spam_policy",
+    TRANSPORT_RULE = "transport_rule",
     OTHER = "other",
 }
 
@@ -883,6 +972,13 @@ export interface IngestQueueEntry extends BaseEntity {
     status: IngestStatus;
 
     errorMessage?: string;
+
+    /** Set by `BaseMailIngestRoute.deliver()` when a `TransportRule`'s `quarantine` action matched this
+     * message - `ScanQueueJob` quarantines this entry unconditionally (using this as `QuarantineEntry.reason`)
+     * rather than deriving a verdict from AV/spam scanning alone, though scanning still runs normally so a
+     * policy-quarantined message still gets a real `ScanResult` for the reviewer. `undefined` for an entry
+     * whose eventual verdict is decided purely by `resolveDeliveryVerdict()`. */
+    quarantineReason?: QuarantineReason;
 }
 
 /**

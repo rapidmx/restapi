@@ -10,7 +10,7 @@ import {
     PersistenceDecorators,
 } from "@rapidrest/service-core";
 import { ObjectDecorators } from "@rapidrest/core";
-import { IngestQueueEntry, IngestStatus } from "../types.js";
+import { IngestQueueEntry, IngestStatus, QuarantineReason } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Nullable } = ObjectDecorators;
@@ -66,6 +66,11 @@ export class IngestQueueEntryMongo extends BaseMongoEntity implements IngestQueu
     @Nullable
     public errorMessage?: string;
 
+    @Column()
+    @Description("Set when a `TransportRule`'s `quarantine` action matched this message.")
+    @Nullable
+    public quarantineReason?: QuarantineReason;
+
     constructor(other?: Partial<IngestQueueEntryMongo>) {
         super(other);
 
@@ -76,6 +81,7 @@ export class IngestQueueEntryMongo extends BaseMongoEntity implements IngestQueu
             this.rawBlobKey = other.rawBlobKey !== undefined ? other.rawBlobKey : this.rawBlobKey;
             this.status = other.status !== undefined ? other.status : this.status;
             this.errorMessage = "errorMessage" in other ? other.errorMessage : this.errorMessage;
+            this.quarantineReason = "quarantineReason" in other ? other.quarantineReason : this.quarantineReason;
         }
     }
 }

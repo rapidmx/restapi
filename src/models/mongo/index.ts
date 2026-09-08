@@ -18,3 +18,4 @@ export * from "./ScanResultMongo.js";
 export * from "./SearchIndexStateMongo.js";
 export * from "./TaskListMongo.js";
 export * from "./TaskMongo.js";
+export * from "./TransportRuleMongo.js";

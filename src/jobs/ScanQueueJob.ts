@@ -249,7 +249,10 @@ export abstract class ScanQueueJob<
             from: entry.envelopeFrom,
             to: entry.envelopeTo,
         });
-        const verdict = resolveDeliveryVerdict(result);
+        // A `TransportRule`'s `quarantine` action (stamped by `BaseMailIngestRoute.deliver()`) always wins over
+        // an AV/spam-derived verdict of "deliver"/"junk" - but scanning still ran normally above, so a
+        // policy-quarantined message still gets a real `ScanResult` for the reviewer to see.
+        const verdict = entry.quarantineReason ? "quarantine" : resolveDeliveryVerdict(result);
 
         // The `Message`/`QuarantineEntry` this scan is *for* doesn't exist yet, and `ScanResult.targetUid`
         // needs to reference it - pre-generating the target's uid here (rather than letting `create()` mint
@@ -277,7 +280,10 @@ export abstract class ScanQueueJob<
                 new this.quarantineEntryClass({
                     uid: targetUid,
                     mailboxUid: entry.mailboxUid,
-                    reason: result.av.verdict === AvVerdict.INFECTED ? QuarantineReason.INFECTED : QuarantineReason.OTHER,
+                    reason:
+                        result.av.verdict === AvVerdict.INFECTED
+                            ? QuarantineReason.INFECTED
+                            : (entry.quarantineReason ?? QuarantineReason.OTHER),
                     scanResultUid: scanResult.uid,
                     rawBlobKey: entry.rawBlobKey,
                 }),

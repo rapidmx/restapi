@@ -29,6 +29,7 @@ class TestMailIngestRoute extends BaseMailIngestRoute<any, any> {
     protected mailboxClass: any = StubEntity;
     protected ingestQueueClass: any = StubEntity;
     protected distributionListClass: any = StubEntity;
+    protected transportRuleClass: any = StubEntity;
 }
 
 function makeRes(): any {
@@ -77,6 +78,7 @@ async function makeRoute(overrides: {
     (route as any).mailTransport = mailTransport;
     (route as any).mailboxRepo = makeAddressRepo(overrides.mailboxes ?? {});
     (route as any).distributionListRepo = makeAddressRepo(overrides.lists ?? {});
+    (route as any).transportRuleRepo = { find: vi.fn().mockResolvedValue([]) };
     (route as any).ingestQueueRepo = ingestQueueRepo;
     if (overrides.maxListDepth !== undefined) {
         (route as any).maxListDepth = overrides.maxListDepth;

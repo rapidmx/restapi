@@ -16,3 +16,4 @@ export * from "./QuarantineRouteSQL.js";
 export * from "./SearchRouteSQL.js";
 export * from "./TaskListRouteSQL.js";
 export * from "./TaskRouteSQL.js";
+export * from "./TransportRuleRouteSQL.js";

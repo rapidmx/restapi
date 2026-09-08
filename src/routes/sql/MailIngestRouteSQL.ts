@@ -3,13 +3,14 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { Raw } from "typeorm";
-import { DistributionListSQL, IngestQueueEntrySQL, MailboxSQL } from "../../sql.js";
+import { DistributionListSQL, IngestQueueEntrySQL, MailboxSQL, TransportRuleSQL } from "../../sql.js";
 import { BaseMailIngestRoute } from "../BaseMailIngestRoute.js";
 
 export class MailIngestRouteSQL extends BaseMailIngestRoute<MailboxSQL, IngestQueueEntrySQL> {
     protected mailboxClass: any = MailboxSQL;
     protected ingestQueueClass: any = IngestQueueEntrySQL;
     protected distributionListClass: any = DistributionListSQL;
+    protected transportRuleClass: any = TransportRuleSQL;
 
     /**
      * `MailboxSQL.aliasAddresses`/`DistributionListSQL.aliasAddresses` are both `simple-json` columns, stored

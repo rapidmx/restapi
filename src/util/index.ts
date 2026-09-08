@@ -21,5 +21,7 @@ export * from "./MailFilterUtils.js";
 export * from "./MailSendUtils.js";
 export * from "./MailSignatureUtils.js";
 export * from "./MailboxScopeUtils.js";
+export * from "./MimeHeaderUtils.js";
 export * from "./OofUtils.js";
 export * from "./RecoverableRepoUtils.js";
+export * from "./TransportRuleUtils.js";

@@ -470,6 +470,42 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         expect(quarantineEntries[0].reason).toBe(QuarantineReason.OTHER);
     });
 
+    it("Quarantines an entry pre-tagged by a TransportRule (quarantineReason) even though AV/spam scanning found it clean, still recording a real ScanResult.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makePlainRawMessage());
+        const entry = await createIngestEntry({ rawBlobKey, quarantineReason: QuarantineReason.TRANSPORT_RULE });
+
+        await job.run();
+
+        const updated = await ingestQueueRepo.findOne({ uid: entry.uid } as any);
+        expect(updated!.status).toBe(IngestStatus.DELIVERED);
+
+        const messages = await messageRepo.find({ mailboxUid }).toArray();
+        expect(messages.length).toBe(0);
+
+        const quarantineEntries = await quarantineEntryRepo.find({ mailboxUid }).toArray();
+        expect(quarantineEntries.length).toBe(1);
+        expect(quarantineEntries[0].reason).toBe(QuarantineReason.TRANSPORT_RULE);
+        expect(quarantineEntries[0].rawBlobKey).toBe(rawBlobKey);
+
+        const scanResults = await scanResultRepo.find({ targetUid: quarantineEntries[0].uid }).toArray();
+        expect(scanResults.length).toBe(1);
+    });
+
+    it("An actually-infected message pre-tagged by a TransportRule still reports the more specific INFECTED reason.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makePlainRawMessage("X-Test-Force-Infected: true"));
+        await createIngestEntry({ rawBlobKey, quarantineReason: QuarantineReason.TRANSPORT_RULE });
+
+        await job.run();
+
+        const quarantineEntries = await quarantineEntryRepo.find({ mailboxUid }).toArray();
+        expect(quarantineEntries.length).toBe(1);
+        expect(quarantineEntries[0].reason).toBe(QuarantineReason.INFECTED);
+    });
+
     it("Marks an entry FAILED with the error message when processing throws, without crashing the whole run.", async () => {
         // No blob was ever put at this key, so `blobStore.get()` rejects with a real "no blob" error.
         const entry = await createIngestEntry({ rawBlobKey: `raw/${uuid.v4()}` });

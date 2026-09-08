@@ -18,6 +18,7 @@ import {
     ScanTargetType,
     SpamVerdict,
     TaskPriority,
+    TransportRuleActionType,
 } from "../../src/models/types.js";
 import { AttachmentSQL } from "../../src/models/sql/AttachmentSQL.js";
 import { CalendarEventSQL } from "../../src/models/sql/CalendarEventSQL.js";
@@ -35,6 +36,7 @@ import { QuarantineEntrySQL } from "../../src/models/sql/QuarantineEntrySQL.js";
 import { ScanResultSQL } from "../../src/models/sql/ScanResultSQL.js";
 import { SearchIndexStateSQL } from "../../src/models/sql/SearchIndexStateSQL.js";
 import { TaskSQL } from "../../src/models/sql/TaskSQL.js";
+import { TransportRuleSQL } from "../../src/models/sql/TransportRuleSQL.js";
 
 describe("SQL model default construction", () => {
     it("MailboxSQL falls back to class defaults when constructed with no data.", () => {
@@ -667,6 +669,7 @@ describe("SQL model default construction", () => {
         expect(obj.rawBlobKey).toBe("");
         expect(obj.status).toBe(IngestStatus.PENDING);
         expect(obj.errorMessage).toBeUndefined();
+        expect(obj.quarantineReason).toBeUndefined();
     });
 
     it("IngestQueueEntrySQL applies provided overrides when constructed with data.", () => {
@@ -677,6 +680,7 @@ describe("SQL model default construction", () => {
             rawBlobKey: "blob-1",
             status: IngestStatus.FAILED,
             errorMessage: "parse error",
+            quarantineReason: QuarantineReason.TRANSPORT_RULE,
         });
 
         expect(obj.mailboxUid).toBe("mailbox-1");
@@ -685,6 +689,7 @@ describe("SQL model default construction", () => {
         expect(obj.rawBlobKey).toBe("blob-1");
         expect(obj.status).toBe(IngestStatus.FAILED);
         expect(obj.errorMessage).toBe("parse error");
+        expect(obj.quarantineReason).toBe(QuarantineReason.TRANSPORT_RULE);
     });
 
     it("IngestQueueEntrySQL preserves class defaults for fields omitted from a partial override object.", () => {
@@ -696,6 +701,36 @@ describe("SQL model default construction", () => {
         expect(obj.rawBlobKey).toBe("");
         expect(obj.status).toBe(IngestStatus.PENDING);
         expect(obj.errorMessage).toBeUndefined();
+        expect(obj.quarantineReason).toBeUndefined();
+    });
+
+    it("TransportRuleSQL falls back to class defaults when constructed with no data.", () => {
+        const obj = new TransportRuleSQL();
+
+        expect(obj.name).toBe("");
+        expect(obj.enabled).toBe(true);
+        expect(obj.sequence).toBe(0);
+        expect(obj.stopProcessingRules).toBe(false);
+        expect(obj.conditions).toEqual({});
+        expect(obj.actions).toEqual([]);
+    });
+
+    it("TransportRuleSQL applies provided overrides when constructed with data.", () => {
+        const obj = new TransportRuleSQL({
+            name: "Block competitor mentions",
+            enabled: false,
+            sequence: 5,
+            stopProcessingRules: true,
+            conditions: { subjectContains: ["confidential"] },
+            actions: [{ type: TransportRuleActionType.REJECT }],
+        });
+
+        expect(obj.name).toBe("Block competitor mentions");
+        expect(obj.enabled).toBe(false);
+        expect(obj.sequence).toBe(5);
+        expect(obj.stopProcessingRules).toBe(true);
+        expect(obj.conditions).toEqual({ subjectContains: ["confidential"] });
+        expect(obj.actions).toEqual([{ type: TransportRuleActionType.REJECT }]);
     });
 
     it("DeviceSyncStateSQL falls back to class defaults when constructed with no data.", () => {

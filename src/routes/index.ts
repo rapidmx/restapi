@@ -12,3 +12,4 @@ export * from "./BaseMailIngestRoute.js";
 export * from "./BaseMessageRoute.js";
 export * from "./BaseScopedChildRoute.js";
 export * from "./BaseSearchRoute.js";
+export * from "./BaseTransportRuleRoute.js";

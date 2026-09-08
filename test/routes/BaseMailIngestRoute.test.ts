@@ -36,6 +36,7 @@ class TestMailIngestRoute extends BaseMailIngestRoute<any, any> {
     protected mailboxClass: any = class {};
     protected ingestQueueClass: any = class {};
     protected distributionListClass: any = class {};
+    protected transportRuleClass: any = class {};
 }
 
 function makeRes(): any {
@@ -58,6 +59,7 @@ describe("BaseMailIngestRoute Tests (blobStore guard clause only)", () => {
         (route as any).mailboxRepo = { find: vi.fn().mockResolvedValue([]) };
         (route as any).ingestQueueRepo = { create: vi.fn() };
         (route as any).distributionListRepo = { find: vi.fn().mockResolvedValue([]) };
+        (route as any).transportRuleRepo = { find: vi.fn().mockResolvedValue([]) };
         const res = makeRes();
         const req: any = {
             headers: {

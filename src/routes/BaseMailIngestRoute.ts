@@ -17,9 +17,11 @@ import {
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import type { MailTransport } from "../transport/MailTransport.js";
-import { DistributionList, IngestQueueEntry, IngestStatus, Mailbox } from "../models/types.js";
+import { DistributionList, IngestQueueEntry, IngestStatus, Mailbox, QuarantineReason, TransportRule } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
-import { extractHeader, rewriteHeadersForList } from "../util/DistributionListUtils.js";
+import { rewriteHeadersForList } from "../util/DistributionListUtils.js";
+import { extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
+import { buildTransportRuleContext, evaluateTransportRules } from "../util/TransportRuleUtils.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Description, Summary } = DocDecorators;
 const { Get, Post, Query, Request, Response } = RouteDecorators;
@@ -30,9 +32,10 @@ const { Get, Post, Query, Request, Response } = RouteDecorators;
  * are internal-only — never exposed to the public internet — and gated by a shared bearer secret rather than
  * ordinary user JWT auth, since the caller is the MTA process, not an end user.
  *
- * This class is DB-agnostic; `mailboxClass`/`ingestQueueClass`/`distributionListClass` are supplied by the
- * Mongo/SQL concrete subclasses (`MailIngestRouteMongo`/`MailIngestRouteSQL`), following the same pattern
- * `DefaultAccounts`/`DefaultAccountsMongo` use for a background service spanning multiple entity types.
+ * This class is DB-agnostic; `mailboxClass`/`ingestQueueClass`/`distributionListClass`/`transportRuleClass`
+ * are supplied by the Mongo/SQL concrete subclasses (`MailIngestRouteMongo`/`MailIngestRouteSQL`), following
+ * the same pattern `DefaultAccounts`/`DefaultAccountsMongo` use for a background service spanning multiple
+ * entity types.
  *
  * A recipient address can resolve to a `Mailbox` (delivered directly, as before) or a `DistributionList`
  * (expanded recursively to its member `Mailbox`es and/or genuinely external addresses - see
@@ -53,6 +56,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
     protected abstract mailboxClass: any;
     protected abstract ingestQueueClass: any;
     protected abstract distributionListClass: any;
+    protected abstract transportRuleClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -60,6 +64,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
     private mailboxRepo?: RepoUtils<M>;
     private ingestQueueRepo?: RepoUtils<Q>;
     private distributionListRepo?: RepoUtils<DistributionList>;
+    private transportRuleRepo?: RepoUtils<TransportRule>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -69,6 +74,11 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
 
     @Config("mail:transport:ingest:secret")
     private ingestSecret?: string;
+
+    /** This server's configured domain list, used to compute a `TransportRule`'s `anyRecipientExternal`
+     * condition - same key `BaseMailboxRoute`/`BaseDistributionListRoute` already use. */
+    @Config("mail:domains", [] as string[])
+    private domains: string[] = [];
 
     /** Caps how deeply nested distribution lists (a list whose own member is another list) are expanded - a
      * cheap safety net on top of the real cycle guard (`visitedListUids`), which already prevents a true A→B→A
@@ -107,6 +117,12 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             this.distributionListRepo = await this._objectFactory!.newInstance(RepoUtils, {
                 name: this.distributionListClass.name,
                 args: [this.distributionListClass],
+            });
+        }
+        if (!this.transportRuleRepo) {
+            this.transportRuleRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.transportRuleClass.name,
+                args: [this.transportRuleClass],
             });
         }
     }
@@ -280,6 +296,75 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         }
     }
 
+    /**
+     * Evaluates every configured `TransportRule` once against the whole SMTP transaction (`envelopeFrom`, the
+     * full `envelopeTo` list, and the raw message) - the one point in this codebase that has the complete
+     * envelope in hand before per-recipient resolution/fan-out. Called once at the top of `deliver()`, before
+     * anything is queued/relayed.
+     *
+     * Returns immediately (no parse attempted) when no `TransportRule`s are configured at all - zero overhead
+     * for a deployment that doesn't use this feature. A matching `reject` action sends a rejection notice to
+     * `envelopeFrom` (best-effort - a send failure is logged, not propagated) and tells the caller to skip all
+     * delivery; a matching `add_header`/`add_recipient` action is folded into the returned `raw`/`envelopeTo`
+     * so the rest of `deliver()`'s existing per-recipient loop applies it uniformly (an added recipient is
+     * resolved exactly like any other; an added header is present in every stored/relayed copy, including a
+     * distribution-list-expanded one, since `rewriteHeadersForList()` is applied on top of this already-tagged
+     * `raw`). A matching `quarantine` action is surfaced as `quarantineReason` for the caller to stamp onto
+     * every `IngestQueueEntry` it creates for this transaction - see `ScanQueueJob.processEntry()`.
+     */
+    private async applyTransportRules(
+        raw: Buffer,
+        envelopeFrom: string,
+        envelopeTo: string[],
+    ): Promise<{ reject: boolean; raw: Buffer; envelopeTo: string[]; quarantineReason?: QuarantineReason }> {
+        const rules: TransportRule[] = await this.transportRuleRepo!.find({}, { ignoreACL: true });
+        if (rules.length === 0) {
+            return { reject: false, raw, envelopeTo };
+        }
+
+        const context = await buildTransportRuleContext(raw, envelopeFrom, envelopeTo, this.domains);
+        const evaluation = evaluateTransportRules(rules, context);
+
+        if (evaluation.reject) {
+            try {
+                // A null/empty envelope-from is the standard SMTP convention for a bounce/rejection notice
+                // (prevents a bounce-loop if this notice itself were somehow rejected); `postmaster@<domain>`
+                // is used only as the *display* From address, matching how a real MTA's own generated NDRs
+                // present themselves.
+                const composed: Buffer = await new MailComposer({
+                    from: `Mail Delivery System <postmaster@${this.domains[0] ?? "localhost"}>`,
+                    to: envelopeFrom,
+                    subject: "Message Rejected",
+                    text: "Your message could not be delivered because it was blocked by a mail-flow policy on the recipient's mail system.",
+                })
+                    .compile()
+                    .build();
+                await this.mailTransport!.send({ raw: composed, envelopeFrom: "", envelopeTo: [envelopeFrom] });
+            } catch (err: any) {
+                this.logger?.warn(`MailIngestRoute: failed to send transport-rule rejection notice to '${envelopeFrom}': ${err.message}`);
+            }
+            return { reject: true, raw, envelopeTo };
+        }
+
+        const effectiveRaw: Buffer = evaluation.addHeaders.length > 0 ? prependHeaders(raw, evaluation.addHeaders) : raw;
+        const seen: Set<string> = new Set(envelopeTo.map((a) => normalizeAddress(a)));
+        const effectiveEnvelopeTo: string[] = [...envelopeTo];
+        for (const address of evaluation.addRecipients) {
+            const normalized = normalizeAddress(address);
+            if (!seen.has(normalized)) {
+                seen.add(normalized);
+                effectiveEnvelopeTo.push(address);
+            }
+        }
+
+        return {
+            reject: false,
+            raw: effectiveRaw,
+            envelopeTo: effectiveEnvelopeTo,
+            quarantineReason: evaluation.quarantine ? QuarantineReason.TRANSPORT_RULE : undefined,
+        };
+    }
+
     @Summary("Resolve recipient")
     @Description(
         "Called by the MTA's recipient-validation hook before accepting a message. Responds 200 if a mailbox " +
@@ -324,12 +409,24 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         const envelopeFrom: string = firstHeader(req, "x-envelope-from") ?? "";
         const envelopeFromNormalized: string = normalizeAddress(envelopeFrom);
         const envelopeToHeader: string | undefined = firstHeader(req, "x-envelope-to");
-        const envelopeTo: string[] = envelopeToHeader ? envelopeToHeader.split(",").map((a) => a.trim()) : [];
-        const raw: Buffer | undefined = req.rawBody;
+        let envelopeTo: string[] = envelopeToHeader ? envelopeToHeader.split(",").map((a) => a.trim()) : [];
+        let raw: Buffer | undefined = req.rawBody;
 
         if (!raw || raw.length === 0 || envelopeTo.length === 0) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
+
+        // Evaluated once for the whole transaction, before any per-recipient resolution/fan-out below - see
+        // `applyTransportRules()`'s own doc comment for why this must happen here rather than per-recipient.
+        const transportRuleOutcome = await this.applyTransportRules(raw, envelopeFrom, envelopeTo);
+        if (transportRuleOutcome.reject) {
+            const results = envelopeTo.map((rcpt) => ({ rcpt: normalizeAddress(rcpt), queued: false }));
+            res.status(202).json({ results });
+            return res;
+        }
+        raw = transportRuleOutcome.raw;
+        envelopeTo = transportRuleOutcome.envelopeTo;
+        const quarantineReason = transportRuleOutcome.quarantineReason;
 
         // A single SMTP transaction can carry more than one RCPT TO — resolve and stage one IngestQueueEntry
         // per addressed mailbox so `ScanQueueJob` delivers independently to each, and one unknown/unresolvable
@@ -349,6 +446,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                         envelopeTo: [address],
                         rawBlobKey,
                         status: IngestStatus.PENDING,
+                        quarantineReason,
                     }),
                     { ignoreACL: true },
                 );
@@ -411,6 +509,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                         envelopeTo: [address],
                         rawBlobKey,
                         status: IngestStatus.PENDING,
+                        quarantineReason,
                     }),
                     { ignoreACL: true },
                 );
