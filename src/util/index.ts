@@ -15,6 +15,7 @@
 export * from "./AddressUtils.js";
 export * from "./AuditLogUtils.js";
 export * from "./AutoReplyUtils.js";
+export * from "./BookingUtils.js";
 export * from "./ConversationUtils.js";
 export * from "./DistributionListUtils.js";
 export * from "./DnsSetupUtils.js";
@@ -22,6 +23,7 @@ export * from "./DomainUtils.js";
 export * from "./DomainVerificationUtils.js";
 export * from "./FocusedInboxUtils.js";
 export * from "./FolderUtils.js";
+export * from "./FreeBusyUtils.js";
 export * from "./IcsUtils.js";
 export * from "./MailFilterUtils.js";
 export * from "./MailSendUtils.js";

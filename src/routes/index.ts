@@ -4,6 +4,8 @@
 ///////////////////////////////////////////////////////////////////////////////
 export * from "./BaseAttachmentRoute.js";
 export * from "./BaseAuditLogRoute.js";
+export * from "./BaseBookingRoute.js";
+export * from "./BaseBookingTypeRoute.js";
 export * from "./BaseCalendarEventRoute.js";
 export * from "./BaseCalendarShareLinkRoute.js";
 export * from "./BaseDistributionListRoute.js";
