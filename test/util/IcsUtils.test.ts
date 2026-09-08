@@ -72,6 +72,40 @@ describe("buildEventIcs() / parseIcsEvent() Tests", () => {
         expect(parsed.recurrenceRule).toBeUndefined();
     });
 
+    it("Builds a valid ICS payload when startDate/endDate/recurrenceId/until come back as plain strings, not Date objects.", () => {
+        // `CalendarEventMongo` persists (and returns) `startDate`/`endDate`/`recurrenceId` as plain
+        // strings despite being typed `Date` - every real caller of `buildEventIcs()` (`respond()`,
+        // `MeetingSchedulingJob`, `BaseBookingRoute`, `ScanQueueJob`) passes a value read straight off a
+        // persisted `CalendarEvent`, so this is the shape that actually reaches `buildEventIcs()` in
+        // production, not the always-a-real-`Date` shape every other test in this file constructs by hand.
+        const event = makeEvent({
+            startDate: "2026-06-15T19:00:00.000Z" as unknown as Date,
+            endDate: "2026-06-15T20:00:00.000Z" as unknown as Date,
+            recurrenceId: "2026-06-22T19:00:00.000Z" as unknown as Date,
+            recurrenceRule: undefined,
+        });
+
+        const ics = buildEventIcs(event, "REQUEST");
+        expect(ics).toContain("DTSTART:20260615T190000Z");
+        expect(ics).toContain("DTEND:20260615T200000Z");
+        expect(ics).toContain("RECURRENCE-ID:20260622T190000Z");
+    });
+
+    it("Builds a valid ICS payload when a persisted RecurrenceRule's until/exceptions come back as strings.", () => {
+        const event = makeEvent({
+            recurrenceRule: {
+                freq: RecurrenceFrequency.DAILY,
+                interval: 1,
+                until: "2026-12-31T00:00:00.000Z" as unknown as Date,
+                exceptions: ["2026-07-01T19:00:00.000Z" as unknown as Date],
+            },
+        });
+
+        const ics = buildEventIcs(event, "REQUEST");
+        expect(ics).toContain("UNTIL=20261231T000000Z");
+        expect(ics).toContain("EXDATE:20260701T190000Z");
+    });
+
     it("Emits one ATTENDEE line per attendee for REQUEST/CANCEL.", () => {
         const event = makeEvent({
             attendees: [makeAttendee({ address: "a@example.com" }), makeAttendee({ address: "b@example.com" })],

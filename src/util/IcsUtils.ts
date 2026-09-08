@@ -93,11 +93,16 @@ function unescapeText(value: string): string {
     });
 }
 
-function formatDateUtc(date: Date): string {
+/** Accepts `string` alongside the declared `Date` type because `CalendarEventMongo` persists
+ * `startDate`/`endDate`/`recurrenceId` (and `RecurrenceRule.until`/`exceptions`) as plain strings despite
+ * being typed `Date` - every caller here (`buildEventIcs()`) passes a value read straight off a persisted
+ * `CalendarEvent`, so without this coercion any such value throws here instead of formatting correctly. */
+function formatDateUtc(date: Date | string): string {
+    const d = date instanceof Date ? date : new Date(date);
     const pad = (n: number) => String(n).padStart(2, "0");
     return (
-        `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}T` +
-        `${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`
+        `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T` +
+        `${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`
     );
 }
 
