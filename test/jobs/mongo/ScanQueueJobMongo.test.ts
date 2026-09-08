@@ -29,6 +29,9 @@ import { ScanResultMongo } from "../../../src/models/mongo/ScanResultMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MailFilterRuleMongo } from "../../../src/models/mongo/MailFilterRuleMongo.js";
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
+import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
+import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
+import { FocusedInboxOverrideMongo } from "../../../src/models/mongo/FocusedInboxOverrideMongo.js";
 import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySuppressionMongo.js";
 import { buildEventIcs } from "../../../src/util/IcsUtils.js";
 import {
@@ -37,9 +40,11 @@ import {
     BusyStatus,
     CalendarEvent,
     CalendarEventStatus,
+    ContactAddressKind,
     FolderType,
     IngestStatus,
     MailFilterActionType,
+    MessageClassification,
     QuarantineReason,
     RecipientType,
     RecurrenceFrequency,
@@ -177,6 +182,9 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
     let mailFilterRuleRepo: MongoRepository<MailFilterRuleMongo>;
     let calendarEventRepo: MongoRepository<CalendarEventMongo>;
     let oofReplySuppressionRepo: MongoRepository<OofReplySuppressionMongo>;
+    let focusedInboxOverrideRepo: MongoRepository<FocusedInboxOverrideMongo>;
+    let contactRepo: MongoRepository<ContactMongo>;
+    let domainRepo: MongoRepository<DomainMongo>;
 
     const mailboxUid = uuid.v4();
 
@@ -226,6 +234,9 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         models.set("MailFilterRuleMongo", MailFilterRuleMongo);
         models.set("CalendarEventMongo", CalendarEventMongo);
         models.set("OofReplySuppressionMongo", OofReplySuppressionMongo);
+        models.set("FocusedInboxOverrideMongo", FocusedInboxOverrideMongo);
+        models.set("ContactMongo", ContactMongo);
+        models.set("DomainMongo", DomainMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("mongo");
@@ -242,6 +253,9 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         mailFilterRuleRepo = conn.getMongoRepository("MailFilterRuleMongo");
         calendarEventRepo = conn.getMongoRepository("CalendarEventMongo");
         oofReplySuppressionRepo = conn.getMongoRepository("OofReplySuppressionMongo");
+        focusedInboxOverrideRepo = conn.getMongoRepository("FocusedInboxOverrideMongo");
+        contactRepo = conn.getMongoRepository("ContactMongo");
+        domainRepo = conn.getMongoRepository("DomainMongo");
 
         // Constructed once via real ObjectFactory DI: `@Init` builds its ten real `RepoUtils` against the live
         // connection above, and `@Inject("BlobStore")`/`@Inject(ScanPipeline)`/`@Inject("MailTransport")` resolve
@@ -266,6 +280,9 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             mailFilterRuleRepo,
             calendarEventRepo,
             oofReplySuppressionRepo,
+            focusedInboxOverrideRepo,
+            contactRepo,
+            domainRepo,
         ]) {
             try {
                 await repo.clear();
@@ -1709,6 +1726,171 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
 
             const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
             expect(transport.sent.length).toBe(0);
+        });
+    });
+
+    describe("Focused Inbox classification", () => {
+        /** Queues one plain message from `envelopeFrom`, optionally with an extra header, and runs the job. */
+        const deliverFrom = async (envelopeFrom: string, extraHeader?: string): Promise<MessageMongo> => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                Buffer.from(
+                    `From: ${envelopeFrom}\r\nTo: recipient@example.com\r\n` +
+                        `Subject: Plain message\r\n${extraHeader ? `${extraHeader}\r\n` : ""}\r\nHello there.\r\n`,
+                ),
+            );
+            await createIngestEntry({ rawBlobKey, envelopeFrom });
+            await job.run();
+
+            const messages = await messageRepo.find({ mailboxUid }).toArray();
+            expect(messages.length).toBe(1);
+            return messages[0];
+        };
+
+        it("Classifies ordinary mail from a stranger as focused.", async () => {
+            await createMailbox();
+
+            const message = await deliverFrom("stranger@outside.com");
+
+            expect(message.inferenceClassification).toBe(MessageClassification.FOCUSED);
+        });
+
+        it("Classifies mail carrying a List-Unsubscribe header as other.", async () => {
+            await createMailbox();
+
+            const message = await deliverFrom("news@outside.com", "List-Unsubscribe: <https://outside.com/u>");
+
+            expect(message.inferenceClassification).toBe(MessageClassification.OTHER);
+        });
+
+        it("Classifies mail from a verified local domain as focused, even when it looks like bulk otherwise.", async () => {
+            await createMailbox();
+            await domainRepo.save(
+                new DomainMongo({
+                    uid: "example.com",
+                    name: "example.com",
+                    enabled: true,
+                    verified: true,
+                    verificationToken: uuid.v4(),
+                }),
+            );
+
+            const message = await deliverFrom("colleague@example.com");
+
+            expect(message.inferenceClassification).toBe(MessageClassification.FOCUSED);
+        });
+
+        it("Classifies mail from a sender in the mailbox's Contacts as focused.", async () => {
+            await createMailbox();
+            await contactRepo.save(
+                new ContactMongo({
+                    mailboxUid,
+                    folderUid: uuid.v4(),
+                    displayName: "Known Person",
+                    emails: [{ address: "known@outside.com", type: ContactAddressKind.WORK }],
+                }),
+            );
+
+            const message = await deliverFrom("known@outside.com", "List-Unsubscribe: <https://outside.com/u>");
+
+            // The contact makes them a known correspondent, but the bulk header still wins - a newsletter is a
+            // newsletter even from someone in your address book.
+            expect(message.inferenceClassification).toBe(MessageClassification.OTHER);
+
+            await messageRepo.clear();
+            const plain = await deliverFrom("known@outside.com");
+            expect(plain.inferenceClassification).toBe(MessageClassification.FOCUSED);
+        });
+
+        it("Classifies a reply into a thread this mailbox already holds as focused.", async () => {
+            await createMailbox();
+            const inbox = await folderRepo.save(
+                new FolderMongo({ mailboxUid, name: "Inbox", type: FolderType.INBOX, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+            );
+            await messageRepo.save(
+                new MessageMongo({
+                    folderUid: inbox.uid,
+                    mailboxUid,
+                    messageId: "root@outside.com",
+                    conversationId: "root@outside.com",
+                    subject: "Original",
+                    from: { address: "stranger@outside.com", type: RecipientType.TO },
+                    recipients: [{ address: "recipient@example.com", type: RecipientType.TO }],
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey: `raw/${uuid.v4()}`,
+                    bodyPreview: "Original",
+                    flags: { read: false, flagged: false, answered: false, forwarded: false },
+                    references: [],
+                    hasAttachments: false,
+                }),
+            );
+
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                Buffer.from(
+                    "From: stranger@outside.com\r\nTo: recipient@example.com\r\nSubject: Re: Original\r\n" +
+                        "In-Reply-To: <root@outside.com>\r\nReferences: <root@outside.com>\r\n\r\nReplying.\r\n",
+                ),
+            );
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "stranger@outside.com" });
+            await job.run();
+
+            const reply = (await messageRepo.find({ mailboxUid, subject: "Re: Original" }).toArray())[0];
+            expect(reply.conversationId).toBe("root@outside.com");
+            expect(reply.inferenceClassification).toBe(MessageClassification.FOCUSED);
+        });
+
+        it("An explicit override wins over the bulk headers that would otherwise force other.", async () => {
+            await createMailbox();
+            await focusedInboxOverrideRepo.save(
+                new FocusedInboxOverrideMongo({
+                    mailboxUid,
+                    senderAddress: "news@outside.com",
+                    classifyAs: MessageClassification.FOCUSED,
+                }),
+            );
+
+            const message = await deliverFrom("news@outside.com", "List-Unsubscribe: <https://outside.com/u>");
+
+            expect(message.inferenceClassification).toBe(MessageClassification.FOCUSED);
+        });
+
+        it("Leaves junk-routed mail unclassified - Focused/Other is an Inbox-only concept.", async () => {
+            await createMailbox();
+
+            const message = await deliverFrom("spammer@outside.com", "X-Test-Force-Spam: true");
+
+            const folder = await folderRepo.findOne({ uid: message.folderUid } as any);
+            expect(folder!.type).toBe(FolderType.JUNK);
+            expect(message.inferenceClassification).toBeFalsy();
+        });
+
+        it("Leaves mail a rule filed outside the Inbox unclassified.", async () => {
+            await createMailbox();
+            const targetFolder = await folderRepo.save(
+                new FolderMongo({ mailboxUid, name: "Filed", type: FolderType.USER, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+            );
+            await mailFilterRuleRepo.save(
+                new MailFilterRuleMongo({
+                    mailboxUid,
+                    name: "File it",
+                    enabled: true,
+                    sequence: 0,
+                    stopProcessingRules: false,
+                    conditions: { fromContains: ["stranger@outside.com"] },
+                    actions: [{ type: MailFilterActionType.MOVE_TO_FOLDER, folderUid: targetFolder.uid }],
+                }),
+            );
+
+            const message = await deliverFrom("stranger@outside.com");
+
+            expect(message.folderUid).toBe(targetFolder.uid);
+            expect(message.inferenceClassification).toBeFalsy();
         });
     });
 });

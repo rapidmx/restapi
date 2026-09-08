@@ -6,6 +6,7 @@ export * from "./ContactListRouteSQL.js";
 export * from "./ContactRouteSQL.js";
 export * from "./DistributionListRouteSQL.js";
 export * from "./DomainRouteSQL.js";
+export * from "./FocusedInboxOverrideRouteSQL.js";
 export * from "./FolderRouteSQL.js";
 export * from "./IngestQueueRouteSQL.js";
 export * from "./MailboxRouteSQL.js";

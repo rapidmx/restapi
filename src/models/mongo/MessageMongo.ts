@@ -10,7 +10,7 @@ import {
     RecoverableBaseMongoEntity,
 } from "@rapidrest/service-core";
 import { ObjectDecorators } from "@rapidrest/core";
-import { Message, MessageFlags, MessageImportance, Recipient, RecipientType } from "../types.js";
+import { Message, MessageClassification, MessageFlags, MessageImportance, Recipient, RecipientType } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Nullable } = ObjectDecorators;
@@ -146,6 +146,14 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     @Nullable
     public conversationId?: string;
 
+    @Column()
+    @Description(
+        "Which half of the Focused Inbox split this message belongs to, assigned at delivery time - only " +
+            "ever set for mail delivered to the INBOX, absent otherwise (treat absent as focused).",
+    )
+    @Nullable
+    public inferenceClassification?: MessageClassification;
+
     constructor(other?: Partial<MessageMongo>) {
         super(other);
 
@@ -171,6 +179,8 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.scheduledSendTime = "scheduledSendTime" in other ? other.scheduledSendTime : this.scheduledSendTime;
             this.recallRequestedAt = "recallRequestedAt" in other ? other.recallRequestedAt : this.recallRequestedAt;
             this.conversationId = "conversationId" in other ? other.conversationId : this.conversationId;
+            this.inferenceClassification =
+                "inferenceClassification" in other ? other.inferenceClassification : this.inferenceClassification;
         }
     }
 }

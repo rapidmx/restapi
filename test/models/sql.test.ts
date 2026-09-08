@@ -12,6 +12,7 @@ import {
     ContactAddressKind,
     FolderType,
     IngestStatus,
+    MessageClassification,
     MessageImportance,
     QuarantineReason,
     RecipientType,
@@ -30,6 +31,7 @@ import { ContactListSQL } from "../../src/models/sql/ContactListSQL.js";
 import { DeviceSyncStateSQL } from "../../src/models/sql/DeviceSyncStateSQL.js";
 import { DistributionListSQL } from "../../src/models/sql/DistributionListSQL.js";
 import { DomainSQL } from "../../src/models/sql/DomainSQL.js";
+import { FocusedInboxOverrideSQL } from "../../src/models/sql/FocusedInboxOverrideSQL.js";
 import { FolderSQL } from "../../src/models/sql/FolderSQL.js";
 import { IngestQueueEntrySQL } from "../../src/models/sql/IngestQueueEntrySQL.js";
 import { MailboxSQL } from "../../src/models/sql/MailboxSQL.js";
@@ -173,6 +175,7 @@ describe("SQL model default construction", () => {
             hasAttachments: true,
             scanResultUid: "scan-1",
             searchIndexedAt,
+            inferenceClassification: MessageClassification.OTHER,
         });
 
         expect(obj.folderUid).toBe("folder-1");
@@ -192,6 +195,7 @@ describe("SQL model default construction", () => {
         expect(obj.hasAttachments).toBe(true);
         expect(obj.scanResultUid).toBe("scan-1");
         expect(obj.searchIndexedAt).toBe(searchIndexedAt);
+        expect(obj.inferenceClassification).toBe(MessageClassification.OTHER);
     });
 
     it("MessageSQL preserves class defaults for fields omitted from a partial override object.", () => {
@@ -400,6 +404,26 @@ describe("SQL model default construction", () => {
         expect(obj.dkimPublicKey).toBe("MIGfMA0GCSq");
         expect(obj.dmarcPolicy).toBe("quarantine");
         expect(obj.dmarcReportEmail).toBe("dmarc@example.com");
+    });
+
+    it("FocusedInboxOverrideSQL falls back to class defaults when constructed with no data.", () => {
+        const obj = new FocusedInboxOverrideSQL();
+
+        expect(obj.mailboxUid).toBe("");
+        expect(obj.senderAddress).toBe("");
+        expect(obj.classifyAs).toBe(MessageClassification.FOCUSED);
+    });
+
+    it("FocusedInboxOverrideSQL applies provided overrides when constructed with data.", () => {
+        const obj = new FocusedInboxOverrideSQL({
+            mailboxUid: "mailbox-1",
+            senderAddress: "newsletter@example.com",
+            classifyAs: MessageClassification.OTHER,
+        });
+
+        expect(obj.mailboxUid).toBe("mailbox-1");
+        expect(obj.senderAddress).toBe("newsletter@example.com");
+        expect(obj.classifyAs).toBe(MessageClassification.OTHER);
     });
 
     it("CalendarEventSQL falls back to class defaults when constructed with no data.", () => {

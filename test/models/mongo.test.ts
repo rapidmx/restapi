@@ -12,6 +12,7 @@ import {
     ContactAddressKind,
     FolderType,
     IngestStatus,
+    MessageClassification,
     MessageImportance,
     QuarantineReason,
     RecipientType,
@@ -30,6 +31,7 @@ import { ContactListMongo } from "../../src/models/mongo/ContactListMongo.js";
 import { DeviceSyncStateMongo } from "../../src/models/mongo/DeviceSyncStateMongo.js";
 import { DistributionListMongo } from "../../src/models/mongo/DistributionListMongo.js";
 import { DomainMongo } from "../../src/models/mongo/DomainMongo.js";
+import { FocusedInboxOverrideMongo } from "../../src/models/mongo/FocusedInboxOverrideMongo.js";
 import { FolderMongo } from "../../src/models/mongo/FolderMongo.js";
 import { IngestQueueEntryMongo } from "../../src/models/mongo/IngestQueueEntryMongo.js";
 import { MailboxMongo } from "../../src/models/mongo/MailboxMongo.js";
@@ -173,6 +175,7 @@ describe("Mongo model default construction", () => {
             hasAttachments: true,
             scanResultUid: "scan-1",
             searchIndexedAt,
+            inferenceClassification: MessageClassification.OTHER,
         });
 
         expect(obj.folderUid).toBe("folder-1");
@@ -192,6 +195,7 @@ describe("Mongo model default construction", () => {
         expect(obj.hasAttachments).toBe(true);
         expect(obj.scanResultUid).toBe("scan-1");
         expect(obj.searchIndexedAt).toBe(searchIndexedAt);
+        expect(obj.inferenceClassification).toBe(MessageClassification.OTHER);
     });
 
     it("MessageMongo preserves class defaults for fields omitted from a partial override object.", () => {
@@ -400,6 +404,26 @@ describe("Mongo model default construction", () => {
         expect(obj.dkimPublicKey).toBe("MIGfMA0GCSq");
         expect(obj.dmarcPolicy).toBe("quarantine");
         expect(obj.dmarcReportEmail).toBe("dmarc@example.com");
+    });
+
+    it("FocusedInboxOverrideMongo falls back to class defaults when constructed with no data.", () => {
+        const obj = new FocusedInboxOverrideMongo();
+
+        expect(obj.mailboxUid).toBe("");
+        expect(obj.senderAddress).toBe("");
+        expect(obj.classifyAs).toBe(MessageClassification.FOCUSED);
+    });
+
+    it("FocusedInboxOverrideMongo applies provided overrides when constructed with data.", () => {
+        const obj = new FocusedInboxOverrideMongo({
+            mailboxUid: "mailbox-1",
+            senderAddress: "newsletter@example.com",
+            classifyAs: MessageClassification.OTHER,
+        });
+
+        expect(obj.mailboxUid).toBe("mailbox-1");
+        expect(obj.senderAddress).toBe("newsletter@example.com");
+        expect(obj.classifyAs).toBe(MessageClassification.OTHER);
     });
 
     it("CalendarEventMongo falls back to class defaults when constructed with no data.", () => {

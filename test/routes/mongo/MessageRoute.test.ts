@@ -8,10 +8,17 @@ import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionMana
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
+import { FocusedInboxOverrideMongo } from "../../../src/models/mongo/FocusedInboxOverrideMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
-import { AuditAction, FolderType, MessageImportance, RecipientType } from "../../../src/models/types.js";
+import {
+    AuditAction,
+    FolderType,
+    MessageClassification,
+    MessageImportance,
+    RecipientType,
+} from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles, InMemoryBlobStore, RecordingMailTransport } from "../../testDoubles.js";
 
@@ -32,6 +39,7 @@ describe("Route:MessageMongo Tests", () => {
     let messageRepo: MongoRepository<MessageMongo>;
     let aclRepo: MongoRepository<any>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
+    let overrideRepo: MongoRepository<FocusedInboxOverrideMongo>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -118,6 +126,7 @@ describe("Route:MessageMongo Tests", () => {
             folderRepo = conn.getMongoRepository("FolderMongo");
             messageRepo = conn.getMongoRepository("MessageMongo");
             auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
+            overrideRepo = conn.getMongoRepository("FocusedInboxOverrideMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -130,7 +139,7 @@ describe("Route:MessageMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, folderRepo, messageRepo, auditLogRepo]) {
+        for (const repo of [mailboxRepo, folderRepo, messageRepo, auditLogRepo, overrideRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -779,5 +788,130 @@ describe("Route:MessageMongo Tests", () => {
         expect(entries[0].targetType).toBe("Message");
         expect(entries[0].mailboxUid).toBe(mailbox.uid);
         expect(entries[0].actorUserUid).toBe(owner.uid);
+    });
+
+    describe("classify()", () => {
+        it("Moves a message to Other without recording a sender override.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                from: { address: "News@Example.com", type: RecipientType.TO },
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/classify`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ classifyAs: MessageClassification.OTHER });
+
+            expect(result.status).toBe(200);
+            expect(result.body.inferenceClassification).toBe(MessageClassification.OTHER);
+
+            const overrides = await overrideRepo.find({ mailboxUid: mailbox.uid }).toArray();
+            expect(overrides.length).toBe(0);
+        });
+
+        it("Records a normalized sender override when applyToSender is set.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                from: { address: "News@Example.com", type: RecipientType.TO },
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/classify`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ classifyAs: MessageClassification.OTHER, applyToSender: true });
+
+            expect(result.status).toBe(200);
+
+            const overrides = await overrideRepo.find({ mailboxUid: mailbox.uid }).toArray();
+            expect(overrides.length).toBe(1);
+            expect(overrides[0].senderAddress).toBe("news@example.com");
+            expect(overrides[0].classifyAs).toBe(MessageClassification.OTHER);
+        });
+
+        it("Replaces the existing override for a sender rather than adding a second, contradictory one.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                from: { address: "news@example.com", type: RecipientType.TO },
+            });
+
+            for (const classifyAs of [MessageClassification.OTHER, MessageClassification.FOCUSED]) {
+                const result = await request(server.getApplication())
+                    .post(`${baseUrl}/${message.uid}/classify`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .send({ classifyAs, applyToSender: true });
+                expect(result.status).toBe(200);
+            }
+
+            const overrides = await overrideRepo.find({ mailboxUid: mailbox.uid }).toArray();
+            expect(overrides.length).toBe(1);
+            expect(overrides[0].classifyAs).toBe(MessageClassification.FOCUSED);
+        });
+
+        it("Rejects a classifyAs that isn't focused or other (400).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/classify`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ classifyAs: "important" });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects a request with no body at all (400).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/classify`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(400);
+        });
+
+        it("A different user cannot classify a message they don't have access to (403).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/classify`)
+                .set("Authorization", "jwt " + otherUserToken)
+                .send({ classifyAs: MessageClassification.OTHER });
+
+            expect(result.status).toBe(403);
+        });
+
+        it("Classifying a nonexistent message returns 404.", async () => {
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${uuid.v4()}/classify`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ classifyAs: MessageClassification.OTHER });
+
+            expect(result.status).toBe(404);
+        });
+
+        it("Filtering by inferenceClassification returns only that half of the Inbox.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const focused = await createMessage(mailbox.uid, folder.uid, {
+                inferenceClassification: MessageClassification.FOCUSED,
+            });
+            await createMessage(mailbox.uid, folder.uid, { inferenceClassification: MessageClassification.OTHER });
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}?folderUid=${folder.uid}&inferenceClassification=${MessageClassification.FOCUSED}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body.length).toBe(1);
+            expect(result.body[0].uid).toBe(focused.uid);
+        });
     });
 });

@@ -47,6 +47,14 @@ describe("BaseMessageRoute Tests (dependency guard clause only)", () => {
         await expect(route.recall("msg-1", { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
     });
 
+    it("classify() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
+        const route = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
+
+        await expect(
+            route.classify("msg-1", { classifyAs: "other" }, { uid: "user-1" } as any),
+        ).rejects.toThrow(/internal error/i);
+    });
+
     it("conversations() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
         const route = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
 

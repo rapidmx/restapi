@@ -104,6 +104,10 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
             oof: {
                 resuppress_after_hours: 24,
             },
+            focused_inbox: {
+                enabled: true,
+                other_spam_score: 3,
+            },
         },
     };
 }

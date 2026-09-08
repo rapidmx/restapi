@@ -23,6 +23,9 @@ import { ScanResultSQL } from "../../../src/models/sql/ScanResultSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MailFilterRuleSQL } from "../../../src/models/sql/MailFilterRuleSQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
+import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
+import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
+import { FocusedInboxOverrideSQL } from "../../../src/models/sql/FocusedInboxOverrideSQL.js";
 import { OofReplySuppressionSQL } from "../../../src/models/sql/OofReplySuppressionSQL.js";
 import { buildEventIcs } from "../../../src/util/IcsUtils.js";
 import {
@@ -31,9 +34,11 @@ import {
     BusyStatus,
     CalendarEvent,
     CalendarEventStatus,
+    ContactAddressKind,
     FolderType,
     IngestStatus,
     MailFilterActionType,
+    MessageClassification,
     QuarantineReason,
     RecipientType,
     RecurrenceFrequency,
@@ -167,6 +172,9 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
     let mailFilterRuleRepo: Repository<MailFilterRuleSQL>;
     let calendarEventRepo: Repository<CalendarEventSQL>;
     let oofReplySuppressionRepo: Repository<OofReplySuppressionSQL>;
+    let focusedInboxOverrideRepo: Repository<FocusedInboxOverrideSQL>;
+    let contactRepo: Repository<ContactSQL>;
+    let domainRepo: Repository<DomainSQL>;
 
     const mailboxUid = uuid.v4();
 
@@ -218,6 +226,9 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         models.set("MailFilterRuleSQL", MailFilterRuleSQL);
         models.set("CalendarEventSQL", CalendarEventSQL);
         models.set("OofReplySuppressionSQL", OofReplySuppressionSQL);
+        models.set("FocusedInboxOverrideSQL", FocusedInboxOverrideSQL);
+        models.set("ContactSQL", ContactSQL);
+        models.set("DomainSQL", DomainSQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");
@@ -234,6 +245,9 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         mailFilterRuleRepo = conn.getRepository(MailFilterRuleSQL);
         calendarEventRepo = conn.getRepository(CalendarEventSQL);
         oofReplySuppressionRepo = conn.getRepository(OofReplySuppressionSQL);
+        focusedInboxOverrideRepo = conn.getRepository(FocusedInboxOverrideSQL);
+        contactRepo = conn.getRepository(ContactSQL);
+        domainRepo = conn.getRepository(DomainSQL);
 
         // Constructed once via real ObjectFactory DI: `@Init` builds its ten real `RepoUtils` against the live
         // connection above, and `@Inject("BlobStore")`/`@Inject(ScanPipeline)`/`@Inject("MailTransport")` resolve
@@ -257,6 +271,9 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             mailFilterRuleRepo,
             calendarEventRepo,
             oofReplySuppressionRepo,
+            focusedInboxOverrideRepo,
+            contactRepo,
+            domainRepo,
         ]) {
             await repo.clear();
         }
@@ -1500,6 +1517,143 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
 
             const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
             expect(transport.sent.length).toBe(0);
+        });
+    });
+
+    describe("Focused Inbox classification", () => {
+        /** Queues one plain message from `envelopeFrom`, optionally with an extra header, and runs the job. */
+        const deliverFrom = async (envelopeFrom: string, extraHeader?: string): Promise<MessageSQL> => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                Buffer.from(
+                    `From: ${envelopeFrom}\r\nTo: recipient@example.com\r\n` +
+                        `Subject: Plain message\r\n${extraHeader ? `${extraHeader}\r\n` : ""}\r\nHello there.\r\n`,
+                ),
+            );
+            await createIngestEntry({ rawBlobKey, envelopeFrom });
+            await job.run();
+
+            const messages = await messageRepo.find({ where: { mailboxUid } });
+            expect(messages.length).toBe(1);
+            return messages[0];
+        };
+
+        it("Classifies ordinary mail from a stranger as focused.", async () => {
+            await createMailbox();
+
+            const message = await deliverFrom("stranger@outside.com");
+
+            expect(message.inferenceClassification).toBe(MessageClassification.FOCUSED);
+        });
+
+        it("Classifies mail carrying a List-Unsubscribe header as other.", async () => {
+            await createMailbox();
+
+            const message = await deliverFrom("news@outside.com", "List-Unsubscribe: <https://outside.com/u>");
+
+            expect(message.inferenceClassification).toBe(MessageClassification.OTHER);
+        });
+
+        it("Classifies mail from a verified local domain as focused.", async () => {
+            await createMailbox();
+            await domainRepo.save(
+                new DomainSQL({
+                    uid: "example.com",
+                    name: "example.com",
+                    enabled: true,
+                    verified: true,
+                    verificationToken: uuid.v4(),
+                }),
+            );
+
+            const message = await deliverFrom("colleague@example.com");
+
+            expect(message.inferenceClassification).toBe(MessageClassification.FOCUSED);
+        });
+
+        it("Matches a sender in the mailbox's Contacts through the SQL simple-json LIKE query.", async () => {
+            await createMailbox();
+            await contactRepo.save(
+                new ContactSQL({
+                    mailboxUid,
+                    folderUid: uuid.v4(),
+                    displayName: "Known Person",
+                    emails: [{ address: "known@outside.com", type: ContactAddressKind.WORK }],
+                }),
+            );
+
+            const message = await deliverFrom("known@outside.com");
+
+            expect(message.inferenceClassification).toBe(MessageClassification.FOCUSED);
+        });
+
+        it("Escapes LIKE wildcards in the sender address rather than letting them match anything.", async () => {
+            await createMailbox();
+            await contactRepo.save(
+                new ContactSQL({
+                    mailboxUid,
+                    folderUid: uuid.v4(),
+                    displayName: "Literal Wildcards",
+                    emails: [{ address: "a_%b@outside.com", type: ContactAddressKind.WORK }],
+                }),
+            );
+
+            // Matches only because `_`/`%` are escaped into literals - unescaped they are SQL LIKE wildcards.
+            const matched = await deliverFrom("a_%b@outside.com");
+            expect(matched.inferenceClassification).toBe(MessageClassification.FOCUSED);
+
+            await messageRepo.clear();
+
+            // And the same wildcards must not let a different address match that stored contact.
+            const notMatched = await deliverFrom("aXYb@outside.com", "List-Unsubscribe: <https://outside.com/u>");
+            expect(notMatched.inferenceClassification).toBe(MessageClassification.OTHER);
+        });
+
+        it("Does not match a contact whose address merely shares a prefix with the sender.", async () => {
+            await createMailbox();
+            await contactRepo.save(
+                new ContactSQL({
+                    mailboxUid,
+                    folderUid: uuid.v4(),
+                    displayName: "Someone Else",
+                    emails: [{ address: "known@outside.com.au", type: ContactAddressKind.WORK }],
+                }),
+            );
+
+            // Anchored on the full quoted value, so "known@outside.com" must not match a stored
+            // "known@outside.com.au" - and with no other focused signal this stays on the default.
+            const message = await deliverFrom("known@outside.com");
+
+            expect(message.inferenceClassification).toBe(MessageClassification.FOCUSED);
+            const contacts = await contactRepo.find({ where: { mailboxUid } });
+            expect(contacts.length).toBe(1);
+        });
+
+        it("An explicit override wins over the bulk headers that would otherwise force other.", async () => {
+            await createMailbox();
+            await focusedInboxOverrideRepo.save(
+                new FocusedInboxOverrideSQL({
+                    mailboxUid,
+                    senderAddress: "news@outside.com",
+                    classifyAs: MessageClassification.FOCUSED,
+                }),
+            );
+
+            const message = await deliverFrom("news@outside.com", "List-Unsubscribe: <https://outside.com/u>");
+
+            expect(message.inferenceClassification).toBe(MessageClassification.FOCUSED);
+        });
+
+        it("Leaves junk-routed mail unclassified - Focused/Other is an Inbox-only concept.", async () => {
+            await createMailbox();
+
+            const message = await deliverFrom("spammer@outside.com", "X-Test-Force-Spam: true");
+
+            const folder = await folderRepo.findOne({ where: { uid: message.folderUid } });
+            expect(folder!.type).toBe(FolderType.JUNK);
+            expect(message.inferenceClassification).toBeFalsy();
         });
     });
 });

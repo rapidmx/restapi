@@ -11,16 +11,26 @@ import {
     DocDecorators,
     HttpRequest,
     HttpResponse,
+    RepoUtils,
     RouteDecorators,
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
+import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
-import { AuditAction, FolderType, Message, MessageFlags, Recipient } from "../models/types.js";
+import {
+    AuditAction,
+    FocusedInboxOverride,
+    FolderType,
+    Message,
+    MessageClassification,
+    MessageFlags,
+    Recipient,
+} from "../models/types.js";
 const { Config, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Delete, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
@@ -96,7 +106,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * `AuditLogEntry` without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so `classify()` can record an "always put this
+     * sender in Focused/Other" instruction without depending on either backend directly. */
+    protected abstract focusedInboxOverrideClass: any;
+
     private folderRepo?: RecoverableRepoUtils<any>;
+
+    private focusedInboxOverrideRepo?: RepoUtils<FocusedInboxOverride>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -120,6 +136,16 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             });
         }
         return this.folderRepo;
+    }
+
+    private async getFocusedInboxOverrideRepo(): Promise<RepoUtils<FocusedInboxOverride>> {
+        if (!this.focusedInboxOverrideRepo) {
+            this.focusedInboxOverrideRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.focusedInboxOverrideClass.name,
+                args: [this.focusedInboxOverrideClass],
+            });
+        }
+        return this.focusedInboxOverrideRepo;
     }
 
     /**
@@ -340,6 +366,93 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         );
 
         return updated;
+    }
+
+    /**
+     * Moves a message between the Focused and Other halves of the Inbox, and - with
+     * `applyToSender: true` - records a `FocusedInboxOverride` so every future message from that same
+     * sender goes there automatically. These are Outlook's two adjacent gestures ("Move to Other" vs.
+     * "Always move to Other"), and Microsoft Graph's equivalent pair of calls (a `PATCH` of
+     * `inferenceClassification` plus a POST to `inferenceClassificationOverrides`), collapsed into the
+     * single round trip a client actually wants.
+     *
+     * Reclassifying just this one message needs no action at all - the inherited
+     * `PUT /:id/inferenceClassification` (`BaseScopedChildRoute.updateProperty()`) already does it; this
+     * exists for the override half, and accepts the message update too so a client never has to make both
+     * calls and handle one of them failing.
+     *
+     * The override is keyed on the message's own `from` address (normalized), and upserts: re-classifying
+     * the same sender the other way later replaces the instruction rather than accumulating a second,
+     * contradictory one.
+     */
+    @Summary("Classify a message as Focused or Other")
+    @Description(
+        "Sets the message's Focused Inbox classification and, when applyToSender is set, records an " +
+            "override so all future mail from that sender is classified the same way.",
+    )
+    @Returns([Object])
+    @Post("/:id/classify")
+    public async classify(
+        @Param("id") id: string,
+        body: { classifyAs?: string; applyToSender?: boolean } | undefined,
+        @AuthUser user?: JWTUser,
+    ): Promise<T> {
+        if (!this.repoUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+
+        const classifyAs: string | undefined = body?.classifyAs;
+        if (classifyAs !== MessageClassification.FOCUSED && classifyAs !== MessageClassification.OTHER) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                `classifyAs must be one of: ${MessageClassification.FOCUSED}, ${MessageClassification.OTHER}.`,
+            );
+        }
+
+        const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
+        if (!message) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        if (!(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+
+        if (body?.applyToSender) {
+            await this.upsertSenderOverride(message.mailboxUid, message.from.address, classifyAs);
+        }
+
+        return await this.repoUtils.update(
+            { uid: message.uid, version: (message as any).version, inferenceClassification: classifyAs } as any,
+            message,
+            { user, ignoreACL: true },
+        );
+    }
+
+    /** Creates - or, when one already exists for this sender, updates - the mailbox's standing
+     * Focused/Other instruction for `senderAddress`. */
+    private async upsertSenderOverride(
+        mailboxUid: string,
+        senderAddress: string,
+        classifyAs: MessageClassification,
+    ): Promise<void> {
+        const normalized: string = normalizeAddress(senderAddress);
+        const repo: RepoUtils<FocusedInboxOverride> = await this.getFocusedInboxOverrideRepo();
+        const existing: FocusedInboxOverride[] = await repo.find(
+            { mailboxUid, senderAddress: normalized, limit: 1 } as any,
+            { ignoreACL: true, limit: 1 },
+        );
+        if (existing[0]) {
+            await repo.update(
+                { uid: existing[0].uid, version: (existing[0] as any).version, classifyAs },
+                existing[0],
+                { ignoreACL: true },
+            );
+            return;
+        }
+        await repo.create(new this.focusedInboxOverrideClass({ mailboxUid, senderAddress: normalized, classifyAs }), {
+            ignoreACL: true,
+        });
     }
 
     /**

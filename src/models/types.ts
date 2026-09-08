@@ -176,6 +176,18 @@ export enum MessageImportance {
 }
 
 /**
+ * Which half of a Focused Inbox split a `Message` belongs to - Outlook/Exchange's "Focused" vs "Other"
+ * view of one Inbox (NOT two separate folders; both live in the same `FolderType.INBOX`). The string
+ * values deliberately match Microsoft Graph's own `inferenceClassification` wire format, which is also
+ * what MAPI (`PidTagInferenceClassification`) and EAS (`Email2:InferenceClassification`) expose, so the
+ * sibling protocol packages can map this field straight through.
+ */
+export enum MessageClassification {
+    FOCUSED = "focused",
+    OTHER = "other",
+}
+
+/**
  * Defines a single email message stored in a `Folder`. The raw MIME source and sanitized HTML body are not
  * stored inline on this record — they live in the configured `BlobStore`, referenced by
  * `bodyBlobKey`/`sanitizedHtmlBlobKey`.
@@ -283,6 +295,43 @@ export interface Message extends RecoverableBaseEntity {
      * `inReplyTo`/`messageId`. Absent on a message written before this field existed - `conversations()`
      * (`BaseMessageRoute`) falls back to that message's own `uid` as a singleton conversation in that case. */
     conversationId?: string;
+
+    /**
+     * Which half of the Focused Inbox split this message belongs to, assigned once at delivery time by
+     * `util/FocusedInboxUtils.ts`'s `classifyMessage()` (see `ScanQueueJob.deliverMessage()`). Only ever set
+     * for mail actually delivered to the `INBOX` - junk-routed mail and mail a `MailFilterRule` moved
+     * elsewhere are left unclassified, since Focused/Other is an Inbox-only concept.
+     *
+     * Absent on a message written before this field existed (and on every non-Inbox message), so a client
+     * should treat absent as `FOCUSED` rather than hiding it: `?inferenceClassification=other` is the exact
+     * Other view, and the Focused view is everything else. Pre-existing mail is deliberately not backfilled -
+     * the same going-forward-only rollout Outlook's own Focused Inbox had.
+     */
+    inferenceClassification?: MessageClassification;
+}
+
+/**
+ * A user's explicit "always put mail from this sender in Focused/Other" instruction, which overrides
+ * whatever `classifyMessage()`'s heuristics would otherwise decide for that sender. Mirrors Microsoft
+ * Graph's `inferenceClassificationOverride` (and Exchange's `Set-FocusedInboxOverride`) - the entity a
+ * client writes when the user picks "Always move to Other" on a message.
+ *
+ * Per-mailbox and admin-free: exactly the same shape/ACL/route treatment as `MailFilterRule`, the library's
+ * other per-mailbox user-configurable behavior entity.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface FocusedInboxOverride extends BaseEntity {
+    /** The unique identifier of the `Mailbox` this override applies to. */
+    mailboxUid: string;
+
+    /** The sender address this override matches, normalized to lowercase (`util/AddressUtils.ts`'s
+     * `normalizeAddress()`) so matching is case-insensitive the same way every other address comparison in
+     * this library is. */
+    senderAddress: string;
+
+    /** Where mail from `senderAddress` should always go. */
+    classifyAs: MessageClassification;
 }
 
 /**

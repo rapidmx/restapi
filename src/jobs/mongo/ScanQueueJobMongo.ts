@@ -6,6 +6,9 @@ import { ScanQueueJob } from "../ScanQueueJob.js";
 import {
     AttachmentMongo,
     CalendarEventMongo,
+    ContactMongo,
+    DomainMongo,
+    FocusedInboxOverrideMongo,
     FolderMongo,
     IngestQueueEntryMongo,
     MailboxMongo,
@@ -26,7 +29,9 @@ export class ScanQueueJobMongo extends ScanQueueJob<
     MailboxMongo,
     MailFilterRuleMongo,
     CalendarEventMongo,
-    OofReplySuppressionMongo
+    OofReplySuppressionMongo,
+    FocusedInboxOverrideMongo,
+    ContactMongo
 > {
     protected ingestQueueClass: any = IngestQueueEntryMongo;
     protected folderClass: any = FolderMongo;
@@ -38,4 +43,7 @@ export class ScanQueueJobMongo extends ScanQueueJob<
     protected mailFilterRuleClass: any = MailFilterRuleMongo;
     protected calendarEventClass: any = CalendarEventMongo;
     protected oofReplySuppressionClass: any = OofReplySuppressionMongo;
+    protected focusedInboxOverrideClass: any = FocusedInboxOverrideMongo;
+    protected contactClass: any = ContactMongo;
+    protected domainClass: any = DomainMongo;
 }

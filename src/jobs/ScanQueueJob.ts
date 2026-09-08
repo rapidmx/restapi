@@ -8,8 +8,11 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, ScanPipelineResult } from "../scan/ScanPipeline.js";
+import { normalizeAddress } from "../util/AddressUtils.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { deriveConversationId } from "../util/ConversationUtils.js";
+import { getVerifiedDomainNames } from "../util/DomainUtils.js";
+import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { buildEventIcs, expandOccurrences, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
@@ -24,6 +27,8 @@ import {
     BusyStatus,
     CalendarEvent,
     CalendarEventStatus,
+    Contact,
+    FocusedInboxOverride,
     Folder,
     FolderType,
     IngestQueueEntry,
@@ -31,6 +36,7 @@ import {
     Mailbox,
     MailFilterRule,
     Message,
+    MessageClassification,
     MessageFlags,
     MessageImportance,
     OofReplySuppression,
@@ -107,6 +113,8 @@ export abstract class ScanQueueJob<
     MFR extends MailFilterRule,
     CE extends CalendarEvent,
     OS extends OofReplySuppression,
+    FIO extends FocusedInboxOverride,
+    C extends Contact,
 > extends BackgroundService {
     protected abstract ingestQueueClass: any;
     protected abstract folderClass: any;
@@ -118,6 +126,9 @@ export abstract class ScanQueueJob<
     protected abstract mailFilterRuleClass: any;
     protected abstract calendarEventClass: any;
     protected abstract oofReplySuppressionClass: any;
+    protected abstract focusedInboxOverrideClass: any;
+    protected abstract contactClass: any;
+    protected abstract domainClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -132,6 +143,8 @@ export abstract class ScanQueueJob<
     private mailFilterRuleRepo?: RepoUtils<MFR>;
     private calendarEventRepo?: RecoverableRepoUtils<CE>;
     private oofReplySuppressionRepo?: RepoUtils<OS>;
+    private focusedInboxOverrideRepo?: RepoUtils<FIO>;
+    private contactRepo?: RecoverableRepoUtils<C>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -154,6 +167,16 @@ export abstract class ScanQueueJob<
 
     @Config("mail:oof:resuppress_after_hours", 24)
     private resuppressAfterHours: number = 24;
+
+    /** Master switch for Focused Inbox classification at delivery time. Off leaves every message's
+     * `inferenceClassification` unset, which clients already treat as Focused - so turning this off is
+     * equivalent to not having the feature, with no other behavior change. */
+    @Config("mail:focused_inbox:enabled", true)
+    private focusedInboxEnabled: boolean = true;
+
+    /** The spam score at/above which mail that still cleared the junk cutoff is classified as Other. */
+    @Config("mail:focused_inbox:other_spam_score", 3)
+    private focusedInboxOtherSpamScore: number = 3;
 
     @Logger
     private logger: any;
@@ -203,6 +226,14 @@ export abstract class ScanQueueJob<
         this.oofReplySuppressionRepo = await this._objectFactory!.newInstance(RepoUtils, {
             name: this.oofReplySuppressionClass.name,
             args: [this.oofReplySuppressionClass],
+        });
+        this.focusedInboxOverrideRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.focusedInboxOverrideClass.name,
+            args: [this.focusedInboxOverrideClass],
+        });
+        this.contactRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+            name: this.contactClass.name,
+            args: [this.contactClass],
         });
     }
 
@@ -370,6 +401,15 @@ export abstract class ScanQueueJob<
             const folder: F = await this.resolveTargetFolder(entry.mailboxUid, filterResult.moveToFolderUid, defaultFolderType);
 
             const messageId = result.messageIdHeader ?? crypto.randomUUID();
+            const conversationId: string | undefined = deriveConversationId(result.references, result.inReplyTo, messageId);
+            // Classified before the row is written so the conversation lookup can't match this very message.
+            const inferenceClassification: MessageClassification | undefined = await this.classifyForInbox(
+                entry,
+                result,
+                folder,
+                isJunk,
+                conversationId,
+            );
             const message: M = await this.messageRepo!.create(
                 new this.messageClass({
                     uid: targetUid,
@@ -388,7 +428,8 @@ export abstract class ScanQueueJob<
                     importance: MessageImportance.NORMAL,
                     inReplyTo: result.inReplyTo,
                     references: result.references,
-                    conversationId: deriveConversationId(result.references, result.inReplyTo, messageId),
+                    conversationId,
+                    inferenceClassification,
                     hasAttachments: storedAttachments.length > 0,
                     scanResultUid: scanResult.uid,
                 }),
@@ -405,6 +446,21 @@ export abstract class ScanQueueJob<
                 continue;
             }
             const copyMessageId = result.messageIdHeader ?? crypto.randomUUID();
+            const copyConversationId: string | undefined = deriveConversationId(
+                result.references,
+                result.inReplyTo,
+                copyMessageId,
+            );
+            // A rule can copy into the Inbox itself, in which case that copy is classified like any other
+            // Inbox mail; a copy filed anywhere else is left unclassified (`classifyForInbox()` returns
+            // `undefined` without doing any lookup for a non-Inbox destination).
+            const copyClassification: MessageClassification | undefined = await this.classifyForInbox(
+                entry,
+                result,
+                copyFolder,
+                isJunk,
+                copyConversationId,
+            );
             const copyMessage: M = await this.messageRepo!.create(
                 new this.messageClass({
                     folderUid: copyFolder.uid,
@@ -422,7 +478,8 @@ export abstract class ScanQueueJob<
                     importance: MessageImportance.NORMAL,
                     inReplyTo: result.inReplyTo,
                     references: result.references,
-                    conversationId: deriveConversationId(result.references, result.inReplyTo, copyMessageId),
+                    conversationId: copyConversationId,
+                    inferenceClassification: copyClassification,
                     hasAttachments: storedAttachments.length > 0,
                     scanResultUid: scanResult.uid,
                 }),
@@ -458,6 +515,97 @@ export abstract class ScanQueueJob<
             // to the default destination rather than failing delivery outright.
         }
         return await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, mailboxUid, defaultType);
+    }
+
+    /**
+     * Builds the query fragment that matches a `Contact` whose `emails` array contains `address`. MongoDB
+     * addresses an array element's own field with dot notation natively, so the default here does exactly
+     * that. `ScanQueueJobSQL` overrides it: the SQL backend stores `emails` as a serialized `simple-json`
+     * column, where no field-addressing query is possible at all - the same problem/solution as
+     * `MailIngestRouteSQL.aliasQueryValue()` and `MailboxRouteSQL.findAccessibleMailboxUids()`.
+     */
+    protected contactEmailQuery(address: string): any {
+        return { "emails.address": address };
+    }
+
+    /**
+     * Classifies a message about to be filed into `folder` as Focused or Other (see
+     * `util/FocusedInboxUtils.ts`'s `classifyMessage()` for the decision itself, which is a pure function -
+     * this method only gathers the signals it needs).
+     *
+     * Returns `undefined` - leaving `Message.inferenceClassification` unset - for anything that isn't
+     * ordinary mail landing in the Inbox: junk-routed mail (matching the existing precedent that junk runs
+     * no rules, auto-replies, or iTIP processing), mail a `MailFilterRule` filed somewhere other than the
+     * Inbox, and every message at all when the feature is switched off. Those cases short-circuit before
+     * any lookup, so a deployment not using Focused Inbox pays nothing for it.
+     */
+    private async classifyForInbox(
+        entry: Q,
+        result: ScanPipelineResult,
+        folder: F,
+        isJunk: boolean,
+        conversationId: string | undefined,
+    ): Promise<MessageClassification | undefined> {
+        if (!this.focusedInboxEnabled || isJunk || folder.type !== FolderType.INBOX) {
+            return undefined;
+        }
+
+        const senderAddress: string = normalizeAddress(entry.envelopeFrom);
+        const [override, isKnownCorrespondent, domains] = await Promise.all([
+            this.findFocusedInboxOverride(entry.mailboxUid, senderAddress),
+            this.isKnownCorrespondent(entry.mailboxUid, senderAddress, conversationId),
+            getVerifiedDomainNames(this._objectFactory!, this.domainClass),
+        ]);
+
+        const senderDomain: string | undefined = senderAddress.split("@")[1];
+        const signals: FocusedInboxSignals = {
+            override,
+            isInternalSender: !!senderDomain && domains.includes(senderDomain),
+            isKnownCorrespondent,
+            listUnsubscribeHeader: result.listUnsubscribeHeader,
+            precedenceHeader: result.precedenceHeader,
+            autoSubmittedHeader: result.autoSubmittedHeader,
+            spamScore: result.spam.score,
+        };
+        return classifyMessage(signals, this.focusedInboxOtherSpamScore);
+    }
+
+    /** The user's explicit Focused/Other choice for `senderAddress`, if they've made one. */
+    private async findFocusedInboxOverride(
+        mailboxUid: string,
+        senderAddress: string,
+    ): Promise<MessageClassification | undefined> {
+        const matches: FIO[] = await this.focusedInboxOverrideRepo!.find(
+            { mailboxUid, senderAddress, limit: 1 } as any,
+            { ignoreACL: true, limit: 1 },
+        );
+        return matches[0]?.classifyAs;
+    }
+
+    /**
+     * Whether this mailbox demonstrably corresponds with `senderAddress`: either it already holds another
+     * message in the same conversation (this one is a reply into a thread the user is part of), or the
+     * sender is in the mailbox's own Contacts.
+     */
+    private async isKnownCorrespondent(
+        mailboxUid: string,
+        senderAddress: string,
+        conversationId: string | undefined,
+    ): Promise<boolean> {
+        if (conversationId) {
+            const thread: M[] = await this.messageRepo!.find(
+                { mailboxUid, conversationId, limit: 1 } as any,
+                { ignoreACL: true, limit: 1 },
+            );
+            if (thread.length > 0) {
+                return true;
+            }
+        }
+        const contacts: C[] = await this.contactRepo!.find(
+            { mailboxUid, ...this.contactEmailQuery(senderAddress), limit: 1 },
+            { ignoreACL: true, limit: 1 },
+        );
+        return contacts.length > 0;
     }
 
     private async storeAttachmentBlobs(attachments: ScanPipelineAttachmentResult[]): Promise<StoredAttachment[]> {

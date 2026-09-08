@@ -6,6 +6,7 @@ export * from "./ContactListRouteMongo.js";
 export * from "./ContactRouteMongo.js";
 export * from "./DistributionListRouteMongo.js";
 export * from "./DomainRouteMongo.js";
+export * from "./FocusedInboxOverrideRouteMongo.js";
 export * from "./FolderRouteMongo.js";
 export * from "./IngestQueueRouteMongo.js";
 export * from "./MailboxRouteMongo.js";
