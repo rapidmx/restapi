@@ -299,9 +299,12 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
      * envelope in hand before per-recipient resolution/fan-out. Called once at the top of `deliver()`, before
      * anything is queued/relayed.
      *
-     * Returns immediately (no parse attempted) when no `TransportRule`s are configured at all - zero overhead
-     * for a deployment that doesn't use this feature. A matching `reject` action sends a rejection notice to
-     * `envelopeFrom` (best-effort - a send failure is logged, not propagated) and tells the caller to skip all
+     * Returns immediately (no parse attempted) when no *enabled* `TransportRule`s exist - zero overhead for a
+     * deployment that doesn't use this feature, or has disabled all its rules. `enabled: true` is pushed into
+     * the query itself rather than fetched-then-filtered, matching `evaluateTransportRules()`'s own filter -
+     * see `MailFilterRule`'s identical `ScanQueueJob` fetch for the same convention. A matching `reject`
+     * action sends a rejection notice to `envelopeFrom` (best-effort - a send failure is logged, not
+     * propagated) and tells the caller to skip all
      * delivery; a matching `add_header`/`add_recipient` action is folded into the returned `raw`/`envelopeTo`
      * so the rest of `deliver()`'s existing per-recipient loop applies it uniformly (an added recipient is
      * resolved exactly like any other; an added header is present in every stored/relayed copy, including a
@@ -314,7 +317,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         envelopeFrom: string,
         envelopeTo: string[],
     ): Promise<{ reject: boolean; raw: Buffer; envelopeTo: string[]; quarantineReason?: QuarantineReason }> {
-        const rules: TransportRule[] = await this.transportRuleRepo!.find({}, { ignoreACL: true });
+        const rules: TransportRule[] = await this.transportRuleRepo!.find({ enabled: true }, { ignoreACL: true });
         if (rules.length === 0) {
             return { reject: false, raw, envelopeTo };
         }

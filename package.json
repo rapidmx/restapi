@@ -48,7 +48,7 @@
         "@opensearch-project/opensearch": "^3.5.1",
         "@rapidrest/cli": "^1.0.1",
         "@rapidrest/core": "^5.1.0",
-        "@rapidrest/service-core": "^1.5.0",
+        "@rapidrest/service-core": "^1.6.0",
         "@swc/core": "^1.16.1",
         "@types/html-to-text": "^9.0.4",
         "@types/mailparser": "^3.4.6",

@@ -129,7 +129,7 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
         const attachmentText: string[] = [];
         if (message.hasAttachments) {
             const attachments: A[] = await this.attachmentRepo!.find(
-                { messageUid: message.uid },
+                { messageUid: message.uid, extractedTextBlobKey: "ne(null)" },
                 { ignoreACL: true },
             );
             for (const attachment of attachments) {

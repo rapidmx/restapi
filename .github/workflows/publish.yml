@@ -6,6 +6,10 @@ on:
     types:
       - completed
 
+permissions:
+  id-token: write  # Required for OIDC
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -33,12 +37,16 @@ jobs:
     if: needs.check.outputs.is_release_tag == 'true'
     runs-on: ubuntu-latest
     environment: publish
-    container:
-      image: node:lts-trixie-slim
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false  # never use caching in release builds
 
       - name: Enable corepack
         run: corepack enable
@@ -55,12 +63,10 @@ jobs:
             ${{ runner.os }}-yarn-
 
       - name: Install dependencies
-        run: yarn install --frozen-lockfile
+        run: export REDISMS_DISABLE_POSTINSTALL=true && yarn install --frozen-lockfile
 
       - name: Build
         run: yarn build
 
       - name: Publish to npm
-        env:
-          YARN_NPM_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
