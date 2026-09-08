@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { DistributionListMongo, MailboxMongo } from "../../mongo.js";
+import { AuditLogEntryMongo, DistributionListMongo, MailboxMongo } from "../../mongo.js";
 import { BaseDistributionListRoute } from "../BaseDistributionListRoute.js";
 const { Model } = RouteDecorators;
 
@@ -11,4 +11,5 @@ const { Model } = RouteDecorators;
 export class DistributionListRouteMongo extends BaseDistributionListRoute<DistributionListMongo> {
     protected readonly repoUtilsClass: any = RepoUtils;
     protected mailboxClass: any = MailboxMongo;
+    protected auditLogClass: any = AuditLogEntryMongo;
 }

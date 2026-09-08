@@ -3,12 +3,11 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { AuditLogEntrySQL, TransportRuleSQL } from "../../sql.js";
-import { BaseTransportRuleRoute } from "../BaseTransportRuleRoute.js";
+import { AuditLogEntrySQL } from "../../sql.js";
+import { BaseAuditLogRoute } from "../BaseAuditLogRoute.js";
 const { Model } = RouteDecorators;
 
-@Model(TransportRuleSQL)
-export class TransportRuleRouteSQL extends BaseTransportRuleRoute<TransportRuleSQL> {
+@Model(AuditLogEntrySQL)
+export class AuditLogRouteSQL extends BaseAuditLogRoute<AuditLogEntrySQL> {
     protected readonly repoUtilsClass: any = RepoUtils;
-    protected auditLogClass: any = AuditLogEntrySQL;
 }

@@ -7,8 +7,9 @@ import { request } from "@rapidrest/service-core/test";
 import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
+import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { TransportRuleMongo } from "../../../src/models/mongo/TransportRuleMongo.js";
-import { TransportRuleActionType } from "../../../src/models/types.js";
+import { AuditAction, TransportRuleActionType } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
 
@@ -25,6 +26,7 @@ describe("Route:TransportRuleMongo Tests", () => {
     const server: Server = new Server({ config, basePath: "./test/server-mongo", logger, objectFactory });
     const baseUrl = "/mongo/transport-rules";
     let repo: MongoRepository<TransportRuleMongo>;
+    let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -53,6 +55,7 @@ describe("Route:TransportRuleMongo Tests", () => {
         const conn: any = connMgr?.connections.get("mongo");
         if (conn instanceof MongoConnection) {
             repo = conn.getMongoRepository("TransportRuleMongo");
+            auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -65,11 +68,13 @@ describe("Route:TransportRuleMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        try {
-            await repo.clear();
-        } catch (err: any) {
-            if (err.message !== "ns not found") {
-                throw err;
+        for (const r of [repo, auditLogRepo]) {
+            try {
+                await r.clear();
+            } catch (err: any) {
+                if (err.message !== "ns not found") {
+                    throw err;
+                }
             }
         }
     });
@@ -182,6 +187,38 @@ describe("Route:TransportRuleMongo Tests", () => {
             .get(`${baseUrl}/${rule.uid}`)
             .set("Authorization", "jwt " + adminToken);
         expect(findByIdAfterDelete.status).toBe(404);
+    });
+
+    it("Writes an AuditLogEntry for create, update, and delete.", async () => {
+        const createResult = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ name: "Reject spam", enabled: true, sequence: 0, stopProcessingRules: false, conditions: {}, actions: [] });
+        expect(createResult.status).toBeGreaterThanOrEqual(200);
+        expect(createResult.status).toBeLessThan(300);
+        const ruleUid = createResult.body.uid;
+
+        const updateResult = await request(server.getApplication())
+            .put(`${baseUrl}/${ruleUid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: ruleUid, version: createResult.body.version, name: "Renamed" });
+        expect(updateResult.status).toBe(200);
+
+        const deleteResult = await request(server.getApplication())
+            .delete(`${baseUrl}/${ruleUid}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(deleteResult.status).toBeGreaterThanOrEqual(200);
+        expect(deleteResult.status).toBeLessThan(300);
+
+        const entries = await auditLogRepo.find({ targetUid: ruleUid }).toArray();
+        const actions = entries.map((e) => e.action).sort();
+        expect(actions).toEqual(
+            [AuditAction.TRANSPORT_RULE_CREATE, AuditAction.TRANSPORT_RULE_UPDATE, AuditAction.TRANSPORT_RULE_DELETE].sort(),
+        );
+        for (const entry of entries) {
+            expect(entry.targetType).toBe("TransportRule");
+            expect(entry.actorUserUid).toBe(admin.uid);
+        }
     });
 
     it("Returns 404 updating a transport rule that doesn't exist.", async () => {

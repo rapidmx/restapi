@@ -14,7 +14,8 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { normalizeAddress } from "../util/AddressUtils.js";
-import { DistributionList, Mailbox } from "../models/types.js";
+import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditAction, DistributionList, Mailbox } from "../models/types.js";
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 const { Config } = ObjectDecorators;
 
@@ -46,6 +47,10 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
     protected domains: string[] = [];
 
     protected abstract mailboxClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so `recordAuditLog()` can persist an `AuditLogEntry`
+     * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
+    protected abstract auditLogClass: any;
 
     private mailboxRepo?: RepoUtils<Mailbox>;
 
@@ -108,9 +113,25 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
             seenUids.add((o as any).uid);
         }
 
-        return Array.isArray(obj)
+        const created: T[] = Array.isArray(obj)
             ? await this.doBulkCreate(objs, { req, user, ignoreACL: true })
-            : await this.doCreateObject(objs[0], { req, user, ignoreACL: true });
+            : [await this.doCreateObject(objs[0], { req, user, ignoreACL: true })];
+
+        for (const list of created) {
+            await recordAuditLog(
+                this._objectFactory!,
+                this.auditLogClass,
+                { config: this.config, req, user, logger: this.logger },
+                {
+                    action: AuditAction.DISTRIBUTION_LIST_CREATE,
+                    targetType: "DistributionList",
+                    targetUid: list.uid,
+                    details: { primarySmtpAddress: list.primarySmtpAddress, name: list.name },
+                },
+            );
+        }
+
+        return Array.isArray(obj) ? created : created[0];
     }
 
     @RequiresTrustedRole()
@@ -124,7 +145,21 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        return await this.repoUtils!.update(obj, existing, { user, version: (obj as any).version, ignoreACL: true });
+        const updated: T = await this.repoUtils!.update(obj, existing, { user, version: (obj as any).version, ignoreACL: true });
+
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, req, user, logger: this.logger },
+            {
+                action: AuditAction.DISTRIBUTION_LIST_UPDATE,
+                targetType: "DistributionList",
+                targetUid: updated.uid,
+                details: { primarySmtpAddress: updated.primarySmtpAddress, name: updated.name },
+            },
+        );
+
+        return updated;
     }
 
     @RequiresTrustedRole()
@@ -140,6 +175,18 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
         await this.repoUtils!.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });
+
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, req, user, logger: this.logger },
+            {
+                action: AuditAction.DISTRIBUTION_LIST_DELETE,
+                targetType: "DistributionList",
+                targetUid: existing.uid,
+                details: { primarySmtpAddress: existing.primarySmtpAddress, name: existing.name },
+            },
+        );
     }
 
     @RequiresTrustedRole()

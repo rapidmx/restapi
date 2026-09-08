@@ -16,8 +16,10 @@ import {
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
+import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { DistributionListSQL } from "../../../src/models/sql/DistributionListSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { AuditAction } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
 describe("Route:MailboxSQL Tests", () => {
@@ -28,6 +30,7 @@ describe("Route:MailboxSQL Tests", () => {
     let repo: Repository<MailboxSQL>;
     let aclRepo: Repository<AccessControlListSQL>;
     let distributionListRepo: Repository<DistributionListSQL>;
+    let auditLogRepo: Repository<AuditLogEntrySQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -113,6 +116,7 @@ describe("Route:MailboxSQL Tests", () => {
         if (isSqlDataSource(conn)) {
             repo = conn.getRepository(MailboxSQL);
             distributionListRepo = conn.getRepository(DistributionListSQL);
+            auditLogRepo = conn.getRepository(AuditLogEntrySQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -126,6 +130,7 @@ describe("Route:MailboxSQL Tests", () => {
     beforeEach(async () => {
         await repo.clear();
         await distributionListRepo.clear();
+        await auditLogRepo.clear();
     });
 
     it("Listing mailboxes anonymously (no Authorization header) returns an empty list, not another user's data.", async () => {
@@ -334,6 +339,47 @@ describe("Route:MailboxSQL Tests", () => {
         // The admin who created it shouldn't be left with a stray self-grant on its ACL either.
         const acl: any = await aclRepo.findOne({ where: { uid: result.body.uid } });
         expect(acl?.records ?? []).toEqual([]);
+    });
+
+    it("Writes an AuditLogEntry when a trusted caller creates a mailbox, but not for self-service creation.", async () => {
+        const sharedResult = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Shared Support Mailbox",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+            });
+        expect(sharedResult.status).toBeGreaterThanOrEqual(200);
+        expect(sharedResult.status).toBeLessThan(300);
+
+        const sharedEntries = await auditLogRepo.find({ where: { targetUid: sharedResult.body.uid } });
+        expect(sharedEntries.length).toBe(1);
+        expect(sharedEntries[0].action).toBe(AuditAction.MAILBOX_CREATE);
+        expect(sharedEntries[0].targetType).toBe("Mailbox");
+        expect(sharedEntries[0].mailboxUid).toBe(sharedResult.body.uid);
+        expect(sharedEntries[0].actorUserUid).toBe(admin.uid);
+
+        const selfServiceResult = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                ownerUserUid: owner.uid,
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Self Service Mailbox",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+            });
+        expect(selfServiceResult.status).toBeGreaterThanOrEqual(200);
+        expect(selfServiceResult.status).toBeLessThan(300);
+
+        const selfServiceEntries = await auditLogRepo.find({ where: { targetUid: selfServiceResult.body.uid } });
+        expect(selfServiceEntries.length).toBe(0);
     });
 
     it("Rejects a non-trusted caller creating a resource mailbox (403).", async () => {

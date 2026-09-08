@@ -14,10 +14,11 @@ import {
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
+import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
-import { FolderType, MessageImportance, RecipientType } from "../../../src/models/types.js";
+import { AuditAction, FolderType, MessageImportance, RecipientType } from "../../../src/models/types.js";
 import { registerTestDoubles, InMemoryBlobStore, RecordingMailTransport } from "../../testDoubles.js";
 
 describe("Route:MessageSQL Tests", () => {
@@ -29,6 +30,7 @@ describe("Route:MessageSQL Tests", () => {
     let folderRepo: Repository<FolderSQL>;
     let messageRepo: Repository<MessageSQL>;
     let aclRepo: Repository<AccessControlListSQL>;
+    let auditLogRepo: Repository<AuditLogEntrySQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -115,6 +117,7 @@ describe("Route:MessageSQL Tests", () => {
             mailboxRepo = conn.getRepository(MailboxSQL);
             folderRepo = conn.getRepository(FolderSQL);
             messageRepo = conn.getRepository(MessageSQL);
+            auditLogRepo = conn.getRepository(AuditLogEntrySQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -129,6 +132,7 @@ describe("Route:MessageSQL Tests", () => {
         await messageRepo.clear();
         await folderRepo.clear();
         await mailboxRepo.clear();
+        await auditLogRepo.clear();
         // The recording transport accumulates across tests otherwise, since it's a singleton for the life of
         // this file's one `server` instance.
         const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport");
@@ -429,6 +433,29 @@ describe("Route:MessageSQL Tests", () => {
 
             expect(result.status).toBe(404);
         });
+
+        it("Writes an AuditLogEntry when a message is recalled.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const sentFolder = await createFolder(mailbox.uid, FolderType.SENT_ITEMS);
+            const message = await createMessage(mailbox.uid, sentFolder.uid, {
+                messageId: "recall-audit@example.com",
+                subject: "Recall Me",
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/recall`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+
+            const entries = await auditLogRepo.find({ where: { targetUid: message.uid } });
+            expect(entries.length).toBe(1);
+            expect(entries[0].action).toBe(AuditAction.MESSAGE_RECALL);
+            expect(entries[0].targetType).toBe("Message");
+            expect(entries[0].mailboxUid).toBe(mailbox.uid);
+            expect(entries[0].actorUserUid).toBe(owner.uid);
+        });
     });
 
     describe("conversations()", () => {
@@ -607,5 +634,25 @@ describe("Route:MessageSQL Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.body).toEqual([]);
+    });
+
+    it("Writes an AuditLogEntry when a message is deleted.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+        const message = await createMessage(mailbox.uid, folder.uid, { subject: "Delete Me" });
+
+        const result = await request(server.getApplication())
+            .delete(`${baseUrl}/${message.uid}`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+
+        const entries = await auditLogRepo.find({ where: { targetUid: message.uid } });
+        expect(entries.length).toBe(1);
+        expect(entries[0].action).toBe(AuditAction.MESSAGE_DELETE);
+        expect(entries[0].targetType).toBe("Message");
+        expect(entries[0].mailboxUid).toBe(mailbox.uid);
+        expect(entries[0].actorUserUid).toBe(owner.uid);
     });
 });

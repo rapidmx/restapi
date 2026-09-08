@@ -7,10 +7,11 @@ import { request } from "@rapidrest/service-core/test";
 import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
+import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
-import { FolderType, MessageImportance, RecipientType } from "../../../src/models/types.js";
+import { AuditAction, FolderType, MessageImportance, RecipientType } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles, InMemoryBlobStore, RecordingMailTransport } from "../../testDoubles.js";
 
@@ -30,6 +31,7 @@ describe("Route:MessageMongo Tests", () => {
     let folderRepo: MongoRepository<FolderMongo>;
     let messageRepo: MongoRepository<MessageMongo>;
     let aclRepo: MongoRepository<any>;
+    let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -115,6 +117,7 @@ describe("Route:MessageMongo Tests", () => {
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
             folderRepo = conn.getMongoRepository("FolderMongo");
             messageRepo = conn.getMongoRepository("MessageMongo");
+            auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -127,7 +130,7 @@ describe("Route:MessageMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, folderRepo, messageRepo]) {
+        for (const repo of [mailboxRepo, folderRepo, messageRepo, auditLogRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -555,6 +558,29 @@ describe("Route:MessageMongo Tests", () => {
 
             expect(result.status).toBe(404);
         });
+
+        it("Writes an AuditLogEntry when a message is recalled.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const sentFolder = await createFolder(mailbox.uid, FolderType.SENT_ITEMS);
+            const message = await createMessage(mailbox.uid, sentFolder.uid, {
+                messageId: "recall-audit@example.com",
+                subject: "Recall Me",
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/recall`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+
+            const entries = await auditLogRepo.find({ targetUid: message.uid }).toArray();
+            expect(entries.length).toBe(1);
+            expect(entries[0].action).toBe(AuditAction.MESSAGE_RECALL);
+            expect(entries[0].targetType).toBe("Message");
+            expect(entries[0].mailboxUid).toBe(mailbox.uid);
+            expect(entries[0].actorUserUid).toBe(owner.uid);
+        });
     });
 
     describe("conversations()", () => {
@@ -733,5 +759,25 @@ describe("Route:MessageMongo Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.body).toEqual([]);
+    });
+
+    it("Writes an AuditLogEntry when a message is deleted.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+        const message = await createMessage(mailbox.uid, folder.uid, { subject: "Delete Me" });
+
+        const result = await request(server.getApplication())
+            .delete(`${baseUrl}/${message.uid}`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+
+        const entries = await auditLogRepo.find({ targetUid: message.uid }).toArray();
+        expect(entries.length).toBe(1);
+        expect(entries[0].action).toBe(AuditAction.MESSAGE_DELETE);
+        expect(entries[0].targetType).toBe("Message");
+        expect(entries[0].mailboxUid).toBe(mailbox.uid);
+        expect(entries[0].actorUserUid).toBe(owner.uid);
     });
 });

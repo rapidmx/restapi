@@ -1,4 +1,5 @@
 export * from "./AttachmentRouteMongo.js";
+export * from "./AuditLogRouteMongo.js";
 export * from "./CalendarEventRouteMongo.js";
 export * from "./CalendarShareLinkRouteMongo.js";
 export * from "./ContactListRouteMongo.js";

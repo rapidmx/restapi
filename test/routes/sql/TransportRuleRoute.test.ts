@@ -8,8 +8,9 @@ import { Server, ObjectFactory, ConnectionManager, isSqlDataSource } from "@rapi
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
+import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { TransportRuleSQL } from "../../../src/models/sql/TransportRuleSQL.js";
-import { TransportRuleActionType } from "../../../src/models/types.js";
+import { AuditAction, TransportRuleActionType } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
 describe("Route:TransportRuleSQL Tests", () => {
@@ -18,6 +19,7 @@ describe("Route:TransportRuleSQL Tests", () => {
     const server: Server = new Server({ config, basePath: "./test/server-sql", logger, objectFactory });
     const baseUrl = "/sql/transport-rules";
     let repo: Repository<TransportRuleSQL>;
+    let auditLogRepo: Repository<AuditLogEntrySQL>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -45,6 +47,7 @@ describe("Route:TransportRuleSQL Tests", () => {
         const conn: any = connMgr?.connections.get("sql");
         if (isSqlDataSource(conn)) {
             repo = conn.getRepository(TransportRuleSQL);
+            auditLogRepo = conn.getRepository(AuditLogEntrySQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -57,6 +60,7 @@ describe("Route:TransportRuleSQL Tests", () => {
 
     beforeEach(async () => {
         await repo.clear();
+        await auditLogRepo.clear();
     });
 
     it("A non-trusted caller cannot create a transport rule (403).", async () => {
@@ -167,6 +171,38 @@ describe("Route:TransportRuleSQL Tests", () => {
             .get(`${baseUrl}/${rule.uid}`)
             .set("Authorization", "jwt " + adminToken);
         expect(findByIdAfterDelete.status).toBe(404);
+    });
+
+    it("Writes an AuditLogEntry for create, update, and delete.", async () => {
+        const createResult = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ name: "Reject spam", enabled: true, sequence: 0, stopProcessingRules: false, conditions: {}, actions: [] });
+        expect(createResult.status).toBeGreaterThanOrEqual(200);
+        expect(createResult.status).toBeLessThan(300);
+        const ruleUid = createResult.body.uid;
+
+        const updateResult = await request(server.getApplication())
+            .put(`${baseUrl}/${ruleUid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: ruleUid, version: createResult.body.version, name: "Renamed" });
+        expect(updateResult.status).toBe(200);
+
+        const deleteResult = await request(server.getApplication())
+            .delete(`${baseUrl}/${ruleUid}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(deleteResult.status).toBeGreaterThanOrEqual(200);
+        expect(deleteResult.status).toBeLessThan(300);
+
+        const entries = await auditLogRepo.find({ where: { targetUid: ruleUid } });
+        const actions = entries.map((e) => e.action).sort();
+        expect(actions).toEqual(
+            [AuditAction.TRANSPORT_RULE_CREATE, AuditAction.TRANSPORT_RULE_UPDATE, AuditAction.TRANSPORT_RULE_DELETE].sort(),
+        );
+        for (const entry of entries) {
+            expect(entry.targetType).toBe("TransportRule");
+            expect(entry.actorUserUid).toBe(admin.uid);
+        }
     });
 
     it("Returns 404 updating a transport rule that doesn't exist.", async () => {

@@ -624,6 +624,56 @@ export interface TransportRule extends BaseEntity {
     actions: TransportRuleAction[];
 }
 
+/** The kind of admin/policy or sensitive mailbox-content action an `AuditLogEntry` records - see that
+ * interface's own doc comment for this pass's scope. Extensible for future roadmap items (e.g. domains
+ * management). */
+export enum AuditAction {
+    MAILBOX_CREATE = "mailbox.create",
+    DISTRIBUTION_LIST_CREATE = "distribution_list.create",
+    DISTRIBUTION_LIST_UPDATE = "distribution_list.update",
+    DISTRIBUTION_LIST_DELETE = "distribution_list.delete",
+    TRANSPORT_RULE_CREATE = "transport_rule.create",
+    TRANSPORT_RULE_UPDATE = "transport_rule.update",
+    TRANSPORT_RULE_DELETE = "transport_rule.delete",
+    MESSAGE_DELETE = "message.delete",
+    MESSAGE_RECALL = "message.recall",
+}
+
+/**
+ * A single durable, admin-queryable record of "who did what, when" - Exchange's Admin/Mailbox Audit Log
+ * concept. Written only by `util/AuditLogUtils.ts`'s `recordAuditLog()` (called directly from the handful
+ * of admin/policy and sensitive mailbox-content routes this covers - see `AuditAction`'s own doc comment
+ * for the exact scope), never created/updated/deleted through this entity's own route (see
+ * `BaseAuditLogRoute`'s doc comment for how that's enforced) - an audit trail that could be edited via the
+ * same API it's meant to hold accountable wouldn't be trustworthy.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface AuditLogEntry extends BaseEntity {
+    /** The mailbox this action pertains to, if any - absent for an org-wide action (a `DistributionList`/
+     * `TransportRule` change isn't scoped to one mailbox). */
+    mailboxUid?: string;
+
+    /** The uid of the user who performed this action, if a human caller (vs. a background job). */
+    actorUserUid?: string;
+
+    action: AuditAction;
+
+    /** The entity type this action was performed on, e.g. `"Mailbox"`, `"DistributionList"`,
+     * `"TransportRule"`, `"Message"`. */
+    targetType: string;
+
+    /** The uid of the specific record this action was performed on. */
+    targetUid: string;
+
+    /** The caller's IP address (`NetUtils.getIPAddress()`, trusted-proxy-aware), if available. */
+    ip?: string;
+
+    /** A small, action-specific identifying snapshot (e.g. the affected address/name) - not a full
+     * field-level diff of what changed. */
+    details?: Record<string, any>;
+}
+
 /**
  * Defines a single named, roaming email signature (OWA/New Outlook-style server-side signature, as opposed to
  * Desktop Outlook's local-only signatures) belonging to a `Mailbox`. This library does not compose message

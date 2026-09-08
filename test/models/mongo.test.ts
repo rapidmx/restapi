@@ -5,6 +5,7 @@
 import {
     AttendeeResponseStatus,
     AttendeeRole,
+    AuditAction,
     AvVerdict,
     BusyStatus,
     CalendarEventStatus,
@@ -21,6 +22,7 @@ import {
     TransportRuleActionType,
 } from "../../src/models/types.js";
 import { AttachmentMongo } from "../../src/models/mongo/AttachmentMongo.js";
+import { AuditLogEntryMongo } from "../../src/models/mongo/AuditLogEntryMongo.js";
 import { CalendarEventMongo } from "../../src/models/mongo/CalendarEventMongo.js";
 import { CalendarShareLinkMongo } from "../../src/models/mongo/CalendarShareLinkMongo.js";
 import { ContactMongo } from "../../src/models/mongo/ContactMongo.js";
@@ -731,6 +733,47 @@ describe("Mongo model default construction", () => {
         expect(obj.stopProcessingRules).toBe(true);
         expect(obj.conditions).toEqual({ subjectContains: ["confidential"] });
         expect(obj.actions).toEqual([{ type: TransportRuleActionType.REJECT }]);
+    });
+
+    it("AuditLogEntryMongo falls back to class defaults when constructed with no data.", () => {
+        const obj = new AuditLogEntryMongo();
+
+        expect(obj.mailboxUid).toBeUndefined();
+        expect(obj.actorUserUid).toBeUndefined();
+        expect(obj.action).toBe(AuditAction.MAILBOX_CREATE);
+        expect(obj.targetType).toBe("");
+        expect(obj.targetUid).toBe("");
+        expect(obj.ip).toBeUndefined();
+        expect(obj.details).toBeUndefined();
+    });
+
+    it("AuditLogEntryMongo applies provided overrides when constructed with data.", () => {
+        const obj = new AuditLogEntryMongo({
+            mailboxUid: "mbx-1",
+            actorUserUid: "user-1",
+            action: AuditAction.MESSAGE_DELETE,
+            targetType: "Message",
+            targetUid: "msg-1",
+            ip: "203.0.113.5",
+            details: { subject: "Hello" },
+        });
+
+        expect(obj.mailboxUid).toBe("mbx-1");
+        expect(obj.actorUserUid).toBe("user-1");
+        expect(obj.action).toBe(AuditAction.MESSAGE_DELETE);
+        expect(obj.targetType).toBe("Message");
+        expect(obj.targetUid).toBe("msg-1");
+        expect(obj.ip).toBe("203.0.113.5");
+        expect(obj.details).toEqual({ subject: "Hello" });
+    });
+
+    it("AuditLogEntryMongo keeps class defaults for fields omitted from a partial constructor object.", () => {
+        const obj = new AuditLogEntryMongo({ mailboxUid: "mbx-2" });
+
+        expect(obj.mailboxUid).toBe("mbx-2");
+        expect(obj.action).toBe(AuditAction.MAILBOX_CREATE);
+        expect(obj.targetType).toBe("");
+        expect(obj.targetUid).toBe("");
     });
 
     it("DeviceSyncStateMongo falls back to class defaults when constructed with no data.", () => {

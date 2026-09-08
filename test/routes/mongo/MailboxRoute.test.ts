@@ -15,8 +15,10 @@ import {
 } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
+import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { DistributionListMongo } from "../../../src/models/mongo/DistributionListMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
+import { AuditAction } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
 
@@ -35,6 +37,7 @@ describe("Route:MailboxMongo Tests", () => {
     let repo: MongoRepository<MailboxMongo>;
     let aclRepo: MongoRepository<any>;
     let distributionListRepo: MongoRepository<DistributionListMongo>;
+    let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -113,6 +116,7 @@ describe("Route:MailboxMongo Tests", () => {
         if (conn instanceof MongoConnection) {
             repo = conn.getMongoRepository("MailboxMongo");
             distributionListRepo = conn.getMongoRepository("DistributionListMongo");
+            auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -125,7 +129,7 @@ describe("Route:MailboxMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const r of [repo, distributionListRepo]) {
+        for (const r of [repo, distributionListRepo, auditLogRepo]) {
             try {
                 await r.clear();
             } catch (err: any) {
@@ -431,6 +435,47 @@ describe("Route:MailboxMongo Tests", () => {
         // The admin who created it shouldn't be left with a stray self-grant on its ACL either.
         const acl: any = await aclRepo.findOne({ uid: result.body.uid } as any);
         expect(acl?.records ?? []).toEqual([]);
+    });
+
+    it("Writes an AuditLogEntry when a trusted caller creates a mailbox, but not for self-service creation.", async () => {
+        const sharedResult = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Shared Support Mailbox",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+            });
+        expect(sharedResult.status).toBeGreaterThanOrEqual(200);
+        expect(sharedResult.status).toBeLessThan(300);
+
+        const sharedEntries = await auditLogRepo.find({ targetUid: sharedResult.body.uid }).toArray();
+        expect(sharedEntries.length).toBe(1);
+        expect(sharedEntries[0].action).toBe(AuditAction.MAILBOX_CREATE);
+        expect(sharedEntries[0].targetType).toBe("Mailbox");
+        expect(sharedEntries[0].mailboxUid).toBe(sharedResult.body.uid);
+        expect(sharedEntries[0].actorUserUid).toBe(admin.uid);
+
+        const selfServiceResult = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                ownerUserUid: owner.uid,
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Self Service Mailbox",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+            });
+        expect(selfServiceResult.status).toBeGreaterThanOrEqual(200);
+        expect(selfServiceResult.status).toBeLessThan(300);
+
+        const selfServiceEntries = await auditLogRepo.find({ targetUid: selfServiceResult.body.uid }).toArray();
+        expect(selfServiceEntries.length).toBe(0);
     });
 
     it("Rejects a non-trusted caller creating a resource mailbox (403).", async () => {

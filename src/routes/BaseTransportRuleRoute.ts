@@ -12,7 +12,8 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import { TransportRule } from "../models/types.js";
+import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditAction, TransportRule } from "../models/types.js";
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /**
@@ -34,11 +35,26 @@ const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } =
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CRUDRoute<T> {
+    /** Supplied by the Mongo/SQL concrete subclasses so `recordAuditLog()` can persist an `AuditLogEntry`
+     * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
+    protected abstract auditLogClass: any;
+
     @RequiresTrustedRole()
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
-        return Array.isArray(obj)
+        const created: T[] = Array.isArray(obj)
             ? await this.doBulkCreate(obj, { req, user, ignoreACL: true })
-            : await this.doCreateObject(obj, { req, user, ignoreACL: true });
+            : [await this.doCreateObject(obj, { req, user, ignoreACL: true })];
+
+        for (const rule of created) {
+            await recordAuditLog(
+                this._objectFactory!,
+                this.auditLogClass,
+                { config: this.config, req, user, logger: this.logger },
+                { action: AuditAction.TRANSPORT_RULE_CREATE, targetType: "TransportRule", targetUid: rule.uid, details: { name: rule.name } },
+            );
+        }
+
+        return Array.isArray(obj) ? created : created[0];
     }
 
     @RequiresTrustedRole()
@@ -52,7 +68,16 @@ export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CR
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        return await this.repoUtils!.update(obj, existing, { user, version: (obj as any).version, ignoreACL: true });
+        const updated: T = await this.repoUtils!.update(obj, existing, { user, version: (obj as any).version, ignoreACL: true });
+
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, req, user, logger: this.logger },
+            { action: AuditAction.TRANSPORT_RULE_UPDATE, targetType: "TransportRule", targetUid: updated.uid, details: { name: updated.name } },
+        );
+
+        return updated;
     }
 
     @RequiresTrustedRole()
@@ -68,6 +93,13 @@ export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CR
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
         await this.repoUtils!.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });
+
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, req, user, logger: this.logger },
+            { action: AuditAction.TRANSPORT_RULE_DELETE, targetType: "TransportRule", targetUid: existing.uid, details: { name: existing.name } },
+        );
     }
 
     @RequiresTrustedRole()

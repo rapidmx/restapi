@@ -13,6 +13,7 @@
  * (PDF/DOCX extraction, OpenSearch), not something a protocol package needs.
  */
 export * from "./AddressUtils.js";
+export * from "./AuditLogUtils.js";
 export * from "./AutoReplyUtils.js";
 export * from "./ConversationUtils.js";
 export * from "./DistributionListUtils.js";

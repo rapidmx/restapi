@@ -1,4 +1,5 @@
 export * from "./AttachmentMongo.js";
+export * from "./AuditLogEntryMongo.js";
 export * from "./CalendarEventMongo.js";
 export * from "./CalendarShareLinkMongo.js";
 export * from "./ContactMongo.js";

@@ -13,8 +13,9 @@ import {
     RepoUtils,
     RouteDecorators,
 } from "@rapidrest/service-core";
-import { DistributionList, FolderType, Mailbox } from "../models/types.js";
+import { AuditAction, DistributionList, FolderType, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
+import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 const { Auth, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
@@ -139,6 +140,11 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      */
     protected abstract distributionListClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so `create()` can persist an `AuditLogEntry` for a
+     * trusted-caller-created (shared/resource) mailbox without depending on either backend directly - see
+     * `util/AuditLogUtils.ts`. */
+    protected abstract auditLogClass: any;
+
     private folderRepo?: RecoverableRepoUtils<any>;
 
     private distributionListRepo?: RepoUtils<DistributionList>;
@@ -256,6 +262,25 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.CALENDAR, user);
             await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.CONTACTS, user);
             await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.TASKS, user);
+        }
+
+        // Only a trusted caller's mailbox creation is audited - matches `AuditAction`'s own scope
+        // (org-wide/admin actions), not routine self-service signup.
+        if (isTrusted) {
+            for (const mailbox of created) {
+                await recordAuditLog(
+                    this._objectFactory!,
+                    this.auditLogClass,
+                    { config: this.config, req, user, logger: this.logger },
+                    {
+                        action: AuditAction.MAILBOX_CREATE,
+                        targetType: "Mailbox",
+                        targetUid: mailbox.uid,
+                        mailboxUid: mailbox.uid,
+                        details: { primarySmtpAddress: mailbox.primarySmtpAddress, isResource: !!(mailbox as any).isResource },
+                    },
+                );
+            }
         }
 
         return Array.isArray(obj) ? created : created[0];

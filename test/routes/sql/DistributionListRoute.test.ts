@@ -8,8 +8,10 @@ import { Server, ObjectFactory, ConnectionManager, isSqlDataSource } from "@rapi
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
+import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { DistributionListSQL } from "../../../src/models/sql/DistributionListSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { AuditAction } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
 describe("Route:DistributionListSQL Tests", () => {
@@ -19,6 +21,7 @@ describe("Route:DistributionListSQL Tests", () => {
     const baseUrl = "/sql/distribution-lists";
     let repo: Repository<DistributionListSQL>;
     let mailboxRepo: Repository<MailboxSQL>;
+    let auditLogRepo: Repository<AuditLogEntrySQL>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -47,6 +50,7 @@ describe("Route:DistributionListSQL Tests", () => {
         if (isSqlDataSource(conn)) {
             repo = conn.getRepository(DistributionListSQL);
             mailboxRepo = conn.getRepository(MailboxSQL);
+            auditLogRepo = conn.getRepository(AuditLogEntrySQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -60,6 +64,7 @@ describe("Route:DistributionListSQL Tests", () => {
     beforeEach(async () => {
         await repo.clear();
         await mailboxRepo.clear();
+        await auditLogRepo.clear();
     });
 
     it("A non-trusted caller cannot create a distribution list (403).", async () => {
@@ -167,6 +172,38 @@ describe("Route:DistributionListSQL Tests", () => {
             .get(`${baseUrl}/${list.uid}`)
             .set("Authorization", "jwt " + adminToken);
         expect(findByIdAfterDelete.status).toBe(404);
+    });
+
+    it("Writes an AuditLogEntry for create, update, and delete.", async () => {
+        const createResult = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ primarySmtpAddress: `${uuid.v4()}@example.com`, name: "Sales", memberAddresses: [] });
+        expect(createResult.status).toBeGreaterThanOrEqual(200);
+        expect(createResult.status).toBeLessThan(300);
+        const listUid = createResult.body.uid;
+
+        const updateResult = await request(server.getApplication())
+            .put(`${baseUrl}/${listUid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: listUid, version: createResult.body.version, name: "Renamed" });
+        expect(updateResult.status).toBe(200);
+
+        const deleteResult = await request(server.getApplication())
+            .delete(`${baseUrl}/${listUid}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(deleteResult.status).toBeGreaterThanOrEqual(200);
+        expect(deleteResult.status).toBeLessThan(300);
+
+        const entries = await auditLogRepo.find({ where: { targetUid: listUid } });
+        const actions = entries.map((e) => e.action).sort();
+        expect(actions).toEqual(
+            [AuditAction.DISTRIBUTION_LIST_CREATE, AuditAction.DISTRIBUTION_LIST_UPDATE, AuditAction.DISTRIBUTION_LIST_DELETE].sort(),
+        );
+        for (const entry of entries) {
+            expect(entry.targetType).toBe("DistributionList");
+            expect(entry.actorUserUid).toBe(admin.uid);
+        }
     });
 
     it("Rejects creating a distribution list whose address is already used by an existing Mailbox (409).", async () => {

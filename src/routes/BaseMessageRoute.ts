@@ -15,14 +15,15 @@ import {
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
+import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
-import { FolderType, Message, MessageFlags, Recipient } from "../models/types.js";
+import { AuditAction, FolderType, Message, MessageFlags, Recipient } from "../models/types.js";
 const { Config, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
-const { Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
+const { Delete, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** One row of `BaseMessageRoute.conversations()` - a computed summary over every `Message` sharing one
  * `conversationId`, never persisted on its own (see that method's own doc comment). */
@@ -90,6 +91,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     protected readonly scopeProperty: string = "folderUid";
 
     protected abstract folderClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so `delete()`/`recall()` can persist an
+     * `AuditLogEntry` without depending on either backend directly - see `util/AuditLogUtils.ts`. */
+    protected abstract auditLogClass: any;
 
     private folderRepo?: RecoverableRepoUtils<any>;
 
@@ -315,11 +320,60 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             .build();
         await this.mailTransport.send({ raw: composed, envelopeFrom: message.from.address, envelopeTo });
 
-        return await this.repoUtils.update(
+        const updated: T = await this.repoUtils.update(
             { uid: message.uid, version: (message as any).version, recallRequestedAt: new Date() } as any,
             message,
             { user, ignoreACL: true },
         );
+
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, user, logger: this.logger },
+            {
+                action: AuditAction.MESSAGE_RECALL,
+                targetType: "Message",
+                targetUid: message.uid,
+                mailboxUid: message.mailboxUid,
+                details: { subject: message.subject, recipientCount: envelopeTo.length },
+            },
+        );
+
+        return updated;
+    }
+
+    /**
+     * Wraps the inherited `BaseScopedChildRoute.delete()` (soft/hard-delete, unchanged) with an
+     * `AuditLogEntry` - Exchange's own Mailbox Audit Log flags message deletion as one of its two most
+     * sensitive tracked mailbox-content actions (recall being the other, see `recall()` above). Fetches
+     * the record first since `super.delete()` returns nothing to audit against once it's gone.
+     */
+    @Delete("/:id")
+    public async delete(
+        @Param("id") id: string,
+        @Query("version") version: string | undefined,
+        @Query("purge") purge: string | undefined,
+        @Request req: HttpRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<void> {
+        const existing: T | undefined = this.repoUtils ? await this.repoUtils.findOne(id, { version, ignoreACL: true }) : undefined;
+
+        await super.delete(id, version, purge, req, user);
+
+        if (existing) {
+            await recordAuditLog(
+                this._objectFactory!,
+                this.auditLogClass,
+                { config: this.config, req, user, logger: this.logger },
+                {
+                    action: AuditAction.MESSAGE_DELETE,
+                    targetType: "Message",
+                    targetUid: existing.uid,
+                    mailboxUid: existing.mailboxUid,
+                    details: { subject: existing.subject, folderUid: existing.folderUid },
+                },
+            );
+        }
     }
 
     @Summary("Get message content")

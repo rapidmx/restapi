@@ -7,8 +7,10 @@ import { request } from "@rapidrest/service-core/test";
 import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
+import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { DistributionListMongo } from "../../../src/models/mongo/DistributionListMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
+import { AuditAction } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
 
@@ -26,6 +28,7 @@ describe("Route:DistributionListMongo Tests", () => {
     const baseUrl = "/mongo/distribution-lists";
     let repo: MongoRepository<DistributionListMongo>;
     let mailboxRepo: MongoRepository<MailboxMongo>;
+    let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -55,6 +58,7 @@ describe("Route:DistributionListMongo Tests", () => {
         if (conn instanceof MongoConnection) {
             repo = conn.getMongoRepository("DistributionListMongo");
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
+            auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -67,7 +71,7 @@ describe("Route:DistributionListMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const r of [repo, mailboxRepo]) {
+        for (const r of [repo, mailboxRepo, auditLogRepo]) {
             try {
                 await r.clear();
             } catch (err: any) {
@@ -183,6 +187,38 @@ describe("Route:DistributionListMongo Tests", () => {
             .get(`${baseUrl}/${list.uid}`)
             .set("Authorization", "jwt " + adminToken);
         expect(findByIdAfterDelete.status).toBe(404);
+    });
+
+    it("Writes an AuditLogEntry for create, update, and delete.", async () => {
+        const createResult = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ primarySmtpAddress: `${uuid.v4()}@example.com`, name: "Sales", memberAddresses: [] });
+        expect(createResult.status).toBeGreaterThanOrEqual(200);
+        expect(createResult.status).toBeLessThan(300);
+        const listUid = createResult.body.uid;
+
+        const updateResult = await request(server.getApplication())
+            .put(`${baseUrl}/${listUid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: listUid, version: createResult.body.version, name: "Renamed" });
+        expect(updateResult.status).toBe(200);
+
+        const deleteResult = await request(server.getApplication())
+            .delete(`${baseUrl}/${listUid}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(deleteResult.status).toBeGreaterThanOrEqual(200);
+        expect(deleteResult.status).toBeLessThan(300);
+
+        const entries = await auditLogRepo.find({ targetUid: listUid }).toArray();
+        const actions = entries.map((e) => e.action).sort();
+        expect(actions).toEqual(
+            [AuditAction.DISTRIBUTION_LIST_CREATE, AuditAction.DISTRIBUTION_LIST_UPDATE, AuditAction.DISTRIBUTION_LIST_DELETE].sort(),
+        );
+        for (const entry of entries) {
+            expect(entry.targetType).toBe("DistributionList");
+            expect(entry.actorUserUid).toBe(admin.uid);
+        }
     });
 
     it("Rejects creating a distribution list whose address is already used by an existing Mailbox (409).", async () => {
