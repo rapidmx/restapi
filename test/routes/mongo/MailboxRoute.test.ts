@@ -15,6 +15,7 @@ import {
 } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
+import { DistributionListMongo } from "../../../src/models/mongo/DistributionListMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
@@ -33,6 +34,7 @@ describe("Route:MailboxMongo Tests", () => {
     const baseUrl = "/mongo/mailboxes";
     let repo: MongoRepository<MailboxMongo>;
     let aclRepo: MongoRepository<any>;
+    let distributionListRepo: MongoRepository<DistributionListMongo>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -110,6 +112,7 @@ describe("Route:MailboxMongo Tests", () => {
         conn = connMgr?.connections.get("mongo");
         if (conn instanceof MongoConnection) {
             repo = conn.getMongoRepository("MailboxMongo");
+            distributionListRepo = conn.getMongoRepository("DistributionListMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -122,11 +125,13 @@ describe("Route:MailboxMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        try {
-            await repo.clear();
-        } catch (err: any) {
-            if (err.message !== "ns not found") {
-                throw err;
+        for (const r of [repo, distributionListRepo]) {
+            try {
+                await r.clear();
+            } catch (err: any) {
+                if (err.message !== "ns not found") {
+                    throw err;
+                }
             }
         }
     });
@@ -510,5 +515,97 @@ describe("Route:MailboxMongo Tests", () => {
             .set("Authorization", "jwt " + ownerToken);
 
         expect(result.status).toBe(404);
+    });
+
+    it("Rejects creating a mailbox whose address is already used by an existing DistributionList (409).", async () => {
+        const address = `${uuid.v4()}@example.com`;
+        await distributionListRepo.save(
+            new DistributionListMongo({
+                uid: address,
+                primarySmtpAddress: address,
+                aliasAddresses: [],
+                name: "Existing List",
+                memberAddresses: [],
+            }),
+        );
+
+        const obj: MailboxMongo = new MailboxMongo({
+            ownerUserUid: owner.uid,
+            primarySmtpAddress: address,
+            aliasAddresses: [],
+            displayName: "Collides",
+            timezone: "UTC",
+            quotaBytes: 1_000_000_000,
+            usedBytes: 0,
+        });
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(obj);
+
+        expect(result.status).toBe(409);
+    });
+
+    it("Rejects creating a mailbox with no primarySmtpAddress (400).", async () => {
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ ownerUserUid: owner.uid, displayName: "No Address", timezone: "UTC", quotaBytes: 1, usedBytes: 0 });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Rejects a bulk create request with two mailboxes claiming the same address (409).", async () => {
+        const address = `${uuid.v4()}@example.com`;
+        const objs = [
+            new MailboxMongo({
+                ownerUserUid: owner.uid,
+                primarySmtpAddress: address,
+                aliasAddresses: [],
+                displayName: "One",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+            }),
+            new MailboxMongo({
+                ownerUserUid: owner.uid,
+                primarySmtpAddress: address,
+                aliasAddresses: [],
+                displayName: "Two",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+            }),
+        ];
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(objs);
+
+        expect(result.status).toBe(409);
+    });
+
+    it("A created mailbox's uid is the normalized primary SMTP address.", async () => {
+        const address = `Mixed.Case.${uuid.v4()}@Example.com`;
+        const obj: MailboxMongo = new MailboxMongo({
+            ownerUserUid: owner.uid,
+            primarySmtpAddress: address,
+            aliasAddresses: [],
+            displayName: "Case Test",
+            timezone: "UTC",
+            quotaBytes: 1_000_000_000,
+            usedBytes: 0,
+        });
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(obj);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+        expect(result.body.uid).toBe(address.toLowerCase());
     });
 });

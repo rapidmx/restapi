@@ -3,6 +3,7 @@ export * from "./CalendarEventRouteMongo.js";
 export * from "./CalendarShareLinkRouteMongo.js";
 export * from "./ContactListRouteMongo.js";
 export * from "./ContactRouteMongo.js";
+export * from "./DistributionListRouteMongo.js";
 export * from "./FolderRouteMongo.js";
 export * from "./IngestQueueRouteMongo.js";
 export * from "./MailboxRouteMongo.js";

@@ -1123,7 +1123,7 @@ __metadata:
     "@opensearch-project/opensearch": "npm:^3.5.1"
     "@rapidrest/cli": "npm:^1.0.1"
     "@rapidrest/core": "npm:^5.1.0"
-    "@rapidrest/service-core": "npm:^1.3.0"
+    "@rapidrest/service-core": "npm:^1.5.0"
     "@swc/core": "npm:^1.16.1"
     "@types/html-to-text": "npm:^9.0.4"
     "@types/mailparser": "npm:^3.4.6"
@@ -1228,9 +1228,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@rapidrest/service-core@npm:^1.3.0":
-  version: 1.3.0
-  resolution: "@rapidrest/service-core@npm:1.3.0"
+"@rapidrest/service-core@npm:^1.5.0":
+  version: 1.5.0
+  resolution: "@rapidrest/service-core@npm:1.5.0"
   dependencies:
     axios: "npm:^1.19.0"
     dayjs: "npm:^1.11.23"
@@ -1260,7 +1260,7 @@ __metadata:
       optional: true
     uWebSockets.js:
       optional: true
-  checksum: 10c0/97f2d21f89672181242c905dc0ab5b0155ad24bcc29b5e985021f5f12b0d2973948a0c51919d98794e84beda65138c3366ec552f26ec2a4bebe7e9740e3e44cd
+  checksum: 10c0/42f737ca3185f716d8ec579dbc372c13057ac6ab4dbbecc6bc8e21fc9ff3d06afa1f1b0fff699ffc39957d0498d9ec2677a794d2642d9c496104ad56adc8e4d5
   languageName: node
   linkType: hard
 

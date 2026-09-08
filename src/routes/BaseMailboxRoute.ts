@@ -3,8 +3,18 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
-import { ACLAction, ApiErrorMessages, ApiErrors, CRUDRoute, HttpRequest, HttpResponse, RouteDecorators } from "@rapidrest/service-core";
-import { FolderType, Mailbox } from "../models/types.js";
+import {
+    ACLAction,
+    ApiErrorMessages,
+    ApiErrors,
+    CRUDRoute,
+    HttpRequest,
+    HttpResponse,
+    RepoUtils,
+    RouteDecorators,
+} from "@rapidrest/service-core";
+import { DistributionList, FolderType, Mailbox } from "../models/types.js";
+import { normalizeAddress } from "../util/AddressUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 const { Auth, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
@@ -122,7 +132,16 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      */
     protected abstract folderClass: any;
 
+    /**
+     * Supplied by the Mongo/SQL concrete subclasses so `create()` can check a candidate
+     * `primarySmtpAddress` against `DistributionList` too - see the `uid` architecture note on
+     * `DistributionList` and `BaseDistributionListRoute`'s symmetric check.
+     */
+    protected abstract distributionListClass: any;
+
     private folderRepo?: RecoverableRepoUtils<any>;
+
+    private distributionListRepo?: RepoUtils<DistributionList>;
 
     /**
      * Returns the uids of every mailbox this user has any ACL grant on — as owner, as a shared delegate, or
@@ -141,6 +160,16 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             });
         }
         return this.folderRepo;
+    }
+
+    private async getDistributionListRepo(): Promise<RepoUtils<DistributionList>> {
+        if (!this.distributionListRepo) {
+            this.distributionListRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.distributionListClass.name,
+                args: [this.distributionListClass],
+            });
+        }
+        return this.distributionListRepo;
     }
 
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
@@ -168,6 +197,39 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 }
             }
         }
+
+        // `uid` is derived from the mailbox's own address (e.g. `joe@domain.com`) rather than a random id, so
+        // that address uniqueness across *every* addressable entity (a `Mailbox`, a `DistributionList`) is a
+        // cheap `uid` lookup instead of a separate per-entity field-uniqueness check - see the architecture
+        // note on `DistributionList`. Unconditionally overwrites any client-supplied `uid`, same override-style
+        // already used above for `ownerUserUid`. Only newly-created mailboxes get this treatment; an
+        // already-provisioned mailbox keeps whatever `uid` it already has.
+        const distributionListRepo: RepoUtils<DistributionList> = await this.getDistributionListRepo();
+        const seenUids: Set<string> = new Set();
+        for (const o of objs) {
+            if (!o.primarySmtpAddress) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+            }
+            const candidateUid: string = normalizeAddress(o.primarySmtpAddress);
+            (o as any).uid = candidateUid;
+            if (seenUids.has(candidateUid)) {
+                throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "Duplicate address within the same request.");
+            }
+            seenUids.add(candidateUid);
+
+            const [existingMailbox, existingList] = await Promise.all([
+                this.repoUtils!.findOne(candidateUid, { ignoreACL: true, includeDeleted: true }),
+                distributionListRepo.findOne(candidateUid, { ignoreACL: true, includeDeleted: true }),
+            ]);
+            if (existingMailbox || existingList) {
+                throw new ApiError(
+                    ApiErrors.IDENTIFIER_EXISTS,
+                    409,
+                    "This address is already in use by another mailbox or distribution list.",
+                );
+            }
+        }
+
         const created: T[] = Array.isArray(obj)
             ? await this.doBulkCreate(objs, { req, user, ignoreACL: true })
             : [await this.doCreateObject(objs[0], { req, user, ignoreACL: true })];

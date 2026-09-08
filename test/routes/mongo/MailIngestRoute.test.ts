@@ -7,11 +7,12 @@ import { request } from "@rapidrest/service-core/test";
 import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
+import { DistributionListMongo } from "../../../src/models/mongo/DistributionListMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { IngestQueueEntryMongo } from "../../../src/models/mongo/IngestQueueEntryMongo.js";
 import { IngestStatus } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
-import { registerTestDoubles } from "../../testDoubles.js";
+import { InMemoryBlobStore, RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -27,6 +28,7 @@ describe("Route:MailIngestRouteMongo Tests", () => {
     const baseUrl = "/mongo/internal/mta";
     let mailboxRepo: MongoRepository<MailboxMongo>;
     let ingestQueueRepo: MongoRepository<IngestQueueEntryMongo>;
+    let distributionListRepo: MongoRepository<DistributionListMongo>;
 
     const secret = config.get("mail:transport:ingest:secret");
 
@@ -44,6 +46,19 @@ describe("Route:MailIngestRouteMongo Tests", () => {
         return await mailboxRepo.save(obj);
     };
 
+    const createList = async function (data?: any): Promise<DistributionListMongo> {
+        const address: string = data?.primarySmtpAddress ?? `${uuid.v4()}@example.com`;
+        const obj: DistributionListMongo = new DistributionListMongo({
+            uid: address.toLowerCase(),
+            primarySmtpAddress: address,
+            aliasAddresses: [],
+            name: "Test List",
+            memberAddresses: [],
+            ...data,
+        });
+        return await distributionListRepo.save(obj);
+    };
+
     beforeAll(async () => {
         await mongod.start();
         registerTestDoubles(objectFactory);
@@ -54,6 +69,7 @@ describe("Route:MailIngestRouteMongo Tests", () => {
         if (conn instanceof MongoConnection) {
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
             ingestQueueRepo = conn.getMongoRepository("IngestQueueEntryMongo");
+            distributionListRepo = conn.getMongoRepository("DistributionListMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -66,7 +82,7 @@ describe("Route:MailIngestRouteMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, ingestQueueRepo]) {
+        for (const repo of [mailboxRepo, ingestQueueRepo, distributionListRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -75,6 +91,7 @@ describe("Route:MailIngestRouteMongo Tests", () => {
                 }
             }
         }
+        (objectFactory.getInstance<RecordingMailTransport>("MailTransport")!).sent = [];
     });
 
     it("Rejects a resolve request without the internal bearer secret.", async () => {
@@ -190,5 +207,175 @@ describe("Route:MailIngestRouteMongo Tests", () => {
             .send(Buffer.alloc(0));
 
         expect(result.status).toBe(400);
+    });
+
+    it("Resolves 200 for a distribution list's primary SMTP address.", async () => {
+        const list = await createList();
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/resolve?rcpt=${list.primarySmtpAddress}`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(200);
+    });
+
+    it("Resolves 200 for a distribution list's alias address.", async () => {
+        await createList({ aliasAddresses: ["list-alias@example.com"] });
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/resolve?rcpt=list-alias@example.com`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(200);
+    });
+
+    it("Fans out to every internal member mailbox of a distribution list, all sharing one rewritten blob-stored copy.", async () => {
+        const m1 = await createMailbox();
+        const m2 = await createMailbox();
+        const list = await createList({ memberAddresses: [m1.primarySmtpAddress, m2.primarySmtpAddress] });
+        const raw = Buffer.from(
+            `From: sender@example.com\r\nTo: ${list.primarySmtpAddress}\r\nReply-To: original@example.com\r\n\r\nHello\r\n`,
+        );
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", list.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        expect(result.body.results).toEqual([{ rcpt: list.primarySmtpAddress, queued: true }]);
+
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo
+            .find({ mailboxUid: { $in: [m1.uid, m2.uid] } })
+            .toArray();
+        expect(entries.length).toBe(2);
+        expect(new Set(entries.map((e) => e.mailboxUid))).toEqual(new Set([m1.uid, m2.uid]));
+        expect(new Set(entries.map((e) => e.rawBlobKey)).size).toBe(1);
+
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const stored: Buffer = await blobStore.get(entries[0].rawBlobKey);
+        const storedText = stored.toString();
+        expect(storedText).toContain(`Reply-To: ${list.primarySmtpAddress}`);
+        expect(storedText).toContain("List-Id:");
+        expect(storedText).toContain("List-Unsubscribe:");
+        expect(storedText).not.toContain("original@example.com");
+        expect(storedText).toContain("Hello");
+    });
+
+    it("Relays to a genuinely external (non-mailbox, non-list) member via MailTransport.", async () => {
+        const list = await createList({ memberAddresses: ["external@outside.com"] });
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${list.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", list.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        expect(result.body.results).toEqual([{ rcpt: list.primarySmtpAddress, queued: true }]);
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(1);
+        expect(transport.sent[0].envelopeTo).toEqual(["external@outside.com"]);
+        expect(transport.sent[0].envelopeFrom).toBe(list.primarySmtpAddress);
+        expect(transport.sent[0].raw.toString()).toContain("List-Id:");
+
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo.find({}).toArray();
+        expect(entries.length).toBe(0);
+    });
+
+    it("Expands a nested distribution list transitively, delivering exactly once to a member reachable via two paths.", async () => {
+        const m1 = await createMailbox();
+        const listB = await createList({ memberAddresses: [m1.primarySmtpAddress] });
+        const listA = await createList({ memberAddresses: [listB.primarySmtpAddress, m1.primarySmtpAddress] });
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${listA.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", listA.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo.find({ mailboxUid: m1.uid }).toArray();
+        expect(entries.length).toBe(1);
+    });
+
+    it("Detects a distribution list cycle without hanging or duplicating delivery, while still delivering to a real member.", async () => {
+        const m1 = await createMailbox();
+        const listA = await createList();
+        const listB = await createList({ memberAddresses: [listA.primarySmtpAddress, m1.primarySmtpAddress] });
+        const listAFresh: any = await distributionListRepo.findOne({ uid: listA.uid } as any);
+        listAFresh.memberAddresses = [listB.primarySmtpAddress];
+        await distributionListRepo.save(listAFresh);
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${listA.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", listA.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo.find({ mailboxUid: m1.uid }).toArray();
+        expect(entries.length).toBe(1);
+    });
+
+    it("restrictSenders drops delivery to a restricted list from a non-member sender, without fan-out or relay.", async () => {
+        const m1 = await createMailbox();
+        const list = await createList({ memberAddresses: [m1.primarySmtpAddress], restrictSenders: true });
+        const raw = Buffer.from(`From: outsider@example.com\r\nTo: ${list.primarySmtpAddress}\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "outsider@example.com")
+            .set("X-Envelope-To", list.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        expect(result.body.results).toEqual([{ rcpt: list.primarySmtpAddress, queued: false }]);
+
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo.find({ mailboxUid: m1.uid }).toArray();
+        expect(entries.length).toBe(0);
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(0);
+    });
+
+    it("A current member emailing the list with Subject: unsubscribe is removed from memberAddresses and receives a confirmation, without fan-out.", async () => {
+        const member = await createMailbox();
+        const list = await createList({ memberAddresses: [member.primarySmtpAddress, "other@example.com"] });
+        const raw = Buffer.from(
+            `From: ${member.primarySmtpAddress}\r\nTo: ${list.primarySmtpAddress}\r\nSubject: unsubscribe\r\n\r\nBye\r\n`,
+        );
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", member.primarySmtpAddress)
+            .set("X-Envelope-To", list.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        expect(result.body.results).toEqual([{ rcpt: list.primarySmtpAddress, queued: false }]);
+
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo.find({ mailboxUid: member.uid }).toArray();
+        expect(entries.length).toBe(0);
+
+        const updated = await distributionListRepo.findOne({ uid: list.uid } as any);
+        expect(updated?.memberAddresses).toEqual(["other@example.com"]);
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(1);
+        expect(transport.sent[0].envelopeTo).toEqual([member.primarySmtpAddress]);
+        expect(transport.sent[0].envelopeFrom).toBe(list.primarySmtpAddress);
     });
 });

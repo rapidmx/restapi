@@ -25,6 +25,7 @@ import { CalendarShareLinkSQL } from "../../src/models/sql/CalendarShareLinkSQL.
 import { ContactSQL } from "../../src/models/sql/ContactSQL.js";
 import { ContactListSQL } from "../../src/models/sql/ContactListSQL.js";
 import { DeviceSyncStateSQL } from "../../src/models/sql/DeviceSyncStateSQL.js";
+import { DistributionListSQL } from "../../src/models/sql/DistributionListSQL.js";
 import { FolderSQL } from "../../src/models/sql/FolderSQL.js";
 import { IngestQueueEntrySQL } from "../../src/models/sql/IngestQueueEntrySQL.js";
 import { MailboxSQL } from "../../src/models/sql/MailboxSQL.js";
@@ -319,6 +320,38 @@ describe("SQL model default construction", () => {
 
         expect(obj.mailboxUid).toBe("mailbox-1");
         expect(obj.name).toBe("Friends");
+    });
+
+    it("DistributionListSQL falls back to class defaults when constructed with no data.", () => {
+        const obj = new DistributionListSQL();
+
+        expect(obj.primarySmtpAddress).toBe("");
+        expect(obj.aliasAddresses).toEqual([]);
+        expect(obj.name).toBe("");
+        expect(obj.description).toBeUndefined();
+        expect(obj.ownerUserUid).toBeUndefined();
+        expect(obj.memberAddresses).toEqual([]);
+        expect(obj.restrictSenders).toBe(false);
+    });
+
+    it("DistributionListSQL applies provided overrides when constructed with data.", () => {
+        const obj = new DistributionListSQL({
+            primarySmtpAddress: "sales@example.com",
+            aliasAddresses: ["sales-team@example.com"],
+            name: "Sales",
+            description: "Sales team distribution list",
+            ownerUserUid: "user-1",
+            memberAddresses: ["a@example.com", "b@example.com"],
+            restrictSenders: true,
+        });
+
+        expect(obj.primarySmtpAddress).toBe("sales@example.com");
+        expect(obj.aliasAddresses).toEqual(["sales-team@example.com"]);
+        expect(obj.name).toBe("Sales");
+        expect(obj.description).toBe("Sales team distribution list");
+        expect(obj.ownerUserUid).toBe("user-1");
+        expect(obj.memberAddresses).toEqual(["a@example.com", "b@example.com"]);
+        expect(obj.restrictSenders).toBe(true);
     });
 
     it("CalendarEventSQL falls back to class defaults when constructed with no data.", () => {

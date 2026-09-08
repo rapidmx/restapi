@@ -10,7 +10,7 @@ import {
     RouteDecorators,
     type MongoRepository,
 } from "@rapidrest/service-core";
-import { FolderMongo, MailboxMongo } from "../../mongo.js";
+import { DistributionListMongo, FolderMongo, MailboxMongo } from "../../mongo.js";
 import { BaseMailboxRoute } from "../BaseMailboxRoute.js";
 const { Model } = RouteDecorators;
 const { Repository } = DatabaseDecorators;
@@ -19,6 +19,7 @@ const { Repository } = DatabaseDecorators;
 export class MailboxRouteMongo extends BaseMailboxRoute<MailboxMongo> {
     protected readonly repoUtilsClass: any = RepoUtils;
     protected folderClass: any = FolderMongo;
+    protected distributionListClass: any = DistributionListMongo;
 
     // `@Repository`-injected, always present in any functioning deployment (the `acl` datastore is a hard
     // requirement of this entire library — every permission check everywhere else depends on it too), so an

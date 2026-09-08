@@ -3,6 +3,7 @@ export * from "./CalendarEventRouteSQL.js";
 export * from "./CalendarShareLinkRouteSQL.js";
 export * from "./ContactListRouteSQL.js";
 export * from "./ContactRouteSQL.js";
+export * from "./DistributionListRouteSQL.js";
 export * from "./FolderRouteSQL.js";
 export * from "./IngestQueueRouteSQL.js";
 export * from "./MailboxRouteSQL.js";

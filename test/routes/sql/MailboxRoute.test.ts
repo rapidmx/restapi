@@ -16,6 +16,7 @@ import {
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
+import { DistributionListSQL } from "../../../src/models/sql/DistributionListSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
@@ -26,6 +27,7 @@ describe("Route:MailboxSQL Tests", () => {
     const baseUrl = "/sql/mailboxes";
     let repo: Repository<MailboxSQL>;
     let aclRepo: Repository<AccessControlListSQL>;
+    let distributionListRepo: Repository<DistributionListSQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -110,6 +112,7 @@ describe("Route:MailboxSQL Tests", () => {
         conn = connMgr?.connections.get("sql");
         if (isSqlDataSource(conn)) {
             repo = conn.getRepository(MailboxSQL);
+            distributionListRepo = conn.getRepository(DistributionListSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -122,6 +125,7 @@ describe("Route:MailboxSQL Tests", () => {
 
     beforeEach(async () => {
         await repo.clear();
+        await distributionListRepo.clear();
     });
 
     it("Listing mailboxes anonymously (no Authorization header) returns an empty list, not another user's data.", async () => {
@@ -414,5 +418,97 @@ describe("Route:MailboxSQL Tests", () => {
             .set("Authorization", "jwt " + ownerToken);
 
         expect(result.status).toBe(404);
+    });
+
+    it("Rejects creating a mailbox whose address is already used by an existing DistributionList (409).", async () => {
+        const address = `${uuid.v4()}@example.com`;
+        await distributionListRepo.save(
+            new DistributionListSQL({
+                uid: address,
+                primarySmtpAddress: address,
+                aliasAddresses: [],
+                name: "Existing List",
+                memberAddresses: [],
+            } as any),
+        );
+
+        const obj: MailboxSQL = new MailboxSQL({
+            ownerUserUid: owner.uid,
+            primarySmtpAddress: address,
+            aliasAddresses: [],
+            displayName: "Collides",
+            timezone: "UTC",
+            quotaBytes: 1_000_000_000,
+            usedBytes: 0,
+        });
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(obj);
+
+        expect(result.status).toBe(409);
+    });
+
+    it("Rejects creating a mailbox with no primarySmtpAddress (400).", async () => {
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ ownerUserUid: owner.uid, displayName: "No Address", timezone: "UTC", quotaBytes: 1, usedBytes: 0 });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Rejects a bulk create request with two mailboxes claiming the same address (409).", async () => {
+        const address = `${uuid.v4()}@example.com`;
+        const objs = [
+            new MailboxSQL({
+                ownerUserUid: owner.uid,
+                primarySmtpAddress: address,
+                aliasAddresses: [],
+                displayName: "One",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+            }),
+            new MailboxSQL({
+                ownerUserUid: owner.uid,
+                primarySmtpAddress: address,
+                aliasAddresses: [],
+                displayName: "Two",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+            }),
+        ];
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(objs);
+
+        expect(result.status).toBe(409);
+    });
+
+    it("A created mailbox's uid is the normalized primary SMTP address.", async () => {
+        const address = `Mixed.Case.${uuid.v4()}@Example.com`;
+        const obj: MailboxSQL = new MailboxSQL({
+            ownerUserUid: owner.uid,
+            primarySmtpAddress: address,
+            aliasAddresses: [],
+            displayName: "Case Test",
+            timezone: "UTC",
+            quotaBytes: 1_000_000_000,
+            usedBytes: 0,
+        });
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(obj);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+        expect(result.body.uid).toBe(address.toLowerCase());
     });
 });

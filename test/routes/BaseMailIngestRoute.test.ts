@@ -35,6 +35,7 @@ import { BaseMailIngestRoute } from "../../src/routes/BaseMailIngestRoute.js";
 class TestMailIngestRoute extends BaseMailIngestRoute<any, any> {
     protected mailboxClass: any = class {};
     protected ingestQueueClass: any = class {};
+    protected distributionListClass: any = class {};
 }
 
 function makeRes(): any {
@@ -56,6 +57,7 @@ describe("BaseMailIngestRoute Tests (blobStore guard clause only)", () => {
         (route as any).ingestSecret = "s3cr3t";
         (route as any).mailboxRepo = { find: vi.fn().mockResolvedValue([]) };
         (route as any).ingestQueueRepo = { create: vi.fn() };
+        (route as any).distributionListRepo = { find: vi.fn().mockResolvedValue([]) };
         const res = makeRes();
         const req: any = {
             headers: {

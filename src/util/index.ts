@@ -12,7 +12,9 @@
  * deliberately not re-exported here - it's an internal helper for this library's own optional peer dependencies
  * (PDF/DOCX extraction, OpenSearch), not something a protocol package needs.
  */
+export * from "./AddressUtils.js";
 export * from "./AutoReplyUtils.js";
+export * from "./DistributionListUtils.js";
 export * from "./FolderUtils.js";
 export * from "./IcsUtils.js";
 export * from "./MailFilterUtils.js";

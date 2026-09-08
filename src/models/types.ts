@@ -374,6 +374,44 @@ export interface ContactList extends BaseEntity {
 }
 
 /**
+ * A mail-enabled group: mail sent to `primarySmtpAddress`/`aliasAddresses` fans out to every address in
+ * `memberAddresses`. A member address may resolve to an internal `Mailbox`, another `DistributionList` (nested
+ * groups), or a fully external address (relayed out) — see `BaseMailIngestRoute`'s expansion logic.
+ *
+ * `uid` is this list's own normalized primary address (e.g. `sales@example.com`), not a random id — the same
+ * convention `Mailbox.uid` uses, so cross-entity address collisions are a cheap `uid` lookup rather than a
+ * separate field-uniqueness check. See `BaseMailboxRoute`/`BaseDistributionListRoute` for where `uid` is derived
+ * and checked.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface DistributionList extends RecoverableBaseEntity {
+    /** The primary SMTP address that mail addressed to this list is delivered/fanned-out under. */
+    primarySmtpAddress: string;
+
+    /** Additional SMTP addresses that also resolve to this list. */
+    aliasAddresses?: string[];
+
+    /** The display name of the list. */
+    name: string;
+
+    description?: string;
+
+    /** Set only when a non-trusted caller could ever create one - kept for parity with `Mailbox.ownerUserUid`,
+     * informational only (v1 has no delegated-ownership enforcement; list management is trusted-role-only). */
+    ownerUserUid?: string;
+
+    /** The email addresses of every member. Each may resolve to an internal `Mailbox`, a nested
+     * `DistributionList`, or a genuinely external address (relayed out via `MailTransport`). */
+    memberAddresses: string[];
+
+    /** When `true`, inbound mail whose envelope sender isn't (case-insensitively) one of `memberAddresses` is
+     * dropped rather than fanned out. Enforced only at `BaseMailIngestRoute.deliver()`-time, not at the MTA's
+     * RCPT-TO stage (`GET /internal/mta/resolve` takes no sender parameter). */
+    restrictSenders?: boolean;
+}
+
+/**
  * Defines a named grouping of `Task` records within a `Mailbox` — the `Task` analog of `ContactList`.
  *
  * @author Jean-Philippe Steinmetz

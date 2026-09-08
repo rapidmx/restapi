@@ -25,6 +25,7 @@ import { CalendarShareLinkMongo } from "../../src/models/mongo/CalendarShareLink
 import { ContactMongo } from "../../src/models/mongo/ContactMongo.js";
 import { ContactListMongo } from "../../src/models/mongo/ContactListMongo.js";
 import { DeviceSyncStateMongo } from "../../src/models/mongo/DeviceSyncStateMongo.js";
+import { DistributionListMongo } from "../../src/models/mongo/DistributionListMongo.js";
 import { FolderMongo } from "../../src/models/mongo/FolderMongo.js";
 import { IngestQueueEntryMongo } from "../../src/models/mongo/IngestQueueEntryMongo.js";
 import { MailboxMongo } from "../../src/models/mongo/MailboxMongo.js";
@@ -319,6 +320,38 @@ describe("Mongo model default construction", () => {
 
         expect(obj.mailboxUid).toBe("mailbox-1");
         expect(obj.name).toBe("Friends");
+    });
+
+    it("DistributionListMongo falls back to class defaults when constructed with no data.", () => {
+        const obj = new DistributionListMongo();
+
+        expect(obj.primarySmtpAddress).toBe("");
+        expect(obj.aliasAddresses).toEqual([]);
+        expect(obj.name).toBe("");
+        expect(obj.description).toBeUndefined();
+        expect(obj.ownerUserUid).toBeUndefined();
+        expect(obj.memberAddresses).toEqual([]);
+        expect(obj.restrictSenders).toBe(false);
+    });
+
+    it("DistributionListMongo applies provided overrides when constructed with data.", () => {
+        const obj = new DistributionListMongo({
+            primarySmtpAddress: "sales@example.com",
+            aliasAddresses: ["sales-team@example.com"],
+            name: "Sales",
+            description: "Sales team distribution list",
+            ownerUserUid: "user-1",
+            memberAddresses: ["a@example.com", "b@example.com"],
+            restrictSenders: true,
+        });
+
+        expect(obj.primarySmtpAddress).toBe("sales@example.com");
+        expect(obj.aliasAddresses).toEqual(["sales-team@example.com"]);
+        expect(obj.name).toBe("Sales");
+        expect(obj.description).toBe("Sales team distribution list");
+        expect(obj.ownerUserUid).toBe("user-1");
+        expect(obj.memberAddresses).toEqual(["a@example.com", "b@example.com"]);
+        expect(obj.restrictSenders).toBe(true);
     });
 
     it("CalendarEventMongo falls back to class defaults when constructed with no data.", () => {
