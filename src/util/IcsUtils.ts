@@ -343,3 +343,146 @@ export function parseIcsEvent(raw: string): ParsedIcsEvent | undefined {
 
     return { method, uid, sequence, summary, location, status, startDate, endDate, organizer, attendees, recurrenceId, recurrenceRule };
 }
+
+/** A single concrete occurrence instant produced by `expandOccurrences()`. */
+export interface OccurrenceWindow {
+    start: Date;
+    end: Date;
+}
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+/** Safety-net cap on how far past `event.startDate` a day-by-day scan will walk for an indefinitely
+ * recurring (no `count`/`until`) rule - not a real RRULE limit, just a bound on worst-case cost. */
+const MAX_SCAN_DAYS = 731;
+/** Safety-net cap on the number of occurrences a single `expandOccurrences()` call will return. */
+const MAX_OCCURRENCES = 500;
+
+const BYDAY_TO_WEEKDAY: Record<string, number> = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+
+function occurrenceOverlapsWindow(start: Date, end: Date, windowStart: Date, windowEnd: Date): boolean {
+    return start.getTime() < windowEnd.getTime() && end.getTime() > windowStart.getTime();
+}
+
+/** `true` if `candidate` (a whole-day step from `seriesStart`, `daysSinceStart` days later) is a real
+ * occurrence of `rule`. See `expandOccurrences()`'s own doc comment for the documented limitations this
+ * inherits (no ordinal `BYDAY`, no `BYSETPOS`, no `WKST`-aware week alignment). */
+function matchesRecurrenceDay(rule: RecurrenceRule, seriesStart: Date, candidate: Date, daysSinceStart: number): boolean {
+    switch (rule.freq) {
+        case RecurrenceFrequency.DAILY:
+            return daysSinceStart % rule.interval === 0;
+        case RecurrenceFrequency.WEEKLY: {
+            const weekIndex = Math.floor(daysSinceStart / 7);
+            if (weekIndex % rule.interval !== 0) {
+                return false;
+            }
+            if (rule.byDay && rule.byDay.length > 0) {
+                return rule.byDay.some((day) => BYDAY_TO_WEEKDAY[day.toUpperCase()] === candidate.getUTCDay());
+            }
+            return candidate.getUTCDay() === seriesStart.getUTCDay();
+        }
+        case RecurrenceFrequency.MONTHLY: {
+            // `candidate` is always `seriesStart` plus a non-negative number of days, so `monthsSinceStart`
+            // is always >= 0 - no separate "candidate before series start" case to guard against here.
+            const monthsSinceStart =
+                (candidate.getUTCFullYear() - seriesStart.getUTCFullYear()) * 12 + (candidate.getUTCMonth() - seriesStart.getUTCMonth());
+            if (monthsSinceStart % rule.interval !== 0) {
+                return false;
+            }
+            if (rule.byMonthDay && rule.byMonthDay.length > 0) {
+                return rule.byMonthDay.includes(candidate.getUTCDate());
+            }
+            if (rule.byDay && rule.byDay.length > 0) {
+                return rule.byDay.some((day) => BYDAY_TO_WEEKDAY[day.toUpperCase()] === candidate.getUTCDay());
+            }
+            return candidate.getUTCDate() === seriesStart.getUTCDate();
+        }
+        case RecurrenceFrequency.YEARLY: {
+            // Same reasoning as MONTHLY above - `yearsSinceStart` is always >= 0.
+            const yearsSinceStart = candidate.getUTCFullYear() - seriesStart.getUTCFullYear();
+            if (yearsSinceStart % rule.interval !== 0) {
+                return false;
+            }
+            if (rule.byMonth && rule.byMonth.length > 0 && !rule.byMonth.includes(candidate.getUTCMonth() + 1)) {
+                return false;
+            }
+            if (rule.byMonthDay && rule.byMonthDay.length > 0) {
+                return rule.byMonthDay.includes(candidate.getUTCDate());
+            }
+            if (rule.byDay && rule.byDay.length > 0) {
+                return rule.byDay.some((day) => BYDAY_TO_WEEKDAY[day.toUpperCase()] === candidate.getUTCDay());
+            }
+            return candidate.getUTCMonth() === seriesStart.getUTCMonth() && candidate.getUTCDate() === seriesStart.getUTCDate();
+        }
+        default:
+            return false;
+    }
+}
+
+/**
+ * Expands `event` (a `CalendarEvent`-shaped `{startDate, endDate, recurrenceRule?}`) into every occurrence
+ * whose `[start, end)` overlaps `[windowStart, windowEnd]`. A non-recurring event yields at most one
+ * occurrence (its own `startDate`/`endDate`). `excludeDates` (matched by exact instant) skips a generated
+ * occurrence entirely - used both for `RecurrenceRule.exceptions` (EXDATE-cancelled occurrences) and for a
+ * sibling override row's own `recurrenceId` (so a master's expansion doesn't phantom-generate an occurrence
+ * at its *original* time when a real override row already represents that occurrence's actual, possibly
+ * different, time).
+ *
+ * Bounded by `MAX_OCCURRENCES` (a runaway-loop safety net, not a real RRULE limit) - scans day-by-day from
+ * `event.startDate` (not `windowStart`), since `COUNT`/`UNTIL` are counted from the series' true beginning,
+ * capped at `MAX_SCAN_DAYS` from `event.startDate` to bound worst-case cost for a very old, indefinitely
+ * recurring series.
+ *
+ * A day-by-day scan (rather than four bespoke per-frequency steppers) is deliberately the simplest correct
+ * approach here: the window is capped small enough that a day-by-day scan is cheap, and one unified loop is
+ * far easier to verify correct than bespoke DAILY/WEEKLY/MONTHLY/YEARLY advancement logic.
+ */
+export function expandOccurrences(
+    event: { startDate: Date; endDate: Date; recurrenceRule?: RecurrenceRule },
+    windowStart: Date,
+    windowEnd: Date,
+    excludeDates?: Date[],
+): OccurrenceWindow[] {
+    const durationMs = event.endDate.getTime() - event.startDate.getTime();
+    const excluded = new Set((excludeDates ?? []).map((date) => date.getTime()));
+    const rule = event.recurrenceRule;
+
+    if (!rule) {
+        if (excluded.has(event.startDate.getTime())) {
+            return [];
+        }
+        return occurrenceOverlapsWindow(event.startDate, event.endDate, windowStart, windowEnd)
+            ? [{ start: event.startDate, end: event.endDate }]
+            : [];
+    }
+
+    const occurrences: OccurrenceWindow[] = [];
+    const scanEndMs = Math.min(windowEnd.getTime(), event.startDate.getTime() + MAX_SCAN_DAYS * MS_PER_DAY);
+    let matchCount = 0;
+
+    for (let dayOffset = 0; ; dayOffset++) {
+        const candidateStart = new Date(event.startDate.getTime() + dayOffset * MS_PER_DAY);
+        if (candidateStart.getTime() > scanEndMs) {
+            break;
+        }
+        if (rule.until && candidateStart.getTime() > rule.until.getTime()) {
+            break;
+        }
+        if (!matchesRecurrenceDay(rule, event.startDate, candidateStart, dayOffset)) {
+            continue;
+        }
+        matchCount++;
+        if (rule.count !== undefined && matchCount > rule.count) {
+            break;
+        }
+        if (!excluded.has(candidateStart.getTime())) {
+            const candidateEnd = new Date(candidateStart.getTime() + durationMs);
+            if (occurrenceOverlapsWindow(candidateStart, candidateEnd, windowStart, windowEnd)) {
+                occurrences.push({ start: candidateStart, end: candidateEnd });
+                if (occurrences.length >= MAX_OCCURRENCES) {
+                    break;
+                }
+            }
+        }
+    }
+    return occurrences;
+}

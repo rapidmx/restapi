@@ -10,7 +10,7 @@ import { BlobStore } from "../blob/BlobStore.js";
 import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, ScanPipelineResult } from "../scan/ScanPipeline.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
-import { parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
+import { buildEventIcs, expandOccurrences, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
 import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
@@ -53,6 +53,14 @@ function recurrenceIdsMatch(a: Date | undefined, b: Date | undefined): boolean {
     return a.getTime() === b.getTime();
 }
 const { Config, Init, Inject, Logger } = ObjectDecorators;
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+/** How far past a booking request's own start `decideResourceBooking()` looks for conflicts against an
+ * indefinitely-recurring existing booking - a bound on worst-case cost, not a real policy limit. */
+const RESOURCE_BOOKING_HORIZON_MS = 731 * MS_PER_DAY;
+/** Cap on how many of a resource's own existing `CalendarEvent` rows `decideResourceBooking()` compares
+ * against - a busy resource calendar is expected to be reasonably bounded; this is a safety net. */
+const RESOURCE_BOOKING_EXISTING_ROWS_LIMIT = 200;
 
 /** An attachment already persisted to the `BlobStore`, ready to be attached to one or more `Message` rows. */
 interface StoredAttachment {
@@ -627,7 +635,12 @@ export abstract class ScanQueueJob<
 
     private async processItipRequest(mailboxUid: string, parsed: ParsedIcsEvent): Promise<void> {
         const existing = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
-        const attendees: Attendee[] = parsed.attendees.map((attendee) => ({
+        if (existing && parsed.sequence <= existing.sequence) {
+            // Stale/duplicate resend - already have this revision (or a newer one).
+            return;
+        }
+
+        let attendees: Attendee[] = parsed.attendees.map((attendee) => ({
             address: attendee.address,
             displayName: attendee.displayName,
             role: AttendeeRole.REQUIRED,
@@ -635,9 +648,23 @@ export abstract class ScanQueueJob<
             isOrganizer: false,
         }));
 
+        // A resource mailbox (a room/equipment "attendee") with auto-accept enabled decides its own
+        // response here - the one and only place this mailbox's own copy of the invite comes into being.
+        const mailbox: X | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
+        let decision: AttendeeResponseStatus | undefined;
+        if (mailbox?.isResource && mailbox.autoAcceptBookings && parsed.startDate && parsed.endDate) {
+            decision = await this.decideResourceBooking(mailbox, parsed);
+            const resourceDecision = decision;
+            const mailboxAddresses = [mailbox.primarySmtpAddress, ...mailbox.aliasAddresses].map((a) => a.toLowerCase());
+            attendees = attendees.map((attendee) =>
+                mailboxAddresses.includes(attendee.address.toLowerCase()) ? { ...attendee, responseStatus: resourceDecision } : attendee,
+            );
+        }
+
+        let row: CE;
         if (!existing) {
             const folder: F = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, mailboxUid, FolderType.CALENDAR);
-            await this.calendarEventRepo!.create(
+            row = await this.calendarEventRepo!.create(
                 new this.calendarEventClass({
                     folderUid: folder.uid,
                     mailboxUid,
@@ -660,29 +687,144 @@ export abstract class ScanQueueJob<
                 }),
                 { ignoreACL: true },
             );
-            return;
+        } else {
+            row = await this.calendarEventRepo!.update(
+                {
+                    uid: existing.uid,
+                    version: (existing as any).version,
+                    title: parsed.summary ?? existing.title,
+                    location: parsed.location,
+                    startDate: parsed.startDate ?? existing.startDate,
+                    endDate: parsed.endDate ?? existing.endDate,
+                    attendees,
+                    recurrenceRule: parsed.recurrenceRule ?? existing.recurrenceRule,
+                    sequence: parsed.sequence,
+                } as any,
+                existing,
+                { ignoreACL: true },
+            );
         }
 
-        if (parsed.sequence <= existing.sequence) {
-            // Stale/duplicate resend - already have this revision (or a newer one).
-            return;
+        if (mailbox && decision !== undefined) {
+            await this.finalizeResourceDecision(mailbox, row, decision);
+        }
+    }
+
+    /**
+     * Decides accept/decline for an inbound booking request against `mailbox` (a resource mailbox with
+     * `autoAcceptBookings` on) - mirrors Exchange's `Set-CalendarProcessing -AutomateProcessing AutoAccept`
+     * policy checks (duration/booking-window limits evaluated against the request's first occurrence only,
+     * matching real Exchange's "can't partially book a series" behavior, then conflict detection unless
+     * `allowConflicts` is set). Both the incoming request and every existing booking are expanded through
+     * `expandOccurrences()` so a recurring series is checked occurrence-by-occurrence, not just at its first
+     * instance - see this job's own doc comment / the plan this shipped under for the full rationale.
+     */
+    private async decideResourceBooking(mailbox: X, parsed: ParsedIcsEvent): Promise<AttendeeResponseStatus> {
+        const startDate = parsed.startDate!;
+        const endDate = parsed.endDate!;
+
+        // `!= null` (not `!== undefined`) below: an unset optional numeric column comes back from the SQL
+        // backend as `null`, not `undefined` (Mongo omits the field entirely) - see the `MailboxSQL`/
+        // `MailboxMongo` field doc comments.
+        if (mailbox.maxDurationMinutes != null) {
+            const durationMinutes = (endDate.getTime() - startDate.getTime()) / 60_000;
+            if (durationMinutes > mailbox.maxDurationMinutes) {
+                return AttendeeResponseStatus.DECLINED;
+            }
+        }
+        if (mailbox.bookingWindowDays != null) {
+            const latestBookableStart = Date.now() + mailbox.bookingWindowDays * MS_PER_DAY;
+            if (startDate.getTime() > latestBookableStart) {
+                return AttendeeResponseStatus.DECLINED;
+            }
+        }
+        if (mailbox.allowConflicts) {
+            return AttendeeResponseStatus.ACCEPTED;
         }
 
-        await this.calendarEventRepo!.update(
-            {
-                uid: existing.uid,
-                version: (existing as any).version,
-                title: parsed.summary ?? existing.title,
-                location: parsed.location,
-                startDate: parsed.startDate ?? existing.startDate,
-                endDate: parsed.endDate ?? existing.endDate,
-                attendees,
-                recurrenceRule: parsed.recurrenceRule ?? existing.recurrenceRule,
-                sequence: parsed.sequence,
-            } as any,
-            existing,
-            { ignoreACL: true },
+        const horizonEnd = new Date(startDate.getTime() + RESOURCE_BOOKING_HORIZON_MS);
+        const requestedOccurrences: OccurrenceWindow[] = expandOccurrences(
+            { startDate, endDate, recurrenceRule: parsed.recurrenceRule },
+            startDate,
+            horizonEnd,
+            parsed.recurrenceRule?.exceptions,
         );
+
+        const existingRows: CE[] = await this.calendarEventRepo!.find(
+            { mailboxUid: mailbox.uid, limit: RESOURCE_BOOKING_EXISTING_ROWS_LIMIT } as any,
+            { ignoreACL: true, limit: RESOURCE_BOOKING_EXISTING_ROWS_LIMIT },
+        );
+
+        for (const candidateRow of existingRows) {
+            if (candidateRow.icalUid === parsed.uid) {
+                // A prior row of this very request (a resend/update) - never conflicts with itself.
+                continue;
+            }
+            const isMaster = !!candidateRow.recurrenceRule && !candidateRow.recurrenceId;
+            const excludeDates = isMaster
+                ? [
+                      ...(candidateRow.recurrenceRule?.exceptions ?? []),
+                      ...existingRows
+                          .filter((row) => row.icalUid === candidateRow.icalUid && row.recurrenceId)
+                          .map((row) => row.recurrenceId!),
+                  ]
+                : undefined;
+            const existingOccurrences = expandOccurrences(
+                { startDate: candidateRow.startDate, endDate: candidateRow.endDate, recurrenceRule: candidateRow.recurrenceRule },
+                startDate,
+                horizonEnd,
+                excludeDates,
+            );
+
+            for (const requested of requestedOccurrences) {
+                for (const existingOccurrence of existingOccurrences) {
+                    if (
+                        requested.start.getTime() < existingOccurrence.end.getTime() &&
+                        requested.end.getTime() > existingOccurrence.start.getTime()
+                    ) {
+                        return AttendeeResponseStatus.DECLINED;
+                    }
+                }
+            }
+        }
+
+        return AttendeeResponseStatus.ACCEPTED;
+    }
+
+    /**
+     * Applies a resource's auto-accept/decline `decision` to `row` (declining soft-deletes it, same as a
+     * human's decline via `BaseCalendarEventRoute.respond()`), then sends an iTIP `REPLY` for the resource's
+     * own attendee entry back to the organizer - reusing the exact same `buildEventIcs()`/`MailComposer`/
+     * `MailTransport.send()` sequence `respond()` already uses, best-effort (a send failure is logged, not
+     * thrown - the calendar mutation itself has already succeeded either way).
+     */
+    private async finalizeResourceDecision(mailbox: X, row: CE, decision: AttendeeResponseStatus): Promise<void> {
+        if (decision === AttendeeResponseStatus.DECLINED) {
+            await this.calendarEventRepo!.delete(row.uid, { ignoreACL: true });
+        }
+
+        const mailboxAddresses = [mailbox.primarySmtpAddress, ...mailbox.aliasAddresses].map((a) => a.toLowerCase());
+        const resourceAttendee = row.attendees.find((attendee) => mailboxAddresses.includes(attendee.address.toLowerCase()));
+        if (!resourceAttendee) {
+            return;
+        }
+
+        try {
+            const ics = buildEventIcs({ ...row, attendees: [resourceAttendee] }, "REPLY", { onlyAttendee: resourceAttendee });
+            const verb = decision === AttendeeResponseStatus.DECLINED ? "declined" : "accepted";
+            const composed: Buffer = await new MailComposer({
+                from: { name: mailbox.displayName, address: mailbox.primarySmtpAddress },
+                to: row.organizer.address,
+                subject: `${decision === AttendeeResponseStatus.DECLINED ? "Declined" : "Accepted"}: ${row.title}`,
+                text: `${mailbox.displayName || mailbox.primarySmtpAddress} has automatically ${verb}: ${row.title}`,
+                icalEvent: { method: "reply", content: ics },
+            })
+                .compile()
+                .build();
+            await this.mailTransport!.send({ raw: composed, envelopeFrom: mailbox.primarySmtpAddress, envelopeTo: [row.organizer.address] });
+        } catch (err: any) {
+            this.logger?.warn(`ScanQueueJob: failed to send resource auto-response for event ${row.uid}: ${err.message}`);
+        }
     }
 
     private async processItipReply(mailboxUid: string, parsed: ParsedIcsEvent): Promise<void> {

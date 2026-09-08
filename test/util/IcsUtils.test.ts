@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { buildEventIcs, parseIcsEvent } from "../../src/util/IcsUtils.js";
+import { buildEventIcs, expandOccurrences, parseIcsEvent } from "../../src/util/IcsUtils.js";
 import {
     Attendee,
     AttendeeResponseStatus,
@@ -266,6 +266,236 @@ describe("buildEventIcs() / parseIcsEvent() Tests", () => {
             const raw = ["BEGIN:VCALENDAR", "METHOD:REQUEST", "BEGIN:VEVENT", "UID:u1", "DTSTART:not-a-date", "SEQUENCE:0", "END:VEVENT", "END:VCALENDAR"].join("\r\n");
             const parsed = parseIcsEvent(raw)!;
             expect(parsed.startDate).toBeUndefined();
+        });
+    });
+
+    describe("expandOccurrences()", () => {
+        // 2026-06-15 is a Monday.
+        const startDate = new Date("2026-06-15T19:00:00.000Z");
+        const endDate = new Date("2026-06-15T20:00:00.000Z");
+
+        it("A non-recurring event yields its own single occurrence when it overlaps the window.", () => {
+            const occurrences = expandOccurrences({ startDate, endDate }, new Date("2026-06-01T00:00:00.000Z"), new Date("2026-07-01T00:00:00.000Z"));
+            expect(occurrences).toEqual([{ start: startDate, end: endDate }]);
+        });
+
+        it("A non-recurring event yields nothing when it's entirely outside the window.", () => {
+            const occurrences = expandOccurrences({ startDate, endDate }, new Date("2026-07-01T00:00:00.000Z"), new Date("2026-08-01T00:00:00.000Z"));
+            expect(occurrences).toEqual([]);
+        });
+
+        it("A non-recurring event yields nothing when excluded via excludeDates matching its exact start.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate },
+                new Date("2026-06-01T00:00:00.000Z"),
+                new Date("2026-07-01T00:00:00.000Z"),
+                [startDate],
+            );
+            expect(occurrences).toEqual([]);
+        });
+
+        it("DAILY with interval > 1 steps by that many days.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 3, exceptions: [] } },
+                startDate,
+                new Date("2026-06-24T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual([
+                "2026-06-15T19:00:00.000Z",
+                "2026-06-18T19:00:00.000Z",
+                "2026-06-21T19:00:00.000Z",
+                "2026-06-24T19:00:00.000Z",
+            ]);
+        });
+
+        it("WEEKLY with BYDAY and interval > 1 only matches the named weekdays in an active (every Nth) week.", () => {
+            const occurrences = expandOccurrences(
+                {
+                    startDate,
+                    endDate,
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 2, byDay: ["MO", "WE"], exceptions: [] },
+                },
+                startDate,
+                new Date("2026-07-02T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual([
+                "2026-06-15T19:00:00.000Z",
+                "2026-06-17T19:00:00.000Z",
+                "2026-06-29T19:00:00.000Z",
+                "2026-07-01T19:00:00.000Z",
+            ]);
+        });
+
+        it("WEEKLY with no BYDAY repeats only on the start's own weekday.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] } },
+                startDate,
+                new Date("2026-06-29T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual([
+                "2026-06-15T19:00:00.000Z",
+                "2026-06-22T19:00:00.000Z",
+                "2026-06-29T19:00:00.000Z",
+            ]);
+        });
+
+        it("MONTHLY with BYMONTHDAY repeats on that day-of-month every interval months.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.MONTHLY, interval: 1, byMonthDay: [15], exceptions: [] } },
+                startDate,
+                new Date("2026-08-15T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual([
+                "2026-06-15T19:00:00.000Z",
+                "2026-07-15T19:00:00.000Z",
+                "2026-08-15T19:00:00.000Z",
+            ]);
+        });
+
+        it("MONTHLY with BYDAY matches every occurrence of that weekday in the month (no ordinal support).", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.MONTHLY, interval: 1, byDay: ["MO"], exceptions: [] } },
+                startDate,
+                new Date("2026-06-30T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual([
+                "2026-06-15T19:00:00.000Z",
+                "2026-06-22T19:00:00.000Z",
+                "2026-06-29T19:00:00.000Z",
+            ]);
+        });
+
+        it("MONTHLY with neither BYMONTHDAY nor BYDAY repeats on the start's own day-of-month.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.MONTHLY, interval: 2, exceptions: [] } },
+                startDate,
+                new Date("2026-10-15T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-06-15T19:00:00.000Z", "2026-08-15T19:00:00.000Z", "2026-10-15T19:00:00.000Z"]);
+        });
+
+        it("YEARLY with BYMONTH and BYMONTHDAY repeats on that month/day every interval years.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.YEARLY, interval: 1, byMonth: [6], byMonthDay: [15], exceptions: [] } },
+                startDate,
+                new Date("2028-06-15T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual([
+                "2026-06-15T19:00:00.000Z",
+                "2027-06-15T19:00:00.000Z",
+                "2028-06-15T19:00:00.000Z",
+            ]);
+        });
+
+        it("YEARLY with BYDAY (no BYMONTHDAY) matches every occurrence of that weekday within the matching year(s).", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.YEARLY, interval: 1, byMonth: [6], byDay: ["MO"], exceptions: [] } },
+                startDate,
+                new Date("2026-06-30T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual([
+                "2026-06-15T19:00:00.000Z",
+                "2026-06-22T19:00:00.000Z",
+                "2026-06-29T19:00:00.000Z",
+            ]);
+        });
+
+        it("YEARLY with interval > 1 skips the off years.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.YEARLY, interval: 2, byMonth: [6], byMonthDay: [15], exceptions: [] } },
+                startDate,
+                new Date("2028-06-15T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-06-15T19:00:00.000Z", "2028-06-15T19:00:00.000Z"]);
+        });
+
+        it("An unrecognized recurrence frequency never matches any candidate day.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: "bogus" as RecurrenceFrequency, interval: 1, exceptions: [] } },
+                startDate,
+                new Date("2026-07-01T00:00:00.000Z"),
+            );
+            expect(occurrences).toEqual([]);
+        });
+
+        it("YEARLY with neither BYMONTH/BYMONTHDAY/BYDAY repeats on the start's own month and day-of-month.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.YEARLY, interval: 1, exceptions: [] } },
+                startDate,
+                new Date("2028-06-15T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual([
+                "2026-06-15T19:00:00.000Z",
+                "2027-06-15T19:00:00.000Z",
+                "2028-06-15T19:00:00.000Z",
+            ]);
+        });
+
+        it("Stops producing occurrences once COUNT has been reached, regardless of window size.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, count: 3, exceptions: [] } },
+                startDate,
+                new Date("2026-12-31T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual([
+                "2026-06-15T19:00:00.000Z",
+                "2026-06-16T19:00:00.000Z",
+                "2026-06-17T19:00:00.000Z",
+            ]);
+        });
+
+        it("Stops producing occurrences once UNTIL is exceeded, inclusive of the exact UNTIL instant.", () => {
+            const occurrences = expandOccurrences(
+                {
+                    startDate,
+                    endDate,
+                    recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, until: new Date("2026-06-17T19:00:00.000Z"), exceptions: [] },
+                },
+                startDate,
+                new Date("2026-12-31T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual([
+                "2026-06-15T19:00:00.000Z",
+                "2026-06-16T19:00:00.000Z",
+                "2026-06-17T19:00:00.000Z",
+            ]);
+        });
+
+        it("Does not consult RecurrenceRule.exceptions on its own - the caller must fold it into excludeDates.", () => {
+            const rule = { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [new Date("2026-06-16T19:00:00.000Z")] };
+            const withoutExcludeDates = expandOccurrences({ startDate, endDate, recurrenceRule: rule }, startDate, new Date("2026-06-17T23:59:59.000Z"));
+            expect(withoutExcludeDates.map((o) => o.start.toISOString())).toEqual([
+                "2026-06-15T19:00:00.000Z",
+                "2026-06-16T19:00:00.000Z",
+                "2026-06-17T19:00:00.000Z",
+            ]);
+
+            const withExcludeDates = expandOccurrences(
+                { startDate, endDate, recurrenceRule: rule },
+                startDate,
+                new Date("2026-06-17T23:59:59.000Z"),
+                rule.exceptions,
+            );
+            expect(withExcludeDates.map((o) => o.start.toISOString())).toEqual(["2026-06-15T19:00:00.000Z", "2026-06-17T19:00:00.000Z"]);
+        });
+
+        it("Skips an occurrence via the excludeDates parameter independent of the rule's own exceptions - the mechanism a sibling override row's RECURRENCE-ID reuses.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] } },
+                startDate,
+                new Date("2026-06-17T23:59:59.000Z"),
+                [new Date("2026-06-16T19:00:00.000Z")],
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-06-15T19:00:00.000Z", "2026-06-17T19:00:00.000Z"]);
+        });
+
+        it("An indefinitely-recurring rule (no COUNT/UNTIL) is bounded by MAX_SCAN_DAYS/MAX_OCCURRENCES rather than hanging.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] } },
+                startDate,
+                new Date("2036-06-15T23:59:59.000Z"),
+            );
+            expect(occurrences.length).toBe(500);
         });
     });
 });

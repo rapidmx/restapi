@@ -1208,4 +1208,322 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             expect(override!.recurrenceId!.getTime()).toBe(recurrenceId.getTime());
         });
     });
+
+    describe("Resource mailbox auto-accept/decline", () => {
+        const sendItipRequest = async (icsOverrides: Partial<CalendarEvent>): Promise<void> => {
+            const ics = buildEventIcs(makeIcsEventFixture(icsOverrides), "REQUEST");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            await job.run();
+        };
+
+        it("Auto-accepts a non-conflicting request and replies via iTIP REPLY.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true });
+            const startDate = new Date(Date.now() + 60 * 60 * 1000);
+            const endDate = new Date(startDate.getTime() + 30 * 60 * 1000);
+            const icalUid = uuid.v4();
+
+            await sendItipRequest({ icalUid, startDate, endDate });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(false);
+            const resourceAttendee = events[0].attendees.find((a) => a.address === "recipient@example.com");
+            expect(resourceAttendee!.responseStatus).toBe(AttendeeResponseStatus.ACCEPTED);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(1);
+            expect(transport.sent[0].envelopeFrom).toBe("recipient@example.com");
+            expect(transport.sent[0].envelopeTo).toEqual(["organizer@example.com"]);
+            expect(transport.sent[0].raw.toString()).toContain("METHOD:REPLY");
+            expect(transport.sent[0].raw.toString()).toContain("ACCEPTED");
+        });
+
+        it("Auto-declines a request that conflicts with an existing booking, soft-deleting its own copy.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true });
+            const startDate = new Date(Date.now() + 60 * 60 * 1000);
+            const endDate = new Date(startDate.getTime() + 60 * 60 * 1000);
+            await calendarEventRepo.save(
+                new CalendarEventMongo({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Existing Booking",
+                    timezone: "UTC",
+                    organizer: { address: "other-organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid: uuid.v4(),
+                    startDate,
+                    endDate,
+                }),
+            );
+
+            const icalUid = uuid.v4();
+            await sendItipRequest({ icalUid, startDate, endDate });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(true);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(1);
+            expect(transport.sent[0].raw.toString()).toContain("METHOD:REPLY");
+            expect(transport.sent[0].raw.toString()).toContain("DECLINED");
+        });
+
+        it("allowConflicts accepts a request despite an overlapping existing booking.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true, allowConflicts: true });
+            const startDate = new Date(Date.now() + 60 * 60 * 1000);
+            const endDate = new Date(startDate.getTime() + 60 * 60 * 1000);
+            await calendarEventRepo.save(
+                new CalendarEventMongo({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Existing Booking",
+                    timezone: "UTC",
+                    organizer: { address: "other-organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid: uuid.v4(),
+                    startDate,
+                    endDate,
+                }),
+            );
+
+            const icalUid = uuid.v4();
+            await sendItipRequest({ icalUid, startDate, endDate });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(false);
+        });
+
+        it("Auto-declines a request exceeding maxDurationMinutes, without attempting a conflict check.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true, maxDurationMinutes: 30 });
+            const startDate = new Date(Date.now() + 60 * 60 * 1000);
+            const endDate = new Date(startDate.getTime() + 60 * 60 * 1000);
+            const icalUid = uuid.v4();
+
+            await sendItipRequest({ icalUid, startDate, endDate });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(true);
+        });
+
+        it("Auto-declines a request starting further out than bookingWindowDays, without attempting a conflict check.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true, bookingWindowDays: 7 });
+            const startDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+            const endDate = new Date(startDate.getTime() + 30 * 60 * 1000);
+            const icalUid = uuid.v4();
+
+            await sendItipRequest({ icalUid, startDate, endDate });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(true);
+        });
+
+        it("Recurring: auto-declines when an occurrence of the request conflicts with an occurrence of an existing recurring booking.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true });
+            const existingStart = new Date(Date.now() + 24 * 60 * 60 * 1000);
+            const existingEnd = new Date(existingStart.getTime() + 60 * 60 * 1000);
+            await calendarEventRepo.save(
+                new CalendarEventMongo({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Existing Recurring Booking",
+                    timezone: "UTC",
+                    organizer: { address: "other-organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid: uuid.v4(),
+                    startDate: existingStart,
+                    endDate: existingEnd,
+                }),
+            );
+
+            // The request's own second occurrence (start + 7 days) lands exactly on the existing recurring
+            // booking's own weekly occurrence.
+            const requestStart = new Date(existingStart.getTime() - 7 * 24 * 60 * 60 * 1000);
+            const requestEnd = new Date(requestStart.getTime() + 60 * 60 * 1000);
+            const icalUid = uuid.v4();
+            await sendItipRequest({
+                icalUid,
+                startDate: requestStart,
+                endDate: requestEnd,
+                recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, count: 3, exceptions: [] },
+            });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(true);
+        });
+
+        it("Recurring: auto-accepts when none of the request's occurrences conflict with any existing booking.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true });
+            const startDate = new Date(Date.now() + 24 * 60 * 60 * 1000);
+            const endDate = new Date(startDate.getTime() + 60 * 60 * 1000);
+            const icalUid = uuid.v4();
+
+            await sendItipRequest({
+                icalUid,
+                startDate,
+                endDate,
+                recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, count: 3, exceptions: [] },
+            });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(false);
+            const resourceAttendee = events[0].attendees.find((a) => a.address === "recipient@example.com");
+            expect(resourceAttendee!.responseStatus).toBe(AttendeeResponseStatus.ACCEPTED);
+        });
+
+        it("A resent REQUEST for a resource booking doesn't treat its own prior CalendarEvent row as a conflict.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true });
+            const startDate = new Date(Date.now() + 60 * 60 * 1000);
+            const endDate = new Date(startDate.getTime() + 30 * 60 * 1000);
+            const icalUid = uuid.v4();
+
+            await sendItipRequest({ icalUid, startDate, endDate, sequence: 0 });
+            await sendItipRequest({ icalUid, startDate, endDate, sequence: 1, title: "Team Sync (updated)" });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(false);
+            expect(events[0].title).toBe("Team Sync (updated)");
+            const resourceAttendee = events[0].attendees.find((a) => a.address === "recipient@example.com");
+            expect(resourceAttendee!.responseStatus).toBe(AttendeeResponseStatus.ACCEPTED);
+        });
+
+        it("Does not auto-process (attendee stays NEEDS_ACTION, no reply sent) for a non-resource mailbox.", async () => {
+            await createMailbox({ isResource: false });
+            const icalUid = uuid.v4();
+            await sendItipRequest({ icalUid });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events[0].attendees[0].responseStatus).toBe(AttendeeResponseStatus.NEEDS_ACTION);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(0);
+        });
+
+        it("Does not auto-process (attendee stays NEEDS_ACTION, no reply sent) for a resource mailbox with autoAcceptBookings unset.", async () => {
+            await createMailbox({ isResource: true });
+            const icalUid = uuid.v4();
+            await sendItipRequest({ icalUid });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events[0].attendees[0].responseStatus).toBe(AttendeeResponseStatus.NEEDS_ACTION);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(0);
+        });
+
+        it("Recurring: a sibling override row's RECURRENCE-ID excludes the master's phantom occurrence at that instant, so a request for the vacated original time isn't falsely declined.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true });
+            const existingMasterStart = new Date(Date.now() + 24 * 60 * 60 * 1000);
+            const existingMasterEnd = new Date(existingMasterStart.getTime() + 60 * 60 * 1000);
+            const existingIcalUid = uuid.v4();
+            await calendarEventRepo.save(
+                new CalendarEventMongo({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Existing Recurring Booking",
+                    timezone: "UTC",
+                    organizer: { address: "other-organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid: existingIcalUid,
+                    startDate: existingMasterStart,
+                    endDate: existingMasterEnd,
+                }),
+            );
+            // The master's second occurrence was rescheduled 3 hours later - the override row represents its
+            // real (moved) time, and the master's own expansion must not phantom-generate it at the original
+            // instant any more.
+            const originalSecondOccurrence = new Date(existingMasterStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+            const movedSecondOccurrenceStart = new Date(originalSecondOccurrence.getTime() + 3 * 60 * 60 * 1000);
+            await calendarEventRepo.save(
+                new CalendarEventMongo({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Existing Recurring Booking (moved occurrence)",
+                    timezone: "UTC",
+                    organizer: { address: "other-organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid: existingIcalUid,
+                    recurrenceId: originalSecondOccurrence,
+                    startDate: movedSecondOccurrenceStart,
+                    endDate: new Date(movedSecondOccurrenceStart.getTime() + 60 * 60 * 1000),
+                }),
+            );
+
+            // A new, non-recurring request for exactly the vacated original slot - must not be declined
+            // against a phantom occurrence of the master that no longer actually occupies that time.
+            const icalUid = uuid.v4();
+            await sendItipRequest({
+                icalUid,
+                startDate: originalSecondOccurrence,
+                endDate: new Date(originalSecondOccurrence.getTime() + 60 * 60 * 1000),
+            });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(false);
+        });
+
+        it("Sends no auto-response when the resource's own address isn't listed among the request's attendees.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true });
+            const icalUid = uuid.v4();
+            const startDate = new Date(Date.now() + 60 * 60 * 1000);
+            const endDate = new Date(startDate.getTime() + 30 * 60 * 1000);
+
+            await sendItipRequest({
+                icalUid,
+                startDate,
+                endDate,
+                attendees: [
+                    {
+                        address: "someone-else@example.com",
+                        displayName: "Someone Else",
+                        role: AttendeeRole.REQUIRED,
+                        responseStatus: AttendeeResponseStatus.NEEDS_ACTION,
+                        isOrganizer: false,
+                    },
+                ],
+            });
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(false);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(0);
+        });
+
+        it("Logs a warning and does not throw when sending the resource's auto-response fails.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true });
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            const sendSpy = vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("simulated transport failure"));
+
+            const icalUid = uuid.v4();
+            const startDate = new Date(Date.now() + 60 * 60 * 1000);
+            const endDate = new Date(startDate.getTime() + 30 * 60 * 1000);
+            await expect(sendItipRequest({ icalUid, startDate, endDate })).resolves.toBeUndefined();
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(false);
+            sendSpy.mockRestore();
+        });
+    });
 });

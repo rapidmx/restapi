@@ -180,6 +180,13 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
         if (!isTrusted) {
             for (const o of objs) {
+                if ((o as any).isResource) {
+                    throw new ApiError(
+                        ApiErrors.AUTH_PERMISSION_FAILURE,
+                        403,
+                        "Resource mailboxes may only be created by a trusted administrator.",
+                    );
+                }
                 (o as any).ownerUserUid = user.uid;
             }
         }

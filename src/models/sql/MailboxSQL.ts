@@ -91,6 +91,48 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     @Nullable
     public oofEndTime?: Date;
 
+    @Column({ nullable: true })
+    @Description(
+        "`true` if this mailbox represents a bookable resource (Exchange's \"room\"/\"equipment\" mailbox " +
+            "concept) rather than a person - see `resourceType`/the auto-accept fields below.",
+    )
+    @Nullable
+    public isResource?: boolean = undefined;
+
+    // Enum-like string-literal-union column - needs an explicit type, same as `IngestQueueEntrySQL.status`.
+    @Column({ type: "varchar", nullable: true })
+    @Description("Whether this resource is a `room` or `equipment` - only meaningful when `isResource` is `true`.")
+    @Nullable
+    public resourceType?: "room" | "equipment" = undefined;
+
+    @Column({ nullable: true })
+    @Description("Informational only (e.g. for a future room-picker UI) - not used by any accept/decline logic.")
+    @Nullable
+    public resourceCapacity?: number = undefined;
+
+    @Column({ nullable: true })
+    @Description(
+        "Mirrors Exchange's `Set-CalendarProcessing -AutomateProcessing AutoAccept` - has no effect unless " +
+            "`isResource` is also `true`.",
+    )
+    @Nullable
+    public autoAcceptBookings?: boolean = undefined;
+
+    @Column({ nullable: true })
+    @Description("Mirrors `-AllowConflicts $true` - when set, every booking request is auto-accepted regardless of existing bookings.")
+    @Nullable
+    public allowConflicts?: boolean = undefined;
+
+    @Column({ nullable: true })
+    @Description("Mirrors `-BookingWindowInDays` - a request starting further out than this many days is auto-declined.")
+    @Nullable
+    public bookingWindowDays?: number = undefined;
+
+    @Column({ nullable: true })
+    @Description("Mirrors `-MaximumDurationInMinutes` - a request longer than this is auto-declined.")
+    @Nullable
+    public maxDurationMinutes?: number = undefined;
+
     constructor(other?: Partial<MailboxSQL>) {
         super(other);
 
@@ -107,6 +149,13 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
             this.oofMessage = other.oofMessage !== undefined ? other.oofMessage : this.oofMessage;
             this.oofStartTime = "oofStartTime" in other ? other.oofStartTime : this.oofStartTime;
             this.oofEndTime = "oofEndTime" in other ? other.oofEndTime : this.oofEndTime;
+            this.isResource = "isResource" in other ? other.isResource : this.isResource;
+            this.resourceType = "resourceType" in other ? other.resourceType : this.resourceType;
+            this.resourceCapacity = "resourceCapacity" in other ? other.resourceCapacity : this.resourceCapacity;
+            this.autoAcceptBookings = "autoAcceptBookings" in other ? other.autoAcceptBookings : this.autoAcceptBookings;
+            this.allowConflicts = "allowConflicts" in other ? other.allowConflicts : this.allowConflicts;
+            this.bookingWindowDays = "bookingWindowDays" in other ? other.bookingWindowDays : this.bookingWindowDays;
+            this.maxDurationMinutes = "maxDurationMinutes" in other ? other.maxDurationMinutes : this.maxDurationMinutes;
         }
     }
 }

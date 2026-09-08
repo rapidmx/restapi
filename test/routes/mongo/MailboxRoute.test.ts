@@ -433,6 +433,53 @@ describe("Route:MailboxMongo Tests", () => {
         expect(acl?.records ?? []).toEqual([]);
     });
 
+    it("Rejects a non-trusted caller creating a resource mailbox (403).", async () => {
+        const obj: any = {
+            primarySmtpAddress: `${uuid.v4()}@example.com`,
+            aliasAddresses: [],
+            displayName: "Conference Room",
+            timezone: "UTC",
+            quotaBytes: 1_000_000_000,
+            usedBytes: 0,
+            isResource: true,
+        };
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(obj);
+
+        expect(result.status).toBe(403);
+    });
+
+    it("A trusted (admin) caller can create a resource mailbox, and its resource fields round-trip.", async () => {
+        const obj: any = {
+            primarySmtpAddress: `${uuid.v4()}@example.com`,
+            aliasAddresses: [],
+            displayName: "Conference Room",
+            timezone: "UTC",
+            quotaBytes: 1_000_000_000,
+            usedBytes: 0,
+            isResource: true,
+            resourceType: "room",
+            resourceCapacity: 12,
+            autoAcceptBookings: true,
+            allowConflicts: false,
+            bookingWindowDays: 90,
+            maxDurationMinutes: 120,
+        };
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send(obj);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+        expect(result.body.ownerUserUid == null).toBe(true);
+        expectMatchingFields(result.body, obj);
+    });
+
     it("Creating a mailbox eagerly provisions its Inbox, Drafts, Calendar, Contacts, and Tasks folders (the webmail client needs each to render anything at all).", async () => {
         const obj: MailboxMongo = new MailboxMongo({
             ownerUserUid: owner.uid,

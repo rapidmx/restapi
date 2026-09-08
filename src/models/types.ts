@@ -71,6 +71,35 @@ export interface Mailbox extends BaseEntity {
     oofStartTime?: Date;
 
     oofEndTime?: Date;
+
+    /** `true` if this mailbox represents a bookable resource (Exchange's "room"/"equipment" mailbox
+     * concept) rather than a person - see `resourceType`/the auto-accept fields below. A resource mailbox
+     * is otherwise an ordinary `Mailbox` (still needs `ownerUserUid` unset - creating one is
+     * trusted-role-only, same gate `BaseMailboxRoute.create()` already applies to any ownerless mailbox). */
+    isResource?: boolean;
+
+    /** Whether this resource is a `room` or `equipment` - only meaningful when `isResource` is `true`. */
+    resourceType?: "room" | "equipment";
+
+    /** Informational only (e.g. for a future room-picker UI) - not used by any accept/decline logic. */
+    resourceCapacity?: number;
+
+    /** Mirrors Exchange's `Set-CalendarProcessing -AutomateProcessing AutoAccept` (vs `None`) - off by
+     * default, matching this codebase's "silently-enabling automated behavior needs an explicit opt-in"
+     * convention (e.g. `mail:auto_provision:enabled`). Has no effect unless `isResource` is also `true`. */
+    autoAcceptBookings?: boolean;
+
+    /** Mirrors `-AllowConflicts $true` - when set, every request is auto-accepted regardless of existing
+     * bookings (conflict checking is skipped entirely). */
+    allowConflicts?: boolean;
+
+    /** Mirrors `-BookingWindowInDays` - a request whose first occurrence starts further out than this many
+     * days from now is auto-declined. `undefined` means no limit. */
+    bookingWindowDays?: number;
+
+    /** Mirrors `-MaximumDurationInMinutes` - a request longer than this is auto-declined. `undefined` means
+     * no limit. */
+    maxDurationMinutes?: number;
 }
 
 /**
