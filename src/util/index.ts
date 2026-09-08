@@ -14,6 +14,7 @@
  */
 export * from "./AutoReplyUtils.js";
 export * from "./FolderUtils.js";
+export * from "./IcsUtils.js";
 export * from "./MailFilterUtils.js";
 export * from "./MailSendUtils.js";
 export * from "./MailSignatureUtils.js";

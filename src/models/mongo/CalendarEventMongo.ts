@@ -135,6 +135,19 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
     @Nullable
     public autoReplyMessage?: string;
 
+    @Column()
+    @Description(
+        "The `sequence` value as of the last time invites were successfully sent to attendees. " +
+            "`undefined` means never invited.",
+    )
+    @Nullable
+    public inviteSequenceSent?: number;
+
+    @Column()
+    @Description("Set once an iTIP CANCEL has been sent to attendees for this event.")
+    @Nullable
+    public cancelNoticeSentAt?: Date;
+
     constructor(other?: Partial<CalendarEventMongo>) {
         super(other);
 
@@ -161,6 +174,8 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
             this.sequence = other.sequence !== undefined ? other.sequence : this.sequence;
             this.autoReplyEnabled = "autoReplyEnabled" in other ? other.autoReplyEnabled : this.autoReplyEnabled;
             this.autoReplyMessage = "autoReplyMessage" in other ? other.autoReplyMessage : this.autoReplyMessage;
+            this.inviteSequenceSent = "inviteSequenceSent" in other ? other.inviteSequenceSent : this.inviteSequenceSent;
+            this.cancelNoticeSentAt = "cancelNoticeSentAt" in other ? other.cancelNoticeSentAt : this.cancelNoticeSentAt;
         }
     }
 }

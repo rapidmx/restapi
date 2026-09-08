@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
-import { CalendarEventMongo } from "../../mongo.js";
-import { BaseScopedChildRoute } from "../BaseScopedChildRoute.js";
+import { CalendarEventMongo, MailboxMongo } from "../../mongo.js";
+import { BaseCalendarEventRoute } from "../BaseCalendarEventRoute.js";
 import { RecoverableRepoUtils } from "../../util/RecoverableRepoUtils.js";
 const { Model } = RouteDecorators;
 
 @Model(CalendarEventMongo)
-export class CalendarEventRouteMongo extends BaseScopedChildRoute<CalendarEventMongo> {
+export class CalendarEventRouteMongo extends BaseCalendarEventRoute<CalendarEventMongo> {
     protected readonly repoUtilsClass: any = RecoverableRepoUtils;
-    protected readonly scopeProperty: string = "folderUid";
+    protected mailboxClass: any = MailboxMongo;
 }

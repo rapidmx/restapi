@@ -24,7 +24,76 @@ import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MailFilterRuleSQL } from "../../../src/models/sql/MailFilterRuleSQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
 import { OofReplySuppressionSQL } from "../../../src/models/sql/OofReplySuppressionSQL.js";
-import { FolderType, IngestStatus, MailFilterActionType, QuarantineReason } from "../../../src/models/types.js";
+import { buildEventIcs } from "../../../src/util/IcsUtils.js";
+import {
+    AttendeeResponseStatus,
+    AttendeeRole,
+    BusyStatus,
+    CalendarEvent,
+    CalendarEventStatus,
+    FolderType,
+    IngestStatus,
+    MailFilterActionType,
+    QuarantineReason,
+    RecipientType,
+    RecurrenceFrequency,
+} from "../../../src/models/types.js";
+
+/** A minimal `CalendarEvent`-shaped fixture, just enough for `buildEventIcs()` to render real ICS text from. */
+function makeIcsEventFixture(overrides: Partial<CalendarEvent> = {}): CalendarEvent {
+    return {
+        uid: "fixture-uid",
+        version: 0,
+        dateCreated: new Date(),
+        dateModified: new Date(),
+        deleted: false,
+        folderUid: "organizer-folder",
+        mailboxUid: "organizer-mailbox",
+        title: "Team Sync",
+        startDate: new Date(Date.now() + 60 * 60 * 1000),
+        endDate: new Date(Date.now() + 2 * 60 * 60 * 1000),
+        allDay: false,
+        timezone: "UTC",
+        organizer: { address: "organizer@example.com", displayName: "Organizer", type: RecipientType.TO },
+        attendees: [
+            { address: "recipient@example.com", displayName: "Recipient", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+        ],
+        status: CalendarEventStatus.CONFIRMED,
+        busyStatus: BusyStatus.BUSY,
+        icalUid: "fixture-ical-uid",
+        sequence: 0,
+        ...overrides,
+    };
+}
+
+/** Builds a raw multipart RFC 5322 message carrying `ics` as its `text/calendar` part - the inbound iTIP shape
+ * `ScanPipeline`/`ScanQueueJob.maybeProcessItipMessage()` detect and process. */
+function makeItipRawMessage(ics: string, opts: { from?: string; to?: string } = {}): Buffer {
+    const from = opts.from ?? "organizer@example.com";
+    const to = opts.to ?? "recipient@example.com";
+    const raw = [
+        `From: ${from}`,
+        `To: ${to}`,
+        "Subject: Meeting invite",
+        "MIME-Version: 1.0",
+        'Content-Type: multipart/mixed; boundary="BOUNDARY"',
+        "",
+        "--BOUNDARY",
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        "You have been invited.",
+        "",
+        "--BOUNDARY",
+        'Content-Type: text/calendar; method=REQUEST; name="invite.ics"',
+        'Content-Disposition: attachment; filename="invite.ics"',
+        "",
+        ics,
+        "",
+        "--BOUNDARY--",
+        "",
+    ].join("\r\n");
+    return Buffer.from(raw);
+}
 
 /** Builds a minimal valid multipart RFC 5322 message, optionally with a header/attachment marker. */
 function makeRawMessage(opts: { extraHeader?: string; attachmentMarker?: string } = {}): Buffer {
@@ -648,5 +717,248 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
 
         const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
         expect(transport.sent.length).toBe(0);
+    });
+
+    describe("Inbound iTIP processing", () => {
+        it("Creates a new CalendarEvent in the mailbox's Calendar folder from an inbound REQUEST.", async () => {
+            const icalUid = uuid.v4();
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid }), "REQUEST");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const events = await calendarEventRepo.find({ where: { mailboxUid, icalUid } });
+            expect(events.length).toBe(1);
+            expect(events[0].title).toBe("Team Sync");
+            expect(events[0].attendees[0].responseStatus).toBe(AttendeeResponseStatus.NEEDS_ACTION);
+            const calendarFolder = await folderRepo.findOne({ where: { mailboxUid, type: FolderType.CALENDAR } });
+            expect(events[0].folderUid).toBe(calendarFolder!.uid);
+        });
+
+        it("Updates an existing event in place when a resent REQUEST carries a higher sequence.", async () => {
+            const icalUid = uuid.v4();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+
+            const firstRawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(firstRawBlobKey, makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 0 }), "REQUEST")));
+            await createIngestEntry({ rawBlobKey: firstRawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            await job.run();
+            const created = (await calendarEventRepo.find({ where: { mailboxUid, icalUid } }))[0];
+
+            const secondRawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                secondRawBlobKey,
+                makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 1, title: "Team Sync (moved)" }), "REQUEST")),
+            );
+            await createIngestEntry({ rawBlobKey: secondRawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            await job.run();
+
+            const events = await calendarEventRepo.find({ where: { mailboxUid, icalUid } });
+            expect(events.length).toBe(1);
+            expect(events[0].uid).toBe(created.uid);
+            expect(events[0].title).toBe("Team Sync (moved)");
+            expect(events[0].sequence).toBe(1);
+        });
+
+        it("Ignores a resent REQUEST whose sequence is not higher than the existing row's (stale/duplicate).", async () => {
+            const icalUid = uuid.v4();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+
+            await blobStore.put(`raw/a`, makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 1 }), "REQUEST")));
+            await createIngestEntry({ rawBlobKey: `raw/a`, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            await job.run();
+
+            await blobStore.put(`raw/b`, makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 1, title: "Should not apply" }), "REQUEST")));
+            await createIngestEntry({ rawBlobKey: `raw/b`, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            await job.run();
+
+            const events = await calendarEventRepo.find({ where: { mailboxUid, icalUid } });
+            expect(events.length).toBe(1);
+            expect(events[0].title).toBe("Team Sync");
+        });
+
+        it("Updates the matching attendee's responseStatus from an inbound REPLY.", async () => {
+            const icalUid = uuid.v4();
+            const organizerCopy = await calendarEventRepo.save(
+                new CalendarEventSQL({
+                    folderUid: "organizer-calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [
+                        {
+                            address: "attendee@example.com",
+                            role: AttendeeRole.REQUIRED,
+                            responseStatus: AttendeeResponseStatus.NEEDS_ACTION,
+                            isOrganizer: false,
+                        },
+                    ],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const replyIcs = buildEventIcs(makeIcsEventFixture({ icalUid }), "REPLY", {
+                onlyAttendee: {
+                    address: "attendee@example.com",
+                    role: AttendeeRole.REQUIRED,
+                    responseStatus: AttendeeResponseStatus.ACCEPTED,
+                    isOrganizer: false,
+                },
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(replyIcs, { from: "attendee@example.com", to: "organizer@example.com" }));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "attendee@example.com", envelopeTo: ["organizer@example.com"] });
+
+            await job.run();
+
+            const updated = await calendarEventRepo.findOne({ where: { uid: organizerCopy.uid } });
+            expect(updated!.attendees[0].responseStatus).toBe(AttendeeResponseStatus.ACCEPTED);
+        });
+
+        it("Soft-deletes the mailbox's own copy from a whole-series inbound CANCEL (no recurrenceId).", async () => {
+            const icalUid = uuid.v4();
+            const existing = await calendarEventRepo.save(
+                new CalendarEventSQL({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid }), "CANCEL");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const found = await calendarEventRepo.findOne({ where: { uid: existing.uid } });
+            expect(found!.deleted).toBe(true);
+        });
+
+        it("Recurring: a single-occurrence inbound CANCEL soft-deletes the matching override row.", async () => {
+            const icalUid = uuid.v4();
+            const recurrenceId = new Date(Math.floor((Date.now() + 60 * 60 * 1000) / 1000) * 1000);
+            const override = await calendarEventRepo.save(
+                new CalendarEventSQL({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync (moved)",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    recurrenceId,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid, recurrenceId }), "CANCEL");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const found = await calendarEventRepo.findOne({ where: { uid: override.uid } });
+            expect(found!.deleted).toBe(true);
+        });
+
+        it("Recurring: a single-occurrence CANCEL with no existing override adds the date to the master's recurrenceRule.exceptions.", async () => {
+            const icalUid = uuid.v4();
+            const recurrenceId = new Date(Math.floor((Date.now() + 60 * 60 * 1000) / 1000) * 1000);
+            const master = await calendarEventRepo.save(
+                new CalendarEventSQL({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid, recurrenceId }), "CANCEL");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const updatedMaster = await calendarEventRepo.findOne({ where: { uid: master.uid } });
+            expect(updatedMaster).not.toBeNull();
+            // A `recurrenceRule.exceptions` Date round-trips through SQLite's `simple-json` column as a plain
+            // string, not a reconstructed `Date` instance (a known, pre-existing, already-documented quirk of
+            // this framework's SQL `simple-json` handling, unrelated to this feature) - `new Date(d)` normalizes
+            // either representation before comparing.
+            expect(updatedMaster!.recurrenceRule!.exceptions.map((d) => new Date(d).getTime())).toContain(recurrenceId.getTime());
+        });
+
+        it("Recurring: an inbound REQUEST with a recurrenceId creates/updates only that occurrence, independent of the master.", async () => {
+            const icalUid = uuid.v4();
+            const master = await calendarEventRepo.save(
+                new CalendarEventSQL({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const recurrenceId = new Date(Math.floor((Date.now() + 60 * 60 * 1000) / 1000) * 1000);
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid, recurrenceId, title: "Team Sync (moved)" }), "REQUEST");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const unchangedMaster = await calendarEventRepo.findOne({ where: { uid: master.uid } });
+            expect(unchangedMaster!.title).toBe("Team Sync");
+
+            const events = await calendarEventRepo.find({ where: { mailboxUid, icalUid } });
+            expect(events.length).toBe(2);
+            const override = events.find((e) => e.uid !== master.uid);
+            expect(override!.title).toBe("Team Sync (moved)");
+            expect(override!.recurrenceId!.getTime()).toBe(recurrenceId.getTime());
+        });
     });
 });

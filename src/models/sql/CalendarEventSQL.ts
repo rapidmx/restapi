@@ -139,6 +139,19 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
     @Nullable
     public autoReplyMessage?: string;
 
+    @Column({ nullable: true })
+    @Description(
+        "The `sequence` value as of the last time invites were successfully sent to attendees. " +
+            "`undefined` means never invited.",
+    )
+    @Nullable
+    public inviteSequenceSent?: number;
+
+    @Column({ nullable: true })
+    @Description("Set once an iTIP CANCEL has been sent to attendees for this event.")
+    @Nullable
+    public cancelNoticeSentAt?: Date;
+
     constructor(other?: Partial<CalendarEventSQL>) {
         super(other);
 
@@ -165,6 +178,8 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
             this.sequence = other.sequence !== undefined ? other.sequence : this.sequence;
             this.autoReplyEnabled = "autoReplyEnabled" in other ? other.autoReplyEnabled : this.autoReplyEnabled;
             this.autoReplyMessage = "autoReplyMessage" in other ? other.autoReplyMessage : this.autoReplyMessage;
+            this.inviteSequenceSent = "inviteSequenceSent" in other ? other.inviteSequenceSent : this.inviteSequenceSent;
+            this.cancelNoticeSentAt = "cancelNoticeSentAt" in other ? other.cancelNoticeSentAt : this.cancelNoticeSentAt;
         }
     }
 }

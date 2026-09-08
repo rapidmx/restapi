@@ -19,8 +19,8 @@ import { Repository } from "typeorm";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
-import { BusyStatus, CalendarEventStatus, FolderType, RecipientType } from "../../../src/models/types.js";
-import { registerTestDoubles } from "../../testDoubles.js";
+import { AttendeeResponseStatus, AttendeeRole, BusyStatus, CalendarEventStatus, FolderType, RecipientType } from "../../../src/models/types.js";
+import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
 
 describe("Route:CalendarEventSQL Tests", () => {
     const logger = Logger();
@@ -140,6 +140,7 @@ describe("Route:CalendarEventSQL Tests", () => {
         await calendarEventRepo.clear();
         await folderRepo.clear();
         await mailboxRepo.clear();
+        (objectFactory.getInstance<RecordingMailTransport>("MailTransport")!).sent = [];
     });
 
     it("Requires an explicit folderUid query parameter to list calendar events.", async () => {
@@ -360,6 +361,220 @@ describe("Route:CalendarEventSQL Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.headers["content-length"]).toBe("0");
+    });
+
+    describe("Auto-bumped sequence on scheduling-relevant updates", () => {
+        it("Bumps sequence when startDate changes.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createCalendarEvent(mailbox.uid, folder.uid);
+            const newStart = new Date(event.startDate.getTime() + 60 * 60 * 1000);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: event.uid, version: event.version, startDate: newStart });
+
+            expect(result.status).toBe(200);
+            expect(result.body.sequence).toBe(1);
+        });
+
+        it("Bumps sequence when attendees changes.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createCalendarEvent(mailbox.uid, folder.uid);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    uid: event.uid,
+                    version: event.version,
+                    attendees: [{ address: "attendee@example.com", role: "required", responseStatus: "needsAction", isOrganizer: false }],
+                });
+
+            expect(result.status).toBe(200);
+            expect(result.body.sequence).toBe(1);
+        });
+
+        it("Bumps sequence when endDate changes.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createCalendarEvent(mailbox.uid, folder.uid);
+            const newEnd = new Date(event.endDate.getTime() + 60 * 60 * 1000);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: event.uid, version: event.version, endDate: newEnd });
+
+            expect(result.status).toBe(200);
+            expect(result.body.sequence).toBe(1);
+        });
+
+        it("Does not bump sequence when only an unrelated field (title) changes.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createCalendarEvent(mailbox.uid, folder.uid);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: event.uid, version: event.version, title: "Renamed" });
+
+            expect(result.status).toBe(200);
+            expect(result.body.sequence).toBe(0);
+        });
+    });
+
+    describe("POST /:id/respond", () => {
+        const createInvitedEvent = async (mailboxUid: string, folderUid: string, attendeeAddress: string) =>
+            createCalendarEvent(mailboxUid, folderUid, {
+                organizer: { address: "organizer@example.com", displayName: "Organizer", type: RecipientType.TO },
+                attendees: [
+                    {
+                        address: attendeeAddress,
+                        displayName: "Me",
+                        role: AttendeeRole.REQUIRED,
+                        responseStatus: AttendeeResponseStatus.NEEDS_ACTION,
+                        isOrganizer: false,
+                    },
+                ],
+            });
+
+        it("Accepting updates the mailbox's own attendee entry and sends an iTIP REPLY to the organizer.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createInvitedEvent(mailbox.uid, folder.uid, mailbox.primarySmtpAddress);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${event.uid}/respond`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ responseStatus: "accepted" });
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.attendees[0].responseStatus).toBe("accepted");
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(1);
+            expect(transport.sent[0].envelopeTo).toEqual(["organizer@example.com"]);
+            expect(transport.sent[0].raw.toString()).toContain("METHOD:REPLY");
+        });
+
+        it("Declining soft-deletes the mailbox's own copy of the event.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createInvitedEvent(mailbox.uid, folder.uid, mailbox.primarySmtpAddress);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${event.uid}/respond`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ responseStatus: "declined" });
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.uid).toBe(event.uid);
+
+            const existing = await calendarEventRepo.findOne({ where: { uid: event.uid } });
+            expect(existing?.deleted).toBe(true);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(1);
+            // `nodemailer`'s `MailComposer` quoted-printable-encodes the `text/calendar` part (escaping `=` as
+            // `=3D`), so "PARTSTAT=DECLINED" isn't a literal substring of the raw MIME - "METHOD:REPLY" and the
+            // word "DECLINED" both survive that encoding untouched.
+            expect(transport.sent[0].raw.toString()).toContain("METHOD:REPLY");
+            expect(transport.sent[0].raw.toString()).toContain("DECLINED");
+        });
+
+        it("Tentative response updates the attendee entry without deleting the event.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createInvitedEvent(mailbox.uid, folder.uid, mailbox.primarySmtpAddress);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${event.uid}/respond`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ responseStatus: "tentative" });
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.attendees[0].responseStatus).toBe("tentative");
+
+            const existing = await calendarEventRepo.findOne({ where: { uid: event.uid } });
+            expect(existing?.deleted).toBe(false);
+        });
+
+        it("Returns 400 for an invalid responseStatus value.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createInvitedEvent(mailbox.uid, folder.uid, mailbox.primarySmtpAddress);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${event.uid}/respond`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ responseStatus: "maybe-later" });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Returns 400 when the calling mailbox has no matching attendee entry on the event.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createCalendarEvent(mailbox.uid, folder.uid, {
+                organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                attendees: [],
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${event.uid}/respond`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ responseStatus: "accepted" });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("A different user cannot respond to a calendar event they don't have access to.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createInvitedEvent(mailbox.uid, folder.uid, mailbox.primarySmtpAddress);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${event.uid}/respond`)
+                .set("Authorization", "jwt " + otherUserToken)
+                .send({ responseStatus: "accepted" });
+
+            expect(result.status).toBe(403);
+        });
+
+        it("Responding to a nonexistent calendar event returns 404.", async () => {
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${uuid.v4()}/respond`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ responseStatus: "accepted" });
+
+            expect(result.status).toBe(404);
+        });
+
+        it("Still updates the attendee's status even when sending the iTIP REPLY email fails.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createInvitedEvent(mailbox.uid, folder.uid, mailbox.primarySmtpAddress);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            const sendSpy = vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("simulated transport failure"));
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${event.uid}/respond`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ responseStatus: "accepted" });
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.attendees[0].responseStatus).toBe("accepted");
+            sendSpy.mockRestore();
+        });
     });
 
     // See the identical describe block in test/routes/mongo/CalendarEventRoute.test.ts for the full rationale:

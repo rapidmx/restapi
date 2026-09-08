@@ -602,6 +602,15 @@ export interface CalendarEvent extends RecoverableBaseEntity {
     /** The automatic-reply body to use while this event's window is active. Only meaningful when
      * `autoReplyEnabled` is `true`. */
     autoReplyMessage?: string;
+
+    /** The `sequence` value as of the last time invites were successfully sent to attendees - lets
+     * `MeetingSchedulingJob` tell "just added/changed, not yet invited" apart from "already invited,
+     * nothing new to send." `undefined` means never invited. */
+    inviteSequenceSent?: number;
+
+    /** Set once an iTIP CANCEL has been sent to attendees for this event (triggered by `status:
+     * CANCELLED` or by deleting the event) - prevents resending on every poll. */
+    cancelNoticeSentAt?: Date;
 }
 
 /**

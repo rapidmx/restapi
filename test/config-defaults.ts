@@ -95,6 +95,7 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
                 mailbox_quota_recalc: { schedule: "0 0 7 * * *", batch_size: 100 },
                 scheduled_send: { schedule: "*/30 * * * * *", batch_size: 50 },
                 oof_suppression_cleanup: { schedule: "0 30 6 * * *", batch_size: 500, retention_days: 30 },
+                meeting_scheduling: { schedule: "0 */5 * * * *", batch_size: 100 },
             },
             oof: {
                 resuppress_after_hours: 24,

@@ -30,7 +30,76 @@ import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MailFilterRuleMongo } from "../../../src/models/mongo/MailFilterRuleMongo.js";
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
 import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySuppressionMongo.js";
-import { FolderType, IngestStatus, MailFilterActionType, QuarantineReason } from "../../../src/models/types.js";
+import { buildEventIcs } from "../../../src/util/IcsUtils.js";
+import {
+    AttendeeResponseStatus,
+    AttendeeRole,
+    BusyStatus,
+    CalendarEvent,
+    CalendarEventStatus,
+    FolderType,
+    IngestStatus,
+    MailFilterActionType,
+    QuarantineReason,
+    RecipientType,
+    RecurrenceFrequency,
+} from "../../../src/models/types.js";
+
+/** A minimal `CalendarEvent`-shaped fixture, just enough for `buildEventIcs()` to render real ICS text from. */
+function makeIcsEventFixture(overrides: Partial<CalendarEvent> = {}): CalendarEvent {
+    return {
+        uid: "fixture-uid",
+        version: 0,
+        dateCreated: new Date(),
+        dateModified: new Date(),
+        deleted: false,
+        folderUid: "organizer-folder",
+        mailboxUid: "organizer-mailbox",
+        title: "Team Sync",
+        startDate: new Date(Date.now() + 60 * 60 * 1000),
+        endDate: new Date(Date.now() + 2 * 60 * 60 * 1000),
+        allDay: false,
+        timezone: "UTC",
+        organizer: { address: "organizer@example.com", displayName: "Organizer", type: RecipientType.TO },
+        attendees: [
+            { address: "recipient@example.com", displayName: "Recipient", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+        ],
+        status: CalendarEventStatus.CONFIRMED,
+        busyStatus: BusyStatus.BUSY,
+        icalUid: "fixture-ical-uid",
+        sequence: 0,
+        ...overrides,
+    };
+}
+
+/** Builds a raw multipart RFC 5322 message carrying `ics` as its `text/calendar` part - the inbound iTIP shape
+ * `ScanPipeline`/`ScanQueueJob.maybeProcessItipMessage()` detect and process. */
+function makeItipRawMessage(ics: string, opts: { from?: string; to?: string } = {}): Buffer {
+    const from = opts.from ?? "organizer@example.com";
+    const to = opts.to ?? "recipient@example.com";
+    const raw = [
+        `From: ${from}`,
+        `To: ${to}`,
+        "Subject: Meeting invite",
+        "MIME-Version: 1.0",
+        'Content-Type: multipart/mixed; boundary="BOUNDARY"',
+        "",
+        "--BOUNDARY",
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        "You have been invited.",
+        "",
+        "--BOUNDARY",
+        'Content-Type: text/calendar; method=REQUEST; name="invite.ics"',
+        'Content-Disposition: attachment; filename="invite.ics"',
+        "",
+        ics,
+        "",
+        "--BOUNDARY--",
+        "",
+    ].join("\r\n");
+    return Buffer.from(raw);
+}
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
@@ -800,5 +869,307 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         const suppressions = await oofReplySuppressionRepo.find({ mailboxUid, senderAddress: "sender@example.com" }).toArray();
         expect(suppressions.length).toBe(0);
         sendSpy.mockRestore();
+    });
+
+    describe("Inbound iTIP processing", () => {
+        it("Ignores a text/calendar part with no recognizable UID/METHOD (parseIcsEvent returns undefined).", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage("BEGIN:VCALENDAR\r\nEND:VCALENDAR"));
+            const entry = await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            const updated = await ingestQueueRepo.findOne({ uid: entry.uid } as any);
+            expect(updated!.status).toBe(IngestStatus.DELIVERED);
+        });
+
+        it("Ignores an iTIP message with an unrecognized METHOD (not REQUEST/REPLY/CANCEL).", async () => {
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid: uuid.v4() }), "REQUEST").replace("METHOD:REQUEST", "METHOD:PUBLISH");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await expect(job.run()).resolves.toBeUndefined();
+        });
+
+        it("Logs a warning and continues when processing an iTIP message throws.", async () => {
+            const findSpy = vi.spyOn((job as any).calendarEventRepo, "find").mockRejectedValueOnce(new Error("simulated database failure"));
+
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid: uuid.v4() }), "REQUEST");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            const entry = await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            // The failure is caught and logged - it never fails the overall ingest entry, which still delivers.
+            const updated = await ingestQueueRepo.findOne({ uid: entry.uid } as any);
+            expect(updated!.status).toBe(IngestStatus.DELIVERED);
+            findSpy.mockRestore();
+        });
+
+        it("Ignores a REPLY for which no matching CalendarEvent exists in this mailbox.", async () => {
+            const replyIcs = buildEventIcs(makeIcsEventFixture({ icalUid: uuid.v4() }), "REPLY", {
+                onlyAttendee: {
+                    address: "attendee@example.com",
+                    role: AttendeeRole.REQUIRED,
+                    responseStatus: AttendeeResponseStatus.ACCEPTED,
+                    isOrganizer: false,
+                },
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(replyIcs, { from: "attendee@example.com", to: "organizer@example.com" }));
+            const entry = await createIngestEntry({ rawBlobKey, envelopeFrom: "attendee@example.com", envelopeTo: ["organizer@example.com"] });
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            const updated = await ingestQueueRepo.findOne({ uid: entry.uid } as any);
+            expect(updated!.status).toBe(IngestStatus.DELIVERED);
+        });
+
+        it("Creates a new CalendarEvent in the mailbox's Calendar folder from an inbound REQUEST.", async () => {
+            const icalUid = uuid.v4();
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid }), "REQUEST");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].title).toBe("Team Sync");
+            expect(events[0].attendees[0].responseStatus).toBe(AttendeeResponseStatus.NEEDS_ACTION);
+            const calendarFolder = await folderRepo.findOne({ mailboxUid, type: FolderType.CALENDAR } as any);
+            expect(events[0].folderUid).toBe(calendarFolder!.uid);
+        });
+
+        it("Updates an existing event in place when a resent REQUEST carries a higher sequence.", async () => {
+            const icalUid = uuid.v4();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+
+            const firstRawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(firstRawBlobKey, makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 0 }), "REQUEST")));
+            await createIngestEntry({ rawBlobKey: firstRawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            await job.run();
+            const created = (await calendarEventRepo.find({ mailboxUid, icalUid }).toArray())[0];
+
+            const secondRawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                secondRawBlobKey,
+                makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 1, title: "Team Sync (moved)" }), "REQUEST")),
+            );
+            await createIngestEntry({ rawBlobKey: secondRawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            await job.run();
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].uid).toBe(created.uid);
+            expect(events[0].title).toBe("Team Sync (moved)");
+            expect(events[0].sequence).toBe(1);
+        });
+
+        it("Ignores a resent REQUEST whose sequence is not higher than the existing row's (stale/duplicate).", async () => {
+            const icalUid = uuid.v4();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+
+            await blobStore.put(`raw/a`, makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 1 }), "REQUEST")));
+            await createIngestEntry({ rawBlobKey: `raw/a`, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            await job.run();
+
+            await blobStore.put(`raw/b`, makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 1, title: "Should not apply" }), "REQUEST")));
+            await createIngestEntry({ rawBlobKey: `raw/b`, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            await job.run();
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(1);
+            expect(events[0].title).toBe("Team Sync");
+        });
+
+        it("Updates the matching attendee's responseStatus from an inbound REPLY.", async () => {
+            const icalUid = uuid.v4();
+            const organizerCopy = await calendarEventRepo.save(
+                new CalendarEventMongo({
+                    folderUid: "organizer-calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [
+                        {
+                            address: "attendee@example.com",
+                            role: AttendeeRole.REQUIRED,
+                            responseStatus: AttendeeResponseStatus.NEEDS_ACTION,
+                            isOrganizer: false,
+                        },
+                    ],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const replyIcs = buildEventIcs(makeIcsEventFixture({ icalUid }), "REPLY", {
+                onlyAttendee: {
+                    address: "attendee@example.com",
+                    role: AttendeeRole.REQUIRED,
+                    responseStatus: AttendeeResponseStatus.ACCEPTED,
+                    isOrganizer: false,
+                },
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(replyIcs, { from: "attendee@example.com", to: "organizer@example.com" }));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "attendee@example.com", envelopeTo: ["organizer@example.com"] });
+
+            await job.run();
+
+            const updated = await calendarEventRepo.findOne({ uid: organizerCopy.uid } as any);
+            expect(updated!.attendees[0].responseStatus).toBe(AttendeeResponseStatus.ACCEPTED);
+        });
+
+        it("Soft-deletes the mailbox's own copy from a whole-series inbound CANCEL (no recurrenceId).", async () => {
+            const icalUid = uuid.v4();
+            const existing = await calendarEventRepo.save(
+                new CalendarEventMongo({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid }), "CANCEL");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            // A raw `MongoRepository` (bypassing `RecoverableRepoUtils`) still returns a soft-deleted document -
+            // it just carries `deleted: true` rather than being physically removed.
+            const found = await calendarEventRepo.findOne({ uid: existing.uid } as any);
+            expect(found!.deleted).toBe(true);
+        });
+
+        it("Recurring: a single-occurrence inbound CANCEL soft-deletes the matching override row.", async () => {
+            const icalUid = uuid.v4();
+            // ICS `DATE-TIME` values have only whole-second precision - round accordingly so the round-tripped
+            // value compares equal rather than losing milliseconds.
+            const recurrenceId = new Date(Math.floor((Date.now() + 60 * 60 * 1000) / 1000) * 1000);
+            const override = await calendarEventRepo.save(
+                new CalendarEventMongo({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync (moved)",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    recurrenceId,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid, recurrenceId }), "CANCEL");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const found = await calendarEventRepo.findOne({ uid: override.uid } as any);
+            expect(found!.deleted).toBe(true);
+        });
+
+        it("Recurring: a single-occurrence CANCEL with no existing override adds the date to the master's recurrenceRule.exceptions.", async () => {
+            const icalUid = uuid.v4();
+            const recurrenceId = new Date(Math.floor((Date.now() + 60 * 60 * 1000) / 1000) * 1000);
+            const master = await calendarEventRepo.save(
+                new CalendarEventMongo({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid, recurrenceId }), "CANCEL");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const updatedMaster = await calendarEventRepo.findOne({ uid: master.uid } as any);
+            expect(updatedMaster).not.toBeNull();
+            expect(updatedMaster!.recurrenceRule!.exceptions.map((d) => d.getTime())).toContain(recurrenceId.getTime());
+        });
+
+        it("Recurring: an inbound REQUEST with a recurrenceId creates/updates only that occurrence, independent of the master.", async () => {
+            const icalUid = uuid.v4();
+            const master = await calendarEventRepo.save(
+                new CalendarEventMongo({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [],
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const recurrenceId = new Date(Math.floor((Date.now() + 60 * 60 * 1000) / 1000) * 1000);
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid, recurrenceId, title: "Team Sync (moved)" }), "REQUEST");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const unchangedMaster = await calendarEventRepo.findOne({ uid: master.uid } as any);
+            expect(unchangedMaster!.title).toBe("Team Sync");
+
+            const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
+            expect(events.length).toBe(2);
+            const override = events.find((e) => e.uid !== master.uid);
+            expect(override!.title).toBe("Team Sync (moved)");
+            expect(override!.recurrenceId!.getTime()).toBe(recurrenceId.getTime());
+        });
     });
 });

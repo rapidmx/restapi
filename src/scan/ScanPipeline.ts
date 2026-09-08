@@ -50,6 +50,9 @@ export interface ScanPipelineResult {
     precedenceHeader?: string;
     /** The message's parsed `Message-ID` header, used to set `In-Reply-To`/`References` on an automatic reply. */
     messageIdHeader?: string;
+    /** The decoded text of this message's `text/calendar` part (an iTIP `REQUEST`/`REPLY`/`CANCEL`), if it has
+     * one - see `IcsUtils.parseIcsEvent()` and `ScanQueueJob.maybeProcessItipMessage()`. */
+    icsPart?: string;
 }
 
 /** Verdicts ranked worst-to-best, used to combine the raw-message and per-attachment AV results. */
@@ -113,6 +116,7 @@ export class ScanPipeline {
         const parsedFrom: string | undefined = parsed.from?.text;
         const autoSubmittedHeader: string | undefined = this.getHeaderString(parsed, "auto-submitted");
         const precedenceHeader: string | undefined = this.getHeaderString(parsed, "precedence");
+        const icsPart: string | undefined = this.deriveIcsPart(parsed);
 
         return {
             spam,
@@ -125,6 +129,7 @@ export class ScanPipeline {
             autoSubmittedHeader,
             precedenceHeader,
             messageIdHeader: parsed.messageId,
+            icsPart,
         };
     }
 
@@ -138,6 +143,17 @@ export class ScanPipeline {
                   ? convert(parsed.html, { wordwrap: false })
                   : undefined;
         return text?.trim().slice(0, BODY_PREVIEW_MAX_LENGTH);
+    }
+
+    /** Finds this message's `text/calendar` part (an iTIP invite/reply/cancel), if it has one - mailparser
+     * exposes any non `text/plain`/`text/html` part (including an inline-or-attached `.ics` part) via
+     * `parsed.attachments`, matched here by content type first and filename extension as a fallback for a
+     * sender that omits/mangles the `text/calendar` content type. */
+    private deriveIcsPart(parsed: ParsedMail): string | undefined {
+        const icsAttachment = (parsed.attachments ?? []).find(
+            (attachment) => attachment.contentType === "text/calendar" || (attachment.filename ?? "").toLowerCase().endsWith(".ics"),
+        );
+        return icsAttachment?.content.toString("utf-8");
     }
 
     /** Reads a single header value out of mailparser's parsed header map, which normalizes keys to lowercase and

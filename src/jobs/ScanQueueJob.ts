@@ -10,13 +10,19 @@ import { BlobStore } from "../blob/BlobStore.js";
 import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, ScanPipelineResult } from "../scan/ScanPipeline.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
+import { parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
 import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import {
     Attachment,
+    Attendee,
+    AttendeeRole,
+    AttendeeResponseStatus,
     AvVerdict,
+    BusyStatus,
     CalendarEvent,
+    CalendarEventStatus,
     Folder,
     FolderType,
     IngestQueueEntry,
@@ -33,6 +39,19 @@ import {
     ScanResult,
     ScanTargetType,
 } from "../models/types.js";
+
+/** `true` if two `CalendarEvent.recurrenceId` values name the same occurrence (or both are the master row's
+ * "no occurrence" `undefined`) - used to match an iTIP message to the right row among a master/override set
+ * sharing the same `icalUid`. */
+function recurrenceIdsMatch(a: Date | undefined, b: Date | undefined): boolean {
+    if (!a && !b) {
+        return true;
+    }
+    if (!a || !b) {
+        return false;
+    }
+    return a.getTime() === b.getTime();
+}
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** An attachment already persisted to the `BlobStore`, ready to be attached to one or more `Message` rows. */
@@ -267,10 +286,11 @@ export abstract class ScanQueueJob<
         } else {
             await this.deliverMessage(entry, raw, targetUid, scanResult, result, verdict === "junk");
 
-            // Mail filter rules and automatic replies only apply to mail actually delivered to the Inbox -
-            // matching Exchange's own behavior, junk-routed mail never runs either.
+            // Mail filter rules, automatic replies, and iTIP processing only apply to mail actually delivered
+            // to the Inbox - matching Exchange's own behavior, junk-routed mail never runs any of them.
             if (verdict === "deliver") {
                 await this.maybeSendAutoReply(entry, raw, result);
+                await this.maybeProcessItipMessage(entry, result);
             }
         }
 
@@ -548,6 +568,166 @@ export abstract class ScanQueueJob<
             }
         } catch (err: any) {
             this.logger?.warn(`ScanQueueJob: failed to send automatic reply for mailbox ${entry.mailboxUid}: ${err.message}`);
+        }
+    }
+
+    /**
+     * Applies the calendar-mutation side effect of an inbound iTIP REQUEST/REPLY/CANCEL message, if this
+     * message carries one - the message itself still gets filed to Inbox normally via `deliverMessage()`
+     * (unchanged), exactly like Outlook/OWA still show "Jane accepted your meeting" mails in the Inbox
+     * alongside the calendar update.
+     *
+     * Every lookup below matches by `(icalUid, recurrenceId)` together, not `icalUid` alone: a
+     * `parsed.recurrenceId` present means the message is about one occurrence's own override row; absent
+     * means it's about the master/whole-series row - see `IcsUtils.ts`'s own doc comment on the master/
+     * override `CalendarEvent` row model this relies on.
+     */
+    private async maybeProcessItipMessage(entry: Q, result: ScanPipelineResult): Promise<void> {
+        if (!result.icsPart) {
+            return;
+        }
+        const parsed: ParsedIcsEvent | undefined = parseIcsEvent(result.icsPart);
+        if (!parsed) {
+            return;
+        }
+
+        try {
+            switch (parsed.method) {
+                case "REQUEST":
+                    await this.processItipRequest(entry.mailboxUid, parsed);
+                    break;
+                case "REPLY":
+                    await this.processItipReply(entry.mailboxUid, parsed);
+                    break;
+                case "CANCEL":
+                    await this.processItipCancel(entry.mailboxUid, parsed);
+                    break;
+                default:
+                    break;
+            }
+        } catch (err: any) {
+            this.logger?.warn(`ScanQueueJob: failed to process iTIP ${parsed.method} for event ${parsed.uid}: ${err.message}`);
+        }
+    }
+
+    /** Finds the `CalendarEvent` row in `mailboxUid` matching `(icalUid, recurrenceId)` together, if any. */
+    private async findCalendarEventRow(mailboxUid: string, icalUid: string, recurrenceId: Date | undefined): Promise<CE | undefined> {
+        const rows: CE[] = await this.calendarEventRepo!.find(
+            { mailboxUid, icalUid, limit: 50 } as any,
+            { ignoreACL: true, limit: 50 },
+        );
+        return rows.find((row) => recurrenceIdsMatch(row.recurrenceId, recurrenceId));
+    }
+
+    private async processItipRequest(mailboxUid: string, parsed: ParsedIcsEvent): Promise<void> {
+        const existing = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
+        const attendees: Attendee[] = parsed.attendees.map((attendee) => ({
+            address: attendee.address,
+            displayName: attendee.displayName,
+            role: AttendeeRole.REQUIRED,
+            responseStatus: attendee.partstat ?? AttendeeResponseStatus.NEEDS_ACTION,
+            isOrganizer: false,
+        }));
+
+        if (!existing) {
+            const folder: F = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, mailboxUid, FolderType.CALENDAR);
+            await this.calendarEventRepo!.create(
+                new this.calendarEventClass({
+                    folderUid: folder.uid,
+                    mailboxUid,
+                    title: parsed.summary ?? "",
+                    location: parsed.location,
+                    startDate: parsed.startDate ?? new Date(),
+                    endDate: parsed.endDate ?? new Date(),
+                    allDay: false,
+                    timezone: "UTC",
+                    organizer: parsed.organizer
+                        ? { address: parsed.organizer.address, displayName: parsed.organizer.displayName, type: RecipientType.TO }
+                        : { address: "", type: RecipientType.TO },
+                    attendees,
+                    recurrenceRule: parsed.recurrenceRule,
+                    recurrenceId: parsed.recurrenceId,
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid: parsed.uid,
+                    sequence: parsed.sequence,
+                }),
+                { ignoreACL: true },
+            );
+            return;
+        }
+
+        if (parsed.sequence <= existing.sequence) {
+            // Stale/duplicate resend - already have this revision (or a newer one).
+            return;
+        }
+
+        await this.calendarEventRepo!.update(
+            {
+                uid: existing.uid,
+                version: (existing as any).version,
+                title: parsed.summary ?? existing.title,
+                location: parsed.location,
+                startDate: parsed.startDate ?? existing.startDate,
+                endDate: parsed.endDate ?? existing.endDate,
+                attendees,
+                recurrenceRule: parsed.recurrenceRule ?? existing.recurrenceRule,
+                sequence: parsed.sequence,
+            } as any,
+            existing,
+            { ignoreACL: true },
+        );
+    }
+
+    private async processItipReply(mailboxUid: string, parsed: ParsedIcsEvent): Promise<void> {
+        const existing = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
+        const replyingAttendee = parsed.attendees[0];
+        if (!existing || !replyingAttendee?.partstat) {
+            return;
+        }
+
+        const attendees = existing.attendees.map((attendee) =>
+            attendee.address.toLowerCase() === replyingAttendee.address.toLowerCase()
+                ? { ...attendee, responseStatus: replyingAttendee.partstat! }
+                : attendee,
+        );
+        await this.calendarEventRepo!.update(
+            { uid: existing.uid, version: (existing as any).version, attendees } as any,
+            existing,
+            { ignoreACL: true },
+        );
+    }
+
+    private async processItipCancel(mailboxUid: string, parsed: ParsedIcsEvent): Promise<void> {
+        if (parsed.recurrenceId) {
+            const override = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
+            if (override) {
+                await this.calendarEventRepo!.delete(override.uid, { ignoreACL: true });
+                return;
+            }
+            // No override row exists for this occurrence yet - drop it from the master's own recurrence
+            // definition instead, the standard RFC 5545 way to exclude one occurrence from an otherwise-
+            // unmodified series.
+            const master = await this.findCalendarEventRow(mailboxUid, parsed.uid, undefined);
+            if (master?.recurrenceRule) {
+                const exceptions = [...(master.recurrenceRule.exceptions ?? []), parsed.recurrenceId];
+                await this.calendarEventRepo!.update(
+                    { uid: master.uid, version: (master as any).version, recurrenceRule: { ...master.recurrenceRule, exceptions } } as any,
+                    master,
+                    { ignoreACL: true },
+                );
+            }
+            return;
+        }
+
+        // No `recurrenceId` - cancelling the whole series: remove the master and every override row sharing
+        // its `icalUid`.
+        const rows: CE[] = await this.calendarEventRepo!.find(
+            { mailboxUid, icalUid: parsed.uid, limit: 50 } as any,
+            { ignoreACL: true, limit: 50 },
+        );
+        for (const row of rows) {
+            await this.calendarEventRepo!.delete(row.uid, { ignoreACL: true });
         }
     }
 }
