@@ -297,6 +297,10 @@ export abstract class ScanQueueJob<
                 }),
                 { ignoreACL: true },
             );
+        } else if (verdict === "deliver" && result.recallOfMessageId) {
+            // A recall control message is never filed to the Inbox - matching real Outlook hiding these from
+            // the reading pane - only the mutation it triggers (if any) and the report back to the sender.
+            await this.processRecall(entry, result.recallOfMessageId);
         } else {
             await this.deliverMessage(entry, raw, targetUid, scanResult, result, verdict === "junk");
 
@@ -582,6 +586,69 @@ export abstract class ScanQueueJob<
             }
         } catch (err: any) {
             this.logger?.warn(`ScanQueueJob: failed to send automatic reply for mailbox ${entry.mailboxUid}: ${err.message}`);
+        }
+    }
+
+    /**
+     * Applies a `BaseMessageRoute.recall()` control message's effect in this mailbox (`entry.mailboxUid`):
+     * finds the target `Message` by `messageId` - matching regardless of which folder it's since been moved
+     * to, mirroring how `findCalendarEventRow()` matches an iTIP message by `icalUid` rather than a foreign
+     * key - and deletes it only if still unread, matching real Exchange/Outlook's "Recall This Message"
+     * behavior exactly. Either way, reports the outcome back to the original sender - see
+     * `sendRecallReport()`.
+     */
+    private async processRecall(entry: Q, recallOfMessageId: string): Promise<void> {
+        const matches: M[] = await this.messageRepo!.find(
+            { mailboxUid: entry.mailboxUid, messageId: recallOfMessageId, limit: 5 } as any,
+            { ignoreACL: true, limit: 5 },
+        );
+        const target: M | undefined = matches.find((message) => !message.flags.read);
+
+        let outcome: "succeeded" | "already_read" | "not_found";
+        if (target) {
+            await this.messageRepo!.delete(target.uid, { ignoreACL: true });
+            outcome = "succeeded";
+        } else {
+            outcome = matches.length > 0 ? "already_read" : "not_found";
+        }
+
+        await this.sendRecallReport(entry, outcome);
+    }
+
+    /**
+     * Sends a plain, visible report email back to `entry.envelopeFrom` (the mailbox that requested the
+     * recall) describing what happened in *this* mailbox - mirrors real Outlook's own recall-report
+     * behavior (a normal email in the sender's Inbox, not a synced status flag). Best-effort, same as every
+     * other cross-mailbox notification in this codebase.
+     */
+    private async sendRecallReport(entry: Q, outcome: "succeeded" | "already_read" | "not_found"): Promise<void> {
+        const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            return;
+        }
+
+        // Kept short and single-line deliberately: `MailComposer` quoted-printable-encodes a plain-text body
+        // and soft-wraps around 76 characters, which would otherwise split a longer sentence's words across a
+        // `=\r\n` line break in the raw wire bytes - annoying for anything that greps the raw message for a
+        // specific phrase (this codebase's own tests included).
+        const text = {
+            succeeded: `Recalled from ${mailbox.primarySmtpAddress} before it was read.`,
+            already_read: `Not recalled from ${mailbox.primarySmtpAddress} - already read.`,
+            not_found: `Not recalled from ${mailbox.primarySmtpAddress} - not found.`,
+        }[outcome];
+
+        try {
+            const composed: Buffer = await new MailComposer({
+                from: { name: mailbox.displayName, address: mailbox.primarySmtpAddress },
+                to: entry.envelopeFrom,
+                subject: "Recall report",
+                text,
+            })
+                .compile()
+                .build();
+            await this.mailTransport!.send({ raw: composed, envelopeFrom: mailbox.primarySmtpAddress, envelopeTo: [entry.envelopeFrom] });
+        } catch (err: any) {
+            this.logger?.warn(`ScanQueueJob: failed to send recall report for mailbox ${entry.mailboxUid}: ${err.message}`);
         }
     }
 

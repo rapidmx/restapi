@@ -1315,4 +1315,149 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             sendSpy.mockRestore();
         });
     });
+
+    describe("Message recall", () => {
+        const makeRecallRaw = (targetMessageId: string): Buffer => makePlainRawMessage(`X-RapidMX-Recall-Of: ${targetMessageId}`);
+
+        it("Deletes the target message and reports success when it's still unread.", async () => {
+            await createMailbox();
+            const targetMessageId = "target-message@example.com";
+            const target = await messageRepo.save(
+                new MessageSQL({
+                    mailboxUid,
+                    folderUid: "inbox-folder",
+                    messageId: targetMessageId,
+                    from: { address: "someone@example.com", type: RecipientType.TO },
+                    recipients: [{ address: "recipient@example.com", type: RecipientType.TO }],
+                    bodyBlobKey: `bodies/${uuid.v4()}`,
+                }),
+            );
+
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeRecallRaw(targetMessageId));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "sender@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const found = await messageRepo.findOne({ where: { uid: target.uid } });
+            expect(found!.deleted).toBe(true);
+
+            // The recall control message itself is never filed anywhere in the recipient's mailbox.
+            const allMessages = await messageRepo.find({ where: { mailboxUid } });
+            expect(allMessages.length).toBe(1);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(1);
+            expect(transport.sent[0].envelopeFrom).toBe("recipient@example.com");
+            expect(transport.sent[0].envelopeTo).toEqual(["sender@example.com"]);
+            expect(transport.sent[0].raw.toString()).toContain("Recalled from recipient@example.com before it was read.");
+        });
+
+        it("Leaves the target message alone and reports 'already read' when it's already been read.", async () => {
+            await createMailbox();
+            const targetMessageId = "already-read@example.com";
+            const target = await messageRepo.save(
+                new MessageSQL({
+                    mailboxUid,
+                    folderUid: "inbox-folder",
+                    messageId: targetMessageId,
+                    from: { address: "someone@example.com", type: RecipientType.TO },
+                    recipients: [{ address: "recipient@example.com", type: RecipientType.TO }],
+                    bodyBlobKey: `bodies/${uuid.v4()}`,
+                    flags: { read: true, flagged: false, answered: false, forwarded: false },
+                }),
+            );
+
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeRecallRaw(targetMessageId));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "sender@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const found = await messageRepo.findOne({ where: { uid: target.uid } });
+            expect(found!.deleted).toBe(false);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(1);
+            expect(transport.sent[0].raw.toString()).toContain("Not recalled from recipient@example.com - already read.");
+        });
+
+        it("Reports 'not found' when no matching message exists.", async () => {
+            await createMailbox();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeRecallRaw("nonexistent@example.com"));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "sender@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(1);
+            expect(transport.sent[0].raw.toString()).toContain("Not recalled from recipient@example.com - not found.");
+        });
+
+        it("Sends no report when the recipient mailbox itself doesn't exist (defensive - shouldn't happen in practice).", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeRecallRaw("whatever@example.com"));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "sender@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(0);
+        });
+
+        it("Logs a warning and does not throw when sending the recall report fails.", async () => {
+            await createMailbox();
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            const sendSpy = vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("simulated transport failure"));
+
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeRecallRaw("whatever@example.com"));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "sender@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            sendSpy.mockRestore();
+        });
+
+        it("A junk-verdicted recall signal is filed normally and never acted on (the default delivery path is unaffected).", async () => {
+            const targetMessageId = "target-message@example.com";
+            const target = await messageRepo.save(
+                new MessageSQL({
+                    mailboxUid,
+                    folderUid: "inbox-folder",
+                    messageId: targetMessageId,
+                    from: { address: "someone@example.com", type: RecipientType.TO },
+                    recipients: [{ address: "recipient@example.com", type: RecipientType.TO }],
+                    bodyBlobKey: `bodies/${uuid.v4()}`,
+                }),
+            );
+
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            const raw = Buffer.from(
+                `From: sender@example.com\r\nTo: recipient@example.com\r\nX-Test-Force-Spam: true\r\nX-RapidMX-Recall-Of: ${targetMessageId}\r\n\r\nHello.\r\n`,
+            );
+            await blobStore.put(rawBlobKey, raw);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "sender@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const found = await messageRepo.findOne({ where: { uid: target.uid } });
+            expect(found!.deleted).toBe(false);
+
+            // Filed normally to Junk, like any other junk-verdicted mail - not suppressed the way a
+            // "deliver"-verdicted recall signal is.
+            const allMessages = await messageRepo.find({ where: { mailboxUid } });
+            expect(allMessages.length).toBe(2);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(0);
+        });
+    });
 });

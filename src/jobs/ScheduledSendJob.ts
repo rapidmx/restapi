@@ -110,14 +110,16 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
         const raw: Buffer = await this.blobStore!.get(message.bodyBlobKey);
         const envelopeTo: string[] = message.recipients.map((r) => r.address);
 
-        const { sanitizedHtmlBlobKey: scannedHtmlBlobKey } = await scanAndRelay(
-            raw,
-            message.from.address,
-            envelopeTo,
-            this.scanPipeline!,
-            this.mailTransport,
-            this.blobStore!,
-        );
+        const {
+            raw: relayedRaw,
+            messageId,
+            sanitizedHtmlBlobKey: scannedHtmlBlobKey,
+        } = await scanAndRelay(raw, message.from.address, envelopeTo, this.scanPipeline!, this.mailTransport, this.blobStore!);
+        if (relayedRaw !== raw) {
+            // See the identical comment in `BaseMessageRoute.send()` - keeps the stored blob consistent with
+            // what was actually relayed whenever `scanAndRelay()` had to inject a missing `Message-ID`.
+            await this.blobStore!.put(message.bodyBlobKey, relayedRaw, { contentType: "message/rfc822" });
+        }
 
         const sentFolder: any = await findOrCreateWellKnownFolder(
             this.folderRepo!,
@@ -135,6 +137,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 folderUid: sentFolder.uid,
                 flags,
                 sanitizedHtmlBlobKey,
+                messageId,
                 // `null`, not `undefined`: TypeORM's `Repository.update()` silently skips an `undefined`
                 // property (leaving the SQL column unchanged) but does set an explicit `null` to NULL - the
                 // Mongo backend's `$set` handles both the same way, so `null` is the one value that reliably

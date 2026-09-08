@@ -130,6 +130,14 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     @Nullable
     public scheduledSendTime?: Date;
 
+    @Column()
+    @Description(
+        "Set by recall() the moment a recall is requested - purely informational, the eventual outcome is " +
+            "reported back to the sender as an ordinary visible email instead of being synced onto this field.",
+    )
+    @Nullable
+    public recallRequestedAt?: Date;
+
     constructor(other?: Partial<MessageMongo>) {
         super(other);
 
@@ -153,6 +161,7 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.scanResultUid = "scanResultUid" in other ? other.scanResultUid : this.scanResultUid;
             this.searchIndexedAt = "searchIndexedAt" in other ? other.searchIndexedAt : this.searchIndexedAt;
             this.scheduledSendTime = "scheduledSendTime" in other ? other.scheduledSendTime : this.scheduledSendTime;
+            this.recallRequestedAt = "recallRequestedAt" in other ? other.recallRequestedAt : this.recallRequestedAt;
         }
     }
 }

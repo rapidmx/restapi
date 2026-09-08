@@ -53,6 +53,10 @@ export interface ScanPipelineResult {
     /** The decoded text of this message's `text/calendar` part (an iTIP `REQUEST`/`REPLY`/`CANCEL`), if it has
      * one - see `IcsUtils.parseIcsEvent()` and `ScanQueueJob.maybeProcessItipMessage()`. */
     icsPart?: string;
+    /** The `Message-ID` (angle brackets stripped) this message asks to recall, from its custom
+     * `X-RapidMX-Recall-Of` header - present only on the control message `BaseMessageRoute.recall()`
+     * composes, see `ScanQueueJob.processRecall()`. */
+    recallOfMessageId?: string;
 }
 
 /** Verdicts ranked worst-to-best, used to combine the raw-message and per-attachment AV results. */
@@ -117,6 +121,7 @@ export class ScanPipeline {
         const autoSubmittedHeader: string | undefined = this.getHeaderString(parsed, "auto-submitted");
         const precedenceHeader: string | undefined = this.getHeaderString(parsed, "precedence");
         const icsPart: string | undefined = this.deriveIcsPart(parsed);
+        const recallOfMessageId: string | undefined = this.getHeaderString(parsed, "x-rapidmx-recall-of");
 
         return {
             spam,
@@ -130,6 +135,7 @@ export class ScanPipeline {
             precedenceHeader,
             messageIdHeader: parsed.messageId,
             icsPart,
+            recallOfMessageId,
         };
     }
 
@@ -158,7 +164,7 @@ export class ScanPipeline {
 
     /** Reads a single header value out of mailparser's parsed header map, which normalizes keys to lowercase and
      * may store a header's value as a plain string or (for structured headers) an object - only a plain string
-     * value is meaningful for the headers this is used for (`Auto-Submitted`/`Precedence`). */
+     * value is meaningful for the headers this is used for (`Auto-Submitted`/`Precedence`/`X-RapidMX-Recall-Of`). */
     private getHeaderString(parsed: ParsedMail, headerName: string): string | undefined {
         const value = parsed.headers.get(headerName);
         return typeof value === "string" ? value : undefined;

@@ -206,6 +206,37 @@ describe("ScanPipeline Tests", () => {
         });
     });
 
+    describe("run() - X-RapidMX-Recall-Of extraction", () => {
+        beforeEach(() => {
+            (pipeline as any).spamScanProvider = spamScanProvider;
+            (pipeline as any).avScanProvider = avScanProvider;
+        });
+
+        it("Extracts recallOfMessageId from an X-RapidMX-Recall-Of header.", async () => {
+            const raw = Buffer.from(
+                [
+                    "From: sender@example.com",
+                    "To: recipient@example.com",
+                    "Subject: Recall: Test message",
+                    "X-RapidMX-Recall-Of: abc123@example.com",
+                    "",
+                    "Recall notice.",
+                    "",
+                ].join("\r\n"),
+            );
+
+            const result = await pipeline.run(raw, makeEnvelope());
+
+            expect(result.recallOfMessageId).toBe("abc123@example.com");
+        });
+
+        it("Leaves recallOfMessageId undefined for an ordinary message.", async () => {
+            const result = await pipeline.run(makePlainRawMessage(), makeEnvelope());
+
+            expect(result.recallOfMessageId).toBeUndefined();
+        });
+    });
+
     describe("run() - attachment result shape", () => {
         beforeEach(() => {
             (pipeline as any).spamScanProvider = spamScanProvider;

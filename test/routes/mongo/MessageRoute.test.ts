@@ -407,6 +407,54 @@ describe("Route:MessageMongo Tests", () => {
         expect(stillDraft?.folderUid).toBe(draftsFolder.uid);
     });
 
+    it("Sending a draft with no Message-ID header generates one and persists it on the record and the stored blob.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+        const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        await blobStore.put(
+            bodyBlobKey,
+            Buffer.from("From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n"),
+        );
+        const message = await createMessage(mailbox.uid, draftsFolder.uid, { bodyBlobKey, messageId: "" });
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/${message.uid}/send`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+        expect(result.body.messageId).toBeTruthy();
+
+        const storedRaw: Buffer = await blobStore.get(bodyBlobKey);
+        expect(storedRaw.toString()).toContain(`Message-ID: <${result.body.messageId}>`);
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent[0].raw.toString()).toContain(`Message-ID: <${result.body.messageId}>`);
+    });
+
+    it("Sending a draft whose raw MIME already has a Message-ID header persists that exact value, unchanged.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+        const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        const raw =
+            "From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Hi\r\nMessage-ID: <original-id@example.com>\r\n\r\nHello there.\r\n";
+        await blobStore.put(bodyBlobKey, Buffer.from(raw));
+        const message = await createMessage(mailbox.uid, draftsFolder.uid, { bodyBlobKey });
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/${message.uid}/send`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+        expect(result.body.messageId).toBe("original-id@example.com");
+
+        const storedRaw: Buffer = await blobStore.get(bodyBlobKey);
+        expect(storedRaw.toString()).toBe(raw);
+    });
+
     it("A different user cannot send a message they don't have access to.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
@@ -431,6 +479,82 @@ describe("Route:MessageMongo Tests", () => {
             .set("Authorization", "jwt " + ownerToken);
 
         expect(result.status).toBe(404);
+    });
+
+    describe("recall()", () => {
+        it("Recalling a sent message sends an X-RapidMX-Recall-Of control message to every recipient and stamps recallRequestedAt.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const sentFolder = await createFolder(mailbox.uid, FolderType.SENT_ITEMS);
+            const message = await createMessage(mailbox.uid, sentFolder.uid, {
+                messageId: "abc123@example.com",
+                from: { address: "owner@example.com", type: RecipientType.TO },
+                recipients: [
+                    { address: "recipient1@example.com", type: RecipientType.TO },
+                    { address: "recipient2@example.com", type: RecipientType.CC },
+                ],
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/recall`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.recallRequestedAt).toBeTruthy();
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(1);
+            expect(transport.sent[0].envelopeFrom).toBe("owner@example.com");
+            expect(transport.sent[0].envelopeTo).toEqual(["recipient1@example.com", "recipient2@example.com"]);
+            // `nodemailer`'s `MailComposer` re-capitalizes a custom header name (e.g. `X-Rapidmx-Recall-Of`) -
+            // header names are case-insensitive per RFC 5322, and `ScanPipeline`'s own lookup normalizes to
+            // lowercase the same way, so this compares case-insensitively rather than assuming exact casing.
+            expect(transport.sent[0].raw.toString().toLowerCase()).toContain("x-rapidmx-recall-of: abc123@example.com");
+        });
+
+        it("Rejects recalling a message that isn't in Sent Items (400).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, inbox.uid);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/recall`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects recalling a message with no Message-ID (400).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const sentFolder = await createFolder(mailbox.uid, FolderType.SENT_ITEMS);
+            const message = await createMessage(mailbox.uid, sentFolder.uid, { messageId: "" });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/recall`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(400);
+        });
+
+        it("A different user cannot recall a message they don't have access to (403).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const sentFolder = await createFolder(mailbox.uid, FolderType.SENT_ITEMS);
+            const message = await createMessage(mailbox.uid, sentFolder.uid);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/recall`)
+                .set("Authorization", "jwt " + otherUserToken);
+
+            expect(result.status).toBe(403);
+        });
+
+        it("Recalling a nonexistent message returns 404.", async () => {
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${uuid.v4()}/recall`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(404);
+        });
     });
 
     it("Owner can fetch a message's sanitized HTML content once it has one.", async () => {

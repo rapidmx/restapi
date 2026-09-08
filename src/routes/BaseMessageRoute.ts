@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import {
     ACLAction,
@@ -102,14 +103,17 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const raw: Buffer = await this.blobStore.get(message.bodyBlobKey);
         const envelopeTo: string[] = message.recipients.map((r) => r.address);
 
-        const { sanitizedHtmlBlobKey: scannedHtmlBlobKey } = await scanAndRelay(
-            raw,
-            message.from.address,
-            envelopeTo,
-            this.scanPipeline,
-            this.mailTransport,
-            this.blobStore,
-        );
+        const {
+            raw: relayedRaw,
+            messageId,
+            sanitizedHtmlBlobKey: scannedHtmlBlobKey,
+        } = await scanAndRelay(raw, message.from.address, envelopeTo, this.scanPipeline, this.mailTransport, this.blobStore);
+        if (relayedRaw !== raw) {
+            // `scanAndRelay()` injected a `Message-ID` this draft didn't already have - persist the augmented
+            // bytes so a later read (and any future `recall()` of this very message) sees the same header it
+            // was actually relayed with.
+            await this.blobStore.put(message.bodyBlobKey, relayedRaw, { contentType: "message/rfc822" });
+        }
 
         const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
         const sentFolder: any = await findOrCreateWellKnownFolder(
@@ -132,7 +136,71 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 folderUid: sentFolder.uid,
                 flags,
                 sanitizedHtmlBlobKey,
+                messageId,
             } as any,
+            message,
+            { user, ignoreACL: true },
+        );
+    }
+
+    /**
+     * Attempts to recall a message this mailbox previously sent — Exchange/Outlook's "Recall This Message" —
+     * by composing and relaying a small control message, carrying `message.messageId` in a custom
+     * `X-RapidMX-Recall-Of` header, to every original recipient. This is asynchronous and best-effort by
+     * necessity: there is no direct link between this mailbox's Sent Items copy and a recipient's own Inbox
+     * copy (internal delivery goes through the exact same ingest/scan pipeline as external mail), so the
+     * actual mutation happens later, on the *recipient's own* `ScanQueueJob` run, when it recognizes this
+     * control message and — only if its own copy is still unread, matching real Exchange/Outlook — deletes
+     * it (see `ScanQueueJob.processRecall()`). The outcome is reported back to this mailbox as an ordinary
+     * visible email rather than synced onto this record.
+     *
+     * Only available for a message currently in Sent Items (matches Outlook's own restriction — recall isn't
+     * offered anywhere else).
+     */
+    @Summary("Recall message")
+    @Description(
+        "Attempts to recall (delete before it's read) a message this mailbox previously sent, from every " +
+            "original recipient on this mail system. Only available for a message currently in Sent Items. " +
+            "Asynchronous and best-effort — see this method's own doc comment.",
+    )
+    @Returns([Object])
+    @Post("/:id/recall")
+    public async recall(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<T> {
+        if (!this.repoUtils || !this.mailTransport) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+
+        const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
+        if (!message) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        if (!(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+
+        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        const folder: any = await folderRepo.findOne(message.folderUid, { ignoreACL: true });
+        if (folder?.type !== FolderType.SENT_ITEMS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Only a message in Sent Items can be recalled.");
+        }
+        if (!message.messageId) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This message cannot be recalled.");
+        }
+
+        const envelopeTo: string[] = message.recipients.map((r) => r.address);
+        const composed: Buffer = await new MailComposer({
+            from: { address: message.from.address, name: message.from.displayName },
+            to: envelopeTo,
+            subject: `Recall: ${message.subject}`,
+            text: `${message.from.displayName ?? message.from.address} is attempting to recall the message: "${message.subject}".`,
+            headers: { "X-RapidMX-Recall-Of": message.messageId },
+        })
+            .compile()
+            .build();
+        await this.mailTransport.send({ raw: composed, envelopeFrom: message.from.address, envelopeTo });
+
+        return await this.repoUtils.update(
+            { uid: message.uid, version: (message as any).version, recallRequestedAt: new Date() } as any,
             message,
             { user, ignoreACL: true },
         );

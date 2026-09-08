@@ -232,7 +232,10 @@ export interface Message extends RecoverableBaseEntity {
 
     receivedDate: Date;
 
-    /** The key under which the raw MIME source is stored in the `BlobStore`, unmodified from ingestion/send. */
+    /** The key under which the raw MIME source is stored in the `BlobStore`, unmodified from ingestion/send —
+     * except that `send()`/`ScheduledSendJob` may rewrite it once, in place, to inject a `Message-ID` header a
+     * drafted message didn't already have (see `MailSendUtils.scanAndRelay()`), so every recipient's own copy
+     * and this mailbox's own Sent Items copy agree on the same identifier. */
     bodyBlobKey: string;
 
     /**
@@ -268,6 +271,12 @@ export interface Message extends RecoverableBaseEntity {
      * mirrors Outlook's "Do not deliver before" (`PR_DEFERRED_SEND_TIME`). The message sits in the mailbox's
      * `OUTBOX` folder until `ScheduledSendJob` relays it and clears this field. */
     scheduledSendTime?: Date;
+
+    /** Set by `BaseMessageRoute.recall()` the moment a recall is requested — purely informational (lets a
+     * client show "recall requested" immediately). The eventual outcome (each recipient's own `ScanQueueJob`
+     * either deleting its still-unread copy or not) is reported back to the sender as an ordinary visible
+     * email instead of being synced onto this field - see `ScanQueueJob.sendRecallReport()`. */
+    recallRequestedAt?: Date;
 }
 
 /**
