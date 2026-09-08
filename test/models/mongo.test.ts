@@ -29,6 +29,7 @@ import { ContactMongo } from "../../src/models/mongo/ContactMongo.js";
 import { ContactListMongo } from "../../src/models/mongo/ContactListMongo.js";
 import { DeviceSyncStateMongo } from "../../src/models/mongo/DeviceSyncStateMongo.js";
 import { DistributionListMongo } from "../../src/models/mongo/DistributionListMongo.js";
+import { DomainMongo } from "../../src/models/mongo/DomainMongo.js";
 import { FolderMongo } from "../../src/models/mongo/FolderMongo.js";
 import { IngestQueueEntryMongo } from "../../src/models/mongo/IngestQueueEntryMongo.js";
 import { MailboxMongo } from "../../src/models/mongo/MailboxMongo.js";
@@ -356,6 +357,37 @@ describe("Mongo model default construction", () => {
         expect(obj.ownerUserUid).toBe("user-1");
         expect(obj.memberAddresses).toEqual(["a@example.com", "b@example.com"]);
         expect(obj.restrictSenders).toBe(true);
+    });
+
+    it("DomainMongo falls back to class defaults when constructed with no data.", () => {
+        const obj = new DomainMongo();
+
+        expect(obj.name).toBe("");
+        expect(obj.enabled).toBe(true);
+        expect(obj.verified).toBe(false);
+        expect(obj.verificationToken).toBe("");
+        expect(obj.verifiedAt).toBeUndefined();
+        expect(obj.lastCheckedAt).toBeUndefined();
+    });
+
+    it("DomainMongo applies provided overrides when constructed with data.", () => {
+        const verifiedAt = new Date();
+        const lastCheckedAt = new Date();
+        const obj = new DomainMongo({
+            name: "example.com",
+            enabled: false,
+            verified: true,
+            verificationToken: "abc123",
+            verifiedAt,
+            lastCheckedAt,
+        });
+
+        expect(obj.name).toBe("example.com");
+        expect(obj.enabled).toBe(false);
+        expect(obj.verified).toBe(true);
+        expect(obj.verificationToken).toBe("abc123");
+        expect(obj.verifiedAt).toBe(verifiedAt);
+        expect(obj.lastCheckedAt).toBe(lastCheckedAt);
     });
 
     it("CalendarEventMongo falls back to class defaults when constructed with no data.", () => {

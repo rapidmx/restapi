@@ -3,13 +3,12 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 // SQL counterpart of test/routes/mongo/MailboxAutoProvision.test.ts — see that file's header comment
-// for why this lives in its own file (needs `mail:auto_provision:enabled`/`mail:domains` turned on,
-// isolated from MailboxRoute.test.ts's own unrestricted-domain assumptions via per-file module
-// isolation).
+// for why this lives in its own file (needs `mail:auto_provision:enabled` turned on and verified
+// `Domain` rows seeded, isolated from MailboxRoute.test.ts's own unrestricted-domain assumptions via
+// per-file module isolation).
 import config from "../../config.sql.js";
 
 config.set("mail:auto_provision:enabled", true);
-config.set("mail:domains", ["example.com", "example.org"]);
 config.set("mail:auth_server_url", "http://auth.test");
 
 import { request } from "@rapidrest/service-core/test";
@@ -17,6 +16,7 @@ import { Server, ObjectFactory, ConnectionManager, isSqlDataSource } from "@rapi
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
+import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
@@ -26,6 +26,7 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
     const server: Server = new Server({ config, basePath: "./test/server-sql", logger, objectFactory });
     const baseUrl = "/sql/mailboxes";
     let repo: Repository<MailboxSQL>;
+    let domainRepo: Repository<DomainSQL>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -55,12 +56,28 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
         const conn: any = connMgr?.connections.get("sql");
         if (isSqlDataSource(conn)) {
             repo = conn.getRepository(MailboxSQL);
+            domainRepo = conn.getRepository(DomainSQL);
         } else {
             throw new Error("Could not find sql connection");
+        }
+
+        // `save()` upserts on the primary key (`uid`), so re-running against the shared on-disk SQLite
+        // file used by every SQL test just refreshes these rows rather than conflicting with a prior
+        // run's (see restapi's own testing-conventions note).
+        for (const name of ["example.com", "example.org"]) {
+            await domainRepo.save(
+                new DomainSQL({ name, enabled: true, verified: true, verificationToken: uuid.v4(), uid: name } as any),
+            );
         }
     });
 
     afterAll(async () => {
+        // These seeded `Domain` rows live in the shared on-disk SQLite file every SQL test file uses -
+        // clean them up so they can't leak into an unrelated later test file's own unrestricted-domain
+        // assumptions within the same `vitest run` process (see DistributionListDomains.test.ts's
+        // identical rationale).
+        await domainRepo.delete({ uid: "example.com" });
+        await domainRepo.delete({ uid: "example.org" });
         await server.stop();
         await objectFactory.destroy();
     });

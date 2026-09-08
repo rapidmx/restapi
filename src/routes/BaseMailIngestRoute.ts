@@ -20,6 +20,7 @@ import type { MailTransport } from "../transport/MailTransport.js";
 import { DistributionList, IngestQueueEntry, IngestStatus, Mailbox, QuarantineReason, TransportRule } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { rewriteHeadersForList } from "../util/DistributionListUtils.js";
+import { getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { buildTransportRuleContext, evaluateTransportRules } from "../util/TransportRuleUtils.js";
 const { Config, Inject, Logger } = ObjectDecorators;
@@ -32,8 +33,8 @@ const { Get, Post, Query, Request, Response } = RouteDecorators;
  * are internal-only — never exposed to the public internet — and gated by a shared bearer secret rather than
  * ordinary user JWT auth, since the caller is the MTA process, not an end user.
  *
- * This class is DB-agnostic; `mailboxClass`/`ingestQueueClass`/`distributionListClass`/`transportRuleClass`
- * are supplied by the Mongo/SQL concrete subclasses (`MailIngestRouteMongo`/`MailIngestRouteSQL`), following
+ * This class is DB-agnostic; `mailboxClass`/`ingestQueueClass`/`distributionListClass`/`transportRuleClass`/
+ * `domainClass` are supplied by the Mongo/SQL concrete subclasses (`MailIngestRouteMongo`/`MailIngestRouteSQL`), following
  * the same pattern `DefaultAccounts`/`DefaultAccountsMongo` use for a background service spanning multiple
  * entity types.
  *
@@ -57,6 +58,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
     protected abstract ingestQueueClass: any;
     protected abstract distributionListClass: any;
     protected abstract transportRuleClass: any;
+    protected abstract domainClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -74,11 +76,6 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
 
     @Config("mail:transport:ingest:secret")
     private ingestSecret?: string;
-
-    /** This server's configured domain list, used to compute a `TransportRule`'s `anyRecipientExternal`
-     * condition - same key `BaseMailboxRoute`/`BaseDistributionListRoute` already use. */
-    @Config("mail:domains", [] as string[])
-    private domains: string[] = [];
 
     /** Caps how deeply nested distribution lists (a list whose own member is another list) are expanded - a
      * cheap safety net on top of the real cycle guard (`visitedListUids`), which already prevents a true A→B→A
@@ -322,7 +319,8 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             return { reject: false, raw, envelopeTo };
         }
 
-        const context = await buildTransportRuleContext(raw, envelopeFrom, envelopeTo, this.domains);
+        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        const context = await buildTransportRuleContext(raw, envelopeFrom, envelopeTo, domains);
         const evaluation = evaluateTransportRules(rules, context);
 
         if (evaluation.reject) {
@@ -332,7 +330,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 // is used only as the *display* From address, matching how a real MTA's own generated NDRs
                 // present themselves.
                 const composed: Buffer = await new MailComposer({
-                    from: `Mail Delivery System <postmaster@${this.domains[0] ?? "localhost"}>`,
+                    from: `Mail Delivery System <postmaster@${domains[0] ?? "localhost"}>`,
                     to: envelopeFrom,
                     subject: "Message Rejected",
                     text: "Your message could not be delivered because it was blocked by a mail-flow policy on the recipient's mail system.",

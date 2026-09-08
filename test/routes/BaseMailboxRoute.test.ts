@@ -68,15 +68,11 @@ describe("BaseMailboxRoute Tests (repoUtils guard clauses only)", () => {
         await expect(route.autoProvision({} as any, undefined, undefined)).rejects.toThrow(/permission/i);
     });
 
-    it("autoProvision() throws INTERNAL_ERROR when repoUtils is not set (even though enabled/configured).", async () => {
+    it("autoProvision() throws INTERNAL_ERROR when repoUtils is not set, before ever touching enabled/domains/alias config.", async () => {
         const route = objectFactory.newInstance<TestMailboxRoute>(TestMailboxRoute, { initialize: false });
-        // `initialize: false` also skips the `@Config` injection that a real request always gets, so the
-        // enabled/domains/authServerUrl checks ahead of the `repoUtils` one need setting by hand here —
-        // this test exists specifically to isolate the `repoUtils` guard, not those earlier ones (already
-        // covered for real via test/routes/mongo/MailboxRoute.test.ts's "disabled by default" case).
-        (route as any).autoProvisionEnabled = true;
-        (route as any).domains = ["example.com"];
-        (route as any).authServerUrl = "http://auth.test";
+        // `repoUtils` is checked before the (now DB-backed, async) verified-domains lookup, so this guard
+        // is reachable with `initialize: false`'s otherwise-unconfigured defaults left untouched - no need
+        // to hand-set autoProvisionEnabled/authServerUrl/domainClass here at all.
 
         await expect(route.autoProvision({} as any, undefined, { uid: "user-1" } as any)).rejects.toThrow(
             /internal error/i,

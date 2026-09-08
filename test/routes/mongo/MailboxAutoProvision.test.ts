@@ -5,14 +5,13 @@
 // Real HTTP+DB integration tests for BaseMailboxRoute's autoProvision()/listDomains() and create()'s
 // domain-allowlist enforcement — matching this library's real-server-integration-test convention (see
 // MailboxRoute.test.ts's own header comment). Kept in its own file rather than appended to that one:
-// this needs `mail:auto_provision:enabled`/`mail:domains` turned ON, and vitest isolates each test
-// file's module graph (confirmed via this project's `pool: "forks"` default `isolate: true`), so
-// mutating the shared `config` singleton here can't leak into MailboxRoute.test.ts's own assertions,
-// which rely on the unrestricted-domain default.
+// this needs `mail:auto_provision:enabled` turned ON and verified `Domain` rows seeded, and vitest
+// isolates each test file's module graph (confirmed via this project's `pool: "forks"` default
+// `isolate: true`), so mutating the shared `config` singleton here can't leak into MailboxRoute.test.ts's
+// own assertions, which rely on the unrestricted (zero `Domain` rows) default.
 import config from "../../config.js";
 
 config.set("mail:auto_provision:enabled", true);
-config.set("mail:domains", ["example.com", "example.org"]);
 config.set("mail:auth_server_url", "http://auth.test");
 // Short enough to make the timeout test below fast (real time, no fake timers), long enough that
 // every other test's synchronously-resolving mocked `fetch` never comes close to tripping it.
@@ -22,6 +21,7 @@ import { request } from "@rapidrest/service-core/test";
 import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
+import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
@@ -39,6 +39,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
     const server: Server = new Server({ config, basePath: "./test/server-mongo", logger, objectFactory });
     const baseUrl = "/mongo/mailboxes";
     let repo: MongoRepository<MailboxMongo>;
+    let domainRepo: MongoRepository<DomainMongo>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -69,8 +70,13 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
         const conn: any = connMgr?.connections.get("mongo");
         if (conn instanceof MongoConnection) {
             repo = conn.getMongoRepository("MailboxMongo");
+            domainRepo = conn.getMongoRepository("DomainMongo");
         } else {
             throw new Error("Could not find mongo connection");
+        }
+
+        for (const name of ["example.com", "example.org"]) {
+            await domainRepo.save(new DomainMongo({ name, enabled: true, verified: true, verificationToken: uuid.v4(), uid: name }));
         }
     });
 

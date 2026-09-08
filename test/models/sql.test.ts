@@ -29,6 +29,7 @@ import { ContactSQL } from "../../src/models/sql/ContactSQL.js";
 import { ContactListSQL } from "../../src/models/sql/ContactListSQL.js";
 import { DeviceSyncStateSQL } from "../../src/models/sql/DeviceSyncStateSQL.js";
 import { DistributionListSQL } from "../../src/models/sql/DistributionListSQL.js";
+import { DomainSQL } from "../../src/models/sql/DomainSQL.js";
 import { FolderSQL } from "../../src/models/sql/FolderSQL.js";
 import { IngestQueueEntrySQL } from "../../src/models/sql/IngestQueueEntrySQL.js";
 import { MailboxSQL } from "../../src/models/sql/MailboxSQL.js";
@@ -356,6 +357,37 @@ describe("SQL model default construction", () => {
         expect(obj.ownerUserUid).toBe("user-1");
         expect(obj.memberAddresses).toEqual(["a@example.com", "b@example.com"]);
         expect(obj.restrictSenders).toBe(true);
+    });
+
+    it("DomainSQL falls back to class defaults when constructed with no data.", () => {
+        const obj = new DomainSQL();
+
+        expect(obj.name).toBe("");
+        expect(obj.enabled).toBe(true);
+        expect(obj.verified).toBe(false);
+        expect(obj.verificationToken).toBe("");
+        expect(obj.verifiedAt).toBeUndefined();
+        expect(obj.lastCheckedAt).toBeUndefined();
+    });
+
+    it("DomainSQL applies provided overrides when constructed with data.", () => {
+        const verifiedAt = new Date();
+        const lastCheckedAt = new Date();
+        const obj = new DomainSQL({
+            name: "example.com",
+            enabled: false,
+            verified: true,
+            verificationToken: "abc123",
+            verifiedAt,
+            lastCheckedAt,
+        });
+
+        expect(obj.name).toBe("example.com");
+        expect(obj.enabled).toBe(false);
+        expect(obj.verified).toBe(true);
+        expect(obj.verificationToken).toBe("abc123");
+        expect(obj.verifiedAt).toBe(verifiedAt);
+        expect(obj.lastCheckedAt).toBe(lastCheckedAt);
     });
 
     it("CalendarEventSQL falls back to class defaults when constructed with no data.", () => {

@@ -9,13 +9,13 @@
 import config from "../../config.js";
 
 config.set("mail:auto_provision:enabled", true);
-config.set("mail:domains", ["example.com"]);
 config.set("mail:auto_provision:static_aliases", ["dev-user"]);
 
 import { request } from "@rapidrest/service-core/test";
-import { MongoConnection, Server, ObjectFactory, ConnectionManager } from "@rapidrest/service-core";
+import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
+import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
 
@@ -47,6 +47,16 @@ describe("Route:MailboxMongo auto-provision (static aliases) Tests", () => {
         if (!(conn instanceof MongoConnection)) {
             throw new Error("Could not find mongo connection");
         }
+        const domainRepo: MongoRepository<DomainMongo> = conn.getMongoRepository("DomainMongo");
+        await domainRepo.save(
+            new DomainMongo({
+                name: "example.com",
+                enabled: true,
+                verified: true,
+                verificationToken: uuid.v4(),
+                uid: "example.com",
+            }),
+        );
     });
 
     afterAll(async () => {

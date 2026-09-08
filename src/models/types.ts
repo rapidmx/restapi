@@ -637,6 +637,48 @@ export enum AuditAction {
     TRANSPORT_RULE_DELETE = "transport_rule.delete",
     MESSAGE_DELETE = "message.delete",
     MESSAGE_RECALL = "message.recall",
+    DOMAIN_CREATE = "domain.create",
+    DOMAIN_UPDATE = "domain.update",
+    DOMAIN_DELETE = "domain.delete",
+    DOMAIN_VERIFIED = "domain.verified",
+}
+
+/**
+ * An admin-managed domain this mail server accepts mail on, and restricts `Mailbox`/`DistributionList`
+ * addresses to. A newly created domain starts unverified with a generated `verificationToken` - an admin
+ * must prove DNS ownership by adding it as a TXT record before the domain is usable anywhere this
+ * server's domain list is consulted (see `util/DomainUtils.ts`'s `getVerifiedDomainNames()`). See
+ * `util/DomainVerificationUtils.ts` for the exact TXT record format and lookup logic, `BaseDomainRoute`
+ * for the manual `POST /:id/verify` action, and `jobs/DomainVerificationJob.ts` for the periodic
+ * background check. Real DNS/DMARC record management beyond this one ownership check is a separate
+ * roadmap item.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface Domain extends BaseEntity {
+    /** The hostname this mail server accepts mail on, e.g. "example.com". */
+    name: string;
+
+    /** Admin on/off toggle, independent of verification - a disabled domain is excluded from every
+     * restriction check without losing its row or verification state. */
+    enabled: boolean;
+
+    /** Whether DNS ownership has been proven via `verificationToken`. Only an enabled AND verified
+     * domain counts as one of "this server's domains" anywhere that's consulted. Once true, this
+     * library never flips it back to false - removing the TXT record after proving it once is fine. */
+    verified: boolean;
+
+    /** The random token that must appear in a TXT record on `name` (as
+     * `rapidmx-domain-verification=<token>`, see `DomainVerificationUtils.ts`) to prove ownership.
+     * Server-generated on create, regenerated if `name` is ever changed; never client-settable. */
+    verificationToken: string;
+
+    /** When `verified` became `true`, if it has. */
+    verifiedAt?: Date;
+
+    /** Last time a verification check (background job or manual trigger) ran against this domain,
+     * whether or not it succeeded - lets an admin see the check is actually happening. */
+    lastCheckedAt?: Date;
 }
 
 /**

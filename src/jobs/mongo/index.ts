@@ -1,5 +1,6 @@
 export * from "./AttachmentExtractionJobMongo.js";
 export * from "./CalendarReminderJobMongo.js";
+export * from "./DomainVerificationJobMongo.js";
 export * from "./EasDeviceStateCleanupJobMongo.js";
 export * from "./ExternalShareExpirationJobMongo.js";
 export * from "./MailboxQuotaRecalcJobMongo.js";

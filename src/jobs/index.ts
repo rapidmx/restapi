@@ -1,5 +1,6 @@
 export * from "./AttachmentExtractionJob.js";
 export * from "./CalendarReminderJob.js";
+export * from "./DomainVerificationJob.js";
 export * from "./EasDeviceStateCleanupJob.js";
 export * from "./ExternalShareExpirationJob.js";
 export * from "./MailboxQuotaRecalcJob.js";

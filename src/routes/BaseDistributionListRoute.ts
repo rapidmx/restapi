@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
+import { ApiError, type JWTUser } from "@rapidrest/core";
 import {
     ApiErrorMessages,
     ApiErrors,
@@ -15,9 +15,9 @@ import {
 } from "@rapidrest/service-core";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { AuditAction, DistributionList, Mailbox } from "../models/types.js";
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
-const { Config } = ObjectDecorators;
 
 /**
  * Extends the standard `CRUDRoute` CRUD scaffolding for `DistributionList` with trusted-role-only access to
@@ -43,10 +43,11 @@ const { Config } = ObjectDecorators;
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseDistributionListRoute<T extends DistributionList> extends CRUDRoute<T> {
-    @Config("mail:domains", [] as string[])
-    protected domains: string[] = [];
-
     protected abstract mailboxClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so `create()` can look up this server's verified
+     * domains without depending on either backend directly - see `util/DomainUtils.ts`. */
+    protected abstract domainClass: any;
 
     /** Supplied by the Mongo/SQL concrete subclasses so `recordAuditLog()` can persist an `AuditLogEntry`
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
@@ -65,21 +66,22 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
     }
 
     /**
-     * Validates a candidate list's `primarySmtpAddress` (domain must be in `mail:domains`, once configured -
-     * same rule `BaseMailboxRoute.create()` applies), derives its `uid` from that address, and rejects a
-     * collision against either an existing `DistributionList` (including a soft-deleted one, which still
-     * occupies its uid) or an existing `Mailbox`. Mutates `o.uid` in place.
+     * Validates a candidate list's `primarySmtpAddress` (its domain must be one of this server's verified
+     * `Domain`s, once at least one exists - same rule `BaseMailboxRoute.create()` applies), derives its
+     * `uid` from that address, and rejects a collision against either an existing `DistributionList`
+     * (including a soft-deleted one, which still occupies its uid) or an existing `Mailbox`. Mutates
+     * `o.uid` in place.
      */
-    private async assignUidAndCheckCollision(o: Partial<T>): Promise<void> {
+    private async assignUidAndCheckCollision(o: Partial<T>, domains: string[]): Promise<void> {
         if (!o.primarySmtpAddress) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        const domain: string | undefined = o.primarySmtpAddress.split("@")[1];
-        if (this.domains.length > 0 && (!domain || !this.domains.includes(domain))) {
+        const domain: string | undefined = o.primarySmtpAddress.split("@")[1]?.toLowerCase();
+        if (domains.length > 0 && (!domain || !domains.includes(domain))) {
             throw new ApiError(
                 ApiErrors.INVALID_REQUEST,
                 400,
-                `Distribution list addresses must be on one of this server's configured domains: ${this.domains.join(", ")}.`,
+                `Distribution list addresses must be on one of this server's configured domains: ${domains.join(", ")}.`,
             );
         }
 
@@ -103,10 +105,11 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
     @RequiresTrustedRole()
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
+        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
 
         const seenUids: Set<string> = new Set();
         for (const o of objs) {
-            await this.assignUidAndCheckCollision(o);
+            await this.assignUidAndCheckCollision(o, domains);
             if (seenUids.has((o as any).uid)) {
                 throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "Duplicate address within the same request.");
             }

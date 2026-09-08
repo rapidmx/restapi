@@ -16,13 +16,14 @@ import {
 import { AuditAction, DistributionList, FolderType, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 const { Auth, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 const { Config } = ObjectDecorators;
 
 /** One (name alias, domain) combination the caller could register as their mailbox address — the full
- * cross product of their auth-server name aliases and this server's configured `mail:domains` list. */
+ * cross product of their auth-server name aliases and this server's verified `Domain`s. */
 export interface MailboxAutoProvisionAliasOption {
     alias: string;
     domain: string;
@@ -109,17 +110,6 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     @Config("mail:auto_provision:enabled", false)
     protected autoProvisionEnabled: boolean = false;
 
-    /**
-     * The single source of truth for every domain this mail server accepts mail for — a deployment
-     * serving more than one domain lists all of them here. Governs *every* mailbox this route creates,
-     * not just auto-provisioned ones: `create()` below rejects a `primarySmtpAddress` on any other
-     * domain once this is non-empty (an empty list is the "unconfigured, no restriction" default, for
-     * backward compatibility with a deployment that hasn't set this up). `autoProvision()` offers the
-     * caller the cross product of their name aliases and this list to choose their own address from.
-     */
-    @Config("mail:domains", [] as string[])
-    protected domains: string[] = [];
-
     @Config("mail:auto_provision:quota_bytes", 5_000_000_000)
     protected autoProvisionQuotaBytes: number = 5_000_000_000;
 
@@ -139,6 +129,11 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * `DistributionList` and `BaseDistributionListRoute`'s symmetric check.
      */
     protected abstract distributionListClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so `create()`/`autoProvision()`/`listDomains()` can
+     * look up this server's verified domains without depending on either backend directly - see
+     * `util/DomainUtils.ts`. */
+    protected abstract domainClass: any;
 
     /** Supplied by the Mongo/SQL concrete subclasses so `create()` can persist an `AuditLogEntry` for a
      * trusted-caller-created (shared/resource) mailbox without depending on either backend directly - see
@@ -196,16 +191,18 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 (o as any).ownerUserUid = user.uid;
             }
         }
-        // Applies to every caller, trusted or not — `mail:domains` (once configured) is this server's
-        // one source of truth for which domains it accepts mail on at all, not just a self-service guard.
-        if (this.domains.length > 0) {
+        // Applies to every caller, trusted or not — this server's verified `Domain`s (once at least one
+        // exists) are the one source of truth for which domains it accepts mail on at all, not just a
+        // self-service guard.
+        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        if (domains.length > 0) {
             for (const o of objs) {
-                const domain = o.primarySmtpAddress?.split("@")[1];
-                if (!domain || !this.domains.includes(domain)) {
+                const domain = o.primarySmtpAddress?.split("@")[1]?.toLowerCase();
+                if (!domain || !domains.includes(domain)) {
                     throw new ApiError(
                         ApiErrors.INVALID_REQUEST,
                         400,
-                        `Mailbox addresses must be on one of this server's configured domains: ${this.domains.join(", ")}.`,
+                        `Mailbox addresses must be on one of this server's verified domains: ${domains.join(", ")}.`,
                     );
                 }
             }
@@ -289,19 +286,19 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     /**
      * Self-service mailbox creation with no `Mailbox` object required from the caller — for a deployment
      * where users only ever come from an external auth-server and are never manually provisioned a
-     * mailbox first. Disabled unless `mail:auto_provision:enabled` is on and `mail:domains` is non-empty
-     * (see the `@Config` fields above).
+     * mailbox first. Disabled unless `mail:auto_provision:enabled` is on and at least one verified
+     * `Domain` exists (see the `@Config` fields above and `util/DomainUtils.ts`).
      *
      * A mailbox needs a `primarySmtpAddress`, which this route has no way to know on its own — the caller
      * has no email registered anywhere in this system yet by definition. Instead, this derives candidates
      * from the identity auth-server already has for them: it calls auth-server's own `GET /api/aliases/me?
      * type=name` (forwarding the caller's own `jwt` cookie, so it only ever sees that user's own aliases)
-     * and offers the caller the full cross product of those aliases against `mail:domains` — a deployment
-     * can serve more than one domain, and the caller should get to pick which (alias, domain) pair they
-     * want, not have one silently chosen for them even when there's only one possible combination. So
-     * with no `body.alias`/`body.domain`, this *always* returns `needs_selection` rather than creating
-     * anything; only a call that supplies both, validated fresh against the real alias list and the
-     * configured domain list (never trusted blindly), actually creates the mailbox.
+     * and offers the caller the full cross product of those aliases against this server's verified
+     * domains — a deployment can serve more than one domain, and the caller should get to pick which
+     * (alias, domain) pair they want, not have one silently chosen for them even when there's only one
+     * possible combination. So with no `body.alias`/`body.domain`, this *always* returns `needs_selection`
+     * rather than creating anything; only a call that supplies both, validated fresh against the real
+     * alias list and the verified domain list (never trusted blindly), actually creates the mailbox.
      *
      * Idempotent: a caller who already owns a mailbox gets it back (`status: "existing"`) rather than a
      * second one, since nothing prevents this being called more than once (e.g. two tabs racing on first
@@ -317,12 +314,13 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         if (!user) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
-        const hasAliasSource = this.staticAliases.length > 0 || !!this.authServerUrl;
-        if (!this.autoProvisionEnabled || this.domains.length === 0 || !hasAliasSource) {
-            throw new ApiError(ApiErrors.NOT_FOUND, 404, "Automatic mailbox provisioning is not enabled.");
-        }
         if (!this.repoUtils) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const hasAliasSource = this.staticAliases.length > 0 || !!this.authServerUrl;
+        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        if (!this.autoProvisionEnabled || domains.length === 0 || !hasAliasSource) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, "Automatic mailbox provisioning is not enabled.");
         }
 
         const existing: T[] = await this.repoUtils.find({ ownerUserUid: user.uid }, {
@@ -342,11 +340,11 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             return {
                 status: "needs_selection",
                 options: aliases.flatMap((alias) =>
-                    this.domains.map((domain) => ({ alias, domain, primarySmtpAddress: `${alias}@${domain}` })),
+                    domains.map((domain) => ({ alias, domain, primarySmtpAddress: `${alias}@${domain}` })),
                 ),
             };
         }
-        if (!aliases.includes(body.alias) || !this.domains.includes(body.domain)) {
+        if (!aliases.includes(body.alias) || !domains.includes(body.domain)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
 
@@ -364,13 +362,13 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         return { status: "created", mailbox };
     }
 
-    /** This server's configured domain list (`mail:domains`) — lets a client (e.g. the admin console's
-     * "New mailbox" form) constrain the domain half of an address to what this server actually accepts,
-     * without hardcoding or duplicating that list client-side. */
+    /** This server's verified domains — lets a client (e.g. the admin console's "New mailbox" form)
+     * constrain the domain half of an address to what this server actually accepts, without hardcoding or
+     * duplicating that list client-side. */
     @Auth(["jwt"])
     @Get("/domains")
     public async listDomains(): Promise<string[]> {
-        return this.domains;
+        return await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
     }
 
     /** The caller's own auth-server "name" aliases (e.g. usernames), via `GET /api/aliases/me?type=name` —

@@ -171,7 +171,7 @@ export async function buildTransportRuleContext(
     const anyRecipientExternal: boolean =
         domains.length > 0 &&
         envelopeTo.some((address) => {
-            const domain = address.split("@")[1];
+            const domain = address.split("@")[1]?.toLowerCase();
             return !domain || !domains.includes(domain);
         });
 

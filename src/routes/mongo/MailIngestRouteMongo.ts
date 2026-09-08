@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { DistributionListMongo, IngestQueueEntryMongo, MailboxMongo, TransportRuleMongo } from "../../mongo.js";
+import { DistributionListMongo, DomainMongo, IngestQueueEntryMongo, MailboxMongo, TransportRuleMongo } from "../../mongo.js";
 import { BaseMailIngestRoute } from "../BaseMailIngestRoute.js";
 
 export class MailIngestRouteMongo extends BaseMailIngestRoute<MailboxMongo, IngestQueueEntryMongo> {
@@ -10,4 +10,5 @@ export class MailIngestRouteMongo extends BaseMailIngestRoute<MailboxMongo, Inge
     protected ingestQueueClass: any = IngestQueueEntryMongo;
     protected distributionListClass: any = DistributionListMongo;
     protected transportRuleClass: any = TransportRuleMongo;
+    protected domainClass: any = DomainMongo;
 }

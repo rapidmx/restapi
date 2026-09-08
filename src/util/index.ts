@@ -17,6 +17,8 @@ export * from "./AuditLogUtils.js";
 export * from "./AutoReplyUtils.js";
 export * from "./ConversationUtils.js";
 export * from "./DistributionListUtils.js";
+export * from "./DomainUtils.js";
+export * from "./DomainVerificationUtils.js";
 export * from "./FolderUtils.js";
 export * from "./IcsUtils.js";
 export * from "./MailFilterUtils.js";

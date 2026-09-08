@@ -7,5 +7,6 @@ export * from "./routes/index.js";
 export * from "./jobs/index.js";
 export * from "./transport/index.js";
 export * from "./blob/index.js";
+export * from "./dns/index.js";
 export * from "./push/index.js";
 export * from "./util/index.js";

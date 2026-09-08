@@ -3,14 +3,12 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { AuditLogEntrySQL, DistributionListSQL, DomainSQL, MailboxSQL } from "../../sql.js";
-import { BaseDistributionListRoute } from "../BaseDistributionListRoute.js";
+import { AuditLogEntrySQL, DomainSQL } from "../../sql.js";
+import { BaseDomainRoute } from "../BaseDomainRoute.js";
 const { Model } = RouteDecorators;
 
-@Model(DistributionListSQL)
-export class DistributionListRouteSQL extends BaseDistributionListRoute<DistributionListSQL> {
+@Model(DomainSQL)
+export class DomainRouteSQL extends BaseDomainRoute<DomainSQL> {
     protected readonly repoUtilsClass: any = RepoUtils;
-    protected mailboxClass: any = MailboxSQL;
-    protected domainClass: any = DomainSQL;
     protected auditLogClass: any = AuditLogEntrySQL;
 }

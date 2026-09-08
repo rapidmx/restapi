@@ -6,6 +6,7 @@ export * from "./ContactMongo.js";
 export * from "./ContactListMongo.js";
 export * from "./DeviceSyncStateMongo.js";
 export * from "./DistributionListMongo.js";
+export * from "./DomainMongo.js";
 export * from "./FolderMongo.js";
 export * from "./IngestQueueEntryMongo.js";
 export * from "./MailboxMongo.js";
