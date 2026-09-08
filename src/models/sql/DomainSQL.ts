@@ -56,6 +56,26 @@ export class DomainSQL extends BaseEntity implements Domain {
     @Nullable
     public lastCheckedAt?: Date;
 
+    @Column({ nullable: true })
+    @Description("DKIM selector - the admin's own MTA/OpenDKIM key pair is under this selector name.")
+    @Nullable
+    public dkimSelector?: string;
+
+    @Column({ nullable: true })
+    @Description("The base64 public-key portion (the p= value) of that same DKIM key pair.")
+    @Nullable
+    public dkimPublicKey?: string;
+
+    @Column({ type: "varchar", nullable: true })
+    @Description("DMARC policy to recommend/check for - defaults to 'none' if not customized.")
+    @Nullable
+    public dmarcPolicy?: "none" | "quarantine" | "reject";
+
+    @Column({ nullable: true })
+    @Description("Optional mailto target for DMARC aggregate reports.")
+    @Nullable
+    public dmarcReportEmail?: string;
+
     constructor(other?: Partial<DomainSQL>) {
         super(other);
 
@@ -66,6 +86,10 @@ export class DomainSQL extends BaseEntity implements Domain {
             this.verificationToken = other.verificationToken !== undefined ? other.verificationToken : this.verificationToken;
             this.verifiedAt = "verifiedAt" in other ? other.verifiedAt : this.verifiedAt;
             this.lastCheckedAt = "lastCheckedAt" in other ? other.lastCheckedAt : this.lastCheckedAt;
+            this.dkimSelector = "dkimSelector" in other ? other.dkimSelector : this.dkimSelector;
+            this.dkimPublicKey = "dkimPublicKey" in other ? other.dkimPublicKey : this.dkimPublicKey;
+            this.dmarcPolicy = "dmarcPolicy" in other ? other.dmarcPolicy : this.dmarcPolicy;
+            this.dmarcReportEmail = "dmarcReportEmail" in other ? other.dmarcReportEmail : this.dmarcReportEmail;
         }
     }
 }

@@ -3,10 +3,16 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 
+/** One MX record - the priority-ordered hostname a domain accepts inbound mail on. */
+export interface DnsMxRecord {
+    priority: number;
+    exchange: string;
+}
+
 /**
- * A pluggable DNS TXT record lookup, used by `Domain` ownership verification
- * (`util/DomainVerificationUtils.ts`). Kept behind an interface - like `BlobStore`/`MailTransport` - so
- * tests never touch real DNS.
+ * A pluggable DNS lookup, used by `Domain` ownership verification (`util/DomainVerificationUtils.ts`)
+ * and DNS setup checks (`util/DnsSetupUtils.ts`). Kept behind an interface - like
+ * `BlobStore`/`MailTransport` - so tests never touch real DNS.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -19,4 +25,11 @@ export interface DnsResolver {
      * @throws if the lookup fails (NXDOMAIN, no TXT records, network error, etc.)
      */
     resolveTxt(hostname: string): Promise<string[][]>;
+
+    /**
+     * Resolves the MX records for `hostname`.
+     *
+     * @throws if the lookup fails (NXDOMAIN, no MX records, network error, etc.)
+     */
+    resolveMx(hostname: string): Promise<DnsMxRecord[]>;
 }

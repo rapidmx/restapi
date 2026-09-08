@@ -13,7 +13,7 @@
 // shared test utility" convention: this library has pluggable interfaces auth does not, and duplicating this
 // registration across ~24 integration test files would be unreasonable.
 import type { BlobPutOptions, BlobRange, BlobStore } from "../src/blob/BlobStore.js";
-import type { DnsResolver } from "../src/dns/DnsResolver.js";
+import type { DnsMxRecord, DnsResolver } from "../src/dns/DnsResolver.js";
 import type { SearchDocument, SearchEntityType, SearchProvider, SearchQuery, SearchResultPage } from "../src/search/SearchProvider.js";
 import type { ScanEnvelope, SpamScanProvider, SpamScanResult } from "../src/scan/SpamScanProvider.js";
 import type { AvScanProvider, AvScanResult } from "../src/scan/AvScanProvider.js";
@@ -163,11 +163,20 @@ export class RecordingMailTransport implements MailTransport {
  */
 export class StaticDnsResolver implements DnsResolver {
     public records: Map<string, string[][]> = new Map();
+    public mxRecords: Map<string, DnsMxRecord[]> = new Map();
 
     public async resolveTxt(hostname: string): Promise<string[][]> {
         const records: string[][] | undefined = this.records.get(hostname);
         if (!records) {
             throw new Error(`StaticDnsResolver: no TXT records for '${hostname}'`);
+        }
+        return records;
+    }
+
+    public async resolveMx(hostname: string): Promise<DnsMxRecord[]> {
+        const records: DnsMxRecord[] | undefined = this.mxRecords.get(hostname);
+        if (!records) {
+            throw new Error(`StaticDnsResolver: no MX records for '${hostname}'`);
         }
         return records;
     }

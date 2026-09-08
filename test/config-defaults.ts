@@ -54,6 +54,9 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
                     root: "./test/.tmp/blobs",
                 },
             },
+            dns: {
+                mx_hostname: "mail.rapidmx-test.example.com",
+            },
             transport: {
                 ingest: {
                     secret: "test-ingest-secret",

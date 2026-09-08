@@ -299,6 +299,88 @@ describe("Route:DomainMongo Tests", () => {
         });
     });
 
+    describe("dns-setup()", () => {
+        it("A non-trusted caller cannot fetch DNS setup status (403).", async () => {
+            const domain = await createDomain();
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/${domain.uid}/dns-setup`)
+                .set("Authorization", "jwt " + userToken);
+
+            expect(result.status).toBe(403);
+        });
+
+        it("A trusted caller gets all 5 record checks, reflecting live DNS state and per-domain DKIM/DMARC config.", async () => {
+            const domain = await createDomain({
+                name: "setup-me.com",
+                dkimSelector: "default",
+                dkimPublicKey: "MIGfMA0GCSq",
+                dmarcPolicy: "quarantine",
+            });
+            const resolver = objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!;
+            resolver.records.set("setup-me.com", [
+                [buildVerificationTxtValue(domain.verificationToken)],
+                ["v=spf1 mx ~all"],
+            ]);
+            resolver.mxRecords.set("setup-me.com", [{ priority: 10, exchange: "mail.rapidmx-test.example.com" }]);
+            resolver.records.set("default._domainkey.setup-me.com", [["v=DKIM1; k=rsa; p=MIGfMA0GCSq"]]);
+            resolver.records.set("_dmarc.setup-me.com", [["v=DMARC1; p=quarantine;"]]);
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/${domain.uid}/dns-setup`)
+                .set("Authorization", "jwt " + adminToken);
+
+            expect(result.status).toBe(200);
+            const byType = Object.fromEntries(result.body.map((c: any) => [c.type, c]));
+            expect(byType.ownership.matches).toBe(true);
+            expect(byType.mx.configured).toBe(true);
+            expect(byType.mx.matches).toBe(true);
+            expect(byType.spf.matches).toBe(true);
+            expect(byType.dkim.matches).toBe(true);
+            expect(byType.dmarc.matches).toBe(true);
+        });
+
+        it("Reports dkim as not configured until the domain has a selector and public key.", async () => {
+            const domain = await createDomain({ name: "no-dkim.com" });
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/${domain.uid}/dns-setup`)
+                .set("Authorization", "jwt " + adminToken);
+
+            expect(result.status).toBe(200);
+            const dkim = result.body.find((c: any) => c.type === "dkim");
+            expect(dkim.configured).toBe(false);
+        });
+
+        it("Returns 404 for a domain that doesn't exist.", async () => {
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/does-not-exist.com/dns-setup`)
+                .set("Authorization", "jwt " + adminToken);
+
+            expect(result.status).toBe(404);
+        });
+    });
+
+    it("Rejects an invalid dmarcPolicy on create (400).", async () => {
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ name: "bad-dmarc.com", dmarcPolicy: "not-a-real-policy" });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Rejects an invalid dmarcPolicy on update (400).", async () => {
+        const domain = await createDomain();
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${domain.uid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: domain.uid, version: domain.version, dmarcPolicy: "not-a-real-policy" });
+
+        expect(result.status).toBe(400);
+    });
+
     it("Writes an AuditLogEntry for create, update, and delete.", async () => {
         const createResult = await request(server.getApplication())
             .post(baseUrl)

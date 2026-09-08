@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as dns from "dns";
-import { DnsResolver } from "./DnsResolver.js";
+import { DnsMxRecord, DnsResolver } from "./DnsResolver.js";
 
 /**
  * `DnsResolver` backed by Node's own built-in resolver - no extra dependency, works for any deployment.
@@ -15,5 +15,9 @@ import { DnsResolver } from "./DnsResolver.js";
 export class NodeDnsResolver implements DnsResolver {
     public async resolveTxt(hostname: string): Promise<string[][]> {
         return await dns.promises.resolveTxt(hostname);
+    }
+
+    public async resolveMx(hostname: string): Promise<DnsMxRecord[]> {
+        return await dns.promises.resolveMx(hostname);
     }
 }

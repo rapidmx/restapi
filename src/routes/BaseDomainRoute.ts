@@ -16,10 +16,21 @@ import {
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { checkDnsSetup, type DnsRecordCheck } from "../util/DnsSetupUtils.js";
 import { checkDomainVerification } from "../util/DomainVerificationUtils.js";
 import { AuditAction, Domain } from "../models/types.js";
-const { Param, Post, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
-const { Inject } = ObjectDecorators;
+const { Get, Param, Post, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
+const { Config, Inject } = ObjectDecorators;
+
+const DMARC_POLICIES = new Set(["none", "quarantine", "reject"]);
+
+/** Rejects an explicitly-provided `dmarcPolicy` that isn't one of the three real DMARC policy values -
+ * `undefined` (not provided at all) is left alone, matching every other optional field's semantics. */
+function validateDmarcPolicy(dmarcPolicy: unknown): void {
+    if (dmarcPolicy !== undefined && !DMARC_POLICIES.has(dmarcPolicy as string)) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `dmarcPolicy must be one of: ${[...DMARC_POLICIES].join(", ")}.`);
+    }
+}
 
 /**
  * Extends the standard `CRUDRoute` CRUD scaffolding for `Domain` with trusted-role-only access to every
@@ -42,6 +53,12 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
     @Inject("DnsResolver")
     private dnsResolver?: DnsResolver;
 
+    /** This server's own inbound mail-exchange hostname - every `Domain`'s recommended MX (and, by
+     * extension, SPF `mx` mechanism) record points here. One global value, same single-value-config
+     * pattern as `mail:auth_server_url`. */
+    @Config("mail:dns:mx_hostname", "")
+    private mxHostname: string = "";
+
     private newVerificationToken(): string {
         return crypto.randomBytes(32).toString("base64url");
     }
@@ -53,6 +70,7 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         if (!o.name) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
+        validateDmarcPolicy(o.dmarcPolicy);
         const uid: string = normalizeAddress(o.name);
         (o as any).uid = uid;
         (o as any).verified = false;
@@ -121,6 +139,7 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         if (patch.name !== undefined && normalizeAddress(patch.name) !== existing.uid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain's name cannot be changed - delete and re-create it instead.");
         }
+        validateDmarcPolicy(patch.dmarcPolicy);
 
         const updated: T = await this.repoUtils!.update(patch, existing, { user, version: (obj as any).version, ignoreACL: true });
 
@@ -229,5 +248,23 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         }
 
         return updated;
+    }
+
+    /**
+     * Read-only DNS setup status for `domain` - computes and live-checks every mail-related DNS record
+     * this server recommends (ownership TXT, MX, SPF, DKIM, DMARC - see `checkDnsSetup()`'s own doc
+     * comment for the exact per-type logic) so an admin console can show a single "here's what to add to
+     * your DNS, and whether it's live yet" checklist. Unlike `verify()`, this never mutates the domain or
+     * writes an `AuditLogEntry` - nothing here has ownership verification's security consequence, it's
+     * purely diagnostic and always computed fresh.
+     */
+    @RequiresTrustedRole()
+    @Get("/:id/dns-setup")
+    public async dnsSetup(@Param("id") id: string): Promise<DnsRecordCheck[]> {
+        const domain: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+        if (!domain) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        return await checkDnsSetup(this.dnsResolver!, domain, this.mxHostname);
     }
 }

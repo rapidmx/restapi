@@ -679,6 +679,22 @@ export interface Domain extends BaseEntity {
     /** Last time a verification check (background job or manual trigger) ran against this domain,
      * whether or not it succeeded - lets an admin see the check is actually happening. */
     lastCheckedAt?: Date;
+
+    /** DKIM selector, e.g. "default" - the admin's own MTA/OpenDKIM already has a key pair under this
+     * selector name; this app never generates or stores DKIM key material (see `util/DnsSetupUtils.ts`). */
+    dkimSelector?: string;
+
+    /** The base64 public-key portion of that same DKIM key pair (the `p=` value), used to compute and
+     * check the `<dkimSelector>._domainkey.<name>` TXT record. */
+    dkimPublicKey?: string;
+
+    /** DMARC policy to recommend/check for - defaults to the safe "none" (monitor-only) starting point
+     * recommended by every DMARC deployment guide if not customized. */
+    dmarcPolicy?: "none" | "quarantine" | "reject";
+
+    /** Optional mailto target for DMARC aggregate reports (the record's `rua=` tag), if the admin wants
+     * reports sent somewhere. */
+    dmarcReportEmail?: string;
 }
 
 /**

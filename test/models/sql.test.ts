@@ -368,6 +368,10 @@ describe("SQL model default construction", () => {
         expect(obj.verificationToken).toBe("");
         expect(obj.verifiedAt).toBeUndefined();
         expect(obj.lastCheckedAt).toBeUndefined();
+        expect(obj.dkimSelector).toBeUndefined();
+        expect(obj.dkimPublicKey).toBeUndefined();
+        expect(obj.dmarcPolicy).toBeUndefined();
+        expect(obj.dmarcReportEmail).toBeUndefined();
     });
 
     it("DomainSQL applies provided overrides when constructed with data.", () => {
@@ -380,6 +384,10 @@ describe("SQL model default construction", () => {
             verificationToken: "abc123",
             verifiedAt,
             lastCheckedAt,
+            dkimSelector: "default",
+            dkimPublicKey: "MIGfMA0GCSq",
+            dmarcPolicy: "quarantine",
+            dmarcReportEmail: "dmarc@example.com",
         });
 
         expect(obj.name).toBe("example.com");
@@ -388,6 +396,10 @@ describe("SQL model default construction", () => {
         expect(obj.verificationToken).toBe("abc123");
         expect(obj.verifiedAt).toBe(verifiedAt);
         expect(obj.lastCheckedAt).toBe(lastCheckedAt);
+        expect(obj.dkimSelector).toBe("default");
+        expect(obj.dkimPublicKey).toBe("MIGfMA0GCSq");
+        expect(obj.dmarcPolicy).toBe("quarantine");
+        expect(obj.dmarcReportEmail).toBe("dmarc@example.com");
     });
 
     it("CalendarEventSQL falls back to class defaults when constructed with no data.", () => {
