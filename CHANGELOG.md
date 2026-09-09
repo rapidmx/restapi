@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-09
+
+### Added
+- Added an IANA's Special-Use Domain Name now skips validation and is automatically set as verified
+
+### Changed
+- Cleaning up contributors
+- Updated readme
+
 ## [0.3.0] - 2026-09-09
 
 ### Added
@@ -151,6 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/RapidMX/restapi/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/RapidMX/restapi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/RapidMX/restapi/compare/v0.1.0...v0.2.0

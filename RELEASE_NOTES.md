@@ -1,3 +1,3 @@
 # Release Notes
 
-## Unreleased
+## v0.3.1
