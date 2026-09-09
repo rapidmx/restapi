@@ -31,3 +31,19 @@ export async function getVerifiedDomainNames(objectFactory: ObjectFactory, domai
     const domains = await repo.find({ enabled: true, verified: true }, { ignoreACL: true });
     return domains.map((d: any) => d.name);
 }
+
+/**
+ * `true` if `address`'s domain is one of "this server's domains" (see `getVerifiedDomainNames()`) - the same
+ * "internal sender" signal `ScanQueueJob.classifyForInbox()` already computes for Focused Inbox, reused as-is
+ * for the delivery/read receipt design's own internal-vs-external mailbox settings (`ScanQueueJob.
+ * maybeSendReceipt()`/`BaseMessageRoute.send()`/its `update()` override - see `Mailbox.
+ * alwaysRequestReceiptInternal`/`autoSendReceiptsInternal` et al.).
+ */
+export async function isInternalAddress(objectFactory: ObjectFactory, domainClass: any, address: string): Promise<boolean> {
+    const domain: string | undefined = address.split("@")[1]?.toLowerCase();
+    if (!domain) {
+        return false;
+    }
+    const domains = await getVerifiedDomainNames(objectFactory, domainClass);
+    return domains.includes(domain);
+}

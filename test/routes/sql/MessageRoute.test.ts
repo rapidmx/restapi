@@ -15,6 +15,7 @@ import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
+import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { FocusedInboxOverrideSQL } from "../../../src/models/sql/FocusedInboxOverrideSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
@@ -39,6 +40,7 @@ describe("Route:MessageSQL Tests", () => {
     let aclRepo: Repository<AccessControlListSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
     let overrideRepo: Repository<FocusedInboxOverrideSQL>;
+    let domainRepo: Repository<DomainSQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -127,6 +129,7 @@ describe("Route:MessageSQL Tests", () => {
             messageRepo = conn.getRepository(MessageSQL);
             auditLogRepo = conn.getRepository(AuditLogEntrySQL);
             overrideRepo = conn.getRepository(FocusedInboxOverrideSQL);
+            domainRepo = conn.getRepository(DomainSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -143,6 +146,7 @@ describe("Route:MessageSQL Tests", () => {
         await mailboxRepo.clear();
         await auditLogRepo.clear();
         await overrideRepo.clear();
+        await domainRepo.clear();
         // The recording transport accumulates across tests otherwise, since it's a singleton for the life of
         // this file's one `server` instance.
         const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport");
@@ -788,6 +792,407 @@ describe("Route:MessageSQL Tests", () => {
             expect(result.status).toBe(200);
             expect(result.body.length).toBe(1);
             expect(result.body[0].uid).toBe(focused.uid);
+        });
+    });
+
+    /** Registers "example.com" as a verified domain, so an "@example.com" address (`createMessage()`'s own
+     * default `from`/`recipients` domain) is classified internal by `isInternalAddress()`. */
+    const verifyOwnDomain = async function (): Promise<void> {
+        await domainRepo.save(
+            new DomainSQL({
+                uid: "example.com",
+                name: "example.com",
+                enabled: true,
+                verified: true,
+                verificationToken: uuid.v4(),
+            }),
+        );
+    };
+
+    describe("Read receipt trigger (update())", () => {
+        it("Marking a message read sends the read receipt immediately for an internal requester (the mailbox default).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            await verifyOwnDomain();
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "colleague@example.com",
+            });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, flags: { ...message.flags, read: true } });
+
+            expect(result.status).toBe(200);
+            expect(result.body.readReceiptSentAt).toBeTruthy();
+            expect(result.body.readReceiptPending).toBe(false);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(1);
+            expect(transport.sent[0].envelopeTo).toEqual(["colleague@example.com"]);
+            expect(transport.sent[0].raw.toString()).toContain("multipart/report");
+        });
+
+        it("Holds the read receipt pending approval for an external requester (the mailbox default).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "stranger@outside.com",
+            });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, flags: { ...message.flags, read: true } });
+
+            expect(result.status).toBe(200);
+            expect(result.body.readReceiptSentAt).toBeFalsy();
+            expect(result.body.readReceiptPending).toBe(true);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(0);
+        });
+
+        it("Sends the read receipt at most once - a later update that keeps flags.read true does not re-send.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            await verifyOwnDomain();
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "colleague@example.com",
+            });
+
+            const first = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, flags: { ...message.flags, read: true } });
+            expect(first.status).toBe(200);
+
+            const second = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: first.body.version, flags: { ...first.body.flags, flagged: true } });
+            expect(second.status).toBe(200);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(1);
+        });
+
+        it("Does nothing receipt-related for an ordinary message with no receipt request at all.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, flags: { ...message.flags, read: true } });
+
+            expect(result.status).toBe(200);
+            expect(result.body.readReceiptSentAt).toBeFalsy();
+            expect(result.body.readReceiptPending).toBe(false);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(0);
+        });
+
+        it("Leaves the message unchanged (still 200) when marking it read and its mailbox no longer exists.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "stranger@outside.com",
+            });
+            await mailboxRepo.delete({ uid: mailbox.uid });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, flags: { ...message.flags, read: true } });
+
+            expect(result.status).toBe(200);
+            expect(result.body.readReceiptSentAt).toBeFalsy();
+            expect(result.body.readReceiptPending).toBe(false);
+        });
+
+        it("Logs rather than throws when sending the read receipt fails outright.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            await verifyOwnDomain();
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "colleague@example.com",
+            });
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            const spy = vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("smtp is down"));
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, flags: { ...message.flags, read: true } });
+
+            expect(result.status).toBe(200);
+            expect(result.body.readReceiptSentAt).toBeFalsy();
+            expect(result.body.readReceiptPending).toBe(false);
+            spy.mockRestore();
+        });
+    });
+
+    describe("receipt/approve and receipt/decline", () => {
+        it("Approves a pending read receipt, sending it and clearing the pending flag.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "stranger@outside.com",
+                readReceiptPending: true,
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/approve`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ type: "read" });
+
+            expect(result.status).toBe(200);
+            expect(result.body.readReceiptPending).toBe(false);
+            expect(result.body.readReceiptSentAt).toBeTruthy();
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(1);
+        });
+
+        it("Declines a pending delivery receipt permanently, without ever sending it.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "stranger@outside.com",
+                deliveryReceiptPending: true,
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/decline`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ type: "delivery" });
+
+            expect(result.status).toBe(200);
+            expect(result.body.deliveryReceiptPending).toBe(false);
+            expect(result.body.deliveryReceiptSentAt).toBeFalsy();
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(0);
+        });
+
+        it("Approves a pending delivery receipt (the other type branch).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "stranger@outside.com",
+                deliveryReceiptPending: true,
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/approve`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ type: "delivery" });
+
+            expect(result.status).toBe(200);
+            expect(result.body.deliveryReceiptPending).toBe(false);
+            expect(result.body.deliveryReceiptSentAt).toBeTruthy();
+        });
+
+        it("Declines a pending read receipt (the other type branch).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "stranger@outside.com",
+                readReceiptPending: true,
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/decline`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ type: "read" });
+
+            expect(result.status).toBe(200);
+            expect(result.body.readReceiptPending).toBe(false);
+            expect(result.body.readReceiptSentAt).toBeFalsy();
+        });
+
+        it("Logs rather than throws when sending an approved receipt fails outright.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "stranger@outside.com",
+                readReceiptPending: true,
+            });
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            const spy = vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("smtp is down"));
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/approve`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ type: "read" });
+
+            expect(result.status).toBe(200);
+            expect(result.body.readReceiptPending).toBe(false);
+            expect(result.body.readReceiptSentAt).toBeFalsy();
+            spy.mockRestore();
+        });
+
+        it("Returns 500 when approving a receipt whose mailbox no longer exists.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "stranger@outside.com",
+                deliveryReceiptPending: true,
+            });
+            await mailboxRepo.delete({ uid: mailbox.uid });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/approve`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ type: "delivery" });
+
+            expect(result.status).toBe(500);
+        });
+
+        it("Rejects an invalid type (400).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, { deliveryReceiptPending: true });
+
+            const approveResult = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/approve`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ type: "bogus" });
+            expect(approveResult.status).toBe(400);
+
+            const declineResult = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/decline`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({});
+            expect(declineResult.status).toBe(400);
+        });
+
+        it("Rejects approving/declining a receipt that isn't pending (400).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid);
+
+            const approveResult = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/approve`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ type: "delivery" });
+            expect(approveResult.status).toBe(400);
+
+            const declineResult = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/decline`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ type: "read" });
+            expect(declineResult.status).toBe(400);
+        });
+
+        it("A different user cannot approve/decline a receipt on a message they don't have access to (403).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, { deliveryReceiptPending: true });
+
+            const approveResult = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/approve`)
+                .set("Authorization", "jwt " + otherUserToken)
+                .send({ type: "delivery" });
+            expect(approveResult.status).toBe(403);
+
+            const declineResult = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/receipt/decline`)
+                .set("Authorization", "jwt " + otherUserToken)
+                .send({ type: "delivery" });
+            expect(declineResult.status).toBe(403);
+        });
+
+        it("Approving/declining a nonexistent message returns 404.", async () => {
+            const approveResult = await request(server.getApplication())
+                .post(`${baseUrl}/${uuid.v4()}/receipt/approve`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ type: "delivery" });
+            expect(approveResult.status).toBe(404);
+
+            const declineResult = await request(server.getApplication())
+                .post(`${baseUrl}/${uuid.v4()}/receipt/decline`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ type: "delivery" });
+            expect(declineResult.status).toBe(404);
+        });
+    });
+
+    describe("send() receipt request injection", () => {
+        const sendDraft = async function (mailbox: MailboxSQL, draftsFolder: FolderSQL, data?: any) {
+            const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await blobStore.put(
+                bodyBlobKey,
+                Buffer.from("From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n"),
+            );
+            const message = await createMessage(mailbox.uid, draftsFolder.uid, { bodyBlobKey, ...data });
+            return await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/send`)
+                .set("Authorization", "jwt " + ownerToken);
+        };
+
+        it("Attaches Disposition-Notification-To and seeds receiptStatus for an internal recipient (the mailbox default).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            await verifyOwnDomain();
+
+            const result = await sendDraft(mailbox, draftsFolder);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.receiptStatus).toEqual([{ recipientAddress: "recipient@example.com" }]);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).toContain("Disposition-Notification-To: owner@example.com");
+        });
+
+        it("Does not attach a request header for an external-only recipient by default.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            // "example.com" is never verified in this test, so "recipient@example.com" is external.
+
+            const result = await sendDraft(mailbox, draftsFolder);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.body.receiptStatus).toBeFalsy();
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).not.toContain("Disposition-Notification-To");
+        });
+
+        it("An explicit requestReceipt: false overrides the mailbox's own internal default off.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            await verifyOwnDomain();
+
+            const result = await sendDraft(mailbox, draftsFolder, { requestReceipt: false });
+
+            expect(result.body.receiptStatus).toBeFalsy();
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).not.toContain("Disposition-Notification-To");
+        });
+
+        it("alwaysRequestReceiptExternal opts an external recipient in.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await mailboxRepo.update({ uid: mailbox.uid }, { alwaysRequestReceiptExternal: true });
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+
+            const result = await sendDraft(mailbox, draftsFolder);
+
+            expect(result.body.receiptStatus).toEqual([{ recipientAddress: "recipient@example.com" }]);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).toContain("Disposition-Notification-To: owner@example.com");
         });
     });
 });

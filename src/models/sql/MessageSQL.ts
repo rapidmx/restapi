@@ -10,7 +10,15 @@ import {
     RecoverableBaseEntity,
 } from "@rapidrest/service-core";
 import { ObjectDecorators } from "@rapidrest/core";
-import { Message, MessageClassification, MessageFlags, MessageImportance, Recipient, RecipientType } from "../types.js";
+import {
+    Message,
+    MessageClassification,
+    MessageFlags,
+    MessageImportance,
+    MessageReceiptEntry,
+    Recipient,
+    RecipientType,
+} from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Nullable } = ObjectDecorators;
@@ -159,6 +167,51 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
     @Nullable
     public inferenceClassification?: MessageClassification;
 
+    @Column({ nullable: true })
+    @Description(
+        "Set on a Draft, before send(), to request a real RFC 3798 MDN from every recipient - undefined " +
+            "means 'use this mailbox's own always-request default'.",
+    )
+    @Nullable
+    public requestReceipt?: boolean;
+
+    @Column({ nullable: true })
+    @Description(
+        "The address a receipt should be sent back to, persisted on the recipient's own delivered copy at " +
+            "delivery time from the inbound Disposition-Notification-To header.",
+    )
+    @Nullable
+    public dispositionNotificationTo?: string;
+
+    @Column({ nullable: true })
+    @Description("Idempotency stamp, recipient's own delivered copy - set once a delivery receipt has actually been sent.")
+    @Nullable
+    public deliveryReceiptSentAt?: Date;
+
+    @Column({ nullable: true })
+    @Description("Idempotency stamp, recipient's own delivered copy - set once a read receipt has actually been sent.")
+    @Nullable
+    public readReceiptSentAt?: Date;
+
+    @Column()
+    @Description(
+        "true when a delivery receipt was requested but is held for the mailbox owner's explicit approval " +
+            "instead of being sent immediately.",
+    )
+    public deliveryReceiptPending: boolean = false;
+
+    @Column()
+    @Description("Same as deliveryReceiptPending, for a read receipt.")
+    public readReceiptPending: boolean = false;
+
+    @Column({ type: "simple-json", nullable: true })
+    @Description(
+        "The per-recipient delivery/read roster - the client-visible indicator shown on the original sent " +
+            "message. undefined (not an empty array) when no receipt was ever requested for this message.",
+    )
+    @Nullable
+    public receiptStatus?: MessageReceiptEntry[];
+
     constructor(other?: Partial<MessageSQL>) {
         super(other);
 
@@ -186,6 +239,15 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
             this.conversationId = "conversationId" in other ? other.conversationId : this.conversationId;
             this.inferenceClassification =
                 "inferenceClassification" in other ? other.inferenceClassification : this.inferenceClassification;
+            this.requestReceipt = "requestReceipt" in other ? other.requestReceipt : this.requestReceipt;
+            this.dispositionNotificationTo =
+                "dispositionNotificationTo" in other ? other.dispositionNotificationTo : this.dispositionNotificationTo;
+            this.deliveryReceiptSentAt = "deliveryReceiptSentAt" in other ? other.deliveryReceiptSentAt : this.deliveryReceiptSentAt;
+            this.readReceiptSentAt = "readReceiptSentAt" in other ? other.readReceiptSentAt : this.readReceiptSentAt;
+            this.deliveryReceiptPending =
+                other.deliveryReceiptPending !== undefined ? other.deliveryReceiptPending : this.deliveryReceiptPending;
+            this.readReceiptPending = other.readReceiptPending !== undefined ? other.readReceiptPending : this.readReceiptPending;
+            this.receiptStatus = "receiptStatus" in other ? other.receiptStatus : this.receiptStatus;
         }
     }
 }

@@ -5,7 +5,7 @@
 // Isolated unit tests for getVerifiedDomainNames() - objectFactory/repo are hand-built mocks, no real DB,
 // same rationale as test/util/AuditLogUtils.test.ts (a fresh stub class per test so the module-level
 // repo-cache WeakMap can't leak between tests).
-import { getVerifiedDomainNames } from "../../src/util/DomainUtils.js";
+import { getVerifiedDomainNames, isInternalAddress } from "../../src/util/DomainUtils.js";
 
 function makeStubClass(): any {
     return class StubDomain {
@@ -48,5 +48,36 @@ describe("getVerifiedDomainNames() Tests", () => {
 
         expect(objectFactory.newInstance).toHaveBeenCalledTimes(1);
         expect(repo.find).toHaveBeenCalledTimes(2);
+    });
+});
+
+describe("isInternalAddress() Tests", () => {
+    let repo: { find: ReturnType<typeof vi.fn> };
+    let objectFactory: { newInstance: ReturnType<typeof vi.fn> };
+
+    beforeEach(() => {
+        repo = { find: vi.fn().mockResolvedValue([{ name: "example.com" }]) };
+        objectFactory = { newInstance: vi.fn().mockResolvedValue(repo) };
+    });
+
+    it("Returns true for an address whose domain is verified.", async () => {
+        const result = await isInternalAddress(objectFactory as any, makeStubClass(), "user@example.com");
+        expect(result).toBe(true);
+    });
+
+    it("Returns false for an address whose domain is not verified.", async () => {
+        const result = await isInternalAddress(objectFactory as any, makeStubClass(), "user@outside.com");
+        expect(result).toBe(false);
+    });
+
+    it("Is case-insensitive on the domain.", async () => {
+        const result = await isInternalAddress(objectFactory as any, makeStubClass(), "user@EXAMPLE.COM");
+        expect(result).toBe(true);
+    });
+
+    it("Returns false without querying at all for an address with no @ (no domain to check).", async () => {
+        const result = await isInternalAddress(objectFactory as any, makeStubClass(), "not-an-address");
+        expect(result).toBe(false);
+        expect(objectFactory.newInstance).not.toHaveBeenCalled();
     });
 });

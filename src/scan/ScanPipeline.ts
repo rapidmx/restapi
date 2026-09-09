@@ -71,6 +71,14 @@ export interface ScanPipelineResult {
     /** The message's parsed `References` header, oldest ancestor first, or `[]` if absent - see
      * `util/ConversationUtils.ts`'s `deriveConversationId()`. */
     references: string[];
+    /** The RFC 3798 `Disposition-Notification-To` header's address, if present - a request for a real MDN
+     * receipt back. `undefined` when absent, or when the header names no resolvable address. See
+     * `util/ReceiptUtils.ts` and `ScanQueueJob.maybeSendReceipt()`. */
+    dispositionNotificationTo?: string;
+    /** The decoded text of this message's `message/disposition-notification` part, if it has one (i.e. this
+     * message is itself an inbound MDN) - see `ScanQueueJob.processReceipt()` and
+     * `util/ReceiptUtils.ts`'s `parseDispositionNotification()`, which actually interprets it. */
+    dispositionNotificationPart?: string;
 }
 
 /** Strips a `Message-ID`-shaped header value's surrounding angle brackets, if present - mailparser
@@ -145,6 +153,8 @@ export class ScanPipeline {
         const listUnsubscribeHeader: string | undefined = this.getRawHeaderLine(parsed, "list-unsubscribe");
         const icsPart: string | undefined = this.deriveIcsPart(parsed);
         const recallOfMessageId: string | undefined = this.getHeaderString(parsed, "x-rapidmx-recall-of");
+        const dispositionNotificationTo: string | undefined = this.getHeaderAddress(parsed, "disposition-notification-to");
+        const dispositionNotificationPart: string | undefined = this.deriveDispositionNotificationPart(parsed);
         // mailparser types `references` as `string[] | string | undefined` (a single reference collapses to a
         // bare string rather than a one-element array) - normalize to always an array, oldest ancestor first,
         // and (unlike `parsed.messageId`) mailparser leaves these bracketed, so strip them here too.
@@ -173,6 +183,8 @@ export class ScanPipeline {
             recallOfMessageId,
             inReplyTo,
             references,
+            dispositionNotificationTo,
+            dispositionNotificationPart,
         };
     }
 
@@ -199,6 +211,17 @@ export class ScanPipeline {
         return icsAttachment?.content.toString("utf-8");
     }
 
+    /** Finds this message's `message/disposition-notification` part (present only on an inbound MDN receipt),
+     * mirroring `deriveIcsPart()` exactly - mailparser exposes it via `parsed.attachments` the same way it
+     * does a `text/calendar` part. Read as `"binary"` (latin1), not `"utf-8"`: the part is itself just an
+     * RFC 822 header block (ASCII by spec), and `util/ReceiptUtils.ts`'s `parseDispositionNotification()`
+     * re-wraps this text into a `Buffer` the same way for `MimeHeaderUtils.extractHeader()` - matching that
+     * module's own encoding convention keeps the two sides consistent. */
+    private deriveDispositionNotificationPart(parsed: ParsedMail): string | undefined {
+        const part = (parsed.attachments ?? []).find((attachment) => attachment.contentType === "message/disposition-notification");
+        return part?.content.toString("binary");
+    }
+
     /** Reads a single header value out of mailparser's parsed header map, which normalizes keys to lowercase and
      * may store a header's value as a plain string or (for structured headers) an object - only a plain string
      * value is meaningful for the headers this is used for (`Auto-Submitted`/`Precedence`/`X-RapidMX-Recall-Of`). */
@@ -222,6 +245,17 @@ export class ScanPipeline {
         }
         const separatorIndex: number = line.indexOf(":");
         return separatorIndex >= 0 ? line.slice(separatorIndex + 1).trim() : undefined;
+    }
+
+    /** Reads a single address-typed header (e.g. `Disposition-Notification-To`) out of mailparser's parsed
+     * header map. mailparser folds an address-typed header into a structured `{ value: [{address, name}],
+     * html, text }` object rather than a plain string - the same situation `List-Unsubscribe` is in relative
+     * to `getHeaderString()`, confirmed with a throwaway script - so this reads `.value[0].address`
+     * specifically rather than `.text` (which would include a display name RFC 3798 doesn't want here).
+     * Returns `undefined` if the header is absent or names no resolvable address. */
+    private getHeaderAddress(parsed: ParsedMail, headerName: string): string | undefined {
+        const value: any = parsed.headers.get(headerName);
+        return typeof value === "object" && value !== null ? value.value?.[0]?.address : undefined;
     }
 
     private async scanAttachments(attachments: ParsedAttachment[]): Promise<ScanPipelineAttachmentResult[]> {

@@ -61,6 +61,10 @@ describe("SQL model default construction", () => {
         expect(obj.oofMessage).toBe("");
         expect(obj.oofStartTime).toBeUndefined();
         expect(obj.oofEndTime).toBeUndefined();
+        expect(obj.alwaysRequestReceiptInternal).toBe(true);
+        expect(obj.alwaysRequestReceiptExternal).toBe(false);
+        expect(obj.autoSendReceiptsInternal).toBe(true);
+        expect(obj.autoSendReceiptsExternal).toBe(false);
     });
 
     it("MailboxSQL applies provided overrides when constructed with data.", () => {
@@ -78,6 +82,10 @@ describe("SQL model default construction", () => {
             oofMessage: "I am out of office.",
             oofStartTime,
             oofEndTime,
+            alwaysRequestReceiptInternal: false,
+            alwaysRequestReceiptExternal: true,
+            autoSendReceiptsInternal: false,
+            autoSendReceiptsExternal: true,
         });
 
         expect(obj.ownerUserUid).toBe("user-1");
@@ -91,6 +99,10 @@ describe("SQL model default construction", () => {
         expect(obj.oofMessage).toBe("I am out of office.");
         expect(obj.oofStartTime).toBe(oofStartTime);
         expect(obj.oofEndTime).toBe(oofEndTime);
+        expect(obj.alwaysRequestReceiptInternal).toBe(false);
+        expect(obj.alwaysRequestReceiptExternal).toBe(true);
+        expect(obj.autoSendReceiptsInternal).toBe(false);
+        expect(obj.autoSendReceiptsExternal).toBe(true);
     });
 
     it("MailboxSQL preserves class defaults for fields omitted from a partial override object.", () => {
@@ -100,6 +112,10 @@ describe("SQL model default construction", () => {
         expect(obj.oofMessage).toBe("");
         expect(obj.oofStartTime).toBeUndefined();
         expect(obj.oofEndTime).toBeUndefined();
+        expect(obj.alwaysRequestReceiptInternal).toBe(true);
+        expect(obj.alwaysRequestReceiptExternal).toBe(false);
+        expect(obj.autoSendReceiptsInternal).toBe(true);
+        expect(obj.autoSendReceiptsExternal).toBe(false);
     });
 
     it("FolderSQL falls back to class defaults when constructed with no data.", () => {
@@ -154,12 +170,21 @@ describe("SQL model default construction", () => {
         expect(obj.hasAttachments).toBe(false);
         expect(obj.scanResultUid).toBeUndefined();
         expect(obj.searchIndexedAt).toBeUndefined();
+        expect(obj.requestReceipt).toBeUndefined();
+        expect(obj.dispositionNotificationTo).toBeUndefined();
+        expect(obj.deliveryReceiptSentAt).toBeUndefined();
+        expect(obj.readReceiptSentAt).toBeUndefined();
+        expect(obj.deliveryReceiptPending).toBe(false);
+        expect(obj.readReceiptPending).toBe(false);
+        expect(obj.receiptStatus).toBeUndefined();
     });
 
     it("MessageSQL applies provided overrides when constructed with data.", () => {
         const sentDate = new Date("2026-01-01T00:00:00Z");
         const receivedDate = new Date("2026-01-01T00:01:00Z");
         const searchIndexedAt = new Date("2026-01-02T00:00:00Z");
+        const deliveryReceiptSentAt = new Date("2026-01-01T00:05:00Z");
+        const readReceiptSentAt = new Date("2026-01-01T00:10:00Z");
         const obj = new MessageSQL({
             folderUid: "folder-1",
             mailboxUid: "mailbox-1",
@@ -179,6 +204,13 @@ describe("SQL model default construction", () => {
             scanResultUid: "scan-1",
             searchIndexedAt,
             inferenceClassification: MessageClassification.OTHER,
+            requestReceipt: true,
+            dispositionNotificationTo: "sender@example.com",
+            deliveryReceiptSentAt,
+            readReceiptSentAt,
+            deliveryReceiptPending: true,
+            readReceiptPending: true,
+            receiptStatus: [{ recipientAddress: "to@example.com", deliveredAt: "2026-01-01T00:02:00.000Z" }],
         });
 
         expect(obj.folderUid).toBe("folder-1");
@@ -199,6 +231,13 @@ describe("SQL model default construction", () => {
         expect(obj.scanResultUid).toBe("scan-1");
         expect(obj.searchIndexedAt).toBe(searchIndexedAt);
         expect(obj.inferenceClassification).toBe(MessageClassification.OTHER);
+        expect(obj.requestReceipt).toBe(true);
+        expect(obj.dispositionNotificationTo).toBe("sender@example.com");
+        expect(obj.deliveryReceiptSentAt).toBe(deliveryReceiptSentAt);
+        expect(obj.readReceiptSentAt).toBe(readReceiptSentAt);
+        expect(obj.deliveryReceiptPending).toBe(true);
+        expect(obj.readReceiptPending).toBe(true);
+        expect(obj.receiptStatus).toEqual([{ recipientAddress: "to@example.com", deliveredAt: "2026-01-01T00:02:00.000Z" }]);
     });
 
     it("MessageSQL preserves class defaults for fields omitted from a partial override object.", () => {
@@ -221,6 +260,13 @@ describe("SQL model default construction", () => {
         expect(obj.hasAttachments).toBe(false);
         expect(obj.scanResultUid).toBeUndefined();
         expect(obj.searchIndexedAt).toBeUndefined();
+        expect(obj.requestReceipt).toBeUndefined();
+        expect(obj.dispositionNotificationTo).toBeUndefined();
+        expect(obj.deliveryReceiptSentAt).toBeUndefined();
+        expect(obj.readReceiptSentAt).toBeUndefined();
+        expect(obj.deliveryReceiptPending).toBe(false);
+        expect(obj.readReceiptPending).toBe(false);
+        expect(obj.receiptStatus).toBeUndefined();
     });
 
     it("AttachmentSQL falls back to class defaults when constructed with no data.", () => {

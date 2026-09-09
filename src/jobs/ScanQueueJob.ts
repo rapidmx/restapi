@@ -11,13 +11,14 @@ import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, Sca
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { deriveConversationId } from "../util/ConversationUtils.js";
-import { getVerifiedDomainNames } from "../util/DomainUtils.js";
+import { getVerifiedDomainNames, isInternalAddress } from "../util/DomainUtils.js";
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { buildEventIcs, expandOccurrences, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
 import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
+import { buildDispositionNotification, parseDispositionNotification } from "../util/ReceiptUtils.js";
 import {
     Attachment,
     Attendee,
@@ -39,6 +40,7 @@ import {
     MessageClassification,
     MessageFlags,
     MessageImportance,
+    MessageReceiptEntry,
     OofReplySuppression,
     QuarantineEntry,
     QuarantineReason,
@@ -177,6 +179,12 @@ export abstract class ScanQueueJob<
     /** The spam score at/above which mail that still cleared the junk cutoff is classified as Other. */
     @Config("mail:focused_inbox:other_spam_score", 3)
     private focusedInboxOtherSpamScore: number = 3;
+
+    /** This server's own inbound mail-exchange hostname, reused as the `Reporting-UA` half of a generated
+     * delivery/read receipt MDN (RFC 3798 §3.2.1) - same config `BaseDomainRoute` already reads for its own,
+     * unrelated purpose (a `Domain`'s recommended MX record). */
+    @Config("mail:dns:mx_hostname", "")
+    private mxHostname: string = "";
 
     @Logger
     private logger: any;
@@ -333,6 +341,10 @@ export abstract class ScanQueueJob<
             // A recall control message is never filed to the Inbox - matching real Outlook hiding these from
             // the reading pane - only the mutation it triggers (if any) and the report back to the sender.
             await this.processRecall(entry, result.recallOfMessageId);
+        } else if (verdict === "deliver" && result.dispositionNotificationPart) {
+            // An inbound MDN receipt is never filed either - only the indicator it stamps onto the original
+            // sent message, if any is found - see processReceipt()'s own doc comment.
+            await this.processReceipt(entry, result.dispositionNotificationPart);
         } else {
             await this.deliverMessage(entry, raw, targetUid, scanResult, result, verdict === "junk");
 
@@ -353,7 +365,11 @@ export abstract class ScanQueueJob<
 
     /**
      * Files a "deliver"/"junk"-verdicted message, applying any matching `MailFilterRule`'s actions first (only
-     * for a "deliver" verdict - `isJunk` mail skips rule evaluation entirely).
+     * for a "deliver" verdict - `isJunk` mail skips rule evaluation entirely). A requested delivery receipt
+     * (see `maybeSendDeliveryReceipt()`) is decided and sent - or held pending approval - only for the
+     * *primary* message (never a rule's `copyToFolderUids` copy), and not at all for a message a rule deletes
+     * outright: a receipt for a message the mailbox owner's own rule routed elsewhere or discarded entirely
+     * would be misleading.
      */
     private async deliverMessage(
         entry: Q,
@@ -410,6 +426,26 @@ export abstract class ScanQueueJob<
                 isJunk,
                 conversationId,
             );
+            // A delivery receipt (if requested) is decided and sent - or held pending approval - before the
+            // row exists, so the outcome can be written directly into the initial `create()` rather than a
+            // second follow-up `update()`. Gated on `dispositionNotificationTo` being present at all: the
+            // overwhelmingly common case is no receipt requested, which costs nothing beyond one property
+            // check - no mailbox lookup, no `isInternalAddress()` query.
+            let deliveryReceiptSentAt: Date | undefined;
+            let deliveryReceiptPending = false;
+            if (result.dispositionNotificationTo) {
+                const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
+                if (mailbox) {
+                    const outcome = await this.maybeSendDeliveryReceipt(
+                        result.dispositionNotificationTo,
+                        mailbox,
+                        messageId,
+                        result.subject ?? "",
+                    );
+                    deliveryReceiptSentAt = outcome.sentAt;
+                    deliveryReceiptPending = outcome.pending;
+                }
+            }
             const message: M = await this.messageRepo!.create(
                 new this.messageClass({
                     uid: targetUid,
@@ -432,6 +468,9 @@ export abstract class ScanQueueJob<
                     inferenceClassification,
                     hasAttachments: storedAttachments.length > 0,
                     scanResultUid: scanResult.uid,
+                    dispositionNotificationTo: result.dispositionNotificationTo,
+                    deliveryReceiptSentAt,
+                    deliveryReceiptPending,
                 }),
                 { ignoreACL: true },
             );
@@ -805,6 +844,127 @@ export abstract class ScanQueueJob<
         } catch (err: any) {
             this.logger?.warn(`ScanQueueJob: failed to send recall report for mailbox ${entry.mailboxUid}: ${err.message}`);
         }
+    }
+
+    /**
+     * Decides and, if appropriate, immediately sends the delivery-receipt MDN for a message about to be filed
+     * into `mailbox`'s Inbox - called from `deliverMessage()` only when `dispositionNotificationTo` (the
+     * requester's address, from the inbound `Disposition-Notification-To` header) is present at all.
+     *
+     * The requester is classified internal/external via `isInternalAddress()` (`util/DomainUtils.ts` - the
+     * same "this server's domains" check Focused Inbox's own `classifyForInbox()` already uses), which decides
+     * whether `Mailbox.autoSendReceiptsInternal`/`autoSendReceiptsExternal` applies. When that setting is
+     * `false`, nothing is sent - the receipt is left for the mailbox owner's explicit approval instead (see
+     * `BaseMessageRoute`'s `POST /:id/receipt/approve`/`/decline`, which call `sendDispositionNotification()`
+     * below directly). A send failure is logged and treated the same as never having sent one at all (not left
+     * "pending") - matching every other best-effort cross-mailbox notification in this class, none of which
+     * retry.
+     */
+    private async maybeSendDeliveryReceipt(
+        dispositionNotificationTo: string,
+        mailbox: X,
+        originalMessageId: string,
+        originalSubject: string,
+    ): Promise<{ sentAt?: Date; pending: boolean }> {
+        const internal: boolean = await isInternalAddress(this._objectFactory!, this.domainClass, dispositionNotificationTo);
+        const autoSend: boolean = internal ? mailbox.autoSendReceiptsInternal : mailbox.autoSendReceiptsExternal;
+        if (!autoSend) {
+            return { pending: true };
+        }
+
+        const sent: boolean = await this.sendDispositionNotification(
+            dispositionNotificationTo,
+            mailbox,
+            originalMessageId,
+            originalSubject,
+            "delivery",
+        );
+        return sent ? { sentAt: new Date(), pending: false } : { pending: false };
+    }
+
+    /**
+     * Composes and relays one real RFC 3798 MDN via `util/ReceiptUtils.ts`'s `buildDispositionNotification()`
+     * - shared by `maybeSendDeliveryReceipt()` (called automatically at delivery time) and
+     * `BaseMessageRoute`'s `POST /:id/receipt/approve` (called explicitly, once the mailbox owner approves a
+     * receipt this method originally declined to auto-send). Returns whether the send actually succeeded, so
+     * each caller can decide for itself what to persist (a `*SentAt` stamp vs. leaving a pending flag alone).
+     */
+    private async sendDispositionNotification(
+        dispositionNotificationTo: string,
+        mailbox: X,
+        originalMessageId: string,
+        originalSubject: string,
+        dispositionType: "read" | "delivery",
+    ): Promise<boolean> {
+        try {
+            const composed: Buffer = await buildDispositionNotification({
+                from: { address: mailbox.primarySmtpAddress, displayName: mailbox.displayName },
+                to: dispositionNotificationTo,
+                subject: `${dispositionType === "read" ? "Read" : "Delivered"}: ${originalSubject}`,
+                finalRecipient: mailbox.primarySmtpAddress,
+                originalMessageId,
+                dispositionType,
+                reportingUa: `${this.mxHostname}; RapidMX`,
+            });
+            await this.mailTransport!.send({
+                raw: composed,
+                envelopeFrom: mailbox.primarySmtpAddress,
+                envelopeTo: [dispositionNotificationTo],
+            });
+            return true;
+        } catch (err: any) {
+            this.logger?.warn(`ScanQueueJob: failed to send ${dispositionType} receipt for mailbox ${mailbox.uid}: ${err.message}`);
+            return false;
+        }
+    }
+
+    /**
+     * Applies the indicator-update side effect of an inbound MDN receipt - this message is never filed as a
+     * visible message at all (see `processEntry()`'s own branch for this), regardless of whether it
+     * correlates to anything, mirroring `processRecall()`'s identical "not_found" handling. Works uniformly
+     * whether the receipt was generated by another mailbox on this same system or by a genuine external mail
+     * system - the parsing is real RFC 3798, not a RapidMX-specific shortcut (see `util/ReceiptUtils.ts`'s own
+     * doc comment).
+     *
+     * Correlates by `(mailboxUid, messageId)` exactly like `processRecall()`, then finds the `receiptStatus`
+     * entry whose `recipientAddress` matches this MDN's own `Final-Recipient` (normalized) and stamps its
+     * `deliveredAt`/`readAt` - or, if none matches (a `DistributionList` member `send()` could never have
+     * pre-seeded, or a message sent before this feature existed), appends a new entry rather than dropping the
+     * update, so the roster still ends up complete.
+     */
+    private async processReceipt(entry: Q, dispositionNotificationPart: string): Promise<void> {
+        const parsed = parseDispositionNotification(dispositionNotificationPart);
+        if (!parsed || !parsed.dispositionType) {
+            return;
+        }
+
+        const matches: M[] = await this.messageRepo!.find(
+            { mailboxUid: entry.mailboxUid, messageId: parsed.originalMessageId, limit: 5 } as any,
+            { ignoreACL: true, limit: 5 },
+        );
+        const target: M | undefined = matches[0];
+        // Without a `Final-Recipient` there is no address to correlate against or append under - nothing
+        // useful this method could do, unlike the `finalRecipient`-present case below.
+        if (!target || !parsed.finalRecipient) {
+            return;
+        }
+
+        const timestamp: string = new Date().toISOString();
+        const roster: MessageReceiptEntry[] = target.receiptStatus ?? [];
+        const recipientAddress: string = parsed.finalRecipient;
+        const existingIndex: number = roster.findIndex((row) => row.recipientAddress === recipientAddress);
+        const stamp: Partial<MessageReceiptEntry> =
+            parsed.dispositionType === "read" ? { readAt: timestamp } : { deliveredAt: timestamp };
+        const updatedRoster: MessageReceiptEntry[] =
+            existingIndex >= 0
+                ? roster.map((row, i) => (i === existingIndex ? { ...row, ...stamp } : row))
+                : [...roster, { recipientAddress, ...stamp }];
+
+        await this.messageRepo!.update(
+            { uid: target.uid, version: (target as any).version, receiptStatus: updatedRoster } as any,
+            target,
+            { ignoreACL: true },
+        );
     }
 
     /**

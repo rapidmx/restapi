@@ -34,6 +34,7 @@ import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { FocusedInboxOverrideMongo } from "../../../src/models/mongo/FocusedInboxOverrideMongo.js";
 import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySuppressionMongo.js";
 import { buildEventIcs } from "../../../src/util/IcsUtils.js";
+import { buildDispositionNotification } from "../../../src/util/ReceiptUtils.js";
 import {
     AttendeeResponseStatus,
     AttendeeRole,
@@ -1891,6 +1892,297 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
 
             expect(message.folderUid).toBe(targetFolder.uid);
             expect(message.inferenceClassification).toBeFalsy();
+        });
+    });
+
+    describe("Delivery/read receipts", () => {
+        /** Queues a plain message from `sender` requesting a receipt back to `requester` (default: `sender`
+         * itself, matching how `send()` always sets `Disposition-Notification-To` to the sender's own
+         * address), and runs the job. */
+        const deliverRequestingReceipt = async (sender: string, requester: string = sender): Promise<MessageMongo> => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                Buffer.from(
+                    `From: ${sender}\r\nTo: recipient@example.com\r\nSubject: Plain message\r\n` +
+                        `Disposition-Notification-To: ${requester}\r\n\r\nHello there.\r\n`,
+                ),
+            );
+            await createIngestEntry({ rawBlobKey, envelopeFrom: sender });
+            await job.run();
+
+            const messages = await messageRepo.find({ mailboxUid }).toArray();
+            expect(messages.length).toBe(1);
+            return messages[0];
+        };
+
+        const verifiedDomain = async (): Promise<void> => {
+            await domainRepo.save(
+                new DomainMongo({
+                    uid: "example.com",
+                    name: "example.com",
+                    enabled: true,
+                    verified: true,
+                    verificationToken: uuid.v4(),
+                }),
+            );
+        };
+
+        it("Sends a delivery receipt immediately for an internal requester (the default) and stamps the delivered copy.", async () => {
+            await createMailbox();
+            await verifiedDomain();
+
+            const message = await deliverRequestingReceipt("sender@example.com", "colleague@example.com");
+
+            expect(message.dispositionNotificationTo).toBe("colleague@example.com");
+            expect(message.deliveryReceiptSentAt).toBeInstanceOf(Date);
+            expect(message.deliveryReceiptPending).toBe(false);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(1);
+            expect(transport.sent[0].envelopeTo).toEqual(["colleague@example.com"]);
+            expect(transport.sent[0].raw.toString()).toContain("multipart/report");
+        });
+
+        it("Holds the delivery receipt pending approval for an external requester (the default).", async () => {
+            await createMailbox();
+
+            const message = await deliverRequestingReceipt("sender@example.com", "stranger@outside.com");
+
+            expect(message.dispositionNotificationTo).toBe("stranger@outside.com");
+            expect(message.deliveryReceiptSentAt).toBeUndefined();
+            expect(message.deliveryReceiptPending).toBe(true);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(0);
+        });
+
+        it("Sends immediately for an external requester when the mailbox opts in via autoSendReceiptsExternal.", async () => {
+            await createMailbox({ autoSendReceiptsExternal: true });
+
+            const message = await deliverRequestingReceipt("sender@example.com", "stranger@outside.com");
+
+            expect(message.deliveryReceiptSentAt).toBeInstanceOf(Date);
+            expect(message.deliveryReceiptPending).toBe(false);
+        });
+
+        it("Does nothing receipt-related when no receipt was requested at all.", async () => {
+            await createMailbox();
+
+            const message = await deliverFromPlain();
+
+            expect(message.dispositionNotificationTo).toBeUndefined();
+            expect(message.deliveryReceiptSentAt).toBeUndefined();
+            expect(message.deliveryReceiptPending).toBe(false);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(0);
+        });
+
+        /** A plain message with no receipt-request header at all. */
+        async function deliverFromPlain(): Promise<MessageMongo> {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage());
+            await createIngestEntry({ rawBlobKey });
+            await job.run();
+            return (await messageRepo.find({ mailboxUid }).toArray())[0];
+        }
+
+        it("Does not send a delivery receipt for a message a MailFilterRule deletes outright.", async () => {
+            await createMailbox();
+            await mailFilterRuleRepo.save(
+                new MailFilterRuleMongo({
+                    mailboxUid,
+                    name: "Discard it",
+                    enabled: true,
+                    sequence: 0,
+                    stopProcessingRules: false,
+                    conditions: { fromContains: ["sender@example.com"] },
+                    actions: [{ type: MailFilterActionType.DELETE }],
+                }),
+            );
+
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                Buffer.from(
+                    "From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Plain message\r\n" +
+                        "Disposition-Notification-To: sender@example.com\r\n\r\nHello there.\r\n",
+                ),
+            );
+            await createIngestEntry({ rawBlobKey });
+            await job.run();
+
+            expect((await messageRepo.find({ mailboxUid }).toArray()).length).toBe(0);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(0);
+        });
+
+        it("An inbound MDN updates the matching recipient's roster entry and is never filed as a visible message.", async () => {
+            await createMailbox();
+            const sentFolder = await folderRepo.save(
+                new FolderMongo({ mailboxUid, name: "Sent Items", type: FolderType.SENT_ITEMS, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+            );
+            const sent = await messageRepo.save(
+                new MessageMongo({
+                    folderUid: sentFolder.uid,
+                    mailboxUid,
+                    messageId: "original@example.com",
+                    subject: "Hello",
+                    from: { address: "recipient@example.com", type: RecipientType.TO },
+                    recipients: [{ address: "bob@example.com", type: RecipientType.TO }],
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey: `raw/${uuid.v4()}`,
+                    bodyPreview: "Hello",
+                    flags: { read: true, flagged: false, answered: false, forwarded: false },
+                    references: [],
+                    hasAttachments: false,
+                    receiptStatus: [{ recipientAddress: "bob@example.com" }],
+                }),
+            );
+
+            const mdn: Buffer = await buildDispositionNotification({
+                from: { address: "bob@example.com" },
+                to: "recipient@example.com",
+                subject: "Read: Hello",
+                finalRecipient: "bob@example.com",
+                originalMessageId: "original@example.com",
+                dispositionType: "read",
+                reportingUa: "mail.example.com; RapidMX",
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, mdn);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "bob@example.com" });
+
+            const beforeCount = (await messageRepo.find({ mailboxUid }).toArray()).length;
+            await job.run();
+            const afterCount = (await messageRepo.find({ mailboxUid }).toArray()).length;
+
+            // The MDN itself was never filed - the message count is unchanged (still just the pre-seeded sent
+            // message).
+            expect(afterCount).toBe(beforeCount);
+
+            const updated = await messageRepo.findOne({ uid: sent.uid } as any);
+            expect(updated!.receiptStatus).toEqual([{ recipientAddress: "bob@example.com", readAt: expect.any(String) }]);
+        });
+
+        it("Appends a new roster entry when the MDN's Final-Recipient matches no pre-seeded entry (the distribution-list-expansion case).", async () => {
+            await createMailbox();
+            const sentFolder = await folderRepo.save(
+                new FolderMongo({ mailboxUid, name: "Sent Items", type: FolderType.SENT_ITEMS, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+            );
+            const sent = await messageRepo.save(
+                new MessageMongo({
+                    folderUid: sentFolder.uid,
+                    mailboxUid,
+                    messageId: "original@example.com",
+                    subject: "Hello",
+                    from: { address: "recipient@example.com", type: RecipientType.TO },
+                    recipients: [{ address: "list@example.com", type: RecipientType.TO }],
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey: `raw/${uuid.v4()}`,
+                    bodyPreview: "Hello",
+                    flags: { read: true, flagged: false, answered: false, forwarded: false },
+                    references: [],
+                    hasAttachments: false,
+                    receiptStatus: [{ recipientAddress: "list@example.com" }],
+                }),
+            );
+
+            const mdn: Buffer = await buildDispositionNotification({
+                from: { address: "carol@example.com" },
+                to: "recipient@example.com",
+                subject: "Delivered: Hello",
+                finalRecipient: "carol@example.com",
+                originalMessageId: "original@example.com",
+                dispositionType: "delivery",
+                reportingUa: "mail.example.com; RapidMX",
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, mdn);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "carol@example.com" });
+            await job.run();
+
+            const updated = await messageRepo.findOne({ uid: sent.uid } as any);
+            expect(updated!.receiptStatus).toEqual(
+                expect.arrayContaining([
+                    { recipientAddress: "list@example.com" },
+                    { recipientAddress: "carol@example.com", deliveredAt: expect.any(String) },
+                ]),
+            );
+        });
+
+        it("Silently drops an MDN whose Original-Message-ID matches nothing in this mailbox, still never filing it.", async () => {
+            await createMailbox();
+
+            const mdn: Buffer = await buildDispositionNotification({
+                from: { address: "bob@example.com" },
+                to: "recipient@example.com",
+                subject: "Read: Hello",
+                finalRecipient: "bob@example.com",
+                originalMessageId: "no-such-message@example.com",
+                dispositionType: "read",
+                reportingUa: "mail.example.com; RapidMX",
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, mdn);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "bob@example.com" });
+
+            await expect(job.run()).resolves.toBeUndefined();
+            expect((await messageRepo.find({ mailboxUid }).toArray()).length).toBe(0);
+        });
+
+        it("Silently drops an MDN part that has no resolvable Disposition at all, still never filing it.", async () => {
+            await createMailbox();
+
+            // Hand-rolled rather than via `buildDispositionNotification()` (which always includes a
+            // `Disposition` line) - a malformed/incomplete MDN part is exactly the case this test exists for.
+            const raw = [
+                "From: bob@example.com",
+                "To: recipient@example.com",
+                "Subject: Malformed MDN",
+                'Content-Type: multipart/report; report-type=disposition-notification; boundary="B"',
+                "",
+                "--B",
+                "Content-Type: text/plain",
+                "",
+                "This is a receipt.",
+                "",
+                "--B",
+                "Content-Type: message/disposition-notification",
+                "",
+                "Original-Message-ID: <original@example.com>",
+                "",
+                "--B--",
+                "",
+            ].join("\r\n");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, Buffer.from(raw));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "bob@example.com" });
+
+            await expect(job.run()).resolves.toBeUndefined();
+            expect((await messageRepo.find({ mailboxUid }).toArray()).length).toBe(0);
+        });
+
+        it("Logs rather than throws when sending the delivery receipt fails outright.", async () => {
+            await createMailbox();
+            await verifiedDomain();
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            const spy = vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("smtp is down"));
+
+            const message = await deliverRequestingReceipt("sender@example.com", "colleague@example.com");
+
+            expect(message.deliveryReceiptSentAt).toBeUndefined();
+            expect(message.deliveryReceiptPending).toBe(false);
+            spy.mockRestore();
         });
     });
 });

@@ -13,27 +13,33 @@ import {
     HttpResponse,
     RepoUtils,
     RouteDecorators,
+    type UpdateObject,
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { isInternalAddress } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
+import { prependHeaders } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
+import { buildDispositionNotification } from "../util/ReceiptUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import {
     AuditAction,
     FocusedInboxOverride,
     FolderType,
+    Mailbox,
     Message,
     MessageClassification,
     MessageFlags,
+    MessageReceiptEntry,
     Recipient,
 } from "../models/types.js";
 const { Config, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
-const { Delete, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
+const { Delete, Get, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** One row of `BaseMessageRoute.conversations()` - a computed summary over every `Message` sharing one
  * `conversationId`, never persisted on its own (see that method's own doc comment). */
@@ -110,9 +116,25 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * sender in Focused/Other" instruction without depending on either backend directly. */
     protected abstract focusedInboxOverrideClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so `send()`/the read-receipt trigger can read the
+     * sending/recipient mailbox's own receipt settings without depending on either backend directly. */
+    protected abstract mailboxClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so `isInternalAddress()` can classify a receipt
+     * request's recipient/requester without depending on either backend directly - same field
+     * `ScanQueueJob`/`BaseMailIngestRoute` already carry for the identical purpose. */
+    protected abstract domainClass: any;
+
     private folderRepo?: RecoverableRepoUtils<any>;
 
     private focusedInboxOverrideRepo?: RepoUtils<FocusedInboxOverride>;
+
+    private mailboxRepo?: RepoUtils<Mailbox>;
+
+    /** This server's own inbound mail-exchange hostname, reused as the `Reporting-UA` half of a generated
+     * receipt MDN - same config `ScanQueueJob`/`BaseDomainRoute` already read. */
+    @Config("mail:dns:mx_hostname", "")
+    private mxHostname: string = "";
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -146,6 +168,51 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             });
         }
         return this.focusedInboxOverrideRepo;
+    }
+
+    private async getMailboxRepo(): Promise<RepoUtils<Mailbox>> {
+        if (!this.mailboxRepo) {
+            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
+        return this.mailboxRepo;
+    }
+
+    /**
+     * Composes and relays one real RFC 3798 MDN via `util/ReceiptUtils.ts`'s `buildDispositionNotification()`
+     * - the exact same shape `ScanQueueJob.sendDispositionNotification()` uses for the automatic path; this
+     * route's own copy is used by `approveReceipt()`, where the mailbox owner is explicitly acting on a
+     * receipt `ScanQueueJob` originally left pending. Returns whether the send actually succeeded.
+     */
+    private async sendDispositionNotification(
+        dispositionNotificationTo: string,
+        mailbox: Mailbox,
+        originalMessageId: string,
+        originalSubject: string,
+        dispositionType: "read" | "delivery",
+    ): Promise<boolean> {
+        try {
+            const composed: Buffer = await buildDispositionNotification({
+                from: { address: mailbox.primarySmtpAddress, displayName: mailbox.displayName },
+                to: dispositionNotificationTo,
+                subject: `${dispositionType === "read" ? "Read" : "Delivered"}: ${originalSubject}`,
+                finalRecipient: mailbox.primarySmtpAddress,
+                originalMessageId,
+                dispositionType,
+                reportingUa: `${this.mxHostname}; RapidMX`,
+            });
+            await this.mailTransport!.send({
+                raw: composed,
+                envelopeFrom: mailbox.primarySmtpAddress,
+                envelopeTo: [dispositionNotificationTo],
+            });
+            return true;
+        } catch (err: any) {
+            this.logger?.warn(`BaseMessageRoute: failed to send ${dispositionType} receipt for mailbox ${mailbox.uid}: ${err.message}`);
+            return false;
+        }
     }
 
     /**
@@ -245,8 +312,35 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // The message's `bodyBlobKey` already holds the fully composed RFC 5322 source (assembled by the
         // webmail compose UI, or an EAS/MAPI "send" handler, before this endpoint is called) — this route's
         // job is scanning and relay, not MIME composition.
-        const raw: Buffer = await this.blobStore.get(message.bodyBlobKey);
+        let raw: Buffer = await this.blobStore.get(message.bodyBlobKey);
         const envelopeTo: string[] = message.recipients.map((r) => r.address);
+
+        // A receipt request is a single message-level header - RFC 3798 has no "only notify me for these
+        // recipients" concept, every recipient's own system independently decides whether to honor it - so
+        // the rule is "attach it if it applies to *any* recipient": each recipient is classified internal/
+        // external (`isInternalAddress()`, the same "this server's domains" check Focused Inbox already
+        // uses), and an explicit per-draft `message.requestReceipt` overrides both of the sending mailbox's
+        // own `alwaysRequestReceiptInternal`/`External` defaults at once when set.
+        const sendingMailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, {
+            ignoreACL: true,
+        });
+        let attachesReceiptRequest = false;
+        if (sendingMailbox) {
+            const effectiveInternal: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptInternal;
+            const effectiveExternal: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptExternal;
+            if (effectiveInternal || effectiveExternal) {
+                for (const address of envelopeTo) {
+                    const internal: boolean = await isInternalAddress(this._objectFactory!, this.domainClass, address);
+                    if ((internal && effectiveInternal) || (!internal && effectiveExternal)) {
+                        attachesReceiptRequest = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (attachesReceiptRequest) {
+            raw = prependHeaders(raw, [{ name: "Disposition-Notification-To", value: message.from.address }]);
+        }
 
         const {
             raw: relayedRaw,
@@ -274,6 +368,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // message with no HTML body at all keeps whatever `sanitizedHtmlBlobKey` it already had (absent, for a
         // freshly composed draft).
         const sanitizedHtmlBlobKey: string | undefined = scannedHtmlBlobKey ?? (message as any).sanitizedHtmlBlobKey;
+        // Seeded only when a receipt was actually requested - nothing could ever populate it otherwise. One
+        // placeholder row per recipient (including a `DistributionList`'s own address as-is - see
+        // `processReceipt()`'s own doc comment for why its expanded members can only ever be discovered
+        // later, as their own real MDNs arrive, not predicted here).
+        const receiptStatus: MessageReceiptEntry[] | undefined = attachesReceiptRequest
+            ? envelopeTo.map((address) => ({ recipientAddress: normalizeAddress(address) }))
+            : undefined;
 
         return await this.repoUtils.update(
             {
@@ -284,6 +385,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 sanitizedHtmlBlobKey,
                 messageId,
                 conversationId,
+                receiptStatus,
             } as any,
             message,
             { user, ignoreACL: true },
@@ -453,6 +555,177 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         await repo.create(new this.focusedInboxOverrideClass({ mailboxUid, senderAddress: normalized, classifyAs }), {
             ignoreACL: true,
         });
+    }
+
+    /**
+     * Wraps the inherited `BaseScopedChildRoute.update()` (unchanged) with the read-receipt trigger: if this
+     * update carries `flags.read` transitioning `false → true` and the message still has a receipt to answer
+     * (`dispositionNotificationTo` set, `readReceiptSentAt`/`readReceiptPending` both still unset - i.e. this
+     * is genuinely the first time), decides and sends (or defers pending approval) the read MDN via
+     * `maybeSendReadReceipt()`. Reads the pre-update state itself, since `super.update()`'s own inherited
+     * behavior has no reason to expose it.
+     */
+    @Put("/:id")
+    public async update(
+        @Param("id") id: string,
+        obj: UpdateObject<T>,
+        @Request req?: HttpRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<T> {
+        const existing: T | undefined = this.repoUtils ? await this.repoUtils.findOne(id, { ignoreACL: true }) : undefined;
+        const updated: T = await super.update(id, obj, req, user);
+
+        const justMarkedRead: boolean = !!existing && !existing.flags.read && updated.flags.read;
+        if (
+            justMarkedRead &&
+            updated.dispositionNotificationTo &&
+            !updated.readReceiptSentAt &&
+            !updated.readReceiptPending
+        ) {
+            return await this.maybeSendReadReceipt(updated);
+        }
+
+        return updated;
+    }
+
+    /**
+     * Decides whether to auto-send or hold-for-approval the read receipt for `message` (which the caller has
+     * already confirmed both requests one and hasn't already been handled), applying `Mailbox.
+     * autoSendReceiptsInternal`/`External` per the requester's own internal/external classification - the
+     * exact same rule `ScanQueueJob.maybeSendReceipt()` applies for a delivery receipt, just triggered here by
+     * a read instead of a delivery. A send failure is left unrecorded (neither stamped sent nor marked
+     * pending) rather than persisted as a permanent failure - the natural retry opportunity is simply the
+     * message being marked read again later (e.g. unread, then read once more). Returns the message as it
+     * ends up after this method's own follow-up update, if any - `update()` returns *this* value, not its own
+     * pre-receipt snapshot, so the caller actually sees `readReceiptSentAt`/`readReceiptPending` reflected.
+     */
+    private async maybeSendReadReceipt(message: T): Promise<T> {
+        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            return message;
+        }
+
+        const internal: boolean = await isInternalAddress(this._objectFactory!, this.domainClass, message.dispositionNotificationTo!);
+        const autoSend: boolean = internal ? mailbox.autoSendReceiptsInternal : mailbox.autoSendReceiptsExternal;
+        if (!autoSend) {
+            return await this.repoUtils!.update(
+                { uid: message.uid, version: (message as any).version, readReceiptPending: true } as any,
+                message,
+                { ignoreACL: true },
+            );
+        }
+
+        const sent: boolean = await this.sendDispositionNotification(
+            message.dispositionNotificationTo!,
+            mailbox,
+            message.messageId,
+            message.subject,
+            "read",
+        );
+        if (sent) {
+            return await this.repoUtils!.update(
+                { uid: message.uid, version: (message as any).version, readReceiptSentAt: new Date() } as any,
+                message,
+                { ignoreACL: true },
+            );
+        }
+        return message;
+    }
+
+    /**
+     * Sends a receipt `ScanQueueJob`/`update()`'s own automatic path originally left pending the mailbox
+     * owner's explicit approval for (`Mailbox.autoSendReceiptsInternal`/`External` was `false` for the
+     * requester's category) - the mailbox owner reviewing "sender requested a read receipt" on the message
+     * and choosing to answer it after all.
+     */
+    @Summary("Approve a pending receipt")
+    @Description("Sends a delivery or read receipt this mailbox originally held pending the owner's explicit approval.")
+    @Returns([Object])
+    @Post("/:id/receipt/approve")
+    public async approveReceipt(
+        @Param("id") id: string,
+        body: { type?: "delivery" | "read" } | undefined,
+        @AuthUser user?: JWTUser,
+    ): Promise<T> {
+        const { message, type } = await this.requirePendingReceipt(id, body, user);
+
+        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const sent: boolean = await this.sendDispositionNotification(
+            message.dispositionNotificationTo!,
+            mailbox,
+            message.messageId,
+            message.subject,
+            type,
+        );
+
+        const patch: any = { uid: message.uid, version: (message as any).version };
+        if (type === "delivery") {
+            patch.deliveryReceiptPending = false;
+            if (sent) {
+                patch.deliveryReceiptSentAt = new Date();
+            }
+        } else {
+            patch.readReceiptPending = false;
+            if (sent) {
+                patch.readReceiptSentAt = new Date();
+            }
+        }
+        return await this.repoUtils!.update(patch, message, { user, ignoreACL: true });
+    }
+
+    /** Declines a pending receipt permanently - no later re-prompt for that same event. */
+    @Summary("Decline a pending receipt")
+    @Description("Permanently declines a delivery or read receipt this mailbox held pending the owner's explicit approval.")
+    @Returns([Object])
+    @Post("/:id/receipt/decline")
+    public async declineReceipt(
+        @Param("id") id: string,
+        body: { type?: "delivery" | "read" } | undefined,
+        @AuthUser user?: JWTUser,
+    ): Promise<T> {
+        const { message, type } = await this.requirePendingReceipt(id, body, user);
+
+        const patch: any = { uid: message.uid, version: (message as any).version };
+        if (type === "delivery") {
+            patch.deliveryReceiptPending = false;
+        } else {
+            patch.readReceiptPending = false;
+        }
+        return await this.repoUtils!.update(patch, message, { user, ignoreACL: true });
+    }
+
+    /** Shared validation for `approveReceipt()`/`declineReceipt()`: resolves `id`, checks permission, and
+     * confirms the requested `type` actually has a receipt pending approval on this message. */
+    private async requirePendingReceipt(
+        id: string,
+        body: { type?: "delivery" | "read" } | undefined,
+        user: JWTUser | undefined,
+    ): Promise<{ message: T; type: "delivery" | "read" }> {
+        if (!this.repoUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const type: string | undefined = body?.type;
+        if (type !== "delivery" && type !== "read") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "type must be one of: delivery, read.");
+        }
+
+        const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
+        if (!message) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        if (!(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+
+        const pending: boolean = type === "delivery" ? message.deliveryReceiptPending : message.readReceiptPending;
+        if (!pending || !message.dispositionNotificationTo) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This message has no receipt pending approval.");
+        }
+
+        return { message, type };
     }
 
     /**

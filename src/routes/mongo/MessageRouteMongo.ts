@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
-import { AuditLogEntryMongo, FocusedInboxOverrideMongo, FolderMongo, MessageMongo } from "../../mongo.js";
+import { AuditLogEntryMongo, DomainMongo, FocusedInboxOverrideMongo, FolderMongo, MailboxMongo, MessageMongo } from "../../mongo.js";
 import { BaseMessageRoute } from "../BaseMessageRoute.js";
 import { RecoverableRepoUtils } from "../../util/RecoverableRepoUtils.js";
 const { Model } = RouteDecorators;
@@ -14,4 +14,6 @@ export class MessageRouteMongo extends BaseMessageRoute<MessageMongo> {
     protected folderClass: any = FolderMongo;
     protected auditLogClass: any = AuditLogEntryMongo;
     protected focusedInboxOverrideClass: any = FocusedInboxOverrideMongo;
+    protected mailboxClass: any = MailboxMongo;
+    protected domainClass: any = DomainMongo;
 }

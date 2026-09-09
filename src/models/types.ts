@@ -100,6 +100,42 @@ export interface Mailbox extends BaseEntity {
     /** Mirrors `-MaximumDurationInMinutes` - a request longer than this is auto-declined. `undefined` means
      * no limit. */
     maxDurationMinutes?: number;
+
+    /**
+     * Whether `send()` attaches a real RFC 3798 receipt request (`Disposition-Notification-To`) to every
+     * outgoing message by default, for internal vs. external recipients respectively - split per your own
+     * explicit design call, not one flat toggle: a message can have a mix of both, and
+     * `Disposition-Notification-To` is a single message-level header (RFC 3798 has no "only notify me for
+     * these recipients" concept - every recipient's own system independently decides whether to honor the
+     * request regardless), so the effective rule in `BaseMessageRoute.send()` is "attach it if it applies to
+     * *any* recipient on the message". "Internal"/"external" here means the recipient being addressed,
+     * classified by `isInternalAddress()` (`ScanQueueJob`/`BaseMessageRoute` - a domain-verified-list check,
+     * same mechanism `FocusedInboxUtils`'s "internal sender" signal already uses). A per-draft
+     * `Message.requestReceipt` always overrides both of these at once when explicitly set.
+     *
+     * Internal defaults to `true` ("silently sent" within this same system, matching your own framing);
+     * external defaults to `false` (attaching a receipt request to every reply to a stranger or mailing list
+     * would be unusual and is opt-in instead).
+     */
+    alwaysRequestReceiptInternal: boolean;
+
+    alwaysRequestReceiptExternal: boolean;
+
+    /**
+     * Whether this mailbox, as the *recipient* of a receipt request, sends one back immediately versus
+     * holding it for the mailbox owner's explicit approval (`BaseMessageRoute`'s `POST /:id/receipt/approve`/
+     * `/decline`) - again split internal vs. external, this time classifying the *requester* (the address a
+     * receipt would be sent back to). Internal defaults to `true` (send automatically - matches your "all
+     * internal mail should always send/respond to receipt requests"); external defaults to `false` (held for
+     * approval by default - "external mail should be opt-in by default").
+     *
+     * This is a two-state design (auto-send vs. hold-for-approval), not three - there is no "never respond at
+     * all, silently" state. A mailbox owner who always declines a given sender's pending requests achieves
+     * the practical equivalent, just as an explicit per-message action rather than a silent standing rule.
+     */
+    autoSendReceiptsInternal: boolean;
+
+    autoSendReceiptsExternal: boolean;
 }
 
 /**
@@ -185,6 +221,27 @@ export enum MessageImportance {
 export enum MessageClassification {
     FOCUSED = "focused",
     OTHER = "other",
+}
+
+/**
+ * One row of `Message.receiptStatus` - the delivery/read status of one recipient of a sent message, the
+ * client-visible indicator behind this library's whole delivery/read receipt design (see `util/
+ * ReceiptUtils.ts`'s own doc comment). `recipientAddress` matches a real MDN's own `Final-Recipient` field.
+ *
+ * `deliveredAt`/`readAt` are ISO 8601 strings, not `Date` - deliberately: this type is stored inside a
+ * `simple-json` column on the SQL backend, which round-trips through `JSON.stringify`/`JSON.parse` with no
+ * transformer, so a nested `Date` comes back out as a string anyway (the same latent trap
+ * `RecurrenceRule.until`/`.exceptions` already sit in, and the same fix already applied once this session to
+ * `BookingDateOverride.date`) - a field that is genuinely a string to begin with can't be silently mistyped
+ * that way.
+ */
+export interface MessageReceiptEntry {
+    /** Normalized to lowercase. */
+    recipientAddress: string;
+
+    deliveredAt?: string;
+
+    readAt?: string;
 }
 
 /**
@@ -308,6 +365,54 @@ export interface Message extends RecoverableBaseEntity {
      * the same going-forward-only rollout Outlook's own Focused Inbox had.
      */
     inferenceClassification?: MessageClassification;
+
+    /**
+     * Set on a Draft, before calling `send()`, to request a real RFC 3798 MDN (`Disposition-Notification-To`)
+     * from every recipient - see `util/ReceiptUtils.ts` and `ScanQueueJob.maybeSendReceipt()`/`processReceipt()`
+     * for the full delivery/read receipt design. `undefined` means "use this mailbox's own
+     * `alwaysRequestReceiptInternal`/`External` default" (see `Mailbox`); an explicit `true`/`false` here
+     * always overrides both mailbox defaults at once, for every recipient regardless of internal/external.
+     * Same "set via an ordinary PUT before calling send()" convention as `scheduledSendTime`. Meaningless
+     * (never read) once the message has actually been sent.
+     */
+    requestReceipt?: boolean;
+
+    /**
+     * The address a receipt should be sent back to, persisted on the *recipient's own delivered copy* at
+     * delivery time from the inbound `Disposition-Notification-To` header (see
+     * `ScanPipelineResult.dispositionNotificationTo`) - needed because the read-receipt trigger fires later,
+     * independently, whenever this message's `flags.read` transitions to `true`, with no access to the
+     * original scan result any more.
+     */
+    dispositionNotificationTo?: string;
+
+    /** Idempotency stamp, recipient's own delivered copy - set once a delivery receipt has actually been
+     * sent for this message, so a re-run can never send a second one. */
+    deliveryReceiptSentAt?: Date;
+
+    /** Idempotency stamp, recipient's own delivered copy - set once a read receipt has actually been sent
+     * (on the first `flags.read` transition to `true` that requests one), so re-reading the message never
+     * sends a second one. */
+    readReceiptSentAt?: Date;
+
+    /** `true` when a delivery receipt was requested but the recipient mailbox's `autoSendReceiptsInternal`/
+     * `External` setting held it for the mailbox owner's explicit approval instead of sending it immediately
+     * - see `BaseMessageRoute`'s `POST /:id/receipt/approve`/`/decline`. Recipient's own delivered copy. */
+    deliveryReceiptPending: boolean;
+
+    /** Same as `deliveryReceiptPending`, for a read receipt. */
+    readReceiptPending: boolean;
+
+    /**
+     * The per-recipient delivery/read roster - **the client-visible indicator**, shown on the *original sent*
+     * message instead of a separate visible receipt email (see this library's whole receipt design). Seeded
+     * by `send()` with one entry per address in `recipients` (both timestamps unset) whenever a receipt was
+     * actually requested; grows further as real MDNs arrive and `ScanQueueJob.processReceipt()` correlates
+     * them by `Final-Recipient` - including appending a wholly new entry for a `DistributionList` member
+     * neither `send()` nor anything else could have known about in advance (see that method's own doc
+     * comment). `undefined` (not an empty array) when no receipt was ever requested for this message at all.
+     */
+    receiptStatus?: MessageReceiptEntry[];
 }
 
 /**

@@ -133,6 +133,22 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     @Nullable
     public maxDurationMinutes?: number = undefined;
 
+    @Column()
+    @Description("Whether send() attaches a receipt request to every outgoing message to an internal recipient by default.")
+    public alwaysRequestReceiptInternal: boolean = true;
+
+    @Column()
+    @Description("Same as alwaysRequestReceiptInternal, for an external recipient.")
+    public alwaysRequestReceiptExternal: boolean = false;
+
+    @Column()
+    @Description("Whether this mailbox auto-sends a receipt back to an internal requester versus holding it for approval.")
+    public autoSendReceiptsInternal: boolean = true;
+
+    @Column()
+    @Description("Same as autoSendReceiptsInternal, for an external requester.")
+    public autoSendReceiptsExternal: boolean = false;
+
     constructor(other?: Partial<MailboxSQL>) {
         super(other);
 
@@ -156,6 +172,18 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
             this.allowConflicts = "allowConflicts" in other ? other.allowConflicts : this.allowConflicts;
             this.bookingWindowDays = "bookingWindowDays" in other ? other.bookingWindowDays : this.bookingWindowDays;
             this.maxDurationMinutes = "maxDurationMinutes" in other ? other.maxDurationMinutes : this.maxDurationMinutes;
+            this.alwaysRequestReceiptInternal =
+                other.alwaysRequestReceiptInternal !== undefined
+                    ? other.alwaysRequestReceiptInternal
+                    : this.alwaysRequestReceiptInternal;
+            this.alwaysRequestReceiptExternal =
+                other.alwaysRequestReceiptExternal !== undefined
+                    ? other.alwaysRequestReceiptExternal
+                    : this.alwaysRequestReceiptExternal;
+            this.autoSendReceiptsInternal =
+                other.autoSendReceiptsInternal !== undefined ? other.autoSendReceiptsInternal : this.autoSendReceiptsInternal;
+            this.autoSendReceiptsExternal =
+                other.autoSendReceiptsExternal !== undefined ? other.autoSendReceiptsExternal : this.autoSendReceiptsExternal;
         }
     }
 }

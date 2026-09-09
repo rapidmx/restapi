@@ -67,4 +67,20 @@ describe("BaseMessageRoute Tests (dependency guard clause only)", () => {
 
         await expect(route.content("msg-1", res, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
     });
+
+    it("approveReceipt() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
+        const route = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
+
+        await expect(
+            route.approveReceipt("msg-1", { type: "delivery" }, { uid: "user-1" } as any),
+        ).rejects.toThrow(/internal error/i);
+    });
+
+    it("declineReceipt() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
+        const route = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
+
+        await expect(
+            route.declineReceipt("msg-1", { type: "delivery" }, { uid: "user-1" } as any),
+        ).rejects.toThrow(/internal error/i);
+    });
 });
