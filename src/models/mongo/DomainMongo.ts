@@ -57,7 +57,7 @@ export class DomainMongo extends BaseMongoEntity implements Domain {
     public lastCheckedAt?: Date;
 
     @Column()
-    @Description("DKIM selector - the admin's own MTA/OpenDKIM key pair is under this selector name.")
+    @Description("DKIM selector - the MTA's DKIM key pair for this domain is filed under this selector name.")
     @Nullable
     public dkimSelector?: string;
 

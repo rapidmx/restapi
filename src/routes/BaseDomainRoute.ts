@@ -13,6 +13,7 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
+import type { DkimKeyProvider } from "../dkim/DkimKeyProvider.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
@@ -55,6 +56,13 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
     @Inject("DnsResolver")
     private dnsResolver?: DnsResolver;
 
+    /** Optional - a deployment that hasn't registered a `DkimKeyProvider` keeps the original manual model
+     * (an admin runs their own OpenDKIM keygen and fills in `dkimSelector`/`dkimPublicKey` by hand). See
+     * `DkimKeyProvider`'s own doc comment for why this crosses a boundary this library previously drew
+     * deliberately, and is therefore opt-in via DI registration rather than always-on. */
+    @Inject("DkimKeyProvider")
+    private dkimKeyProvider?: DkimKeyProvider;
+
     /** This server's own inbound mail-exchange hostname - every `Domain`'s recommended MX (and, by
      * extension, SPF `mx` mechanism) record points here. One global value, same single-value-config
      * pattern as `mail:auth_server_url`. */
@@ -63,6 +71,23 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
 
     private newVerificationToken(): string {
         return crypto.randomBytes(32).toString("base64url");
+    }
+
+    /** Fills in `o.dkimSelector`/`o.dkimPublicKey` from `dkimKeyProvider` unless the caller already
+     * supplied both fields itself (an explicit caller-supplied pair - an admin importing their own
+     * externally-managed OpenDKIM key - always wins) or the registered provider doesn't manage key
+     * material at all (`NullDkimKeyProvider`, the default - see `DkimKeyProvider`'s own doc comment). A
+     * no-op (leaves whatever the caller sent, including nothing) in either of those cases. */
+    private async ensureDkimFields(o: Partial<T>): Promise<void> {
+        if (o.dkimSelector && o.dkimPublicKey) {
+            return;
+        }
+        const keyPair = await this.dkimKeyProvider!.ensureKeyPair(o.name!);
+        if (!keyPair) {
+            return;
+        }
+        (o as any).dkimSelector = keyPair.selector;
+        (o as any).dkimPublicKey = keyPair.publicKey;
     }
 
     /** Normalizes `o.name`, derives `uid` from it, and rejects a 409 on collision against an existing
@@ -78,6 +103,7 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         const uid: string = normalizeAddress(o.name);
         (o as any).uid = uid;
         (o as any).verificationToken = this.newVerificationToken();
+        await this.ensureDkimFields(o);
         if (isReservedDomainName(uid)) {
             // A reserved/special-use TLD (.local, .internal, etc. - see `isReservedDomainName()`'s own doc
             // comment) is never resolvable via public DNS, so ownership can't be proven that way. Adding
@@ -275,10 +301,29 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
     @RequiresTrustedRole()
     @Get("/:id/dns-setup")
     public async dnsSetup(@Param("id") id: string): Promise<DnsRecordCheck[]> {
-        const domain: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+        let domain: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
         if (!domain) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
+
+        // Backfill for a domain added before a key-generating `DkimKeyProvider` was registered (or one
+        // that predates this feature entirely) - a no-op once both fields are already set, or when the
+        // registered provider doesn't manage key material at all (`NullDkimKeyProvider`, the default), so
+        // this only ever does real work once per domain in a deployment that has opted into auto-
+        // generation. Best-effort: a key-generation failure here shouldn't break the rest of this otherwise
+        // read-only diagnostic endpoint.
+        if (!(domain.dkimSelector && domain.dkimPublicKey)) {
+            try {
+                const keyPair = await this.dkimKeyProvider!.ensureKeyPair(domain.name);
+                if (keyPair) {
+                    const patch: any = { uid: domain.uid, version: domain.version, dkimSelector: keyPair.selector, dkimPublicKey: keyPair.publicKey };
+                    domain = await this.repoUtils!.update(patch, domain, { version: domain.version, ignoreACL: true });
+                }
+            } catch (err: any) {
+                this.logger?.warn(`BaseDomainRoute: failed to backfill DKIM key pair for '${domain.name}': ${err.message}`);
+            }
+        }
+
         return await checkDnsSetup(this.dnsResolver!, domain, this.mxHostname);
     }
 }

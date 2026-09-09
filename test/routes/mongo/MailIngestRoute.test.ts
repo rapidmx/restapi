@@ -8,6 +8,7 @@ import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionMana
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { DistributionListMongo } from "../../../src/models/mongo/DistributionListMongo.js";
+import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { IngestQueueEntryMongo } from "../../../src/models/mongo/IngestQueueEntryMongo.js";
 import { TransportRuleMongo } from "../../../src/models/mongo/TransportRuleMongo.js";
@@ -31,6 +32,7 @@ describe("Route:MailIngestRouteMongo Tests", () => {
     let ingestQueueRepo: MongoRepository<IngestQueueEntryMongo>;
     let distributionListRepo: MongoRepository<DistributionListMongo>;
     let transportRuleRepo: MongoRepository<TransportRuleMongo>;
+    let domainRepo: MongoRepository<DomainMongo>;
 
     const secret = config.get("mail:transport:ingest:secret");
 
@@ -61,6 +63,19 @@ describe("Route:MailIngestRouteMongo Tests", () => {
         return await distributionListRepo.save(obj);
     };
 
+    const createDomain = async function (data?: any): Promise<DomainMongo> {
+        const name: string = data?.name ?? `${uuid.v4()}.example.com`;
+        const obj: DomainMongo = new DomainMongo({
+            uid: name,
+            name,
+            enabled: true,
+            verified: true,
+            verificationToken: uuid.v4(),
+            ...data,
+        });
+        return await domainRepo.save(obj);
+    };
+
     const createTransportRule = async function (data?: any): Promise<TransportRuleMongo> {
         const obj: TransportRuleMongo = new TransportRuleMongo({
             name: "Test Rule",
@@ -86,6 +101,7 @@ describe("Route:MailIngestRouteMongo Tests", () => {
             ingestQueueRepo = conn.getMongoRepository("IngestQueueEntryMongo");
             distributionListRepo = conn.getMongoRepository("DistributionListMongo");
             transportRuleRepo = conn.getMongoRepository("TransportRuleMongo");
+            domainRepo = conn.getMongoRepository("DomainMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -98,7 +114,7 @@ describe("Route:MailIngestRouteMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, ingestQueueRepo, distributionListRepo, transportRuleRepo]) {
+        for (const repo of [mailboxRepo, ingestQueueRepo, distributionListRepo, transportRuleRepo, domainRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -108,6 +124,42 @@ describe("Route:MailIngestRouteMongo Tests", () => {
             }
         }
         (objectFactory.getInstance<RecordingMailTransport>("MailTransport")!).sent = [];
+    });
+
+    it("Rejects a domain request without the internal bearer secret.", async () => {
+        const domain = await createDomain();
+        const result = await request(server.getApplication()).get(`${baseUrl}/domain?name=${domain.name}`);
+        expect(result.status).toBe(403);
+    });
+
+    it("Rejects a domain request with no name query parameter.", async () => {
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/domain`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(400);
+    });
+
+    it("Resolves 200 for an enabled, verified domain.", async () => {
+        const domain = await createDomain();
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/domain?name=${domain.name}`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(200);
+    });
+
+    it("Resolves 404 for a domain that isn't verified yet.", async () => {
+        const domain = await createDomain({ verified: false });
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/domain?name=${domain.name}`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(404);
+    });
+
+    it("Resolves 404 for a domain with no matching Domain record.", async () => {
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/domain?name=nobody.example.com`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(404);
     });
 
     it("Rejects a resolve request without the internal bearer secret.", async () => {

@@ -420,6 +420,29 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         };
     }
 
+    @Summary("Check relay domain")
+    @Description(
+        "Called by the MTA's relay-domain lookup (e.g. Postfix `relay_domains`) to decide whether it should " +
+            "accept/relay mail for a given domain at all, before ever checking an individual recipient. " +
+            "Responds 200 if the domain is a currently enabled-and-verified `Domain`, 404 otherwise.",
+    )
+    @Get("/domain")
+    public async domain(
+        @Query("name") name: string,
+        @Request req: HttpRequest,
+        @Response res: HttpResponse,
+    ): Promise<HttpResponse> {
+        this.authorizeInternalCaller(req);
+        await this.init();
+
+        if (!name) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+
+        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        return domains.includes(name.toLowerCase()) ? res.status(200) : res.status(404);
+    }
+
     @Summary("Resolve recipient")
     @Description(
         "Called by the MTA's recipient-validation hook before accepting a message. Responds 200 if a mailbox " +

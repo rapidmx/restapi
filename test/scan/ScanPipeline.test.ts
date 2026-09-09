@@ -206,6 +206,34 @@ describe("ScanPipeline Tests", () => {
         });
     });
 
+    describe("real DI resolution (regression - not the hand-built `new ScanPipeline()` used everywhere above)", () => {
+        // Reproduces a real bug found live via a consuming app's docker-compose boot: `ObjectFactory.
+        // initialize()` throws "No configuration variable is defined at path: ..." for ANY `@Config` field
+        // with neither a config value present nor an explicit default - `allowedTags` had no default,
+        // so constructing a `ScanPipeline` (as some other class's own `@Inject`-ed dependency) failed
+        // outright whenever the consuming app never set `mail:scan:sanitize:allowed_tags`, silently
+        // disabling all spam/AV scanning. `test/config.ts` happens to always set this key (to `[]`), which
+        // is exactly why this was never caught by any test going through that shared config - this test
+        // uses a minimal config that genuinely omits it, matching what actually broke.
+        it("Constructs successfully via the real ObjectFactory even when the config key is entirely absent.", async () => {
+            const { ObjectFactory } = await import("@rapidrest/service-core");
+            const { Logger } = await import("@rapidrest/core");
+            const { RspamdSpamScanProvider } = await import("../../src/scan/RspamdSpamScanProvider.js");
+            const { ClamAvScanProvider } = await import("../../src/scan/ClamAvScanProvider.js");
+
+            const minimalConfig = { get: (_path: string) => undefined };
+            const objectFactory = new (ObjectFactory as any)(minimalConfig, Logger());
+            objectFactory.register(RspamdSpamScanProvider, "SpamScanProvider");
+            objectFactory.register(ClamAvScanProvider, "AvScanProvider");
+
+            const instance = await objectFactory.newInstance(ScanPipeline, { name: "ScanPipeline:test" });
+
+            expect(instance).toBeInstanceOf(ScanPipeline);
+            expect(instance.allowedTags).toEqual(expect.arrayContaining(["p", "b", "i"]));
+            expect(instance.allowedTags).not.toContain("script");
+        });
+    });
+
     describe("run() - X-RapidMX-Recall-Of extraction", () => {
         beforeEach(() => {
             (pipeline as any).spamScanProvider = spamScanProvider;

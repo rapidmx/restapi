@@ -114,7 +114,14 @@ export class ScanPipeline {
     @Inject("AvScanProvider")
     private avScanProvider?: AvScanProvider;
 
-    @Config("mail:scan:sanitize:allowed_tags")
+    // A default MUST be supplied here even though `sanitize()` already has its own `?? sanitizeHtml.defaults...`
+    // fallback for an undefined value: `ObjectFactory.initialize()`'s config-injection loop throws
+    // "No configuration variable is defined at path: ..." for ANY `@Config` field that has neither a config
+    // value present nor an explicit default - confirmed live via a real docker-compose boot, where this made
+    // constructing a `ScanPipeline` (as `ScanQueueJob`'s/`MessageRoute`'s own `@Inject`-ed dependency) fail
+    // outright with `mail:scan:sanitize:allowed_tags` unset, silently disabling ALL spam/AV scanning - every
+    // other `@Config` usage in this codebase already supplies a default for exactly this reason.
+    @Config("mail:scan:sanitize:allowed_tags", sanitizeHtml.defaults.allowedTags.filter((tag) => tag !== "script"))
     private allowedTags?: string[];
 
     @Logger

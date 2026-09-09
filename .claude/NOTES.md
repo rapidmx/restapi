@@ -381,3 +381,90 @@ entities, `BaseScopedChildRoute` subclasses scoped by `mailboxUid`, `BackgroundS
   remaining gap is the same pre-existing `MailboxRouteSQL.ts` one-function gap noted in the entry
   above (confirmed untouched via `git diff`). `yarn build`/`yarn tsc --noEmit` clean. Not committed —
   left staged/unstaged per the standing commit-discipline rule.
+
+### 2026-09-09 — New `dkim/` module (opt-in DKIM key generation) + `GET /internal/mta/domain`, driven by `@rapidmx/server`'s docker-compose deploy-wiring session
+
+This session's actual driver was `@rapidmx/server`'s own NOTES.md 2026-09-09 entry ("Deploy wiring:
+docker-compose... dynamic per-domain DKIM, real inbound MTA bridge") — read that entry for the full
+narrative (docker-compose/Postfix/mta-bridge design); this entry covers only what changed *in this repo*.
+
+- **New `src/dkim/` module**: `DkimKeyProvider` interface (`ensureKeyPair(domain): Promise<DkimKeyPair |
+  undefined>`), `FsDkimKeyProvider` (generates+persists a 2048-bit RSA key pair straight into rspamd's own
+  `dkim_signing` module's expected `<key_dir>/<domain>.<selector>.key` path — confirmed via
+  `docs.rspamd.com/modules/dkim_signing`, not guessed), `NullDkimKeyProvider` (always resolves `undefined`
+  — the default). Exported from the package root (`src/index.ts`), same as `dns/`.
+- **This crosses a boundary this library previously drew deliberately**: `Domain.dkimSelector`/
+  `dkimPublicKey`'s doc comments (`models/types.ts` + both Mongo/SQL model files) used to say this app
+  "never generates or stores DKIM key material" — an admin was expected to run their own OpenDKIM keygen
+  and paste in the selector/public key. Confirmed with JP before crossing it (this is real custody of
+  MTA-signing private key material, a security-relevant choice, not a pure implementation detail) — see
+  the `@rapidmx/server` NOTES.md entry for how that confirmation was obtained. Doc comments updated
+  accordingly; the manual model still works exactly as before when `NullDkimKeyProvider` (the default) is
+  registered.
+- **Found the hard way: `@Inject("...")` throws if *nothing at all* is registered under that token — there
+  is no "leave it undefined" optional-injection mode in `@rapidrest/core`'s `ObjectFactory`.** Adding
+  `@Inject("DkimKeyProvider")` to `BaseDomainRoute` broke every existing integration test in this repo
+  (`No class found with name: DkimKeyProvider`) the instant `Server.start()` tried to construct
+  `DomainRoute`/`MailIngestRoute`, because nothing had ever registered anything under that brand-new token.
+  Fixed by making `NullDkimKeyProvider` the always-registered default (`test/testDoubles.ts`) and having
+  `ensureKeyPair()` itself return `undefined` for "not managed," rather than `BaseDomainRoute` trying to
+  detect "is anything registered at all" (there's no clean way to ask that once *something* always is).
+  **A downstream consumer of this library now MUST register something under `"DkimKeyProvider"`** (even if
+  it's just `NullDkimKeyProvider`) or `Server.start()` will throw — this is a breaking addition for any
+  app built on this library, `@rapidmx/server` included (it now registers `FsDkimKeyProvider`). Worth
+  calling out explicitly in this package's next release notes.
+- **A second, related gotcha, worth remembering for any future optional-but-overridable DI token**:
+  `ObjectFactory.register(clazz, fqn)` is **first-registration-wins**, not last -
+  `if (!this.classes.has(name)) { this.classes.set(name, clazz); }` in `@rapidrest/core`'s own source. A
+  test file that wants a different implementation than `testDoubles.ts`'s default must register it
+  **before** calling `registerTestDoubles()`, not after, or the default silently wins and the override is a
+  no-op. Cost real debugging time this session (`test/routes/{mongo,sql}/DomainRoute.dkim.test.ts` failed
+  with "expected 'mail' but got null" until the registration order was flipped).
+- **`BaseDomainRoute.create()`** auto-fills `dkimSelector`/`dkimPublicKey` from the registered provider
+  unless the caller already supplied both explicitly (an admin importing their own key pair is never
+  silently overwritten). **`dnsSetup()`** backfills the same, lazily, for a domain created before this
+  feature existed (or before a key-generating provider was registered) — best-effort, a generation failure
+  there doesn't break the rest of that otherwise read-only diagnostic call.
+- **New `GET /internal/mta/domain?name=<domain>` on `BaseMailIngestRoute`**: 200 if the domain is
+  `enabled && verified` (reuses `getVerifiedDomainNames()`, already used by `applyTransportRules()` — no
+  new query logic), 404 otherwise. Lets an MTA's relay-domain acceptance check
+  (`relay_domains`/`tcp_table`, see `transport/MTAIngestAdapter.ts`'s updated doc comment) stay in sync with
+  this app's own `Domain` database dynamically, with no MTA restart needed for a newly-added domain — the
+  other two endpoints (`resolve`/`deliver`) were already dynamic this way; this one had been the missing
+  piece.
+- New tests: `test/dkim/FsDkimKeyProvider.test.ts` (real filesystem I/O against a temp dir, mirrors
+  `test/blob/LocalFsBlobStore.test.ts`'s own convention for the same reason), new
+  `test/routes/{mongo,sql}/DomainRoute.dkim.test.ts` (a deliberately separate `Server`/`ObjectFactory` per
+  backend with `FsDkimKeyProvider` registered, rather than changing the existing `DomainRoute.test.ts`
+  files — those keep registering nothing, proving the `NullDkimKeyProvider` default is unaffected), and new
+  `/internal/mta/domain` cases added directly to the existing `test/routes/{mongo,sql}/MailIngestRoute.test.ts`.
+- Verification: full suite re-run after all of the above — 130 files / 1912 tests passing (up from
+  1022/1022 at the last entry above — that jump also reflects unrelated work between sessions, not just
+  this entry's additions). `yarn tsc --noEmit` and `eslint ./src ./test` both clean. Not committed — left
+  staged/unstaged per the standing commit-discipline rule; `@rapidmx/server` currently consumes this via
+  `yarn patch` ahead of a real publish (see that repo's own NOTES.md) — **bump this package's own version
+  and publish when ready, calling out the new required `DkimKeyProvider` DI registration as a breaking
+  change for any existing consumer**, then have `@rapidmx/server` drop the patch and point at the real
+  published version.
+
+- **Real, previously-undiscovered bug found and fixed via `@rapidmx/server`'s live docker-compose boot
+  (not by reading code): `ScanPipeline` could never actually be constructed via real DI in any deployment
+  that doesn't explicitly set `mail:scan:sanitize:allowed_tags`.** `@Config("mail:scan:sanitize:allowed_tags")`
+  (`src/scan/ScanPipeline.ts`) had no default value — unlike every other `@Config` usage in this codebase.
+  `@rapidrest/core`'s `ObjectFactory.initialize()` throws `"No configuration variable is defined at path:
+  ..."` synchronously for any `@Config` field with neither a live config value nor an explicit default, so
+  every attempt to construct a `ScanPipeline` (as `ScanQueueJob`'s/`MessageRoute`'s own `@Inject`-ed
+  dependency) failed outright and was silently swallowed by the caller's injection-resolution `.catch()` —
+  **no scanning ever actually ran**, with only an unassertedly-logged error to show for it. Never caught by
+  this repo's own test suite because `test/config.ts`/`config.sql.ts` happen to always set this key (to
+  `[]`), papering over the exact absence that broke `@rapidmx/server`'s own `config.mongo.ts`/`config.sql.ts`
+  (which never set it at all). Fixed by giving the `@Config` call a real default (the same
+  `sanitizeHtml.defaults.allowedTags.filter((tag) => tag !== "script")` list `sanitize()`'s own `??`
+  fallback already computed) — `sanitize()`'s fallback itself is left in place as defensive belt-and-suspenders
+  for the isolated `new ScanPipeline()`-without-DI construction this repo's existing tests already use
+  throughout. New regression test in `test/scan/ScanPipeline.test.ts` constructs a `ScanPipeline` through a
+  **real** `ObjectFactory` (not the hand-built `new ScanPipeline()` every other test in that file uses) with
+  a minimal config that genuinely omits the key, asserting it resolves without throwing — the shape of test
+  that would have caught this originally. **Any other `@Config` field added to this codebase in future
+  without an explicit default risks the exact same silent failure mode** — worth a lint rule or code-review
+  habit, not just this one-off fix.

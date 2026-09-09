@@ -9,6 +9,7 @@ import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { In, Repository } from "typeorm";
 import { DistributionListSQL } from "../../../src/models/sql/DistributionListSQL.js";
+import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
 import { TransportRuleSQL } from "../../../src/models/sql/TransportRuleSQL.js";
@@ -24,6 +25,7 @@ describe("Route:MailIngestRouteSQL Tests", () => {
     let ingestQueueRepo: Repository<IngestQueueEntrySQL>;
     let distributionListRepo: Repository<DistributionListSQL>;
     let transportRuleRepo: Repository<TransportRuleSQL>;
+    let domainRepo: Repository<DomainSQL>;
 
     const secret = config.get("mail:transport:ingest:secret");
 
@@ -54,6 +56,19 @@ describe("Route:MailIngestRouteSQL Tests", () => {
         return await distributionListRepo.save(obj);
     };
 
+    const createDomain = async function (data?: any): Promise<DomainSQL> {
+        const name: string = data?.name ?? `${uuid.v4()}.example.com`;
+        const obj: DomainSQL = new DomainSQL({
+            uid: name,
+            name,
+            enabled: true,
+            verified: true,
+            verificationToken: uuid.v4(),
+            ...data,
+        });
+        return await domainRepo.save(obj);
+    };
+
     const createTransportRule = async function (data?: any): Promise<TransportRuleSQL> {
         const obj: TransportRuleSQL = new TransportRuleSQL({
             name: "Test Rule",
@@ -78,6 +93,7 @@ describe("Route:MailIngestRouteSQL Tests", () => {
             ingestQueueRepo = conn.getRepository(IngestQueueEntrySQL);
             distributionListRepo = conn.getRepository(DistributionListSQL);
             transportRuleRepo = conn.getRepository(TransportRuleSQL);
+            domainRepo = conn.getRepository(DomainSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -93,7 +109,44 @@ describe("Route:MailIngestRouteSQL Tests", () => {
         await mailboxRepo.clear();
         await distributionListRepo.clear();
         await transportRuleRepo.clear();
+        await domainRepo.clear();
         (objectFactory.getInstance<RecordingMailTransport>("MailTransport")!).sent = [];
+    });
+
+    it("Rejects a domain request without the internal bearer secret.", async () => {
+        const domain = await createDomain();
+        const result = await request(server.getApplication()).get(`${baseUrl}/domain?name=${domain.name}`);
+        expect(result.status).toBe(403);
+    });
+
+    it("Rejects a domain request with no name query parameter.", async () => {
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/domain`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(400);
+    });
+
+    it("Resolves 200 for an enabled, verified domain.", async () => {
+        const domain = await createDomain();
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/domain?name=${domain.name}`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(200);
+    });
+
+    it("Resolves 404 for a domain that isn't verified yet.", async () => {
+        const domain = await createDomain({ verified: false });
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/domain?name=${domain.name}`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(404);
+    });
+
+    it("Resolves 404 for a domain with no matching Domain record.", async () => {
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/domain?name=nobody.example.com`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(404);
     });
 
     it("Rejects a resolve request without the internal bearer secret.", async () => {

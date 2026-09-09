@@ -13,6 +13,13 @@
  * and additionally gated by a shared bearer secret (`mail:transport:ingest:secret`) checked against the
  * `Authorization` header — never exposed to the public internet.
  *
+ * ### `GET /internal/mta/domain?name=<domain>`
+ * Called by the MTA's relay-domain lookup (e.g. Postfix `relay_domains` backed by a `tcp_table`/socketmap)
+ * to decide whether it should accept/relay mail for a domain at all, before ever checking an individual
+ * recipient - lets the set of accepted domains grow/shrink dynamically as `Domain`s are added/removed/(un)
+ * verified in this app's own database, with no MTA-side config file to keep in sync by hand. Responds
+ * `200` if the domain is currently `enabled` and `verified`, `404` otherwise.
+ *
  * ### `GET /internal/mta/resolve?rcpt=<address>`
  * Called by the MTA's recipient-validation hook (e.g. Postfix `recipient_lookup` via a `tcp_table`/socketmap,
  * or an LMTP handshake) before accepting a message for `rcpt`, so a message for a nonexistent mailbox is

@@ -851,8 +851,10 @@ export interface Domain extends BaseEntity {
      * whether or not it succeeded - lets an admin see the check is actually happening. */
     lastCheckedAt?: Date;
 
-    /** DKIM selector, e.g. "default" - the admin's own MTA/OpenDKIM already has a key pair under this
-     * selector name; this app never generates or stores DKIM key material (see `util/DnsSetupUtils.ts`). */
+    /** DKIM selector, e.g. "default" - the MTA/OpenDKIM key pair this server signs (or a deployment's own
+     * externally-managed one) is filed under this selector name. Auto-populated by `BaseDomainRoute` when
+     * a `DkimKeyProvider` is registered (see its own doc comment); a deployment that hasn't registered one
+     * still expects an admin to fill this in by hand from their own OpenDKIM keygen output. */
     dkimSelector?: string;
 
     /** The base64 public-key portion of that same DKIM key pair (the `p=` value), used to compute and
