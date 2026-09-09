@@ -2,6 +2,7 @@ export * from "./AttachmentMongo.js";
 export * from "./AuditLogEntryMongo.js";
 export * from "./BookingMongo.js";
 export * from "./BookingTypeMongo.js";
+export * from "./BrandingMongo.js";
 export * from "./CalendarEventMongo.js";
 export * from "./CalendarShareLinkMongo.js";
 export * from "./ContactMongo.js";

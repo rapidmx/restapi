@@ -2,6 +2,7 @@ export * from "./AttachmentRouteSQL.js";
 export * from "./AuditLogRouteSQL.js";
 export * from "./BookingRouteSQL.js";
 export * from "./BookingTypeRouteSQL.js";
+export * from "./BrandingRouteSQL.js";
 export * from "./CalendarEventRouteSQL.js";
 export * from "./CalendarShareLinkRouteSQL.js";
 export * from "./ContactListRouteSQL.js";

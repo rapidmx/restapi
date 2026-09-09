@@ -690,6 +690,7 @@ export enum AuditAction {
     DOMAIN_UPDATE = "domain.update",
     DOMAIN_DELETE = "domain.delete",
     DOMAIN_VERIFIED = "domain.verified",
+    BRANDING_UPDATE = "branding.update",
 }
 
 /**
@@ -744,6 +745,61 @@ export interface Domain extends BaseEntity {
     /** Optional mailto target for DMARC aggregate reports (the record's `rua=` tag), if the admin wants
      * reports sent somewhere. */
     dmarcReportEmail?: string;
+}
+
+/**
+ * A single, admin-managed, publicly-readable record of this deployment's custom branding (logo, product
+ * title/company name, stylesheet, and web-client UI chrome) - what a downstream server or web client
+ * renders instead of this library's own defaults. Always exactly one row, at the well-known `uid:
+ * "branding"` - `BaseBrandingRoute` creates it lazily on the first admin write and never on a public read.
+ *
+ * Deny-all class ACL like every other admin-managed entity in this library - `"anonymous"` is never
+ * granted anything through the ACL system (see the incident documented on `BaseMailboxRoute`); the public
+ * `GET /branding` is a route-level decision `BaseBrandingRoute` makes itself, not an ACL grant.
+ *
+ * `logoUrl`/`stylesheetUrl` each support two independent ways for an admin to set them: a plain external
+ * URL (the admin already hosts the asset elsewhere), or an upload through `BaseBrandingRoute`'s own
+ * `POST /branding/logo`/`POST /branding/stylesheet`, which stores the file via `BlobStore` and rewrites
+ * the URL to this API's own `GET /branding/logo`/`GET /branding/stylesheet`. The `*BlobKey`/`*ContentType`
+ * fields are route-managed bookkeeping for the upload case only - never client-settable directly, and
+ * never returned by the public `GET /branding` (see `BaseBrandingRoute.toPublicBranding()`) - they exist so
+ * the route can tell whether the current `logoUrl`/`stylesheetUrl` is self-hosted (and needs its blob
+ * cleaned up if replaced) versus merely an external link with nothing here to serve.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface Branding extends BaseEntity {
+    companyName: string;
+
+    /** Browser-tab / product title shown by the web client. */
+    title: string;
+
+    /** The URL a client should render as the logo - either an admin-set external URL, or this API's own
+     * `/branding/logo` once uploaded. */
+    logoUrl?: string;
+
+    /** Internal, route-managed only - set only when `logoUrl` currently points at an uploaded blob. */
+    logoBlobKey?: string;
+
+    /** Internal, route-managed only - the content-type `GET /branding/logo` serves the uploaded logo back
+     * with. */
+    logoContentType?: string;
+
+    stylesheetUrl?: string;
+
+    /** Internal, route-managed only - set only when `stylesheetUrl` currently points at an uploaded blob. */
+    stylesheetBlobKey?: string;
+
+    /** Internal, route-managed only - the content-type `GET /branding/stylesheet` serves the uploaded
+     * stylesheet back with. */
+    stylesheetContentType?: string;
+
+    /** Free-form UI chrome the web client renders above the mail app - never touched by this library
+     * beyond storing/returning it verbatim. */
+    headerHtml?: string;
+
+    /** Free-form UI chrome the web client renders below the mail app. */
+    footerHtml?: string;
 }
 
 /**
