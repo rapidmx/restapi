@@ -20,14 +20,31 @@ Keep entries terse — this is a reference, not a transcript.
   races with no concrete external trigger path. Every finding should be able to name the actual
   HTTP route/method or WS message type that reaches the code in question.
 
-- **Commit discipline.** Don't `git commit` unless explicitly asked for *that specific piece of
-  work*. An autonomous-execution/"commit as you go" approval given for one approved plan (e.g. via
-  plan mode) is scoped to that plan only — it does not carry forward to later, separate requests in
-  the same session, even ones that look similar in kind (a follow-up review-and-fix pass, a
-  refactor, a new feature), and even after a full review-and-fix cycle with passing tests. Default
-  to leaving changes staged/unstaged and saying so; only commit automatically within the exact
-  scope of a plan that was explicitly approved as autonomous. If unsure whether new work falls
-  inside that scope, treat it as outside and ask.
+- **Commit message style: a flat list of one-line, verb-led items — no summary/title line, no
+  `-`/`*` bullet markers.** This isn't just a style preference — it's dictated by how `release`
+  (`@rapidrest/cli`) actually builds `CHANGELOG.md`. `collectChangelogBullets`/
+  `classifyChangelogLine` (that repo's `src/lib/release.ts`) parse `git log --pretty=format:%B` and
+  treat **every non-blank line of a commit's full message as its own changelog bullet** — there is
+  no subject/body distinction. A conventional "short imperative subject + blank line + prose body"
+  commit therefore leaks one changelog bullet per body sentence, and a `-`/`*`-prefixed line breaks
+  `classifyChangelogLine`'s verb detection (it reads the line's first whitespace-delimited word as
+  the verb; a leading `-` defeats that lookup and the dash leaks into the changelog text as
+  `"- - Added foo"`). Correct format:
+  - No separate summary/title line — if a commit needs an overview, that overview is itself just
+    one more flat line, not a heading distinct from the rest.
+  - No bullet-marker prefix of any kind — write bare lines.
+  - Lead each line with an imperative verb where it fits: `Add`/`Fix`/`Remove` (and `-ing` forms)
+    are recognized and become `Added`/`Fixed`/`Removed` entries; `Configuring`/`Converting`/
+    `Refactoring`/`Updating`/etc. become `Changed`. Anything else still works, defaulting to
+    `Changed` verbatim — see `CHANGELOG_VERB_REWRITES` in that repo's `src/lib/release.ts` for the
+    full map.
+  - A blank line before a trailing git trailer (`Co-Authored-By:`, `Signed-off-by:`, etc.) is fine
+    — trailers matching `CHANGELOG_NOISE_PATTERNS` are dropped from the changelog — but nothing
+    else should follow the item list.
+  This mirrors JP's standing convention across his other repos; copy this exact rule verbatim into
+  each sibling repo's own NOTES.md rather than paraphrasing it, since the paraphrase is what caused
+  this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
+  for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
   
 - **Commit message style: concise, one line per task/bug/feature — no verbose prose.** A commit
   message is a short list of one-line bullets, one per item. This mirrors JP's standing convention
