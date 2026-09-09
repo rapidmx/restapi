@@ -18,6 +18,7 @@ import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { checkDnsSetup, type DnsRecordCheck } from "../util/DnsSetupUtils.js";
 import { checkDomainVerification } from "../util/DomainVerificationUtils.js";
+import { isReservedDomainName } from "../util/DomainUtils.js";
 import { AuditAction, Domain } from "../models/types.js";
 const { Get, Param, Post, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 const { Config, Inject } = ObjectDecorators;
@@ -40,8 +41,9 @@ function validateDmarcPolicy(dmarcPolicy: unknown): void {
  * reason documented on `BaseDistributionListRoute`).
  *
  * `create()`/`update()` own the entire lifecycle of `verified`/`verificationToken`/`verifiedAt` - none of
- * those three fields is ever taken from the caller's request body, only ever set by this class itself or
- * by `verify()` below, so a `PUT` can never be used to bypass DNS ownership proof.
+ * those three fields is ever taken from the caller's request body, only ever set by this class itself (see
+ * `assignUidAndCheckCollision()`'s reserved-TLD carve-out) or by `verify()` below, so a `PUT` can never be
+ * used to bypass DNS ownership proof.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -64,8 +66,10 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
     }
 
     /** Normalizes `o.name`, derives `uid` from it, and rejects a 409 on collision against an existing
-     * `Domain`. Mutates `o` in place - assigns `uid`, and always starts a freshly created domain
-     * unverified with a new token (DNS ownership has never been checked for it yet). */
+     * `Domain`. Mutates `o` in place - assigns `uid`, and starts a freshly created domain unverified with a
+     * new token (DNS ownership has never been checked for it yet), unless `o.name` is under a reserved,
+     * never-publicly-resolvable TLD (see `isReservedDomainName()`), in which case it starts already
+     * verified instead. */
     private async assignUidAndCheckCollision(o: Partial<T>): Promise<void> {
         if (!o.name) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
@@ -73,9 +77,19 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         validateDmarcPolicy(o.dmarcPolicy);
         const uid: string = normalizeAddress(o.name);
         (o as any).uid = uid;
-        (o as any).verified = false;
         (o as any).verificationToken = this.newVerificationToken();
-        (o as any).verifiedAt = undefined;
+        if (isReservedDomainName(uid)) {
+            // A reserved/special-use TLD (.local, .internal, etc. - see `isReservedDomainName()`'s own doc
+            // comment) is never resolvable via public DNS, so ownership can't be proven that way. Adding
+            // one here is itself the admin's assertion of control over their own internal namespace (this
+            // is a legitimate, common setup for an internal-only mail system) - skip the DNS-proof workflow
+            // entirely and start already verified, rather than leaving it permanently stuck unverified.
+            (o as any).verified = true;
+            (o as any).verifiedAt = new Date();
+        } else {
+            (o as any).verified = false;
+            (o as any).verifiedAt = undefined;
+        }
 
         const existing: T | undefined = await this.repoUtils!.findOne(uid, { ignoreACL: true });
         if (existing) {

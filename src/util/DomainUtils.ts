@@ -20,6 +20,22 @@ function getDomainRepo(objectFactory: ObjectFactory, domainClass: any): Promise<
     return cached;
 }
 
+/** IANA's Special-Use Domain Names registry (RFC 6761/6762/2606/8375/9476) - hostnames under any of these
+ * are reserved for local/private resolution (mDNS, home-router discovery, etc.) and are never resolvable
+ * via public DNS, so a `Domain` under one of these can never have its ownership proven by
+ * `checkDomainVerification()`'s public TXT lookup. Registering one is a legitimate, common setup for an
+ * internal-only mail system (e.g. `mail.local`) - since the admin adding it is themselves the only
+ * authority over that namespace, `BaseDomainRoute.create()` treats the TLD itself as sufficient proof and
+ * skips the DNS-proof workflow entirely rather than leaving it permanently stuck unverified. */
+const RESERVED_TLDS = new Set(["local", "localhost", "test", "example", "invalid", "internal", "onion"]);
+
+/** `true` if `name` (a `Domain.name` candidate) is or ends with one of `RESERVED_TLDS` - e.g. both
+ * `"local"` and `"mail.local"` match on the `local` label. */
+export function isReservedDomainName(name: string): boolean {
+    const labels: string[] = name.toLowerCase().split(".");
+    return RESERVED_TLDS.has(labels[labels.length - 1]);
+}
+
 /**
  * Returns the names of every `Domain` that is both `enabled` and `verified` - the one definition of
  * "this server's domains" consumed by `BaseMailboxRoute`, `BaseDistributionListRoute`, and

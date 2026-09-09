@@ -174,6 +174,18 @@ describe("Route:DomainSQL Tests", () => {
         expect(result.status).toBe(400);
     });
 
+    it("A domain under a reserved TLD like .local skips DNS validation and starts already verified.", async () => {
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ name: "mail.local" });
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+        expect(result.body.verified).toBe(true);
+        expect(result.body.verifiedAt).toBeTruthy();
+    });
+
     it("Rejects a bulk create request with two domains claiming the same name (409).", async () => {
         const result = await request(server.getApplication())
             .post(baseUrl)
