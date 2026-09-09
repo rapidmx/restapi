@@ -4,9 +4,9 @@
 [![Coverage Status](https://coveralls.io/repos/github/RapidMX/restapi/badge.svg?branch=main)](https://coveralls.io/github/RapidMX/restapi?branch=main)
 [![npm version](https://img.shields.io/npm/v/@rapidmx/restapi)](https://www.npmjs.com/package/@rapidmx/restapi)
 
-The core data model and standard REST API for building a mail server on RapidREST — reachable entirely over
-HTTP/S. Mailboxes, folders, messages, contacts, calendar (with external sharing and scheduling), notes/tasks,
-full-text search over mail/attachments, and pluggable SPAM/anti-virus scanning.
+The core data model and standard REST API for building a mail server on RapidREST. Mailboxes, folders, messages,
+contacts, calendar (with external sharing and scheduling), notes/tasks, full-text search over mail/attachments,
+and pluggable SPAM/anti-virus scanning.
 
 Protocol compatibility for real mail clients lives in separate, independently-versioned packages that depend
 on this one:

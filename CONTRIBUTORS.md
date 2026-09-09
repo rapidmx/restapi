@@ -4,5 +4,3 @@ List of Contributors
 ====================
 
 Jean-Philippe Steinmetz <caskater4>
-Arthur Thompson <arthurwthompson>
-Thomas Buscaglia
