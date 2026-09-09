@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-09
+
+### Added
+- Added a DkimKeyProvider abstraction (FsDkimKeyProvider/NullDkimKeyProvider) so a deployment can opt into automatic per-domain DKIM key generation instead of the previous admin-fills-it-in-by-hand-only model
+- Added GET /internal/mta/domain to BaseMailIngestRoute so an MTA's relay-domain acceptance check can stay in sync with this app's own Domain database dynamically, with no MTA restart needed
+- Added test/dkim/FsDkimKeyProvider.test.ts, test/routes/{mongo,sql}/DomainRoute.dkim.test.ts, new /internal/mta/domain cases in the existing MailIngestRoute tests, and a real-DI regression test for the ScanPipeline config-default fix
+
+### Changed
+- Wire DkimKeyProvider into BaseDomainRoute.create() (auto-fills dkimSelector/dkimPublicKey unless the caller already supplied both) and dnsSetup() (lazily backfills a pre-existing domain missing them)
+- Register NullDkimKeyProvider as the default test double, required because @Inject throws when nothing at all is registered under a token
+- Document the new /internal/mta/domain endpoint in transport/MTAIngestAdapter.ts alongside the existing resolve/deliver contract
+- Update Domain.dkimSelector/dkimPublicKey doc comments, which previously asserted this library never generates or stores DKIM key material
+
+### Fixed
+- Fixed ScanPipeline's allowedTags @Config field having no default, which made ObjectFactory.initialize() throw for any deployment that never explicitly sets mail:scan:sanitize:allowed_tags, silently disabling all spam/AV scanning
+
 ## [0.3.1] - 2026-09-09
 
 ### Added
@@ -160,7 +176,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/RapidMX/restapi/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/RapidMX/restapi/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/RapidMX/restapi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/RapidMX/restapi/compare/v0.1.0...v0.2.0
