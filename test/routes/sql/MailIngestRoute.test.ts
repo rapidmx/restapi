@@ -135,6 +135,33 @@ describe("Route:MailIngestRouteSQL Tests", () => {
         expect(result.status).toBe(404);
     });
 
+    it("Resolves 200 for a plus-tagged variant of a mailbox's primary SMTP address.", async () => {
+        const local = uuid.v4();
+        await createMailbox({ primarySmtpAddress: `${local}@example.com` });
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/resolve?rcpt=${local}+tag@example.com`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(200);
+    });
+
+    it("Resolves 200 for a plus-tagged variant of a mailbox's alias address.", async () => {
+        const local = uuid.v4();
+        await createMailbox({ aliasAddresses: [`${local}@example.com`] });
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/resolve?rcpt=${local}+tag@example.com`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(200);
+    });
+
+    it("An explicitly-registered address containing a literal plus still matches via the exact-match tier first.", async () => {
+        const local = uuid.v4();
+        await createMailbox({ primarySmtpAddress: `${local}+special@example.com` });
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/resolve?rcpt=${local}+special@example.com`)
+            .set("Authorization", `Bearer ${secret}`);
+        expect(result.status).toBe(200);
+    });
+
     it("Treats '%'/'_' in the rcpt address as literal characters, not SQL LIKE wildcards, when matching aliases.", async () => {
         // Alias lookup on SQL is implemented via a substring LIKE match against a serialized JSON column (see
         // `MailIngestRouteSQL.aliasQueryValue()`). Without escaping, a `_` (SQL "match any one character"
@@ -175,6 +202,26 @@ describe("Route:MailIngestRouteSQL Tests", () => {
         expect(entries.length).toBe(1);
         expect(entries[0].status).toBe(IngestStatus.PENDING);
         expect(entries[0].envelopeFrom).toBe("sender@example.com");
+    });
+
+    it("Delivers a plus-tagged RCPT TO to the base mailbox, preserving the tagged address in the stored message.", async () => {
+        const local = uuid.v4();
+        const mailbox = await createMailbox({ primarySmtpAddress: `${local}@example.com` });
+        const raw = Buffer.from(`From: sender@example.com\r\nTo: ${local}+tag@example.com\r\n\r\nHello\r\n`);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", `${local}+tag@example.com`)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        expect(result.body.results).toEqual([{ rcpt: `${local}+tag@example.com`, queued: true }]);
+
+        const entries: IngestQueueEntrySQL[] = await ingestQueueRepo.find({ where: { mailboxUid: mailbox.uid } });
+        expect(entries.length).toBe(1);
     });
 
     it("Reports an unresolvable recipient as not queued, without failing the whole request.", async () => {

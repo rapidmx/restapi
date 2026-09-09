@@ -18,7 +18,7 @@ import {
 import { BlobStore } from "../blob/BlobStore.js";
 import type { MailTransport } from "../transport/MailTransport.js";
 import { DistributionList, IngestQueueEntry, IngestStatus, Mailbox, QuarantineReason, TransportRule } from "../models/types.js";
-import { normalizeAddress } from "../util/AddressUtils.js";
+import { normalizeAddress, stripPlusTag } from "../util/AddressUtils.js";
 import { rewriteHeadersForList } from "../util/DistributionListUtils.js";
 import { getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
@@ -83,6 +83,12 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
     @Config("mail:distribution_lists:max_depth", 10)
     private maxListDepth: number = 10;
 
+    /** Gmail-style `user+tag@domain.com` plus-addressing - see `findMailboxByAddress()`. Mailbox-scoped only
+     * (not `DistributionList`) and delivery-routing only (not authentication/login) - deliberate scope
+     * boundaries, not oversights. */
+    @Config("mail:plus_addressing:enabled", true)
+    private plusAddressingEnabled: boolean = true;
+
     @Logger
     private logger: any;
 
@@ -146,11 +152,33 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         }
     }
 
+    /**
+     * Resolves `address` to a `Mailbox`, tried in three tiers: an exact `primarySmtpAddress` match, then an
+     * exact `aliasAddresses` match, then - only if `address`'s local part has a `+` and plus-addressing is
+     * enabled - the same two exact-match tiers again against the plus-stripped base address
+     * (`stripPlusTag()`, `util/AddressUtils.ts`). Retrying both tiers (not just `primarySmtpAddress`) means
+     * `alias+tag@domain.com` also resolves through an existing `aliasAddresses` entry, not just a mailbox's
+     * own primary address. Exact matches always win first, so a mailbox that has explicitly registered a
+     * literal `+`-containing address (unusual, but not disallowed) still resolves to itself directly rather
+     * than being reinterpreted as a plus-tagged variant of some other mailbox.
+     */
     private async findMailboxByAddress(address: string): Promise<M | undefined> {
         const mailboxes: M[] = await this.mailboxRepo!.find({ primarySmtpAddress: address }, { ignoreACL: true, limit: 1 });
-        return (
+        const exactMatch: M | undefined =
             mailboxes[0] ??
-            (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(address) }, { ignoreACL: true, limit: 1 }))[0]
+            (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(address) }, { ignoreACL: true, limit: 1 }))[0];
+        if (exactMatch) {
+            return exactMatch;
+        }
+
+        const baseAddress: string = stripPlusTag(address);
+        if (!this.plusAddressingEnabled || baseAddress === address) {
+            return undefined;
+        }
+        const baseMailboxes: M[] = await this.mailboxRepo!.find({ primarySmtpAddress: baseAddress }, { ignoreACL: true, limit: 1 });
+        return (
+            baseMailboxes[0] ??
+            (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(baseAddress) }, { ignoreACL: true, limit: 1 }))[0]
         );
     }
 

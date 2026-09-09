@@ -126,6 +126,9 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
             booking: {
                 public_url: "https://bookings.rapidmx-test.example.com",
             },
+            plus_addressing: {
+                enabled: true,
+            },
         },
     };
 }
