@@ -369,12 +369,23 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // freshly composed draft).
         const sanitizedHtmlBlobKey: string | undefined = scannedHtmlBlobKey ?? (message as any).sanitizedHtmlBlobKey;
         // Seeded only when a receipt was actually requested - nothing could ever populate it otherwise. One
-        // placeholder row per recipient (including a `DistributionList`'s own address as-is - see
+        // placeholder row per *distinct* recipient (including a `DistributionList`'s own address as-is - see
         // `processReceipt()`'s own doc comment for why its expanded members can only ever be discovered
-        // later, as their own real MDNs arrive, not predicted here).
-        const receiptStatus: MessageReceiptEntry[] | undefined = attachesReceiptRequest
-            ? envelopeTo.map((address) => ({ recipientAddress: normalizeAddress(address) }))
-            : undefined;
+        // later, as their own real MDNs arrive, not predicted here) - deduplicated by normalized address so a
+        // recipient appearing twice (e.g. a case-variant duplicate across To/Cc) doesn't seed two rows that
+        // `processReceipt()`'s `findIndex()` could only ever update the first of.
+        let receiptStatus: MessageReceiptEntry[] | undefined;
+        if (attachesReceiptRequest) {
+            const seenAddresses: Set<string> = new Set();
+            receiptStatus = [];
+            for (const address of envelopeTo) {
+                const normalized: string = normalizeAddress(address);
+                if (!seenAddresses.has(normalized)) {
+                    seenAddresses.add(normalized);
+                    receiptStatus.push({ recipientAddress: normalized });
+                }
+            }
+        }
 
         return await this.repoUtils.update(
             {
@@ -580,7 +591,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             justMarkedRead &&
             updated.dispositionNotificationTo &&
             !updated.readReceiptSentAt &&
-            !updated.readReceiptPending
+            !updated.readReceiptPending &&
+            !updated.readReceiptDeclined
         ) {
             return await this.maybeSendReadReceipt(updated);
         }
@@ -691,8 +703,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const patch: any = { uid: message.uid, version: (message as any).version };
         if (type === "delivery") {
             patch.deliveryReceiptPending = false;
+            patch.deliveryReceiptDeclined = true;
         } else {
             patch.readReceiptPending = false;
+            patch.readReceiptDeclined = true;
         }
         return await this.repoUtils!.update(patch, message, { user, ignoreACL: true });
     }

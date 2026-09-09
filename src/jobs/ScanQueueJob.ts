@@ -931,10 +931,27 @@ export abstract class ScanQueueJob<
      * `deliveredAt`/`readAt` - or, if none matches (a `DistributionList` member `send()` could never have
      * pre-seeded, or a message sent before this feature existed), appends a new entry rather than dropping the
      * update, so the roster still ends up complete.
+     *
+     * Authenticity check: RFC 3798 semantics mean `Final-Recipient` is always the *generating* mailbox's own
+     * address (each recipient reports its own disposition) - so a genuine MDN's claimed `Final-Recipient` must
+     * equal the address this inbound message was actually sent from (`entry.envelopeFrom`). Without this check,
+     * anyone who can email this mailbox (e.g. a real recipient who legitimately saw the original message's
+     * `Message-ID` in their own inbox copy) could forge an MDN claiming an arbitrary `Final-Recipient` -
+     * including an address that was never actually sent the message - and have it silently recorded as a real
+     * delivered/read timestamp. A mismatch is dropped exactly like an unresolvable `originalMessageId`.
      */
     private async processReceipt(entry: Q, dispositionNotificationPart: string): Promise<void> {
         const parsed = parseDispositionNotification(dispositionNotificationPart);
-        if (!parsed || !parsed.dispositionType) {
+        // Without a `Final-Recipient` there is no address to correlate against, append under, or authenticate -
+        // nothing useful this method could do.
+        if (!parsed || !parsed.dispositionType || !parsed.finalRecipient) {
+            return;
+        }
+        if (normalizeAddress(parsed.finalRecipient) !== normalizeAddress(entry.envelopeFrom)) {
+            this.logger?.warn(
+                `ScanQueueJob: dropping MDN for mailbox ${entry.mailboxUid} whose claimed Final-Recipient ` +
+                    `does not match its own envelope sender - possible forgery attempt.`,
+            );
             return;
         }
 
@@ -943,9 +960,7 @@ export abstract class ScanQueueJob<
             { ignoreACL: true, limit: 5 },
         );
         const target: M | undefined = matches[0];
-        // Without a `Final-Recipient` there is no address to correlate against or append under - nothing
-        // useful this method could do, unlike the `finalRecipient`-present case below.
-        if (!target || !parsed.finalRecipient) {
+        if (!target) {
             return;
         }
 

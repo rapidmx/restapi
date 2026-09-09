@@ -204,6 +204,17 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
     @Description("Same as deliveryReceiptPending, for a read receipt.")
     public readReceiptPending: boolean = false;
 
+    @Column()
+    @Description(
+        "true once the mailbox owner has explicitly declined a pending delivery receipt - a separate, " +
+            "permanent 'handled, don't ask again' marker distinct from deliveryReceiptPending.",
+    )
+    public deliveryReceiptDeclined: boolean = false;
+
+    @Column()
+    @Description("Same as deliveryReceiptDeclined, for a read receipt.")
+    public readReceiptDeclined: boolean = false;
+
     @Column({ type: "simple-json", nullable: true })
     @Description(
         "The per-recipient delivery/read roster - the client-visible indicator shown on the original sent " +
@@ -247,6 +258,10 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
             this.deliveryReceiptPending =
                 other.deliveryReceiptPending !== undefined ? other.deliveryReceiptPending : this.deliveryReceiptPending;
             this.readReceiptPending = other.readReceiptPending !== undefined ? other.readReceiptPending : this.readReceiptPending;
+            this.deliveryReceiptDeclined =
+                other.deliveryReceiptDeclined !== undefined ? other.deliveryReceiptDeclined : this.deliveryReceiptDeclined;
+            this.readReceiptDeclined =
+                other.readReceiptDeclined !== undefined ? other.readReceiptDeclined : this.readReceiptDeclined;
             this.receiptStatus = "receiptStatus" in other ? other.receiptStatus : this.receiptStatus;
         }
     }

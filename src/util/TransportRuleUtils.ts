@@ -5,6 +5,7 @@
 import { convert } from "html-to-text";
 import { ParsedMail, simpleParser } from "mailparser";
 import { TransportRule, TransportRuleAction, TransportRuleActionType, TransportRuleConditions } from "../models/types.js";
+import { stripPlusTag } from "./AddressUtils.js";
 
 /** The maximum length, in characters, of the plain-text body preview `buildTransportRuleContext()` derives -
  * mirrors `ScanPipeline`'s own `BODY_PREVIEW_MAX_LENGTH` constant (kept as a separate constant/parse rather
@@ -149,12 +150,21 @@ export function evaluateTransportRules(rules: TransportRule[], context: Transpor
  * `mailparser` parse (subject/body-preview/attachment filenames only, no spam/AV scanning), run once per
  * SMTP transaction at ingest time, before per-recipient resolution/fan-out. `domains` is this server's
  * configured `mail:domains` list, used to compute `anyRecipientExternal`.
+ *
+ * `plusAddressingEnabled` (mirrors `BaseMailIngestRoute`'s own config toggle - see `findMailboxByAddress()`)
+ * additionally includes each recipient's plus-stripped base address in `recipientAddresses`: without it, a
+ * `recipientContains` rule scoped to `sales@company.com` would never match a `RCPT TO: sales+urgent@company.com`
+ * transaction even though it resolves to and is delivered at exactly the same mailbox - silently letting a
+ * sender evade a mail-flow rule (e.g. REJECT/QUARANTINE targeting a specific recipient) just by adding a tag.
+ * Only added when the feature is actually enabled, so this stays consistent with what `findMailboxByAddress()`
+ * itself would resolve.
  */
 export async function buildTransportRuleContext(
     raw: Buffer,
     envelopeFrom: string,
     envelopeTo: string[],
     domains: string[],
+    plusAddressingEnabled: boolean = false,
 ): Promise<TransportRuleMatchContext> {
     const parsed: ParsedMail = await simpleParser(raw);
 
@@ -175,11 +185,15 @@ export async function buildTransportRuleContext(
             return !domain || !domains.includes(domain);
         });
 
+    const recipientAddresses: string[] = plusAddressingEnabled
+        ? Array.from(new Set(envelopeTo.flatMap((address) => [address, stripPlusTag(address)])))
+        : envelopeTo;
+
     return {
         fromAddress: envelopeFrom,
         subject: parsed.subject ?? "",
         bodyPreview,
-        recipientAddresses: envelopeTo,
+        recipientAddresses,
         anyRecipientExternal,
         hasAttachment,
         attachmentFilenames,

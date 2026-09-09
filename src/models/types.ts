@@ -404,6 +404,22 @@ export interface Message extends RecoverableBaseEntity {
     readReceiptPending: boolean;
 
     /**
+     * `true` once the mailbox owner has explicitly declined a pending delivery receipt via `POST
+     * /:id/receipt/decline` - a separate, permanent "handled, don't ask again" marker distinct from
+     * `deliveryReceiptPending`/`deliveryReceiptSentAt`. Needed because `deliveryReceiptPending` only means
+     * "not currently awaiting approval" - without this field, an event that could re-trigger the same pending
+     * decision (e.g. `readReceiptPending` after a message is marked unread then read again) would see the
+     * same "never handled" state a decline was supposed to permanently rule out. Recipient's own delivered
+     * copy.
+     */
+    deliveryReceiptDeclined: boolean;
+
+    /** Same as `deliveryReceiptDeclined`, for a read receipt - checked by `BaseMessageRoute.update()`'s
+     * read-receipt trigger guard so declining once truly means "don't re-prompt", even across a later
+     * unread-then-read cycle. */
+    readReceiptDeclined: boolean;
+
+    /**
      * The per-recipient delivery/read roster - **the client-visible indicator**, shown on the *original sent*
      * message instead of a separate visible receipt email (see this library's whole receipt design). Seeded
      * by `send()` with one entry per address in `recipients` (both timestamps unset) whenever a receipt was

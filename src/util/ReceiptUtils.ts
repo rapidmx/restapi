@@ -69,7 +69,12 @@ export function parseDispositionNotification(raw: string): ParsedDispositionNoti
     if (!originalMessageIdHeader) {
         return undefined;
     }
-    const originalMessageId: string = originalMessageIdHeader.replace(/^</, "").replace(/>$/, "");
+    // `extractHeader()`'s generic unfolding joins a folded continuation line with a literal space, which is
+    // correct for ordinary free-text headers but corrupts a `msg-id` token specifically - a real msg-id never
+    // legally contains internal whitespace, so any whitespace surviving inside one here can only be unfolding
+    // artifact, never real content. Stripped outright (not just trimmed) so a msg-id folded by a non-strict
+    // sender's line-wrapping still round-trips to the exact same lookup key `send()` originally stored.
+    const originalMessageId: string = originalMessageIdHeader.replace(/^</, "").replace(/>$/, "").replace(/\s+/g, "");
 
     // `Final-Recipient` is `rfc822;<address>` (RFC 3798 §3.2.3) - possibly with a display name/comment this
     // library never generates itself but a real external MDN might; the address is always the last

@@ -152,6 +152,30 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         }
     }
 
+    /** An exact `primarySmtpAddress`/`aliasAddresses` match for `address`, with no plus-tag fallback. Split out
+     * from `findMailboxByAddress()` so callers that must not let the plus-tag fallback tier shadow an exact
+     * `DistributionList` match (`deliver()`, `expandDistributionList()`) can check this tier, then a
+     * `DistributionList`, before ever falling back to a plus-stripped mailbox match. */
+    private async findExactMailboxByAddress(address: string): Promise<M | undefined> {
+        const mailboxes: M[] = await this.mailboxRepo!.find({ primarySmtpAddress: address }, { ignoreACL: true, limit: 1 });
+        return (
+            mailboxes[0] ??
+            (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(address) }, { ignoreACL: true, limit: 1 }))[0]
+        );
+    }
+
+    /** Only the plus-tag fallback tier of `findMailboxByAddress()` - an exact match against the plus-stripped
+     * base address (`stripPlusTag()`, `util/AddressUtils.ts`), tried only if `address`'s local part has a `+`
+     * and plus-addressing is enabled. Kept separate from `findExactMailboxByAddress()` so a caller that already
+     * knows the exact tier missed doesn't need to needlessly re-query it. */
+    private async findPlusStrippedMailbox(address: string): Promise<M | undefined> {
+        const baseAddress: string = stripPlusTag(address);
+        if (!this.plusAddressingEnabled || baseAddress === address) {
+            return undefined;
+        }
+        return await this.findExactMailboxByAddress(baseAddress);
+    }
+
     /**
      * Resolves `address` to a `Mailbox`, tried in three tiers: an exact `primarySmtpAddress` match, then an
      * exact `aliasAddresses` match, then - only if `address`'s local part has a `+` and plus-addressing is
@@ -161,25 +185,17 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
      * own primary address. Exact matches always win first, so a mailbox that has explicitly registered a
      * literal `+`-containing address (unusual, but not disallowed) still resolves to itself directly rather
      * than being reinterpreted as a plus-tagged variant of some other mailbox.
+     *
+     * Callers that also resolve `DistributionList` addresses (`deliver()`, `expandDistributionList()`'s member
+     * loop) must NOT call this method directly - it would let the plus-tag fallback tier shadow an exact
+     * `DistributionList` match (e.g. a list at `sales+urgent@domain.com` being misdelivered to a mailbox
+     * `sales@domain.com` instead). Those callers use `findExactMailboxByAddress()`/`findPlusStrippedMailbox()`
+     * directly, with an exact `DistributionList` check interleaved between the two tiers. `resolve()` has no
+     * such ordering concern (either type resolving is equally a 200, never a delivery choice) and still calls
+     * this method directly.
      */
     private async findMailboxByAddress(address: string): Promise<M | undefined> {
-        const mailboxes: M[] = await this.mailboxRepo!.find({ primarySmtpAddress: address }, { ignoreACL: true, limit: 1 });
-        const exactMatch: M | undefined =
-            mailboxes[0] ??
-            (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(address) }, { ignoreACL: true, limit: 1 }))[0];
-        if (exactMatch) {
-            return exactMatch;
-        }
-
-        const baseAddress: string = stripPlusTag(address);
-        if (!this.plusAddressingEnabled || baseAddress === address) {
-            return undefined;
-        }
-        const baseMailboxes: M[] = await this.mailboxRepo!.find({ primarySmtpAddress: baseAddress }, { ignoreACL: true, limit: 1 });
-        return (
-            baseMailboxes[0] ??
-            (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(baseAddress) }, { ignoreACL: true, limit: 1 }))[0]
-        );
+        return (await this.findExactMailboxByAddress(address)) ?? (await this.findPlusStrippedMailbox(address));
     }
 
     private async findDistributionListByAddress(address: string): Promise<DistributionList | undefined> {
@@ -241,7 +257,18 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 continue;
             }
 
-            const mailbox: M | undefined = await this.findMailboxByAddress(member);
+            // Exact mailbox match, then exact `DistributionList` match, THEN the plus-tag fallback - in that
+            // order - so a nested list whose own address happens to contain a `+` can never be shadowed by an
+            // unrelated mailbox's plus-stripped base address (see `findMailboxByAddress()`'s own doc comment).
+            let mailbox: M | undefined = await this.findExactMailboxByAddress(member);
+            let nestedList: DistributionList | undefined;
+            if (!mailbox) {
+                nestedList = await this.findDistributionListByAddress(member);
+            }
+            if (!mailbox && !nestedList) {
+                mailbox = await this.findPlusStrippedMailbox(member);
+            }
+
             if (mailbox) {
                 if (!seenMailboxUids.has(mailbox.uid)) {
                     seenMailboxUids.add(mailbox.uid);
@@ -250,7 +277,6 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 continue;
             }
 
-            const nestedList: DistributionList | undefined = await this.findDistributionListByAddress(member);
             if (nestedList) {
                 if (visitedListUids.has(nestedList.uid)) {
                     this.logger?.warn(`MailIngestRoute: skipping distribution list cycle at '${nestedList.primarySmtpAddress}'.`);
@@ -351,7 +377,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         }
 
         const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
-        const context = await buildTransportRuleContext(raw, envelopeFrom, envelopeTo, domains);
+        const context = await buildTransportRuleContext(raw, envelopeFrom, envelopeTo, domains, this.plusAddressingEnabled);
         const evaluation = evaluateTransportRules(rules, context);
 
         if (evaluation.reject) {
@@ -463,7 +489,17 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         const results: { rcpt: string; queued: boolean }[] = [];
         for (const rcpt of envelopeTo) {
             const address: string = normalizeAddress(rcpt);
-            const mailbox: M | undefined = await this.findMailboxByAddress(address);
+            // Exact mailbox match, then exact `DistributionList` match, THEN the plus-tag fallback - in that
+            // order - so a list whose own address happens to contain a `+` can never be shadowed by an
+            // unrelated mailbox's plus-stripped base address (see `findMailboxByAddress()`'s own doc comment).
+            let mailbox: M | undefined = await this.findExactMailboxByAddress(address);
+            let list: DistributionList | undefined;
+            if (!mailbox) {
+                list = await this.findDistributionListByAddress(address);
+            }
+            if (!mailbox && !list) {
+                mailbox = await this.findPlusStrippedMailbox(address);
+            }
 
             if (mailbox) {
                 const rawBlobKey: string = `ingest/${crypto.randomUUID()}`;
@@ -483,7 +519,6 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 continue;
             }
 
-            const list: DistributionList | undefined = await this.findDistributionListByAddress(address);
             if (!list) {
                 this.logger?.warn(`MailIngestRoute: dropping delivery for unresolvable recipient '${address}'.`);
                 results.push({ rcpt: address, queued: false });

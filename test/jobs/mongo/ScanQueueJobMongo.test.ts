@@ -2139,6 +2139,54 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             expect((await messageRepo.find({ mailboxUid }).toArray()).length).toBe(0);
         });
 
+        it("Drops an MDN whose claimed Final-Recipient does not match its own envelope sender (forgery attempt) and does not update the roster.", async () => {
+            await createMailbox();
+            const sentFolder = await folderRepo.save(
+                new FolderMongo({ mailboxUid, name: "Sent Items", type: FolderType.SENT_ITEMS, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+            );
+            const sent = await messageRepo.save(
+                new MessageMongo({
+                    folderUid: sentFolder.uid,
+                    mailboxUid,
+                    messageId: "original@example.com",
+                    subject: "Hello",
+                    from: { address: "recipient@example.com", type: RecipientType.TO },
+                    recipients: [{ address: "bob@example.com", type: RecipientType.TO }],
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey: `raw/${uuid.v4()}`,
+                    bodyPreview: "Hello",
+                    flags: { read: true, flagged: false, answered: false, forwarded: false },
+                    references: [],
+                    hasAttachments: false,
+                    receiptStatus: [{ recipientAddress: "bob@example.com" }],
+                }),
+            );
+
+            // Sent from mallory@example.com's own mailbox, but the MDN body itself dishonestly claims to be
+            // reporting bob@example.com's disposition - exactly the forgery this authenticity check exists to
+            // catch, since Mallory could otherwise fabricate a fake "read" timestamp for an address she was
+            // never actually sent the message at.
+            const mdn: Buffer = await buildDispositionNotification({
+                from: { address: "mallory@example.com" },
+                to: "recipient@example.com",
+                subject: "Read: Hello",
+                finalRecipient: "bob@example.com",
+                originalMessageId: "original@example.com",
+                dispositionType: "read",
+                reportingUa: "mail.example.com; RapidMX",
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, mdn);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "mallory@example.com" });
+
+            await job.run();
+
+            const updated = await messageRepo.findOne({ uid: sent.uid } as any);
+            expect(updated!.receiptStatus).toEqual([{ recipientAddress: "bob@example.com" }]);
+        });
+
         it("Silently drops an MDN part that has no resolvable Disposition at all, still never filing it.", async () => {
             await createMailbox();
 

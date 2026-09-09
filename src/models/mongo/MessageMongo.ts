@@ -201,6 +201,17 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
 
     @Column()
     @Description(
+        "true once the mailbox owner has explicitly declined a pending delivery receipt - a separate, " +
+            "permanent 'handled, don't ask again' marker distinct from deliveryReceiptPending.",
+    )
+    public deliveryReceiptDeclined: boolean = false;
+
+    @Column()
+    @Description("Same as deliveryReceiptDeclined, for a read receipt.")
+    public readReceiptDeclined: boolean = false;
+
+    @Column()
+    @Description(
         "The per-recipient delivery/read roster - the client-visible indicator shown on the original sent " +
             "message. undefined (not an empty array) when no receipt was ever requested for this message.",
     )
@@ -242,6 +253,10 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.deliveryReceiptPending =
                 other.deliveryReceiptPending !== undefined ? other.deliveryReceiptPending : this.deliveryReceiptPending;
             this.readReceiptPending = other.readReceiptPending !== undefined ? other.readReceiptPending : this.readReceiptPending;
+            this.deliveryReceiptDeclined =
+                other.deliveryReceiptDeclined !== undefined ? other.deliveryReceiptDeclined : this.deliveryReceiptDeclined;
+            this.readReceiptDeclined =
+                other.readReceiptDeclined !== undefined ? other.readReceiptDeclined : this.readReceiptDeclined;
             this.receiptStatus = "receiptStatus" in other ? other.receiptStatus : this.receiptStatus;
         }
     }

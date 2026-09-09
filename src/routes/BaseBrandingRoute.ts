@@ -102,15 +102,31 @@ export abstract class BaseBrandingRoute<T extends Branding> {
         }
     }
 
+    /**
+     * `RepoUtils.create()`'s duplicate-uid guard is a `count()` pre-check, not an atomic constraint check - two
+     * concurrent first-ever callers can both observe `existing === undefined` below and both reach `create()`,
+     * so the loser's `create()` throws a raw driver duplicate-key error rather than a clean conflict. Since
+     * this is a singleton keyed on the fixed `BRANDING_UID`, the loser attempted nothing different from the
+     * winner - re-fetching and returning the now-existing row is the correct outcome for a caller who only
+     * ever wanted "the one branding row, created if necessary", not a real failure to surface.
+     */
     private async findOrCreate(): Promise<T> {
         const existing: T | undefined = await this.brandingRepo!.findOne(BRANDING_UID, { ignoreACL: true });
         if (existing) {
             return existing;
         }
-        return await this.brandingRepo!.create(
-            new this.brandingClass({ uid: BRANDING_UID, companyName: "", title: "" }),
-            { ignoreACL: true },
-        );
+        try {
+            return await this.brandingRepo!.create(
+                new this.brandingClass({ uid: BRANDING_UID, companyName: "", title: "" }),
+                { ignoreACL: true },
+            );
+        } catch (err) {
+            const winner: T | undefined = await this.brandingRepo!.findOne(BRANDING_UID, { ignoreACL: true });
+            if (winner) {
+                return winner;
+            }
+            throw err;
+        }
     }
 
     /** `?? undefined` on every optional field: an unset optional column comes back as `null` on the SQL
