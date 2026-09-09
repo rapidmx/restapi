@@ -441,11 +441,13 @@ narrative (docker-compose/Postfix/mta-bridge design); this entry covers only wha
 - Verification: full suite re-run after all of the above — 130 files / 1912 tests passing (up from
   1022/1022 at the last entry above — that jump also reflects unrelated work between sessions, not just
   this entry's additions). `yarn tsc --noEmit` and `eslint ./src ./test` both clean. Not committed — left
-  staged/unstaged per the standing commit-discipline rule; `@rapidmx/server` currently consumes this via
-  `yarn patch` ahead of a real publish (see that repo's own NOTES.md) — **bump this package's own version
-  and publish when ready, calling out the new required `DkimKeyProvider` DI registration as a breaking
-  change for any existing consumer**, then have `@rapidmx/server` drop the patch and point at the real
-  published version.
+  staged/unstaged per the standing commit-discipline rule; `@rapidmx/server` consumed this via `yarn patch`
+  ahead of a real publish for the rest of that session.
+- **Published as `0.4.0` the same day** (JP, after the ScanPipeline fix above landed) — the new required
+  `DkimKeyProvider` DI registration (`NullDkimKeyProvider` is the default; nothing needs to change for an
+  existing consumer that never registers one itself) should be called out in that release's own notes if
+  it wasn't already. `@rapidmx/server` has since dropped its `yarn patch` and moved to a plain `"^0.4.0"`
+  constraint, re-verified clean against the real published package.
 
 - **Real, previously-undiscovered bug found and fixed via `@rapidmx/server`'s live docker-compose boot
   (not by reading code): `ScanPipeline` could never actually be constructed via real DI in any deployment
