@@ -62,8 +62,10 @@ describe("Mongo model default construction", () => {
         expect(obj.oofStartTime).toBeUndefined();
         expect(obj.oofEndTime).toBeUndefined();
         expect(obj.alwaysRequestReceiptInternal).toBe(true);
+        expect(obj.alwaysRequestReceiptFederated).toBe(false);
         expect(obj.alwaysRequestReceiptExternal).toBe(false);
         expect(obj.autoSendReceiptsInternal).toBe(true);
+        expect(obj.autoSendReceiptsFederated).toBe(false);
         expect(obj.autoSendReceiptsExternal).toBe(false);
     });
 
@@ -83,8 +85,10 @@ describe("Mongo model default construction", () => {
             oofStartTime,
             oofEndTime,
             alwaysRequestReceiptInternal: false,
+            alwaysRequestReceiptFederated: true,
             alwaysRequestReceiptExternal: true,
             autoSendReceiptsInternal: false,
+            autoSendReceiptsFederated: true,
             autoSendReceiptsExternal: true,
         });
 
@@ -100,8 +104,10 @@ describe("Mongo model default construction", () => {
         expect(obj.oofStartTime).toBe(oofStartTime);
         expect(obj.oofEndTime).toBe(oofEndTime);
         expect(obj.alwaysRequestReceiptInternal).toBe(false);
+        expect(obj.alwaysRequestReceiptFederated).toBe(true);
         expect(obj.alwaysRequestReceiptExternal).toBe(true);
         expect(obj.autoSendReceiptsInternal).toBe(false);
+        expect(obj.autoSendReceiptsFederated).toBe(true);
         expect(obj.autoSendReceiptsExternal).toBe(true);
     });
 
@@ -113,8 +119,10 @@ describe("Mongo model default construction", () => {
         expect(obj.oofStartTime).toBeUndefined();
         expect(obj.oofEndTime).toBeUndefined();
         expect(obj.alwaysRequestReceiptInternal).toBe(true);
+        expect(obj.alwaysRequestReceiptFederated).toBe(false);
         expect(obj.alwaysRequestReceiptExternal).toBe(false);
         expect(obj.autoSendReceiptsInternal).toBe(true);
+        expect(obj.autoSendReceiptsFederated).toBe(false);
         expect(obj.autoSendReceiptsExternal).toBe(false);
     });
 

@@ -11,7 +11,7 @@ import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, Sca
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { deriveConversationId } from "../util/ConversationUtils.js";
-import { getVerifiedDomainNames, isInternalAddress } from "../util/DomainUtils.js";
+import { classifyRecipientTier, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { buildEventIcs, expandOccurrences, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
@@ -430,7 +430,7 @@ export abstract class ScanQueueJob<
             // row exists, so the outcome can be written directly into the initial `create()` rather than a
             // second follow-up `update()`. Gated on `dispositionNotificationTo` being present at all: the
             // overwhelmingly common case is no receipt requested, which costs nothing beyond one property
-            // check - no mailbox lookup, no `isInternalAddress()` query.
+            // check - no mailbox lookup, no `classifyRecipientTier()` query.
             let deliveryReceiptSentAt: Date | undefined;
             let deliveryReceiptPending = false;
             if (result.dispositionNotificationTo) {
@@ -851,14 +851,14 @@ export abstract class ScanQueueJob<
      * into `mailbox`'s Inbox - called from `deliverMessage()` only when `dispositionNotificationTo` (the
      * requester's address, from the inbound `Disposition-Notification-To` header) is present at all.
      *
-     * The requester is classified internal/external via `isInternalAddress()` (`util/DomainUtils.ts` - the
-     * same "this server's domains" check Focused Inbox's own `classifyForInbox()` already uses), which decides
-     * whether `Mailbox.autoSendReceiptsInternal`/`autoSendReceiptsExternal` applies. When that setting is
-     * `false`, nothing is sent - the receipt is left for the mailbox owner's explicit approval instead (see
-     * `BaseMessageRoute`'s `POST /:id/receipt/approve`/`/decline`, which call `sendDispositionNotification()`
-     * below directly). A send failure is logged and treated the same as never having sent one at all (not left
-     * "pending") - matching every other best-effort cross-mailbox notification in this class, none of which
-     * retry.
+     * The requester is classified via `classifyRecipientTier()` (`util/DomainUtils.ts` - same-org/federated/
+     * external, built on the same "this server's domains" check Focused Inbox's own `classifyForInbox()`
+     * already uses), which decides whether `Mailbox.autoSendReceiptsInternal`/`Federated`/`External` applies.
+     * When that setting is `false`, nothing is sent - the receipt is left for the mailbox owner's explicit
+     * approval instead (see `BaseMessageRoute`'s `POST /:id/receipt/approve`/`/decline`, which call
+     * `sendDispositionNotification()` below directly). A send failure is logged and treated the same as never
+     * having sent one at all (not left "pending") - matching every other best-effort cross-mailbox
+     * notification in this class, none of which retry.
      */
     private async maybeSendDeliveryReceipt(
         dispositionNotificationTo: string,
@@ -866,8 +866,13 @@ export abstract class ScanQueueJob<
         originalMessageId: string,
         originalSubject: string,
     ): Promise<{ sentAt?: Date; pending: boolean }> {
-        const internal: boolean = await isInternalAddress(this._objectFactory!, this.domainClass, dispositionNotificationTo);
-        const autoSend: boolean = internal ? mailbox.autoSendReceiptsInternal : mailbox.autoSendReceiptsExternal;
+        const tier = await classifyRecipientTier(this._objectFactory!, this.domainClass, dispositionNotificationTo);
+        const autoSend: boolean =
+            tier === "same-org"
+                ? mailbox.autoSendReceiptsInternal
+                : tier === "federated"
+                  ? mailbox.autoSendReceiptsFederated
+                  : mailbox.autoSendReceiptsExternal;
         if (!autoSend) {
             return { pending: true };
         }

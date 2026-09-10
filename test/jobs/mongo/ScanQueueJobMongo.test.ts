@@ -1967,6 +1967,15 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             expect(message.deliveryReceiptPending).toBe(false);
         });
 
+        it("Does NOT send immediately for an external requester when the mailbox only opts in via autoSendReceiptsFederated - no federation detection exists yet so a non-internal requester always classifies as external, and autoSendReceiptsExternal (left false here) is the setting that actually governs.", async () => {
+            await createMailbox({ autoSendReceiptsFederated: true });
+
+            const message = await deliverRequestingReceipt("sender@example.com", "stranger@outside.com");
+
+            expect(message.deliveryReceiptSentAt).toBeFalsy();
+            expect(message.deliveryReceiptPending).toBe(true);
+        });
+
         it("Does nothing receipt-related when no receipt was requested at all.", async () => {
             await createMailbox();
 

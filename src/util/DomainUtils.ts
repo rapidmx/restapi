@@ -63,3 +63,40 @@ export async function isInternalAddress(objectFactory: ObjectFactory, domainClas
     const domains = await getVerifiedDomainNames(objectFactory, domainClass);
     return domains.includes(domain);
 }
+
+/** The three receipt-scoping tiers a recipient/requester address classifies into, per the Scoping Principle
+ * in `specs/end-to-end_encryption.md` (disclosing capabilities like receipts scope to same-organisation by
+ * default, unlike protective capabilities which scope to any federated peer): `"same-org"` is exactly
+ * `isInternalAddress()`'s existing check; `"federated"` is a remote domain publishing a valid `_rapidmx`
+ * policy record - a different organisation that has still opted into RapidMX's federated protocols;
+ * `"external"` is everything else. */
+export type RecipientTier = "same-org" | "federated" | "external";
+
+/** Checks whether `address`'s domain is a federated RapidMX peer. `classifyRecipientTier()` calls through
+ * this seam rather than hard-coding a check, so this module carries no dependency on the federation-discovery
+ * infrastructure (DNS `_rapidmx` TXT resolution) that doesn't exist yet - see the `ds_e2e_roadmap` project
+ * memory. */
+export type FederatedPeerCheck = (address: string) => Promise<boolean>;
+
+/** The default `FederatedPeerCheck` - always `false`, so every non-`same-org` address classifies as
+ * `"external"` until a real implementation is wired in as `classifyRecipientTier()`'s `isFederatedPeer`
+ * argument. This keeps `classifyRecipientTier()`'s observable behavior identical to plain internal/external
+ * classification until that federation work lands. */
+const neverFederated: FederatedPeerCheck = async () => false;
+
+/**
+ * Classifies `address` into one of the three `RecipientTier`s above - the shared basis for the receipt
+ * feature's `Mailbox.alwaysRequestReceipt*`/`autoSendReceipts*` three-way settings. `isFederatedPeer`
+ * defaults to `neverFederated`; callers pass a real federation check once one exists.
+ */
+export async function classifyRecipientTier(
+    objectFactory: ObjectFactory,
+    domainClass: any,
+    address: string,
+    isFederatedPeer: FederatedPeerCheck = neverFederated,
+): Promise<RecipientTier> {
+    if (await isInternalAddress(objectFactory, domainClass, address)) {
+        return "same-org";
+    }
+    return (await isFederatedPeer(address)) ? "federated" : "external";
+}

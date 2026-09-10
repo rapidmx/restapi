@@ -103,37 +103,43 @@ export interface Mailbox extends BaseEntity {
 
     /**
      * Whether `send()` attaches a real RFC 3798 receipt request (`Disposition-Notification-To`) to every
-     * outgoing message by default, for internal vs. external recipients respectively - split per your own
-     * explicit design call, not one flat toggle: a message can have a mix of both, and
-     * `Disposition-Notification-To` is a single message-level header (RFC 3798 has no "only notify me for
-     * these recipients" concept - every recipient's own system independently decides whether to honor the
-     * request regardless), so the effective rule in `BaseMessageRoute.send()` is "attach it if it applies to
-     * *any* recipient on the message". "Internal"/"external" here means the recipient being addressed,
-     * classified by `isInternalAddress()` (`ScanQueueJob`/`BaseMessageRoute` - a domain-verified-list check,
-     * same mechanism `FocusedInboxUtils`'s "internal sender" signal already uses). A per-draft
-     * `Message.requestReceipt` always overrides both of these at once when explicitly set.
+     * outgoing message by default, split by the recipient's `RecipientTier` (`util/DomainUtils.ts`'s
+     * `classifyRecipientTier()`) - not one flat toggle: a message can have a mix of tiers among its
+     * recipients, and `Disposition-Notification-To` is a single message-level header (RFC 3798 has no "only
+     * notify me for these recipients" concept - every recipient's own system independently decides whether to
+     * honor the request regardless), so the effective rule in `BaseMessageRoute.send()` is "attach it if it
+     * applies to *any* recipient on the message". A per-draft `Message.requestReceipt` always overrides all
+     * three of these at once when explicitly set.
      *
-     * Internal defaults to `true` ("silently sent" within this same system, matching your own framing);
-     * external defaults to `false` (attaching a receipt request to every reply to a stranger or mailing list
-     * would be unusual and is opt-in instead).
+     * Receipt requests are a *disclosing* capability under `specs/end-to-end_encryption.md`'s Scoping
+     * Principle, so they default to same-organisation only: `Internal` (same-org) defaults to `true`
+     * ("silently sent" within this same system); `Federated` (a different organisation that has opted into
+     * RapidMX's federated protocols, but whose users never agreed to *this* organisation's read-tracking
+     * norms) and `External` both default to `false` - attaching a receipt request to a reply outside this
+     * organisation would be unusual and is opt-in instead.
      */
     alwaysRequestReceiptInternal: boolean;
+
+    alwaysRequestReceiptFederated: boolean;
 
     alwaysRequestReceiptExternal: boolean;
 
     /**
      * Whether this mailbox, as the *recipient* of a receipt request, sends one back immediately versus
      * holding it for the mailbox owner's explicit approval (`BaseMessageRoute`'s `POST /:id/receipt/approve`/
-     * `/decline`) - again split internal vs. external, this time classifying the *requester* (the address a
+     * `/decline`) - again split by `RecipientTier`, this time classifying the *requester* (the address a
      * receipt would be sent back to). Internal defaults to `true` (send automatically - matches your "all
-     * internal mail should always send/respond to receipt requests"); external defaults to `false` (held for
-     * approval by default - "external mail should be opt-in by default").
+     * internal mail should always send/respond to receipt requests"); Federated and External both default to
+     * `false` (held for approval by default - "anything outside this organisation should be opt-in by
+     * default").
      *
      * This is a two-state design (auto-send vs. hold-for-approval), not three - there is no "never respond at
      * all, silently" state. A mailbox owner who always declines a given sender's pending requests achieves
      * the practical equivalent, just as an explicit per-message action rather than a silent standing rule.
      */
     autoSendReceiptsInternal: boolean;
+
+    autoSendReceiptsFederated: boolean;
 
     autoSendReceiptsExternal: boolean;
 }

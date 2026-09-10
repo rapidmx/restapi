@@ -855,6 +855,25 @@ describe("Route:MessageSQL Tests", () => {
             expect(transport.sent).toHaveLength(0);
         });
 
+        it("autoSendReceiptsFederated does NOT auto-send for an external requester - no federation detection exists yet so a non-internal requester always classifies as external, and the mailbox's own autoSendReceiptsExternal default (false) still governs.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await mailboxRepo.update({ uid: mailbox.uid }, { autoSendReceiptsFederated: true });
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, {
+                messageId: "original@example.com",
+                dispositionNotificationTo: "stranger@outside.com",
+            });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, flags: { ...message.flags, read: true } });
+
+            expect(result.status).toBe(200);
+            expect(result.body.readReceiptSentAt).toBeFalsy();
+            expect(result.body.readReceiptPending).toBe(true);
+        });
+
         it("Sends the read receipt at most once - a later update that keeps flags.read true does not re-send.", async () => {
             const mailbox = await createMailbox(owner.uid);
             const folder = await createFolder(mailbox.uid, FolderType.INBOX);
@@ -1193,6 +1212,18 @@ describe("Route:MessageSQL Tests", () => {
             expect(result.body.receiptStatus).toEqual([{ recipientAddress: "recipient@example.com" }]);
             const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
             expect(transport.sent[0].raw.toString()).toContain("Disposition-Notification-To: owner@example.com");
+        });
+
+        it("alwaysRequestReceiptFederated does NOT opt an external recipient in - federated and external are distinct tiers, and no federation detection exists yet so a non-internal recipient always classifies as external.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await mailboxRepo.update({ uid: mailbox.uid }, { alwaysRequestReceiptFederated: true });
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+
+            const result = await sendDraft(mailbox, draftsFolder);
+
+            expect(result.body.receiptStatus).toBeFalsy();
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).not.toContain("Disposition-Notification-To");
         });
     });
 });

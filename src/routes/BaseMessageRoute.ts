@@ -19,7 +19,7 @@ import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { isInternalAddress } from "../util/DomainUtils.js";
+import { classifyRecipientTier } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { prependHeaders } from "../util/MimeHeaderUtils.js";
@@ -120,7 +120,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * sending/recipient mailbox's own receipt settings without depending on either backend directly. */
     protected abstract mailboxClass: any;
 
-    /** Supplied by the Mongo/SQL concrete subclasses so `isInternalAddress()` can classify a receipt
+    /** Supplied by the Mongo/SQL concrete subclasses so `classifyRecipientTier()` can classify a receipt
      * request's recipient/requester without depending on either backend directly - same field
      * `ScanQueueJob`/`BaseMailIngestRoute` already carry for the identical purpose. */
     protected abstract domainClass: any;
@@ -317,21 +317,26 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
         // A receipt request is a single message-level header - RFC 3798 has no "only notify me for these
         // recipients" concept, every recipient's own system independently decides whether to honor it - so
-        // the rule is "attach it if it applies to *any* recipient": each recipient is classified internal/
-        // external (`isInternalAddress()`, the same "this server's domains" check Focused Inbox already
-        // uses), and an explicit per-draft `message.requestReceipt` overrides both of the sending mailbox's
-        // own `alwaysRequestReceiptInternal`/`External` defaults at once when set.
+        // the rule is "attach it if it applies to *any* recipient": each recipient is classified by
+        // `classifyRecipientTier()` (`util/DomainUtils.ts` - same-org/federated/external), and an explicit
+        // per-draft `message.requestReceipt` overrides all three of the sending mailbox's own
+        // `alwaysRequestReceipt*` defaults at once when set.
         const sendingMailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, {
             ignoreACL: true,
         });
         let attachesReceiptRequest = false;
         if (sendingMailbox) {
             const effectiveInternal: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptInternal;
+            const effectiveFederated: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptFederated;
             const effectiveExternal: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptExternal;
-            if (effectiveInternal || effectiveExternal) {
+            if (effectiveInternal || effectiveFederated || effectiveExternal) {
                 for (const address of envelopeTo) {
-                    const internal: boolean = await isInternalAddress(this._objectFactory!, this.domainClass, address);
-                    if ((internal && effectiveInternal) || (!internal && effectiveExternal)) {
+                    const tier = await classifyRecipientTier(this._objectFactory!, this.domainClass, address);
+                    if (
+                        (tier === "same-org" && effectiveInternal) ||
+                        (tier === "federated" && effectiveFederated) ||
+                        (tier === "external" && effectiveExternal)
+                    ) {
                         attachesReceiptRequest = true;
                         break;
                     }
@@ -603,13 +608,14 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     /**
      * Decides whether to auto-send or hold-for-approval the read receipt for `message` (which the caller has
      * already confirmed both requests one and hasn't already been handled), applying `Mailbox.
-     * autoSendReceiptsInternal`/`External` per the requester's own internal/external classification - the
-     * exact same rule `ScanQueueJob.maybeSendReceipt()` applies for a delivery receipt, just triggered here by
-     * a read instead of a delivery. A send failure is left unrecorded (neither stamped sent nor marked
-     * pending) rather than persisted as a permanent failure - the natural retry opportunity is simply the
-     * message being marked read again later (e.g. unread, then read once more). Returns the message as it
-     * ends up after this method's own follow-up update, if any - `update()` returns *this* value, not its own
-     * pre-receipt snapshot, so the caller actually sees `readReceiptSentAt`/`readReceiptPending` reflected.
+     * autoSendReceipts*` per the requester's own `RecipientTier` (`util/DomainUtils.ts`'s
+     * `classifyRecipientTier()`) - the exact same rule `ScanQueueJob.maybeSendDeliveryReceipt()` applies for a
+     * delivery receipt, just triggered here by a read instead of a delivery. A send failure is left unrecorded
+     * (neither stamped sent nor marked pending) rather than persisted as a permanent failure - the natural
+     * retry opportunity is simply the message being marked read again later (e.g. unread, then read once
+     * more). Returns the message as it ends up after this method's own follow-up update, if any - `update()`
+     * returns *this* value, not its own pre-receipt snapshot, so the caller actually sees
+     * `readReceiptSentAt`/`readReceiptPending` reflected.
      */
     private async maybeSendReadReceipt(message: T): Promise<T> {
         const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
@@ -617,8 +623,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             return message;
         }
 
-        const internal: boolean = await isInternalAddress(this._objectFactory!, this.domainClass, message.dispositionNotificationTo!);
-        const autoSend: boolean = internal ? mailbox.autoSendReceiptsInternal : mailbox.autoSendReceiptsExternal;
+        const tier = await classifyRecipientTier(this._objectFactory!, this.domainClass, message.dispositionNotificationTo!);
+        const autoSend: boolean =
+            tier === "same-org"
+                ? mailbox.autoSendReceiptsInternal
+                : tier === "federated"
+                  ? mailbox.autoSendReceiptsFederated
+                  : mailbox.autoSendReceiptsExternal;
         if (!autoSend) {
             return await this.repoUtils!.update(
                 { uid: message.uid, version: (message as any).version, readReceiptPending: true } as any,

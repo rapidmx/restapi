@@ -138,12 +138,20 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     public alwaysRequestReceiptInternal: boolean = true;
 
     @Column()
+    @Description("Same as alwaysRequestReceiptInternal, for a federated-peer recipient.")
+    public alwaysRequestReceiptFederated: boolean = false;
+
+    @Column()
     @Description("Same as alwaysRequestReceiptInternal, for an external recipient.")
     public alwaysRequestReceiptExternal: boolean = false;
 
     @Column()
     @Description("Whether this mailbox auto-sends a receipt back to an internal requester versus holding it for approval.")
     public autoSendReceiptsInternal: boolean = true;
+
+    @Column()
+    @Description("Same as autoSendReceiptsInternal, for a federated-peer requester.")
+    public autoSendReceiptsFederated: boolean = false;
 
     @Column()
     @Description("Same as autoSendReceiptsInternal, for an external requester.")
@@ -176,12 +184,18 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
                 other.alwaysRequestReceiptInternal !== undefined
                     ? other.alwaysRequestReceiptInternal
                     : this.alwaysRequestReceiptInternal;
+            this.alwaysRequestReceiptFederated =
+                other.alwaysRequestReceiptFederated !== undefined
+                    ? other.alwaysRequestReceiptFederated
+                    : this.alwaysRequestReceiptFederated;
             this.alwaysRequestReceiptExternal =
                 other.alwaysRequestReceiptExternal !== undefined
                     ? other.alwaysRequestReceiptExternal
                     : this.alwaysRequestReceiptExternal;
             this.autoSendReceiptsInternal =
                 other.autoSendReceiptsInternal !== undefined ? other.autoSendReceiptsInternal : this.autoSendReceiptsInternal;
+            this.autoSendReceiptsFederated =
+                other.autoSendReceiptsFederated !== undefined ? other.autoSendReceiptsFederated : this.autoSendReceiptsFederated;
             this.autoSendReceiptsExternal =
                 other.autoSendReceiptsExternal !== undefined ? other.autoSendReceiptsExternal : this.autoSendReceiptsExternal;
         }
