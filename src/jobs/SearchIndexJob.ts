@@ -8,6 +8,7 @@ import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-
 import { BlobStore } from "../blob/BlobStore.js";
 import { SearchDocument, SearchProvider } from "../search/SearchProvider.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
+import { isEncryptedBody } from "../util/SmimeUtils.js";
 import { Attachment, Message } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
@@ -124,10 +125,17 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
     private async buildDocument(message: M): Promise<SearchDocument> {
         const raw: Buffer = await this.blobStore!.get(message.bodyBlobKey);
         const parsed: ParsedMail = await simpleParser(raw);
-        const body: string = typeof parsed.text === "string" ? parsed.text : (parsed.html || "").toString();
+        // An S/MIME-encrypted body is ciphertext to this server - indexing it (or any attachment text
+        // extracted from inside it) would only ever put garbage into the index, not a privacy leak by itself,
+        // but garbage nonetheless. `Message.subject`/`participants`/`dateForSort` below are unaffected: they
+        // come from the outer RFC 5322 headers, which S/MIME's `EnvelopedData` never encrypts (a sender using
+        // RFC 9788 header protection on top already replaces a real Subject with a non-revealing placeholder
+        // in that same outer header, so no extra detection is needed here for that case either).
+        const encrypted: boolean = isEncryptedBody(parsed);
+        const body: string = encrypted ? "" : typeof parsed.text === "string" ? parsed.text : (parsed.html || "").toString();
 
         const attachmentText: string[] = [];
-        if (message.hasAttachments) {
+        if (!encrypted && message.hasAttachments) {
             const attachments: A[] = await this.attachmentRepo!.find(
                 { messageUid: message.uid, extractedTextBlobKey: "ne(null)" },
                 { ignoreACL: true },

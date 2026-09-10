@@ -57,6 +57,68 @@ function makePlainRawMessage(): Buffer {
     return Buffer.from(raw);
 }
 
+/** An S/MIME `EnvelopedData` message - the entire body is one opaque `application/pkcs7-mime` part, exactly
+ * as this library's own (future) outgoing encrypted mail would be shaped per `specs/end-to-end_encryption.md`. */
+function makeEncryptedRawMessage(): Buffer {
+    const raw = [
+        "From: Sender <sender@example.com>",
+        "To: Recipient <recipient@example.com>",
+        "Subject: Encrypted message",
+        "MIME-Version: 1.0",
+        'Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"',
+        "Content-Transfer-Encoding: base64",
+        'Content-Disposition: attachment; filename="smime.p7m"',
+        "",
+        Buffer.from("fake CMS EnvelopedData DER bytes").toString("base64"),
+        "",
+    ].join("\r\n");
+    return Buffer.from(raw);
+}
+
+/** The OpenPGP/MIME encrypted shape - checked defensively even though this library only ever emits S/MIME. */
+function makeMultipartEncryptedRawMessage(): Buffer {
+    const raw = [
+        "From: Sender <sender@example.com>",
+        "To: Recipient <recipient@example.com>",
+        "Subject: PGP encrypted message",
+        "MIME-Version: 1.0",
+        'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="BOUNDARY"',
+        "",
+        "--BOUNDARY",
+        "Content-Type: application/pgp-encrypted",
+        "",
+        "Version: 1",
+        "",
+        "--BOUNDARY",
+        "Content-Type: application/octet-stream",
+        "",
+        Buffer.from("fake OpenPGP ciphertext").toString("base64"),
+        "",
+        "--BOUNDARY--",
+        "",
+    ].join("\r\n");
+    return Buffer.from(raw);
+}
+
+/** Opaque S/MIME *signing* (not encryption) - `smime-type=signed-data` still carries the real content, just
+ * PKCS#7-encoded, so `isEncryptedBody()` must not treat it as encrypted. This library's own signing never
+ * produces this content type (it uses detached `multipart/signed` instead), but a message from an external
+ * sender could still arrive shaped this way. */
+function makeOpaqueSignedRawMessage(): Buffer {
+    const raw = [
+        "From: Sender <sender@example.com>",
+        "To: Recipient <recipient@example.com>",
+        "Subject: Opaque signed message",
+        "MIME-Version: 1.0",
+        'Content-Type: application/pkcs7-mime; smime-type=signed-data; name="smime.p7m"',
+        "Content-Transfer-Encoding: base64",
+        "",
+        Buffer.from("fake CMS SignedData DER bytes").toString("base64"),
+        "",
+    ].join("\r\n");
+    return Buffer.from(raw);
+}
+
 function cleanSpam(): SpamScanResult {
     return { score: 0, verdict: SpamVerdict.CLEAN, symbols: [] };
 }
@@ -203,6 +265,46 @@ describe("ScanPipeline Tests", () => {
             const result = await pipeline.run(makeRawMessage(), makeEnvelope());
 
             expect(result.sanitizedHtml?.trim()).toBe("<p>Hello</p>");
+        });
+    });
+
+    describe("run() - encrypted body detection", () => {
+        beforeEach(() => {
+            (pipeline as any).spamScanProvider = spamScanProvider;
+            (pipeline as any).avScanProvider = avScanProvider;
+        });
+
+        it("Sets encrypted: true and derives no sanitizedHtml/bodyPreview for an S/MIME EnvelopedData message.", async () => {
+            const result = await pipeline.run(makeEncryptedRawMessage(), makeEnvelope());
+
+            expect(result.encrypted).toBe(true);
+            expect(result.sanitizedHtml).toBeUndefined();
+            expect(result.bodyPreview).toBeUndefined();
+        });
+
+        it("Sets encrypted: true for the multipart/encrypted (OpenPGP/MIME) shape too.", async () => {
+            const result = await pipeline.run(makeMultipartEncryptedRawMessage(), makeEnvelope());
+
+            expect(result.encrypted).toBe(true);
+        });
+
+        it("Does NOT treat opaque S/MIME signing (smime-type=signed-data) as encrypted.", async () => {
+            const result = await pipeline.run(makeOpaqueSignedRawMessage(), makeEnvelope());
+
+            expect(result.encrypted).toBe(false);
+        });
+
+        it("Sets encrypted: false for an ordinary HTML message, still deriving sanitizedHtml normally.", async () => {
+            const result = await pipeline.run(makeRawMessage(), makeEnvelope());
+
+            expect(result.encrypted).toBe(false);
+            expect(result.sanitizedHtml).toBeDefined();
+        });
+
+        it("Sets encrypted: false for an ordinary plain-text message.", async () => {
+            const result = await pipeline.run(makePlainRawMessage(), makeEnvelope());
+
+            expect(result.encrypted).toBe(false);
         });
     });
 

@@ -6,6 +6,7 @@ import { convert } from "html-to-text";
 import { ParsedMail, simpleParser } from "mailparser";
 import { TransportRule, TransportRuleAction, TransportRuleActionType, TransportRuleConditions } from "../models/types.js";
 import { stripPlusTag } from "./AddressUtils.js";
+import { isEncryptedBody } from "./SmimeUtils.js";
 
 /** The maximum length, in characters, of the plain-text body preview `buildTransportRuleContext()` derives -
  * mirrors `ScanPipeline`'s own `BODY_PREVIEW_MAX_LENGTH` constant (kept as a separate constant/parse rather
@@ -168,15 +169,31 @@ export async function buildTransportRuleContext(
 ): Promise<TransportRuleMatchContext> {
     const parsed: ParsedMail = await simpleParser(raw);
 
-    const bodyPreview: string =
-        (typeof parsed.text === "string" ? parsed.text : typeof parsed.html === "string" ? convert(parsed.html, { wordwrap: false }) : "")
-            ?.trim()
-            .slice(0, BODY_PREVIEW_MAX_LENGTH) ?? "";
+    // An S/MIME-encrypted body is ciphertext to this server - `bodyContains` can only ever see an empty
+    // preview for it (mailparser never populates `parsed.text`/`parsed.html` from a non-text top-level part),
+    // so it naturally never matches without any special-casing here. `hasAttachment`/`attachmentNameContains`
+    // need one, though: mailparser folds the *entire* encrypted body (`application/pkcs7-mime`, or the
+    // `application/pgp-encrypted`+`application/octet-stream` pair for `multipart/encrypted`) into
+    // `parsed.attachments` as a synthetic "attachment" node, since neither content type is `text/plain`/
+    // `text/html`. A real S/MIME `EnvelopedData` wraps the *entire* message body, so there is never a
+    // genuinely separate, still-visible attachment alongside it - anything mailparser reports here for an
+    // encrypted message is that synthetic node, not a real one, and must be ignored rather than surfaced as a
+    // false-positive attachment match.
+    const encrypted: boolean = isEncryptedBody(parsed);
 
-    const hasAttachment: boolean = (parsed.attachments ?? []).length > 0;
-    const attachmentFilenames: string[] = (parsed.attachments ?? [])
-        .map((attachment) => attachment.filename)
-        .filter((filename): filename is string => !!filename);
+    const bodyPreview: string = encrypted
+        ? ""
+        : ((typeof parsed.text === "string"
+              ? parsed.text
+              : typeof parsed.html === "string"
+                ? convert(parsed.html, { wordwrap: false })
+                : ""
+          )?.trim().slice(0, BODY_PREVIEW_MAX_LENGTH) ?? "");
+
+    const hasAttachment: boolean = !encrypted && (parsed.attachments ?? []).length > 0;
+    const attachmentFilenames: string[] = encrypted
+        ? []
+        : (parsed.attachments ?? []).map((attachment) => attachment.filename).filter((filename): filename is string => !!filename);
 
     const anyRecipientExternal: boolean =
         domains.length > 0 &&

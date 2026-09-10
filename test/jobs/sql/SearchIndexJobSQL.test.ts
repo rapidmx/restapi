@@ -216,6 +216,31 @@ describe("SearchIndexJobSQL Tests (real DB + DI)", () => {
         expect(doc!.body).toBe("");
     });
 
+    it("Indexes an empty body and no attachment text for an S/MIME-encrypted message, even when it's flagged as having attachments (the encrypted blob itself, not a real one).", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const blobKey = `body/${uuid.v4()}`;
+        await blobStore.put(
+            blobKey,
+            Buffer.from(
+                'Subject: Encrypted\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"\r\n' +
+                    "Content-Transfer-Encoding: base64\r\n\r\n" +
+                    Buffer.from("fake CMS EnvelopedData DER bytes").toString("base64"),
+            ),
+        );
+        const message = await createMessage({ bodyBlobKey: blobKey, hasAttachments: true });
+        const extractedBlobKey = `attachment-text/${uuid.v4()}`;
+        await blobStore.put(extractedBlobKey, Buffer.from("should never surface for an encrypted message"));
+        await createAttachment({ messageUid: message.uid, extractedTextBlobKey: extractedBlobKey });
+
+        await job.run();
+
+        const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+        const doc = searchProvider.indexed.get(`message:${message.uid}`);
+        expect(doc!.body).toBe("");
+        expect(doc!.attachmentText).toEqual([]);
+        expect(doc!.subject).toBe(message.subject);
+    });
+
     it("Includes extracted attachment text for a message that has attachments, skipping ones with no extracted text yet.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const bodyBlobKey = `body/${uuid.v4()}`;

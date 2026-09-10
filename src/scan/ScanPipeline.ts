@@ -7,6 +7,7 @@ import sanitizeHtml from "sanitize-html";
 import { simpleParser, ParsedMail, Attachment as ParsedAttachment } from "mailparser";
 import { ObjectDecorators } from "@rapidrest/core";
 import { AvVerdict, SpamVerdict } from "../models/types.js";
+import { isEncryptedBody } from "../util/SmimeUtils.js";
 import { AvScanProvider, AvScanResult } from "./AvScanProvider.js";
 import { ScanEnvelope, SpamScanProvider, SpamScanResult } from "./SpamScanProvider.js";
 const { Config, Inject, Logger } = ObjectDecorators;
@@ -30,14 +31,24 @@ export interface ScanPipelineResult {
     /** The overall AV verdict for the message: the worst of the raw-message-level and every attachment's scan. */
     av: AvScanResult;
     attachments: ScanPipelineAttachmentResult[];
-    /** The message's HTML body with `<script>`/active content stripped, if it had one. */
+    /** `true` when `util/SmimeUtils.ts`'s `isEncryptedBody()` identifies this message's body as S/MIME (CMS)
+     * encrypted - the server has no plaintext to work with, so `sanitizedHtml`/`bodyPreview` are never derived
+     * (mailparser wouldn't populate `parsed.html`/`parsed.text` from ciphertext anyway, but this flag is the
+     * authoritative signal downstream consumers - `SearchIndexJob`, `TransportRuleUtils`'s `bodyContains`
+     * condition - key off of, rather than inferring "encrypted" from "body fields happen to be empty" (which
+     * is also true of a message that's merely blank). AV/spam scoring above is unaffected: both operate on the
+     * raw message buffer, which needs no plaintext. */
+    encrypted: boolean;
+    /** The message's HTML body with `<script>`/active content stripped, if it had one. Never derived for an
+     * encrypted body - see `encrypted`. */
     sanitizedHtml?: string;
     /** The message's parsed subject line, used to populate `Message.subject` and to evaluate `MailFilterRule`
      * subject conditions. */
     subject?: string;
     /** A short plain-text preview of the message body (from its plain-text part, or its HTML part converted to
      * text if it has no plain-text part), truncated to `BODY_PREVIEW_MAX_LENGTH` characters. Used to populate
-     * `Message.bodyPreview` and to evaluate `MailFilterRule` body conditions. */
+     * `Message.bodyPreview` and to evaluate `MailFilterRule` body conditions. Never derived for an encrypted
+     * body - see `encrypted`. */
     bodyPreview?: string;
     /** The message's parsed `From` address (e.g. `"Jane Doe <jane@x.com>"`), used to evaluate `MailFilterRule`
      * from conditions - the envelope-from (`ScanEnvelope.from`) is the SMTP `MAIL FROM`, which can legitimately
@@ -150,10 +161,12 @@ export class ScanPipeline {
             }
         }
 
-        const sanitizedHtml: string | undefined =
-            typeof parsed.html === "string" ? this.sanitize(parsed.html) : undefined;
+        const encrypted: boolean = isEncryptedBody(parsed);
 
-        const bodyPreview: string | undefined = this.derivePreview(parsed);
+        const sanitizedHtml: string | undefined =
+            !encrypted && typeof parsed.html === "string" ? this.sanitize(parsed.html) : undefined;
+
+        const bodyPreview: string | undefined = encrypted ? undefined : this.derivePreview(parsed);
         const parsedFrom: string | undefined = parsed.from?.text;
         const autoSubmittedHeader: string | undefined = this.getHeaderString(parsed, "auto-submitted");
         const precedenceHeader: string | undefined = this.getHeaderString(parsed, "precedence");
@@ -178,6 +191,7 @@ export class ScanPipeline {
             spam,
             av: worstAv,
             attachments: attachmentResults,
+            encrypted,
             sanitizedHtml,
             subject: parsed.subject,
             bodyPreview,

@@ -246,5 +246,30 @@ describe("TransportRuleUtils Tests", () => {
             const context = await buildTransportRuleContext(raw, "sender@example.com", ["a@example.com"], ["example.com"]);
             expect(context.anyRecipientExternal).toBe(false);
         });
+
+        it("Leaves bodyPreview empty, hasAttachment false, and attachmentFilenames empty for an S/MIME-encrypted message - the entire encrypted body is otherwise indistinguishable from a real attachment to mailparser.", async () => {
+            const raw = Buffer.from(
+                [
+                    "From: sender@example.com",
+                    "Subject: Encrypted",
+                    'Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"',
+                    "Content-Transfer-Encoding: base64",
+                    'Content-Disposition: attachment; filename="smime.p7m"',
+                    "",
+                    Buffer.from("fake CMS EnvelopedData DER bytes").toString("base64"),
+                    "",
+                ].join("\r\n"),
+            );
+            const context = await buildTransportRuleContext(raw, "sender@example.com", ["a@example.com"], []);
+
+            expect(context.bodyPreview).toBe("");
+            expect(context.hasAttachment).toBe(false);
+            expect(context.attachmentFilenames).toEqual([]);
+        });
+
+        it("bodyContains never matches an encrypted message's (empty) body preview.", () => {
+            const context = makeContext({ bodyPreview: "" });
+            expect(matchesTransportRuleConditions({ bodyContains: ["anything"] }, context)).toBe(false);
+        });
     });
 });
