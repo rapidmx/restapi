@@ -23,6 +23,59 @@ export enum FolderType {
 }
 
 /**
+ * Describes a cryptographic public key used to sign or encrypt messages between parties - published via the
+ * federation discovery protocol (`.well-known/rapidmx/keys/:hash`, see `util/FederationUtils.ts`/
+ * `util/KeyDiscoveryClient.ts`) and stored on both `Mailbox` (this server's own users, once the key-vault
+ * work lands) and `Contact` (third parties discovered via that protocol). MUST NOT ever carry private key
+ * material - see `specs/end-to-end_encryption.md`'s Data Model section, where the corresponding
+ * `WrappedPrivateKey`/`MasterKeyWrap`/`KeyVault` types (private-material-carrying, and therefore not defined
+ * here yet) are introduced alongside the key-vault storage endpoints that actually need them.
+ */
+export interface PublicKey {
+    /** The base64 encoded public key (DER-encoded X.509 certificate). */
+    publicKey: string;
+    /** The key's type and format (e.g. `x509`). */
+    type: string;
+    /** The purpose this key is used for. */
+    useType: "sign" | "encrypt";
+    /** SHA-256 fingerprint of the certificate, hex encoded. Used for TOFU pinning and out-of-band verification. */
+    fingerprint: string;
+    /** UTC timestamp (epoch ms) at which this key becomes valid. */
+    notBefore: number;
+    /** UTC timestamp (epoch ms) at which this key expires. */
+    notAfter: number;
+    /** UTC timestamp (epoch ms) at which this key was revoked, if applicable. */
+    revokedAt?: number;
+}
+
+/**
+ * Describes the encryption preference of a `Mailbox` (this server's own users) or `Contact` (a third party
+ * discovered via the federation protocol) - whether messages to/from that address should default to
+ * encrypted. A client defaults to encrypting only when **both** sender and recipient report `"mutual"` - see
+ * the Encryption section of `specs/end-to-end_encryption.md`.
+ */
+export interface EncryptionPreference {
+    /** UTC timestamp (epoch ms) of the most recent effective date this preference was observed/set - used by
+     * the spec's Anti-Downgrade rule to reject a stale update (an older message must never regress a newer
+     * preference already on file). */
+    lastSeen?: number;
+    /** The encryption preference to apply to outgoing messages. */
+    preferEncrypt: "mutual" | "nopreference";
+}
+
+/**
+ * The JSON body served from (and consumed from) the federation discovery endpoint,
+ * `GET /.well-known/rapidmx/keys/:hash` - see `specs/end-to-end_encryption.md`'s "Public Endpoint" section.
+ * `escrow` is a self-reported, unverifiable honesty signal (whether the serving domain holds a key capable
+ * of decrypting this mailbox), never a guarantee.
+ */
+export interface KeyDiscoveryResponse {
+    encryptPreference: EncryptionPreference;
+    keys: PublicKey[];
+    escrow: boolean;
+}
+
+/**
  * Defines a single mailbox belonging to a `User`. A mailbox is the root of a user's Folder hierarchy and the
  * unit that MAPI/EAS clients log on to.
  *
