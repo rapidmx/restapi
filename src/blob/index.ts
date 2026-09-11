@@ -4,3 +4,4 @@
 ///////////////////////////////////////////////////////////////////////////////
 export * from "./BlobStore.js";
 export * from "./LocalFsBlobStore.js";
+export * from "./S3BlobStore.js";

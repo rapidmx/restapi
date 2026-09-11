@@ -1,0 +1,174 @@
+///////////////////////////////////////////////////////////////////////////////
+// Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
+// SPDX-License-Identifier: MPL-2.0
+///////////////////////////////////////////////////////////////////////////////
+import type { GetObjectCommandOutput, HeadObjectCommandOutput, S3Client } from "@aws-sdk/client-s3";
+import { ApiError, ObjectDecorators } from "@rapidrest/core";
+import { ApiErrors } from "@rapidrest/service-core";
+import { importAwsClientS3 } from "../shared.js";
+import { BlobPutOptions, BlobRange, BlobStore } from "./BlobStore.js";
+import { toBuffer } from "./LocalFsBlobStore.js";
+const { Config } = ObjectDecorators;
+
+/**
+ * A `BlobStore` implementation backed by Amazon S3 or any S3-compatible object store (MinIO, Cloudflare
+ * R2, DigitalOcean Spaces, etc.) — the recommended `BlobStore` for a multi-instance deployment, where
+ * `LocalFsBlobStore`'s single-host/shared-mount assumption no longer holds.
+ *
+ * Deliberately not AWS-only: `mail:blob:s3:endpoint`/`mail:blob:s3:force_path_style` let this same class
+ * target a self-hosted or non-AWS S3-compatible endpoint instead, matching this repo's established
+ * preference for avoiding a single paid vendor's lock-in wherever a genuinely compatible open alternative
+ * exists (`OpenBaoPkiCertificateAuthority` over Vault, `PostfixSendmailTransport` over a paid relay).
+ * Credentials default to the standard AWS SDK credential provider chain (an IAM role in a real AWS
+ * deployment), the same "no secret/key configuration of its own" posture `SesMailTransport` uses;
+ * `mail:blob:s3:access_key_id`/`mail:blob:s3:secret_access_key` are an explicit override pair for a
+ * target with no IAM-equivalent chain to fall back to (e.g. a standalone MinIO instance).
+ *
+ * `mail:blob:s3:prefix` mirrors `LocalFsBlobStore`'s `mail:blob:local:root` concept for object storage:
+ * it lets one bucket be safely shared across multiple environments/apps (e.g. `prod/`, `staging/`)
+ * without key collisions, since a bucket is a comparatively coarse-grained/slow-to-provision resource
+ * compared to a filesystem directory.
+ *
+ * Unlike `LocalFsBlobStore`, keys are not hashed/sharded before use as the S3 object key - S3 has no
+ * "too many files in one directory" problem, and preserving the caller's own key verbatim (aside from
+ * the prefix) keeps objects easy to locate directly in the bucket for operational debugging. Deleting a
+ * nonexistent key is also a plain no-op success response from S3 itself (idempotent by design), unlike
+ * `fs.unlink`'s `ENOENT` - `delete()` below needs no error handling at all as a result.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export class S3BlobStore implements BlobStore {
+    @Config("mail:blob:s3:bucket", "")
+    private bucket: string = "";
+
+    @Config("mail:blob:s3:region")
+    private region?: string;
+
+    /** Prepended to every key - see class doc comment. Empty string (the default) means no prefixing. */
+    @Config("mail:blob:s3:prefix", "")
+    private prefix: string = "";
+
+    /** A custom S3-compatible endpoint (MinIO, R2, Spaces, etc.) - unset targets real AWS S3. */
+    @Config("mail:blob:s3:endpoint")
+    private endpoint?: string;
+
+    @Config("mail:blob:s3:force_path_style", false)
+    private forcePathStyle: boolean = false;
+
+    @Config("mail:blob:s3:access_key_id")
+    private accessKeyId?: string;
+
+    @Config("mail:blob:s3:secret_access_key")
+    private secretAccessKey?: string;
+
+    private client?: S3Client;
+
+    private resolveKey(key: string): string {
+        return this.prefix ? `${this.prefix.replace(/\/+$/, "")}/${key}` : key;
+    }
+
+    private async getClient(sdk?: any): Promise<S3Client> {
+        if (!this.bucket) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, "mail:blob:s3:bucket is required but was not configured.");
+        }
+        sdk = sdk ?? (await importAwsClientS3());
+        if (!this.client) {
+            if ((this.accessKeyId && !this.secretAccessKey) || (!this.accessKeyId && this.secretAccessKey)) {
+                throw new ApiError(
+                    ApiErrors.INTERNAL_ERROR,
+                    500,
+                    "mail:blob:s3:access_key_id and mail:blob:s3:secret_access_key must both be set, or both left unset.",
+                );
+            }
+            const options: any = {};
+            if (this.region) {
+                options.region = this.region;
+            }
+            if (this.endpoint) {
+                options.endpoint = this.endpoint;
+            }
+            if (this.forcePathStyle) {
+                options.forcePathStyle = true;
+            }
+            if (this.accessKeyId && this.secretAccessKey) {
+                options.credentials = { accessKeyId: this.accessKeyId, secretAccessKey: this.secretAccessKey };
+            }
+            this.client = new sdk.S3Client(options);
+        }
+        return this.client as any;
+    }
+
+    public async put(key: string, data: Buffer | NodeJS.ReadableStream, options?: BlobPutOptions): Promise<void> {
+        const sdk = await importAwsClientS3();
+        const client = await this.getClient(sdk);
+        await client.send(
+            new sdk.PutObjectCommand({
+                Bucket: this.bucket,
+                Key: this.resolveKey(key),
+                Body: data,
+                ContentType: options?.contentType,
+            }),
+        );
+    }
+
+    public async get(key: string): Promise<Buffer> {
+        return await toBuffer(await this.getStream(key));
+    }
+
+    public async getStream(key: string, range?: BlobRange): Promise<NodeJS.ReadableStream> {
+        const sdk = await importAwsClientS3();
+        const client = await this.getClient(sdk);
+        try {
+            const response: GetObjectCommandOutput = await client.send(
+                new sdk.GetObjectCommand({
+                    Bucket: this.bucket,
+                    Key: this.resolveKey(key),
+                    Range: range ? `bytes=${range.start}-${range.end ?? ""}` : undefined,
+                }),
+            );
+            return response.Body as unknown as NodeJS.ReadableStream;
+        } catch (err: any) {
+            if (err.name === "NoSuchKey") {
+                throw new ApiError(ApiErrors.NOT_FOUND, 404, `No blob exists at key '${key}'.`);
+            }
+            throw err;
+        }
+    }
+
+    public async delete(key: string): Promise<void> {
+        const sdk = await importAwsClientS3();
+        const client = await this.getClient(sdk);
+        // S3 delete of a nonexistent key is a normal success response - see class doc comment.
+        await client.send(new sdk.DeleteObjectCommand({ Bucket: this.bucket, Key: this.resolveKey(key) }));
+    }
+
+    public async exists(key: string): Promise<boolean> {
+        const sdk = await importAwsClientS3();
+        const client = await this.getClient(sdk);
+        try {
+            await client.send(new sdk.HeadObjectCommand({ Bucket: this.bucket, Key: this.resolveKey(key) }));
+            return true;
+        } catch (err: any) {
+            if (err.name === "NotFound" || err.$metadata?.httpStatusCode === 404) {
+                return false;
+            }
+            throw err;
+        }
+    }
+
+    public async size(key: string): Promise<number> {
+        const sdk = await importAwsClientS3();
+        const client = await this.getClient(sdk);
+        try {
+            const response: HeadObjectCommandOutput = await client.send(
+                new sdk.HeadObjectCommand({ Bucket: this.bucket, Key: this.resolveKey(key) }),
+            );
+            return response.ContentLength ?? 0;
+        } catch (err: any) {
+            if (err.name === "NotFound" || err.$metadata?.httpStatusCode === 404) {
+                throw new ApiError(ApiErrors.NOT_FOUND, 404, `No blob exists at key '${key}'.`);
+            }
+            throw err;
+        }
+    }
+}
