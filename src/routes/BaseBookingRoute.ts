@@ -326,11 +326,14 @@ export abstract class BaseBookingRoute<
     /**
      * Counts the non-cancelled bookings already placed on the local calendar date containing `slotStart`.
      *
-     * Implemented as two `count()` queries whose results are subtracted, rather than one range query plus
-     * in-process filtering: the query DSL's `range()` operator falls back to comparing *strings* when its
-     * operands aren't JSON-parseable (which ISO timestamps never are), which does not compare correctly against
-     * a real datetime column. Two `gte()` counts are unambiguous, fully evaluated in the database, and portable
-     * across both backends.
+     * A single `range()` count query. This used to be two `count()` queries subtracted instead, because the
+     * query DSL's `range()` operator fell back to comparing ISO timestamps as raw strings against a real
+     * datetime column - fixed by `@rapidrest/service-core` 2.0's improved operand type coercion, confirmed by
+     * reading its `ModelUtils.coerceOperand()` (both `range()` operands now go through the exact same
+     * Date-aware coercion `gte()`/`lte()` already used). `range()` is inclusive on both ends (TypeORM
+     * `Between()` / Mongo `$gte`+`$lte`), so the upper bound is `dayEnd` minus one millisecond to keep this
+     * the same half-open `[dayStart, dayEnd)` window the old workaround computed - without it, a booking
+     * starting at exactly the next day's midnight would double-count into both days.
      */
     private async countBookingsOnDay(bookingType: BT, slotStart: Date): Promise<number> {
         const parts = new Intl.DateTimeFormat("en-US", {
@@ -344,19 +347,16 @@ export abstract class BaseBookingRoute<
             values[part.type] = part.value;
         }
         const dayStart: Date = convertLocalToUtc(Number(values.year), Number(values.month), Number(values.day), 0, 0, 0, bookingType.timezone)!;
-        const dayEnd: Date = new Date(dayStart.getTime() + MS_PER_DAY);
+        const dayEnd: Date = new Date(dayStart.getTime() + MS_PER_DAY - 1);
 
-        const [fromDayStart, fromDayEnd] = await Promise.all([
-            this.bookingRepo!.count(
-                { bookingTypeUid: bookingType.uid, status: `ne(${BookingStatus.CANCELLED})`, startDate: `gte(${dayStart.toISOString()})` } as any,
-                { ignoreACL: true },
-            ),
-            this.bookingRepo!.count(
-                { bookingTypeUid: bookingType.uid, status: `ne(${BookingStatus.CANCELLED})`, startDate: `gte(${dayEnd.toISOString()})` } as any,
-                { ignoreACL: true },
-            ),
-        ]);
-        return fromDayStart - fromDayEnd;
+        return await this.bookingRepo!.count(
+            {
+                bookingTypeUid: bookingType.uid,
+                status: `ne(${BookingStatus.CANCELLED})`,
+                startDate: `range(${dayStart.toISOString()},${dayEnd.toISOString()})`,
+            } as any,
+            { ignoreACL: true },
+        );
     }
 
     /**
