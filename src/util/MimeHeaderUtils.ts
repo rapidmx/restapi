@@ -62,6 +62,31 @@ export function extractHeader(raw: Buffer, name: string): string | undefined {
 }
 
 /**
+ * Like `extractHeader()`, but returns every occurrence of `name` rather than just the first - needed for a
+ * header that can legitimately repeat (e.g. `Authentication-Results`, once per authenticating hop) or where
+ * the mere presence of more than one occurrence is itself meaningful (e.g. `RapidMX-Key`'s own processing
+ * rule: a message carrying more than one MUST have all of them ignored - a caller can't tell that happened
+ * from `extractHeader()`'s single, first-match result alone).
+ */
+export function extractHeaders(raw: Buffer, name: string): string[] {
+    const { headerText } = splitRawIntoHeaderAndBody(raw);
+    const prefix: string = `${name.toLowerCase()}:`;
+    const values: string[] = [];
+    for (const line of splitLogicalHeaderLines(headerText)) {
+        if (line.toLowerCase().startsWith(prefix)) {
+            values.push(
+                line
+                    .slice(prefix.length)
+                    .split(/\r\n[ \t]*/)
+                    .join(" ")
+                    .trim(),
+            );
+        }
+    }
+    return values;
+}
+
+/**
  * Splits `raw` into its header block/body, filters the header block's logical lines through
  * `filterLine` (return `false` to drop a header), then rebuilds the message with `newHeaders` prepended
  * ahead of the surviving ones - headers are order-independent, so prepending is always safe. Shared by

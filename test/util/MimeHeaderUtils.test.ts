@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { extractHeader, prependHeaders } from "../../src/util/MimeHeaderUtils.js";
+import { extractHeader, extractHeaders, prependHeaders } from "../../src/util/MimeHeaderUtils.js";
 
 describe("MimeHeaderUtils Tests", () => {
     describe("extractHeader()", () => {
@@ -30,6 +30,38 @@ describe("MimeHeaderUtils Tests", () => {
             const raw = Buffer.from("\r\nFrom: a@example.com\r\nSubject: Hello\r\n\r\nBody\r\n");
             expect(extractHeader(raw, "Subject")).toBe("Hello");
             expect(extractHeader(raw, "From")).toBe("a@example.com");
+        });
+    });
+
+    describe("extractHeaders()", () => {
+        it("Returns every occurrence of a header that repeats.", () => {
+            const raw = Buffer.from(
+                "Authentication-Results: mx1.example.com; dkim=pass\r\nAuthentication-Results: mx2.example.com; dkim=fail\r\n\r\nBody\r\n",
+            );
+            expect(extractHeaders(raw, "Authentication-Results")).toEqual([
+                "mx1.example.com; dkim=pass",
+                "mx2.example.com; dkim=fail",
+            ]);
+        });
+
+        it("Returns a single-element array for a header that appears once.", () => {
+            const raw = Buffer.from("From: a@example.com\r\nSubject: Hello\r\n\r\nBody\r\n");
+            expect(extractHeaders(raw, "Subject")).toEqual(["Hello"]);
+        });
+
+        it("Returns an empty array when the header isn't present at all.", () => {
+            const raw = Buffer.from("From: a@example.com\r\n\r\nBody\r\n");
+            expect(extractHeaders(raw, "Subject")).toEqual([]);
+        });
+
+        it("Unfolds a continuation line the same way extractHeader() does.", () => {
+            const raw = Buffer.from("Subject: Hello\r\n World\r\n\r\nBody\r\n");
+            expect(extractHeaders(raw, "Subject")).toEqual(["Hello World"]);
+        });
+
+        it("Is case-insensitive on the header name.", () => {
+            const raw = Buffer.from("X-Custom: value\r\n\r\nBody\r\n");
+            expect(extractHeaders(raw, "x-custom")).toEqual(["value"]);
         });
     });
 

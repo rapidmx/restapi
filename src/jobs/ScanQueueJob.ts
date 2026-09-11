@@ -10,16 +10,20 @@ import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, ScanPipelineResult } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
+import { hasAlignedPassingDkim } from "../util/AuthenticationResultsUtils.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { deriveConversationId } from "../util/ConversationUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { buildEventIcs, expandOccurrences, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
+import { applyDiscoveredKeys, ContactKeyState } from "../util/KeyringUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
+import { extractHeaders } from "../util/MimeHeaderUtils.js";
 import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification, parseDispositionNotification } from "../util/ReceiptUtils.js";
+import { parseRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
 import {
     Attachment,
     Attendee,
@@ -30,11 +34,13 @@ import {
     CalendarEvent,
     CalendarEventStatus,
     Contact,
+    ContactAddressKind,
     FocusedInboxOverride,
     Folder,
     FolderType,
     IngestQueueEntry,
     IngestStatus,
+    KeyDiscoveryResponse,
     Mailbox,
     MailFilterRule,
     Message,
@@ -386,6 +392,11 @@ export abstract class ScanQueueJob<
         result: ScanPipelineResult,
         isJunk: boolean,
     ): Promise<void> {
+        // Independent of everything below (filtering, filing, junk classification) - `specs/
+        // end-to-end_encryption.md`'s "Only inbound messages are processed, keyed on the From address" rule
+        // applies to every delivered message regardless of which folder (or none) it ends up filed into.
+        await this.processInboundRapidMxKeyHeader(entry, raw);
+
         let sanitizedHtmlBlobKey: string | undefined;
         if (result.sanitizedHtml !== undefined) {
             sanitizedHtmlBlobKey = `sanitized/${crypto.randomUUID()}`;
@@ -574,6 +585,77 @@ export abstract class ScanQueueJob<
      */
     protected contactEmailQuery(address: string): any {
         return { "emails.address": address };
+    }
+
+    /**
+     * Implements `specs/end-to-end_encryption.md`'s In-Band Key Attachment processing rules for an inbound
+     * message's `RapidMX-Key` header (Group E3). Reuses `util/KeyringUtils.ts`'s `applyDiscoveredKeys()` -
+     * the same TOFU/Key-Conflict/Anti-Downgrade merge logic Group E2's `GET /keys/lookup` uses, applied here
+     * to a header-carried key instead of a live Discovery fetch.
+     *
+     * Fails closed at every gate: more than one `RapidMX-Key` header, an unverified/misaligned DKIM result
+     * (`util/AuthenticationResultsUtils.ts`), or a header that doesn't parse
+     * (`util/RapidMxKeyHeaderUtils.ts`) are all treated identically to "no key header present at all" - never
+     * a thrown error, and never enough to justify creating a new `Contact` on their own (see below).
+     *
+     * `Contact.lastMessageSeen` is still stamped for an *existing* Contact even when nothing new was
+     * discovered, per the spec's Anti-Downgrade rule - but a brand-new `Contact` is only ever created when a
+     * key was actually, successfully discovered; recording `lastMessageSeen` alone is not reason enough to
+     * add an address to the mailbox's own address book.
+     */
+    private async processInboundRapidMxKeyHeader(entry: Q, raw: Buffer): Promise<void> {
+        const fromAddress: string = entry.envelopeFrom;
+        const fromDomain: string | undefined = fromAddress.split("@")[1];
+        if (!fromDomain) {
+            return;
+        }
+
+        let discovered: KeyDiscoveryResponse | undefined;
+        const keyHeaders: string[] = extractHeaders(raw, "RapidMX-Key");
+        if (keyHeaders.length > 0 && hasAlignedPassingDkim(extractHeaders(raw, "Authentication-Results"), fromDomain)) {
+            const parsed = parseRapidMxKeyHeader(keyHeaders, fromAddress);
+            if (parsed) {
+                discovered = { keys: [parsed.publicKey], encryptPreference: { preferEncrypt: parsed.preferEncrypt, lastSeen: Date.now() }, escrow: false };
+            }
+        }
+
+        const existingMatches: C[] = await this.contactRepo!.find(
+            { mailboxUid: entry.mailboxUid, ...this.contactEmailQuery(fromAddress) },
+            { ignoreACL: true, limit: 1 },
+        );
+        const existingContact: C | undefined = existingMatches[0];
+        if (!existingContact && !discovered) {
+            // Nothing on file, nothing discovered - recording lastMessageSeen alone isn't reason enough to
+            // create a Contact for every random inbound sender.
+            return;
+        }
+
+        const now: number = Date.now();
+        const update: ContactKeyState = applyDiscoveredKeys(existingContact, discovered, now, "header");
+
+        if (existingContact) {
+            await this.contactRepo!.update(
+                { uid: existingContact.uid, version: (existingContact as any).version, ...update, lastMessageSeen: now } as any,
+                existingContact,
+                { ignoreACL: true },
+            );
+            return;
+        }
+
+        const folder: F = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, entry.mailboxUid, FolderType.CONTACTS);
+        await this.contactRepo!.create(
+            new this.contactClass({
+                mailboxUid: entry.mailboxUid,
+                folderUid: folder.uid,
+                displayName: fromAddress,
+                emails: [{ address: fromAddress, type: ContactAddressKind.OTHER }],
+                phones: [],
+                addresses: [],
+                ...update,
+                lastMessageSeen: now,
+            }),
+            { ignoreACL: true },
+        );
     }
 
     /**

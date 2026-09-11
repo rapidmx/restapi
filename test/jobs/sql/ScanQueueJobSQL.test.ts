@@ -7,6 +7,8 @@
 // header for the full rationale (also applies here verbatim). Uses `config.sql.ts`, whose `acl` datastore is
 // ALSO SQL-backed (`AccessControlListSQL`, auto-selected by `ACLUtils` from the connection's runtime type) -
 // so this file has no MongoDB dependency at all, unlike the Mongo-ACL-dependent form this file used earlier.
+import "reflect-metadata";
+import * as x509 from "@peculiar/x509";
 import { ACLUtils, AccessControlListSQL, ConnectionManager, ObjectFactory, isSqlDataSource } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
@@ -157,6 +159,23 @@ function makeEncryptedRawMessage(): Buffer {
         "",
     ].join("\r\n");
     return Buffer.from(raw);
+}
+
+x509.cryptoProvider.set(crypto);
+
+async function makeCertBase64(cn: string): Promise<string> {
+    const keys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
+        "sign",
+        "verify",
+    ]);
+    const cert = await x509.X509CertificateGenerator.createSelfSigned({
+        name: `CN=${cn}`,
+        notBefore: new Date(),
+        notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+        keys,
+        signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+    });
+    return Buffer.from(cert.rawData).toString("base64");
 }
 
 /** A plain message with no attachments at all. */
@@ -355,6 +374,134 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         const messages = await messageRepo.find({ where: { folderUid: inbox!.uid } });
         expect(messages.length).toBe(1);
         expect(messages[0].encrypted).toBe(true);
+    });
+
+    describe("Inbound RapidMX-Key header processing (Group E3)", () => {
+        it("Does nothing (no throw) when envelopeFrom has no domain part at all.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, Buffer.from("From: malformed\r\nTo: recipient@example.com\r\n\r\nHello.\r\n"));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "malformed" });
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            const contacts = await contactRepo.find({ where: { mailboxUid } });
+            expect(contacts).toHaveLength(0);
+        });
+
+        it("Creates a Contact carrying the discovered key when the header is present with an aligned, passing DKIM result.", async () => {
+            const keydata = await makeCertBase64("sender@example.com");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                makePlainRawMessage(
+                    `RapidMX-Key: addr=sender@example.com; prefer-encrypt=mutual; type=x509; keydata=${keydata}\r\nAuthentication-Results: mx.example.com; dkim=pass header.d=example.com`,
+                ),
+            );
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            const contacts = await contactRepo.find({ where: { mailboxUid } });
+            expect(contacts).toHaveLength(1);
+            expect(contacts[0].emails).toEqual([{ address: "sender@example.com", type: "other" }]);
+            expect(contacts[0].keys).toHaveLength(1);
+            expect(contacts[0].keys![0].fingerprint).toMatch(/^[0-9a-f]+$/);
+            expect(contacts[0].encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: expect.any(Number) });
+            expect(contacts[0].lastMessageSeen).toEqual(expect.any(Number));
+        });
+
+        it("Ignores the header (and creates no Contact) when there is no Authentication-Results header at all.", async () => {
+            const keydata = await makeCertBase64("sender@example.com");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                makePlainRawMessage(`RapidMX-Key: addr=sender@example.com; type=x509; keydata=${keydata}`),
+            );
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            const contacts = await contactRepo.find({ where: { mailboxUid } });
+            expect(contacts).toHaveLength(0);
+        });
+
+        it("Ignores the header when DKIM failed, even though the header itself is well-formed.", async () => {
+            const keydata = await makeCertBase64("sender@example.com");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                makePlainRawMessage(
+                    `RapidMX-Key: addr=sender@example.com; type=x509; keydata=${keydata}\r\nAuthentication-Results: mx.example.com; dkim=fail header.d=example.com`,
+                ),
+            );
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            const contacts = await contactRepo.find({ where: { mailboxUid } });
+            expect(contacts).toHaveLength(0);
+        });
+
+        it("Stamps lastMessageSeen on an existing Contact for a message with no key header, leaving its pinned key untouched (Anti-Downgrade).", async () => {
+            const pinnedKey = { publicKey: "b64", type: "x509", useType: "encrypt" as const, fingerprint: "fp-pinned", notBefore: 0, notAfter: Date.now() + 1_000_000 };
+            await contactRepo.save(
+                new ContactSQL({
+                    mailboxUid,
+                    folderUid: uuid.v4(),
+                    displayName: "sender@example.com",
+                    emails: [{ address: "sender@example.com", type: "other" as any }],
+                    phones: [],
+                    addresses: [],
+                    keys: [pinnedKey],
+                    encryptPreference: { preferEncrypt: "mutual", lastSeen: 5 },
+                }),
+            );
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage());
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            const contacts = await contactRepo.find({ where: { mailboxUid } });
+            expect(contacts).toHaveLength(1);
+            expect(contacts[0].keys).toEqual([pinnedKey]);
+            expect(contacts[0].encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 5 });
+            expect(contacts[0].lastMessageSeen).toEqual(expect.any(Number));
+        });
+
+        it("Does not create a Contact for a message with no key header when none already exists.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage());
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            const contacts = await contactRepo.find({ where: { mailboxUid } });
+            expect(contacts).toHaveLength(0);
+        });
+
+        it("Ignores more than one RapidMX-Key header on the same message.", async () => {
+            const keydata = await makeCertBase64("sender@example.com");
+            const oneHeader = `RapidMX-Key: addr=sender@example.com; type=x509; keydata=${keydata}`;
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                makePlainRawMessage(`${oneHeader}\r\n${oneHeader}\r\nAuthentication-Results: mx.example.com; dkim=pass header.d=example.com`),
+            );
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            const contacts = await contactRepo.find({ where: { mailboxUid } });
+            expect(contacts).toHaveLength(0);
+        });
     });
 
     it("Sets conversationId to the message's own resolved messageId when it has no References/In-Reply-To (starts a new conversation).", async () => {
