@@ -38,6 +38,9 @@ export interface SearchDocument {
     flags?: string[];
     /** Whether the entity has attachments - powers the `has:attachment` query operator. */
     hasAttachments?: boolean;
+    /** `Label.uid`s applied to this entity (a message), if any - powers the `label:` query operator. Matched
+     * by uid, the same "client resolves the human-readable form first" convention `folderUid`/`in:` uses. */
+    labels?: string[];
     /**
      * True when this document was built from an encrypted entity whose `subject`/`body`/`attachmentText`
      * were therefore intentionally excluded (`specs/search.md` §2/§6, Tier 1 still indexes the reduced field
@@ -84,6 +87,9 @@ export interface SearchQuery {
     folderUid?: string;
     /** `is:` - one or more flag/state strings, matched as an AND (all must be present). */
     flags?: string[];
+    /** `label:` - one or more `Label.uid`s, matched as an AND (all must be present), the same semantics `is:`
+     * already uses for flags. */
+    labels?: string[];
 }
 
 /** A single ranked hit returned by `SearchProvider.search()`. */
@@ -122,6 +128,7 @@ export interface CandidateQuery {
     after?: Date;
     folderUid?: string;
     flags?: string[];
+    labels?: string[];
     limit?: number;
     cursor?: string;
 }

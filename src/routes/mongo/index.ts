@@ -16,6 +16,7 @@ export * from "./IngestQueueRouteMongo.js";
 export * from "./KeyDiscoveryRouteMongo.js";
 export * from "./KeyLookupRouteMongo.js";
 export * from "./KeyVaultRouteMongo.js";
+export * from "./LabelRouteMongo.js";
 export * from "./MailboxRouteMongo.js";
 export * from "./MailFilterRuleRouteMongo.js";
 export * from "./MailIngestRouteMongo.js";

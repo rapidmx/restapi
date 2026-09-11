@@ -43,6 +43,9 @@ export interface MailFilterEvaluationResult {
 
     /** One entry per matching `FORWARD` action's `forwardTo` address. */
     forwardTo: string[];
+
+    /** One entry per matching `APPLY_LABEL` action's `labelUid` - folded onto the delivered `Message.labelUids`. */
+    labelUidsToApply: string[];
 }
 
 function containsAnyIgnoreCase(haystack: string, needles?: string[]): boolean {
@@ -106,6 +109,11 @@ function applyAction(result: MailFilterEvaluationResult, action: MailFilterActio
                 result.forwardTo.push(action.forwardTo);
             }
             break;
+        case MailFilterActionType.APPLY_LABEL:
+            if (action.labelUid) {
+                result.labelUidsToApply.push(action.labelUid);
+            }
+            break;
     }
 }
 
@@ -115,7 +123,13 @@ function applyAction(result: MailFilterEvaluationResult, action: MailFilterActio
  * rule has `stopProcessingRules: true` (mirrors the Rules Wizard's "stop processing more rules" checkbox).
  */
 export function evaluateMailFilterRules(rules: MailFilterRule[], context: MailFilterMatchContext): MailFilterEvaluationResult {
-    const result: MailFilterEvaluationResult = { copyToFolderUids: [], deleted: false, markRead: false, forwardTo: [] };
+    const result: MailFilterEvaluationResult = {
+        copyToFolderUids: [],
+        deleted: false,
+        markRead: false,
+        forwardTo: [],
+        labelUidsToApply: [],
+    };
 
     const sorted = rules.filter((rule) => rule.enabled).sort((a, b) => a.sequence - b.sequence);
     for (const rule of sorted) {

@@ -88,7 +88,13 @@ describe("matchesConditions() Tests", () => {
 describe("evaluateMailFilterRules() Tests", () => {
     it("Returns an all-false/empty result when no rule matches.", () => {
         const result = evaluateMailFilterRules([makeRule({ conditions: { subjectContains: ["invoice"] } })], makeContext());
-        expect(result).toEqual({ copyToFolderUids: [], deleted: false, markRead: false, forwardTo: [] });
+        expect(result).toEqual({
+            copyToFolderUids: [],
+            deleted: false,
+            markRead: false,
+            forwardTo: [],
+            labelUidsToApply: [],
+        });
     });
 
     it("Skips disabled rules even if their conditions would match.", () => {
@@ -132,6 +138,15 @@ describe("evaluateMailFilterRules() Tests", () => {
         ];
         const result = evaluateMailFilterRules(rules, makeContext());
         expect(result.forwardTo).toEqual(["a@example.com", "b@example.com"]);
+    });
+
+    it("Accumulates labelUidsToApply across matching rules' APPLY_LABEL actions.", () => {
+        const rules = [
+            makeRule({ sequence: 0, actions: [{ type: MailFilterActionType.APPLY_LABEL, labelUid: "label-a" }] }),
+            makeRule({ sequence: 1, actions: [{ type: MailFilterActionType.APPLY_LABEL, labelUid: "label-b" }] }),
+        ];
+        const result = evaluateMailFilterRules(rules, makeContext());
+        expect(result.labelUidsToApply).toEqual(["label-a", "label-b"]);
     });
 
     it("Evaluates rules in ascending sequence order regardless of array order.", () => {

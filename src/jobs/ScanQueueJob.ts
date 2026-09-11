@@ -416,7 +416,13 @@ export abstract class ScanQueueJob<
             });
         }
 
-        let filterResult: MailFilterEvaluationResult = { copyToFolderUids: [], deleted: false, markRead: false, forwardTo: [] };
+        let filterResult: MailFilterEvaluationResult = {
+            copyToFolderUids: [],
+            deleted: false,
+            markRead: false,
+            forwardTo: [],
+            labelUidsToApply: [],
+        };
         if (!isJunk) {
             const rules: MFR[] = await this.mailFilterRuleRepo!.find(
                 { mailboxUid: entry.mailboxUid, enabled: true, sort: "sequence", limit: 500 } as any,
@@ -515,6 +521,7 @@ export abstract class ScanQueueJob<
                     conversationId,
                     inferenceClassification,
                     hasAttachments: storedAttachments.length > 0,
+                    labelUids: filterResult.labelUidsToApply,
                     encrypted: result.encrypted,
                     scanResultUid: scanResult.uid,
                     dispositionNotificationTo: result.dispositionNotificationTo,
@@ -569,6 +576,7 @@ export abstract class ScanQueueJob<
                     conversationId: copyConversationId,
                     inferenceClassification: copyClassification,
                     hasAttachments: storedAttachments.length > 0,
+                    labelUids: filterResult.labelUidsToApply,
                     encrypted: result.encrypted,
                     scanResultUid: scanResult.uid,
                 }),

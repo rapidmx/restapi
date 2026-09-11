@@ -74,6 +74,7 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
                 ADD COLUMN IF NOT EXISTS cc_addresses text[],
                 ADD COLUMN IF NOT EXISTS folder_uid varchar(64),
                 ADD COLUMN IF NOT EXISTS flags text[],
+                ADD COLUMN IF NOT EXISTS label_uids text[],
                 ADD COLUMN IF NOT EXISTS has_attachments boolean,
                 ADD COLUMN IF NOT EXISTS metadata_only boolean
         `);
@@ -108,13 +109,13 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
                 `INSERT INTO ${TABLE_NAME}
                     (entity_type, entity_uid, mailbox_uid, subject, body, attachment_text, participants,
                      date_for_sort, search_vector, from_address, to_addresses, cc_addresses, folder_uid,
-                     flags, has_attachments, metadata_only)
+                     flags, label_uids, has_attachments, metadata_only)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
                     setweight(to_tsvector('english', coalesce($4, '')), 'A') ||
                     setweight(to_tsvector('english', coalesce($5, '')), 'B') ||
                     setweight(to_tsvector('english', coalesce($6, '')), 'C') ||
                     setweight(to_tsvector('english', coalesce($7, '')), 'D'),
-                    $9, $10, $11, $12, $13, $14, $15)
+                    $9, $10, $11, $12, $13, $14, $15, $16)
                  ON CONFLICT (entity_type, entity_uid) DO UPDATE SET
                     mailbox_uid = EXCLUDED.mailbox_uid,
                     subject = EXCLUDED.subject,
@@ -128,6 +129,7 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
                     cc_addresses = EXCLUDED.cc_addresses,
                     folder_uid = EXCLUDED.folder_uid,
                     flags = EXCLUDED.flags,
+                    label_uids = EXCLUDED.label_uids,
                     has_attachments = EXCLUDED.has_attachments,
                     metadata_only = EXCLUDED.metadata_only`,
                 [
@@ -144,6 +146,7 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
                     doc.cc ?? null,
                     doc.folderUid ?? null,
                     doc.flags ?? null,
+                    doc.labels ?? null,
                     doc.hasAttachments ?? null,
                     doc.metadataOnly ?? null,
                 ],
@@ -218,6 +221,10 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
             const p = this.addParam(params, query.flags);
             conditions.push(`flags @> $${p}::text[]`);
         }
+        if (query.labels && query.labels.length > 0) {
+            const p = this.addParam(params, query.labels);
+            conditions.push(`label_uids @> $${p}::text[]`);
+        }
         if (query.before !== undefined) {
             const p = this.addParam(params, query.before);
             conditions.push(`date_for_sort < $${p}`);
@@ -286,6 +293,10 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
         if (query.flags && query.flags.length > 0) {
             const p = this.addParam(params, query.flags);
             conditions.push(`flags @> $${p}::text[]`);
+        }
+        if (query.labels && query.labels.length > 0) {
+            const p = this.addParam(params, query.labels);
+            conditions.push(`label_uids @> $${p}::text[]`);
         }
         if (query.before !== undefined) {
             const p = this.addParam(params, query.before);

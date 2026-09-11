@@ -15,6 +15,7 @@ export * from "./FocusedInboxOverrideSQL.js";
 export * from "./FolderSQL.js";
 export * from "./IngestQueueEntrySQL.js";
 export * from "./KeyVaultSQL.js";
+export * from "./LabelSQL.js";
 export * from "./MailboxSQL.js";
 export * from "./MailFilterRuleSQL.js";
 export * from "./MailSignatureSQL.js";

@@ -504,6 +504,12 @@ export interface Message extends RecoverableBaseEntity {
 
     hasAttachments: boolean;
 
+    /** The `Label`s applied to this message, if any - independent of folder placement, a message keeps
+     * whatever folder it's actually filed in regardless of which (if any) labels it also carries. Referenced
+     * by `Label.uid`, not embedded name/colour - see `Label`'s own doc comment for why. Absent/`undefined` is
+     * equivalent to an empty array. */
+    labelUids?: string[];
+
     /** `true` when this message's body is S/MIME (CMS) encrypted - see `util/SmimeUtils.ts`'s
      * `isEncryptedBody()`, which `ScanPipeline.run()` computes this from at ingest/send time. Downstream
      * consumers that would otherwise try to read plaintext out of an encrypted body (`AttachmentExtractionJob`,
@@ -845,15 +851,34 @@ export interface TaskList extends BaseEntity {
     name: string;
 }
 
+/**
+ * A Gmail-style label: a named, optionally coloured tag a mailbox owner defines once and then applies to any
+ * number of `Message`s (`Message.labelUids`), independent of folder placement - unlike a `Folder`, a message can
+ * carry any number of labels at once and stays in whatever folder it's actually filed in. Referenced by `uid`
+ * rather than embedded by name/colour on each `Message`, so renaming or recolouring a label is a single-row
+ * update rather than a rewrite of every message that carries it.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface Label extends BaseEntity {
+    mailboxUid: string;
+
+    name: string;
+
+    /** An optional display colour hint (e.g. a hex code), the same convention `Note.color` already uses. */
+    color?: string;
+}
+
 /** The kind of action a `MailFilterRule` performs once its `MailFilterConditions` match - mirrors MAPI's
  * `PR_RULE_ACTIONS` action types (a pragmatic subset: `OP_MOVE`/`OP_COPY`/`OP_DELETE`/`OP_MARK_AS_READ`/
- * `OP_FORWARD`). */
+ * `OP_FORWARD`), plus `APPLY_LABEL` - a Gmail-style action MAPI has no analog for. */
 export enum MailFilterActionType {
     MOVE_TO_FOLDER = "move_to_folder",
     COPY_TO_FOLDER = "copy_to_folder",
     DELETE = "delete",
     MARK_AS_READ = "mark_as_read",
     FORWARD = "forward",
+    APPLY_LABEL = "apply_label",
 }
 
 /** An embedded action on a `MailFilterRule`. */
@@ -865,6 +890,9 @@ export interface MailFilterAction {
 
     /** The address to forward the message to. Required for `FORWARD`. */
     forwardTo?: string;
+
+    /** The unique identifier of the `Label` to apply. Required for `APPLY_LABEL`. */
+    labelUid?: string;
 }
 
 /** The embedded match criteria on a `MailFilterRule`. Every populated field must match (AND) for the rule to

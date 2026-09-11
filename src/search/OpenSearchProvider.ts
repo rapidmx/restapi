@@ -71,6 +71,7 @@ export class OpenSearchProvider implements SearchProvider {
                             dateForSort: { type: "date" },
                             folderUid: { type: "keyword" },
                             flags: { type: "keyword" },
+                            labels: { type: "keyword" },
                             hasAttachments: { type: "boolean" },
                             metadataOnly: { type: "boolean" },
                         },
@@ -124,6 +125,7 @@ export class OpenSearchProvider implements SearchProvider {
         entityTypes: SearchEntityType[] | undefined,
         folderUid: string | undefined,
         flags: string[] | undefined,
+        labels: string[] | undefined,
         before: Date | undefined,
         after: Date | undefined,
     ): any[] {
@@ -136,6 +138,9 @@ export class OpenSearchProvider implements SearchProvider {
         }
         for (const flag of flags ?? []) {
             filter.push({ term: { flags: flag } });
+        }
+        for (const label of labels ?? []) {
+            filter.push({ term: { labels: label } });
         }
         if (before !== undefined || after !== undefined) {
             const range: any = {};
@@ -159,6 +164,7 @@ export class OpenSearchProvider implements SearchProvider {
             query.entityTypes,
             query.folderUid,
             query.flags,
+            query.labels,
             query.before,
             query.after,
         );
@@ -231,6 +237,7 @@ export class OpenSearchProvider implements SearchProvider {
             query.entityTypes,
             query.folderUid,
             query.flags,
+            query.labels,
             query.before,
             query.after,
         );

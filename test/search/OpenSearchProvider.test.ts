@@ -301,7 +301,7 @@ describe("OpenSearchProvider Tests", () => {
             expect(result.results[0].metadataOnly).toBe(true);
         });
 
-        it("Applies structured operator-grammar filters (from/to/cc/hasAttachment) as term filters, and folderUid/flags/date-range via structuredFilter().", async () => {
+        it("Applies structured operator-grammar filters (from/to/cc/hasAttachment) as term filters, and folderUid/flags/labels/date-range via structuredFilter().", async () => {
             const before = new Date("2026-06-01");
             const after = new Date("2026-01-01");
 
@@ -314,6 +314,7 @@ describe("OpenSearchProvider Tests", () => {
                 hasAttachment: true,
                 folderUid: "folder-1",
                 flags: ["read", "flagged"],
+                labels: ["label-a", "label-b"],
                 before,
                 after,
             });
@@ -325,6 +326,8 @@ describe("OpenSearchProvider Tests", () => {
                     { term: { folderUid: "folder-1" } },
                     { term: { flags: "read" } },
                     { term: { flags: "flagged" } },
+                    { term: { labels: "label-a" } },
+                    { term: { labels: "label-b" } },
                     { range: { dateForSort: { lt: before, gt: after } } },
                     { term: { from: "alice@example.com" } },
                     { term: { to: "bob@example.com" } },

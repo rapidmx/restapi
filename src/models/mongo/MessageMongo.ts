@@ -121,6 +121,10 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     public hasAttachments: boolean = false;
 
     @Column()
+    @Description("The `Label.uid`s applied to this message, if any.")
+    public labelUids: string[] = [];
+
+    @Column()
     @Description("`true` if this message's body is S/MIME (CMS) encrypted.")
     public encrypted: boolean = false;
 
@@ -242,6 +246,7 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.inReplyTo = "inReplyTo" in other ? other.inReplyTo : this.inReplyTo;
             this.references = other.references !== undefined ? other.references : this.references;
             this.hasAttachments = other.hasAttachments !== undefined ? other.hasAttachments : this.hasAttachments;
+            this.labelUids = other.labelUids !== undefined ? other.labelUids : this.labelUids;
             this.encrypted = other.encrypted !== undefined ? other.encrypted : this.encrypted;
             this.scanResultUid = "scanResultUid" in other ? other.scanResultUid : this.scanResultUid;
             this.searchIndexedAt = "searchIndexedAt" in other ? other.searchIndexedAt : this.searchIndexedAt;

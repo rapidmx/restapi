@@ -279,7 +279,7 @@ describe("MongoTextSearchProvider Tests", () => {
             expect(result.results[0].metadataOnly).toBe(true);
         });
 
-        it("Applies structured operator-grammar filters (from/to/cc/hasAttachment/folderUid/flags/before/after) as exact/range predicates.", async () => {
+        it("Applies structured operator-grammar filters (from/to/cc/hasAttachment/folderUid/flags/labels/before/after) as exact/range predicates.", async () => {
             wireConnection();
             await (provider as any).init();
             const cursor = makeCursor([]);
@@ -296,6 +296,7 @@ describe("MongoTextSearchProvider Tests", () => {
                 hasAttachment: true,
                 folderUid: "folder-1",
                 flags: ["read", "flagged"],
+                labels: ["label-a", "label-b"],
                 before,
                 after,
             });
@@ -308,6 +309,7 @@ describe("MongoTextSearchProvider Tests", () => {
                     hasAttachments: true,
                     folderUid: "folder-1",
                     flags: { $all: ["read", "flagged"] },
+                    labels: { $all: ["label-a", "label-b"] },
                     dateForSort: { $lt: before, $gt: after },
                 }),
                 expect.anything(),

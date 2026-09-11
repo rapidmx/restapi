@@ -186,6 +186,7 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
             dateForSort: message.sentDate,
             folderUid: message.folderUid,
             flags,
+            labels: message.labelUids ?? [],
             hasAttachments: message.hasAttachments,
             metadataOnly: encrypted,
         };

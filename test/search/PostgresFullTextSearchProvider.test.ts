@@ -88,6 +88,7 @@ describe("PostgresFullTextSearchProvider Tests", () => {
                 null,
                 null,
                 null,
+                null,
             ]);
         });
 
@@ -296,6 +297,7 @@ describe("PostgresFullTextSearchProvider Tests", () => {
                 hasAttachment: true,
                 folderUid: "folder-1",
                 flags: ["read", "flagged"],
+                labels: ["label-a", "label-b"],
                 before,
                 after,
             });
@@ -307,10 +309,21 @@ describe("PostgresFullTextSearchProvider Tests", () => {
             expect(sql).toMatch(/has_attachments = \$\d+/);
             expect(sql).toMatch(/folder_uid = \$\d+/);
             expect(sql).toMatch(/flags @> \$\d+::text\[\]/);
+            expect(sql).toMatch(/label_uids @> \$\d+::text\[\]/);
             expect(sql).toMatch(/date_for_sort < \$\d+/);
             expect(sql).toMatch(/date_for_sort > \$\d+/);
             expect(params).toEqual(
-                expect.arrayContaining(["alice@example.com", "bob@example.com", "carol@example.com", true, "folder-1", ["read", "flagged"], before, after]),
+                expect.arrayContaining([
+                    "alice@example.com",
+                    "bob@example.com",
+                    "carol@example.com",
+                    true,
+                    "folder-1",
+                    ["read", "flagged"],
+                    ["label-a", "label-b"],
+                    before,
+                    after,
+                ]),
             );
         });
 
@@ -346,7 +359,7 @@ describe("PostgresFullTextSearchProvider Tests", () => {
             expect(result).toEqual({ candidates: [] });
         });
 
-        it("Filters by mailboxUid, entityTypes, participants (OR'd ILIKE), folderUid/flags/date range, sorted by date, identifiers only.", async () => {
+        it("Filters by mailboxUid, entityTypes, participants (OR'd ILIKE), folderUid/flags/labels/date range, sorted by date, identifiers only.", async () => {
             wireConnection();
             await (provider as any).init();
             mockConnection.query.mockClear();
@@ -357,14 +370,18 @@ describe("PostgresFullTextSearchProvider Tests", () => {
                 entityTypes: ["message"],
                 participants: ["bob@example.com", "carol@example.com"],
                 folderUid: "folder-1",
+                labels: ["label-a"],
             });
 
             const [sql, params] = mockConnection.query.mock.calls[0];
             expect(sql).toMatch(/SELECT entity_type, entity_uid/);
             expect(sql).not.toMatch(/search_vector|rank/);
             expect(sql).toMatch(/participants ILIKE '%' \|\| \$\d+ \|\| '%' OR participants ILIKE '%' \|\| \$\d+ \|\| '%'/);
+            expect(sql).toMatch(/label_uids @> \$\d+::text\[\]/);
             expect(sql).toMatch(/ORDER BY date_for_sort DESC NULLS LAST/);
-            expect(params).toEqual(expect.arrayContaining(["mbx-1", ["message"], "bob@example.com", "carol@example.com", "folder-1"]));
+            expect(params).toEqual(
+                expect.arrayContaining(["mbx-1", ["message"], "bob@example.com", "carol@example.com", "folder-1", ["label-a"]]),
+            );
             expect(result).toEqual({ candidates: [{ entityType: "message", entityUid: "msg-1" }], nextCursor: undefined });
         });
 

@@ -191,6 +191,7 @@ describe("SQL model default construction", () => {
         expect(obj.inReplyTo).toBeUndefined();
         expect(obj.references).toEqual([]);
         expect(obj.hasAttachments).toBe(false);
+        expect(obj.labelUids).toEqual([]);
         expect(obj.encrypted).toBe(false);
         expect(obj.scanResultUid).toBeUndefined();
         expect(obj.searchIndexedAt).toBeUndefined();
@@ -225,6 +226,7 @@ describe("SQL model default construction", () => {
             inReplyTo: "<parent@example.com>",
             references: ["<ref1@example.com>"],
             hasAttachments: true,
+            labelUids: ["label-1"],
             encrypted: true,
             scanResultUid: "scan-1",
             searchIndexedAt,
@@ -253,6 +255,7 @@ describe("SQL model default construction", () => {
         expect(obj.inReplyTo).toBe("<parent@example.com>");
         expect(obj.references).toEqual(["<ref1@example.com>"]);
         expect(obj.hasAttachments).toBe(true);
+        expect(obj.labelUids).toEqual(["label-1"]);
         expect(obj.encrypted).toBe(true);
         expect(obj.scanResultUid).toBe("scan-1");
         expect(obj.searchIndexedAt).toBe(searchIndexedAt);
@@ -284,6 +287,7 @@ describe("SQL model default construction", () => {
         expect(obj.inReplyTo).toBeUndefined();
         expect(obj.references).toEqual([]);
         expect(obj.hasAttachments).toBe(false);
+        expect(obj.labelUids).toEqual([]);
         expect(obj.encrypted).toBe(false);
         expect(obj.scanResultUid).toBeUndefined();
         expect(obj.searchIndexedAt).toBeUndefined();

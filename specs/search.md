@@ -479,6 +479,7 @@ A light operator syntax is introduced and applies to **all tiers**, including Ti
 | `before:`, `after:` | Date bounds                         |
 | `in:`               | Folder or calendar                  |
 | `is:`               | Flags — `read`, `unread`, `flagged` |
+| `label:`            | Gmail-style `Label.uid`s applied to the message |
 | `type:`             | Maps to `SearchQuery.entityTypes`   |
 
 Unqualified terms remain free text and are matched as they are today. Quoted strings are phrase queries. A leading `-` negates.

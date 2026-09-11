@@ -95,6 +95,7 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
         @Query("after") afterParam: string | undefined,
         @Query("in") folderUid: string | undefined,
         @Query("is") isParam: string | undefined,
+        @Query("label") labelParam: string | undefined,
         @AuthUser user?: JWTUser,
     ): Promise<SearchResultPage> {
         if (!this.searchProvider) {
@@ -135,6 +136,7 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
             after: parseDateParam(afterParam),
             folderUid,
             flags: isParam ? isParam.split(",") : undefined,
+            labels: labelParam ? labelParam.split(",") : undefined,
         });
     }
 
@@ -159,6 +161,7 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
         @Query("after") afterParam: string | undefined,
         @Query("in") folderUid: string | undefined,
         @Query("is") isParam: string | undefined,
+        @Query("label") labelParam: string | undefined,
         @Query("cursor") cursor: string | undefined,
         @Query("limit") limitParam: string | undefined,
         @AuthUser user?: JWTUser,
@@ -181,6 +184,7 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
             after: parseDateParam(afterParam),
             folderUid,
             flags: isParam ? isParam.split(",") : undefined,
+            labels: labelParam ? labelParam.split(",") : undefined,
             cursor,
             limit: limitParam ? parseInt(limitParam, 10) : undefined,
         });

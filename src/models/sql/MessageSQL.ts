@@ -124,6 +124,16 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
     @Description("`true` if the message has one or more attachments.")
     public hasAttachments: boolean = false;
 
+    // `nullable: true` for the same reason `encrypted` below needs it - added after this table already
+    // existed in deployed installations, and `@Column` has no SQL-level `DEFAULT` option, so a NOT NULL
+    // `ALTER TABLE ADD COLUMN` fails against a populated table. Unlike a boolean, a legacy row's `NULL` here
+    // reads back as literal `null`, not `[]` - every reader of this field elsewhere in this codebase treats
+    // it defensively (`labelUids ?? []`) for exactly that reason, matching `Message.labelUids`'s own "absent
+    // is equivalent to empty" contract in `models/types.ts`.
+    @Column({ type: "simple-json", nullable: true })
+    @Description("The `Label.uid`s applied to this message, if any.")
+    public labelUids: string[] = [];
+
     // `nullable: true`: added after the table already existed in deployed installations, and this framework's
     // `@Column` decorator has no SQL-level `DEFAULT` option (see `ColumnOptions`) - without `nullable: true`,
     // `synchronize: true`'s `ALTER TABLE ... ADD COLUMN ... NOT NULL` fails outright against a populated table
@@ -251,6 +261,7 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
             this.inReplyTo = "inReplyTo" in other ? other.inReplyTo : this.inReplyTo;
             this.references = other.references !== undefined ? other.references : this.references;
             this.hasAttachments = other.hasAttachments !== undefined ? other.hasAttachments : this.hasAttachments;
+            this.labelUids = other.labelUids !== undefined ? other.labelUids : this.labelUids;
             this.encrypted = other.encrypted !== undefined ? other.encrypted : this.encrypted;
             this.scanResultUid = "scanResultUid" in other ? other.scanResultUid : this.scanResultUid;
             this.searchIndexedAt = "searchIndexedAt" in other ? other.searchIndexedAt : this.searchIndexedAt;

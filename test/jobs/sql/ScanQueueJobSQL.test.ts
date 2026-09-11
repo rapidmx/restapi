@@ -854,6 +854,42 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         expect(copyAttachments.length).toBe(1);
     });
 
+    it("Applies an APPLY_LABEL rule, stamping the delivered message (and any COPY_TO_FOLDER copy) with the label uid.", async () => {
+        const copyFolder = await folderRepo.save(
+            new FolderSQL({ mailboxUid, name: "Archive", type: FolderType.USER, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+        );
+        await mailFilterRuleRepo.save(
+            new MailFilterRuleSQL({
+                mailboxUid,
+                name: "Label and copy",
+                enabled: true,
+                sequence: 0,
+                stopProcessingRules: false,
+                conditions: { subjectContains: ["Test message"] },
+                actions: [
+                    { type: MailFilterActionType.APPLY_LABEL, labelUid: "label-1" },
+                    { type: MailFilterActionType.COPY_TO_FOLDER, folderUid: copyFolder.uid },
+                ],
+            }),
+        );
+
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeRawMessage());
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const inbox = await folderRepo.findOne({ where: { mailboxUid, type: FolderType.INBOX } });
+        const inboxMessages = await messageRepo.find({ where: { folderUid: inbox!.uid } });
+        expect(inboxMessages.length).toBe(1);
+        expect(inboxMessages[0].labelUids).toEqual(["label-1"]);
+
+        const copyMessages = await messageRepo.find({ where: { folderUid: copyFolder.uid } });
+        expect(copyMessages.length).toBe(1);
+        expect(copyMessages[0].labelUids).toEqual(["label-1"]);
+    });
+
     it("Applies a FORWARD rule, relaying the original raw message to the forward address via MailTransport.", async () => {
         await mailFilterRuleRepo.save(
             new MailFilterRuleSQL({

@@ -34,6 +34,7 @@ interface StoredDoc {
     dateForSort?: Date;
     folderUid?: string;
     flags?: string[];
+    labels?: string[];
     hasAttachments?: boolean;
     metadataOnly?: boolean;
 }
@@ -100,6 +101,7 @@ export class MongoTextSearchProvider implements SearchProvider {
             dateForSort: doc.dateForSort,
             folderUid: doc.folderUid,
             flags: doc.flags,
+            labels: doc.labels,
             hasAttachments: doc.hasAttachments,
             metadataOnly: doc.metadataOnly,
         };
@@ -131,7 +133,14 @@ export class MongoTextSearchProvider implements SearchProvider {
     /** Applies the structured operator-grammar predicates (specs/search.md §14) shared by `search()` and
      * `candidates()`. `$text` (free-text ranking) is deliberately not built here - `search()` layers it on
      * separately, and `candidates()` never uses it at all (metadata-only, per its own doc comment). */
-    private structuredFilter(entityTypes: SearchEntityType[] | undefined, before?: Date, after?: Date, folderUid?: string, flags?: string[]): any {
+    private structuredFilter(
+        entityTypes: SearchEntityType[] | undefined,
+        before?: Date,
+        after?: Date,
+        folderUid?: string,
+        flags?: string[],
+        labels?: string[],
+    ): any {
         const filter: any = {};
         if (entityTypes && entityTypes.length > 0) {
             filter.entityType = { $in: entityTypes };
@@ -141,6 +150,9 @@ export class MongoTextSearchProvider implements SearchProvider {
         }
         if (flags && flags.length > 0) {
             filter.flags = { $all: flags };
+        }
+        if (labels && labels.length > 0) {
+            filter.labels = { $all: labels };
         }
         if (before !== undefined || after !== undefined) {
             filter.dateForSort = {};
@@ -164,7 +176,14 @@ export class MongoTextSearchProvider implements SearchProvider {
 
         const filter: any = {
             mailboxUid: query.mailboxUid,
-            ...this.structuredFilter(query.entityTypes, query.before, query.after, query.folderUid, query.flags),
+            ...this.structuredFilter(
+                query.entityTypes,
+                query.before,
+                query.after,
+                query.folderUid,
+                query.flags,
+                query.labels,
+            ),
         };
         if (query.from !== undefined) {
             filter.from = query.from;
@@ -223,7 +242,14 @@ export class MongoTextSearchProvider implements SearchProvider {
 
         const filter: any = {
             mailboxUid: query.mailboxUid,
-            ...this.structuredFilter(query.entityTypes, query.before, query.after, query.folderUid, query.flags),
+            ...this.structuredFilter(
+                query.entityTypes,
+                query.before,
+                query.after,
+                query.folderUid,
+                query.flags,
+                query.labels,
+            ),
         };
         if (query.participants && query.participants.length > 0) {
             filter.participants = { $in: query.participants };
