@@ -63,7 +63,7 @@ jobs:
             ${{ runner.os }}-yarn-
 
       - name: Install dependencies
-        run: export REDISMS_DISABLE_POSTINSTALL=true && yarn install --frozen-lockfile
+        run: yarn install --frozen-lockfile
 
       - name: Build
         run: yarn build

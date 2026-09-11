@@ -18,7 +18,8 @@
         "test": "vitest run",
         "test:prod": "npm run lint && vitest run --coverage",
         "test:watch": "vitest",
-        "release": "rapidrest release"
+        "release": "npx @rapidrest/cli release",
+        "prepublish": "yarn build"
     },
     "peerDependencies": {
         "@opensearch-project/opensearch": ">=3.0.0",
@@ -47,7 +48,6 @@
     },
     "devDependencies": {
         "@opensearch-project/opensearch": "^3.6.0",
-        "@rapidrest/cli": "^1.0.1",
         "@rapidrest/core": "^5.2.2",
         "@rapidrest/service-core": "^2.0.0",
         "@swc/core": "^1.16.2",
