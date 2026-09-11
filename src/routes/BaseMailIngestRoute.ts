@@ -519,6 +519,13 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         // per addressed mailbox so `ScanQueueJob` delivers independently to each, and one unknown/unresolvable
         // recipient in the batch doesn't block delivery to the others.
         const results: { rcpt: string; queued: boolean }[] = [];
+        // Every direct-mailbox recipient below shares this exact same `raw` (it's never rewritten per-
+        // recipient, unlike the distribution-list branch's `listRaw`) - written to the blob store at most once
+        // per `deliver()` call and reused, the same one-copy-shared-by-every-recipient pattern the
+        // distribution-list branch below already uses for `listRaw`/`rawBlobKey`. Previously minted a fresh
+        // blob (a full copy of `raw`) per direct recipient - e.g. a 20MB attachment CC'd to 50 internal
+        // mailboxes wrote ~1GB for one logical message instead of one 20MB blob.
+        let directRawBlobKey: string | undefined;
         for (const rcpt of envelopeTo) {
             const address: string = normalizeAddress(rcpt);
             // Exact mailbox match, then exact `DistributionList` match, THEN the plus-tag fallback - in that
@@ -534,14 +541,16 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             }
 
             if (mailbox) {
-                const rawBlobKey: string = `ingest/${crypto.randomUUID()}`;
-                await this.blobStore.put(rawBlobKey, raw, { contentType: "message/rfc822" });
+                if (!directRawBlobKey) {
+                    directRawBlobKey = `ingest/${crypto.randomUUID()}`;
+                    await this.blobStore.put(directRawBlobKey, raw, { contentType: "message/rfc822" });
+                }
                 await this.ingestQueueRepo!.create(
                     new this.ingestQueueClass({
                         mailboxUid: mailbox.uid,
                         envelopeFrom,
                         envelopeTo: [address],
-                        rawBlobKey,
+                        rawBlobKey: directRawBlobKey,
                         status: IngestStatus.PENDING,
                         quarantineReason,
                     }),

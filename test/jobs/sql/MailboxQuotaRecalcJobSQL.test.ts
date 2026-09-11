@@ -161,6 +161,32 @@ describe("MailboxQuotaRecalcJobSQL Tests (real DB + DI)", () => {
         expect(updated!.version).toBe(mailbox.version + 1);
     });
 
+    it("Batches the attachment query across every message-with-attachments into one find() call instead of one per message - closes an N+1 pattern.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const bodyKey = `body/${uuid.v4()}`;
+        await blobStore.put(bodyKey, Buffer.alloc(10));
+        const mailbox = await createMailbox({ usedBytes: 0 });
+        const attachedMessageCount = 5;
+        let expectedBytes = 0;
+        for (let i = 0; i < attachedMessageCount; i++) {
+            const message = await createMessage(mailbox.uid, { bodyBlobKey: bodyKey, hasAttachments: true });
+            await createAttachment(message.uid, mailbox.uid, { sizeBytes: 7 });
+            expectedBytes += 10 + 7;
+        }
+
+        const attachmentRepoUtils = (job as any).attachmentRepo;
+        const findSpy = vi.spyOn(attachmentRepoUtils, "find");
+
+        await job.run();
+
+        // One call per chunk (chunk size 100, well above this test's 5 attached messages), not one per message.
+        expect(findSpy.mock.calls.length).toBe(1);
+        findSpy.mockRestore();
+
+        const updated = await mailboxRepo.findOne({ where: { uid: mailbox.uid } });
+        expect(updated!.usedBytes).toBe(expectedBytes);
+    });
+
     it("Skips the write entirely when the recomputed usedBytes matches the stored value.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const bodyKey = `body/${uuid.v4()}`;

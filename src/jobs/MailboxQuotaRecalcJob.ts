@@ -9,6 +9,11 @@ import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { Attachment, Mailbox, Message } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
+/** How many message uids `recalcMailbox()` batches into a single `messageUid: in(...)` attachment query at
+ * once - small enough to keep the generated query comfortably within the shared query DSL's own node/length
+ * limits, large enough to meaningfully cut the number of round-trips versus one query per message. */
+const ATTACHMENT_QUERY_CHUNK_SIZE = 100;
+
 /**
  * Periodically recomputes `Mailbox.usedBytes` from the mailbox's actual stored content (message body blobs plus
  * attachment content) and corrects any drift from the incremental updates other code paths (ingest, delete,
@@ -144,12 +149,19 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
                     `MailboxQuotaRecalcJob: failed to size body blob ${message.bodyBlobKey} for message ${message.uid}, treating as 0 bytes: ${err.message}`,
                 );
             }
+        }
 
-            if (message.hasAttachments) {
-                const attachments: A[] = await this.findAllPages(this.attachmentRepo!, { messageUid: message.uid });
-                for (const attachment of attachments) {
-                    usedBytes += attachment.sizeBytes;
-                }
+        // Batched by messageUid via the query DSL's `in(...)` operator, `ATTACHMENT_QUERY_CHUNK_SIZE` message
+        // uids at a time, instead of one `findAllPages()` call per individual message - a mailbox with
+        // thousands of messages carrying attachments previously issued that many separate DB round-trips
+        // every run. `sizeBytes` is summed directly across the whole mailbox's attachments; nothing here needs
+        // them correlated back to a specific message.
+        const messageUidsWithAttachments: string[] = messages.filter((m) => m.hasAttachments).map((m) => m.uid);
+        for (let i = 0; i < messageUidsWithAttachments.length; i += ATTACHMENT_QUERY_CHUNK_SIZE) {
+            const chunk: string[] = messageUidsWithAttachments.slice(i, i + ATTACHMENT_QUERY_CHUNK_SIZE);
+            const attachments: A[] = await this.findAllPages(this.attachmentRepo!, { messageUid: `in(${chunk.join(",")})` });
+            for (const attachment of attachments) {
+                usedBytes += attachment.sizeBytes;
             }
         }
 

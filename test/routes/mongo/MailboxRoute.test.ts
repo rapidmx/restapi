@@ -310,6 +310,54 @@ describe("Route:MailboxMongo Tests", () => {
         expect(result.body.keyDiscoveryHash).toBe(computeKeyDiscoveryHash(newAddress.split("@")[0]));
     });
 
+    it("Rejects renaming a mailbox's primarySmtpAddress to an address already used by an existing DistributionList (409) - previously let a self-service owner silently hijack a list's mail flow.", async () => {
+        const address = `${uuid.v4()}@example.com`;
+        await distributionListRepo.save(
+            new DistributionListMongo({
+                uid: address,
+                primarySmtpAddress: address,
+                aliasAddresses: [],
+                name: "Existing List",
+                memberAddresses: [],
+            }),
+        );
+
+        const obj = await createMailboxMongo();
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}/primarySmtpAddress`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(address);
+
+        expect(result.status).toBe(409);
+
+        const unchanged = await repo.findOne({ uid: obj.uid } as any);
+        expect(unchanged?.primarySmtpAddress).toBe(obj.primarySmtpAddress);
+    });
+
+    it("Rejects renaming a mailbox's primarySmtpAddress to an address already used by another Mailbox (409), via a raw PUT of the whole object.", async () => {
+        const other = await createMailboxMongo();
+        const obj = await createMailboxMongo();
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: other.primarySmtpAddress });
+
+        expect(result.status).toBe(409);
+    });
+
+    it("Allows a PUT that resends the mailbox's own current, unchanged primarySmtpAddress (200) - re-validating only on a genuine change.", async () => {
+        const obj = await createMailboxMongo();
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: obj.primarySmtpAddress, displayName: "Still Fine" });
+
+        expect(result.status).toBe(200);
+        expect(result.body.displayName).toBe("Still Fine");
+    });
+
     it("Keeps keyDiscoveryHash in sync for a bulk update too (updateBulk()) - the earlier update()-only override missed this path entirely.", async () => {
         const obj = await createMailboxMongo();
         const newAddress = `${uuid.v4()}@example.com`;

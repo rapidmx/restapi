@@ -91,8 +91,18 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
         // object itself (all `ModelUtils.buildSearchQuerySQL` reads - it ignores `options.limit` entirely and
         // falls back to its own default of 100 otherwise). Confirmed by real-database testing: on the SQL
         // backend, `options.limit` alone silently caps at 100 regardless of the configured batch size.
+        //
+        // `inviteSequenceSent !== sequence` (the real eligibility check) is a field-to-field comparison the
+        // shared query DSL can't express, so it stays a client-side filter below - but an unfiltered,
+        // unsorted `find()` meant that once total `CalendarEvent` rows exceeded `batchSize`, whichever fixed
+        // set of rows the DB happened to return first (typically the oldest, by insertion order) permanently
+        // occupied the whole window, silently starving any event that needed an invite. `status: ne(CANCELLED)`
+        // prunes the (usually large) share of rows that can never need an invite, and `sort: -dateModified`
+        // guarantees a genuinely new or just-edited event - which always has the most recent `dateModified`,
+        // since `RepoUtils.update()` unconditionally refreshes it - sorts to the front of the window ahead of
+        // old, already-fully-processed rows, rather than being starved behind them.
         const candidates: CE[] = await this.calendarEventRepo!.find(
-            { limit: this.batchSize } as any,
+            { status: `ne(${CalendarEventStatus.CANCELLED})`, sort: "-dateModified", limit: this.batchSize } as any,
             { ignoreACL: true, limit: this.batchSize },
         );
 

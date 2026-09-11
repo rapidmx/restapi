@@ -21,6 +21,23 @@ const { Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Get, Param, Post, Request, Response, User: AuthUser } = RouteDecorators;
 
+/** Strips CR/LF (header injection) from a client-supplied filename before it's ever stored - matches
+ * `DistributionListUtils.rewriteHeadersForList()`'s identical `safeName` convention for any other value
+ * that ends up interpolated into a raw header. */
+function sanitizeFilename(filename: string): string {
+    return filename.replace(/[\r\n]/g, "");
+}
+
+/** Escapes a filename for safe use inside a `Content-Disposition` quoted-string parameter (RFC 6266) -
+ * backslash-escapes any embedded `"`/`\`, and strips CR/LF as defense-in-depth alongside `sanitizeFilename()`
+ * (an attachment uploaded before that check existed could still have a raw newline in its stored filename).
+ * Without this, an unescaped embedded `"` breaks out of the quoted value and injects a second `filename=`
+ * parameter, letting an uploader make a downloaded attachment save under a different, attacker-chosen name
+ * than the one shown in the UI/metadata to a later downloader. */
+function escapeContentDispositionFilename(filename: string): string {
+    return filename.replace(/[\r\n]/g, "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
 /**
  * Extends `BaseScopedChildRoute` (scoped by `folderUid` — see the architecture note on `Message.mailboxUid`)
  * for `Attachment` with `upload`/`download` endpoints that move binary content through the configured
@@ -101,7 +118,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
                 messageUid,
                 folderUid: message.folderUid,
                 mailboxUid: message.mailboxUid,
-                filename,
+                filename: sanitizeFilename(filename),
                 mimeType: (Array.isArray(mimeType) ? mimeType[0] : mimeType) ?? "application/octet-stream",
                 sizeBytes: raw.length,
                 blobKey,
@@ -139,7 +156,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         res.setHeader("content-length", attachment.sizeBytes);
         res.setHeader(
             "content-disposition",
-            `${attachment.isInline ? "inline" : "attachment"}; filename="${attachment.filename}"`,
+            `${attachment.isInline ? "inline" : "attachment"}; filename="${escapeContentDispositionFilename(attachment.filename)}"`,
         );
         res.send(content);
     }

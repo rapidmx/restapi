@@ -177,6 +177,22 @@ describe("Route:AttachmentSQL Tests", () => {
         expect(stored.toString()).toBe("hello world");
     });
 
+    it("Strips CR/LF from an uploaded filename (header-injection hardening) before storing it.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const message = await createMessage(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/upload?messageUid=${message.uid}&filename=${encodeURIComponent('evil\r\nX-Injected: 1.txt')}&mimeType=text/plain`)
+            .set("Authorization", "jwt " + ownerToken)
+            .set("Content-Type", "application/octet-stream")
+            .send(Buffer.from("hello world"));
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+        expect(result.body.filename).not.toMatch(/[\r\n]/);
+    });
+
     it("Rejects an upload whose messageUid doesn't correspond to any real message.", async () => {
         const result = await request(server.getApplication())
             .post(`${baseUrl}/upload?messageUid=${uuid.v4()}&filename=test.txt&mimeType=text/plain`)
@@ -232,6 +248,24 @@ describe("Route:AttachmentSQL Tests", () => {
         expect(result.status).toBe(200);
         expect(result.text).toBe("attachment content");
         expect(result.headers["content-type"]).toBe("text/plain");
+    });
+
+    it("Escapes an embedded double-quote in a stored filename when building Content-Disposition (400/spoofed-name hardening) - previously let it break out of the quoted value and inject a second filename= parameter.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const attachment = await createAttachment(mailbox.uid, folder.uid, {
+            filename: 'evil.exe"; filename="report.pdf',
+        });
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${attachment.uid}/content`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(200);
+        const header: string = result.headers["content-disposition"];
+        // The embedded quotes are backslash-escaped, so the whole thing parses as one quoted-string value
+        // (per RFC 6266) rather than a raw `"` terminating it early and starting a second filename= parameter.
+        expect(header).toBe('attachment; filename="evil.exe\\"; filename=\\"report.pdf"');
     });
 
     it("A different user cannot download an attachment's content they don't have access to.", async () => {

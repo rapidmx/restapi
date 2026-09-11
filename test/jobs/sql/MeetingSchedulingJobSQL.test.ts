@@ -159,6 +159,25 @@ describe("MeetingSchedulingJobSQL Tests (real DB + DI)", () => {
         expect(updated!.inviteSequenceSent).toBe(1);
     });
 
+    it("Still sends an invite for a genuinely new event even when the table already holds batch_size other, already-invited events - proves the query is no longer an unfiltered/unsorted top-N that a large table could permanently starve.", async () => {
+        const batchSize: number = config.get("mail:jobs:meeting_scheduling:batch_size");
+        const old = new Date(2020, 0, 1);
+        for (let i = 0; i < batchSize; i++) {
+            await createEvent({ inviteSequenceSent: 0, sequence: 0, dateCreated: old, dateModified: old });
+        }
+        // The one genuinely pending event - created last, so on the old unsorted/unfiltered query it would
+        // sort after all `batchSize` already-processed rows and never be fetched at all.
+        const pending = await createEvent({ inviteSequenceSent: undefined, sequence: 0 });
+
+        await job.run();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(1);
+
+        const updated = await calendarEventRepo.findOne({ where: { uid: pending.uid } });
+        expect(updated!.inviteSequenceSent).toBe(0);
+    });
+
     it("Skips an event with no attendees.", async () => {
         await createEvent({ attendees: [] });
 

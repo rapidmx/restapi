@@ -137,6 +137,43 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         return Array.isArray(obj) ? created : created[0];
     }
 
+    /**
+     * Re-runs `create()`'s own verified-domain and collision checks (`assignUidAndCheckCollision()`) against
+     * a changed `primarySmtpAddress` on `update()` - without this, a trusted admin could `PUT` an existing
+     * list with `primarySmtpAddress` set to an existing `Mailbox`'s address (its `uid` stays unchanged, since
+     * `RepoUtils.update()` only requires `obj.uid === existing.uid`, not that the address matches it), which
+     * `BaseMailIngestRoute`'s address-resolution logic would then treat as a real collision at delivery time -
+     * exactly the same class of gap fixed on `BaseMailboxRoute.validateAddressChange()`, just for the trusted-
+     * admin-only side of the same `uid`-derived-from-`primarySmtpAddress` convention. Checked by
+     * `primarySmtpAddress` field value (matching `BaseMailIngestRoute.findDistributionListByAddress()`'s own
+     * query), not `uid` - a list that has itself already been through one address change would otherwise not
+     * be caught by a `uid`-keyed check alone.
+     */
+    private async validateAddressChange(existing: T, newAddress: string): Promise<void> {
+        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        const domain: string | undefined = newAddress.split("@")[1]?.toLowerCase();
+        if (domains.length > 0 && (!domain || !domains.includes(domain))) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                `Distribution list addresses must be on one of this server's configured domains: ${domains.join(", ")}.`,
+            );
+        }
+
+        const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
+        const [collidingLists, collidingMailboxes] = await Promise.all([
+            this.repoUtils!.find({ primarySmtpAddress: newAddress } as any, { ignoreACL: true, limit: 1 }),
+            mailboxRepo.find({ primarySmtpAddress: newAddress } as any, { ignoreACL: true, limit: 1 }),
+        ]);
+        if (collidingLists.length > 0 || collidingMailboxes.length > 0) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                "This address is already in use by another mailbox or distribution list.",
+            );
+        }
+    }
+
     @RequiresTrustedRole()
     public async update(
         @Param("id") id: string,
@@ -147,6 +184,11 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        // Only re-validate on a genuine change - a caller round-tripping the full object back unchanged must
+        // not start failing because e.g. a domain was un-verified after the fact.
+        if (obj.primarySmtpAddress !== undefined && obj.primarySmtpAddress !== existing.primarySmtpAddress) {
+            await this.validateAddressChange(existing, obj.primarySmtpAddress);
         }
         const updated: T = await this.repoUtils!.update(obj, existing, { user, version: (obj as any).version, ignoreACL: true });
 

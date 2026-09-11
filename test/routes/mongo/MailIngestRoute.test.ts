@@ -376,6 +376,38 @@ describe("Route:MailIngestRouteMongo Tests", () => {
         expect(storedText).toContain("Hello");
     });
 
+    it("Multiple direct-mailbox recipients in the same envelope all share one blob-stored copy of the raw message - previously wrote a full duplicate per recipient.", async () => {
+        const m1 = await createMailbox();
+        const m2 = await createMailbox();
+        const raw = Buffer.from(
+            `From: sender@example.com\r\nTo: ${m1.primarySmtpAddress}, ${m2.primarySmtpAddress}\r\n\r\nHello\r\n`,
+        );
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", `${m1.primarySmtpAddress},${m2.primarySmtpAddress}`)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        expect(result.body.results).toEqual([
+            { rcpt: m1.primarySmtpAddress, queued: true },
+            { rcpt: m2.primarySmtpAddress, queued: true },
+        ]);
+
+        const entries: IngestQueueEntryMongo[] = await ingestQueueRepo
+            .find({ mailboxUid: { $in: [m1.uid, m2.uid] } })
+            .toArray();
+        expect(entries.length).toBe(2);
+        expect(new Set(entries.map((e) => e.rawBlobKey)).size).toBe(1);
+
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const stored: Buffer = await blobStore.get(entries[0].rawBlobKey);
+        expect(stored.toString()).toContain("Hello");
+    });
+
     it("Relays to a genuinely external (non-mailbox, non-list) member via MailTransport.", async () => {
         const list = await createList({ memberAddresses: ["external@outside.com"] });
         const raw = Buffer.from(`From: sender@example.com\r\nTo: ${list.primarySmtpAddress}\r\n\r\nHello\r\n`);

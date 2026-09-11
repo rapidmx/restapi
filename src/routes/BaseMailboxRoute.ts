@@ -340,25 +340,88 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser): Promise<void> {
         rejectServerManagedFields(obj);
         if (obj.primarySmtpAddress !== undefined) {
+            // Only re-validate when the address is genuinely changing, not merely present in the patch (a
+            // client round-tripping the full object back unchanged must not start failing because e.g. a
+            // domain was un-verified after the fact - the same "only act on a real change" guard
+            // `BaseDomainRoute.update()` applies to its own uid-derived `name` field).
+            const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+            if (existing && existing.primarySmtpAddress !== obj.primarySmtpAddress) {
+                await this.validateAddressChange(id, obj.primarySmtpAddress);
+            }
             (obj as any).keyDiscoveryHash = computeKeyDiscoveryHash(obj.primarySmtpAddress.split("@")[0]);
         }
         return super.validateUpdate(id, obj, user);
     }
 
     /**
-     * `keys`/`keyDiscoveryHash` are rejected outright, same as every other update path (`validateUpdate()`
-     * above) - `updateProperty()` calls `validateUpdate()` itself before this runs, so those two are already
-     * covered; this override exists only for `primarySmtpAddress`, which `validateUpdate()` *can't* keep
-     * `keyDiscoveryHash` in sync for here (see its own doc comment) - redirected to the full `update()` path
-     * instead, which can. `update()`'s underlying `doUpdate()` enforces optimistic-concurrency locking against
-     * `version`, which a single-property PUT's caller never supplies (its own route contract has no such
-     * field) - the record is re-fetched here specifically to supply it, not merely to validate existence.
+     * Re-runs `create()`'s own verified-domain and collision checks against a changed `primarySmtpAddress` -
+     * without this, `validateUpdate()` recomputed `keyDiscoveryHash` for a changed address but never actually
+     * validated it, so a self-service owner (via a raw `PUT` of the whole object, or `updateProperty()`'s
+     * dedicated single-field rename endpoint - see its own doc comment: `uid` deliberately stays fixed across
+     * an address change, so `primarySmtpAddress` and `uid` can legitimately diverge after a rename) could
+     * point their own mailbox's `primarySmtpAddress` at ANY string, including an existing `DistributionList`'s
+     * address. Since `BaseMailIngestRoute.findExactMailboxByAddress()` is always tried before
+     * `findDistributionListByAddress()`, that would silently hijack the list's inbound mail to the caller's
+     * own mailbox instead. Checked by `primarySmtpAddress` field value (matching that same mail-resolution
+     * query), not `uid` - the whole point is that `uid` no longer reliably tracks the current address post-
+     * rename, so a `uid`-keyed collision check alone wouldn't catch this.
+     */
+    private async validateAddressChange(id: string, newAddress: string): Promise<void> {
+        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        if (domains.length > 0) {
+            const domain = newAddress.split("@")[1]?.toLowerCase();
+            if (!domain || !domains.includes(domain)) {
+                throw new ApiError(
+                    ApiErrors.INVALID_REQUEST,
+                    400,
+                    `Mailbox addresses must be on one of this server's verified domains: ${domains.join(", ")}.`,
+                );
+            }
+        }
+
+        const distributionListRepo: RepoUtils<DistributionList> = await this.getDistributionListRepo();
+        const [collidingMailboxes, collidingLists] = await Promise.all([
+            this.repoUtils!.find({ primarySmtpAddress: newAddress } as any, { ignoreACL: true, limit: 1 }),
+            distributionListRepo.find({ primarySmtpAddress: newAddress } as any, { ignoreACL: true, limit: 1 }),
+        ]);
+        if (collidingMailboxes.length > 0 || collidingLists.length > 0) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                "This address is already in use by another mailbox or distribution list.",
+            );
+        }
+    }
+
+    /**
+     * For every property except `primarySmtpAddress`, `super.updateProperty()` calls `this.validateUpdate()`
+     * itself before persisting, so `keys`/`keyDiscoveryHash` rejection is already covered there. This override
+     * exists only for `primarySmtpAddress`, which `validateUpdate()` *can't* keep `keyDiscoveryHash` in sync
+     * for here (see its own doc comment) - redirected to the full `update()` path instead, which can.
+     * `update()`'s underlying `doUpdate()` enforces optimistic-concurrency locking against `version`, which a
+     * single-property PUT's caller never supplies (its own route contract has no such field) - the record is
+     * re-fetched here specifically to supply it, not merely to validate existence.
+     *
+     * Calling `this.update()` here is a plain in-process method call, NOT an HTTP dispatch - so the
+     * `@Validate("validateUpdate")` pipeline middleware that would normally run `validateUpdate()` (and, via
+     * it, `validateAddressChange()`) for a real `PUT` never fires. This override calls `validateAddressChange()`
+     * explicitly itself for exactly that reason - confirmed the hard way: an earlier version of this method
+     * assumed `validateUpdate()` would run automatically here, and a regression test against this exact
+     * endpoint (renaming to an address already claimed by a `DistributionList`) caught that it didn't.
      */
     public async updateProperty(id: string, propertyName: string, obj: any, user?: JWTUser): Promise<T> {
         if (propertyName === "primarySmtpAddress") {
             const current: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
             if (!current) {
                 throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+            }
+            // This redirects straight to `this.update()` below rather than going through the framework's own
+            // HTTP dispatch (there is none here - this is a plain in-process call), so the `@Validate
+            // ("validateUpdate")` pipeline middleware that would normally run `validateUpdate()` for a real
+            // PUT never fires for this path. `validateAddressChange()` must therefore be called explicitly
+            // here too, the same "only on a genuine change" guard `validateUpdate()` itself applies.
+            if (current.primarySmtpAddress !== obj) {
+                await this.validateAddressChange(id, obj);
             }
             return this.update(
                 id,

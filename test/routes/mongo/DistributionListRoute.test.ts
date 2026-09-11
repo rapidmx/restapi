@@ -244,6 +244,45 @@ describe("Route:DistributionListMongo Tests", () => {
         expect(result.status).toBe(409);
     });
 
+    it("Rejects updating a distribution list's primarySmtpAddress to an address already used by an existing Mailbox (409) - previously let a trusted admin silently hijack a mailbox's mail flow.", async () => {
+        const address = `${uuid.v4()}@example.com`;
+        await mailboxRepo.save(
+            new MailboxMongo({
+                ownerUserUid: uuid.v4(),
+                primarySmtpAddress: address,
+                aliasAddresses: [],
+                displayName: "Existing Mailbox",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+                uid: address,
+            }),
+        );
+        const list = await createList();
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${list.uid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: list.uid, version: list.version, primarySmtpAddress: address });
+
+        expect(result.status).toBe(409);
+
+        const unchanged = await repo.findOne({ uid: list.uid } as any);
+        expect(unchanged?.primarySmtpAddress).toBe(list.primarySmtpAddress);
+    });
+
+    it("Allows a PUT that resends the list's own current, unchanged primarySmtpAddress (200) - re-validating only on a genuine change.", async () => {
+        const list = await createList();
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${list.uid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: list.uid, version: list.version, primarySmtpAddress: list.primarySmtpAddress, name: "Renamed" });
+
+        expect(result.status).toBe(200);
+        expect(result.body.name).toBe("Renamed");
+    });
+
     it("Rejects creating a distribution list whose address is already used by an existing (including soft-deleted) DistributionList (409).", async () => {
         const list = await createList({ deleted: true } as any);
 

@@ -60,6 +60,14 @@ const MASTER_KEY_WRAP_METHODS = ["password", "passkey", "recovery", "escrow"] as
  * produce, small enough to block a denial-of-service-sized blob from being stored as a "wrap". */
 const MAX_WRAP_FIELD_LENGTH = 8192;
 
+/** Bounds how many enrolled keys/wraps a single mailbox can accumulate - without this, a caller with only
+ * ordinary mailbox `UPDATE` access could repeatedly call `enrollKey()`/`addMasterKeyWrap()` to grow
+ * `Mailbox.keys`/`KeyVault.wrappedKeys`/`KeyVault.masterKeyWraps` without limit, eventually hitting (and
+ * permanently breaking further updates to) MongoDB's 16MB document size limit. Generous enough for any real
+ * deployment's key-rotation history. */
+const MAX_ENROLLED_KEYS = 50;
+const MAX_MASTER_KEY_WRAPS = 20;
+
 /**
  * Validates a client-supplied `MasterKeyWrap` shape before it's persisted - `addMasterKeyWrap()`/`rekey()`
  * previously accepted the request body completely unvalidated (no `method` check, no field presence/type/size
@@ -95,6 +103,19 @@ function validateMasterKeyWrap(wrap: MasterKeyWrap, { allowEscrow }: { allowEscr
     }
     if (wrap.methodId !== undefined && (typeof wrap.methodId !== "string" || wrap.methodId.length > MAX_WRAP_FIELD_LENGTH)) {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "methodId must be a string.");
+    }
+}
+
+/** Validates a client-supplied `WrappedPrivateKey`'s wire fields before it's persisted - mirrors
+ * `validateMasterKeyWrap()`'s own reasoning: without this, `enrollKey()`/`rekey()` accepted the wrapped-key
+ * blob completely unvalidated (no field presence/type/size check at all), the same gap that function's own
+ * doc comment describes for `MasterKeyWrap`. */
+function validateWrappedPrivateKey(key: Pick<WrappedPrivateKey, "ciphertext" | "nonce" | "algorithm">): void {
+    for (const field of ["ciphertext", "nonce", "algorithm"] as const) {
+        const value: unknown = key[field];
+        if (typeof value !== "string" || value.length === 0 || value.length > MAX_WRAP_FIELD_LENGTH) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `${field} must be a non-empty string of at most ${MAX_WRAP_FIELD_LENGTH} characters.`);
+        }
     }
 }
 
@@ -325,6 +346,17 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         if (!body?.wrappedKey) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "wrappedKey is required.");
         }
+        validateWrappedPrivateKey(body.wrappedKey);
+        const requestedMasterKeyWraps: MasterKeyWrap[] = body.masterKeyWraps ?? [];
+        if (requestedMasterKeyWraps.length > MAX_MASTER_KEY_WRAPS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `masterKeyWraps cannot exceed ${MAX_MASTER_KEY_WRAPS} entries.`);
+        }
+        for (const wrap of requestedMasterKeyWraps) {
+            validateMasterKeyWrap(wrap, { allowEscrow: false });
+        }
+        if ((mailbox.keys ?? []).length >= MAX_ENROLLED_KEYS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox cannot enroll more than ${MAX_ENROLLED_KEYS} keys.`);
+        }
 
         let publicKey: PublicKey;
         let fingerprint: string;
@@ -432,6 +464,9 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         if (!keyVault) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "This mailbox has not enrolled a key yet.");
         }
+        if (keyVault.masterKeyWraps.length >= MAX_MASTER_KEY_WRAPS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A key vault cannot hold more than ${MAX_MASTER_KEY_WRAPS} master key wraps.`);
+        }
 
         const updated: K = await this.keyVaultRepo!.update(
             {
@@ -493,12 +528,23 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "This mailbox has not enrolled a key yet.");
         }
 
-        const remaining: MasterKeyWrap[] = keyVault.masterKeyWraps.filter(
-            (w) => !(w.method === method && (methodId === undefined || w.methodId === methodId)),
+        const matching: MasterKeyWrap[] = keyVault.masterKeyWraps.filter(
+            (w) => w.method === method && (methodId === undefined || w.methodId === methodId),
         );
-        if (remaining.length === keyVault.masterKeyWraps.length) {
+        if (matching.length === 0) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "No matching master key wrap was found.");
         }
+        // `methodId` is required whenever more than one wrap could share `method` (see this method's own doc
+        // comment) - without this check, omitting it while two-or-more such wraps exist would silently delete
+        // all of them in one call instead of rejecting the ambiguous request.
+        if (methodId === undefined && matching.length > 1) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                `This mailbox has ${matching.length} master key wraps for method '${method}' - methodId is required to disambiguate which one to remove.`,
+            );
+        }
+        const remaining: MasterKeyWrap[] = keyVault.masterKeyWraps.filter((w) => !matching.includes(w));
 
         const updated: K = await this.keyVaultRepo!.update(
             { uid: keyVault.uid, version: (keyVault as any).version, masterKeyWraps: remaining } as any,
@@ -565,8 +611,17 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                 );
             }
         }
+        if ((body.masterKeyWraps ?? []).length > MAX_MASTER_KEY_WRAPS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `masterKeyWraps cannot exceed ${MAX_MASTER_KEY_WRAPS} entries.`);
+        }
         for (const wrap of body.masterKeyWraps ?? []) {
             validateMasterKeyWrap(wrap, { allowEscrow: false });
+        }
+        if ((body.wrappedKeys ?? []).length > MAX_ENROLLED_KEYS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `wrappedKeys cannot exceed ${MAX_ENROLLED_KEYS} entries.`);
+        }
+        for (const wrappedKey of body.wrappedKeys ?? []) {
+            validateWrappedPrivateKey(wrappedKey);
         }
 
         const updated: K = await this.persistRekey(mailbox, keyVault, body);

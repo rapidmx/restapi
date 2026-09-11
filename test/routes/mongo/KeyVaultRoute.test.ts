@@ -320,6 +320,55 @@ describe("Route:KeyVaultMongo Tests", () => {
             expect(result.status).toBe(400);
         });
 
+        it("Rejects a wrappedKey with a missing/empty ciphertext (400) - proves the wrapped-key blob is actually validated, not stored as-is.", async () => {
+            const mailbox = await createMailbox();
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    useType: "encrypt",
+                    csr: await generateTestCsr(mailbox.primarySmtpAddress),
+                    wrappedKey: { ciphertext: "", nonce: "n", algorithm: "AES-256-GCM" },
+                });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects an initial masterKeyWraps entry asserting method 'escrow' (403) - closes the same escrow-spoofing gap addMasterKeyWrap()/rekey() are already protected against.", async () => {
+            const mailbox = await createMailbox();
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    useType: "encrypt",
+                    csr: await generateTestCsr(mailbox.primarySmtpAddress),
+                    wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" },
+                    masterKeyWraps: [
+                        { method: "escrow", ciphertext: "mkct", nonce: "mkn", salt: "salt", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() },
+                    ],
+                });
+
+            expect(result.status).toBe(403);
+
+            const updatedMailbox = await mailboxRepo.findOne({ uid: mailbox.uid } as any);
+            expect(updatedMailbox?.keys ?? []).toHaveLength(0);
+        });
+
+        it("Rejects an initial masterKeyWraps entry with a missing ciphertext (400).", async () => {
+            const mailbox = await createMailbox();
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    useType: "encrypt",
+                    csr: await generateTestCsr(mailbox.primarySmtpAddress),
+                    wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" },
+                    masterKeyWraps: [{ method: "password", nonce: "mkn", salt: "salt", kdf: "argon2id", schemeVersion: 1 }],
+                });
+
+            expect(result.status).toBe(400);
+        });
+
         it("Rejects useType 'encrypt' with no csr (400).", async () => {
             const mailbox = await createMailbox();
             const result = await request(server.getApplication())
@@ -462,6 +511,29 @@ describe("Route:KeyVaultMongo Tests", () => {
 
             const entries = await auditLogRepo.find({ action: AuditAction.KEY_VAULT_WRAP_REMOVE }).toArray();
             expect(entries).toHaveLength(1);
+        });
+
+        it("Rejects removing a wrap by method alone (no methodId) when more than one wrap shares that method (400) - previously silently deleted all of them.", async () => {
+            const mailbox = await createMailbox();
+            await enrollFirstKey(mailbox);
+            await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/wraps`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ method: "passkey", methodId: "cred-1", ciphertext: "ct", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() });
+            await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/wraps`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ method: "passkey", methodId: "cred-2", ciphertext: "ct", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${mailbox.uid}/keyvault/wraps/passkey`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(400);
+
+            // Neither passkey wrap was removed - the ambiguous request was rejected outright.
+            const vault = await keyVaultRepo.findOne({ mailboxUid: mailbox.uid } as any);
+            expect(vault?.masterKeyWraps.filter((w: any) => w.method === "passkey")).toHaveLength(2);
         });
 
         it("Returns 404 removing a wrap that doesn't match any stored method/methodId.", async () => {
