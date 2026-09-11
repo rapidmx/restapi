@@ -13,6 +13,7 @@ export * from "./EncryptionPolicyRouteMongo.js";
 export * from "./FocusedInboxOverrideRouteMongo.js";
 export * from "./FolderRouteMongo.js";
 export * from "./IngestQueueRouteMongo.js";
+export * from "./KeyDiscoveryRouteMongo.js";
 export * from "./KeyVaultRouteMongo.js";
 export * from "./MailboxRouteMongo.js";
 export * from "./MailFilterRuleRouteMongo.js";
