@@ -622,6 +622,101 @@ describe("Route:MessageMongo Tests", () => {
         });
     });
 
+    describe("archive()", () => {
+        it("Archiving a message lazily creates the mailbox's Archive folder and moves the message into it.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, inbox.uid);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/archive`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+
+            const archiveFolder = await folderRepo.findOne({ mailboxUid: mailbox.uid, type: FolderType.ARCHIVE } as any);
+            expect(archiveFolder).not.toBeNull();
+            expect(result.body.folderUid).toBe(archiveFolder!.uid);
+        });
+
+        it("Reuses the mailbox's existing Archive folder rather than creating a second one.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX);
+            const archiveFolder = await createFolder(mailbox.uid, FolderType.ARCHIVE);
+            const message = await createMessage(mailbox.uid, inbox.uid);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/archive`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.folderUid).toBe(archiveFolder.uid);
+
+            const archiveFolders = await folderRepo.find({ mailboxUid: mailbox.uid, type: FolderType.ARCHIVE }).toArray();
+            expect(archiveFolders.length).toBe(1);
+        });
+
+        it("Archiving a message already in Archive succeeds as a no-op.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const archiveFolder = await createFolder(mailbox.uid, FolderType.ARCHIVE);
+            const message = await createMessage(mailbox.uid, archiveFolder.uid);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/archive`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.folderUid).toBe(archiveFolder.uid);
+        });
+
+        it("Rejects archiving a message currently in Drafts (400).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const message = await createMessage(mailbox.uid, draftsFolder.uid);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/archive`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects archiving a message currently in Outbox (400).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const outbox = await createFolder(mailbox.uid, FolderType.OUTBOX);
+            const message = await createMessage(mailbox.uid, outbox.uid);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/archive`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(400);
+        });
+
+        it("A different user cannot archive a message they don't have access to (403).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, inbox.uid);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/archive`)
+                .set("Authorization", "jwt " + otherUserToken);
+
+            expect(result.status).toBe(403);
+        });
+
+        it("Archiving a nonexistent message returns 404.", async () => {
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${uuid.v4()}/archive`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(404);
+        });
+    });
+
     describe("conversations()", () => {
         it("Groups a reply (sent via send()) with its parent message, across Inbox and Sent Items.", async () => {
             const mailbox = await createMailbox(owner.uid);

@@ -15,6 +15,7 @@ export enum FolderType {
     DELETED_ITEMS = "deleted_items",
     OUTBOX = "outbox",
     JUNK = "junk",
+    ARCHIVE = "archive",
     CALENDAR = "calendar",
     CONTACTS = "contacts",
     TASKS = "tasks",

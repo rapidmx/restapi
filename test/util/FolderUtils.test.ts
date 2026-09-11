@@ -91,4 +91,13 @@ describe("findOrCreateWellKnownFolder() Tests", () => {
         const [createdInstance] = repo.create.mock.calls[0];
         expect(createdInstance.data.name).toBe("Contacts");
     });
+
+    it("Uses 'Archive' as the default name for FolderType.ARCHIVE.", async () => {
+        const repo = makeRepo();
+
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.ARCHIVE);
+
+        const [createdInstance] = repo.create.mock.calls[0];
+        expect(createdInstance.data.name).toBe("Archive");
+    });
 });

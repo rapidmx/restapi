@@ -13,6 +13,7 @@ const DEFAULT_FOLDER_NAMES: Record<FolderType, string> = {
     [FolderType.DELETED_ITEMS]: "Deleted Items",
     [FolderType.OUTBOX]: "Outbox",
     [FolderType.JUNK]: "Junk Email",
+    [FolderType.ARCHIVE]: "Archive",
     [FolderType.CALENDAR]: "Calendar",
     [FolderType.CONTACTS]: "Contacts",
     [FolderType.TASKS]: "Tasks",

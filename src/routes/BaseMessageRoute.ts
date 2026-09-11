@@ -533,6 +533,57 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     }
 
     /**
+     * Moves a message to the mailbox's Archive folder (created lazily on first use, like any other
+     * well-known folder - see `findOrCreateWellKnownFolder()`) - a manual, one-click equivalent of moving
+     * it there via an ordinary folder `update()`. Blocked for a message currently in Drafts or Outbox:
+     * `Message.scheduledSendTime`'s own doc comment notes a scheduled/draft send sits in Outbox until
+     * `ScheduledSendJob` relays it, and archiving it out from under that job's own folder-scoped query
+     * would silently prevent it from ever being sent. No other folder-type restriction - archiving from
+     * Inbox, Sent Items, Junk, or any user folder is fine, and re-archiving an already-archived message is
+     * a harmless idempotent no-op.
+     */
+    @Summary("Archive message")
+    @Description(
+        "Moves a message to the mailbox's Archive folder (created on first use, like any other well-known " +
+            "folder) - a manual, one-click equivalent of moving it there via an ordinary folder update.",
+    )
+    @Returns([Object])
+    @Post("/:id/archive")
+    public async archive(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<T> {
+        if (!this.repoUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+
+        const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
+        if (!message) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        if (!(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+
+        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        const currentFolder: any = await folderRepo.findOne(message.folderUid, { ignoreACL: true });
+        if (currentFolder?.type === FolderType.DRAFTS || currentFolder?.type === FolderType.OUTBOX) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A message in Drafts or Outbox cannot be archived.");
+        }
+
+        const archiveFolder: any = await findOrCreateWellKnownFolder(
+            folderRepo,
+            this.folderClass,
+            message.mailboxUid,
+            FolderType.ARCHIVE,
+            user,
+        );
+
+        return await this.repoUtils.update(
+            { uid: message.uid, version: (message as any).version, folderUid: archiveFolder.uid } as any,
+            message,
+            { user, ignoreACL: true },
+        );
+    }
+
+    /**
      * Moves a message between the Focused and Other halves of the Inbox, and - with
      * `applyToSender: true` - records a `FocusedInboxOverride` so every future message from that same
      * sender goes there automatically. These are Outlook's two adjacent gestures ("Move to Other" vs.
