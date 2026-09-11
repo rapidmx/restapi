@@ -623,6 +623,7 @@ describe("Mongo model default construction", () => {
         expect(obj.reminderMinutesBeforeStart).toBeUndefined();
         expect(obj.icalUid).toBe("");
         expect(obj.sequence).toBe(0);
+        expect(obj.encrypted).toBe(false);
     });
 
     it("CalendarEventMongo applies provided overrides when constructed with data.", () => {
@@ -654,6 +655,7 @@ describe("Mongo model default construction", () => {
             reminderMinutesBeforeStart: 15,
             icalUid: "ical-uid-1",
             sequence: 2,
+            encrypted: true,
         });
 
         expect(obj.folderUid).toBe("folder-1");
@@ -680,6 +682,7 @@ describe("Mongo model default construction", () => {
         expect(obj.reminderMinutesBeforeStart).toBe(15);
         expect(obj.icalUid).toBe("ical-uid-1");
         expect(obj.sequence).toBe(2);
+        expect(obj.encrypted).toBe(true);
     });
 
     it("CalendarShareLinkMongo falls back to class defaults when constructed with no data.", () => {

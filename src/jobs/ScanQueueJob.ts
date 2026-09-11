@@ -1024,7 +1024,7 @@ export abstract class ScanQueueJob<
         try {
             switch (parsed.method) {
                 case "REQUEST":
-                    await this.processItipRequest(entry.mailboxUid, parsed);
+                    await this.processItipRequest(entry.mailboxUid, parsed, result.encrypted);
                     break;
                 case "REPLY":
                     await this.processItipReply(entry.mailboxUid, parsed);
@@ -1049,7 +1049,10 @@ export abstract class ScanQueueJob<
         return rows.find((row) => recurrenceIdsMatch(row.recurrenceId, recurrenceId));
     }
 
-    private async processItipRequest(mailboxUid: string, parsed: ParsedIcsEvent): Promise<void> {
+    /** `encrypted` is only ever consulted on the create branch below - an existing row's own `encrypted`
+     * (set once, from whichever REQUEST first created it) is deliberately never overwritten by a later
+     * update, per the spec's "sticky" encryption-state rule (`CalendarEvent.encrypted`'s own doc comment). */
+    private async processItipRequest(mailboxUid: string, parsed: ParsedIcsEvent, encrypted: boolean): Promise<void> {
         const existing = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
         if (existing && parsed.sequence <= existing.sequence) {
             // Stale/duplicate resend - already have this revision (or a newer one).
@@ -1100,6 +1103,7 @@ export abstract class ScanQueueJob<
                     busyStatus: BusyStatus.BUSY,
                     icalUid: parsed.uid,
                     sequence: parsed.sequence,
+                    encrypted,
                 }),
                 { ignoreACL: true },
             );

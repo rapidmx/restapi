@@ -860,8 +860,45 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             expect(events.length).toBe(1);
             expect(events[0].title).toBe("Team Sync");
             expect(events[0].attendees[0].responseStatus).toBe(AttendeeResponseStatus.NEEDS_ACTION);
+            expect(events[0].encrypted).toBe(false);
             const calendarFolder = await folderRepo.findOne({ where: { mailboxUid, type: FolderType.CALENDAR } });
             expect(events[0].folderUid).toBe(calendarFolder!.uid);
+        });
+
+        it("Preserves encrypted: true on an existing event when a later resent REQUEST updates it - encryption state is sticky, never recomputed from the current message.", async () => {
+            const icalUid = uuid.v4();
+            const folder = await folderRepo.save(
+                new FolderSQL({ mailboxUid, name: "Calendar", type: FolderType.CALENDAR, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+            );
+            await calendarEventRepo.save(
+                new CalendarEventSQL({
+                    folderUid: folder.uid,
+                    mailboxUid,
+                    title: "Team Sync",
+                    startDate: new Date(),
+                    endDate: new Date(),
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: "to" as any },
+                    icalUid,
+                    sequence: 0,
+                    encrypted: true,
+                }),
+            );
+
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 1, title: "Team Sync (moved)" }), "REQUEST")),
+            );
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const events = await calendarEventRepo.find({ where: { mailboxUid, icalUid } });
+            expect(events.length).toBe(1);
+            expect(events[0].title).toBe("Team Sync (moved)");
+            expect(events[0].encrypted).toBe(true);
         });
 
         it("Updates an existing event in place when a resent REQUEST carries a higher sequence.", async () => {

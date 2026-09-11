@@ -1198,6 +1198,19 @@ export interface CalendarEvent extends RecoverableBaseEntity {
     /** Set once an iTIP CANCEL has been sent to attendees for this event (triggered by `status:
      * CANCELLED` or by deleting the event) - prevents resending on every poll. */
     cancelNoticeSentAt?: Date;
+
+    /** A provenance flag: `true` when this event derives from (or was explicitly created as) an encrypted
+     * message/invitation, per `specs/end-to-end_encryption.md`'s "Derived Entities" section. This is
+     * currently the *only* part of that section implemented here - actual field-level encryption of
+     * `title`/`location`/attachments (leaving `startDate`/`endDate`/`attendees`/RSVP status plaintext, per
+     * the spec) requires the client-side E2E composition/decryption work this repo defers, since today
+     * `ScanQueueJob`'s iTIP pipeline only ever reads a `text/calendar` part that's already plaintext-visible
+     * to the server - a genuinely S/MIME-encrypted invitation has no such separately-visible part at all
+     * (see `util/SmimeUtils.ts`), so this flag is set defensively (never false-negative) rather than
+     * something the current pipeline exercises in the common case. **Sticky**: once `true`, an update,
+     * cancellation, or any instance of a recurring series MUST preserve it rather than recomputing it from
+     * whatever triggered that particular mutation - see `ScanQueueJob.processItipRequest()`. */
+    encrypted: boolean;
 }
 
 /**
