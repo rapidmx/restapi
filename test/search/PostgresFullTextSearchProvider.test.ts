@@ -37,10 +37,13 @@ describe("PostgresFullTextSearchProvider Tests", () => {
 
             await (provider as any).init();
 
-            expect(mockConnection.query).toHaveBeenCalledTimes(3);
+            expect(mockConnection.query).toHaveBeenCalledTimes(6);
             expect(mockConnection.query.mock.calls[0][0]).toMatch(/CREATE TABLE IF NOT EXISTS mail_search_index/);
-            expect(mockConnection.query.mock.calls[1][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_vector/);
-            expect(mockConnection.query.mock.calls[2][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_mailbox/);
+            expect(mockConnection.query.mock.calls[1][0]).toMatch(/ALTER TABLE mail_search_index/);
+            expect(mockConnection.query.mock.calls[2][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_vector/);
+            expect(mockConnection.query.mock.calls[3][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_mailbox/);
+            expect(mockConnection.query.mock.calls[4][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_folder/);
+            expect(mockConnection.query.mock.calls[5][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_date/);
         });
 
         it("Throws when no connection is found for the configured datasource.", async () => {
@@ -69,7 +72,23 @@ describe("PostgresFullTextSearchProvider Tests", () => {
             const [sql, params] = mockConnection.query.mock.calls[0];
             expect(sql).toMatch(/INSERT INTO mail_search_index/);
             expect(sql).toMatch(/ON CONFLICT \(entity_type, entity_uid\) DO UPDATE SET/);
-            expect(params).toEqual(["message", "msg-1", "mbx-1", "Hello", "World", null, null, null]);
+            expect(params).toEqual([
+                "message",
+                "msg-1",
+                "mbx-1",
+                "Hello",
+                "World",
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+            ]);
         });
 
         it("Falls back to null for subject/body when they are omitted.", async () => {
@@ -232,6 +251,134 @@ describe("PostgresFullTextSearchProvider Tests", () => {
 
             const [, params] = mockConnection.query.mock.calls[0];
             expect(params[2]).toBe(201);
+        });
+
+        it("Uses websearch_to_tsquery, not plainto_tsquery, for the free-text match.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockConnection.query.mockClear();
+            mockConnection.query.mockResolvedValueOnce([]);
+
+            await provider.search({ mailboxUid: "mbx-1", text: "hello -spam" });
+
+            const [sql] = mockConnection.query.mock.calls[0];
+            expect(sql).toMatch(/websearch_to_tsquery/);
+            expect(sql).not.toMatch(/plainto_tsquery/);
+        });
+
+        it("Propagates metadata_only from the row onto the result as metadataOnly.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockConnection.query.mockClear();
+            mockConnection.query.mockResolvedValueOnce([
+                { entity_type: "message", entity_uid: "msg-1", rank: 0.1, metadata_only: true },
+            ]);
+
+            const result = await provider.search({ mailboxUid: "mbx-1", text: "hello" });
+
+            expect(result.results[0].metadataOnly).toBe(true);
+        });
+
+        it("Applies structured operator-grammar filters as WHERE predicates, in addition to the free-text match.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockConnection.query.mockClear();
+            mockConnection.query.mockResolvedValueOnce([]);
+            const before = new Date("2026-06-01");
+            const after = new Date("2026-01-01");
+
+            await provider.search({
+                mailboxUid: "mbx-1",
+                text: "hello",
+                from: "alice@example.com",
+                to: "bob@example.com",
+                cc: "carol@example.com",
+                hasAttachment: true,
+                folderUid: "folder-1",
+                flags: ["read", "flagged"],
+                before,
+                after,
+            });
+
+            const [sql, params] = mockConnection.query.mock.calls[0];
+            expect(sql).toMatch(/from_address = \$\d+/);
+            expect(sql).toMatch(/\$\d+ = ANY\(to_addresses\)/);
+            expect(sql).toMatch(/\$\d+ = ANY\(cc_addresses\)/);
+            expect(sql).toMatch(/has_attachments = \$\d+/);
+            expect(sql).toMatch(/folder_uid = \$\d+/);
+            expect(sql).toMatch(/flags @> \$\d+::text\[\]/);
+            expect(sql).toMatch(/date_for_sort < \$\d+/);
+            expect(sql).toMatch(/date_for_sort > \$\d+/);
+            expect(params).toEqual(
+                expect.arrayContaining(["alice@example.com", "bob@example.com", "carol@example.com", true, "folder-1", ["read", "flagged"], before, after]),
+            );
+        });
+
+        it("Matches subject: against a subject-scoped tsvector, as an additional AND predicate alongside the free-text match.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockConnection.query.mockClear();
+            mockConnection.query.mockResolvedValueOnce([]);
+
+            await provider.search({ mailboxUid: "mbx-1", text: "", subject: "budget" });
+
+            const [sql, params] = mockConnection.query.mock.calls[0];
+            expect(sql).toMatch(/to_tsvector\('english', coalesce\(subject, ''\)\) @@ websearch_to_tsquery/);
+            expect(params).toContain("budget");
+        });
+
+        it("Sorts by date_for_sort, not rank, when text is empty - a pure structured-filter query.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockConnection.query.mockClear();
+            mockConnection.query.mockResolvedValueOnce([]);
+
+            await provider.search({ mailboxUid: "mbx-1", text: "", folderUid: "folder-1" });
+
+            const [sql] = mockConnection.query.mock.calls[0];
+            expect(sql).toMatch(/ORDER BY date_for_sort DESC NULLS LAST/);
+        });
+    });
+
+    describe("candidates()", () => {
+        it("Returns an empty page when no dataSource has been initialized.", async () => {
+            const result = await provider.candidates({ mailboxUid: "mbx-1" });
+            expect(result).toEqual({ candidates: [] });
+        });
+
+        it("Filters by mailboxUid, entityTypes, participants (OR'd ILIKE), folderUid/flags/date range, sorted by date, identifiers only.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockConnection.query.mockClear();
+            mockConnection.query.mockResolvedValueOnce([{ entity_type: "message", entity_uid: "msg-1" }]);
+
+            const result = await provider.candidates({
+                mailboxUid: "mbx-1",
+                entityTypes: ["message"],
+                participants: ["bob@example.com", "carol@example.com"],
+                folderUid: "folder-1",
+            });
+
+            const [sql, params] = mockConnection.query.mock.calls[0];
+            expect(sql).toMatch(/SELECT entity_type, entity_uid/);
+            expect(sql).not.toMatch(/search_vector|rank/);
+            expect(sql).toMatch(/participants ILIKE '%' \|\| \$\d+ \|\| '%' OR participants ILIKE '%' \|\| \$\d+ \|\| '%'/);
+            expect(sql).toMatch(/ORDER BY date_for_sort DESC NULLS LAST/);
+            expect(params).toEqual(expect.arrayContaining(["mbx-1", ["message"], "bob@example.com", "carol@example.com", "folder-1"]));
+            expect(result).toEqual({ candidates: [{ entityType: "message", entityUid: "msg-1" }], nextCursor: undefined });
+        });
+
+        it("Sets hasMore/nextCursor when more rows are returned than the requested limit.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockConnection.query.mockClear();
+            const rows = Array.from({ length: 3 }, (_, i) => ({ entity_type: "message", entity_uid: `msg-${i}` }));
+            mockConnection.query.mockResolvedValueOnce(rows);
+
+            const result = await provider.candidates({ mailboxUid: "mbx-1", limit: 2 });
+
+            expect(result.candidates).toHaveLength(2);
+            expect(result.nextCursor).toBe("2");
         });
     });
 });

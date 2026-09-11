@@ -129,4 +129,132 @@ describe("Route:SearchRouteSQL Tests", () => {
         expect(result.body.results.length).toBe(1);
         expect(result.body.results[0].entityType).toBe("note");
     });
+
+    it("Accepts a pure structured-filter query with no free text (q) at all - a subject: filter, no q param present.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+        await searchProvider.index({
+            entityType: "message",
+            entityUid: "msg-1",
+            mailboxUid: mailbox.uid,
+            subject: "Q3 budget",
+        });
+        await searchProvider.index({
+            entityType: "message",
+            entityUid: "msg-2",
+            mailboxUid: mailbox.uid,
+            subject: "Unrelated",
+        });
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}?subject=budget`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(200);
+        expect(result.body.results.map((r: any) => r.entityUid)).toEqual(["msg-1"]);
+    });
+
+    it("Rejects a request with neither q nor any structured filter (400).", async () => {
+        await createMailbox(owner.uid);
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}?types=note`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Applies from/hasAttachment structured filters alongside free text.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+        await searchProvider.index({
+            entityType: "message",
+            entityUid: "msg-1",
+            mailboxUid: mailbox.uid,
+            subject: "Report",
+            body: "Report body",
+            from: "alice@example.com",
+            hasAttachments: true,
+        });
+        await searchProvider.index({
+            entityType: "message",
+            entityUid: "msg-2",
+            mailboxUid: mailbox.uid,
+            subject: "Report",
+            body: "Report body",
+            from: "bob@example.com",
+            hasAttachments: true,
+        });
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}?q=Report&from=alice@example.com&hasAttachment=true`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(200);
+        expect(result.body.results.map((r: any) => r.entityUid)).toEqual(["msg-1"]);
+    });
+
+    describe("GET /search/candidates", () => {
+        it("Requires authentication.", async () => {
+            const result = await request(server.getApplication()).get(`${baseUrl}/candidates`);
+            expect(result.status).toBe(401);
+        });
+
+        it("Returns 404 when the caller owns no mailbox.", async () => {
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/candidates`)
+                .set("Authorization", "jwt " + ownerToken);
+            expect(result.status).toBe(404);
+        });
+
+        it("Returns identifiers only, scoped to the caller's own mailbox, with no q required.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            await searchProvider.index({
+                entityType: "message",
+                entityUid: "msg-1",
+                mailboxUid: mailbox.uid,
+                subject: "Encrypted mail, unreadable server-side",
+                metadataOnly: true,
+            });
+            await searchProvider.index({
+                entityType: "message",
+                entityUid: "msg-2",
+                mailboxUid: "some-other-mailbox",
+                subject: "Different mailbox",
+            });
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/candidates`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body.candidates).toEqual([{ entityType: "message", entityUid: "msg-1" }]);
+        });
+
+        it("Filters by participants and folder.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            await searchProvider.index({
+                entityType: "message",
+                entityUid: "msg-1",
+                mailboxUid: mailbox.uid,
+                participants: ["alice@example.com"],
+                folderUid: "folder-1",
+            });
+            await searchProvider.index({
+                entityType: "message",
+                entityUid: "msg-2",
+                mailboxUid: mailbox.uid,
+                participants: ["bob@example.com"],
+                folderUid: "folder-1",
+            });
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/candidates?participants=alice@example.com&in=folder-1`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body.candidates).toEqual([{ entityType: "message", entityUid: "msg-1" }]);
+        });
+    });
 });

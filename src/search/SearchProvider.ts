@@ -10,6 +10,11 @@ export type SearchEntityType = "message" | "contact" | "calendarEvent" | "note" 
  * A flattened, provider-agnostic representation of one searchable entity, built from a `Message`/`Contact`/
  * `CalendarEvent`/`Note`/`Task` record (plus, for a message, its attachments' extracted text) and handed to a
  * `SearchProvider` for indexing.
+ *
+ * `from`/`to`/`cc` and `participants` (the spec's "Required Schema Changes", `specs/search.md` §14) are both
+ * populated together, not one derived from the other at query time: `participants` remains the flattened union
+ * used by existing free-text ranking (weighted like `body`), while `from`/`to`/`cc` exist so the `from:`/`to:`/
+ * `cc:` query operators can filter on a specific role rather than "any participant".
  */
 export interface SearchDocument {
     entityType: SearchEntityType;
@@ -18,17 +23,67 @@ export interface SearchDocument {
     subject?: string;
     body?: string;
     attachmentText?: string[];
+    /** The union of `from`/`to`/`cc`, for existing free-text participant ranking. */
     participants?: string[];
+    /** Sender address - powers the `from:` query operator. */
+    from?: string;
+    /** Recipient (`To`) addresses - powers the `to:` query operator. */
+    to?: string[];
+    /** Recipient (`Cc`) addresses - powers the `cc:` query operator. */
+    cc?: string[];
     dateForSort?: Date;
+    /** The folder this entity currently resides in - powers the `in:` query operator. */
+    folderUid?: string;
+    /** Flag/state strings (e.g. `"read"`, `"unread"`, `"flagged"`) - powers the `is:` query operator. */
+    flags?: string[];
+    /** Whether the entity has attachments - powers the `has:attachment` query operator. */
+    hasAttachments?: boolean;
+    /**
+     * True when this document was built from an encrypted entity whose `subject`/`body`/`attachmentText`
+     * were therefore intentionally excluded (`specs/search.md` §2/§6, Tier 1 still indexes the reduced field
+     * set for an encrypted message so participant/date search keeps working, but a score computed from that
+     * reduced set is not comparable to one computed from full content). Propagated to
+     * `SearchResult.metadataOnly` on every result built from this document.
+     */
+    metadataOnly?: boolean;
 }
 
-/** A search query issued against `BaseSearchRoute` / `SearchProvider.search()`. */
+/**
+ * A search query issued against `BaseSearchRoute` / `SearchProvider.search()`.
+ *
+ * The structured filter fields below are the operator-grammar portion of a query (`specs/search.md` §14) -
+ * `from:`/`to:`/`cc:`/`subject:`/`has:attachment`/`before:`/`after:`/`in:`/`is:`. Per the spec, parsing the
+ * operator syntax out of raw query text ("`from:bob has:attachment foo`") happens once, client-side, so that
+ * every tier (including a client's own local Tier 2/3 search) interprets it identically - this interface
+ * accepts the already-parsed result, not raw operator text. `type:` needs no separate field; it maps directly
+ * onto `entityTypes` below, which already existed. `text` continues to drive free-text relevance ranking
+ * across the full weighted field set; the structured fields narrow via exact/range predicates instead.
+ */
 export interface SearchQuery {
     mailboxUid: string;
     text: string;
     entityTypes?: SearchEntityType[];
     limit?: number;
     cursor?: string;
+    /** `from:` - sender address. */
+    from?: string;
+    /** `to:` - a recipient address in the `To` line. */
+    to?: string;
+    /** `cc:` - a recipient address in the `Cc` line. */
+    cc?: string;
+    /** `subject:` - restricts free-text-style matching to the subject/title field only, instead of `text`
+     * matching against the full weighted field set. May be used together with or instead of `text`. */
+    subject?: string;
+    /** `has:attachment` */
+    hasAttachment?: boolean;
+    /** `before:` */
+    before?: Date;
+    /** `after:` */
+    after?: Date;
+    /** `in:` - folder or calendar uid. */
+    folderUid?: string;
+    /** `is:` - one or more flag/state strings, matched as an AND (all must be present). */
+    flags?: string[];
 }
 
 /** A single ranked hit returned by `SearchProvider.search()`. */
@@ -38,12 +93,42 @@ export interface SearchResult {
     score: number;
     /** A short, provider-generated snippet highlighting the matched text, if supported. */
     snippet?: string;
+    /** True when `score` is derived from server-visible metadata only (participants/date, not content) and
+     * is not comparable to a result scored from full content - see `SearchDocument.metadataOnly`. */
+    metadataOnly?: boolean;
 }
 
 /** The page of results returned by `SearchProvider.search()`. */
 export interface SearchResultPage {
     results: SearchResult[];
     /** Opaque cursor to pass back as `SearchQuery.cursor` to retrieve the next page, if more results exist. */
+    nextCursor?: string;
+}
+
+/**
+ * Requests a Tier 3 candidate set (`specs/search.md` §6 "Tier 3 — Server-assisted narrowing") - identifiers
+ * only, ranked purely on server-visible metadata (participants, dates, folder, flags), never on content. For
+ * an encrypted entity outside a client's local Tier 2 index window, the client uses this to narrow down to a
+ * manageable candidate set, then fetches/decrypts/matches each candidate locally - the server never learns
+ * which candidate actually matched.
+ */
+export interface CandidateQuery {
+    mailboxUid: string;
+    entityTypes?: SearchEntityType[];
+    /** Participant terms extracted from the query text, matched against server-visible envelope data
+     * (`from`/`to`/`cc`/`participants`). */
+    participants?: string[];
+    before?: Date;
+    after?: Date;
+    folderUid?: string;
+    flags?: string[];
+    limit?: number;
+    cursor?: string;
+}
+
+/** The page of candidate identifiers returned by `SearchProvider.candidates()`. */
+export interface CandidateResultPage {
+    candidates: { entityType: SearchEntityType; entityUid: string }[];
     nextCursor?: string;
 }
 
@@ -73,4 +158,8 @@ export interface SearchProvider {
 
     /** Executes a search query, returning ranked results across the requested entity types. */
     search(query: SearchQuery): Promise<SearchResultPage>;
+
+    /** Executes a Tier 3 candidate query, returning identifiers only - see `CandidateQuery`'s own doc
+     * comment. Ranked on server-visible metadata alone, never on `subject`/`body`/`attachmentText`. */
+    candidates(query: CandidateQuery): Promise<CandidateResultPage>;
 }

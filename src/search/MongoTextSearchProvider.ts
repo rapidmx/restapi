@@ -5,7 +5,15 @@
 import type { Collection, Db } from "mongodb";
 import { ObjectDecorators } from "@rapidrest/core";
 import { ConnectionManager } from "@rapidrest/service-core";
-import { SearchDocument, SearchEntityType, SearchProvider, SearchQuery, SearchResultPage } from "./SearchProvider.js";
+import {
+    CandidateQuery,
+    CandidateResultPage,
+    SearchDocument,
+    SearchEntityType,
+    SearchProvider,
+    SearchQuery,
+    SearchResultPage,
+} from "./SearchProvider.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 const COLLECTION_NAME = "mail_search_index";
@@ -20,7 +28,14 @@ interface StoredDoc {
     body?: string;
     attachmentText?: string;
     participants?: string;
+    from?: string;
+    to?: string[];
+    cc?: string[];
     dateForSort?: Date;
+    folderUid?: string;
+    flags?: string[];
+    hasAttachments?: boolean;
+    metadataOnly?: boolean;
 }
 
 /**
@@ -59,6 +74,10 @@ export class MongoTextSearchProvider implements SearchProvider {
             { name: "mail_search_text" },
         );
         await this.collection.createIndex({ mailboxUid: 1, entityType: 1 });
+        // Supports the structured operator-grammar filters (specs/search.md §14) and the Tier 3 candidate
+        // query, none of which go through the `$text` index above.
+        await this.collection.createIndex({ mailboxUid: 1, folderUid: 1 });
+        await this.collection.createIndex({ mailboxUid: 1, dateForSort: 1 });
     }
 
     private docId(entityType: SearchEntityType, entityUid: string): string {
@@ -75,7 +94,14 @@ export class MongoTextSearchProvider implements SearchProvider {
             body: doc.body,
             attachmentText: doc.attachmentText?.join("\n"),
             participants: doc.participants?.join(" "),
+            from: doc.from,
+            to: doc.to,
+            cc: doc.cc,
             dateForSort: doc.dateForSort,
+            folderUid: doc.folderUid,
+            flags: doc.flags,
+            hasAttachments: doc.hasAttachments,
+            metadataOnly: doc.metadataOnly,
         };
     }
 
@@ -102,6 +128,32 @@ export class MongoTextSearchProvider implements SearchProvider {
         await this.collection?.deleteOne({ _id: this.docId(entityType, entityUid) });
     }
 
+    /** Applies the structured operator-grammar predicates (specs/search.md §14) shared by `search()` and
+     * `candidates()`. `$text` (free-text ranking) is deliberately not built here - `search()` layers it on
+     * separately, and `candidates()` never uses it at all (metadata-only, per its own doc comment). */
+    private structuredFilter(entityTypes: SearchEntityType[] | undefined, before?: Date, after?: Date, folderUid?: string, flags?: string[]): any {
+        const filter: any = {};
+        if (entityTypes && entityTypes.length > 0) {
+            filter.entityType = { $in: entityTypes };
+        }
+        if (folderUid !== undefined) {
+            filter.folderUid = folderUid;
+        }
+        if (flags && flags.length > 0) {
+            filter.flags = { $all: flags };
+        }
+        if (before !== undefined || after !== undefined) {
+            filter.dateForSort = {};
+            if (before !== undefined) {
+                filter.dateForSort.$lt = before;
+            }
+            if (after !== undefined) {
+                filter.dateForSort.$gt = after;
+            }
+        }
+        return filter;
+    }
+
     public async search(query: SearchQuery): Promise<SearchResultPage> {
         if (!this.collection) {
             return { results: [] };
@@ -110,16 +162,41 @@ export class MongoTextSearchProvider implements SearchProvider {
         const limit: number = Math.min(query.limit ?? 25, 200);
         const skip: number = query.cursor ? Math.max(0, parseInt(query.cursor, 10) || 0) : 0;
 
-        const filter: any = { mailboxUid: query.mailboxUid, $text: { $search: query.text } };
-        if (query.entityTypes && query.entityTypes.length > 0) {
-            filter.entityType = { $in: query.entityTypes };
+        const filter: any = {
+            mailboxUid: query.mailboxUid,
+            ...this.structuredFilter(query.entityTypes, query.before, query.after, query.folderUid, query.flags),
+        };
+        if (query.from !== undefined) {
+            filter.from = query.from;
+        }
+        if (query.to !== undefined) {
+            filter.to = query.to;
+        }
+        if (query.cc !== undefined) {
+            filter.cc = query.cc;
+        }
+        if (query.hasAttachment !== undefined) {
+            filter.hasAttachments = query.hasAttachment;
+        }
+        // `$text` cannot be scoped to a single field on a combined multi-field text index, so `subject:` falls
+        // back to a case-insensitive regex against the (untokenized) `subject` string - correct, if not
+        // stemmed/ranked the way the combined `$text` match is. Applied as an additional AND predicate, not a
+        // replacement for `$text`, so `subject:foo bar` still ranks on `bar` across every field too.
+        if (query.subject !== undefined) {
+            filter.subject = { $regex: query.subject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" };
+        }
+        if (query.text) {
+            filter.$text = { $search: query.text };
         }
 
-        const cursor = this.collection
-            .find(filter, { projection: { score: { $meta: "textScore" } } })
-            .sort({ score: { $meta: "textScore" } })
-            .skip(skip)
-            .limit(limit + 1);
+        const projection: any = query.text ? { score: { $meta: "textScore" } } : {};
+        const cursor = this.collection.find(filter, { projection });
+        if (query.text) {
+            cursor.sort({ score: { $meta: "textScore" } });
+        } else {
+            cursor.sort({ dateForSort: -1 });
+        }
+        cursor.skip(skip).limit(limit + 1);
         const rows: (StoredDoc & { score?: number })[] = await cursor.toArray();
 
         const hasMore: boolean = rows.length > limit;
@@ -130,7 +207,40 @@ export class MongoTextSearchProvider implements SearchProvider {
                 entityType: row.entityType,
                 entityUid: row.entityUid,
                 score: row.score ?? 0,
+                metadataOnly: row.metadataOnly,
             })),
+            nextCursor: hasMore ? String(skip + limit) : undefined,
+        };
+    }
+
+    public async candidates(query: CandidateQuery): Promise<CandidateResultPage> {
+        if (!this.collection) {
+            return { candidates: [] };
+        }
+
+        const limit: number = Math.min(query.limit ?? 25, 200);
+        const skip: number = query.cursor ? Math.max(0, parseInt(query.cursor, 10) || 0) : 0;
+
+        const filter: any = {
+            mailboxUid: query.mailboxUid,
+            ...this.structuredFilter(query.entityTypes, query.before, query.after, query.folderUid, query.flags),
+        };
+        if (query.participants && query.participants.length > 0) {
+            filter.participants = { $in: query.participants };
+        }
+
+        const rows: StoredDoc[] = await this.collection
+            .find(filter, { projection: { entityType: 1, entityUid: 1 } })
+            .sort({ dateForSort: -1 })
+            .skip(skip)
+            .limit(limit + 1)
+            .toArray();
+
+        const hasMore: boolean = rows.length > limit;
+        const page: StoredDoc[] = hasMore ? rows.slice(0, limit) : rows;
+
+        return {
+            candidates: page.map((row) => ({ entityType: row.entityType, entityUid: row.entityUid })),
             nextCursor: hasMore ? String(skip + limit) : undefined,
         };
     }

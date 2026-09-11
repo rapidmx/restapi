@@ -16,7 +16,15 @@ import "reflect-metadata";
 import * as x509 from "@peculiar/x509";
 import type { BlobPutOptions, BlobRange, BlobStore } from "../src/blob/BlobStore.js";
 import type { DnsMxRecord, DnsResolver } from "../src/dns/DnsResolver.js";
-import type { SearchDocument, SearchEntityType, SearchProvider, SearchQuery, SearchResultPage } from "../src/search/SearchProvider.js";
+import type {
+    CandidateQuery,
+    CandidateResultPage,
+    SearchDocument,
+    SearchEntityType,
+    SearchProvider,
+    SearchQuery,
+    SearchResultPage,
+} from "../src/search/SearchProvider.js";
 import type { ScanEnvelope, SpamScanProvider, SpamScanResult } from "../src/scan/SpamScanProvider.js";
 import type { AvScanProvider, AvScanResult } from "../src/scan/AvScanProvider.js";
 import type { MailTransport, OutboundMessage, TransportResult } from "../src/transport/MailTransport.js";
@@ -100,9 +108,27 @@ export class NoopSearchProvider implements SearchProvider {
         const results = Array.from(this.indexed.values())
             .filter((doc) => doc.mailboxUid === query.mailboxUid)
             .filter((doc) => !query.entityTypes || query.entityTypes.includes(doc.entityType))
-            .filter((doc) => (doc.subject ?? "").includes(query.text) || (doc.body ?? "").includes(query.text))
-            .map((doc) => ({ entityType: doc.entityType, entityUid: doc.entityUid, score: 1 }));
+            .filter((doc) => !query.text || (doc.subject ?? "").includes(query.text) || (doc.body ?? "").includes(query.text))
+            .filter((doc) => query.subject === undefined || (doc.subject ?? "").includes(query.subject))
+            .filter((doc) => query.from === undefined || doc.from === query.from)
+            .filter((doc) => query.to === undefined || (doc.to ?? []).includes(query.to))
+            .filter((doc) => query.cc === undefined || (doc.cc ?? []).includes(query.cc))
+            .filter((doc) => query.hasAttachment === undefined || doc.hasAttachments === query.hasAttachment)
+            .filter((doc) => query.folderUid === undefined || doc.folderUid === query.folderUid)
+            .filter((doc) => !query.flags || query.flags.every((f) => (doc.flags ?? []).includes(f)))
+            .map((doc) => ({ entityType: doc.entityType, entityUid: doc.entityUid, score: 1, metadataOnly: doc.metadataOnly }));
         return { results };
+    }
+
+    public async candidates(query: CandidateQuery): Promise<CandidateResultPage> {
+        const candidates = Array.from(this.indexed.values())
+            .filter((doc) => doc.mailboxUid === query.mailboxUid)
+            .filter((doc) => !query.entityTypes || query.entityTypes.includes(doc.entityType))
+            .filter((doc) => query.folderUid === undefined || doc.folderUid === query.folderUid)
+            .filter((doc) => !query.flags || query.flags.every((f) => (doc.flags ?? []).includes(f)))
+            .filter((doc) => !query.participants || query.participants.some((p) => (doc.participants ?? []).includes(p)))
+            .map((doc) => ({ entityType: doc.entityType, entityUid: doc.entityUid }));
+        return { candidates };
     }
 }
 

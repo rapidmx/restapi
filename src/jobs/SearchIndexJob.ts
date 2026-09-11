@@ -9,7 +9,7 @@ import { BlobStore } from "../blob/BlobStore.js";
 import { SearchDocument, SearchProvider } from "../search/SearchProvider.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { isEncryptedBody } from "../util/SmimeUtils.js";
-import { Attachment, Message } from "../models/types.js";
+import { Attachment, Message, RecipientType } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** Well above any real message's attachment count - see `buildDocument()`'s own note on why this must be
@@ -156,7 +156,21 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
             }
         }
 
+        const to: string[] = message.recipients.filter((r) => r.type === RecipientType.TO).map((r) => r.address);
+        const cc: string[] = message.recipients.filter((r) => r.type === RecipientType.CC).map((r) => r.address);
         const participants: string[] = [message.from.address, ...message.recipients.map((r) => r.address)];
+
+        const flags: string[] = [];
+        flags.push(message.flags.read ? "read" : "unread");
+        if (message.flags.flagged) {
+            flags.push("flagged");
+        }
+        if (message.flags.answered) {
+            flags.push("answered");
+        }
+        if (message.flags.forwarded) {
+            flags.push("forwarded");
+        }
 
         return {
             entityType: "message",
@@ -166,7 +180,14 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
             body,
             attachmentText,
             participants,
+            from: message.from.address,
+            to,
+            cc,
             dateForSort: message.sentDate,
+            folderUid: message.folderUid,
+            flags,
+            hasAttachments: message.hasAttachments,
+            metadataOnly: encrypted,
         };
     }
 }

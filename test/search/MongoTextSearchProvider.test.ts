@@ -265,5 +265,141 @@ describe("MongoTextSearchProvider Tests", () => {
 
             expect(result.results[0].score).toBe(0);
         });
+
+        it("Propagates metadataOnly from the stored document onto the result.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const cursor = makeCursor([
+                { _id: "message:msg-1", entityType: "message", entityUid: "msg-1", score: 1, metadataOnly: true },
+            ]);
+            mockCollection.find.mockReturnValue(cursor);
+
+            const result = await provider.search({ mailboxUid: "mbx-1", text: "hello" });
+
+            expect(result.results[0].metadataOnly).toBe(true);
+        });
+
+        it("Applies structured operator-grammar filters (from/to/cc/hasAttachment/folderUid/flags/before/after) as exact/range predicates.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const cursor = makeCursor([]);
+            mockCollection.find.mockReturnValue(cursor);
+            const before = new Date("2026-06-01");
+            const after = new Date("2026-01-01");
+
+            await provider.search({
+                mailboxUid: "mbx-1",
+                text: "hello",
+                from: "alice@example.com",
+                to: "bob@example.com",
+                cc: "carol@example.com",
+                hasAttachment: true,
+                folderUid: "folder-1",
+                flags: ["read", "flagged"],
+                before,
+                after,
+            });
+
+            expect(mockCollection.find).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    from: "alice@example.com",
+                    to: "bob@example.com",
+                    cc: "carol@example.com",
+                    hasAttachments: true,
+                    folderUid: "folder-1",
+                    flags: { $all: ["read", "flagged"] },
+                    dateForSort: { $lt: before, $gt: after },
+                }),
+                expect.anything(),
+            );
+        });
+
+        it("Falls back to a case-insensitive regex against subject when subject: is given, as an additional AND predicate.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const cursor = makeCursor([]);
+            mockCollection.find.mockReturnValue(cursor);
+
+            await provider.search({ mailboxUid: "mbx-1", text: "", subject: "budget (q3)" });
+
+            const [filter] = mockCollection.find.mock.calls[0];
+            expect(filter.subject).toEqual({ $regex: "budget \\(q3\\)", $options: "i" });
+            // No free text was given, so $text is omitted entirely rather than searching for an empty string.
+            expect(filter.$text).toBeUndefined();
+        });
+
+        it("Sorts by dateForSort (not textScore) when text is empty - a pure structured-filter query.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const cursor = makeCursor([]);
+            mockCollection.find.mockReturnValue(cursor);
+
+            await provider.search({ mailboxUid: "mbx-1", text: "", folderUid: "folder-1" });
+
+            expect(cursor.sort).toHaveBeenCalledWith({ dateForSort: -1 });
+        });
+    });
+
+    describe("candidates()", () => {
+        it("Returns an empty page when no collection has been initialized.", async () => {
+            const result = await provider.candidates({ mailboxUid: "mbx-1" });
+            expect(result).toEqual({ candidates: [] });
+        });
+
+        it("Filters by mailboxUid/participants/structured predicates, sorts by dateForSort, and returns identifiers only.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const cursor = makeCursor([
+                { _id: "message:msg-1", entityType: "message", entityUid: "msg-1" },
+            ]);
+            mockCollection.find.mockReturnValue(cursor);
+
+            const result = await provider.candidates({
+                mailboxUid: "mbx-1",
+                entityTypes: ["message"],
+                participants: ["bob@example.com"],
+                folderUid: "folder-1",
+            });
+
+            expect(mockCollection.find).toHaveBeenCalledWith(
+                {
+                    mailboxUid: "mbx-1",
+                    entityType: { $in: ["message"] },
+                    folderUid: "folder-1",
+                    participants: { $in: ["bob@example.com"] },
+                },
+                { projection: { entityType: 1, entityUid: 1 } },
+            );
+            expect(cursor.sort).toHaveBeenCalledWith({ dateForSort: -1 });
+            expect(result).toEqual({ candidates: [{ entityType: "message", entityUid: "msg-1" }], nextCursor: undefined });
+        });
+
+        it("Never includes score/content - only entityType/entityUid.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const cursor = makeCursor([{ _id: "message:msg-1", entityType: "message", entityUid: "msg-1" }]);
+            mockCollection.find.mockReturnValue(cursor);
+
+            const result = await provider.candidates({ mailboxUid: "mbx-1" });
+
+            expect(Object.keys(result.candidates[0])).toEqual(["entityType", "entityUid"]);
+        });
+
+        it("Sets hasMore/nextCursor when more rows are returned than the requested limit.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const rows = Array.from({ length: 3 }, (_, i) => ({
+                _id: `message:msg-${i}`,
+                entityType: "message",
+                entityUid: `msg-${i}`,
+            }));
+            const cursor = makeCursor(rows);
+            mockCollection.find.mockReturnValue(cursor);
+
+            const result = await provider.candidates({ mailboxUid: "mbx-1", limit: 2 });
+
+            expect(result.candidates).toHaveLength(2);
+            expect(result.nextCursor).toBe("2");
+        });
     });
 });

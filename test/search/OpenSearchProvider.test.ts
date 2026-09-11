@@ -254,5 +254,158 @@ describe("OpenSearchProvider Tests", () => {
             const call = mockClientInstance.search.mock.calls[0][0];
             expect(call.body.size).toBe(201);
         });
+
+        it("Populates snippet from the highlight response, joining fragments across fields.", async () => {
+            mockClientInstance.search.mockResolvedValue({
+                body: {
+                    hits: {
+                        hits: [
+                            {
+                                _source: { entityType: "message", entityUid: "msg-1" },
+                                _score: 1,
+                                highlight: { subject: ["<em>Budget</em> Q3"], body: ["discussing the <em>budget</em>"] },
+                            },
+                        ],
+                    },
+                },
+            });
+
+            const result = await provider.search({ mailboxUid: "mbx-1", text: "budget" });
+
+            expect(result.results[0].snippet).toBe("<em>Budget</em> Q3 … discussing the <em>budget</em>");
+            const call = mockClientInstance.search.mock.calls[0][0];
+            expect(call.body.highlight).toEqual({ fields: { subject: {}, body: {}, attachmentText: {} } });
+        });
+
+        it("Leaves snippet undefined when the hit carries no highlight.", async () => {
+            mockClientInstance.search.mockResolvedValue({
+                body: { hits: { hits: [{ _source: { entityType: "message", entityUid: "msg-1" }, _score: 1 }] } },
+            });
+
+            const result = await provider.search({ mailboxUid: "mbx-1", text: "budget" });
+
+            expect(result.results[0].snippet).toBeUndefined();
+        });
+
+        it("Propagates metadataOnly from _source onto the result.", async () => {
+            mockClientInstance.search.mockResolvedValue({
+                body: {
+                    hits: {
+                        hits: [{ _source: { entityType: "message", entityUid: "msg-1", metadataOnly: true }, _score: 1 }],
+                    },
+                },
+            });
+
+            const result = await provider.search({ mailboxUid: "mbx-1", text: "hello" });
+
+            expect(result.results[0].metadataOnly).toBe(true);
+        });
+
+        it("Applies structured operator-grammar filters (from/to/cc/hasAttachment) as term filters, and folderUid/flags/date-range via structuredFilter().", async () => {
+            const before = new Date("2026-06-01");
+            const after = new Date("2026-01-01");
+
+            await provider.search({
+                mailboxUid: "mbx-1",
+                text: "hello",
+                from: "alice@example.com",
+                to: "bob@example.com",
+                cc: "carol@example.com",
+                hasAttachment: true,
+                folderUid: "folder-1",
+                flags: ["read", "flagged"],
+                before,
+                after,
+            });
+
+            const call = mockClientInstance.search.mock.calls[0][0];
+            expect(call.body.query.bool.filter).toEqual(
+                expect.arrayContaining([
+                    { term: { mailboxUid: "mbx-1" } },
+                    { term: { folderUid: "folder-1" } },
+                    { term: { flags: "read" } },
+                    { term: { flags: "flagged" } },
+                    { range: { dateForSort: { lt: before, gt: after } } },
+                    { term: { from: "alice@example.com" } },
+                    { term: { to: "bob@example.com" } },
+                    { term: { cc: "carol@example.com" } },
+                    { term: { hasAttachments: true } },
+                ]),
+            );
+        });
+
+        it("Adds a subject-scoped match clause alongside multi_match when subject: is given.", async () => {
+            await provider.search({ mailboxUid: "mbx-1", text: "hello", subject: "budget" });
+
+            const call = mockClientInstance.search.mock.calls[0][0];
+            expect(call.body.query.bool.must).toEqual(
+                expect.arrayContaining([expect.objectContaining({ match: { subject: "budget" } })]),
+            );
+        });
+
+        it("Uses match_all and sorts by dateForSort when neither text nor subject is given.", async () => {
+            await provider.search({ mailboxUid: "mbx-1", text: "", folderUid: "folder-1" });
+
+            const call = mockClientInstance.search.mock.calls[0][0];
+            expect(call.body.query.bool.must).toEqual([{ match_all: {} }]);
+            expect(call.body.sort).toEqual([{ dateForSort: "desc" }]);
+        });
+    });
+
+    describe("candidates()", () => {
+        beforeEach(async () => {
+            await (provider as any).init();
+        });
+
+        it("Queries with match_all and structured filters, sorted by dateForSort, returning identifiers only.", async () => {
+            mockClientInstance.search.mockResolvedValue({
+                body: { hits: { hits: [{ _source: { entityType: "message", entityUid: "msg-1" } }] } },
+            });
+
+            const result = await provider.candidates({ mailboxUid: "mbx-1", entityTypes: ["message"], folderUid: "folder-1" });
+
+            const call = mockClientInstance.search.mock.calls[0][0];
+            expect(call.body.query.bool.must).toEqual([{ match_all: {} }]);
+            expect(call.body.query.bool.filter).toEqual([
+                { term: { mailboxUid: "mbx-1" } },
+                { terms: { entityType: ["message"] } },
+                { term: { folderUid: "folder-1" } },
+            ]);
+            expect(call.body.sort).toEqual([{ dateForSort: "desc" }]);
+            expect(result).toEqual({ candidates: [{ entityType: "message", entityUid: "msg-1" }], nextCursor: undefined });
+        });
+
+        it("Matches on any of the given participant terms via should/minimum_should_match.", async () => {
+            mockClientInstance.search.mockResolvedValue({ body: { hits: { hits: [] } } });
+
+            await provider.candidates({ mailboxUid: "mbx-1", participants: ["bob@example.com", "carol@example.com"] });
+
+            const call = mockClientInstance.search.mock.calls[0][0];
+            expect(call.body.query.bool.must).toEqual([
+                {
+                    bool: {
+                        should: [{ match: { participants: "bob@example.com" } }, { match: { participants: "carol@example.com" } }],
+                        minimum_should_match: 1,
+                    },
+                },
+            ]);
+        });
+
+        it("Sets hasMore/nextCursor when more hits are returned than the requested limit.", async () => {
+            mockClientInstance.search.mockResolvedValue({
+                body: {
+                    hits: {
+                        hits: Array.from({ length: 3 }, (_, i) => ({
+                            _source: { entityType: "message", entityUid: `msg-${i}` },
+                        })),
+                    },
+                },
+            });
+
+            const result = await provider.candidates({ mailboxUid: "mbx-1", limit: 2 });
+
+            expect(result.candidates).toHaveLength(2);
+            expect(result.nextCursor).toBe("2");
+        });
     });
 });

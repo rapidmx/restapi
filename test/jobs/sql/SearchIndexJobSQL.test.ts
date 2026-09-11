@@ -188,6 +188,38 @@ describe("SearchIndexJobSQL Tests (real DB + DI)", () => {
         expect(updated!.searchIndexedAt).toBeInstanceOf(Date);
     });
 
+    it("Splits recipients into to/cc, and populates folderUid/flags/hasAttachments/metadataOnly for an unencrypted message.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const blobKey = `body/${uuid.v4()}`;
+        await blobStore.put(blobKey, Buffer.from("Subject: Hello\r\n\r\nBody text."));
+        const message = await createMessage({
+            bodyBlobKey: blobKey,
+            recipients: [
+                { address: "to1@example.com", type: RecipientType.TO },
+                { address: "to2@example.com", type: RecipientType.TO },
+                { address: "cc1@example.com", type: RecipientType.CC },
+            ],
+            hasAttachments: false,
+            flags: { read: true, flagged: true, answered: false, forwarded: false },
+        });
+
+        await job.run();
+
+        const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+        const doc = searchProvider.indexed.get(`message:${message.uid}`);
+        expect(doc).toEqual(
+            expect.objectContaining({
+                from: "sender@example.com",
+                to: ["to1@example.com", "to2@example.com"],
+                cc: ["cc1@example.com"],
+                folderUid: message.folderUid,
+                flags: ["read", "flagged"],
+                hasAttachments: false,
+                metadataOnly: false,
+            }),
+        );
+    });
+
     it("Falls back to the HTML body when the parsed message has no plain-text body.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const blobKey = `body/${uuid.v4()}`;
@@ -239,6 +271,7 @@ describe("SearchIndexJobSQL Tests (real DB + DI)", () => {
         expect(doc!.body).toBe("");
         expect(doc!.attachmentText).toEqual([]);
         expect(doc!.subject).toBe(message.subject);
+        expect(doc!.metadataOnly).toBe(true);
     });
 
     it("Includes extracted attachment text for a message that has attachments, skipping ones with no extracted text yet.", async () => {
