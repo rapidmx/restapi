@@ -9,5 +9,6 @@ export * from "./transport/index.js";
 export * from "./blob/index.js";
 export * from "./dns/index.js";
 export * from "./dkim/index.js";
+export * from "./pki/index.js";
 export * from "./push/index.js";
 export * from "./util/index.js";

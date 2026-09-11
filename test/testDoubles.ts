@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Lightweight, deterministic test-double implementations of this library's pluggable interfaces
 // (`BlobStore`, `SearchProvider`, `SpamScanProvider`, `AvScanProvider`, `MailTransport`, `DnsResolver`,
-// `DkimKeyProvider`), registered with an
+// `DkimKeyProvider`, `EncryptionCertificateAuthority`), registered with an
 // `ObjectFactory` under the same string names the library's `@Inject("...")` decorators resolve against. Every
 // integration test that boots the shared `test/server-mongo`/`test/server-sql` fixture app needs these
 // registered *before* `server.start()`, because `Server` eagerly instantiates every route it discovers -
@@ -19,6 +19,7 @@ import type { ScanEnvelope, SpamScanProvider, SpamScanResult } from "../src/scan
 import type { AvScanProvider, AvScanResult } from "../src/scan/AvScanProvider.js";
 import type { MailTransport, OutboundMessage, TransportResult } from "../src/transport/MailTransport.js";
 import { NullDkimKeyProvider } from "../src/dkim/NullDkimKeyProvider.js";
+import { NullEncryptionCertificateAuthority } from "../src/pki/NullEncryptionCertificateAuthority.js";
 import { AvVerdict, SpamVerdict } from "../src/models/types.js";
 import type { ObjectFactory } from "@rapidrest/service-core";
 
@@ -196,4 +197,5 @@ export function registerTestDoubles(objectFactory: ObjectFactory): void {
     objectFactory.register(RecordingMailTransport, "MailTransport");
     objectFactory.register(StaticDnsResolver, "DnsResolver");
     objectFactory.register(NullDkimKeyProvider, "DkimKeyProvider");
+    objectFactory.register(NullEncryptionCertificateAuthority, "EncryptionCertificateAuthority");
 }
