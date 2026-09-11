@@ -13,13 +13,7 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { AuditLogEntry } from "../models/types.js";
-const { Delete, Param, Post, Put, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
-
-/** Always throws 403 - see `BaseAuditLogRoute`'s own doc comment for why every write path is blocked for
- * every caller, trusted included. */
-function rejectWrite(): never {
-    throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "AuditLogEntry records cannot be created, updated, or deleted through this API.");
-}
+const { Before, Delete, Param, Post, Put, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /**
  * Extends the standard `CRUDRoute` CRUD scaffolding for `AuditLogEntry` with trusted-role-only *read*
@@ -39,6 +33,14 @@ function rejectWrite(): never {
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseAuditLogRoute<T extends AuditLogEntry> extends CRUDRoute<T> {
+    /** Runs as `@Before` middleware on every write handler below, strictly before the handler body - see
+     * this class's own doc comment for why every write path is blocked for every caller, trusted included.
+     * Each handler also calls this itself as a defensive fallback, in case `@Before` is ever dropped from
+     * one of them. */
+    protected rejectWrite(): never {
+        throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "AuditLogEntry records cannot be created, updated, or deleted through this API.");
+    }
+
     @RequiresTrustedRole()
     public async find(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<T[]> {
         return await this.repoUtils!.find(
@@ -76,21 +78,24 @@ export abstract class BaseAuditLogRoute<T extends AuditLogEntry> extends CRUDRou
     }
 
     @Post()
+    @Before("rejectWrite")
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
-        return rejectWrite();
+        return this.rejectWrite();
     }
 
     @Put("/:id")
+    @Before("rejectWrite")
     public async update(
         @Param("id") id: string,
         obj: UpdateObject<T>,
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
-        return rejectWrite();
+        return this.rejectWrite();
     }
 
     @Delete("/:id")
+    @Before("rejectWrite")
     public async delete(
         @Param("id") id: string,
         @Query("version") version: string | undefined,
@@ -98,11 +103,12 @@ export abstract class BaseAuditLogRoute<T extends AuditLogEntry> extends CRUDRou
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<void> {
-        return rejectWrite();
+        return this.rejectWrite();
     }
 
     @Delete()
+    @Before("rejectWrite")
     public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
-        return rejectWrite();
+        return this.rejectWrite();
     }
 }

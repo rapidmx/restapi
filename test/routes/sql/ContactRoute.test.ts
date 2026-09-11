@@ -189,6 +189,25 @@ describe("Route:ContactSQL Tests", () => {
         expect(acl).toBeNull();
     });
 
+    it("Rejects creating a contact with an explicit empty displayName (400) - proves model validation actually runs on create(), not just update(). BaseScopedChildRoute.create() never calls this.validate() itself; this is enforced by the framework's own dispatch-time @Validate metadata, which is inherited through every override in the chain (BaseContactRoute -> BaseScopedChildRoute -> CRUDRoute) even though none of them re-declare @Validate explicitly - confirmed by reading RouteDecorators.js's Reflect.getMetadata (chain-walking) usage.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                mailboxUid: mailbox.uid,
+                folderUid: folder.uid,
+                displayName: "",
+                emails: [],
+                phones: [],
+                addresses: [],
+            });
+
+        expect(result.status).toBe(400);
+    });
+
     it("Rejects creating a contact that attempts to set a key-discovery-managed field directly (400).", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid);

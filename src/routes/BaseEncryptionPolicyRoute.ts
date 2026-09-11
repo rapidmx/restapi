@@ -7,7 +7,7 @@ import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators 
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { AuditAction, EncryptionPolicy, PolicyState } from "../models/types.js";
 const { Config, Logger } = ObjectDecorators;
-const { Get, Put, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
+const { Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorators;
 
 /** The fixed, well-known identifier of the one `EncryptionPolicy` row this route ever reads/writes - same
  * singleton-row convention as `BaseBrandingRoute.ts`'s `BRANDING_UID`. */
@@ -105,6 +105,35 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
         };
     }
 
+    /** Only ever copies a field into the returned patch if the caller actually supplied it, so an
+     * unrelated field this route doesn't recognize can never ride along into `repoUtils.update()`. */
+    private extractPatch(obj: Partial<PublicEncryptionPolicy> | undefined): Partial<PublicEncryptionPolicy> {
+        const patch: Partial<PublicEncryptionPolicy> = {};
+        for (const field of ["encryptSameOrg", "encryptFederated", "encryptExternal"] as const) {
+            const value = obj?.[field];
+            if (value !== undefined) {
+                patch[field] = value;
+            }
+        }
+        return patch;
+    }
+
+    /** Runs as `@Validate` middleware, strictly before `update()` is ever invoked - guarantees a rejected
+     * (400) request never has the side effect of materializing the singleton row on what would otherwise
+     * be its first write, the same guarantee the inline check this replaced was written to preserve. */
+    protected validateUpdate(obj: Partial<PublicEncryptionPolicy> | undefined): void {
+        for (const field of ["encryptSameOrg", "encryptFederated", "encryptExternal"] as const) {
+            const value = obj?.[field];
+            if (value !== undefined && !VALID_POLICY_STATES.has(value)) {
+                throw new ApiError(
+                    ApiErrors.INVALID_REQUEST,
+                    400,
+                    `'${field}' must be one of "automatic", "optional", "prohibited".`,
+                );
+            }
+        }
+    }
+
     @Get()
     public async get(@AuthUser user?: JWTUser): Promise<PublicEncryptionPolicy> {
         if (!user) {
@@ -117,24 +146,9 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
 
     @RequiresTrustedRole()
     @Put()
+    @Validate("validateUpdate")
     public async update(obj: Partial<PublicEncryptionPolicy> | undefined, @AuthUser user?: JWTUser): Promise<PublicEncryptionPolicy> {
-        // Validated before `findOrCreate()` runs, deliberately - a rejected (400) request must never have the
-        // side effect of materializing the singleton row on what would otherwise be its first write.
-        const patch: Partial<PublicEncryptionPolicy> = {};
-        for (const field of ["encryptSameOrg", "encryptFederated", "encryptExternal"] as const) {
-            const value = obj?.[field];
-            if (value === undefined) {
-                continue;
-            }
-            if (!VALID_POLICY_STATES.has(value)) {
-                throw new ApiError(
-                    ApiErrors.INVALID_REQUEST,
-                    400,
-                    `'${field}' must be one of "automatic", "optional", "prohibited".`,
-                );
-            }
-            patch[field] = value;
-        }
+        const patch: Partial<PublicEncryptionPolicy> = this.extractPatch(obj);
 
         await this.init();
         const existing: T = await this.findOrCreate();

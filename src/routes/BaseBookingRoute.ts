@@ -36,7 +36,7 @@ import {
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Description, Summary } = DocDecorators;
 const { Transactional } = DatabaseDecorators;
-const { Get, Param, Post, Query, RateLimit } = RouteDecorators;
+const { Get, Param, Post, Query, RateLimit, Validate } = RouteDecorators;
 
 /** Caps how many `CalendarEvent` rows any one availability lookup will pull back per query. */
 const BUSY_EVENT_ROWS_LIMIT = 500;
@@ -556,6 +556,18 @@ export abstract class BaseBookingRoute<
         return subtractBusy(candidates, busy, bookingType.bufferBeforeMinutes, bookingType.bufferAfterMinutes);
     }
 
+    /** Runs as `@Validate` middleware, strictly before `book()` is ever invoked - pure shape/format
+     * checks on the request body only, independent of the `:slug` booking type or slot availability
+     * (which need a DB round-trip and stay in `book()` itself as business-rule checks). */
+    protected validateBook(body: BookingRequestBody | undefined): void {
+        if (!body?.bookerName?.trim()) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'bookerName' is required.");
+        }
+        if (!body.bookerEmail || !EMAIL_PATTERN.test(body.bookerEmail.trim())) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'bookerEmail' must be a valid email address.");
+        }
+    }
+
     @Summary("Books an appointment.")
     @Description(
         "Books the requested slot, creating a real calendar event on the host's calendar and emailing the " +
@@ -563,16 +575,12 @@ export abstract class BaseBookingRoute<
     )
     @RateLimit()
     @Post("/types/:slug")
-    public async book(@Param("slug") slug: string, body: BookingRequestBody | undefined): Promise<PublicBooking> {
+    @Validate("validateBook")
+    public async book(@Param("slug") slug: string, rawBody: BookingRequestBody | undefined): Promise<PublicBooking> {
+        // `validateBook()` (run by `@Validate` before this handler) already guarantees `rawBody` is defined.
+        const body: BookingRequestBody = rawBody!;
         await this.init();
         const bookingType: BT = await this.requireBookingType(slug);
-
-        if (!body?.bookerName?.trim()) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'bookerName' is required.");
-        }
-        if (!body.bookerEmail || !EMAIL_PATTERN.test(body.bookerEmail.trim())) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'bookerEmail' must be a valid email address.");
-        }
         const start: Date = this.requireDate(body.start, "start");
         const slot: OccurrenceWindow = await this.requireAvailableSlot(bookingType, start, new Date());
 
