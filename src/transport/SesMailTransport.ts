@@ -2,9 +2,10 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { SendEmailCommand, SESv2Client } from "@aws-sdk/client-sesv2";
+import type { SendEmailCommandOutput, SESv2Client } from "@aws-sdk/client-sesv2";
 import { ObjectDecorators } from "@rapidrest/core";
-import { MailTransport, OutboundMessage, TransportResult } from "@rapidmx/restapi";
+import { MailTransport, OutboundMessage, TransportResult } from "./MailTransport.js";
+import { importAwsClientSESv2 } from "../shared.js";
 const { Config, Logger } = ObjectDecorators;
 
 /**
@@ -46,17 +47,20 @@ export class SesMailTransport implements MailTransport {
 
     private client?: SESv2Client;
 
-    private getClient(): SESv2Client {
+    private async getClient(sdk?: any): Promise<SESv2Client> {
+        sdk = sdk ?? (await importAwsClientSESv2());
         if (!this.client) {
-            this.client = new SESv2Client(this.region ? { region: this.region } : {});
+            this.client = new sdk.SESv2Client(this.region ? { region: this.region } : {});
         }
-        return this.client;
+        return this.client as any;
     }
 
     public async send(message: OutboundMessage): Promise<TransportResult> {
         try {
-            const result = await this.getClient().send(
-                new SendEmailCommand({
+            const sdk = await importAwsClientSESv2();
+            const client = await this.getClient();
+            const result: SendEmailCommandOutput = await client.send(
+                new sdk.SendEmailCommand({
                     FromEmailAddress: message.envelopeFrom,
                     Destination: { ToAddresses: message.envelopeTo },
                     Content: { Raw: { Data: message.raw } },

@@ -22,6 +22,9 @@
         "prepublish": "yarn build"
     },
     "peerDependencies": {
+        "@aws-sdk/client-s3": "3.x",
+        "@aws-sdk/client-ses": "3.x",
+        "@aws-sdk/client-sesv2": "3.x",
         "@opensearch-project/opensearch": ">=3.0.0",
         "@rapidrest/core": "5.x",
         "@rapidrest/service-core": "2.x",
@@ -29,6 +32,15 @@
         "pdf-parse": ">=1.1.1"
     },
     "peerDependenciesMeta": {
+        "@aws-sdk/client-s3": {
+            "optional": true
+        },
+        "@aws-sdk/client-ses": {
+            "optional": true
+        },
+        "@aws-sdk/client-sesv2": {
+            "optional": true
+        },
         "@opensearch-project/opensearch": {
             "optional": true
         },
@@ -47,6 +59,9 @@
         "sanitize-html": "^2.17.7"
     },
     "devDependencies": {
+        "@aws-sdk/client-s3": "^3.906.0",
+        "@aws-sdk/client-ses": "^3.906.0",
+        "@aws-sdk/client-sesv2": "^3.906.0",
         "@opensearch-project/opensearch": "^3.6.0",
         "@rapidrest/core": "^5.2.2",
         "@rapidrest/service-core": "^2.0.0",
