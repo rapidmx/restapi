@@ -16,10 +16,11 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
+import type { DnsResolver } from "../dns/DnsResolver.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { classifyRecipientTier } from "../util/DomainUtils.js";
+import { classifyRecipientTier, createFederatedPeerCheck } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { prependHeaders } from "../util/MimeHeaderUtils.js";
@@ -144,6 +145,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
     @Inject(ScanPipeline)
     private scanPipeline?: ScanPipeline;
+
+    /** Backs the real federated-peer check `classifyRecipientTier()` calls (`util/DomainUtils.ts`'s
+     * `createFederatedPeerCheck()`) - same DI token `BaseDomainRoute`/`DomainVerificationJob` already
+     * register/consume, so every deployment and test environment already has one. */
+    @Inject("DnsResolver")
+    private dnsResolver?: DnsResolver;
 
     /** Safety-net cap on how many of a mailbox's messages `conversations()` scans to build its groups - see
      * that method's own doc comment for why there's no query-time group-by to rely on instead. */
@@ -331,7 +338,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             const effectiveExternal: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptExternal;
             if (effectiveInternal || effectiveFederated || effectiveExternal) {
                 for (const address of envelopeTo) {
-                    const tier = await classifyRecipientTier(this._objectFactory!, this.domainClass, address);
+                    const tier = await classifyRecipientTier(
+                        this._objectFactory!,
+                        this.domainClass,
+                        address,
+                        createFederatedPeerCheck(this.dnsResolver!),
+                    );
                     if (
                         (tier === "same-org" && effectiveInternal) ||
                         (tier === "federated" && effectiveFederated) ||
@@ -623,7 +635,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             return message;
         }
 
-        const tier = await classifyRecipientTier(this._objectFactory!, this.domainClass, message.dispositionNotificationTo!);
+        const tier = await classifyRecipientTier(
+            this._objectFactory!,
+            this.domainClass,
+            message.dispositionNotificationTo!,
+            createFederatedPeerCheck(this.dnsResolver!),
+        );
         const autoSend: boolean =
             tier === "same-org"
                 ? mailbox.autoSendReceiptsInternal

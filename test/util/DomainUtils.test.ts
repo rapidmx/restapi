@@ -5,7 +5,7 @@
 // Isolated unit tests for getVerifiedDomainNames() - objectFactory/repo are hand-built mocks, no real DB,
 // same rationale as test/util/AuditLogUtils.test.ts (a fresh stub class per test so the module-level
 // repo-cache WeakMap can't leak between tests).
-import { classifyRecipientTier, getVerifiedDomainNames, isInternalAddress } from "../../src/util/DomainUtils.js";
+import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames, isInternalAddress } from "../../src/util/DomainUtils.js";
 
 function makeStubClass(): any {
     return class StubDomain {
@@ -123,5 +123,40 @@ describe("classifyRecipientTier() Tests", () => {
     it("Defaults to 'external' for any non-same-org address when no isFederatedPeer is supplied.", async () => {
         const result = await classifyRecipientTier(objectFactory as any, makeStubClass(), "user@outside.com");
         expect(result).toBe("external");
+    });
+});
+
+describe("createFederatedPeerCheck() Tests", () => {
+    function makeResolver(txtRecords: string[][]) {
+        return { resolveTxt: vi.fn().mockResolvedValue(txtRecords), resolveMx: vi.fn() };
+    }
+
+    it("Returns true for an address whose domain publishes a valid _rapidmx TXT record.", async () => {
+        const resolver = makeResolver([["v=RMXv1; id=1; host=mail.peer1.example;"]]);
+        const check = createFederatedPeerCheck(resolver);
+
+        const result = await check("user@peer1.example");
+
+        expect(result).toBe(true);
+        expect(resolver.resolveTxt).toHaveBeenCalledWith("_rapidmx.peer1.example");
+    });
+
+    it("Returns false for an address whose domain publishes no _rapidmx record.", async () => {
+        const resolver = { resolveTxt: vi.fn().mockRejectedValue(new Error("NXDOMAIN")), resolveMx: vi.fn() };
+        const check = createFederatedPeerCheck(resolver);
+
+        const result = await check("user@peer2.example");
+
+        expect(result).toBe(false);
+    });
+
+    it("Returns false without querying DNS at all for an address with no @ (no domain to check).", async () => {
+        const resolver = makeResolver([["v=RMXv1; id=1; host=mail.peer3.example;"]]);
+        const check = createFederatedPeerCheck(resolver);
+
+        const result = await check("not-an-address");
+
+        expect(result).toBe(false);
+        expect(resolver.resolveTxt).not.toHaveBeenCalled();
     });
 });

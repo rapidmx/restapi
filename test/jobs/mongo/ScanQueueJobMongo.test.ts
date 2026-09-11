@@ -18,7 +18,7 @@ import { ACLUtils, ConnectionManager, MongoConnection, MongoRepository, Notifica
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import config from "../../config.js";
-import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
+import { registerTestDoubles, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
 import { ScanQueueJobMongo } from "../../../src/jobs/mongo/ScanQueueJobMongo.js";
 import { IngestQueueEntryMongo } from "../../../src/models/mongo/IngestQueueEntryMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
@@ -1967,13 +1967,26 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             expect(message.deliveryReceiptPending).toBe(false);
         });
 
-        it("Does NOT send immediately for an external requester when the mailbox only opts in via autoSendReceiptsFederated - no federation detection exists yet so a non-internal requester always classifies as external, and autoSendReceiptsExternal (left false here) is the setting that actually governs.", async () => {
+        it("Does NOT send immediately for an external requester when the mailbox only opts in via autoSendReceiptsFederated - 'outside.com' publishes no _rapidmx record so it classifies as external, not federated, and autoSendReceiptsExternal (left false here) is the setting that actually governs.", async () => {
             await createMailbox({ autoSendReceiptsFederated: true });
 
             const message = await deliverRequestingReceipt("sender@example.com", "stranger@outside.com");
 
             expect(message.deliveryReceiptSentAt).toBeFalsy();
             expect(message.deliveryReceiptPending).toBe(true);
+        });
+
+        it("DOES send immediately for a real federated peer once its _rapidmx TXT record resolves, when the mailbox opts in via autoSendReceiptsFederated (proves classifyRecipientTier() is wired to real DNS resolution, not just the stub).", async () => {
+            await createMailbox({ autoSendReceiptsFederated: true });
+            const dnsResolver = objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!;
+            dnsResolver.records.set("_rapidmx.federated-peer-mongo.example", [
+                ["v=RMXv1; id=1; host=mail.federated-peer-mongo.example;"],
+            ]);
+
+            const message = await deliverRequestingReceipt("sender@example.com", "peer@federated-peer-mongo.example");
+
+            expect(message.deliveryReceiptSentAt).toBeInstanceOf(Date);
+            expect(message.deliveryReceiptPending).toBe(false);
         });
 
         it("Does nothing receipt-related when no receipt was requested at all.", async () => {

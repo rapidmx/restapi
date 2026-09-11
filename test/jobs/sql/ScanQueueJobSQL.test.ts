@@ -12,7 +12,7 @@ import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import config from "../../config.sql.js";
-import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
+import { registerTestDoubles, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
 import { ScanQueueJobSQL } from "../../../src/jobs/sql/ScanQueueJobSQL.js";
 import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
@@ -1730,13 +1730,26 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             expect(message.deliveryReceiptPending).toBe(false);
         });
 
-        it("Does NOT send immediately for an external requester when the mailbox only opts in via autoSendReceiptsFederated - no federation detection exists yet so a non-internal requester always classifies as external, and autoSendReceiptsExternal (left false here) is the setting that actually governs.", async () => {
+        it("Does NOT send immediately for an external requester when the mailbox only opts in via autoSendReceiptsFederated - 'outside.com' publishes no _rapidmx record so it classifies as external, not federated, and autoSendReceiptsExternal (left false here) is the setting that actually governs.", async () => {
             await createMailbox({ autoSendReceiptsFederated: true });
 
             const message = await deliverRequestingReceipt("sender@example.com", "stranger@outside.com");
 
             expect(message.deliveryReceiptSentAt).toBeFalsy();
             expect(message.deliveryReceiptPending).toBe(true);
+        });
+
+        it("DOES send immediately for a real federated peer once its _rapidmx TXT record resolves, when the mailbox opts in via autoSendReceiptsFederated (proves classifyRecipientTier() is wired to real DNS resolution, not just the stub).", async () => {
+            await createMailbox({ autoSendReceiptsFederated: true });
+            const dnsResolver = objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!;
+            dnsResolver.records.set("_rapidmx.federated-peer-sql.example", [
+                ["v=RMXv1; id=1; host=mail.federated-peer-sql.example;"],
+            ]);
+
+            const message = await deliverRequestingReceipt("sender@example.com", "peer@federated-peer-sql.example");
+
+            expect(message.deliveryReceiptSentAt).toBeInstanceOf(Date);
+            expect(message.deliveryReceiptPending).toBe(false);
         });
 
         it("Does nothing receipt-related when no receipt was requested at all.", async () => {

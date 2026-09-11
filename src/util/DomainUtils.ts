@@ -4,6 +4,8 @@
 ///////////////////////////////////////////////////////////////////////////////
 import type { ObjectFactory } from "@rapidrest/core";
 import { RepoUtils } from "@rapidrest/service-core";
+import type { DnsResolver } from "../dns/DnsResolver.js";
+import { resolveFederationPolicy } from "./FederationUtils.js";
 
 /** Caches one `RepoUtils` per concrete `Domain` class (Mongo vs SQL) - shared across every calling route
  * rather than each maintaining its own lazy-repo field/getter, mirroring `AuditLogUtils.ts`'s
@@ -73,16 +75,31 @@ export async function isInternalAddress(objectFactory: ObjectFactory, domainClas
 export type RecipientTier = "same-org" | "federated" | "external";
 
 /** Checks whether `address`'s domain is a federated RapidMX peer. `classifyRecipientTier()` calls through
- * this seam rather than hard-coding a check, so this module carries no dependency on the federation-discovery
- * infrastructure (DNS `_rapidmx` TXT resolution) that doesn't exist yet - see the `ds_e2e_roadmap` project
- * memory. */
+ * this seam rather than hard-coding a check, keeping this module free of a hard dependency on any one
+ * `DnsResolver` - see `createFederatedPeerCheck()` below for the real implementation. */
 export type FederatedPeerCheck = (address: string) => Promise<boolean>;
 
 /** The default `FederatedPeerCheck` - always `false`, so every non-`same-org` address classifies as
- * `"external"` until a real implementation is wired in as `classifyRecipientTier()`'s `isFederatedPeer`
- * argument. This keeps `classifyRecipientTier()`'s observable behavior identical to plain internal/external
- * classification until that federation work lands. */
+ * `"external"` for a caller that hasn't wired in `createFederatedPeerCheck()`'s real implementation as
+ * `classifyRecipientTier()`'s `isFederatedPeer` argument. */
 const neverFederated: FederatedPeerCheck = async () => false;
+
+/**
+ * Builds a real `FederatedPeerCheck` backed by `util/FederationUtils.ts`'s `resolveFederationPolicy()` - a
+ * federated peer is any domain publishing a valid `_rapidmx` TXT record, regardless of which organisation
+ * operates it. `classifyRecipientTier()` only ever consults this for a domain that's already failed the
+ * same-org check, so there's no need to special-case "this server's own domain" here too.
+ */
+export function createFederatedPeerCheck(dnsResolver: DnsResolver): FederatedPeerCheck {
+    return async (address: string): Promise<boolean> => {
+        const domain: string | undefined = address.split("@")[1]?.toLowerCase();
+        if (!domain) {
+            return false;
+        }
+        const policy = await resolveFederationPolicy(dnsResolver, domain);
+        return policy !== undefined;
+    };
+}
 
 /**
  * Classifies `address` into one of the three `RecipientTier`s above - the shared basis for the receipt

@@ -21,7 +21,7 @@ import {
     RecipientType,
 } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
-import { registerTestDoubles, InMemoryBlobStore, RecordingMailTransport } from "../../testDoubles.js";
+import { registerTestDoubles, InMemoryBlobStore, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -978,7 +978,7 @@ describe("Route:MessageMongo Tests", () => {
             expect(transport.sent).toHaveLength(0);
         });
 
-        it("autoSendReceiptsFederated does NOT auto-send for an external requester - no federation detection exists yet so a non-internal requester always classifies as external, and the mailbox's own autoSendReceiptsExternal default (false) still governs.", async () => {
+        it("autoSendReceiptsFederated does NOT auto-send for an external requester - 'outside.com' publishes no _rapidmx record so it classifies as external, not federated, and the mailbox's own autoSendReceiptsExternal default (false) still governs.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await mailboxRepo.updateOne({ uid: mailbox.uid }, { $set: { autoSendReceiptsFederated: true } });
             const folder = await createFolder(mailbox.uid, FolderType.INBOX);
@@ -1337,7 +1337,7 @@ describe("Route:MessageMongo Tests", () => {
             expect(transport.sent[0].raw.toString()).toContain("Disposition-Notification-To: owner@example.com");
         });
 
-        it("alwaysRequestReceiptFederated does NOT opt an external recipient in - federated and external are distinct tiers, and no federation detection exists yet so a non-internal recipient always classifies as external.", async () => {
+        it("alwaysRequestReceiptFederated does NOT opt an external recipient in - federated and external are distinct tiers, and 'example.com' (never verified in this test) publishes no _rapidmx record so it classifies as external, not federated.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await mailboxRepo.updateOne({ uid: mailbox.uid }, { $set: { alwaysRequestReceiptFederated: true } });
             const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
@@ -1347,6 +1347,35 @@ describe("Route:MessageMongo Tests", () => {
             expect(result.body.receiptStatus).toBeFalsy();
             const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
             expect(transport.sent[0].raw.toString()).not.toContain("Disposition-Notification-To");
+        });
+
+        it("alwaysRequestReceiptFederated DOES opt in a real federated peer once its _rapidmx TXT record resolves (proves classifyRecipientTier() is wired to real DNS resolution, not just the stub).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await mailboxRepo.updateOne({ uid: mailbox.uid }, { $set: { alwaysRequestReceiptFederated: true } });
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+
+            const dnsResolver = objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!;
+            dnsResolver.records.set("_rapidmx.federated-peer-mongo.example", [
+                ["v=RMXv1; id=1; host=mail.federated-peer-mongo.example;"],
+            ]);
+            const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await blobStore.put(
+                bodyBlobKey,
+                Buffer.from("From: owner@example.com\r\nTo: peer@federated-peer-mongo.example\r\nSubject: Hi\r\n\r\nHello there.\r\n"),
+            );
+
+            // `envelopeTo` in send() comes from message.recipients (a structured field), not parsed from the
+            // raw blob's own To: header - both must point at the federated peer for this test to actually
+            // exercise that recipient's tier classification.
+            const result = await sendDraft(mailbox, draftsFolder, {
+                bodyBlobKey,
+                recipients: [{ address: "peer@federated-peer-mongo.example", type: RecipientType.TO }],
+            });
+
+            expect(result.body.receiptStatus).toEqual([{ recipientAddress: "peer@federated-peer-mongo.example" }]);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).toContain("Disposition-Notification-To: owner@example.com");
         });
     });
 });

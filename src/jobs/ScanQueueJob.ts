@@ -7,11 +7,12 @@ import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
+import type { DnsResolver } from "../dns/DnsResolver.js";
 import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, ScanPipelineResult } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { deriveConversationId } from "../util/ConversationUtils.js";
-import { classifyRecipientTier, getVerifiedDomainNames } from "../util/DomainUtils.js";
+import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { buildEventIcs, expandOccurrences, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
@@ -160,6 +161,12 @@ export abstract class ScanQueueJob<
     /** Publishes a live-update notification (see `push/MailPushRoute.ts`) once a message is delivered. */
     @Inject(NotificationUtils)
     private notificationUtils?: NotificationUtils;
+
+    /** Backs the real federated-peer check `classifyRecipientTier()` calls (`util/DomainUtils.ts`'s
+     * `createFederatedPeerCheck()`) - same DI token `BaseDomainRoute`/`DomainVerificationJob` already
+     * register/consume, so every deployment and test environment already has one. */
+    @Inject("DnsResolver")
+    private dnsResolver?: DnsResolver;
 
     @Config("mail:jobs:scan_queue:schedule", "*/10 * * * * *")
     private scheduleExpr: string = "*/10 * * * * *";
@@ -866,7 +873,12 @@ export abstract class ScanQueueJob<
         originalMessageId: string,
         originalSubject: string,
     ): Promise<{ sentAt?: Date; pending: boolean }> {
-        const tier = await classifyRecipientTier(this._objectFactory!, this.domainClass, dispositionNotificationTo);
+        const tier = await classifyRecipientTier(
+            this._objectFactory!,
+            this.domainClass,
+            dispositionNotificationTo,
+            createFederatedPeerCheck(this.dnsResolver!),
+        );
         const autoSend: boolean =
             tier === "same-org"
                 ? mailbox.autoSendReceiptsInternal
