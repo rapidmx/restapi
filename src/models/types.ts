@@ -1022,6 +1022,10 @@ export enum AuditAction {
     DOMAIN_VERIFIED = "domain.verified",
     BRANDING_UPDATE = "branding.update",
     ENCRYPTION_POLICY_UPDATE = "encryption_policy.update",
+    KEY_VAULT_ENROLL = "key_vault.enroll",
+    KEY_VAULT_WRAP_ADD = "key_vault.wrap_add",
+    KEY_VAULT_WRAP_REMOVE = "key_vault.wrap_remove",
+    KEY_VAULT_REKEY = "key_vault.rekey",
 }
 
 /**

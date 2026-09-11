@@ -12,6 +12,8 @@
 // specific route a given test file is exercising. This is a deliberate departure from `@rapidrest/auth`'s "no
 // shared test utility" convention: this library has pluggable interfaces auth does not, and duplicating this
 // registration across ~24 integration test files would be unreasonable.
+import "reflect-metadata";
+import * as x509 from "@peculiar/x509";
 import type { BlobPutOptions, BlobRange, BlobStore } from "../src/blob/BlobStore.js";
 import type { DnsMxRecord, DnsResolver } from "../src/dns/DnsResolver.js";
 import type { SearchDocument, SearchEntityType, SearchProvider, SearchQuery, SearchResultPage } from "../src/search/SearchProvider.js";
@@ -21,8 +23,11 @@ import type { MailTransport, OutboundMessage, TransportResult } from "../src/tra
 import { NullDkimKeyProvider } from "../src/dkim/NullDkimKeyProvider.js";
 import { NullEncryptionCertificateAuthority } from "../src/pki/NullEncryptionCertificateAuthority.js";
 import { NullSigningCertificateEnrollment } from "../src/pki/NullSigningCertificateEnrollment.js";
+import type { EncryptionCertificateAuthority, IssuedCertificate } from "../src/pki/EncryptionCertificateAuthority.js";
 import { AvVerdict, SpamVerdict } from "../src/models/types.js";
 import type { ObjectFactory } from "@rapidrest/service-core";
+
+x509.cryptoProvider.set(crypto);
 
 /** An in-memory `BlobStore` — content lives only for the lifetime of the process. */
 export class InMemoryBlobStore implements BlobStore {
@@ -183,6 +188,74 @@ export class StaticDnsResolver implements DnsResolver {
         }
         return records;
     }
+}
+
+/**
+ * A real, working `EncryptionCertificateAuthority` for tests that actually need a key enrolled (unlike the
+ * default `NullEncryptionCertificateAuthority`, which throws) - an in-memory-only simplification of
+ * `LocalX509CertificateAuthority` (same CSR-verification/issuance logic, minus the on-disk CA-key
+ * persistence, which a test has no reason to exercise). Not registered by `registerTestDoubles()` itself -
+ * a test file that needs real key enrollment registers this in place of `NullEncryptionCertificateAuthority`
+ * itself, via `objectFactory.register(FakeEncryptionCertificateAuthority, "EncryptionCertificateAuthority")`.
+ */
+export class FakeEncryptionCertificateAuthority implements EncryptionCertificateAuthority {
+    public readonly name: string = "fake";
+    private ca?: { keys: CryptoKeyPair; cert: x509.X509Certificate };
+
+    private async ensureCa(): Promise<{ keys: CryptoKeyPair; cert: x509.X509Certificate }> {
+        if (!this.ca) {
+            const keys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
+                "sign",
+                "verify",
+            ]);
+            const cert: x509.X509Certificate = await x509.X509CertificateGenerator.createSelfSigned({
+                name: "CN=Fake Test CA",
+                notBefore: new Date(),
+                notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+                keys,
+                signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+            });
+            this.ca = { keys, cert };
+        }
+        return this.ca;
+    }
+
+    public async issue(identity: string, csr: string): Promise<IssuedCertificate> {
+        const { keys, cert } = await this.ensureCa();
+        const parsedCsr = new x509.Pkcs10CertificateRequest(csr);
+        const notBefore = new Date();
+        const notAfter = new Date(notBefore.getTime() + 365 * 24 * 60 * 60 * 1000);
+        const leaf: x509.X509Certificate = await x509.X509CertificateGenerator.create({
+            subject: `CN=${identity}`,
+            issuer: cert.subjectName,
+            notBefore,
+            notAfter,
+            publicKey: parsedCsr.publicKey,
+            signingKey: keys.privateKey,
+            signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+        });
+        const fingerprint: string = Buffer.from(await leaf.getThumbprint("SHA-256")).toString("hex");
+        return { certificate: leaf.toString("pem"), fingerprint, notBefore, notAfter, serialNumber: leaf.serialNumber };
+    }
+
+    public async revoke(_fingerprint: string): Promise<void> {
+        // Intentionally empty - no test needs revocation state tracked.
+    }
+}
+
+/** Generates a fresh P-256 self-signed PKCS#10 CSR for `identity` - the client-side half of the encryption-
+ * key enrollment flow, needed by any test that calls `POST /mailbox/:id/keyvault/keys`. */
+export async function generateTestCsr(identity: string): Promise<string> {
+    const keys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
+        "sign",
+        "verify",
+    ]);
+    const csr = await x509.Pkcs10CertificateRequestGenerator.create({
+        name: `CN=${identity}`,
+        keys,
+        signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+    });
+    return csr.toString("pem");
 }
 
 /**
