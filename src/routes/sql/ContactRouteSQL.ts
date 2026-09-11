@@ -4,12 +4,12 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
 import { ContactSQL } from "../../sql.js";
-import { BaseScopedChildRoute } from "../BaseScopedChildRoute.js";
+import { BaseContactRoute } from "../BaseContactRoute.js";
 import { RecoverableRepoUtils } from "../../util/RecoverableRepoUtils.js";
 const { Model } = RouteDecorators;
 
 @Model(ContactSQL)
-export class ContactRouteSQL extends BaseScopedChildRoute<ContactSQL> {
+export class ContactRouteSQL extends BaseContactRoute<ContactSQL> {
     protected readonly repoUtilsClass: any = RecoverableRepoUtils;
     protected readonly scopeProperty: string = "folderUid";
 }

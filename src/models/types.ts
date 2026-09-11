@@ -25,11 +25,11 @@ export enum FolderType {
 /**
  * Describes a cryptographic public key used to sign or encrypt messages between parties - published via the
  * federation discovery protocol (`.well-known/rapidmx/keys/:hash`, see `util/FederationUtils.ts`/
- * `util/KeyDiscoveryClient.ts`) and stored on both `Mailbox` (this server's own users, once the key-vault
- * work lands) and `Contact` (third parties discovered via that protocol). MUST NOT ever carry private key
- * material - see `specs/end-to-end_encryption.md`'s Data Model section, where the corresponding
- * `WrappedPrivateKey`/`MasterKeyWrap`/`KeyVault` types (private-material-carrying, and therefore not defined
- * here yet) are introduced alongside the key-vault storage endpoints that actually need them.
+ * `util/KeyDiscoveryClient.ts`) and stored on both `Mailbox.keys` (this server's own users) and `Contact.keys`
+ * (third parties discovered via that protocol). MUST NOT ever carry private key material - see
+ * `WrappedPrivateKey`/`MasterKeyWrap`/`KeyVault` (below) for the corresponding private-material-carrying
+ * types, returned only from the authenticated key-vault endpoints that actually need them, never alongside a
+ * `PublicKey`.
  */
 export interface PublicKey {
     /** The base64 encoded public key (DER-encoded X.509 certificate). */
@@ -61,6 +61,76 @@ export interface EncryptionPreference {
     lastSeen?: number;
     /** The encryption preference to apply to outgoing messages. */
     preferEncrypt: "mutual" | "nopreference";
+}
+
+/**
+ * A private key encrypted under a mailbox's master key (MK) - only ever returned from an authenticated
+ * `GET /mailbox/:id/keyvault` call (`KeyVault`, below), never from an ordinary `Mailbox` fetch. The server
+ * never sees the unwrapped private key or the master key that wraps it - `ciphertext`/`nonce`/`algorithm` are
+ * opaque to this app, produced and consumed entirely client-side.
+ */
+export interface WrappedPrivateKey {
+    /** AEAD ciphertext of the private key, base64 encoded. */
+    ciphertext: string;
+    /** Base64 encoded AEAD nonce. */
+    nonce: string;
+    /** AEAD algorithm identifier (e.g. `AES-256-GCM`). */
+    algorithm: string;
+    /** Fingerprint of the corresponding `PublicKey`. */
+    fingerprint: string;
+    /** The purpose this key is used for. */
+    useType: "sign" | "encrypt";
+}
+
+/**
+ * One wrapped copy of a mailbox's master key, per unlock method - a mailbox typically has several of these
+ * (e.g. one per registered passkey, plus a password-derived one), any of which independently unwraps the same
+ * underlying master key client-side. Removing a wrap only prevents *future* unlocks by that method; it does
+ * not revoke access already granted via a captured wrap - true revocation requires the client to fully
+ * re-key (see `BaseKeyVaultRoute`'s re-key endpoint), not merely delete a wrap.
+ */
+export interface MasterKeyWrap {
+    /** Unlock method used to derive the wrapping key. */
+    method: "password" | "passkey" | "recovery" | "escrow";
+    /** Opaque identifier for the method instance (e.g. a WebAuthn credential ID). */
+    methodId?: string;
+    /** For method `escrow`: the escrow scope this wrap belongs to. Re-wrapped on scope change or key rotation.
+     * A seed field only - full Escrow Scoping (named scopes, role-holders, dual control, matter-based access)
+     * is its own deferred follow-up roadmap; this field exists now so that work never needs a breaking schema
+     * migration. */
+    escrowScopeId?: string;
+    /** AEAD ciphertext of the master key, base64 encoded. */
+    ciphertext: string;
+    /** Base64 encoded AEAD nonce. */
+    nonce: string;
+    /** Base64 encoded KDF salt. */
+    salt: string;
+    /** KDF identifier and parameters (e.g. `argon2id:m=65536,t=3,p=4`). */
+    kdf: string;
+    /** Wrapping scheme version, so parameters can be upgraded over time. */
+    schemeVersion: number;
+    /** UTC timestamp (epoch ms) of creation. */
+    createdAt: number;
+}
+
+/**
+ * Holds a mailbox's private key material, wrapped under its own master key - returned only from the
+ * authenticated `GET /mailbox/:id/keyvault` (`BaseKeyVaultRoute`), deliberately a separate entity from
+ * `Mailbox` (not embedded fields on it) so private material can never leak via an ordinary `Mailbox` fetch.
+ * Access is checked directly against the owning mailbox's own `AccessControlList` - unlike most entities in
+ * this codebase, a trusted/admin role gets **no** automatic bypass here (see `BaseKeyVaultRoute`'s own doc
+ * comment); any admin access that does occur is audit-logged.
+ */
+export interface KeyVault extends BaseEntity {
+    /** The unique identifier of the `Mailbox` this key vault belongs to. Exactly one `KeyVault` row exists per
+     * mailbox, enforced by `BaseKeyVaultRoute`'s own find-or-create logic rather than a database-level
+     * one-to-one constraint (matching this codebase's existing `find({ field }, { limit: 1 })` lookup-by-field
+     * convention, e.g. `BaseMailIngestRoute.findExactMailboxByAddress()`). */
+    mailboxUid: string;
+
+    wrappedKeys: WrappedPrivateKey[];
+
+    masterKeyWraps: MasterKeyWrap[];
 }
 
 /**
@@ -217,6 +287,29 @@ export interface Mailbox extends BaseEntity {
     autoSendReceiptsFederated: boolean;
 
     autoSendReceiptsExternal: boolean;
+
+    /** This mailbox's own encryption preference - whether outgoing messages from it should default to
+     * encrypted (only when the recipient also reports `mutual`, per `specs/end-to-end_encryption.md`'s
+     * Encryption section). Defaults to `{ preferEncrypt: "nopreference" }` for a mailbox with no preference
+     * ever set - the same default shape the discovery endpoint (`KeyDiscoveryResponse`) reports for a mailbox
+     * with nothing published yet, so a newly created mailbox and one intentionally reporting "no preference"
+     * are indistinguishable to a caller, matching this app's own not-yet-configured defaults elsewhere
+     * (`BaseBrandingRoute`/`BaseEncryptionPolicyRoute`). */
+    encryptPreference: EncryptionPreference;
+
+    /** This mailbox's published public keys (signing and/or encryption) - safe to expose publicly, unlike the
+     * private-material-carrying `KeyVault` returned only from the authenticated `GET /mailbox/:id/keyvault`.
+     * Defaults to `[]` for a mailbox that has never enrolled a key. */
+    keys: PublicKey[];
+
+    /** Precomputed `zbase32(sha256(lowercase(localPart)))` of `primarySmtpAddress` (see
+     * `util/KeyDiscoveryClient.ts`'s `computeKeyDiscoveryHash()`), maintained alongside `primarySmtpAddress`
+     * so the public discovery endpoint (`GET /.well-known/rapidmx/keys/:hash`) is an indexed lookup rather
+     * than a per-request hash-everything scan. Computed on create and recomputed whenever `primarySmtpAddress`
+     * changes (`BaseMailboxRoute`) - optional, not backfilled, rather than required-with-a-default, so a
+     * mailbox that existed before this field was introduced is simply not yet discoverable rather than every
+     * pre-existing row colliding on the same default value under a uniqueness constraint. */
+    keyDiscoveryHash?: string;
 }
 
 /**
@@ -662,6 +755,34 @@ export interface Contact extends RecoverableBaseEntity {
 
     /** Free-form category labels (e.g. Outlook-style colored categories) applied to this contact, if any. */
     categories?: string[];
+
+    /** This contact's known encryption preference, discovered via the federation protocol
+     * (`util/KeyringUtils.ts`) - `undefined` until Discovery has ever run for this address, distinct from an
+     * explicit `{ preferEncrypt: "nopreference" }` the contact has actually published. */
+    encryptPreference?: EncryptionPreference;
+
+    /** The public keys this contact has published, as last observed via Discovery. `undefined` until
+     * Discovery has ever run for this address. */
+    keys?: PublicKey[];
+
+    /** UTC timestamp (epoch ms) at which this contact's keys were first observed - the TOFU (trust-on-first-
+     * use) anchor referenced in `keyConflict`'s `observedAt` comparison and surfaced to the user so they can
+     * judge a key change's plausibility (e.g. "first seen 3 years ago" vs. "first seen yesterday"). */
+    keysFirstSeen?: number;
+
+    /** UTC timestamp (epoch ms) of the most recent message observed from this contact, with or without a key
+     * header - updated on every message regardless of outcome, per the Anti-Downgrade rule: a message with no
+     * discoverable key must still update this field even though it must NOT touch `encryptPreference`/`keys`. */
+    lastMessageSeen?: number;
+
+    /** Set when an observed key conflicts with the currently pinned key for this contact - blocks silent
+     * acceptance of the new key (`util/KeyringUtils.ts`'s Key Conflict Handling) until the user takes explicit
+     * action. The previously pinned key in `keys`/`encryptPreference` is retained unchanged while this is set. */
+    keyConflict?: {
+        observedFingerprint: string;
+        observedAt: number;
+        source: "header" | "discovery";
+    };
 }
 
 /**

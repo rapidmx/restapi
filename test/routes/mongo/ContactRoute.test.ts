@@ -203,6 +203,26 @@ describe("Route:ContactMongo Tests", () => {
         expect(acl).toBeNull();
     });
 
+    it("Rejects creating a contact that attempts to set a key-discovery-managed field directly (400).", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                mailboxUid: mailbox.uid,
+                folderUid: folder.uid,
+                displayName: "New Contact",
+                emails: [],
+                phones: [],
+                addresses: [],
+                keys: [{ publicKey: "abc", type: "x509", useType: "encrypt", fingerprint: "fp", notBefore: 0, notAfter: 1 }],
+            });
+
+        expect(result.status).toBe(400);
+    });
+
     it("Publishes a live-update notification to the folder's channel on create.", async () => {
         const sendMessageSpy = vi.spyOn(NotificationUtils.prototype, "sendMessage");
         const mailbox = await createMailbox(owner.uid);
@@ -392,6 +412,26 @@ describe("Route:ContactMongo Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.body.displayName).toBe("Renamed");
+    });
+
+    it("Rejects updating a contact that attempts to set a key-discovery-managed field directly (400), leaving it unchanged.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const contact = await createContact(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${contact.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                uid: contact.uid,
+                version: contact.version,
+                keyConflict: { observedFingerprint: "attacker-fp", observedAt: Date.now(), source: "header" },
+            });
+
+        expect(result.status).toBe(400);
+
+        const existing = await contactRepo.findOne({ uid: contact.uid } as any);
+        expect(existing?.keyConflict).toBeUndefined();
     });
 
     it("A different user cannot update a contact they don't have access to.", async () => {

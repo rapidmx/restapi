@@ -14,6 +14,7 @@ export * from "./EncryptionPolicyMongo.js";
 export * from "./FocusedInboxOverrideMongo.js";
 export * from "./FolderMongo.js";
 export * from "./IngestQueueEntryMongo.js";
+export * from "./KeyVaultMongo.js";
 export * from "./MailboxMongo.js";
 export * from "./MailFilterRuleMongo.js";
 export * from "./MailSignatureMongo.js";

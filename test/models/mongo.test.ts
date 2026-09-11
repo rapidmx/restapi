@@ -37,6 +37,7 @@ import { DomainMongo } from "../../src/models/mongo/DomainMongo.js";
 import { FocusedInboxOverrideMongo } from "../../src/models/mongo/FocusedInboxOverrideMongo.js";
 import { FolderMongo } from "../../src/models/mongo/FolderMongo.js";
 import { IngestQueueEntryMongo } from "../../src/models/mongo/IngestQueueEntryMongo.js";
+import { KeyVaultMongo } from "../../src/models/mongo/KeyVaultMongo.js";
 import { MailboxMongo } from "../../src/models/mongo/MailboxMongo.js";
 import { MessageMongo } from "../../src/models/mongo/MessageMongo.js";
 import { NoteMongo } from "../../src/models/mongo/NoteMongo.js";
@@ -67,6 +68,9 @@ describe("Mongo model default construction", () => {
         expect(obj.autoSendReceiptsInternal).toBe(true);
         expect(obj.autoSendReceiptsFederated).toBe(false);
         expect(obj.autoSendReceiptsExternal).toBe(false);
+        expect(obj.encryptPreference).toEqual({ preferEncrypt: "nopreference" });
+        expect(obj.keys).toEqual([]);
+        expect(obj.keyDiscoveryHash).toBeUndefined();
     });
 
     it("MailboxMongo applies provided overrides when constructed with data.", () => {
@@ -90,6 +94,9 @@ describe("Mongo model default construction", () => {
             autoSendReceiptsInternal: false,
             autoSendReceiptsFederated: true,
             autoSendReceiptsExternal: true,
+            encryptPreference: { preferEncrypt: "mutual", lastSeen: 123 },
+            keys: [{ publicKey: "abc", type: "x509", useType: "encrypt", fingerprint: "fp", notBefore: 0, notAfter: 1 }],
+            keyDiscoveryHash: "hash123",
         });
 
         expect(obj.ownerUserUid).toBe("user-1");
@@ -109,6 +116,11 @@ describe("Mongo model default construction", () => {
         expect(obj.autoSendReceiptsInternal).toBe(false);
         expect(obj.autoSendReceiptsFederated).toBe(true);
         expect(obj.autoSendReceiptsExternal).toBe(true);
+        expect(obj.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 123 });
+        expect(obj.keys).toEqual([
+            { publicKey: "abc", type: "x509", useType: "encrypt", fingerprint: "fp", notBefore: 0, notAfter: 1 },
+        ]);
+        expect(obj.keyDiscoveryHash).toBe("hash123");
     });
 
     it("MailboxMongo preserves class defaults for fields omitted from a partial override object.", () => {
@@ -124,6 +136,9 @@ describe("Mongo model default construction", () => {
         expect(obj.autoSendReceiptsInternal).toBe(true);
         expect(obj.autoSendReceiptsFederated).toBe(false);
         expect(obj.autoSendReceiptsExternal).toBe(false);
+        expect(obj.encryptPreference).toEqual({ preferEncrypt: "nopreference" });
+        expect(obj.keys).toEqual([]);
+        expect(obj.keyDiscoveryHash).toBeUndefined();
     });
 
     it("FolderMongo falls back to class defaults when constructed with no data.", () => {
@@ -342,6 +357,11 @@ describe("Mongo model default construction", () => {
         expect(obj.notes).toBeUndefined();
         expect(obj.photoBlobKey).toBeUndefined();
         expect(obj.sourceUid).toBeUndefined();
+        expect(obj.encryptPreference).toBeUndefined();
+        expect(obj.keys).toBeUndefined();
+        expect(obj.keysFirstSeen).toBeUndefined();
+        expect(obj.lastMessageSeen).toBeUndefined();
+        expect(obj.keyConflict).toBeUndefined();
     });
 
     it("ContactMongo applies provided overrides when constructed with data.", () => {
@@ -360,6 +380,11 @@ describe("Mongo model default construction", () => {
             notes: "Met at conference",
             photoBlobKey: "photo-1",
             sourceUid: "gal-1",
+            encryptPreference: { preferEncrypt: "mutual", lastSeen: 100 },
+            keys: [{ publicKey: "abc", type: "x509", useType: "sign", fingerprint: "fp", notBefore: 0, notAfter: 1 }],
+            keysFirstSeen: 50,
+            lastMessageSeen: 200,
+            keyConflict: { observedFingerprint: "other-fp", observedAt: 150, source: "header" },
         });
 
         expect(obj.mailboxUid).toBe("mailbox-1");
@@ -376,6 +401,72 @@ describe("Mongo model default construction", () => {
         expect(obj.notes).toBe("Met at conference");
         expect(obj.photoBlobKey).toBe("photo-1");
         expect(obj.sourceUid).toBe("gal-1");
+        expect(obj.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 100 });
+        expect(obj.keys).toEqual([
+            { publicKey: "abc", type: "x509", useType: "sign", fingerprint: "fp", notBefore: 0, notAfter: 1 },
+        ]);
+        expect(obj.keysFirstSeen).toBe(50);
+        expect(obj.lastMessageSeen).toBe(200);
+        expect(obj.keyConflict).toEqual({ observedFingerprint: "other-fp", observedAt: 150, source: "header" });
+    });
+
+    it("ContactMongo preserves class defaults for the key-discovery fields omitted from a partial override object.", () => {
+        const obj = new ContactMongo({ displayName: "Jane Doe" });
+
+        expect(obj.encryptPreference).toBeUndefined();
+        expect(obj.keys).toBeUndefined();
+        expect(obj.keysFirstSeen).toBeUndefined();
+        expect(obj.lastMessageSeen).toBeUndefined();
+        expect(obj.keyConflict).toBeUndefined();
+    });
+
+    it("KeyVaultMongo falls back to class defaults when constructed with no data.", () => {
+        const obj = new KeyVaultMongo();
+
+        expect(obj.mailboxUid).toBe("");
+        expect(obj.wrappedKeys).toEqual([]);
+        expect(obj.masterKeyWraps).toEqual([]);
+    });
+
+    it("KeyVaultMongo applies provided overrides when constructed with data.", () => {
+        const obj = new KeyVaultMongo({
+            mailboxUid: "mailbox-1",
+            wrappedKeys: [{ ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM", fingerprint: "fp", useType: "encrypt" }],
+            masterKeyWraps: [
+                {
+                    method: "password",
+                    ciphertext: "mkct",
+                    nonce: "mkn",
+                    salt: "salt",
+                    kdf: "argon2id:m=65536,t=3,p=4",
+                    schemeVersion: 1,
+                    createdAt: 100,
+                },
+            ],
+        });
+
+        expect(obj.mailboxUid).toBe("mailbox-1");
+        expect(obj.wrappedKeys).toEqual([
+            { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM", fingerprint: "fp", useType: "encrypt" },
+        ]);
+        expect(obj.masterKeyWraps).toEqual([
+            {
+                method: "password",
+                ciphertext: "mkct",
+                nonce: "mkn",
+                salt: "salt",
+                kdf: "argon2id:m=65536,t=3,p=4",
+                schemeVersion: 1,
+                createdAt: 100,
+            },
+        ]);
+    });
+
+    it("KeyVaultMongo preserves class defaults for fields omitted from a partial override object.", () => {
+        const obj = new KeyVaultMongo({});
+
+        expect(obj.wrappedKeys).toEqual([]);
+        expect(obj.masterKeyWraps).toEqual([]);
     });
 
     it("ContactListMongo falls back to class defaults when constructed with no data.", () => {

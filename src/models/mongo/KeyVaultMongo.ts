@@ -1,0 +1,56 @@
+///////////////////////////////////////////////////////////////////////////////
+// Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
+// SPDX-License-Identifier: MPL-2.0
+///////////////////////////////////////////////////////////////////////////////
+import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
+import { KeyVault, MasterKeyWrap, WrappedPrivateKey } from "../types.js";
+const { Description } = DocDecorators;
+const { DataStore, Protect } = ModelDecorators;
+const { Column, Entity, Index } = PersistenceDecorators;
+
+/**
+ * Implementation of the `KeyVault` interface for storage in a MongoDB database. If SQL is desired, please use
+ * `models.sql.KeyVaultSQL` instead.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+@DataStore("mongo")
+@Entity()
+@Description(
+    "Holds a mailbox's private key material, wrapped under its own master key - returned only from the " +
+        "authenticated GET /mailbox/:id/keyvault.",
+)
+@Index("keyvault_mailbox", ["mailboxUid"], { unique: true })
+@Protect(
+    {
+        uid: "KeyVault",
+        records: [
+            { userOrRoleId: "anonymous", actions: [] },
+            { userOrRoleId: ".*", actions: [] },
+        ],
+    },
+    false,
+)
+export class KeyVaultMongo extends BaseMongoEntity implements KeyVault {
+    @Column()
+    @Description("The unique identifier of the `Mailbox` this key vault belongs to.")
+    public mailboxUid: string = "";
+
+    @Column()
+    @Description("This mailbox's private keys, each encrypted under its master key.")
+    public wrappedKeys: WrappedPrivateKey[] = [];
+
+    @Column()
+    @Description("Wrapped copies of this mailbox's master key, one per unlock method.")
+    public masterKeyWraps: MasterKeyWrap[] = [];
+
+    constructor(other?: Partial<KeyVaultMongo>) {
+        super(other);
+
+        if (other) {
+            this.mailboxUid = other.mailboxUid !== undefined ? other.mailboxUid : this.mailboxUid;
+            this.wrappedKeys = other.wrappedKeys !== undefined ? other.wrappedKeys : this.wrappedKeys;
+            this.masterKeyWraps = other.masterKeyWraps !== undefined ? other.masterKeyWraps : this.masterKeyWraps;
+        }
+    }
+}

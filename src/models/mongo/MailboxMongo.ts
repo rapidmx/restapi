@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { Mailbox } from "../types.js";
+import { EncryptionPreference, Mailbox, PublicKey } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity, Index } = PersistenceDecorators;
@@ -24,6 +24,10 @@ const { Nullable } = ObjectDecorators;
 )
 @Index("mailbox_owner", ["ownerUserUid"])
 @Index("mailbox_primary_smtp", ["primarySmtpAddress"], { unique: true })
+// Not `unique: true` - see `Mailbox.keyDiscoveryHash`'s own doc comment on why this is optional/unbackfilled
+// rather than required-with-a-default (a uniqueness constraint on a shared default would collide across every
+// pre-existing row the moment a second one is saved).
+@Index("mailbox_key_discovery_hash", ["keyDiscoveryHash"])
 @Protect(
     {
         uid: "Mailbox",
@@ -156,6 +160,19 @@ export class MailboxMongo extends BaseMongoEntity implements Mailbox {
     @Description("Same as autoSendReceiptsInternal, for an external requester.")
     public autoSendReceiptsExternal: boolean = false;
 
+    @Column()
+    @Description("This mailbox's own encryption preference.")
+    public encryptPreference: EncryptionPreference = { preferEncrypt: "nopreference" };
+
+    @Column()
+    @Description("This mailbox's published public keys (signing and/or encryption).")
+    public keys: PublicKey[] = [];
+
+    @Column()
+    @Description("Precomputed zbase32(sha256(localPart)) of primarySmtpAddress, for the discovery endpoint's indexed lookup.")
+    @Nullable
+    public keyDiscoveryHash?: string = undefined;
+
     constructor(other?: Partial<MailboxMongo>) {
         super(other);
 
@@ -197,6 +214,9 @@ export class MailboxMongo extends BaseMongoEntity implements Mailbox {
                 other.autoSendReceiptsFederated !== undefined ? other.autoSendReceiptsFederated : this.autoSendReceiptsFederated;
             this.autoSendReceiptsExternal =
                 other.autoSendReceiptsExternal !== undefined ? other.autoSendReceiptsExternal : this.autoSendReceiptsExternal;
+            this.encryptPreference = other.encryptPreference !== undefined ? other.encryptPreference : this.encryptPreference;
+            this.keys = other.keys !== undefined ? other.keys : this.keys;
+            this.keyDiscoveryHash = "keyDiscoveryHash" in other ? other.keyDiscoveryHash : this.keyDiscoveryHash;
         }
     }
 }

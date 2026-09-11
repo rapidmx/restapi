@@ -37,6 +37,7 @@ import { DomainSQL } from "../../src/models/sql/DomainSQL.js";
 import { FocusedInboxOverrideSQL } from "../../src/models/sql/FocusedInboxOverrideSQL.js";
 import { FolderSQL } from "../../src/models/sql/FolderSQL.js";
 import { IngestQueueEntrySQL } from "../../src/models/sql/IngestQueueEntrySQL.js";
+import { KeyVaultSQL } from "../../src/models/sql/KeyVaultSQL.js";
 import { MailboxSQL } from "../../src/models/sql/MailboxSQL.js";
 import { MessageSQL } from "../../src/models/sql/MessageSQL.js";
 import { NoteSQL } from "../../src/models/sql/NoteSQL.js";
@@ -67,6 +68,9 @@ describe("SQL model default construction", () => {
         expect(obj.autoSendReceiptsInternal).toBe(true);
         expect(obj.autoSendReceiptsFederated).toBe(false);
         expect(obj.autoSendReceiptsExternal).toBe(false);
+        expect(obj.encryptPreference).toEqual({ preferEncrypt: "nopreference" });
+        expect(obj.keys).toEqual([]);
+        expect(obj.keyDiscoveryHash).toBeUndefined();
     });
 
     it("MailboxSQL applies provided overrides when constructed with data.", () => {
@@ -90,6 +94,9 @@ describe("SQL model default construction", () => {
             autoSendReceiptsInternal: false,
             autoSendReceiptsFederated: true,
             autoSendReceiptsExternal: true,
+            encryptPreference: { preferEncrypt: "mutual", lastSeen: 123 },
+            keys: [{ publicKey: "abc", type: "x509", useType: "encrypt", fingerprint: "fp", notBefore: 0, notAfter: 1 }],
+            keyDiscoveryHash: "hash123",
         });
 
         expect(obj.ownerUserUid).toBe("user-1");
@@ -109,6 +116,11 @@ describe("SQL model default construction", () => {
         expect(obj.autoSendReceiptsInternal).toBe(false);
         expect(obj.autoSendReceiptsFederated).toBe(true);
         expect(obj.autoSendReceiptsExternal).toBe(true);
+        expect(obj.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 123 });
+        expect(obj.keys).toEqual([
+            { publicKey: "abc", type: "x509", useType: "encrypt", fingerprint: "fp", notBefore: 0, notAfter: 1 },
+        ]);
+        expect(obj.keyDiscoveryHash).toBe("hash123");
     });
 
     it("MailboxSQL preserves class defaults for fields omitted from a partial override object.", () => {
@@ -124,6 +136,9 @@ describe("SQL model default construction", () => {
         expect(obj.autoSendReceiptsInternal).toBe(true);
         expect(obj.autoSendReceiptsFederated).toBe(false);
         expect(obj.autoSendReceiptsExternal).toBe(false);
+        expect(obj.encryptPreference).toEqual({ preferEncrypt: "nopreference" });
+        expect(obj.keys).toEqual([]);
+        expect(obj.keyDiscoveryHash).toBeUndefined();
     });
 
     it("FolderSQL falls back to class defaults when constructed with no data.", () => {
@@ -342,6 +357,11 @@ describe("SQL model default construction", () => {
         expect(obj.notes).toBeUndefined();
         expect(obj.photoBlobKey).toBeUndefined();
         expect(obj.sourceUid).toBeUndefined();
+        expect(obj.encryptPreference).toBeUndefined();
+        expect(obj.keys).toBeUndefined();
+        expect(obj.keysFirstSeen).toBeUndefined();
+        expect(obj.lastMessageSeen).toBeUndefined();
+        expect(obj.keyConflict).toBeUndefined();
     });
 
     it("ContactSQL applies provided overrides when constructed with data.", () => {
@@ -360,6 +380,11 @@ describe("SQL model default construction", () => {
             notes: "Met at conference",
             photoBlobKey: "photo-1",
             sourceUid: "gal-1",
+            encryptPreference: { preferEncrypt: "mutual", lastSeen: 100 },
+            keys: [{ publicKey: "abc", type: "x509", useType: "sign", fingerprint: "fp", notBefore: 0, notAfter: 1 }],
+            keysFirstSeen: 50,
+            lastMessageSeen: 200,
+            keyConflict: { observedFingerprint: "other-fp", observedAt: 150, source: "header" },
         });
 
         expect(obj.mailboxUid).toBe("mailbox-1");
@@ -376,6 +401,72 @@ describe("SQL model default construction", () => {
         expect(obj.notes).toBe("Met at conference");
         expect(obj.photoBlobKey).toBe("photo-1");
         expect(obj.sourceUid).toBe("gal-1");
+        expect(obj.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 100 });
+        expect(obj.keys).toEqual([
+            { publicKey: "abc", type: "x509", useType: "sign", fingerprint: "fp", notBefore: 0, notAfter: 1 },
+        ]);
+        expect(obj.keysFirstSeen).toBe(50);
+        expect(obj.lastMessageSeen).toBe(200);
+        expect(obj.keyConflict).toEqual({ observedFingerprint: "other-fp", observedAt: 150, source: "header" });
+    });
+
+    it("ContactSQL preserves class defaults for the key-discovery fields omitted from a partial override object.", () => {
+        const obj = new ContactSQL({ displayName: "Jane Doe" });
+
+        expect(obj.encryptPreference).toBeUndefined();
+        expect(obj.keys).toBeUndefined();
+        expect(obj.keysFirstSeen).toBeUndefined();
+        expect(obj.lastMessageSeen).toBeUndefined();
+        expect(obj.keyConflict).toBeUndefined();
+    });
+
+    it("KeyVaultSQL falls back to class defaults when constructed with no data.", () => {
+        const obj = new KeyVaultSQL();
+
+        expect(obj.mailboxUid).toBe("");
+        expect(obj.wrappedKeys).toEqual([]);
+        expect(obj.masterKeyWraps).toEqual([]);
+    });
+
+    it("KeyVaultSQL applies provided overrides when constructed with data.", () => {
+        const obj = new KeyVaultSQL({
+            mailboxUid: "mailbox-1",
+            wrappedKeys: [{ ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM", fingerprint: "fp", useType: "encrypt" }],
+            masterKeyWraps: [
+                {
+                    method: "password",
+                    ciphertext: "mkct",
+                    nonce: "mkn",
+                    salt: "salt",
+                    kdf: "argon2id:m=65536,t=3,p=4",
+                    schemeVersion: 1,
+                    createdAt: 100,
+                },
+            ],
+        });
+
+        expect(obj.mailboxUid).toBe("mailbox-1");
+        expect(obj.wrappedKeys).toEqual([
+            { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM", fingerprint: "fp", useType: "encrypt" },
+        ]);
+        expect(obj.masterKeyWraps).toEqual([
+            {
+                method: "password",
+                ciphertext: "mkct",
+                nonce: "mkn",
+                salt: "salt",
+                kdf: "argon2id:m=65536,t=3,p=4",
+                schemeVersion: 1,
+                createdAt: 100,
+            },
+        ]);
+    });
+
+    it("KeyVaultSQL preserves class defaults for fields omitted from a partial override object.", () => {
+        const obj = new KeyVaultSQL({});
+
+        expect(obj.wrappedKeys).toEqual([]);
+        expect(obj.masterKeyWraps).toEqual([]);
     });
 
     it("ContactListSQL falls back to class defaults when constructed with no data.", () => {

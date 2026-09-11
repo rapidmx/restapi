@@ -10,7 +10,7 @@ import {
     RecoverableBaseMongoEntity,
 } from "@rapidrest/service-core";
 import { ObjectDecorators } from "@rapidrest/core";
-import { Contact, ContactEmail, ContactPhone, ContactPostalAddress } from "../types.js";
+import { Contact, ContactEmail, ContactPhone, ContactPostalAddress, EncryptionPreference, PublicKey } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Nullable } = ObjectDecorators;
@@ -115,6 +115,31 @@ export class ContactMongo extends RecoverableBaseMongoEntity implements Contact 
     @Nullable
     public categories?: string[];
 
+    @Column()
+    @Description("This contact's known encryption preference, discovered via the federation protocol.")
+    @Nullable
+    public encryptPreference?: EncryptionPreference;
+
+    @Column()
+    @Description("The public keys this contact has published, as last observed via Discovery.")
+    @Nullable
+    public keys?: PublicKey[];
+
+    @Column()
+    @Description("UTC timestamp (epoch ms) at which this contact's keys were first observed (TOFU anchor).")
+    @Nullable
+    public keysFirstSeen?: number;
+
+    @Column()
+    @Description("UTC timestamp (epoch ms) of the most recent message observed from this contact.")
+    @Nullable
+    public lastMessageSeen?: number;
+
+    @Column()
+    @Description("Set when an observed key conflicts with the currently pinned key for this contact.")
+    @Nullable
+    public keyConflict?: Contact["keyConflict"];
+
     constructor(other?: Partial<ContactMongo>) {
         super(other);
 
@@ -135,6 +160,11 @@ export class ContactMongo extends RecoverableBaseMongoEntity implements Contact 
             this.sourceUid = "sourceUid" in other ? other.sourceUid : this.sourceUid;
             this.favorite = "favorite" in other ? other.favorite : this.favorite;
             this.categories = "categories" in other ? other.categories : this.categories;
+            this.encryptPreference = "encryptPreference" in other ? other.encryptPreference : this.encryptPreference;
+            this.keys = "keys" in other ? other.keys : this.keys;
+            this.keysFirstSeen = "keysFirstSeen" in other ? other.keysFirstSeen : this.keysFirstSeen;
+            this.lastMessageSeen = "lastMessageSeen" in other ? other.lastMessageSeen : this.lastMessageSeen;
+            this.keyConflict = "keyConflict" in other ? other.keyConflict : this.keyConflict;
         }
     }
 }

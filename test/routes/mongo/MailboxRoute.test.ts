@@ -18,6 +18,7 @@ import * as uuid from "uuid";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { DistributionListMongo } from "../../../src/models/mongo/DistributionListMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
+import { computeKeyDiscoveryHash } from "../../../src/util/KeyDiscoveryClient.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
@@ -88,7 +89,10 @@ describe("Route:MailboxMongo Tests", () => {
         return result;
     };
 
-    const SERVER_ASSIGNED_FIELDS = ["uid", "dateCreated", "dateModified", "version", "_id"];
+    // `keyDiscoveryHash` is derived from `primarySmtpAddress` by `BaseMailboxRoute.create()`, the same way
+    // `uid` itself is - not meaningfully asserted via deep equality against a caller-constructed `Mailbox`
+    // instance, whose own class-level default for the field is `undefined`.
+    const SERVER_ASSIGNED_FIELDS = ["uid", "dateCreated", "dateModified", "version", "_id", "keyDiscoveryHash"];
 
     const expectMatchingFields = function (actual: any, expected: any): void {
         for (const key in expected) {
@@ -166,6 +170,7 @@ describe("Route:MailboxMongo Tests", () => {
         expect(result.status).toBeGreaterThanOrEqual(200);
         expect(result.status).toBeLessThan(300);
         expectMatchingFields(result.body, obj);
+        expect(result.body.keyDiscoveryHash).toBe(computeKeyDiscoveryHash(obj.primarySmtpAddress.split("@")[0]));
 
         const existing: MailboxMongo | null = await repo.findOne({ uid: result.body.uid } as any);
         expect(existing).toBeDefined();
@@ -219,6 +224,27 @@ describe("Route:MailboxMongo Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.body.displayName).toBe("Renamed Mailbox");
+    });
+
+    it("Recomputes keyDiscoveryHash when primarySmtpAddress is patched, leaving it alone otherwise.", async () => {
+        const obj = await createMailboxMongo();
+        const originalHash = obj.keyDiscoveryHash;
+
+        const unrelatedUpdate = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, displayName: "Renamed Mailbox" });
+        expect(unrelatedUpdate.body.keyDiscoveryHash).toBe(originalHash);
+
+        const newAddress = `${uuid.v4()}@example.com`;
+        const addressUpdate = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: unrelatedUpdate.body.version, primarySmtpAddress: newAddress });
+
+        expect(addressUpdate.status).toBe(200);
+        expect(addressUpdate.body.keyDiscoveryHash).toBe(computeKeyDiscoveryHash(newAddress.split("@")[0]));
+        expect(addressUpdate.body.keyDiscoveryHash).not.toBe(originalHash);
     });
 
     it("A different authenticated user cannot update someone else's mailbox.", async () => {

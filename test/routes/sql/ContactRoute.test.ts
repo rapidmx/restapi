@@ -189,6 +189,26 @@ describe("Route:ContactSQL Tests", () => {
         expect(acl).toBeNull();
     });
 
+    it("Rejects creating a contact that attempts to set a key-discovery-managed field directly (400).", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                mailboxUid: mailbox.uid,
+                folderUid: folder.uid,
+                displayName: "New Contact",
+                emails: [],
+                phones: [],
+                addresses: [],
+                keys: [{ publicKey: "abc", type: "x509", useType: "encrypt", fingerprint: "fp", notBefore: 0, notAfter: 1 }],
+            });
+
+        expect(result.status).toBe(400);
+    });
+
     it("A different user cannot create a contact in a folder they don't have access to.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid);
@@ -257,6 +277,28 @@ describe("Route:ContactSQL Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.body.displayName).toBe("Renamed");
+    });
+
+    it("Rejects updating a contact that attempts to set a key-discovery-managed field directly (400), leaving it unchanged.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const contact = await createContact(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${contact.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                uid: contact.uid,
+                version: contact.version,
+                keyConflict: { observedFingerprint: "attacker-fp", observedAt: Date.now(), source: "header" },
+            });
+
+        expect(result.status).toBe(400);
+
+        // SQL stores an unset nullable `simple-json` column as `null`, not `undefined` - see this codebase's
+        // documented SQL null-vs-undefined gotcha (`resource_mailboxes_design` memory).
+        const existing = await contactRepo.findOne({ where: { uid: contact.uid } });
+        expect(existing?.keyConflict).toBeFalsy();
     });
 
     it("A different user cannot update a contact they don't have access to.", async () => {

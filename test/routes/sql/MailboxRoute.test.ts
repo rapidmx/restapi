@@ -19,6 +19,7 @@ import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { DistributionListSQL } from "../../../src/models/sql/DistributionListSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { computeKeyDiscoveryHash } from "../../../src/util/KeyDiscoveryClient.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
@@ -83,7 +84,10 @@ describe("Route:MailboxSQL Tests", () => {
 
     // dateCreated, dateModified, uid and version are assigned by the server. `_id` never applies to a SQL
     // model but is harmless to keep excluded for parity with the Mongo original.
-    const SERVER_ASSIGNED_FIELDS = ["uid", "dateCreated", "dateModified", "version", "_id"];
+    // `keyDiscoveryHash` is derived from `primarySmtpAddress` by `BaseMailboxRoute.create()`, the same way
+    // `uid` itself is - not meaningfully asserted via deep equality against a caller-constructed `Mailbox`
+    // instance, whose own class-level default for the field is `undefined`.
+    const SERVER_ASSIGNED_FIELDS = ["uid", "dateCreated", "dateModified", "version", "_id", "keyDiscoveryHash"];
 
     const expectMatchingFields = function (actual: any, expected: any): void {
         for (const key in expected) {
@@ -159,6 +163,7 @@ describe("Route:MailboxSQL Tests", () => {
         expect(result.status).toBeGreaterThanOrEqual(200);
         expect(result.status).toBeLessThan(300);
         expectMatchingFields(result.body, obj);
+        expect(result.body.keyDiscoveryHash).toBe(computeKeyDiscoveryHash(obj.primarySmtpAddress.split("@")[0]));
 
         const existing: MailboxSQL | null = await repo.findOne({ where: { uid: result.body.uid } });
         expect(existing).toBeDefined();
@@ -212,6 +217,27 @@ describe("Route:MailboxSQL Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.body.displayName).toBe("Renamed Mailbox");
+    });
+
+    it("Recomputes keyDiscoveryHash when primarySmtpAddress is patched, leaving it alone otherwise.", async () => {
+        const obj = await createMailboxSQL();
+        const originalHash = obj.keyDiscoveryHash;
+
+        const unrelatedUpdate = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, displayName: "Renamed Mailbox" });
+        expect(unrelatedUpdate.body.keyDiscoveryHash).toBe(originalHash);
+
+        const newAddress = `${uuid.v4()}@example.com`;
+        const addressUpdate = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: unrelatedUpdate.body.version, primarySmtpAddress: newAddress });
+
+        expect(addressUpdate.status).toBe(200);
+        expect(addressUpdate.body.keyDiscoveryHash).toBe(computeKeyDiscoveryHash(newAddress.split("@")[0]));
+        expect(addressUpdate.body.keyDiscoveryHash).not.toBe(originalHash);
     });
 
     it("A different authenticated user cannot update someone else's mailbox.", async () => {

@@ -12,12 +12,14 @@ import {
     HttpResponse,
     RepoUtils,
     RouteDecorators,
+    type UpdateObject,
 } from "@rapidrest/service-core";
 import { AuditAction, DistributionList, FolderType, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
+import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 const { Auth, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 const { Config } = ObjectDecorators;
@@ -222,6 +224,10 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             }
             const candidateUid: string = normalizeAddress(o.primarySmtpAddress);
             (o as any).uid = candidateUid;
+            // Precomputed alongside `uid` for the same reason `uid` itself is derived here rather than left to
+            // the caller - the public discovery endpoint (Group E) needs an indexed lookup by this hash, not a
+            // per-request hash-everything scan, so it must always reflect the mailbox's current address.
+            (o as any).keyDiscoveryHash = computeKeyDiscoveryHash(o.primarySmtpAddress.split("@")[0]);
             if (seenUids.has(candidateUid)) {
                 throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "Duplicate address within the same request.");
             }
@@ -281,6 +287,18 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
 
         return Array.isArray(obj) ? created : created[0];
+    }
+
+    /**
+     * Keeps `keyDiscoveryHash` in sync whenever a caller's patch actually touches `primarySmtpAddress` -
+     * `RepoUtils.update()` is a genuine partial patch, so an absent `primarySmtpAddress` means "leave it
+     * alone" and must leave the hash alone too, not recompute it from a value that was never sent.
+     */
+    public async update(id: string, obj: UpdateObject<T>, req: HttpRequest, user?: JWTUser): Promise<T> {
+        if (obj.primarySmtpAddress !== undefined) {
+            (obj as any).keyDiscoveryHash = computeKeyDiscoveryHash(obj.primarySmtpAddress.split("@")[0]);
+        }
+        return super.update(id, obj, req, user);
     }
 
     /**
