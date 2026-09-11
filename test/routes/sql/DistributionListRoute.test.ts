@@ -249,6 +249,15 @@ describe("Route:DistributionListSQL Tests", () => {
         expect(result.status).toBe(400);
     });
 
+    it("Rejects creating a distribution list with an explicit empty name (400) - proves model validation actually runs on create(), not just the route's own hand-checked primarySmtpAddress.", async () => {
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ primarySmtpAddress: `${uuid.v4()}@example.com`, name: "", memberAddresses: [] });
+
+        expect(result.status).toBe(400);
+    });
+
     it("Returns 404 updating a distribution list that doesn't exist.", async () => {
         const result = await request(server.getApplication())
             .put(`${baseUrl}/does-not-exist@example.com`)

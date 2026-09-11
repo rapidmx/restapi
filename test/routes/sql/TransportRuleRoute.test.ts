@@ -117,6 +117,25 @@ describe("Route:TransportRuleSQL Tests", () => {
         expect(result.status).toBe(403);
     });
 
+    it("Rejects creating a transport rule with an explicit empty name (400) - proves model validation actually runs on create(), like every other CRUDRoute subclass.", async () => {
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ name: "", enabled: true, sequence: 0, stopProcessingRules: false, conditions: {}, actions: [] });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Rejects updating a transport rule with an explicit empty name (400).", async () => {
+        const rule = await createRule();
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${rule.uid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: rule.uid, version: rule.version, name: "" });
+
+        expect(result.status).toBe(400);
+    });
+
     it("A trusted (admin) caller can create a transport rule.", async () => {
         const result = await request(server.getApplication())
             .post(baseUrl)

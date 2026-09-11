@@ -170,6 +170,24 @@ describe("Route:FolderSQL Tests", () => {
         expect(acl?.parentUid).toBe(mailbox.uid);
     });
 
+    it("Rejects creating a folder with an explicit empty name (400) - proves model validation actually runs on create().", async () => {
+        const mailbox = await createMailbox(owner.uid);
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                mailboxUid: mailbox.uid,
+                name: "",
+                type: FolderType.USER,
+                unreadCount: 0,
+                totalCount: 0,
+                syncKeyVersion: 0,
+            });
+
+        expect(result.status).toBe(400);
+    });
+
     it("A different user cannot create a folder in a mailbox they don't own.", async () => {
         const mailbox = await createMailbox(owner.uid);
 

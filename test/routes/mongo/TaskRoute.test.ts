@@ -200,6 +200,18 @@ describe("Route:TaskMongo Tests", () => {
         expect(acl).toBeNull();
     });
 
+    it("Rejects creating a task with an explicit empty title (400) - proves model validation actually runs on create().", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ mailboxUid: mailbox.uid, folderUid: folder.uid, title: "", completed: false, priority: TaskPriority.NORMAL });
+
+        expect(result.status).toBe(400);
+    });
+
     it("A different user cannot create a task in a folder they don't have access to.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid);

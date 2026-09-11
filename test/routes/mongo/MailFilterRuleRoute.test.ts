@@ -167,6 +167,25 @@ describe("Route:MailFilterRuleMongo Tests", () => {
         expect(acl).toBeNull();
     });
 
+    it("Rejects creating a rule with an explicit empty name (400) - proves model validation actually runs on create().", async () => {
+        const mailbox = await createMailbox(owner.uid);
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                mailboxUid: mailbox.uid,
+                name: "",
+                enabled: true,
+                sequence: 1,
+                stopProcessingRules: true,
+                conditions: {},
+                actions: [],
+            });
+
+        expect(result.status).toBe(400);
+    });
+
     it("A different user cannot create a rule in a mailbox they don't have access to.", async () => {
         const mailbox = await createMailbox(owner.uid);
 

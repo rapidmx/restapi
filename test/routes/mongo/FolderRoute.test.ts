@@ -250,6 +250,24 @@ describe("Route:FolderMongo Tests", () => {
         expect(acl?.parentUid).toBe(mailbox.uid);
     });
 
+    it("Rejects creating a folder with an explicit empty name (400) - proves model validation actually runs on create().", async () => {
+        const mailbox = await createMailbox(owner.uid);
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                mailboxUid: mailbox.uid,
+                name: "",
+                type: FolderType.USER,
+                unreadCount: 0,
+                totalCount: 0,
+                syncKeyVersion: 0,
+            });
+
+        expect(result.status).toBe(400);
+    });
+
     it("Publishes a live-update notification to the owning mailbox's channel on create.", async () => {
         const sendMessageSpy = vi.spyOn(NotificationUtils.prototype, "sendMessage");
         const mailbox = await createMailbox(owner.uid);

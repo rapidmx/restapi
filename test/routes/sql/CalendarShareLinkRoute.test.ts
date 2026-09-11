@@ -192,6 +192,15 @@ describe("Route:CalendarShareLinkSQL Tests", () => {
         expect(acl).toBeNull();
     });
 
+    it("Rejects creating a calendar share link with an explicit empty folderUid (400) - proves model validation actually runs on create().", async () => {
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ token: uuid.v4(), folderUid: "", permittedActions: ["read"], createdByUserUid: owner.uid });
+
+        expect(result.status).toBe(400);
+    });
+
     it("A different user cannot create a calendar share link in a folder they don't have access to.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid);
