@@ -18,6 +18,7 @@ import {
     FolderType,
     MessageClassification,
     MessageImportance,
+    PublicKey,
     RecipientType,
 } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
@@ -1402,6 +1403,101 @@ describe("Route:MessageMongo Tests", () => {
             expect(result.body.receiptStatus).toEqual([{ recipientAddress: "peer@federated-peer-mongo.example" }]);
             const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
             expect(transport.sent[0].raw.toString()).toContain("Disposition-Notification-To: owner@example.com");
+        });
+    });
+
+    describe("send() RapidMX-Key attachment (E4)", () => {
+        const sendDraft = async function (mailbox: MailboxMongo, draftsFolder: FolderMongo, data?: any) {
+            const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await blobStore.put(
+                bodyBlobKey,
+                Buffer.from("From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n"),
+            );
+            const message = await createMessage(mailbox.uid, draftsFolder.uid, { bodyBlobKey, ...data });
+            return await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/send`)
+                .set("Authorization", "jwt " + ownerToken);
+        };
+
+        const activeKey: PublicKey = {
+            publicKey: "ZmFrZS1jZXJ0LWJ5dGVz",
+            type: "x509",
+            useType: "encrypt",
+            fingerprint: "aabbccdd",
+            notBefore: Date.now() - 1000,
+            notAfter: Date.now() + 1000 * 60 * 60 * 24 * 365,
+        };
+
+        it("Attaches RapidMX-Key when the sending mailbox has an active encrypt key.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await mailboxRepo.updateOne(
+                { uid: mailbox.uid },
+                { $set: { keys: [activeKey], encryptPreference: { preferEncrypt: "mutual" } } },
+            );
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+
+            const result = await sendDraft(mailbox, draftsFolder);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).toContain(
+                "RapidMX-Key: addr=owner@example.com; prefer-encrypt=mutual; type=x509; keydata=ZmFrZS1jZXJ0LWJ5dGVz",
+            );
+        });
+
+        it("Does not attach RapidMX-Key when the sending mailbox has no keys.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+
+            const result = await sendDraft(mailbox, draftsFolder);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).not.toContain("RapidMX-Key");
+        });
+
+        it("Does not attach RapidMX-Key for a revoked key.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await mailboxRepo.updateOne(
+                { uid: mailbox.uid },
+                { $set: { keys: [{ ...activeKey, revokedAt: Date.now() - 1000 }] } },
+            );
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+
+            const result = await sendDraft(mailbox, draftsFolder);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).not.toContain("RapidMX-Key");
+        });
+
+        it("Does not attach RapidMX-Key for an expired key.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await mailboxRepo.updateOne(
+                { uid: mailbox.uid },
+                { $set: { keys: [{ ...activeKey, notAfter: Date.now() - 1000 }] } },
+            );
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+
+            const result = await sendDraft(mailbox, draftsFolder);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).not.toContain("RapidMX-Key");
+        });
+
+        it("Only announces a 'sign' key's absence - a signing key alone never yields a RapidMX-Key header.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await mailboxRepo.updateOne(
+                { uid: mailbox.uid },
+                { $set: { keys: [{ ...activeKey, useType: "sign" }] } },
+            );
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+
+            const result = await sendDraft(mailbox, draftsFolder);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).not.toContain("RapidMX-Key");
         });
     });
 });

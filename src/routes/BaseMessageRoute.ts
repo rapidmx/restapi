@@ -24,6 +24,7 @@ import { classifyRecipientTier, createFederatedPeerCheck } from "../util/DomainU
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { prependHeaders } from "../util/MimeHeaderUtils.js";
+import { buildRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification } from "../util/ReceiptUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
@@ -36,6 +37,7 @@ import {
     MessageClassification,
     MessageFlags,
     MessageReceiptEntry,
+    PublicKey,
     Recipient,
 } from "../models/types.js";
 const { Config, Inject } = ObjectDecorators;
@@ -357,6 +359,26 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         }
         if (attachesReceiptRequest) {
             raw = prependHeaders(raw, [{ name: "Disposition-Notification-To", value: message.from.address }]);
+        }
+
+        // Announces the sending mailbox's current encryption key (C2) to the recipient, mirroring the
+        // Disposition-Notification-To attachment above - the Autocrypt-style opportunistic-discovery half of
+        // the protocol (E3 is the inbound counterpart). Only the active (non-revoked, non-expired) "encrypt"
+        // key is ever announced - a revoked/expired one would be actively harmful advice to a recipient.
+        const activeEncryptKey: PublicKey | undefined = sendingMailbox?.keys.find(
+            (k) => k.useType === "encrypt" && !k.revokedAt && k.notAfter > Date.now(),
+        );
+        if (activeEncryptKey) {
+            raw = prependHeaders(raw, [
+                {
+                    name: "RapidMX-Key",
+                    value: buildRapidMxKeyHeader(
+                        message.from.address,
+                        sendingMailbox!.encryptPreference.preferEncrypt,
+                        activeEncryptKey,
+                    ),
+                },
+            ]);
         }
 
         const {

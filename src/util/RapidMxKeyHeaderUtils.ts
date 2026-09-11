@@ -55,6 +55,16 @@ function parseAttributes(value: string): Record<string, string> | undefined {
  * called separately by this function's own caller (`ScanQueueJob`), since DKIM verification needs the
  * message's `Authentication-Results` header(s), not anything this header itself carries.
  */
+/**
+ * Builds the outbound `RapidMX-Key` header value announcing `address`'s current encryption key, for
+ * `BaseMessageRoute.send()` to attach alongside `Disposition-Notification-To` - the inverse of
+ * `parseRapidMxKeyHeader()`, emitting only the four attributes that function understands (never a signing
+ * key - per the spec, this header never carries one).
+ */
+export function buildRapidMxKeyHeader(address: string, preferEncrypt: "mutual" | "nopreference", key: PublicKey): string {
+    return `addr=${address}; prefer-encrypt=${preferEncrypt}; type=${key.type}; keydata=${key.publicKey}`;
+}
+
 export function parseRapidMxKeyHeader(headerValues: string[], fromAddress: string): ParsedRapidMxKeyHeader | undefined {
     if (headerValues.length !== 1) {
         return undefined;
