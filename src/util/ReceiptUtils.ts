@@ -48,6 +48,19 @@ export interface ParsedDispositionNotification {
      * signals rather than being silently dropped. `undefined` if the part carries no `Disposition` line at
      * all (not a real MDN, or too malformed to trust). */
     dispositionType?: "read" | "delivery";
+
+    /** The reporting peer's current encryption-key fingerprint, carried as an RFC 8098 extension field per
+     * `specs/end-to-end_encryption.md`'s "Rotation Notification" section (Group E5). **A cache-invalidation
+     * hint only** - the spec is explicit that a receiving peer MUST re-run real Discovery
+     * (`util/KeyringUtils.ts`'s `discoverAndMergeKeys()`) rather than install this value directly, since an
+     * MDN is only hop-authenticated and a forged one could otherwise force a key change. `undefined` if the
+     * part carries no such extension field. */
+    rotatedKeyFingerprint?: string;
+
+    /** The reporting peer's domain federation policy `id` (`util/FederationUtils.ts`'s cache token), carried
+     * alongside `rotatedKeyFingerprint` for the same reason and given the same cache-invalidation-hint-only
+     * treatment. `undefined` if the part carries no such extension field. */
+    policyId?: string;
 }
 
 /**
@@ -96,7 +109,10 @@ export function parseDispositionNotification(raw: string): ParsedDispositionNoti
             : "delivery"
         : undefined;
 
-    return { originalMessageId, finalRecipient, dispositionType };
+    const rotatedKeyFingerprint: string | undefined = extractHeader(buffer, "X-RapidMX-Key-Fingerprint");
+    const policyId: string | undefined = extractHeader(buffer, "X-RapidMX-Policy-Id");
+
+    return { originalMessageId, finalRecipient, dispositionType, rotatedKeyFingerprint, policyId };
 }
 
 /** The parameters `buildDispositionNotification()` needs to compose one MDN. */
@@ -114,6 +130,17 @@ export interface DispositionNotificationParams {
      * library reuses its own `mail:dns:mx_hostname` config (already used by `BaseDomainRoute`) as the
      * hostname half. */
     reportingUa: string;
+    /** This MDN's own sender's current encryption-key fingerprint, attached as an RFC 8098 extension field
+     * per `specs/end-to-end_encryption.md`'s "Rotation Notification" section (Group E5) - omitted entirely
+     * when the sending mailbox has no active encrypt key (see `ScanQueueJob.sendDispositionNotification()`).
+     * Optional because the underlying spec section is itself a "MAY". */
+    rotatedKeyFingerprint?: string;
+    /** This MDN's own sender's domain federation policy `id` (`util/FederationUtils.ts`'s cache token),
+     * attached alongside `rotatedKeyFingerprint` for the same reason. Not currently populated by this
+     * codebase's own MDN-sending path - nothing here tracks this deployment's own outbound `_rapidmx` TXT
+     * record's `id` value, which is DNS-admin-managed state this app doesn't own (the same category as
+     * `Domain.dkimSelector`) - but accepted and emitted when a future caller does have one. */
+    policyId?: string;
 }
 
 /**
@@ -143,7 +170,9 @@ export function buildDispositionNotification(params: DispositionNotificationPara
         `Reporting-UA: ${params.reportingUa}\r\n` +
             `Final-Recipient: rfc822;${params.finalRecipient}\r\n` +
             `Original-Message-ID: <${messageId}>\r\n` +
-            `Disposition: ${disposition}\r\n`,
+            `Disposition: ${disposition}\r\n` +
+            (params.rotatedKeyFingerprint ? `X-RapidMX-Key-Fingerprint: ${params.rotatedKeyFingerprint}\r\n` : "") +
+            (params.policyId ? `X-RapidMX-Policy-Id: ${params.policyId}\r\n` : ""),
     );
 
     return new Promise<Buffer>((resolve, reject) => {

@@ -2231,5 +2231,185 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             expect(message.deliveryReceiptPending).toBe(false);
             spy.mockRestore();
         });
+
+        it("Attaches the X-RapidMX-Key-Fingerprint extension field on an outgoing MDN when the sending mailbox has an active encrypt key (Group E5).", async () => {
+            await createMailbox({
+                keys: [
+                    {
+                        publicKey: "b64",
+                        type: "x509",
+                        useType: "encrypt",
+                        fingerprint: "own-fp",
+                        notBefore: Date.now() - 1000,
+                        notAfter: Date.now() + 1_000_000,
+                    },
+                ],
+            });
+            await verifiedDomain();
+
+            await deliverRequestingReceipt("sender@example.com", "colleague@example.com");
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).toContain("X-RapidMX-Key-Fingerprint: own-fp");
+        });
+
+        it("Omits the X-RapidMX-Key-Fingerprint extension field when the sending mailbox has no active encrypt key.", async () => {
+            await createMailbox();
+            await verifiedDomain();
+
+            await deliverRequestingReceipt("sender@example.com", "colleague@example.com");
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).not.toContain("X-RapidMX-Key-Fingerprint");
+        });
+    });
+
+    describe("Rotation Notification (Group E5)", () => {
+        let mockFetch: ReturnType<typeof vi.fn>;
+
+        beforeEach(() => {
+            mockFetch = vi.fn();
+            vi.stubGlobal("fetch", mockFetch);
+        });
+
+        function makeDiscoveryResponse(fingerprint: string) {
+            return {
+                encryptPreference: { preferEncrypt: "mutual", lastSeen: 100 },
+                keys: [
+                    { publicKey: "b64", type: "x509", useType: "encrypt", fingerprint, notBefore: 0, notAfter: Date.now() + 1_000_000 },
+                ],
+                escrow: false,
+            };
+        }
+
+        it("Re-runs real Discovery (never trusting the MDN's own claimed fingerprint) when X-RapidMX-Key-Fingerprint is present.", async () => {
+            await createMailbox();
+            const dnsResolver = objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!;
+            dnsResolver.records.set("_rapidmx.rotated-peer-sql.example", [
+                ["v=RMXv1; id=1; host=mail.rotated-peer-sql.example;"],
+            ]);
+            mockFetch.mockResolvedValue({
+                ok: true,
+                status: 200,
+                json: vi.fn().mockResolvedValue(makeDiscoveryResponse("real-fp-from-discovery")),
+                headers: { get: () => null },
+            });
+
+            const mdn: Buffer = await buildDispositionNotification({
+                from: { address: "bob@rotated-peer-sql.example" },
+                to: "recipient@example.com",
+                subject: "Read: Hello",
+                finalRecipient: "bob@rotated-peer-sql.example",
+                originalMessageId: "no-such-message@example.com",
+                dispositionType: "read",
+                reportingUa: "mail.example.com; RapidMX",
+                rotatedKeyFingerprint: "claimed-fp-not-to-be-trusted",
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, mdn);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "bob@rotated-peer-sql.example" });
+
+            await job.run();
+
+            expect(mockFetch).toHaveBeenCalled();
+            const contacts = await contactRepo.find({ where: { mailboxUid } });
+            expect(contacts).toHaveLength(1);
+            expect(contacts[0].keys).toHaveLength(1);
+            expect(contacts[0].keys![0].fingerprint).toBe("real-fp-from-discovery");
+        });
+
+        it("Also triggers the re-lookup when only X-RapidMX-Policy-Id (not the fingerprint field) is present.", async () => {
+            await createMailbox();
+            const dnsResolver = objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!;
+            dnsResolver.records.set("_rapidmx.rotated-peer-sql-2.example", [
+                ["v=RMXv1; id=1; host=mail.rotated-peer-sql-2.example;"],
+            ]);
+            mockFetch.mockResolvedValue({
+                ok: true,
+                status: 200,
+                json: vi.fn().mockResolvedValue(makeDiscoveryResponse("real-fp-2")),
+                headers: { get: () => null },
+            });
+
+            const mdn: Buffer = await buildDispositionNotification({
+                from: { address: "bob@rotated-peer-sql-2.example" },
+                to: "recipient@example.com",
+                subject: "Read: Hello",
+                finalRecipient: "bob@rotated-peer-sql-2.example",
+                originalMessageId: "no-such-message@example.com",
+                dispositionType: "read",
+                reportingUa: "mail.example.com; RapidMX",
+                policyId: "1",
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, mdn);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "bob@rotated-peer-sql-2.example" });
+
+            await job.run();
+
+            expect(mockFetch).toHaveBeenCalled();
+        });
+
+        it("Does not call fetch at all when the MDN carries neither extension field.", async () => {
+            await createMailbox();
+
+            const mdn: Buffer = await buildDispositionNotification({
+                from: { address: "bob@example.com" },
+                to: "recipient@example.com",
+                subject: "Read: Hello",
+                finalRecipient: "bob@example.com",
+                originalMessageId: "no-such-message@example.com",
+                dispositionType: "read",
+                reportingUa: "mail.example.com; RapidMX",
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, mdn);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "bob@example.com" });
+
+            await job.run();
+
+            expect(mockFetch).not.toHaveBeenCalled();
+        });
+
+        it("Anti-Downgrade: leaves an existing pinned key untouched (and never calls fetch) when the peer's domain isn't a federated peer at all.", async () => {
+            await createMailbox();
+            await contactRepo.save(
+                new ContactSQL({
+                    mailboxUid,
+                    folderUid: uuid.v4(),
+                    displayName: "Bob",
+                    emails: [{ address: "bob@not-federated-sql.example", type: ContactAddressKind.OTHER }],
+                    phones: [],
+                    addresses: [],
+                    keys: [
+                        { publicKey: "b64", type: "x509", useType: "encrypt", fingerprint: "pinned-fp", notBefore: 0, notAfter: Date.now() + 1_000_000 },
+                    ],
+                }),
+            );
+
+            const mdn: Buffer = await buildDispositionNotification({
+                from: { address: "bob@not-federated-sql.example" },
+                to: "recipient@example.com",
+                subject: "Read: Hello",
+                finalRecipient: "bob@not-federated-sql.example",
+                originalMessageId: "no-such-message@example.com",
+                dispositionType: "read",
+                reportingUa: "mail.example.com; RapidMX",
+                rotatedKeyFingerprint: "claimed-fp",
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, mdn);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "bob@not-federated-sql.example" });
+
+            await job.run();
+
+            expect(mockFetch).not.toHaveBeenCalled();
+            const contacts = await contactRepo.find({ where: { mailboxUid } });
+            expect(contacts[0].keys![0].fingerprint).toBe("pinned-fp");
+        });
     });
 });

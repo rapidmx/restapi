@@ -17,7 +17,7 @@ import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { buildEventIcs, expandOccurrences, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
-import { applyDiscoveredKeys, ContactKeyState } from "../util/KeyringUtils.js";
+import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
 import { extractHeaders } from "../util/MimeHeaderUtils.js";
 import { resolveActiveOof } from "../util/OofUtils.js";
@@ -49,6 +49,7 @@ import {
     MessageImportance,
     MessageReceiptEntry,
     OofReplySuppression,
+    PublicKey,
     QuarantineEntry,
     QuarantineReason,
     RecipientType,
@@ -632,7 +633,23 @@ export abstract class ScanQueueJob<
 
         const now: number = Date.now();
         const update: ContactKeyState = applyDiscoveredKeys(existingContact, discovered, now, "header");
+        await this.persistContactKeyUpdate(entry.mailboxUid, fromAddress, existingContact, update, now);
+    }
 
+    /**
+     * Shared persistence tail for both `processInboundRapidMxKeyHeader()` (Group E3) and
+     * `maybeRefreshRotatedKey()` (Group E5): stamps `update` (and `lastMessageSeen`) onto `existingContact` if
+     * one was found, or creates a brand-new `Contact` in the mailbox's Contacts folder otherwise. Callers are
+     * responsible for deciding whether creating a new `Contact` is warranted at all (see each caller's own
+     * doc comment) - by the time this runs, that decision has already been made.
+     */
+    private async persistContactKeyUpdate(
+        mailboxUid: string,
+        address: string,
+        existingContact: C | undefined,
+        update: ContactKeyState,
+        now: number,
+    ): Promise<void> {
         if (existingContact) {
             await this.contactRepo!.update(
                 { uid: existingContact.uid, version: (existingContact as any).version, ...update, lastMessageSeen: now } as any,
@@ -642,13 +659,13 @@ export abstract class ScanQueueJob<
             return;
         }
 
-        const folder: F = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, entry.mailboxUid, FolderType.CONTACTS);
+        const folder: F = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, mailboxUid, FolderType.CONTACTS);
         await this.contactRepo!.create(
             new this.contactClass({
-                mailboxUid: entry.mailboxUid,
+                mailboxUid,
                 folderUid: folder.uid,
-                displayName: fromAddress,
-                emails: [{ address: fromAddress, type: ContactAddressKind.OTHER }],
+                displayName: address,
+                emails: [{ address, type: ContactAddressKind.OTHER }],
                 phones: [],
                 addresses: [],
                 ...update,
@@ -656,6 +673,38 @@ export abstract class ScanQueueJob<
             }),
             { ignoreACL: true },
         );
+    }
+
+    /**
+     * Implements the receiving half of `specs/end-to-end_encryption.md`'s "Rotation Notification" mechanism
+     * (Group E5): when an inbound MDN carries either of `util/ReceiptUtils.ts`'s `rotatedKeyFingerprint`/
+     * `policyId` extension fields, this method re-runs real Discovery (`util/KeyringUtils.ts`'s
+     * `discoverAndMergeKeys()`) against the authoritative endpoint for `peerAddress` - it never installs the
+     * MDN's own claimed fingerprint directly, exactly per the spec's "cache invalidation hint only" rule: an
+     * MDN is only hop-authenticated at best, so trusting its claimed value directly would let a forged MDN
+     * force a key change. Called from `processReceipt()` only after that method has already confirmed
+     * `peerAddress` (the MDN's `Final-Recipient`) matches this inbound message's own authenticated envelope
+     * sender - the same forgery guard Group E3's header processing doesn't need (a `RapidMX-Key` header is
+     * gated on DKIM instead), but this path does, since an MDN extension field carries no DKIM-oversigning
+     * requirement of its own.
+     *
+     * A `discoverAndMergeKeys()` result of `undefined` (peer isn't a federated domain, or nothing found) is a
+     * no-op here too, same as Group E3 - this is purely a hint to look again, never a reason to create or
+     * change a `Contact` on its own.
+     */
+    private async maybeRefreshRotatedKey(mailboxUid: string, peerAddress: string): Promise<void> {
+        const existingMatches: C[] = await this.contactRepo!.find(
+            { mailboxUid, ...this.contactEmailQuery(peerAddress) },
+            { ignoreACL: true, limit: 1 },
+        );
+        const existingContact: C | undefined = existingMatches[0];
+
+        const now: number = Date.now();
+        const update: ContactKeyState | undefined = await discoverAndMergeKeys(this.dnsResolver!, peerAddress, existingContact, now);
+        if (!update) {
+            return;
+        }
+        await this.persistContactKeyUpdate(mailboxUid, peerAddress, existingContact, update, now);
     }
 
     /**
@@ -998,6 +1047,11 @@ export abstract class ScanQueueJob<
         dispositionType: "read" | "delivery",
     ): Promise<boolean> {
         try {
+            // Rotation Notification (Group E5) - mirrors E4's "announce my own active encrypt key" logic
+            // exactly, just riding on the MDN instead of the original outbound message.
+            const activeEncryptKey: PublicKey | undefined = mailbox.keys.find(
+                (k) => k.useType === "encrypt" && !k.revokedAt && k.notAfter > Date.now(),
+            );
             const composed: Buffer = await buildDispositionNotification({
                 from: { address: mailbox.primarySmtpAddress, displayName: mailbox.displayName },
                 to: dispositionNotificationTo,
@@ -1006,6 +1060,7 @@ export abstract class ScanQueueJob<
                 originalMessageId,
                 dispositionType,
                 reportingUa: `${this.mxHostname}; RapidMX`,
+                rotatedKeyFingerprint: activeEncryptKey?.fingerprint,
             });
             await this.mailTransport!.send({
                 raw: composed,
@@ -1054,6 +1109,12 @@ export abstract class ScanQueueJob<
                     `does not match its own envelope sender - possible forgery attempt.`,
             );
             return;
+        }
+
+        // Rotation Notification (Group E5) - a cache-invalidation hint only, independent of whether this MDN
+        // also correlates to a message this mailbox can find below.
+        if (parsed.rotatedKeyFingerprint || parsed.policyId) {
+            await this.maybeRefreshRotatedKey(entry.mailboxUid, parsed.finalRecipient);
         }
 
         const matches: M[] = await this.messageRepo!.find(

@@ -65,6 +65,32 @@ describe("buildDispositionNotification() / parseDispositionNotification() round-
         const raw = await buildDispositionNotification({ ...baseParams, from: { address: "bob@example.com" } });
         expect(raw.toString()).toContain("From: bob@example.com");
     });
+
+    it("Round-trips the Rotation Notification (E5) extension fields when both are set.", async () => {
+        const part = await buildAndExtractPart({ ...baseParams, rotatedKeyFingerprint: "aabbcc", policyId: "1" });
+        const result = parseDispositionNotification(part);
+
+        expect(result?.rotatedKeyFingerprint).toBe("aabbcc");
+        expect(result?.policyId).toBe("1");
+    });
+
+    it("Omits both Rotation Notification extension fields when neither is set.", async () => {
+        const part = await buildAndExtractPart(baseParams);
+        const result = parseDispositionNotification(part);
+
+        expect(result?.rotatedKeyFingerprint).toBeUndefined();
+        expect(result?.policyId).toBeUndefined();
+        expect(part).not.toContain("X-RapidMX-Key-Fingerprint");
+        expect(part).not.toContain("X-RapidMX-Policy-Id");
+    });
+
+    it("Emits only the fingerprint extension field when policyId is unset.", async () => {
+        const part = await buildAndExtractPart({ ...baseParams, rotatedKeyFingerprint: "aabbcc" });
+        const result = parseDispositionNotification(part);
+
+        expect(result?.rotatedKeyFingerprint).toBe("aabbcc");
+        expect(result?.policyId).toBeUndefined();
+    });
 });
 
 describe("parseDispositionNotification() Tests", () => {
@@ -117,5 +143,21 @@ describe("parseDispositionNotification() Tests", () => {
             "Original-Message-ID: <abc123@example.com>\r\nFinal-Recipient: bob@example.com\r\n",
         );
         expect(result?.finalRecipient).toBe("bob@example.com");
+    });
+
+    it("Parses the X-RapidMX-Key-Fingerprint/X-RapidMX-Policy-Id extension fields when present.", () => {
+        const result = parseDispositionNotification(
+            "Original-Message-ID: <abc123@example.com>\r\n" +
+                "X-RapidMX-Key-Fingerprint: aabbccdd\r\n" +
+                "X-RapidMX-Policy-Id: 42\r\n",
+        );
+        expect(result?.rotatedKeyFingerprint).toBe("aabbccdd");
+        expect(result?.policyId).toBe("42");
+    });
+
+    it("Leaves rotatedKeyFingerprint/policyId undefined when neither extension field is present.", () => {
+        const result = parseDispositionNotification("Original-Message-ID: <abc123@example.com>\r\n");
+        expect(result?.rotatedKeyFingerprint).toBeUndefined();
+        expect(result?.policyId).toBeUndefined();
     });
 });
