@@ -229,6 +229,39 @@ describe("MeetingSchedulingJobSQL Tests (real DB + DI)", () => {
         expect(updated!.cancelNoticeSentAt).toBeTruthy();
     });
 
+    it("Never composes/sends a plaintext iTIP REQUEST for an event the organizer chose to encrypt (encryptionOrigin: 'originated') - that's the client's own responsibility - but still marks inviteSequenceSent so this job stops re-visiting it.", async () => {
+        const event = await createEvent({ encryptionOrigin: "originated" });
+
+        await job.run();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(0);
+
+        const updated = await calendarEventRepo.findOne({ where: { uid: event.uid } });
+        expect(updated!.inviteSequenceSent).toBe(event.sequence);
+    });
+
+    it("Never composes/sends a plaintext iTIP CANCEL for an encryptionOrigin: 'originated' event either, but still marks cancelNoticeSentAt.", async () => {
+        const event = await createEvent({ status: CalendarEventStatus.CANCELLED, encryptionOrigin: "originated" });
+
+        await job.run();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(0);
+
+        const updated = await calendarEventRepo.findOne({ where: { uid: event.uid } });
+        expect(updated!.cancelNoticeSentAt).toBeTruthy();
+    });
+
+    it("Still sends a plaintext invite normally for encryptionOrigin: 'derived' (an inbound-received provenance flag, not an outbound-encrypt instruction).", async () => {
+        await createEvent({ encryptionOrigin: "derived" });
+
+        await job.run();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(1);
+    });
+
     it("Sends an iTIP CANCEL for a soft-deleted event too, without needing status: CANCELLED.", async () => {
         const event = await createEvent({ inviteSequenceSent: 0 });
         await calendarEventRepo.update({ uid: event.uid }, { deleted: true });

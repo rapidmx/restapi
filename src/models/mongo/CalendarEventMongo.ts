@@ -15,6 +15,7 @@ import {
     BusyStatus,
     CalendarEvent,
     CalendarEventStatus,
+    EncryptionOrigin,
     Recipient,
     RecipientType,
     RecurrenceRule,
@@ -149,8 +150,8 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
     public cancelNoticeSentAt?: Date;
 
     @Column()
-    @Description("A provenance flag: true when this event derives from an encrypted message/invitation.")
-    public encrypted: boolean = false;
+    @Description("Provenance for this event's encryption state - see EncryptionOrigin's own doc comment.")
+    public encryptionOrigin: EncryptionOrigin = "none";
 
     constructor(other?: Partial<CalendarEventMongo>) {
         super(other);
@@ -180,7 +181,7 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
             this.autoReplyMessage = "autoReplyMessage" in other ? other.autoReplyMessage : this.autoReplyMessage;
             this.inviteSequenceSent = "inviteSequenceSent" in other ? other.inviteSequenceSent : this.inviteSequenceSent;
             this.cancelNoticeSentAt = "cancelNoticeSentAt" in other ? other.cancelNoticeSentAt : this.cancelNoticeSentAt;
-            this.encrypted = other.encrypted !== undefined ? other.encrypted : this.encrypted;
+            this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
         }
     }
 }

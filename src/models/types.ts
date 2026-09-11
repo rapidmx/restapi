@@ -1350,19 +1350,40 @@ export interface CalendarEvent extends RecoverableBaseEntity {
      * CANCELLED` or by deleting the event) - prevents resending on every poll. */
     cancelNoticeSentAt?: Date;
 
-    /** A provenance flag: `true` when this event derives from (or was explicitly created as) an encrypted
-     * message/invitation, per `specs/end-to-end_encryption.md`'s "Derived Entities" section. This is
-     * currently the *only* part of that section implemented here - actual field-level encryption of
-     * `title`/`location`/attachments (leaving `startDate`/`endDate`/`attendees`/RSVP status plaintext, per
-     * the spec) requires the client-side E2E composition/decryption work this repo defers, since today
-     * `ScanQueueJob`'s iTIP pipeline only ever reads a `text/calendar` part that's already plaintext-visible
-     * to the server - a genuinely S/MIME-encrypted invitation has no such separately-visible part at all
-     * (see `util/SmimeUtils.ts`), so this flag is set defensively (never false-negative) rather than
-     * something the current pipeline exercises in the common case. **Sticky**: once `true`, an update,
-     * cancellation, or any instance of a recurring series MUST preserve it rather than recomputing it from
-     * whatever triggered that particular mutation - see `ScanQueueJob.processItipRequest()`. */
-    encrypted: boolean;
+    /**
+     * Provenance for this event's encryption state, per `specs/search.md` §3 "Provenance" (refining
+     * `specs/end-to-end_encryption.md`'s "Derived Entities" section, which this field originally implemented
+     * as a plain boolean). `"derived"` and `"originated"` MUST stay distinguishable so a client can explain
+     * *why* an event is encrypted ("received encrypted from bob@orgb.com" vs. "you chose to encrypt this") -
+     * see `EncryptionOrigin`'s own doc comment. Only `ScanQueueJob`'s inbound iTIP pipeline sets `"derived"`
+     * today (an ordinary client `POST`/`PUT` could set `"originated"` itself - ordinary CRUD, not specially
+     * protected, since this field gates indexing behavior only, not access; a client that lies about it only
+     * under-indexes its own event, not anyone else's data).
+     *
+     * Actual field-level encryption of `title`/`location`/attachments (leaving `startDate`/`endDate`/
+     * `attendees`/RSVP status plaintext, per the spec's "Field Split") requires the client-side E2E
+     * composition/decryption work this repo defers - today `ScanQueueJob`'s iTIP pipeline only ever reads a
+     * `text/calendar` part that's already plaintext-visible to the server, so `"derived"` is set defensively
+     * (never false-negative) rather than something the current pipeline exercises in the common case.
+     * **Sticky**: once set to anything but `"none"`, an update, cancellation, or any instance of a recurring
+     * series MUST preserve it rather than recomputing it from whatever triggered that particular mutation -
+     * see `ScanQueueJob.processItipRequest()`.
+     */
+    encryptionOrigin: EncryptionOrigin;
 }
+
+/**
+ * Governs behaviour on edit/update/duplication for an encrypted derived or originated entity - not a security
+ * control (ciphertext is self-evident to the server either way), but the UI needs it to explain *why* an item
+ * is encrypted. See `specs/search.md` §3 "Provenance".
+ */
+export type EncryptionOrigin =
+    /** Not encrypted. */
+    | "none"
+    /** Materialised from an encrypted message received from a federated peer or external sender. */
+    | "derived"
+    /** Encrypted by explicit choice of this user. */
+    | "originated";
 
 /**
  * Supports anonymous, unauthenticated external access to a `CalendarEvent` folder's free/busy information (or

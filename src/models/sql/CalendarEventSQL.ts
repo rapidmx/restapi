@@ -15,6 +15,7 @@ import {
     BusyStatus,
     CalendarEvent,
     CalendarEventStatus,
+    EncryptionOrigin,
     Recipient,
     RecipientType,
     RecurrenceRule,
@@ -155,10 +156,12 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
     // `nullable: true`: added after the table already existed in deployed installations, and this framework's
     // `@Column` decorator has no SQL-level `DEFAULT` option (see `ColumnOptions`) - without `nullable: true`,
     // `synchronize: true`'s `ALTER TABLE ... ADD COLUMN ... NOT NULL` fails outright against a populated table
-    // on Postgres/MySQL. A legacy row's `NULL` reads back as falsy, same as this flag's intended default.
-    @Column({ nullable: true })
-    @Description("A provenance flag: true when this event derives from an encrypted message/invitation.")
-    public encrypted: boolean = false;
+    // on Postgres/MySQL. A legacy row's `NULL` is coalesced to `"none"` by the constructor below, same as this
+    // field's intended default. `type: "varchar"` is required for the same reason as `status` above (see its
+    // own note) - a string-literal-union column TypeORM can't infer a type for on its own.
+    @Column({ type: "varchar", nullable: true })
+    @Description("Provenance for this event's encryption state - see EncryptionOrigin's own doc comment.")
+    public encryptionOrigin: EncryptionOrigin = "none";
 
     constructor(other?: Partial<CalendarEventSQL>) {
         super(other);
@@ -188,7 +191,7 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
             this.autoReplyMessage = "autoReplyMessage" in other ? other.autoReplyMessage : this.autoReplyMessage;
             this.inviteSequenceSent = "inviteSequenceSent" in other ? other.inviteSequenceSent : this.inviteSequenceSent;
             this.cancelNoticeSentAt = "cancelNoticeSentAt" in other ? other.cancelNoticeSentAt : this.cancelNoticeSentAt;
-            this.encrypted = other.encrypted !== undefined ? other.encrypted : this.encrypted;
+            this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
         }
     }
 }

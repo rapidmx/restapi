@@ -118,6 +118,21 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                     continue;
                 }
 
+                // An event the organizer explicitly chose to send encrypted is entirely the client's own
+                // responsibility to compose and send (see this repo's server-side scope boundary - real
+                // sign/encrypt only ever happens client-side) - this job never composes a plaintext iTIP
+                // REQUEST for it. Still stamps `inviteSequenceSent` so this job doesn't keep re-fetching an
+                // event it will never actually send, the same "skip the send, still mark handled" shape
+                // `isRedundantOccurrenceCancel` below already uses for a different reason.
+                if (event.encryptionOrigin === "originated") {
+                    await this.calendarEventRepo!.update(
+                        { uid: event.uid, version: (event as any).version, inviteSequenceSent: event.sequence } as any,
+                        event,
+                        { ignoreACL: true },
+                    );
+                    continue;
+                }
+
                 const ics = buildEventIcs(event, "REQUEST");
                 for (const attendee of event.attendees) {
                     if (attendee.address.toLowerCase() === event.organizer.address.toLowerCase()) {
@@ -168,7 +183,10 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
         for (const event of cancelling) {
             try {
                 const isRedundantOccurrenceCancel = !!event.recurrenceId && cancellingMasterIcalUids.has(event.icalUid);
-                if (!isRedundantOccurrenceCancel) {
+                // Same "client's own responsibility" reasoning as `sendInvites()` above - an encrypted
+                // event's CANCEL is never composed/sent by this job either.
+                const isClientManagedEncrypted = event.encryptionOrigin === "originated";
+                if (!isRedundantOccurrenceCancel && !isClientManagedEncrypted) {
                     const ics = buildEventIcs(event, "CANCEL");
                     for (const attendee of event.attendees) {
                         if (attendee.address.toLowerCase() === event.organizer.address.toLowerCase()) {

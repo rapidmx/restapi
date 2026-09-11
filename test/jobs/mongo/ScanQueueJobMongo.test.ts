@@ -1216,12 +1216,12 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             expect(events.length).toBe(1);
             expect(events[0].title).toBe("Team Sync");
             expect(events[0].attendees[0].responseStatus).toBe(AttendeeResponseStatus.NEEDS_ACTION);
-            expect(events[0].encrypted).toBe(false);
+            expect(events[0].encryptionOrigin).toBe("none");
             const calendarFolder = await folderRepo.findOne({ mailboxUid, type: FolderType.CALENDAR } as any);
             expect(events[0].folderUid).toBe(calendarFolder!.uid);
         });
 
-        it("Preserves encrypted: true on an existing event when a later resent REQUEST updates it - encryption state is sticky, never recomputed from the current message.", async () => {
+        it("Preserves encryptionOrigin: 'derived' on an existing event when a later resent REQUEST updates it - encryption state is sticky, never recomputed from the current message.", async () => {
             const icalUid = uuid.v4();
             const folder = await folderRepo.save(
                 new FolderMongo({ mailboxUid, name: "Calendar", type: FolderType.CALENDAR, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
@@ -1237,7 +1237,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                     organizer: { address: "organizer@example.com", type: "to" as any },
                     icalUid,
                     sequence: 0,
-                    encrypted: true,
+                    encryptionOrigin: "derived",
                 }),
             );
 
@@ -1254,7 +1254,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             const events = await calendarEventRepo.find({ mailboxUid, icalUid }).toArray();
             expect(events.length).toBe(1);
             expect(events[0].title).toBe("Team Sync (moved)");
-            expect(events[0].encrypted).toBe(true);
+            expect(events[0].encryptionOrigin).toBe("derived");
         });
 
         it("Updates an existing event in place when a resent REQUEST carries a higher sequence.", async () => {

@@ -35,6 +35,7 @@ import {
     CalendarEventStatus,
     Contact,
     ContactAddressKind,
+    EncryptionOrigin,
     FocusedInboxOverride,
     Folder,
     FolderType,
@@ -1280,9 +1281,12 @@ export abstract class ScanQueueJob<
         return rows.find((row) => recurrenceIdsMatch(row.recurrenceId, recurrenceId));
     }
 
-    /** `encrypted` is only ever consulted on the create branch below - an existing row's own `encrypted`
-     * (set once, from whichever REQUEST first created it) is deliberately never overwritten by a later
-     * update, per the spec's "sticky" encryption-state rule (`CalendarEvent.encrypted`'s own doc comment). */
+    /** `encrypted` is only ever consulted on the create branch below - an existing row's own
+     * `encryptionOrigin` (set once, from whichever REQUEST first created it) is deliberately never
+     * overwritten by a later update, per the spec's "sticky" encryption-state rule
+     * (`CalendarEvent.encryptionOrigin`'s own doc comment). This inbound iTIP pipeline only ever produces
+     * `"derived"` or `"none"` - `"originated"` is set by a client explicitly creating/marking its own
+     * outbound invite as encrypted, a different code path entirely (see `MeetingSchedulingJob`). */
     private async processItipRequest(mailboxUid: string, parsed: ParsedIcsEvent, encrypted: boolean): Promise<void> {
         const existing = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
         if (existing && parsed.sequence <= existing.sequence) {
@@ -1334,7 +1338,7 @@ export abstract class ScanQueueJob<
                     busyStatus: BusyStatus.BUSY,
                     icalUid: parsed.uid,
                     sequence: parsed.sequence,
-                    encrypted,
+                    encryptionOrigin: (encrypted ? "derived" : "none") as EncryptionOrigin,
                 }),
                 { ignoreACL: true },
             );
