@@ -5,3 +5,4 @@
 export * from "./EncryptionCertificateAuthority.js";
 export * from "./NullEncryptionCertificateAuthority.js";
 export * from "./LocalX509CertificateAuthority.js";
+export * from "./OpenBaoPkiCertificateAuthority.js";

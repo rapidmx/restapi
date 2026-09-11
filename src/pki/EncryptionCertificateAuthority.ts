@@ -14,6 +14,12 @@ export interface IssuedCertificate {
     fingerprint: string;
     notBefore: Date;
     notAfter: Date;
+    /** The certificate's serial number (implementation-defined format - e.g. Vault/OpenBao use colon-separated
+     * hex), if the issuing authority has one worth keeping. Optional: a backend with no real CRL/OCSP
+     * responder (`LocalX509CertificateAuthority`) has no use for it, but a backend whose `revoke()` must
+     * identify a certificate by serial number rather than fingerprint (`OpenBaoPkiCertificateAuthority`)
+     * needs its caller to persist this alongside `fingerprint` for that later `revoke()` call to work. */
+    serialNumber?: string;
 }
 
 /**

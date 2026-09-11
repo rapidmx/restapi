@@ -58,6 +58,7 @@ describe("LocalX509CertificateAuthority Tests", () => {
         expect(result.certificate).toContain("BEGIN CERTIFICATE");
         expect(result.fingerprint).toMatch(/^[0-9a-f]{64}$/);
         expect(result.notAfter.getTime()).toBeGreaterThan(result.notBefore.getTime());
+        expect(result.serialNumber).toBeTruthy();
 
         const caCertPem: string = await fs.readFile(path.join(tmpDir, "ca.cert.pem"), "utf-8");
         const caCert = new x509.X509Certificate(caCertPem);
