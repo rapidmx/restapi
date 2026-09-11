@@ -54,6 +54,21 @@ export class BrandingMongo extends BaseMongoEntity implements Branding {
     public logoContentType?: string;
 
     @Column({ nullable: true })
+    @Description("The URL a client should render as the compact nav-header icon, as opposed to the full logo.")
+    @Nullable
+    public iconUrl?: string;
+
+    @Column({ nullable: true })
+    @Description("Internal - set only when iconUrl currently points at an uploaded blob.")
+    @Nullable
+    public iconBlobKey?: string;
+
+    @Column({ nullable: true })
+    @Description("Internal - the content-type to serve the uploaded icon back with.")
+    @Nullable
+    public iconContentType?: string;
+
+    @Column({ nullable: true })
     @Description("The URL a client should render as the stylesheet.")
     @Nullable
     public stylesheetUrl?: string;
@@ -87,6 +102,9 @@ export class BrandingMongo extends BaseMongoEntity implements Branding {
             this.logoUrl = "logoUrl" in other ? other.logoUrl : this.logoUrl;
             this.logoBlobKey = "logoBlobKey" in other ? other.logoBlobKey : this.logoBlobKey;
             this.logoContentType = "logoContentType" in other ? other.logoContentType : this.logoContentType;
+            this.iconUrl = "iconUrl" in other ? other.iconUrl : this.iconUrl;
+            this.iconBlobKey = "iconBlobKey" in other ? other.iconBlobKey : this.iconBlobKey;
+            this.iconContentType = "iconContentType" in other ? other.iconContentType : this.iconContentType;
             this.stylesheetUrl = "stylesheetUrl" in other ? other.stylesheetUrl : this.stylesheetUrl;
             this.stylesheetBlobKey = "stylesheetBlobKey" in other ? other.stylesheetBlobKey : this.stylesheetBlobKey;
             this.stylesheetContentType = "stylesheetContentType" in other ? other.stylesheetContentType : this.stylesheetContentType;

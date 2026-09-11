@@ -289,6 +289,100 @@ describe("Route:BrandingSQL Tests", () => {
         });
     });
 
+    describe("POST/GET/DELETE /branding/icon", () => {
+        const png = Buffer.from("PNG-fake-icon-bytes-header");
+
+        it("Rejects an upload from a non-trusted caller (403).", async () => {
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/icon`)
+                .set("Authorization", "jwt " + userToken)
+                .set("Content-Type", "image/png")
+                .send(png);
+
+            expect(result.status).toBe(403);
+        });
+
+        it("Rejects a non-image content-type (400).", async () => {
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/icon`)
+                .set("Authorization", "jwt " + adminToken)
+                .set("Content-Type", "text/plain")
+                .send(Buffer.from("not an image"));
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Uploads an icon and serves it back with the stored content-type, independently of the logo.", async () => {
+            await request(server.getApplication())
+                .post(`${baseUrl}/logo`)
+                .set("Authorization", "jwt " + adminToken)
+                .set("Content-Type", "image/png")
+                .send(Buffer.from("PNG-fake-image-bytes-logo"));
+
+            const uploadResult = await request(server.getApplication())
+                .post(`${baseUrl}/icon`)
+                .set("Authorization", "jwt " + adminToken)
+                .set("Content-Type", "image/png")
+                .send(png);
+
+            expect(uploadResult.status).toBe(200);
+            expect(uploadResult.body.iconUrl).toContain("/branding/icon");
+            expect(uploadResult.body.logoUrl).toContain("/branding/logo");
+
+            const getResult = await request(server.getApplication()).get(`${baseUrl}/icon`);
+            expect(getResult.status).toBe(200);
+            expect(getResult.headers["content-type"]).toContain("image/png");
+            expect(Buffer.from(getResult.body)).toEqual(png);
+        });
+
+        it("Returns 404 for GET /branding/icon when nothing has been uploaded.", async () => {
+            const result = await request(server.getApplication()).get(`${baseUrl}/icon`);
+            expect(result.status).toBe(404);
+        });
+
+        it("Setting iconUrl directly clears and deletes a previously self-hosted icon blob.", async () => {
+            await request(server.getApplication())
+                .post(`${baseUrl}/icon`)
+                .set("Authorization", "jwt " + adminToken)
+                .set("Content-Type", "image/png")
+                .send(png);
+
+            const result = await request(server.getApplication())
+                .put(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ iconUrl: "https://cdn.example.com/icon.png" });
+
+            expect(result.status).toBe(200);
+            expect(result.body.iconUrl).toBe("https://cdn.example.com/icon.png");
+
+            const iconResult = await request(server.getApplication()).get(`${baseUrl}/icon`);
+            expect(iconResult.status).toBe(404);
+        });
+
+        it("Deletes the icon (trusted role only).", async () => {
+            await request(server.getApplication())
+                .post(`${baseUrl}/icon`)
+                .set("Authorization", "jwt " + adminToken)
+                .set("Content-Type", "image/png")
+                .send(png);
+
+            const forbidden = await request(server.getApplication())
+                .delete(`${baseUrl}/icon`)
+                .set("Authorization", "jwt " + userToken);
+            expect(forbidden.status).toBe(403);
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/icon`)
+                .set("Authorization", "jwt " + adminToken);
+            expect(result.status).toBe(204);
+
+            const getResult = await request(server.getApplication()).get(`${baseUrl}/icon`);
+            expect(getResult.status).toBe(404);
+            const publicResult = await request(server.getApplication()).get(baseUrl);
+            expect(publicResult.body.iconUrl).toBeFalsy();
+        });
+    });
+
     describe("POST/GET/DELETE /branding/stylesheet", () => {
         const css = Buffer.from("body { color: red; }");
 

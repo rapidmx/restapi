@@ -30,6 +30,9 @@ export interface PublicBranding {
     companyName: string;
     title: string;
     logoUrl?: string;
+    /** The compact nav-header icon, independently configurable from `logoUrl`'s full logo/watermark - no
+     * fallback between the two is applied here, consumers decide how to fall back. */
+    iconUrl?: string;
     stylesheetUrl?: string;
     headerHtml?: string;
     footerHtml?: string;
@@ -38,6 +41,57 @@ export interface PublicBranding {
 /** All-empty defaults `GET /branding` returns when nothing has been configured yet - never a `404`, so a
  * client's boot sequence never has to special-case "no branding". */
 const EMPTY_BRANDING: PublicBranding = { companyName: "", title: "" };
+
+/** `?? undefined` on every optional field: an unset optional column comes back as `null` on the SQL backend
+ * but is simply omitted (`undefined`) on Mongo - see the identical note elsewhere in this codebase on
+ * `Mailbox.maxDurationMinutes` et al. Normalized here so `GET /branding`'s response shape is identical
+ * regardless of which backend a deployment runs. Shared by `BaseBrandingRoute.toPublicBranding()` and
+ * `readPublicBranding()` below (the latter for an SSR caller with no route instance of its own). */
+function brandingToPublicDTO(branding: Branding): PublicBranding {
+    return {
+        companyName: branding.companyName,
+        title: branding.title,
+        logoUrl: branding.logoUrl ?? undefined,
+        iconUrl: branding.iconUrl ?? undefined,
+        stylesheetUrl: branding.stylesheetUrl ?? undefined,
+        headerHtml: branding.headerHtml ?? undefined,
+        footerHtml: branding.footerHtml ?? undefined,
+    };
+}
+
+/**
+ * Reads the current deployment-wide branding in-process, without an HTTP round-trip - for a consumer
+ * that isn't itself a `BaseBrandingRoute` (e.g. a downstream server's `wwwRoute`/`AdminConsoleRoute`,
+ * which need `PublicBranding` server-side to render branding on the very first byte of the response, not
+ * just after a client-side fetch resolves). Constructs its own short-lived `RepoUtils` and replicates
+ * `BaseBrandingRoute.get()`'s read-only lookup - deliberately not `findOrCreate()`, since a read-only SSR
+ * caller has no reason to ever create the singleton row.
+ */
+export async function readPublicBranding(objectFactory: ObjectFactory, brandingClass: any): Promise<PublicBranding> {
+    const repo: RepoUtils<Branding> = await objectFactory.newInstance(RepoUtils, {
+        name: brandingClass.name,
+        args: [brandingClass],
+    });
+    const existing = await repo.findOne(BRANDING_UID, { ignoreACL: true });
+    return existing ? brandingToPublicDTO(existing) : EMPTY_BRANDING;
+}
+
+/**
+ * Convenience wrapper around `readPublicBranding()` for a downstream server's own `wwwRoute`/
+ * `AdminConsoleRoute`-style `fetchProps()` overrides: never lets a branding-read failure break the whole
+ * page render - falls back to `EMPTY_BRANDING` instead, the same safe default every other branding
+ * consumer already falls back to.
+ */
+export async function fetchBrandingPropsForSSR(
+    objectFactory: ObjectFactory,
+    brandingClass: any,
+): Promise<{ branding: PublicBranding }> {
+    try {
+        return { branding: await readPublicBranding(objectFactory, brandingClass) };
+    } catch {
+        return { branding: EMPTY_BRANDING };
+    }
+}
 
 function firstHeader(req: HttpRequest, name: string): string | undefined {
     const value: string | string[] | undefined = req.headers[name];
@@ -55,11 +109,11 @@ function firstHeader(req: HttpRequest, name: string): string | undefined {
  * Mixes two patterns this library already has fully worked out: `BaseBookingRoute`'s unauthenticated public
  * reads, and `BaseDomainRoute`'s `@RequiresTrustedRole()` admin writes plus its `recordAuditLog()` usage.
  *
- * `logoUrl`/`stylesheetUrl` each support two independent ways for an admin to set them - see `Branding`'s own
- * doc comment (`models/types.ts`) for the full rationale. Uploading (`POST /branding/logo`/`/stylesheet`)
- * reads the raw request body directly (`req.rawBody`, matching `BaseMailIngestRoute.deliver()`'s own
- * raw-body convention) rather than parsing multipart form data - simpler, and this library has no other use
- * for a multipart parser.
+ * `logoUrl`/`iconUrl`/`stylesheetUrl` each support two independent ways for an admin to set them - see
+ * `Branding`'s own doc comment (`models/types.ts`) for the full rationale. Uploading
+ * (`POST /branding/logo`/`/icon`/`/stylesheet`) reads the raw request body directly (`req.rawBody`,
+ * matching `BaseMailIngestRoute.deliver()`'s own raw-body convention) rather than parsing multipart form
+ * data - simpler, and this library has no other use for a multipart parser.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -135,14 +189,7 @@ export abstract class BaseBrandingRoute<T extends Branding> {
      * is identical regardless of which backend a deployment runs - a real public API contract downstream
      * clients depend on, unlike an internal field where either representation is equally fine. */
     private toPublicBranding(branding: T): PublicBranding {
-        return {
-            companyName: branding.companyName,
-            title: branding.title,
-            logoUrl: branding.logoUrl ?? undefined,
-            stylesheetUrl: branding.stylesheetUrl ?? undefined,
-            headerHtml: branding.headerHtml ?? undefined,
-            footerHtml: branding.footerHtml ?? undefined,
-        };
+        return brandingToPublicDTO(branding);
     }
 
     private assetUrl(path: string): string {
@@ -189,6 +236,8 @@ export abstract class BaseBrandingRoute<T extends Branding> {
         const patch: any = { ...obj };
         delete patch.logoBlobKey;
         delete patch.logoContentType;
+        delete patch.iconBlobKey;
+        delete patch.iconContentType;
         delete patch.stylesheetBlobKey;
         delete patch.stylesheetContentType;
 
@@ -202,6 +251,11 @@ export abstract class BaseBrandingRoute<T extends Branding> {
             await this.deleteBlobIfSet(existing.logoBlobKey);
             patch.logoBlobKey = null;
             patch.logoContentType = null;
+        }
+        if (patch.iconUrl !== undefined && existing.iconBlobKey) {
+            await this.deleteBlobIfSet(existing.iconBlobKey);
+            patch.iconBlobKey = null;
+            patch.iconContentType = null;
         }
         if (patch.stylesheetUrl !== undefined && existing.stylesheetBlobKey) {
             await this.deleteBlobIfSet(existing.stylesheetBlobKey);
@@ -242,6 +296,29 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     }
 
     @RequiresTrustedRole()
+    @Post("/icon")
+    public async uploadIcon(@Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<PublicBranding> {
+        return await this.uploadAsset(req, user, "image/", {
+            urlField: "iconUrl",
+            blobKeyField: "iconBlobKey",
+            contentTypeField: "iconContentType",
+            keyPrefix: "branding/icon",
+            path: "/branding/icon",
+        });
+    }
+
+    @Get("/icon")
+    public async getIcon(@Response res: HttpResponse): Promise<void> {
+        await this.serveAsset(res, "iconBlobKey", "iconContentType");
+    }
+
+    @RequiresTrustedRole()
+    @Delete("/icon")
+    public async deleteIcon(@AuthUser user?: JWTUser): Promise<void> {
+        await this.deleteAsset(user, "iconUrl", "iconBlobKey", "iconContentType", "icon");
+    }
+
+    @RequiresTrustedRole()
     @Post("/stylesheet")
     public async uploadStylesheet(@Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<PublicBranding> {
         return await this.uploadAsset(req, user, "text/css", {
@@ -273,7 +350,13 @@ export abstract class BaseBrandingRoute<T extends Branding> {
         req: HttpRequest,
         user: JWTUser | undefined,
         requiredContentTypePrefix: string,
-        fields: { urlField: "logoUrl" | "stylesheetUrl"; blobKeyField: "logoBlobKey" | "stylesheetBlobKey"; contentTypeField: "logoContentType" | "stylesheetContentType"; keyPrefix: string; path: string },
+        fields: {
+            urlField: "logoUrl" | "iconUrl" | "stylesheetUrl";
+            blobKeyField: "logoBlobKey" | "iconBlobKey" | "stylesheetBlobKey";
+            contentTypeField: "logoContentType" | "iconContentType" | "stylesheetContentType";
+            keyPrefix: string;
+            path: string;
+        },
     ): Promise<PublicBranding> {
         await this.init();
         const contentType: string = firstHeader(req, "content-type") ?? "";
@@ -312,8 +395,8 @@ export abstract class BaseBrandingRoute<T extends Branding> {
 
     private async serveAsset(
         res: HttpResponse,
-        blobKeyField: "logoBlobKey" | "stylesheetBlobKey",
-        contentTypeField: "logoContentType" | "stylesheetContentType",
+        blobKeyField: "logoBlobKey" | "iconBlobKey" | "stylesheetBlobKey",
+        contentTypeField: "logoContentType" | "iconContentType" | "stylesheetContentType",
     ): Promise<void> {
         await this.init();
         const existing: T | undefined = await this.brandingRepo!.findOne(BRANDING_UID, { ignoreACL: true });
@@ -329,9 +412,9 @@ export abstract class BaseBrandingRoute<T extends Branding> {
 
     private async deleteAsset(
         user: JWTUser | undefined,
-        urlField: "logoUrl" | "stylesheetUrl",
-        blobKeyField: "logoBlobKey" | "stylesheetBlobKey",
-        contentTypeField: "logoContentType" | "stylesheetContentType",
+        urlField: "logoUrl" | "iconUrl" | "stylesheetUrl",
+        blobKeyField: "logoBlobKey" | "iconBlobKey" | "stylesheetBlobKey",
+        contentTypeField: "logoContentType" | "iconContentType" | "stylesheetContentType",
         assetName: string,
     ): Promise<void> {
         await this.init();

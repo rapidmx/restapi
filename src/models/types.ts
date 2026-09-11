@@ -939,14 +939,18 @@ export interface Domain extends BaseEntity {
  * granted anything through the ACL system (see the incident documented on `BaseMailboxRoute`); the public
  * `GET /branding` is a route-level decision `BaseBrandingRoute` makes itself, not an ACL grant.
  *
- * `logoUrl`/`stylesheetUrl` each support two independent ways for an admin to set them: a plain external
- * URL (the admin already hosts the asset elsewhere), or an upload through `BaseBrandingRoute`'s own
- * `POST /branding/logo`/`POST /branding/stylesheet`, which stores the file via `BlobStore` and rewrites
- * the URL to this API's own `GET /branding/logo`/`GET /branding/stylesheet`. The `*BlobKey`/`*ContentType`
- * fields are route-managed bookkeeping for the upload case only - never client-settable directly, and
- * never returned by the public `GET /branding` (see `BaseBrandingRoute.toPublicBranding()`) - they exist so
- * the route can tell whether the current `logoUrl`/`stylesheetUrl` is self-hosted (and needs its blob
- * cleaned up if replaced) versus merely an external link with nothing here to serve.
+ * `logoUrl`/`iconUrl`/`stylesheetUrl` each support two independent ways for an admin to set them: a plain
+ * external URL (the admin already hosts the asset elsewhere), or an upload through `BaseBrandingRoute`'s
+ * own `POST /branding/logo`/`POST /branding/icon`/`POST /branding/stylesheet`, which stores the file via
+ * `BlobStore` and rewrites the URL to this API's own `GET /branding/logo`/`GET /branding/icon`/
+ * `GET /branding/stylesheet`. The `*BlobKey`/`*ContentType` fields are route-managed bookkeeping for the
+ * upload case only - never client-settable directly, and never returned by the public `GET /branding` (see
+ * `BaseBrandingRoute.toPublicBranding()`) - they exist so the route can tell whether the current
+ * `logoUrl`/`iconUrl`/`stylesheetUrl` is self-hosted (and needs its blob cleaned up if replaced) versus
+ * merely an external link with nothing here to serve.
+ *
+ * `logoUrl` is the full logo/watermark; `iconUrl` is a separate, independently configurable compact mark
+ * for nav-header use - no fallback between the two is enforced here, consumers decide how to fall back.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -966,6 +970,17 @@ export interface Branding extends BaseEntity {
     /** Internal, route-managed only - the content-type `GET /branding/logo` serves the uploaded logo back
      * with. */
     logoContentType?: string;
+
+    /** The URL a client should render as the compact nav-header icon, as opposed to `logoUrl`'s full
+     * logo/watermark - either an admin-set external URL, or this API's own `/branding/icon` once uploaded. */
+    iconUrl?: string;
+
+    /** Internal, route-managed only - set only when `iconUrl` currently points at an uploaded blob. */
+    iconBlobKey?: string;
+
+    /** Internal, route-managed only - the content-type `GET /branding/icon` serves the uploaded icon back
+     * with. */
+    iconContentType?: string;
 
     stylesheetUrl?: string;
 
