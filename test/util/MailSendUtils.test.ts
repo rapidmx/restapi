@@ -16,6 +16,7 @@ function makeCleanScanResult(overrides: any = {}) {
         attachments: [],
         references: [],
         inReplyTo: undefined,
+        encrypted: false,
         ...overrides,
     };
 }
@@ -148,5 +149,20 @@ describe("scanAndRelay() Tests", () => {
         );
 
         expect(result.conversationId).toBe(result.messageId);
+    });
+
+    it("Passes through the scan result's encrypted flag unchanged.", async () => {
+        scanPipeline.run.mockResolvedValue(makeCleanScanResult({ encrypted: true }));
+
+        const result = await scanAndRelay(
+            makeRawMessage(),
+            "sender@example.com",
+            ["recipient@example.com"],
+            scanPipeline as any,
+            mailTransport,
+            blobStore,
+        );
+
+        expect(result.encrypted).toBe(true);
     });
 });

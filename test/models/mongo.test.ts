@@ -176,6 +176,7 @@ describe("Mongo model default construction", () => {
         expect(obj.inReplyTo).toBeUndefined();
         expect(obj.references).toEqual([]);
         expect(obj.hasAttachments).toBe(false);
+        expect(obj.encrypted).toBe(false);
         expect(obj.scanResultUid).toBeUndefined();
         expect(obj.searchIndexedAt).toBeUndefined();
         expect(obj.requestReceipt).toBeUndefined();
@@ -209,6 +210,7 @@ describe("Mongo model default construction", () => {
             inReplyTo: "<parent@example.com>",
             references: ["<ref1@example.com>"],
             hasAttachments: true,
+            encrypted: true,
             scanResultUid: "scan-1",
             searchIndexedAt,
             inferenceClassification: MessageClassification.OTHER,
@@ -236,6 +238,7 @@ describe("Mongo model default construction", () => {
         expect(obj.inReplyTo).toBe("<parent@example.com>");
         expect(obj.references).toEqual(["<ref1@example.com>"]);
         expect(obj.hasAttachments).toBe(true);
+        expect(obj.encrypted).toBe(true);
         expect(obj.scanResultUid).toBe("scan-1");
         expect(obj.searchIndexedAt).toBe(searchIndexedAt);
         expect(obj.inferenceClassification).toBe(MessageClassification.OTHER);
@@ -266,6 +269,7 @@ describe("Mongo model default construction", () => {
         expect(obj.inReplyTo).toBeUndefined();
         expect(obj.references).toEqual([]);
         expect(obj.hasAttachments).toBe(false);
+        expect(obj.encrypted).toBe(false);
         expect(obj.scanResultUid).toBeUndefined();
         expect(obj.searchIndexedAt).toBeUndefined();
         expect(obj.requestReceipt).toBeUndefined();

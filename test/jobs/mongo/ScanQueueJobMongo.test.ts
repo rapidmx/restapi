@@ -154,6 +154,21 @@ function makeHtmlRawMessage(): Buffer {
     return Buffer.from(raw);
 }
 
+/** An S/MIME EnvelopedData message - the entire body is one opaque application/pkcs7-mime part. */
+function makeEncryptedRawMessage(): Buffer {
+    const raw = [
+        "From: sender@example.com",
+        "To: recipient@example.com",
+        "Subject: Encrypted message",
+        'Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"',
+        "Content-Transfer-Encoding: base64",
+        "",
+        Buffer.from("fake CMS EnvelopedData DER bytes").toString("base64"),
+        "",
+    ].join("\r\n");
+    return Buffer.from(raw);
+}
+
 /** A plain message with no attachments at all. */
 function makePlainRawMessage(extraHeader?: string): Buffer {
     const raw = [
@@ -328,6 +343,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         const messages = await messageRepo.find({ folderUid: inbox!.uid }).toArray();
         expect(messages.length).toBe(1);
         expect(messages[0].hasAttachments).toBe(true);
+        expect(messages[0].encrypted).toBe(false);
         expect(messages[0].scanResultUid).toBeTruthy();
 
         const attachments = await attachmentRepo.find({ messageUid: messages[0].uid }).toArray();
@@ -340,6 +356,20 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
 
         const scanResults = await scanResultRepo.find({ targetUid: messages[0].uid }).toArray();
         expect(scanResults.length).toBe(1);
+    });
+
+    it("Stamps encrypted: true on a delivered S/MIME-encrypted message.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeEncryptedRawMessage());
+        await createIngestEntry({ rawBlobKey });
+
+        await job.run();
+
+        const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
+        const messages = await messageRepo.find({ folderUid: inbox!.uid }).toArray();
+        expect(messages.length).toBe(1);
+        expect(messages[0].encrypted).toBe(true);
     });
 
     it("Sets conversationId to the message's own resolved messageId when it has no References/In-Reply-To (starts a new conversation).", async () => {

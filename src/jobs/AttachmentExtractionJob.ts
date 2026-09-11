@@ -97,8 +97,17 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
     }
 
     private async processAttachment(attachment: A): Promise<void> {
-        const content: Buffer = await this.blobStore!.get(attachment.blobKey);
-        const text: string | undefined = await this.extractorRegistry.extract(attachment.mimeType, content);
+        const message: M | undefined = await this.messageRepo!.findOne(attachment.messageUid, { ignoreACL: true });
+
+        // An attachment belonging to an S/MIME-encrypted message is ciphertext to this server (a real
+        // `EnvelopedData` message has no separately-visible attachment at all - see `util/SmimeUtils.ts`'s
+        // doc comment - but the message could also legitimately have real attachments once decrypted
+        // client-side, which this server must never attempt to read). Skipped exactly like an unsupported
+        // MIME type today: `extractedTextBlobKey` is still stamped (empty) so this attachment is never
+        // re-selected by this job forever, without ever handing ciphertext to `ExtractorRegistry`.
+        const text: string | undefined = message?.encrypted
+            ? undefined
+            : await this.extractorRegistry.extract(attachment.mimeType, await this.blobStore!.get(attachment.blobKey));
 
         const extractedTextBlobKey = `attachment-text/${crypto.randomUUID()}`;
         await this.blobStore!.put(extractedTextBlobKey, Buffer.from(text ?? "", "utf-8"), {
@@ -111,23 +120,18 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
             { ignoreACL: true },
         );
 
-        if (text && text.length > 0) {
-            const message: M | undefined = await this.messageRepo!.findOne(attachment.messageUid, {
-                ignoreACL: true,
-            });
-            if (message?.searchIndexedAt) {
-                // Explicit `null`, not `undefined`: TypeORM's `Repository.update()` silently drops any
-                // property whose value is `undefined` from its generated `SET` clause, so on the SQL backend
-                // an `undefined` here would leave the persisted `searchIndexedAt` completely untouched (still
-                // reporting "already indexed") - a real, confirmed cross-backend bug caught by real-database
-                // testing. MongoDB's own `updateOne($set: ...)` happens to coerce either value to `null`
-                // equivalently, so `null` is correct there too.
-                await this.messageRepo!.update(
-                    { uid: message.uid, version: (message as any).version, searchIndexedAt: null } as any,
-                    message,
-                    { ignoreACL: true, skipPush: true },
-                );
-            }
+        if (text && text.length > 0 && message?.searchIndexedAt) {
+            // Explicit `null`, not `undefined`: TypeORM's `Repository.update()` silently drops any property
+            // whose value is `undefined` from its generated `SET` clause, so on the SQL backend an
+            // `undefined` here would leave the persisted `searchIndexedAt` completely untouched (still
+            // reporting "already indexed") - a real, confirmed cross-backend bug caught by real-database
+            // testing. MongoDB's own `updateOne($set: ...)` happens to coerce either value to `null`
+            // equivalently, so `null` is correct there too.
+            await this.messageRepo!.update(
+                { uid: message.uid, version: (message as any).version, searchIndexedAt: null } as any,
+                message,
+                { ignoreACL: true, skipPush: true },
+            );
         }
     }
 }

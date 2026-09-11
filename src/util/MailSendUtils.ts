@@ -33,6 +33,11 @@ export interface ScanAndRelayResult {
     /** The blob key `scanResult.sanitizedHtml` (if any) was stored under - see the identical reasoning in
      * `ScanQueueJob.processEntry()`'s own doc comment on why this must never be folded into the raw body key. */
     sanitizedHtmlBlobKey?: string;
+
+    /** `true` if the scan pipeline identified this message's body as S/MIME (CMS) encrypted - see
+     * `util/SmimeUtils.ts`'s `isEncryptedBody()`. Threaded through so `BaseMessageRoute.send()` can persist
+     * it onto the sent `Message`, the same signal `ScanQueueJob` stamps for inbound mail. */
+    encrypted: boolean;
 }
 
 /**
@@ -89,5 +94,5 @@ export async function scanAndRelay(
 
     const conversationId = deriveConversationId(scanResult.references, scanResult.inReplyTo, messageId);
 
-    return { raw: finalRaw, messageId, conversationId, sanitizedHtmlBlobKey };
+    return { raw: finalRaw, messageId, conversationId, sanitizedHtmlBlobKey, encrypted: scanResult.encrypted };
 }

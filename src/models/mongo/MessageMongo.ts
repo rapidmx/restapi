@@ -121,6 +121,10 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     public hasAttachments: boolean = false;
 
     @Column()
+    @Description("`true` if this message's body is S/MIME (CMS) encrypted.")
+    public encrypted: boolean = false;
+
+    @Column()
     @Description("The unique identifier of this message's `ScanResult`, once scanning has completed.")
     @Nullable
     public scanResultUid?: string;
@@ -238,6 +242,7 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.inReplyTo = "inReplyTo" in other ? other.inReplyTo : this.inReplyTo;
             this.references = other.references !== undefined ? other.references : this.references;
             this.hasAttachments = other.hasAttachments !== undefined ? other.hasAttachments : this.hasAttachments;
+            this.encrypted = other.encrypted !== undefined ? other.encrypted : this.encrypted;
             this.scanResultUid = "scanResultUid" in other ? other.scanResultUid : this.scanResultUid;
             this.searchIndexedAt = "searchIndexedAt" in other ? other.searchIndexedAt : this.searchIndexedAt;
             this.scheduledSendTime = "scheduledSendTime" in other ? other.scheduledSendTime : this.scheduledSendTime;

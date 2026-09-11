@@ -197,6 +197,26 @@ describe("AttachmentExtractionJobSQL Tests (real DB + DI)", () => {
         expect(updatedMessage!.version).toBe(message.version);
     });
 
+    it("Stores an empty-content blob without ever calling the extractor for an attachment on an encrypted message.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const blobKey = `attachments/${uuid.v4()}`;
+        await blobStore.put(blobKey, Buffer.from("real extractable text that must never surface"));
+        const message = await createMessage({ encrypted: true, searchIndexedAt: new Date("2026-01-01T00:00:00Z") });
+        const attachment = await createAttachment({ messageUid: message.uid, mimeType: "text/plain", blobKey });
+
+        await job.run();
+
+        const updated = await attachmentRepo.findOne({ where: { uid: attachment.uid } });
+        expect(updated!.extractedTextBlobKey).toContain("attachment-text/");
+        const stored: Buffer = await blobStore.get(updated!.extractedTextBlobKey!);
+        expect(stored.toString()).toBe("");
+
+        // Skipped (falsy text), so the already-indexed encrypted message is left completely untouched too.
+        const untouchedMessage = await messageRepo.findOne({ where: { uid: message.uid } });
+        expect(untouchedMessage!.searchIndexedAt).toEqual(message.searchIndexedAt);
+        expect(untouchedMessage!.version).toBe(message.version);
+    });
+
     it("Extracts non-empty text without crashing when the parent message no longer exists.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const blobKey = `attachments/${uuid.v4()}`;

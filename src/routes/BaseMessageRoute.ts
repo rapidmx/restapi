@@ -364,6 +364,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             messageId,
             conversationId,
             sanitizedHtmlBlobKey: scannedHtmlBlobKey,
+            encrypted,
         } = await scanAndRelay(raw, message.from.address, envelopeTo, this.scanPipeline, this.mailTransport, this.blobStore);
         if (relayedRaw !== raw) {
             // `scanAndRelay()` injected a `Message-ID` this draft didn't already have - persist the augmented
@@ -414,6 +415,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 messageId,
                 conversationId,
                 receiptStatus,
+                encrypted,
             } as any,
             message,
             { user, ignoreACL: true },

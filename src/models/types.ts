@@ -389,6 +389,13 @@ export interface Message extends RecoverableBaseEntity {
 
     hasAttachments: boolean;
 
+    /** `true` when this message's body is S/MIME (CMS) encrypted - see `util/SmimeUtils.ts`'s
+     * `isEncryptedBody()`, which `ScanPipeline.run()` computes this from at ingest/send time. Downstream
+     * consumers that would otherwise try to read plaintext out of an encrypted body (`AttachmentExtractionJob`,
+     * derived-entity creation from an encrypted calendar invite) key off of this rather than re-deriving it
+     * themselves, since by the time they run the original `ScanPipelineResult` is long gone. */
+    encrypted: boolean;
+
     /** The unique identifier of this message's `ScanResult`, once scanning has completed. */
     scanResultUid?: string;
 

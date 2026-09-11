@@ -245,6 +245,32 @@ describe("Route:MessageMongo Tests", () => {
         expect(transport.sent.length).toBe(1);
         expect(transport.sent[0].envelopeFrom).toBe("owner@example.com");
         expect(transport.sent[0].envelopeTo).toEqual(["recipient@example.com"]);
+        expect(result.body.encrypted).toBe(false);
+    });
+
+    it("Sending an already S/MIME-encrypted draft persists encrypted: true on the sent message.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+        const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        await blobStore.put(
+            bodyBlobKey,
+            Buffer.from(
+                "From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Encrypted\r\n" +
+                    'Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"\r\n' +
+                    "Content-Transfer-Encoding: base64\r\n\r\n" +
+                    Buffer.from("fake CMS EnvelopedData DER bytes").toString("base64"),
+            ),
+        );
+        const message = await createMessage(mailbox.uid, draftsFolder.uid, { bodyBlobKey });
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/${message.uid}/send`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+        expect(result.body.encrypted).toBe(true);
     });
 
     it("Sending a draft with a future scheduledSendTime defers relay, moving it to Outbox instead of Sent Items.", async () => {
