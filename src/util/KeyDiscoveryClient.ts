@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
+import * as net from "net";
 import { MemoryStore, SimpleStore } from "@rapidrest/core";
 import { KeyDiscoveryResponse } from "../models/types.js";
 
@@ -101,6 +102,79 @@ export interface FetchRemoteKeysOptions {
     timeoutMs?: number;
 }
 
+/** A syntactically valid DNS hostname label sequence - letters/digits/hyphens per label, joined by single
+ * dots, no leading/trailing dot, no `/`, `?`, `#`, `@`, whitespace, or any other character that could turn
+ * `host` into more than just an authority once interpolated into a URL. */
+const HOSTNAME_PATTERN = /^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))*$/i;
+
+/** Maximum bytes read from a discovery response body - a well-formed `KeyDiscoveryResponse` (a handful of
+ * certificates plus preference metadata) is at most a few KB; this bounds a malicious/misbehaving peer's
+ * ability to stream an unbounded body into this process's memory. */
+const MAX_RESPONSE_BYTES = 1_000_000;
+
+/**
+ * Validates that `host` (the `host` attribute of a remote domain's `_rapidmx` TXT record - attacker-influenced,
+ * since it comes from a DNS record the requesting server does not control) is safe to interpolate directly
+ * into a fetch URL and connect to.
+ *
+ * Two things are enforced:
+ * 1. **Syntax** - `host` must be nothing more than a bare hostname (optionally with `:port`). Without this, a
+ * TXT value like `host=evil.com/admin/purge?x=` or `host=internal.corp:9200/_cluster/state#` lets the
+ * record's author choose the request's path/port/query, not just its authority.
+ * 2. **Not an IP literal** - the spec documents `host` as "Hostname of the RapidMX server serving the key
+ * endpoint", never a bare address; rejecting an IP literal closes the most direct SSRF vector (a TXT
+ * record pointing straight at `127.0.0.1` or a cloud metadata address like `169.254.169.254`).
+ *
+ * **Known residual gap, not silently glossed over**: this does not resolve DNS itself and inspect the
+ * resulting address before connecting, so a syntactically valid public hostname whose own DNS record points
+ * at a private/loopback address (classic DNS-rebinding SSRF) is not caught here - `fetch()` performs its own
+ * resolution internally, and `DnsResolver` (this codebase's pluggable DNS abstraction) exposes no A/AAAA
+ * lookup to check against before that happens. Closing that residual requires either extending `DnsResolver`
+ * with an address-lookup method this function could pre-validate against, or a custom low-level connect hook
+ * - both larger, separate changes from the syntax/redirect/IP-literal hardening this function and
+ * `fetchRemoteKeys()`'s `redirect: "error"` provide today.
+ */
+function isSafeDiscoveryHost(host: string): boolean {
+    const withoutPort: string = host.split(":")[0];
+    if (net.isIP(withoutPort) !== 0) {
+        return false;
+    }
+    return HOSTNAME_PATTERN.test(host);
+}
+
+/**
+ * Reads `response`'s body as JSON, aborting once more than `maxBytes` have been read rather than buffering an
+ * unbounded stream - `Response.json()`/`.text()` have no built-in size cap, so a malicious/misbehaving peer
+ * could otherwise stream gigabytes into this process's heap in response to a single discovery lookup.
+ */
+async function readBoundedJson(response: Response, maxBytes: number): Promise<unknown> {
+    const reader = response.body?.getReader();
+    if (!reader) {
+        // No streamable `.body` (every real `fetch()` Response has one - this only happens against a test
+        // double that stubs `json()` directly without a real stream). Falls back to the ordinary, unbounded
+        // parse rather than assuming a `.text()` method the double may not have either.
+        return response.json();
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            total += value.byteLength;
+            if (total > maxBytes) {
+                throw new Error("Discovery response body exceeded the maximum allowed size.");
+            }
+            chunks.push(value);
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    return JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf-8"));
+}
+
 /**
  * Fetches `address`'s published keys/preference from `host`'s discovery endpoint
  * (`GET https://<host>/.well-known/rapidmx/keys/<hash>`), honoring `ETag`/`Cache-Control` per the spec.
@@ -112,10 +186,19 @@ export interface FetchRemoteKeysOptions {
  * construction; the one thing a caller must never do is pass a custom `dispatcher`/agent that disables
  * certificate validation.
  *
- * Never throws. A network failure, timeout, or non-2xx/304 response falls back to the last cached response
- * for this address (if any, since a transient failure shouldn't erase an otherwise-valid cached key), or
- * `undefined` if nothing has ever been cached for it - the caller's own key-conflict/anti-downgrade logic
- * (Group E) is responsible for deciding what "no result" means for a stored `Contact`, not this function.
+ * Never throws. A network failure, timeout, unsafe `host`, or non-2xx/304 response falls back to the last
+ * cached response for this address (if any, since a transient failure shouldn't erase an otherwise-valid
+ * cached key), or `undefined` if nothing has ever been cached for it - the caller's own key-conflict/
+ * anti-downgrade logic (Group E) is responsible for deciding what "no result" means for a stored `Contact`,
+ * not this function.
+ *
+ * `host` is attacker-influenced (it comes from a remote domain's own `_rapidmx` TXT record) and is hardened
+ * against being used as an SSRF primitive three ways: rejected outright if it isn't a bare, syntactically
+ * valid hostname (`isSafeDiscoveryHost()` - see its own doc comment, including the residual gap it does NOT
+ * close); fetched with `redirect: "error"` rather than the default `"follow"`, so a TLS-valid domain can't
+ * 302 the request to an internal target over a different protocol/host - a legitimate discovery server has no
+ * reason to redirect this request at all; and read via `readBoundedJson()` rather than `response.json()`, so
+ * a misbehaving/malicious peer can't stream an unbounded body into this process.
  */
 export async function fetchRemoteKeys(
     host: string,
@@ -126,6 +209,10 @@ export async function fetchRemoteKeys(
     const hash: string = computeKeyDiscoveryHash(localPart);
     const cacheKey: string = `${CACHE_KEY_PREFIX}${host.toLowerCase()}:${hash}`;
     const cached: CachedKeyDiscoveryResult | undefined = (await keyCache.load(cacheKey)) as CachedKeyDiscoveryResult | undefined;
+
+    if (!isSafeDiscoveryHost(host)) {
+        return cached?.response;
+    }
 
     const headers: Record<string, string> = {};
     if (cached?.etag) {
@@ -138,6 +225,7 @@ export async function fetchRemoteKeys(
         const response = await fetch(`https://${host}/.well-known/rapidmx/keys/${hash}`, {
             headers,
             signal: controller.signal,
+            redirect: "error",
         });
 
         if (response.status === 304 && cached) {
@@ -151,7 +239,7 @@ export async function fetchRemoteKeys(
             return cached?.response;
         }
 
-        const body: KeyDiscoveryResponse = (await response.json()) as KeyDiscoveryResponse;
+        const body: KeyDiscoveryResponse = (await readBoundedJson(response, MAX_RESPONSE_BYTES)) as KeyDiscoveryResponse;
         const etag: string | undefined = response.headers.get("etag") ?? undefined;
         const ttl: number = parseMaxAgeSeconds(response.headers.get("cache-control")) ?? DEFAULT_TTL_SECONDS;
         await keyCache.save(cacheKey, { response: body, etag }, ttl);

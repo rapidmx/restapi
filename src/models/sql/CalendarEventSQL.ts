@@ -152,7 +152,11 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
     @Nullable
     public cancelNoticeSentAt?: Date;
 
-    @Column()
+    // `nullable: true`: added after the table already existed in deployed installations, and this framework's
+    // `@Column` decorator has no SQL-level `DEFAULT` option (see `ColumnOptions`) - without `nullable: true`,
+    // `synchronize: true`'s `ALTER TABLE ... ADD COLUMN ... NOT NULL` fails outright against a populated table
+    // on Postgres/MySQL. A legacy row's `NULL` reads back as falsy, same as this flag's intended default.
+    @Column({ nullable: true })
     @Description("A provenance flag: true when this event derives from an encrypted message/invitation.")
     public encrypted: boolean = false;
 

@@ -29,7 +29,10 @@ describe("getVerifiedDomainNames() Tests", () => {
         const result = await getVerifiedDomainNames(objectFactory as any, makeStubClass());
 
         expect(result).toEqual([]);
-        expect(repo.find).toHaveBeenCalledWith({ enabled: true, verified: true }, { ignoreACL: true });
+        expect(repo.find).toHaveBeenCalledWith(
+            { enabled: true, verified: true, limit: 10_000 },
+            { ignoreACL: true, limit: 10_000 },
+        );
     });
 
     it("Returns the names of every domain the query returns (filtering is left to the query itself).", async () => {

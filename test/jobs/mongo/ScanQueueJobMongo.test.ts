@@ -14,6 +14,7 @@
 // calls against every *other* job's real cron schedule. Instead this drives `ConnectionManager.connect()`
 // directly, registering only the entity classes this job actually touches.
 import "reflect-metadata";
+import * as nodeCrypto from "crypto";
 import * as x509 from "@peculiar/x509";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { ACLUtils, ConnectionManager, MongoConnection, MongoRepository, NotificationUtils, ObjectFactory } from "@rapidrest/service-core";
@@ -2109,20 +2110,29 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
     });
 
     describe("Delivery/read receipts", () => {
-        /** Queues a plain message from `sender` requesting a receipt back to `requester` (default: `sender`
-         * itself, matching how `send()` always sets `Disposition-Notification-To` to the sender's own
-         * address), and runs the job. */
-        const deliverRequestingReceipt = async (sender: string, requester: string = sender): Promise<MessageMongo> => {
+        /** Queues a plain message from (and requesting a receipt back to) `address`, and runs the job.
+         * `Disposition-Notification-To` is always the sender's own address - matching both how `send()`
+         * actually composes it and `deliverMessage()`'s own gate (`specs/end-to-end_encryption.md` §Header
+         * Integrity: "The address in Disposition-Notification-To MUST be compared against the From address
+         * ... A mismatch MUST cause the request to be ignored"), so this helper no longer accepts a separate
+         * "requester" - a real inbound message can't legitimately have one. Includes a real, aligned
+         * `Authentication-Results` header (matching `mail:security:trusted_authserv_id`'s test config value,
+         * `mx.example.com`) so `hasAlignedPassingDkim()` - required before any receipt is even considered -
+         * passes; without it every one of this describe block's scenarios would be gated off before ever
+         * reaching the tier-classification logic they actually test. */
+        const deliverRequestingReceipt = async (address: string): Promise<MessageMongo> => {
+            const domain = address.split("@")[1];
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
             const rawBlobKey = `raw/${uuid.v4()}`;
             await blobStore.put(
                 rawBlobKey,
                 Buffer.from(
-                    `From: ${sender}\r\nTo: recipient@example.com\r\nSubject: Plain message\r\n` +
-                        `Disposition-Notification-To: ${requester}\r\n\r\nHello there.\r\n`,
+                    `From: ${address}\r\nTo: recipient@example.com\r\nSubject: Plain message\r\n` +
+                        `Disposition-Notification-To: ${address}\r\n` +
+                        `Authentication-Results: mx.example.com; dkim=pass header.d=${domain}\r\n\r\nHello there.\r\n`,
                 ),
             );
-            await createIngestEntry({ rawBlobKey, envelopeFrom: sender });
+            await createIngestEntry({ rawBlobKey, envelopeFrom: address });
             await job.run();
 
             const messages = await messageRepo.find({ mailboxUid }).toArray();
@@ -2146,7 +2156,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             await createMailbox();
             await verifiedDomain();
 
-            const message = await deliverRequestingReceipt("sender@example.com", "colleague@example.com");
+            const message = await deliverRequestingReceipt("colleague@example.com");
 
             expect(message.dispositionNotificationTo).toBe("colleague@example.com");
             expect(message.deliveryReceiptSentAt).toBeInstanceOf(Date);
@@ -2161,7 +2171,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         it("Holds the delivery receipt pending approval for an external requester (the default).", async () => {
             await createMailbox();
 
-            const message = await deliverRequestingReceipt("sender@example.com", "stranger@outside.com");
+            const message = await deliverRequestingReceipt("stranger@outside.com");
 
             expect(message.dispositionNotificationTo).toBe("stranger@outside.com");
             expect(message.deliveryReceiptSentAt).toBeUndefined();
@@ -2174,7 +2184,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         it("Sends immediately for an external requester when the mailbox opts in via autoSendReceiptsExternal.", async () => {
             await createMailbox({ autoSendReceiptsExternal: true });
 
-            const message = await deliverRequestingReceipt("sender@example.com", "stranger@outside.com");
+            const message = await deliverRequestingReceipt("stranger@outside.com");
 
             expect(message.deliveryReceiptSentAt).toBeInstanceOf(Date);
             expect(message.deliveryReceiptPending).toBe(false);
@@ -2183,7 +2193,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         it("Does NOT send immediately for an external requester when the mailbox only opts in via autoSendReceiptsFederated - 'outside.com' publishes no _rapidmx record so it classifies as external, not federated, and autoSendReceiptsExternal (left false here) is the setting that actually governs.", async () => {
             await createMailbox({ autoSendReceiptsFederated: true });
 
-            const message = await deliverRequestingReceipt("sender@example.com", "stranger@outside.com");
+            const message = await deliverRequestingReceipt("stranger@outside.com");
 
             expect(message.deliveryReceiptSentAt).toBeFalsy();
             expect(message.deliveryReceiptPending).toBe(true);
@@ -2196,7 +2206,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 ["v=RMXv1; id=1; host=mail.federated-peer-mongo.example;"],
             ]);
 
-            const message = await deliverRequestingReceipt("sender@example.com", "peer@federated-peer-mongo.example");
+            const message = await deliverRequestingReceipt("peer@federated-peer-mongo.example");
 
             expect(message.deliveryReceiptSentAt).toBeInstanceOf(Date);
             expect(message.deliveryReceiptPending).toBe(false);
@@ -2279,7 +2289,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 }),
             );
 
-            const mdn: Buffer = await buildDispositionNotification({
+            let mdn: Buffer = await buildDispositionNotification({
                 from: { address: "bob@example.com" },
                 to: "recipient@example.com",
                 subject: "Read: Hello",
@@ -2288,6 +2298,10 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 dispositionType: "read",
                 reportingUa: "mail.example.com; RapidMX",
             });
+            // `processReceipt()` now requires a real, aligned `Authentication-Results` header (Receipt
+            // Verification checks 1+2) before acting on any MDN at all - see `deliverRequestingReceipt()`'s
+            // own comment above for why.
+            mdn = Buffer.concat([Buffer.from("Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\n"), mdn]);
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
             const rawBlobKey = `raw/${uuid.v4()}`;
             await blobStore.put(rawBlobKey, mdn);
@@ -2329,7 +2343,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 }),
             );
 
-            const mdn: Buffer = await buildDispositionNotification({
+            let mdn: Buffer = await buildDispositionNotification({
                 from: { address: "carol@example.com" },
                 to: "recipient@example.com",
                 subject: "Delivered: Hello",
@@ -2338,6 +2352,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 dispositionType: "delivery",
                 reportingUa: "mail.example.com; RapidMX",
             });
+            mdn = Buffer.concat([Buffer.from("Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\n"), mdn]);
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
             const rawBlobKey = `raw/${uuid.v4()}`;
             await blobStore.put(rawBlobKey, mdn);
@@ -2461,7 +2476,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
             const spy = vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("smtp is down"));
 
-            const message = await deliverRequestingReceipt("sender@example.com", "colleague@example.com");
+            const message = await deliverRequestingReceipt("colleague@example.com");
 
             expect(message.deliveryReceiptSentAt).toBeUndefined();
             expect(message.deliveryReceiptPending).toBe(false);
@@ -2483,7 +2498,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             });
             await verifiedDomain();
 
-            await deliverRequestingReceipt("sender@example.com", "colleague@example.com");
+            await deliverRequestingReceipt("colleague@example.com");
 
             const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
             expect(transport.sent[0].raw.toString()).toContain("X-RapidMX-Key-Fingerprint: own-fp");
@@ -2493,7 +2508,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             await createMailbox();
             await verifiedDomain();
 
-            await deliverRequestingReceipt("sender@example.com", "colleague@example.com");
+            await deliverRequestingReceipt("colleague@example.com");
 
             const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
             expect(transport.sent[0].raw.toString()).not.toContain("X-RapidMX-Key-Fingerprint");
@@ -2508,13 +2523,21 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             vi.stubGlobal("fetch", mockFetch);
         });
 
-        function makeDiscoveryResponse(fingerprint: string) {
+        // `KeyringUtils.sanitizeDiscoveredKey()` drops (never pins) a discovered key whose certificate doesn't
+        // parse, and always recomputes `fingerprint` from it rather than trusting an asserted value - `cn` is
+        // only used to make each generated certificate distinguishable across tests; the real fingerprint is
+        // returned alongside the response since it can't be dictated up front.
+        async function makeDiscoveryResponse(cn: string): Promise<{ response: any; fingerprint: string }> {
+            const publicKey = await makeCertBase64(cn);
+            const cert = new nodeCrypto.X509Certificate(Buffer.from(publicKey, "base64"));
+            const fingerprint = cert.fingerprint256.replace(/:/g, "").toLowerCase();
             return {
-                encryptPreference: { preferEncrypt: "mutual", lastSeen: 100 },
-                keys: [
-                    { publicKey: "b64", type: "x509", useType: "encrypt", fingerprint, notBefore: 0, notAfter: Date.now() + 1_000_000 },
-                ],
-                escrow: false,
+                response: {
+                    encryptPreference: { preferEncrypt: "mutual", lastSeen: 100 },
+                    keys: [{ publicKey, type: "x509", useType: "encrypt", fingerprint: "ignored-recomputed-by-server", notBefore: 0, notAfter: Date.now() + 1_000_000 }],
+                    escrow: false,
+                },
+                fingerprint,
             };
         }
 
@@ -2524,14 +2547,15 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             dnsResolver.records.set("_rapidmx.rotated-peer-mongo.example", [
                 ["v=RMXv1; id=1; host=mail.rotated-peer-mongo.example;"],
             ]);
+            const { response: discoveryResponse, fingerprint: discoveredFingerprint } = await makeDiscoveryResponse("rotated-1");
             mockFetch.mockResolvedValue({
                 ok: true,
                 status: 200,
-                json: vi.fn().mockResolvedValue(makeDiscoveryResponse("real-fp-from-discovery")),
+                json: vi.fn().mockResolvedValue(discoveryResponse),
                 headers: { get: () => null },
             });
 
-            const mdn: Buffer = await buildDispositionNotification({
+            let mdn: Buffer = await buildDispositionNotification({
                 from: { address: "bob@rotated-peer-mongo.example" },
                 to: "recipient@example.com",
                 subject: "Read: Hello",
@@ -2541,6 +2565,10 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 reportingUa: "mail.example.com; RapidMX",
                 rotatedKeyFingerprint: "claimed-fp-not-to-be-trusted",
             });
+            mdn = Buffer.concat([
+                Buffer.from("Authentication-Results: mx.example.com; dkim=pass header.d=rotated-peer-mongo.example\r\n"),
+                mdn,
+            ]);
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
             const rawBlobKey = `raw/${uuid.v4()}`;
             await blobStore.put(rawBlobKey, mdn);
@@ -2552,7 +2580,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             const contacts = await contactRepo.find({ mailboxUid, "emails.address": "bob@rotated-peer-mongo.example" }).toArray();
             expect(contacts).toHaveLength(1);
             expect(contacts[0].keys).toHaveLength(1);
-            expect(contacts[0].keys![0].fingerprint).toBe("real-fp-from-discovery");
+            expect(contacts[0].keys![0].fingerprint).toBe(discoveredFingerprint);
         });
 
         it("Also triggers the re-lookup when only X-RapidMX-Policy-Id (not the fingerprint field) is present.", async () => {
@@ -2561,14 +2589,15 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             dnsResolver.records.set("_rapidmx.rotated-peer-mongo-2.example", [
                 ["v=RMXv1; id=1; host=mail.rotated-peer-mongo-2.example;"],
             ]);
+            const { response: discoveryResponse2 } = await makeDiscoveryResponse("rotated-2");
             mockFetch.mockResolvedValue({
                 ok: true,
                 status: 200,
-                json: vi.fn().mockResolvedValue(makeDiscoveryResponse("real-fp-2")),
+                json: vi.fn().mockResolvedValue(discoveryResponse2),
                 headers: { get: () => null },
             });
 
-            const mdn: Buffer = await buildDispositionNotification({
+            let mdn: Buffer = await buildDispositionNotification({
                 from: { address: "bob@rotated-peer-mongo-2.example" },
                 to: "recipient@example.com",
                 subject: "Read: Hello",
@@ -2578,6 +2607,10 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 reportingUa: "mail.example.com; RapidMX",
                 policyId: "1",
             });
+            mdn = Buffer.concat([
+                Buffer.from("Authentication-Results: mx.example.com; dkim=pass header.d=rotated-peer-mongo-2.example\r\n"),
+                mdn,
+            ]);
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
             const rawBlobKey = `raw/${uuid.v4()}`;
             await blobStore.put(rawBlobKey, mdn);
@@ -2626,7 +2659,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 }),
             );
 
-            const mdn: Buffer = await buildDispositionNotification({
+            let mdn: Buffer = await buildDispositionNotification({
                 from: { address: "bob@not-federated-mongo.example" },
                 to: "recipient@example.com",
                 subject: "Read: Hello",
@@ -2636,6 +2669,14 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 reportingUa: "mail.example.com; RapidMX",
                 rotatedKeyFingerprint: "claimed-fp",
             });
+            // A real, aligned `Authentication-Results` header - unlike the other "never calls fetch" test in
+            // this describe block, this one needs `processReceipt()`'s DKIM gate to actually pass so it
+            // reaches `maybeRefreshRotatedKey()` and exercises ITS OWN "not a federated peer" no-op path
+            // (`discoverAndMergeKeys()` returning `undefined`), not just the earlier DKIM gate.
+            mdn = Buffer.concat([
+                Buffer.from("Authentication-Results: mx.example.com; dkim=pass header.d=not-federated-mongo.example\r\n"),
+                mdn,
+            ]);
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
             const rawBlobKey = `raw/${uuid.v4()}`;
             await blobStore.put(rawBlobKey, mdn);

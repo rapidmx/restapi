@@ -41,6 +41,29 @@ helpers `@rapidmx/activesync`/`@rapidmx/mapi` build their own protocol layers on
 other downstream consumer that needs to resolve a caller's mailbox or relay a composed message through the
 scan pipeline.
 
+## Required deployment configuration
+
+A handful of settings are required for correct operation and are easy to miss because nothing fails loudly
+until a specific code path is hit:
+
+- **`datastores.<name>.invalidWhereValuesBehavior: { null: "sql-null" }`** — required on every SQL (TypeORM)
+  datastore. Several jobs (`AttachmentExtractionJob`, `SearchIndexJob`, `EasDeviceStateCleanupJob`) query a
+  nullable "not yet processed" marker column via a literal `{ field: null }` value; without this setting,
+  TypeORM throws on every run of those jobs against a SQL backend. See `test/config-defaults.ts`'s
+  `sqlDatastoreConfig()` for the exact shape.
+- **`mail:security:trusted_authserv_id`** — the `authserv-id` your MTA/milter (e.g. OpenDKIM) is configured to
+  stamp on its own `Authentication-Results` header (RFC 8601). Required for the E2E encryption feature's
+  inbound `RapidMX-Key` header processing and MDN receipt verification to trust anything at all — both fail
+  closed (treat every message as unverified) when this is unset. **Your MTA MUST also be configured to delete
+  any `Authentication-Results` header already present on an inbound message (which a remote sender can forge)
+  before adding its own** (RFC 8601 §5) — without that, this setting alone does not prevent forgery, since a
+  sender could simply also forge a matching `authserv-id`.
+- **DKIM `h=` oversigning of `RapidMX-Key` and `Disposition-Notification-To`** — `specs/
+  end-to-end_encryption.md` requires both headers to be included twice in your outbound DKIM signature's `h=`
+  tag (RFC 6376 "oversigning") wherever this library attaches them, so a header can't be injected into a
+  message that didn't originally carry one. This is a DKIM-signer configuration concern (outside this
+  library's own code, which only attaches the headers) — configure your outbound MTA/DKIM signer accordingly.
+
 ## Status
 
 This library is under active development. Phase 1 (the core data model, the standard RapidREST CRUD API, mail

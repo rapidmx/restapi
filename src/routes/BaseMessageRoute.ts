@@ -20,7 +20,7 @@ import type { DnsResolver } from "../dns/DnsResolver.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { classifyRecipientTier, createFederatedPeerCheck } from "../util/DomainUtils.js";
+import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { prependHeaders } from "../util/MimeHeaderUtils.js";
@@ -339,22 +339,27 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             const effectiveFederated: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptFederated;
             const effectiveExternal: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptExternal;
             if (effectiveInternal || effectiveFederated || effectiveExternal) {
-                for (const address of envelopeTo) {
-                    const tier = await classifyRecipientTier(
-                        this._objectFactory!,
-                        this.domainClass,
-                        address,
-                        createFederatedPeerCheck(this.dnsResolver!),
-                    );
-                    if (
+                // Fetched once and passed to every `classifyRecipientTier()` call below (`verifiedDomainNames`)
+                // rather than each iteration independently re-querying "this server's domains" from scratch -
+                // a message to N recipients previously cost N sequential `Domain` queries, all inside this
+                // HTTP request, before the message was even handed off for relay. The per-recipient DNS
+                // federated-peer checks are independent of each other, so they run concurrently
+                // (`Promise.all`) instead of a sequential loop - `resolveFederationPolicy()` already caches
+                // per domain, so this also collapses to one real lookup per distinct cold domain rather than
+                // one per recipient.
+                const verifiedDomainNames: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+                const federatedPeerCheck = createFederatedPeerCheck(this.dnsResolver!);
+                const tiers = await Promise.all(
+                    envelopeTo.map((address) =>
+                        classifyRecipientTier(this._objectFactory!, this.domainClass, address, federatedPeerCheck, verifiedDomainNames),
+                    ),
+                );
+                attachesReceiptRequest = tiers.some(
+                    (tier) =>
                         (tier === "same-org" && effectiveInternal) ||
                         (tier === "federated" && effectiveFederated) ||
-                        (tier === "external" && effectiveExternal)
-                    ) {
-                        attachesReceiptRequest = true;
-                        break;
-                    }
-                }
+                        (tier === "external" && effectiveExternal),
+                );
             }
         }
         if (attachesReceiptRequest) {
@@ -365,7 +370,11 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // Disposition-Notification-To attachment above - the Autocrypt-style opportunistic-discovery half of
         // the protocol (E3 is the inbound counterpart). Only the active (non-revoked, non-expired) "encrypt"
         // key is ever announced - a revoked/expired one would be actively harmful advice to a recipient.
-        const activeEncryptKey: PublicKey | undefined = sendingMailbox?.keys.find(
+        // `?? []`: defense in depth against a legacy row whose SQL `keys` column was backfilled to `null`
+        // rather than the column's own default (e.g. a migration applied outside this ORM) - the documented
+        // "SQL returns `null`, not `undefined`, for an unset column" hazard this codebase already guards
+        // against elsewhere (see `ScanQueueJob`'s own note on the same class of issue).
+        const activeEncryptKey: PublicKey | undefined = (sendingMailbox?.keys ?? []).find(
             (k) => k.useType === "encrypt" && !k.revokedAt && k.notAfter > Date.now(),
         );
         if (activeEncryptKey) {
@@ -374,7 +383,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                     name: "RapidMX-Key",
                     value: buildRapidMxKeyHeader(
                         message.from.address,
-                        sendingMailbox!.encryptPreference.preferEncrypt,
+                        // `?? {...}`: same legacy-SQL-row `null` hazard as `keys` above.
+                        (sendingMailbox!.encryptPreference ?? { preferEncrypt: "nopreference" }).preferEncrypt,
                         activeEncryptKey,
                     ),
                 },

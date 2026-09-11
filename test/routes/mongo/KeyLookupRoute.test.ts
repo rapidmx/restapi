@@ -6,21 +6,42 @@ import config from "../../config.js";
 import { request } from "@rapidrest/service-core/test";
 import { ACLRecord, MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager, ACLAction } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
+import * as x509 from "@peculiar/x509";
 import * as uuid from "uuid";
 import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles, StaticDnsResolver } from "../../testDoubles.js";
 
+x509.cryptoProvider.set(crypto);
+
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
 });
 
-function makeDiscoveryResponse(fingerprint: string) {
+/** A discovery response carrying a real, parseable self-signed certificate - `KeyringUtils.
+ * sanitizeDiscoveredKey()` drops (never pins) a discovered key whose certificate doesn't parse, and always
+ * recomputes `fingerprint` from it rather than trusting an asserted value, so a test exercising a real
+ * Discovery merge needs real cert bytes; the resulting fingerprint is returned alongside the response for the
+ * test to assert against, since it can't be dictated up front. */
+async function makeDiscoveryResponse(cn: string): Promise<{ response: any; fingerprint: string }> {
+    const keys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    const cert = await x509.X509CertificateGenerator.createSelfSigned({
+        name: `CN=${cn}`,
+        notBefore: new Date(),
+        notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+        keys,
+        signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+    });
+    const publicKey = Buffer.from(cert.rawData).toString("base64");
+    const fingerprint = Buffer.from(await cert.getThumbprint("SHA-256")).toString("hex");
     return {
-        encryptPreference: { preferEncrypt: "mutual", lastSeen: 100 },
-        keys: [{ publicKey: "b64", type: "x509", useType: "encrypt", fingerprint, notBefore: 0, notAfter: Date.now() + 1_000_000 }],
-        escrow: false,
+        response: {
+            encryptPreference: { preferEncrypt: "mutual", lastSeen: 100 },
+            keys: [{ publicKey, type: "x509", useType: "encrypt", fingerprint: "ignored-recomputed-by-server", notBefore: 0, notAfter: Date.now() + 1_000_000 }],
+            escrow: false,
+        },
+        fingerprint,
     };
 }
 
@@ -103,10 +124,11 @@ describe("Route:KeyLookupMongo Tests", () => {
     it("Discovers a federated peer's keys, creates a new Contact in the mailbox's address book, and returns the keys.", async () => {
         const mailbox = await createMailbox();
         const addr = `alice@participating-lookup-1.example.com`;
+        const { response, fingerprint } = await makeDiscoveryResponse(addr);
         mockFetch.mockResolvedValue({
             ok: true,
             status: 200,
-            json: vi.fn().mockResolvedValue(makeDiscoveryResponse("fp-1")),
+            json: vi.fn().mockResolvedValue(response),
             headers: { get: () => null },
         });
         const dnsResolver = objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!;
@@ -120,7 +142,7 @@ describe("Route:KeyLookupMongo Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.body.keys).toHaveLength(1);
-        expect(result.body.keys[0].fingerprint).toBe("fp-1");
+        expect(result.body.keys[0].fingerprint).toBe(fingerprint);
 
         const contacts = await contactRepo.find({ mailboxUid: mailbox.uid }).toArray();
         expect(contacts).toHaveLength(1);
@@ -135,10 +157,11 @@ describe("Route:KeyLookupMongo Tests", () => {
         dnsResolver.records.set("_rapidmx.participating-lookup-2.example.com", [
             ["v=RMXv1; id=1; host=mail.participating-lookup-2.example.com;"],
         ]);
+        const { response } = await makeDiscoveryResponse(addr);
         mockFetch.mockResolvedValue({
             ok: true,
             status: 200,
-            json: vi.fn().mockResolvedValue(makeDiscoveryResponse("fp-2")),
+            json: vi.fn().mockResolvedValue(response),
             headers: { get: () => null },
         });
 

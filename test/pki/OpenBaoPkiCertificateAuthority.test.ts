@@ -178,4 +178,35 @@ describe("OpenBaoPkiCertificateAuthority Tests", () => {
 
         await expect(authority.revoke("anything")).rejects.toThrow();
     });
+
+    describe("assertSafeAddress()", () => {
+        it("Rejects a configured address that isn't a valid URL at all.", async () => {
+            (authority as any).address = "not a url";
+            await expect(authority.issue("x@example.com", "csr")).rejects.toThrow(/is not a valid URL/);
+            expect(mockFetch).not.toHaveBeenCalled();
+        });
+
+        it("Accepts an https:// address unconditionally.", async () => {
+            const { pem, serialNumber } = await makeSignedCertPem("https-ok@example.com");
+            mockFetch.mockResolvedValue(
+                makeFetchResponse({ json: vi.fn().mockResolvedValue({ data: { certificate: pem, serial_number: serialNumber } }) }),
+            );
+            await expect(authority.issue("https-ok@example.com", "csr")).resolves.toBeDefined();
+        });
+
+        it("Accepts a plaintext http:// address only when it targets loopback (127.0.0.1/::1/localhost).", async () => {
+            const { pem, serialNumber } = await makeSignedCertPem("loopback-ok@example.com");
+            mockFetch.mockResolvedValue(
+                makeFetchResponse({ json: vi.fn().mockResolvedValue({ data: { certificate: pem, serial_number: serialNumber } }) }),
+            );
+            (authority as any).address = "http://127.0.0.1:8200";
+            await expect(authority.issue("loopback-ok@example.com", "csr")).resolves.toBeDefined();
+        });
+
+        it("Rejects a plaintext http:// address pointed at a non-loopback host - refuses to leak the Vault token over the network.", async () => {
+            (authority as any).address = "http://vault.internal.example.com:8200";
+            await expect(authority.issue("x@example.com", "csr")).rejects.toThrow(/must use https/);
+            expect(mockFetch).not.toHaveBeenCalled();
+        });
+    });
 });

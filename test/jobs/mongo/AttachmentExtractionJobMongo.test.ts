@@ -243,11 +243,17 @@ describe("AttachmentExtractionJobMongo Tests (real DB + DI)", () => {
 
     it("Logs a warning and continues processing subsequent attachments when one throws (missing blob).", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        // A real, unencrypted parent message for each - `processAttachment()` now fails closed (skips
+        // extraction, no `blobStore.get()` call at all) whenever the parent message can't be resolved, so
+        // exercising the "blobStore.get() itself throws" path needs a genuine, findable, non-encrypted
+        // message behind each attachment.
+        const badMessage = await createMessage();
+        const goodMessage = await createMessage();
         // No blob was ever put at this key, so `blobStore.get()` rejects with a real "no blob" error.
-        const badAttachment = await createAttachment({ blobKey: `attachments/${uuid.v4()}` });
+        const badAttachment = await createAttachment({ messageUid: badMessage.uid, blobKey: `attachments/${uuid.v4()}` });
         const goodBlobKey = `attachments/${uuid.v4()}`;
         await blobStore.put(goodBlobKey, Buffer.from("good content"));
-        const goodAttachment = await createAttachment({ blobKey: goodBlobKey });
+        const goodAttachment = await createAttachment({ messageUid: goodMessage.uid, blobKey: goodBlobKey });
 
         await expect(job.run()).resolves.toBeUndefined();
 

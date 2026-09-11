@@ -54,6 +54,50 @@ export interface EnrollKeyRequest {
 /** Request body for `addMasterKeyWrap()`. */
 export type AddMasterKeyWrapRequest = MasterKeyWrap;
 
+const MASTER_KEY_WRAP_METHODS = ["password", "passkey", "recovery", "escrow"] as const;
+
+/** Generous enough for any real AEAD ciphertext/nonce/salt/KDF-params string this deployment will ever
+ * produce, small enough to block a denial-of-service-sized blob from being stored as a "wrap". */
+const MAX_WRAP_FIELD_LENGTH = 8192;
+
+/**
+ * Validates a client-supplied `MasterKeyWrap` shape before it's persisted - `addMasterKeyWrap()`/`rekey()`
+ * previously accepted the request body completely unvalidated (no `method` check, no field presence/type/size
+ * check), so any authenticated mailbox owner/delegate could store an arbitrary blob as a "wrap", or falsely
+ * assert `method: "escrow"` to manipulate the public discovery endpoint's `escrow` flag (see `allowEscrow`).
+ *
+ * `allowEscrow: false` additionally rejects `method: "escrow"` outright. `specs/end-to-end_encryption.md`'s
+ * Escrow Scoping section requires escrow to be a distinct, separately-granted compliance role - "A user with
+ * ... the administrative role in RapidMX MUST NOT thereby be able to decrypt mail" - so the ordinary mailbox
+ * owner/delegate path (every caller of this validation today) must never be able to add, remove, or fake an
+ * escrow wrap itself. Full escrow-scope/role management (a distinct admin surface that would pass
+ * `allowEscrow: true`) is a deferred follow-up roadmap item; until it exists, this is the enforcement point.
+ */
+function validateMasterKeyWrap(wrap: MasterKeyWrap, { allowEscrow }: { allowEscrow: boolean }): void {
+    if (!wrap || !MASTER_KEY_WRAP_METHODS.includes(wrap.method)) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `method must be one of: ${MASTER_KEY_WRAP_METHODS.join(", ")}.`);
+    }
+    if (wrap.method === "escrow" && !allowEscrow) {
+        throw new ApiError(
+            ApiErrors.AUTH_PERMISSION_FAILURE,
+            403,
+            "Escrow wraps are managed by the compliance/eDiscovery role and cannot be set through this endpoint.",
+        );
+    }
+    for (const field of ["ciphertext", "nonce", "salt", "kdf"] as const) {
+        const value: unknown = wrap[field];
+        if (typeof value !== "string" || value.length === 0 || value.length > MAX_WRAP_FIELD_LENGTH) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `${field} must be a non-empty string of at most ${MAX_WRAP_FIELD_LENGTH} characters.`);
+        }
+    }
+    if (typeof wrap.schemeVersion !== "number" || !Number.isFinite(wrap.schemeVersion)) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "schemeVersion must be a number.");
+    }
+    if (wrap.methodId !== undefined && (typeof wrap.methodId !== "string" || wrap.methodId.length > MAX_WRAP_FIELD_LENGTH)) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "methodId must be a string.");
+    }
+}
+
 /** Request body for `rekey()` - a full, atomic replacement of a mailbox's entire key-vault contents, following
  * the client's own re-key operation (see `MasterKeyWrap`'s doc comment on why removing a wrap alone never
  * revokes access). */
@@ -149,8 +193,19 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
     }
 
+    /** Stricter than `requireMailboxAccess()`: only the mailbox's actual `ownerUserUid` may proceed, not a
+     * delegate holding an ordinary `UPDATE` grant. `rekey()` is the one operation here that can permanently
+     * destroy the owner's own access to their encrypted mail history (a full, atomic replacement of
+     * `wrappedKeys`/`masterKeyWraps`) - an `UPDATE` grant on a shared mailbox is meant for managing its
+     * content/settings, not for a delegate to be able to do that. */
+    private requireMailboxOwner(mailbox: M, user: JWTUser | undefined): void {
+        if (!user || mailbox.ownerUserUid !== user.uid) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+    }
+
     private async findKeyVault(mailboxUid: string): Promise<K | undefined> {
-        const existing: K[] = await this.keyVaultRepo!.find({ mailboxUid } as any, { ignoreACL: true, limit: 1 });
+        const existing: K[] = await this.keyVaultRepo!.find({ mailboxUid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
         return existing[0];
     }
 
@@ -182,6 +237,17 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
 
         const existing: K | undefined = await this.findKeyVault(mailboxId);
+        // Audit-logged like every mutating endpoint below, not just those - this is the one operation that
+        // actually exfiltrates the vault's contents (including, via `masterKeyWraps`, an escrow wrap capable
+        // of decrypting the mailbox). `specs/end-to-end_encryption.md`'s escrow audit requirement ("every
+        // escrow use MUST be recorded ... capturing the holder ... and the time") depends on this read being
+        // visible after the fact, same as this class's own doc comment already promises for every mutation.
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, user, logger: this.logger },
+            { action: AuditAction.KEY_VAULT_READ, targetType: "KeyVault", targetUid: existing?.uid ?? mailbox.uid, mailboxUid: mailbox.uid },
+        );
         return existing ? { wrappedKeys: existing.wrappedKeys, masterKeyWraps: existing.masterKeyWraps } : EMPTY_KEY_VAULT;
     }
 
@@ -196,12 +262,27 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     private static publicKeyFromCertificatePem(
         certificatePem: string,
         useType: "sign" | "encrypt",
+        mailboxAddress: string,
     ): { publicKey: PublicKey; fingerprint: string } {
         let cert: crypto.X509Certificate;
         try {
             cert = new crypto.X509Certificate(certificatePem);
         } catch {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The provided certificate could not be parsed.");
+        }
+        // Identity binding: "matches the mailbox identity is left to the CA that issued it" (this method's own
+        // doc comment) is true for chain-of-trust validity, but was previously also true for whether the
+        // certificate names this mailbox at all - nothing checked that, so any mailbox owner could publish any
+        // third party's genuinely-valid signing certificate (e.g. lifted from any signed email they received)
+        // as their own. `checkEmail()` is Node's own RFC 5280 `rfc822Name` SAN matcher (falls back to a
+        // CN-based comparison per its documented legacy behavior) - this does not re-litigate the issuing
+        // CA's trust decision, only that the certificate the CA vouched for actually names *this* mailbox.
+        if (!cert.checkEmail(mailboxAddress)) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                "The provided certificate does not identify this mailbox's address.",
+            );
         }
         const fingerprint: string = BaseKeyVaultRoute.normalizeFingerprint(cert.fingerprint256);
         return {
@@ -266,14 +347,14 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             if (!body.certificate) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "certificate is required for useType 'sign'.");
             }
-            const result = BaseKeyVaultRoute.publicKeyFromCertificatePem(body.certificate, "sign");
+            const result = BaseKeyVaultRoute.publicKeyFromCertificatePem(body.certificate, "sign", mailbox.primarySmtpAddress);
             publicKey = result.publicKey;
             fingerprint = result.fingerprint;
         } else {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "useType must be 'sign' or 'encrypt'.");
         }
 
-        const collision: PublicKey | undefined = mailbox.keys.find((k) => k.fingerprint === fingerprint);
+        const collision: PublicKey | undefined = (mailbox.keys ?? []).find((k) => k.fingerprint === fingerprint);
         if (collision && !collision.revokedAt && collision.notAfter > Date.now()) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A non-expired, non-revoked key with this fingerprint is already enrolled.");
         }
@@ -345,6 +426,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         await this.requireMailboxAccess(mailbox, user, ACLAction.UPDATE);
+        validateMasterKeyWrap(body, { allowEscrow: false });
 
         const keyVault: K | undefined = await this.findKeyVault(mailboxId);
         if (!keyVault) {
@@ -396,6 +478,15 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         await this.requireMailboxAccess(mailbox, user, ACLAction.UPDATE);
+        // See `validateMasterKeyWrap()`'s doc comment - the mailbox owner/delegate path must never be able to
+        // remove a compliance-installed escrow wrap themselves.
+        if (method === "escrow") {
+            throw new ApiError(
+                ApiErrors.AUTH_PERMISSION_FAILURE,
+                403,
+                "Escrow wraps are managed by the compliance/eDiscovery role and cannot be removed through this endpoint.",
+            );
+        }
 
         const keyVault: K | undefined = await this.findKeyVault(mailboxId);
         if (!keyVault) {
@@ -433,16 +524,49 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
      * "the client calls this after doing its own re-key," not tied to a revocation feature that doesn't exist
      * yet. Requires an already-initialized vault (`404` otherwise) - there is nothing to re-key for a mailbox
      * that has never enrolled a key.
+     *
+     * Restricted to the mailbox's actual owner (`requireMailboxOwner()`, not `requireMailboxAccess()`) - see
+     * that method's own doc comment.
+     *
+     * `body.keys` is validated, not trusted wholesale like the rest of this method's own doc comment might
+     * suggest: every entry MUST already be present (same `fingerprint`) in the mailbox's current `keys`, with
+     * every field identical except `revokedAt`. Genuinely new key material MUST be enrolled via `enrollKey()`
+     * first, which alone talks to the CA - without this check, `rekey()` was a second, completely unvalidated
+     * path to publish an arbitrary "certificate" at the public discovery endpoint, bypassing the CA entirely.
+     * `rekey()`'s real purpose - re-wrapping the master key under new/changed unlock methods, and optionally
+     * marking an existing key revoked - never requires introducing a fingerprint the CA hasn't already issued.
      */
     @Put("/:id/keyvault/rekey")
     public async rekey(@Param("id") mailboxId: string, body: RekeyRequest, @AuthUser user?: JWTUser): Promise<PublicKeyVault> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
-        await this.requireMailboxAccess(mailbox, user, ACLAction.UPDATE);
+        this.requireMailboxOwner(mailbox, user);
 
         const keyVault: K | undefined = await this.findKeyVault(mailboxId);
         if (!keyVault) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "This mailbox has not enrolled a key yet.");
+        }
+
+        const existingByFingerprint = new Map((mailbox.keys ?? []).map((k) => [k.fingerprint, k]));
+        for (const key of body.keys ?? []) {
+            const existing: PublicKey | undefined = existingByFingerprint.get(key.fingerprint);
+            if (
+                !existing ||
+                existing.publicKey !== key.publicKey ||
+                existing.type !== key.type ||
+                existing.useType !== key.useType ||
+                existing.notBefore !== key.notBefore ||
+                existing.notAfter !== key.notAfter
+            ) {
+                throw new ApiError(
+                    ApiErrors.INVALID_REQUEST,
+                    400,
+                    "Every key in a rekey request must already be enrolled (via enrollKey) with identical fields aside from revokedAt.",
+                );
+            }
+        }
+        for (const wrap of body.masterKeyWraps ?? []) {
+            validateMasterKeyWrap(wrap, { allowEscrow: false });
         }
 
         const updated: K = await this.persistRekey(mailbox, keyVault, body);
@@ -464,12 +588,21 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             mailbox,
             { ignoreACL: true },
         );
+        // Any existing escrow wrap is preserved verbatim, never taken from `body` - see
+        // `validateMasterKeyWrap()`'s doc comment: a rekey request can't assert `method: "escrow"` at all, so
+        // naively replacing wholesale with `body.masterKeyWraps` would silently drop escrow coverage on every
+        // rekey. A real re-wrap of the escrow copy for a *new* MK is server-side future work (the spec notes
+        // it "operates on MK's ciphertext under a public key" and needs no client cooperation) - until that
+        // exists, preserving the existing wrap as-is is the safe interim behavior; it will fail to decrypt a
+        // rotated MK, which is a correctness gap for the escrow holder to resolve out of band, not a security
+        // one (nothing here can let a rekey silently disable escrow coverage the deployment configured).
+        const preservedEscrowWraps: MasterKeyWrap[] = keyVault.masterKeyWraps.filter((w) => w.method === "escrow");
         return await this.keyVaultRepo!.update(
             {
                 uid: keyVault.uid,
                 version: (keyVault as any).version,
                 wrappedKeys: body.wrappedKeys,
-                masterKeyWraps: body.masterKeyWraps,
+                masterKeyWraps: [...preservedEscrowWraps, ...body.masterKeyWraps],
             } as any,
             keyVault,
             { ignoreACL: true },

@@ -258,6 +258,71 @@ describe("Route:MailboxMongo Tests", () => {
         expect(result.status).toBe(403);
     });
 
+    it("Rejects a client attempting to directly set 'keys' via PUT (400) - only the CA-enrollment path may publish keys.", async () => {
+        const obj = await createMailboxMongo();
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                uid: obj.uid,
+                version: obj.version,
+                keys: [{ publicKey: "forged-b64", type: "x509", useType: "encrypt", fingerprint: "forged-fp", notBefore: 0, notAfter: Date.now() + 1_000_000 }],
+            });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Rejects a client attempting to directly set 'keyDiscoveryHash' via PUT (400) - collision with another address's hash would impersonate it at the discovery endpoint.", async () => {
+        const obj = await createMailboxMongo();
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, keyDiscoveryHash: "attacker-chosen-hash" });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Allows a full-object PUT carrying an empty 'keys' array (the class default, not a client assertion).", async () => {
+        const obj = await createMailboxMongo();
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(new MailboxMongo({ ...obj, displayName: "Still Fine" }));
+
+        expect(result.status).toBe(200);
+        expect(result.body.displayName).toBe("Still Fine");
+    });
+
+    it("Redirects a single-property update of primarySmtpAddress through the full update path, keeping keyDiscoveryHash in sync (updateProperty()).", async () => {
+        const obj = await createMailboxMongo();
+        const newAddress = `${uuid.v4()}@example.com`;
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}/primarySmtpAddress`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(newAddress);
+
+        expect(result.status).toBe(200);
+        expect(result.body.primarySmtpAddress).toBe(newAddress);
+        expect(result.body.keyDiscoveryHash).toBe(computeKeyDiscoveryHash(newAddress.split("@")[0]));
+    });
+
+    it("Keeps keyDiscoveryHash in sync for a bulk update too (updateBulk()) - the earlier update()-only override missed this path entirely.", async () => {
+        const obj = await createMailboxMongo();
+        const newAddress = `${uuid.v4()}@example.com`;
+
+        const result = await request(server.getApplication())
+            .put(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send([{ uid: obj.uid, version: obj.version, primarySmtpAddress: newAddress }]);
+
+        expect(result.status).toBe(200);
+        expect(result.body[0].keyDiscoveryHash).toBe(computeKeyDiscoveryHash(newAddress.split("@")[0]));
+    });
+
     it("Owner can delete their own mailbox.", async () => {
         const obj = await createMailboxMongo();
 

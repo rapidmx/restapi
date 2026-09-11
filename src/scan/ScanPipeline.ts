@@ -54,6 +54,12 @@ export interface ScanPipelineResult {
      * from conditions - the envelope-from (`ScanEnvelope.from`) is the SMTP `MAIL FROM`, which can legitimately
      * differ from this header. */
     parsedFrom?: string;
+    /** The bare address (no display name) from the message's parsed `From` header - `specs/
+     * end-to-end_encryption.md` requires `RapidMX-Key`/DKIM-alignment processing to be "keyed on the From
+     * address", which the SMTP envelope-from (`ScanEnvelope.from`/`entry.envelopeFrom`) is not: it legitimately
+     * diverges on forwarded and mailing-list mail, and DKIM/DMARC alignment is itself defined against `From`,
+     * not the envelope. `undefined` if the header is absent or names no resolvable address. */
+    fromAddress?: string;
     /** The RFC 5322 `Auto-Submitted` header value, if present - see `isAutoReplyEligible()` (`util/
      * AutoReplyUtils.ts`). */
     autoSubmittedHeader?: string;
@@ -147,11 +153,22 @@ export class ScanPipeline {
         }
 
         const parsed: ParsedMail = await simpleParser(raw);
+        // Computed before the attachment scan below (not after, where the rest of this method derives it) -
+        // for an S/MIME `EnvelopedData` body, mailparser folds the *entire* encrypted body into
+        // `parsed.attachments` as a synthetic "attachment" node (it isn't `text/plain`/`text/html`, so
+        // mailparser has nowhere else to put it) - a real S/MIME `EnvelopedData` wraps the whole message body,
+        // so there is never a genuinely separate, still-visible attachment alongside it. Treating that
+        // synthetic node as a real attachment would AV-scan and persist the ciphertext a second time and mark
+        // every encrypted message as carrying an attachment it doesn't have - the same hazard `util/
+        // TransportRuleUtils.ts`'s `buildTransportRuleContext()` already guards against for its own,
+        // independent attachment-derived fields; this is the single upstream source both it and `ScanQueueJob`
+        // ultimately need to agree with.
+        const encrypted: boolean = isEncryptedBody(parsed);
 
         const [spam, rawAv, attachmentResults] = await Promise.all([
             this.spamScanProvider.scoreMessage(raw, envelope),
             this.avScanProvider.scanBuffer(raw),
-            this.scanAttachments(parsed.attachments ?? []),
+            this.scanAttachments(encrypted ? [] : (parsed.attachments ?? [])),
         ]);
 
         let worstAv: AvScanResult = rawAv;
@@ -161,13 +178,12 @@ export class ScanPipeline {
             }
         }
 
-        const encrypted: boolean = isEncryptedBody(parsed);
-
         const sanitizedHtml: string | undefined =
             !encrypted && typeof parsed.html === "string" ? this.sanitize(parsed.html) : undefined;
 
         const bodyPreview: string | undefined = encrypted ? undefined : this.derivePreview(parsed);
         const parsedFrom: string | undefined = parsed.from?.text;
+        const fromAddress: string | undefined = parsed.from?.value?.[0]?.address;
         const autoSubmittedHeader: string | undefined = this.getHeaderString(parsed, "auto-submitted");
         const precedenceHeader: string | undefined = this.getHeaderString(parsed, "precedence");
         const listUnsubscribeHeader: string | undefined = this.getRawHeaderLine(parsed, "list-unsubscribe");
@@ -196,6 +212,7 @@ export class ScanPipeline {
             subject: parsed.subject,
             bodyPreview,
             parsedFrom,
+            fromAddress,
             autoSubmittedHeader,
             precedenceHeader,
             listUnsubscribeHeader,

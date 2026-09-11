@@ -141,7 +141,15 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     @Description("Whether send() attaches a receipt request to every outgoing message to an internal recipient by default.")
     public alwaysRequestReceiptInternal: boolean = true;
 
-    @Column()
+    // `nullable: true` (even though the field is a required, defaulted `boolean`): this column was added
+    // after the table already existed in deployed installations, and this framework's `@Column` decorator
+    // exposes no way to attach a SQL-level `DEFAULT` (see `ColumnOptions` - only `nullable` is available).
+    // Without `nullable: true`, `synchronize: true`'s `ALTER TABLE ... ADD COLUMN ... NOT NULL` fails outright
+    // against a populated table on Postgres/MySQL. A legacy row backfilled to SQL `NULL` reads back as
+    // `false` in practice (every consumer here treats this as a plain boolean flag, and `null` is falsy), so
+    // no explicit `?? false` guard is needed at read sites - same reasoning `Mailbox.keyDiscoveryHash` (the
+    // pre-existing case of this exact pattern) documents for itself.
+    @Column({ nullable: true })
     @Description("Same as alwaysRequestReceiptInternal, for a federated-peer recipient.")
     public alwaysRequestReceiptFederated: boolean = false;
 
@@ -153,7 +161,8 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     @Description("Whether this mailbox auto-sends a receipt back to an internal requester versus holding it for approval.")
     public autoSendReceiptsInternal: boolean = true;
 
-    @Column()
+    // See `alwaysRequestReceiptFederated`'s comment above - same reasoning, same fix.
+    @Column({ nullable: true })
     @Description("Same as autoSendReceiptsInternal, for a federated-peer requester.")
     public autoSendReceiptsFederated: boolean = false;
 
@@ -161,11 +170,15 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     @Description("Same as autoSendReceiptsInternal, for an external requester.")
     public autoSendReceiptsExternal: boolean = false;
 
-    @Column({ type: "simple-json" })
+    // `nullable: true` for the same migration-safety reason as the booleans above - this framework's `@Column`
+    // decorator has no SQL-level `DEFAULT` option (see `ColumnOptions`). Unlike a boolean, `null` here is NOT
+    // safely usable as-is (`mailbox.keys.find(...)` throws on `null`) - every read site that could see a
+    // legacy row (`BaseMessageRoute`, `BaseKeyVaultRoute`, `ScanQueueJob`) guards with `?? []`/`?? {...}`.
+    @Column({ type: "simple-json", nullable: true })
     @Description("This mailbox's own encryption preference.")
     public encryptPreference: EncryptionPreference = { preferEncrypt: "nopreference" };
 
-    @Column({ type: "simple-json" })
+    @Column({ type: "simple-json", nullable: true })
     @Description("This mailbox's published public keys (signing and/or encryption).")
     public keys: PublicKey[] = [];
 

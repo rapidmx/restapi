@@ -12,6 +12,10 @@ import { isEncryptedBody } from "../util/SmimeUtils.js";
 import { Attachment, Message } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
+/** Well above any real message's attachment count - see `buildDocument()`'s own note on why this must be
+ * baked into the query object, not just `options`. */
+const MAX_ATTACHMENTS_PER_MESSAGE = 1000;
+
 /**
  * Reconciles `SearchProvider`'s index against `Message` records that haven't been indexed yet
  * (`Message.searchIndexedAt` is unset). This is what decouples "committed to the primary datastore" from
@@ -136,9 +140,13 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
 
         const attachmentText: string[] = [];
         if (!encrypted && message.hasAttachments) {
+            // `limit` baked into the query object itself, not just `options` - `ModelUtils.buildSearchQuerySQL`
+            // ignores `options.limit` and falls back to its own 100-row default otherwise (see `ScanQueueJob`'s
+            // identical note), which would otherwise silently index only an arbitrary 100 of a message's
+            // attachments if it ever had more.
             const attachments: A[] = await this.attachmentRepo!.find(
-                { messageUid: message.uid, extractedTextBlobKey: "ne(null)" },
-                { ignoreACL: true },
+                { messageUid: message.uid, extractedTextBlobKey: "ne(null)", limit: MAX_ATTACHMENTS_PER_MESSAGE } as any,
+                { ignoreACL: true, limit: MAX_ATTACHMENTS_PER_MESSAGE },
             );
             for (const attachment of attachments) {
                 if (attachment.extractedTextBlobKey) {

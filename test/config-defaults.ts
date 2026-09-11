@@ -72,6 +72,12 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
             dns: {
                 mx_hostname: "mail.rapidmx-test.example.com",
             },
+            // Matches the `authserv-id` (`mx.example.com`) used by every test fixture's `Authentication-Results`
+            // header - see `ScanQueueJob`'s `trustedAuthservId`/`util/AuthenticationResultsUtils.ts`'s
+            // `hasAlignedPassingDkim()`, which now fail closed on any other (or absent) `authserv-id`.
+            security: {
+                trusted_authserv_id: "mx.example.com",
+            },
             transport: {
                 ingest: {
                     secret: "test-ingest-secret",
@@ -145,12 +151,16 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
  * `{ field: null }` value, which is the correct/only way to express that against MongoDB (a missing/null field
  * matches `{field: null}` there) but which TypeORM's `SelectQueryBuilder` rejects by default for SQL - it
  * throws ("Null value encountered ... the IsNull() operator must be used") rather than silently treating it as
- * `IS NULL`, and `ModelUtils`'s query-string DSL (see `@rapidrest/service-core`) has no operator that maps onto
- * TypeORM's dedicated `IsNull()`. `"sql-null"` is TypeORM's own supported escape hatch for exactly this shape
- * of query and is required for those jobs' SQL backends to function at all - this is a real config requirement
- * of this library's SQL datastore, not a test-only workaround (see the passed-straight-through `datasource`
- * object in `ConnectionManager`/`TypeOrmSupport.connect()`), and is documented here since a fresh SQL
- * deployment of this library would otherwise 500 on every run of those jobs.
+ * `IS NULL`. `ModelUtils`'s query-string DSL (`@rapidrest/service-core` 2.0+) now *does* have operators that
+ * map onto TypeORM's dedicated `IsNull()` - `eq(null)`/a bare `"null"` value, and `exists(false)` - so those
+ * call sites could migrate off this literal-`null` shape; if they do, use `eq(null)`, not `exists(false)`,
+ * since `exists(false)` maps to MongoDB `$exists: false` (missing only) rather than `$eq: null`
+ * (missing-or-null), and these "not yet processed" marker columns rely on matching both. Regardless of
+ * whether those call sites migrate, `"sql-null"` remains required: it is TypeORM's own supported escape hatch
+ * for a literal `{ field: null }` value specifically, and is a real config requirement of this library's SQL
+ * datastore, not a test-only workaround (see the passed-straight-through `datasource` object in
+ * `ConnectionManager`/`TypeOrmSupport.connect()`) - **a fresh SQL deployment of this library MUST set this, or
+ * it 500s on every run of those jobs.** (Also documented in the deployment README/config reference.)
  */
 export function sqlDatastoreConfig(database: string) {
     return {

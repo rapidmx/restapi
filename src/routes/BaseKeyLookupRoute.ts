@@ -13,7 +13,7 @@ import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { discoverAndMergeKeys, KeyringUpdate } from "../util/KeyringUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 const { Inject } = ObjectDecorators;
-const { Get, Param, Query, User: AuthUser } = RouteDecorators;
+const { Get, Param, Query, RateLimit, User: AuthUser } = RouteDecorators;
 
 /** The wire shape `GET /mailbox/:id/keys/lookup` returns. */
 export type PublicKeyLookupResult = KeyringUpdate;
@@ -89,6 +89,12 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         return { keys: contact.keys ?? [], encryptPreference: contact.encryptPreference, keyConflict: contact.keyConflict };
     }
 
+    // This endpoint drives an outbound DNS lookup plus an HTTPS fetch to a remote, attacker-influenced host
+    // on every cache-miss call (`util/KeyDiscoveryClient.ts`'s `fetchRemoteKeys()`) - unlike
+    // `BaseKeyDiscoveryRoute`'s public endpoint (which already carries `@RateLimit()` for the same reason),
+    // this one had none, making it an unthrottled request-amplification/SSRF-probing primitive for any
+    // authenticated caller with `UPDATE` on a mailbox.
+    @RateLimit()
     @Get("/:id/keys/lookup")
     public async lookup(
         @Param("id") mailboxId: string,
@@ -109,7 +115,7 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         }
 
         const existingMatches: C[] = await this.contactRepo!.find(
-            { mailboxUid: mailbox.uid, ...this.contactEmailQuery(addr) },
+            { mailboxUid: mailbox.uid, limit: 1, ...this.contactEmailQuery(addr) },
             { ignoreACL: true, limit: 1 },
         );
         const existingContact: C | undefined = existingMatches[0];

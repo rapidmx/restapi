@@ -84,6 +84,15 @@ export function parseRapidMxKeyHeader(headerValues: string[], fromAddress: strin
     if (!attrs.type || !attrs.keydata) {
         return undefined;
     }
+    // `Buffer.from(str, "base64")` silently skips any character outside the base64 alphabet rather than
+    // rejecting the input, so two different `keydata` strings (e.g. one with trailing garbage appended) could
+    // otherwise decode to the same certificate while still both appearing "valid" as opaque header text.
+    // Validated as real base64 first, and capped well above any real certificate's encoded size (a P-256 cert
+    // is a few hundred base64 characters; a few KB of headroom covers RSA-4096 with a large extension set)
+    // before ever handing it to the X.509 parser.
+    if (attrs.keydata.length > 8192 || !/^[A-Za-z0-9+/]+={0,2}$/.test(attrs.keydata)) {
+        return undefined;
+    }
 
     let cert: crypto.X509Certificate;
     try {

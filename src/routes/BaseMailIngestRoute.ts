@@ -33,6 +33,15 @@ const { Get, Post, Query, Request, Response } = RouteDecorators;
  * are internal-only — never exposed to the public internet — and gated by a shared bearer secret rather than
  * ordinary user JWT auth, since the caller is the MTA process, not an end user.
  *
+ * **Deployment requirement (RFC 8601 §5):** the MTA MUST delete any `Authentication-Results` header already
+ * present on a message (which a remote sender can forge with arbitrary content, including a fabricated
+ * `dkim=pass`) before adding its own verified result, and MUST stamp its own with the exact `authserv-id`
+ * configured at `mail:security:trusted_authserv_id`. `ScanQueueJob`'s inbound `RapidMX-Key`/receipt processing
+ * (`util/AuthenticationResultsUtils.ts`'s `hasAlignedPassingDkim()`) trusts only an `Authentication-Results`
+ * entry whose `authserv-id` matches that configured value; an MTA that fails to strip a forged pre-existing
+ * instance of the header defeats that gate entirely, since this application has no way to tell a forged
+ * instance from the MTA's own genuine one once both are present on the same message.
+ *
  * This class is DB-agnostic; `mailboxClass`/`ingestQueueClass`/`distributionListClass`/`transportRuleClass`/
  * `domainClass` are supplied by the Mongo/SQL concrete subclasses (`MailIngestRouteMongo`/`MailIngestRouteSQL`), following
  * the same pattern `DefaultAccounts`/`DefaultAccountsMongo` use for a background service spanning multiple

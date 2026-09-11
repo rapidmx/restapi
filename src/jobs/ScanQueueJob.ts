@@ -19,7 +19,7 @@ import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { buildEventIcs, expandOccurrences, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
-import { extractHeaders } from "../util/MimeHeaderUtils.js";
+import { extractHeader, extractHeaders } from "../util/MimeHeaderUtils.js";
 import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification, parseDispositionNotification } from "../util/ReceiptUtils.js";
@@ -200,6 +200,15 @@ export abstract class ScanQueueJob<
     @Config("mail:dns:mx_hostname", "")
     private mxHostname: string = "";
 
+    /** The `authserv-id` this deployment's trusted MTA/milter hop is configured to stamp on its own
+     * `Authentication-Results` header (RFC 8601) - required to gate acceptance of an inbound `RapidMX-Key`
+     * header and of MDN receipts on genuine, aligned DKIM verification (see `util/
+     * AuthenticationResultsUtils.ts`'s `hasAlignedPassingDkim()` and `BaseMailIngestRoute`'s own doc comment
+     * for the corresponding MTA-side requirement). Left unconfigured (`""`), both gates fail closed - no
+     * `Authentication-Results` header is ever trusted - rather than silently accepting any header found. */
+    @Config("mail:security:trusted_authserv_id", "")
+    private trustedAuthservId: string = "";
+
     @Logger
     private logger: any;
 
@@ -358,7 +367,7 @@ export abstract class ScanQueueJob<
         } else if (verdict === "deliver" && result.dispositionNotificationPart) {
             // An inbound MDN receipt is never filed either - only the indicator it stamps onto the original
             // sent message, if any is found - see processReceipt()'s own doc comment.
-            await this.processReceipt(entry, result.dispositionNotificationPart);
+            await this.processReceipt(entry, raw, result.dispositionNotificationPart);
         } else {
             await this.deliverMessage(entry, raw, targetUid, scanResult, result, verdict === "junk");
 
@@ -396,7 +405,7 @@ export abstract class ScanQueueJob<
         // Independent of everything below (filtering, filing, junk classification) - `specs/
         // end-to-end_encryption.md`'s "Only inbound messages are processed, keyed on the From address" rule
         // applies to every delivered message regardless of which folder (or none) it ends up filed into.
-        await this.processInboundRapidMxKeyHeader(entry, raw);
+        await this.processInboundRapidMxKeyHeader(entry, raw, result);
 
         let sanitizedHtmlBlobKey: string | undefined;
         if (result.sanitizedHtml !== undefined) {
@@ -452,7 +461,26 @@ export abstract class ScanQueueJob<
             // check - no mailbox lookup, no `classifyRecipientTier()` query.
             let deliveryReceiptSentAt: Date | undefined;
             let deliveryReceiptPending = false;
-            if (result.dispositionNotificationTo) {
+            // `specs/end-to-end_encryption.md` §Header Integrity: `Disposition-Notification-To` MUST be
+            // DKIM-verified (an unverified header is treated as absent) and MUST be compared against `From`
+            // before a response is generated, so an attacker can't inject an arbitrary redirect address into a
+            // message and turn this mailbox into an MDN reflector. Also gated on RFC 3834 auto-reply
+            // eligibility (`isAutoReplyEligible()`, the same check `maybeSendAutoReply()` uses) - an MDN is
+            // itself an automatic reply and shouldn't be generated for bulk/auto-submitted mail either.
+            if (
+                result.dispositionNotificationTo &&
+                result.fromAddress &&
+                normalizeAddress(result.dispositionNotificationTo) === normalizeAddress(result.fromAddress) &&
+                hasAlignedPassingDkim(
+                    extractHeaders(raw, "Authentication-Results"),
+                    result.fromAddress.split("@")[1] ?? "",
+                    this.trustedAuthservId,
+                ) &&
+                isAutoReplyEligible(entry.envelopeFrom, {
+                    autoSubmittedHeader: result.autoSubmittedHeader,
+                    precedenceHeader: result.precedenceHeader,
+                })
+            ) {
                 const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
                 if (mailbox) {
                     const outcome = await this.maybeSendDeliveryReceipt(
@@ -603,25 +631,48 @@ export abstract class ScanQueueJob<
      * discovered, per the spec's Anti-Downgrade rule - but a brand-new `Contact` is only ever created when a
      * key was actually, successfully discovered; recording `lastMessageSeen` alone is not reason enough to
      * add an address to the mailbox's own address book.
+     *
+     * Keyed on `result.fromAddress` (the parsed `From` header), NOT `entry.envelopeFrom` (the SMTP
+     * `MAIL FROM`) - the spec is explicit twice that this processing is "keyed on the From address", and the
+     * envelope address legitimately diverges from it on forwarded/mailing-list mail. DKIM/DMARC alignment is
+     * likewise defined against `From`, not the envelope, so `hasAlignedPassingDkim()` is checked against
+     * `fromAddress`'s domain here too.
      */
-    private async processInboundRapidMxKeyHeader(entry: Q, raw: Buffer): Promise<void> {
-        const fromAddress: string = entry.envelopeFrom;
-        const fromDomain: string | undefined = fromAddress.split("@")[1];
-        if (!fromDomain) {
+    private async processInboundRapidMxKeyHeader(entry: Q, raw: Buffer, result: ScanPipelineResult): Promise<void> {
+        const fromAddress: string | undefined = result.fromAddress;
+        const fromDomain: string | undefined = fromAddress?.split("@")[1];
+        if (!fromAddress || !fromDomain) {
             return;
         }
 
         let discovered: KeyDiscoveryResponse | undefined;
         const keyHeaders: string[] = extractHeaders(raw, "RapidMX-Key");
-        if (keyHeaders.length > 0 && hasAlignedPassingDkim(extractHeaders(raw, "Authentication-Results"), fromDomain)) {
+        if (
+            keyHeaders.length > 0 &&
+            hasAlignedPassingDkim(extractHeaders(raw, "Authentication-Results"), fromDomain, this.trustedAuthservId)
+        ) {
             const parsed = parseRapidMxKeyHeader(keyHeaders, fromAddress);
             if (parsed) {
-                discovered = { keys: [parsed.publicKey], encryptPreference: { preferEncrypt: parsed.preferEncrypt, lastSeen: Date.now() }, escrow: false };
+                // Anti-Downgrade (spec): the comparison in `KeyringUtils.applyDiscoveredKeys()` is against the
+                // *message's* effective date, not wall-clock time - stamping `Date.now()` here would make that
+                // comparison vacuously true for a replayed/out-of-order message, defeating the whole point of
+                // the check. `Date` header parses to `NaN` for a missing/malformed header; fall back to now
+                // only in that case (a message with no usable date can't be replay-dated anyway).
+                const dateHeader: string | undefined = extractHeader(raw, "Date");
+                const effectiveDate: number = dateHeader ? Date.parse(dateHeader) : NaN;
+                discovered = {
+                    keys: [parsed.publicKey],
+                    encryptPreference: {
+                        preferEncrypt: parsed.preferEncrypt,
+                        lastSeen: Number.isNaN(effectiveDate) ? Date.now() : effectiveDate,
+                    },
+                    escrow: false,
+                };
             }
         }
 
         const existingMatches: C[] = await this.contactRepo!.find(
-            { mailboxUid: entry.mailboxUid, ...this.contactEmailQuery(fromAddress) },
+            { mailboxUid: entry.mailboxUid, limit: 1, ...this.contactEmailQuery(fromAddress) },
             { ignoreACL: true, limit: 1 },
         );
         const existingContact: C | undefined = existingMatches[0];
@@ -694,7 +745,7 @@ export abstract class ScanQueueJob<
      */
     private async maybeRefreshRotatedKey(mailboxUid: string, peerAddress: string): Promise<void> {
         const existingMatches: C[] = await this.contactRepo!.find(
-            { mailboxUid, ...this.contactEmailQuery(peerAddress) },
+            { mailboxUid, limit: 1, ...this.contactEmailQuery(peerAddress) },
             { ignoreACL: true, limit: 1 },
         );
         const existingContact: C | undefined = existingMatches[0];
@@ -1049,7 +1100,7 @@ export abstract class ScanQueueJob<
         try {
             // Rotation Notification (Group E5) - mirrors E4's "announce my own active encrypt key" logic
             // exactly, just riding on the MDN instead of the original outbound message.
-            const activeEncryptKey: PublicKey | undefined = mailbox.keys.find(
+            const activeEncryptKey: PublicKey | undefined = (mailbox.keys ?? []).find(
                 (k) => k.useType === "encrypt" && !k.revokedAt && k.notAfter > Date.now(),
             );
             const composed: Buffer = await buildDispositionNotification({
@@ -1086,7 +1137,22 @@ export abstract class ScanQueueJob<
      * entry whose `recipientAddress` matches this MDN's own `Final-Recipient` (normalized) and stamps its
      * `deliveredAt`/`readAt` - or, if none matches (a `DistributionList` member `send()` could never have
      * pre-seeded, or a message sent before this feature existed), appends a new entry rather than dropping the
-     * update, so the roster still ends up complete.
+     * update, so the roster still ends up complete. That append path is a known, deliberately narrow residual
+     * gap: fully verifying that an appended address was a genuine `DistributionList` member of the original
+     * send would require tracking per-message list-expansion membership, which nothing currently persists -
+     * the DKIM/alignment and uniqueness checks below are what stand between it and abuse in the meantime.
+     *
+     * `specs/end-to-end_encryption.md` §Receipt Verification requires four checks before a receipt is stored,
+     * and this method (together with the DKIM/alignment gate below) is the only place that can enforce them -
+     * `parseDispositionNotification()` only parses RFC 3798 structure, it verifies nothing:
+     *
+     * 1. **DKIM.** The MDN carries a valid DKIM signature from the responding domain.
+     * 2. **Alignment.** The signing domain aligns with the domain of the original recipient.
+     * 3. **Correlation.** `Original-Message-ID` matches a message this server actually sent, from this user,
+     * to that recipient (fully enforced for a pre-seeded recipient; see the append-path note above for the
+     * residual DL case).
+     * 4. **Uniqueness.** No receipt of the same disposition type has already been recorded for that message
+     * and recipient, so a replayed MDN can't rewrite stored state.
      *
      * Authenticity check: RFC 3798 semantics mean `Final-Recipient` is always the *generating* mailbox's own
      * address (each recipient reports its own disposition) - so a genuine MDN's claimed `Final-Recipient` must
@@ -1094,20 +1160,37 @@ export abstract class ScanQueueJob<
      * anyone who can email this mailbox (e.g. a real recipient who legitimately saw the original message's
      * `Message-ID` in their own inbox copy) could forge an MDN claiming an arbitrary `Final-Recipient` -
      * including an address that was never actually sent the message - and have it silently recorded as a real
-     * delivered/read timestamp. A mismatch is dropped exactly like an unresolvable `originalMessageId`.
+     * delivered/read timestamp. A mismatch is dropped exactly like an unresolvable `originalMessageId`. This
+     * check alone is necessary but not sufficient - `entry.envelopeFrom` is the unauthenticated SMTP
+     * `MAIL FROM`, trivially spoofable - which is why check 1/2 (DKIM + alignment) below is required too.
      */
-    private async processReceipt(entry: Q, dispositionNotificationPart: string): Promise<void> {
+    private async processReceipt(entry: Q, raw: Buffer, dispositionNotificationPart: string): Promise<void> {
         const parsed = parseDispositionNotification(dispositionNotificationPart);
         // Without a `Final-Recipient` there is no address to correlate against, append under, or authenticate -
         // nothing useful this method could do.
         if (!parsed || !parsed.dispositionType || !parsed.finalRecipient) {
             return;
         }
-        if (normalizeAddress(parsed.finalRecipient) !== normalizeAddress(entry.envelopeFrom)) {
+        const recipientAddress: string = normalizeAddress(parsed.finalRecipient);
+        if (recipientAddress !== normalizeAddress(entry.envelopeFrom)) {
             this.logger?.warn(
                 `ScanQueueJob: dropping MDN for mailbox ${entry.mailboxUid} whose claimed Final-Recipient ` +
                     `does not match its own envelope sender - possible forgery attempt.`,
             );
+            return;
+        }
+
+        // Receipt Verification checks 1+2: the MDN itself MUST carry a valid DKIM signature whose signing
+        // domain aligns with the responding domain (`recipientAddress`'s own domain, already confirmed above
+        // to equal the envelope sender's). Without this, an MDN is just an ordinary forgeable message and the
+        // Final-Recipient match above proves nothing - the unauthenticated envelope-from used in that
+        // comparison is exactly what a forger controls too.
+        const respondingDomain: string | undefined = recipientAddress.split("@")[1];
+        if (
+            !respondingDomain ||
+            !hasAlignedPassingDkim(extractHeaders(raw, "Authentication-Results"), respondingDomain, this.trustedAuthservId)
+        ) {
+            this.logger?.warn(`ScanQueueJob: dropping unverified/unaligned MDN for mailbox ${entry.mailboxUid}.`);
             return;
         }
 
@@ -1126,12 +1209,17 @@ export abstract class ScanQueueJob<
             return;
         }
 
-        const timestamp: string = new Date().toISOString();
         const roster: MessageReceiptEntry[] = target.receiptStatus ?? [];
-        const recipientAddress: string = parsed.finalRecipient;
-        const existingIndex: number = roster.findIndex((row) => row.recipientAddress === recipientAddress);
-        const stamp: Partial<MessageReceiptEntry> =
-            parsed.dispositionType === "read" ? { readAt: timestamp } : { deliveredAt: timestamp };
+        const existingIndex: number = roster.findIndex((row) => normalizeAddress(row.recipientAddress) === recipientAddress);
+        const stampField: "readAt" | "deliveredAt" = parsed.dispositionType === "read" ? "readAt" : "deliveredAt";
+        if (existingIndex >= 0 && roster[existingIndex][stampField]) {
+            // Uniqueness (check 4): this exact (message, recipient, disposition type) has already been
+            // recorded - a replayed MDN must not be able to rewrite it.
+            return;
+        }
+
+        const timestamp: string = new Date().toISOString();
+        const stamp: Partial<MessageReceiptEntry> = { [stampField]: timestamp };
         const updatedRoster: MessageReceiptEntry[] =
             existingIndex >= 0
                 ? roster.map((row, i) => (i === existingIndex ? { ...row, ...stamp } : row))

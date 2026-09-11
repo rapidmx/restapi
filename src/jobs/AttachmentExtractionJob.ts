@@ -97,15 +97,32 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
     }
 
     private async processAttachment(attachment: A): Promise<void> {
-        const message: M | undefined = await this.messageRepo!.findOne(attachment.messageUid, { ignoreACL: true });
+        // `includeDeleted: true`: `RecoverableRepoUtils.findOne()` filters out a soft-deleted `Message` by
+        // default, and this job's own schedule (`mail:jobs:attachment_extraction:schedule`, every ~20s by
+        // default) means a message can easily be trashed between being received and this job next running.
+        // Without this, `message` comes back `undefined` for a trashed message and the encryption check below
+        // - reasonably reading that as "message not found, nothing to skip" - would fail OPEN and hand a
+        // still-encrypted attachment's ciphertext to `ExtractorRegistry`, exactly what this method exists to
+        // prevent.
+        const message: M | undefined = await this.messageRepo!.findOne(attachment.messageUid, {
+            ignoreACL: true,
+            includeDeleted: true,
+        });
 
         // An attachment belonging to an S/MIME-encrypted message is ciphertext to this server (a real
         // `EnvelopedData` message has no separately-visible attachment at all - see `util/SmimeUtils.ts`'s
         // doc comment - but the message could also legitimately have real attachments once decrypted
         // client-side, which this server must never attempt to read). Skipped exactly like an unsupported
         // MIME type today: `extractedTextBlobKey` is still stamped (empty) so this attachment is never
-        // re-selected by this job forever, without ever handing ciphertext to `ExtractorRegistry`.
-        const text: string | undefined = message?.encrypted
+        // re-selected by this job forever, without ever handing ciphertext to `ExtractorRegistry`. An
+        // unresolvable message (`undefined` even with `includeDeleted: true` - e.g. hard-deleted, or a
+        // dangling reference) fails CLOSED (treated as encrypted, i.e. skipped) rather than open - but a
+        // *found* message with a falsy `encrypted` (`false`, or `null`/`undefined` for a legacy row that
+        // predates this column entirely - see `MessageSQL.encrypted`'s own doc comment on why that can
+        // happen) is still extracted exactly as before: a pre-existing message from before this feature
+        // existed is not encrypted, and failing closed for it too would silently stop indexing every
+        // installation's entire attachment history, not just close the soft-delete race this change targets.
+        const text: string | undefined = !message || message.encrypted
             ? undefined
             : await this.extractorRegistry.extract(attachment.mimeType, await this.blobStore!.get(attachment.blobKey));
 

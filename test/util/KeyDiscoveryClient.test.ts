@@ -202,4 +202,75 @@ describe("fetchRemoteKeys() Tests", () => {
             vi.useRealTimers();
         }
     });
+
+    it("Rejects an IP-literal host outright, never calling fetch, and falls back to any cached response.", async () => {
+        const body = makeDiscoveryResponse({ escrow: true });
+        mockFetch.mockResolvedValueOnce(makeFetchResponse({ json: vi.fn().mockResolvedValue(body) }));
+        await fetchRemoteKeys("mail.example13.com", "alice@example13.com");
+        mockFetch.mockClear();
+
+        const result = await fetchRemoteKeys("127.0.0.1", "alice@example13.com");
+
+        expect(mockFetch).not.toHaveBeenCalled();
+        // Cache key is derived from `host`, so a different (unsafe) host doesn't collide with the cached entry
+        // above - nothing was ever cached for "127.0.0.1" itself.
+        expect(result).toBeUndefined();
+    });
+
+    it("Rejects a host carrying a path/query/fragment injection attempt, never calling fetch.", async () => {
+        const result = await fetchRemoteKeys("evil.example14.com/admin/purge?x=", "alice@example14.com");
+
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(result).toBeUndefined();
+    });
+
+    it("Reads a real streamed response body and parses it once complete (the non-test-double path).", async () => {
+        const body = makeDiscoveryResponse({ escrow: true });
+        const encoded = new TextEncoder().encode(JSON.stringify(body));
+        let sent = false;
+        const stream = new ReadableStream<Uint8Array>({
+            pull(controller) {
+                if (!sent) {
+                    controller.enqueue(encoded);
+                    sent = true;
+                } else {
+                    controller.close();
+                }
+            },
+        });
+        mockFetch.mockResolvedValueOnce({
+            ok: true,
+            status: 200,
+            body: stream,
+            headers: { get: () => null },
+        });
+
+        const result = await fetchRemoteKeys("mail.example15.com", "alice@example15.com");
+
+        expect(result).toEqual(body);
+    });
+
+    it("Falls back to the cached response when a real streamed body exceeds the maximum allowed size.", async () => {
+        const body = makeDiscoveryResponse({ escrow: true });
+        mockFetch.mockResolvedValueOnce(makeFetchResponse({ json: vi.fn().mockResolvedValue(body) }));
+        await fetchRemoteKeys("mail.example16.com", "alice@example16.com");
+
+        const oversized = new Uint8Array(1_000_001);
+        let sent = false;
+        const stream = new ReadableStream<Uint8Array>({
+            pull(controller) {
+                if (!sent) {
+                    controller.enqueue(oversized);
+                    sent = true;
+                } else {
+                    controller.close();
+                }
+            },
+        });
+        mockFetch.mockResolvedValueOnce({ ok: true, status: 200, body: stream, headers: { get: () => null } });
+
+        const second = await fetchRemoteKeys("mail.example16.com", "alice@example16.com");
+
+        expect(second).toEqual(body);
+    });
 });

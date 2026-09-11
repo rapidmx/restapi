@@ -7,6 +7,7 @@
 // test/util/KeyDiscoveryClient.test.ts stub theirs - each test uses a unique domain/address, since both of
 // those modules keep a shared module-level cache across every test in this process.
 import "reflect-metadata";
+import * as nodeCrypto from "crypto";
 import * as x509 from "@peculiar/x509";
 import { applyDiscoveredKeys, discoverAndMergeKeys, type ContactKeyState } from "../../src/util/KeyringUtils.js";
 import type { DnsResolver } from "../../src/dns/DnsResolver.js";
@@ -29,12 +30,66 @@ async function makeCertDer(cn: string): Promise<string> {
     return Buffer.from(cert.rawData).toString("base64");
 }
 
-function makeKey(overrides: Partial<PublicKey> = {}): PublicKey {
+/** Builds two leaf certificates genuinely issued by the same (test-only, self-signed) CA - `makeCertDer()`
+ * alone only ever produces self-signed certs, which `sameIssuingCa()` never treats as "same CA" evidence
+ * regardless of DN (a self-signed certificate's own `issuer` is just an attacker-choosable string in a
+ * certificate the attacker minted themselves - see that function's own doc comment) - these tests need a
+ * real, non-self-signed issuer relationship to exercise the auto-replace path at all. */
+async function makeCaIssuedCertPair(): Promise<{ first: string; second: string }> {
+    const caKeys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    const ca = await x509.X509CertificateGenerator.createSelfSigned({
+        name: "CN=Test Shared CA",
+        notBefore: new Date(),
+        notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+        keys: caKeys,
+        signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+        extensions: [new x509.BasicConstraintsExtension(true, undefined, true)],
+    });
+    async function issueLeaf(cn: string): Promise<string> {
+        const leafKeys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+        const leaf = await x509.X509CertificateGenerator.create({
+            subject: `CN=${cn}`,
+            issuer: ca.subjectName,
+            notBefore: new Date(),
+            notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+            publicKey: leafKeys.publicKey,
+            signingKey: caKeys.privateKey,
+            signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+        });
+        return Buffer.from(leaf.rawData).toString("base64");
+    }
+    return { first: await issueLeaf("leaf-1@example.com"), second: await issueLeaf("leaf-2@example.com") };
+}
+
+// `sanitizeDiscoveredKey()` (`src/util/KeyringUtils.ts`) always recomputes `fingerprint` from the certificate
+// itself rather than trusting an asserted value - this mirrors that exact computation (Node's own
+// `crypto.X509Certificate`, not `@peculiar/x509`'s) so a test can assert against the real, resulting
+// fingerprint of a `makeCertDer()`-built certificate instead of an arbitrary placeholder string.
+function certFingerprint(certDer: string): string {
+    return new nodeCrypto.X509Certificate(Buffer.from(certDer, "base64")).fingerprint256.replace(/:/g, "").toLowerCase();
+}
+
+let uniqueCn = 0;
+
+/**
+ * Builds a `PublicKey` for a test. `publicKey` defaults to a freshly generated *real*, parseable self-signed
+ * certificate (base64 DER) - `applyDiscoveredKeys()` runs every *discovered* key through `sanitizeDiscoveredKey()`,
+ * which drops (never pins) anything that doesn't parse as a real X.509 certificate and always recomputes
+ * `fingerprint` from it, so a discovered-side test key needs real cert bytes and must assert against
+ * `certFingerprint()`'s result, not an arbitrary literal. A test exercising only the *pinned* (existing) side
+ * - never re-validated - may still pass a placeholder `publicKey`/`fingerprint` via `overrides`.
+ */
+async function makeKey(overrides: Partial<PublicKey> = {}): Promise<PublicKey> {
+    const publicKey: string = overrides.publicKey ?? (await makeCertDer(`test-${uniqueCn++}@example.com`));
+    // An explicit `fingerprint` override means the caller is deliberately building a pinned-only (never
+    // re-validated) key, possibly with an intentionally-unparseable `publicKey` - skip recomputing in that
+    // case rather than throwing trying to parse it.
+    const fingerprint: string = overrides.fingerprint ?? certFingerprint(publicKey);
     return {
-        publicKey: "placeholder",
+        publicKey,
         type: "x509",
         useType: "encrypt",
-        fingerprint: "fp-1",
+        fingerprint,
         notBefore: 0,
         notAfter: Date.now() + 1_000_000,
         ...overrides,
@@ -46,8 +101,8 @@ function makeDiscovery(keys: PublicKey[], lastSeen?: number): KeyDiscoveryRespon
 }
 
 describe("applyDiscoveredKeys() Tests", () => {
-    it("TOFU-pins the first key ever observed for a useType, with no conflict, and stamps keysFirstSeen.", () => {
-        const newKey = makeKey({ fingerprint: "fp-new" });
+    it("TOFU-pins the first key ever observed for a useType, with no conflict, and stamps keysFirstSeen.", async () => {
+        const newKey = await makeKey();
         const result = applyDiscoveredKeys(undefined, makeDiscovery([newKey]), 1000, "discovery");
 
         expect(result.keys).toEqual([newKey]);
@@ -55,16 +110,16 @@ describe("applyDiscoveredKeys() Tests", () => {
         expect(result.keysFirstSeen).toBe(1000);
     });
 
-    it("TOFU-pins encrypt and sign keys independently from the same discovery response.", () => {
-        const encryptKey = makeKey({ useType: "encrypt", fingerprint: "fp-enc" });
-        const signKey = makeKey({ useType: "sign", fingerprint: "fp-sign" });
+    it("TOFU-pins encrypt and sign keys independently from the same discovery response.", async () => {
+        const encryptKey = await makeKey({ useType: "encrypt" });
+        const signKey = await makeKey({ useType: "sign" });
         const result = applyDiscoveredKeys(undefined, makeDiscovery([encryptKey, signKey]), 1000, "discovery");
 
         expect(result.keys).toEqual([encryptKey, signKey]);
     });
 
-    it("Is a no-op when the observed key exactly matches the pinned one.", () => {
-        const pinned = makeKey({ fingerprint: "fp-same" });
+    it("Is a no-op when the observed key exactly matches the pinned one.", async () => {
+        const pinned = await makeKey();
         const existing: ContactKeyState = { keys: [pinned], encryptPreference: { preferEncrypt: "mutual", lastSeen: 500 } };
         const result = applyDiscoveredKeys(existing, makeDiscovery([{ ...pinned }], 500), 1000, "discovery");
 
@@ -72,21 +127,21 @@ describe("applyDiscoveredKeys() Tests", () => {
         expect(result.keyConflict).toBeUndefined();
     });
 
-    it("Records a conflict (retaining the pinned key) when a different, still-valid key is observed.", () => {
-        const pinned = makeKey({ fingerprint: "fp-pinned", notAfter: Date.now() + 1_000_000 });
+    it("Records a conflict (retaining the pinned key) when a different, still-valid key is observed.", async () => {
+        const pinned = await makeKey({ notAfter: Date.now() + 1_000_000 });
         const existing: ContactKeyState = { keys: [pinned] };
-        const observed = makeKey({ fingerprint: "fp-different" });
+        const observed = await makeKey();
 
         const result = applyDiscoveredKeys(existing, makeDiscovery([observed]), 2000, "header");
 
         expect(result.keys).toEqual([pinned]);
-        expect(result.keyConflict).toEqual({ observedFingerprint: "fp-different", observedAt: 2000, source: "header" });
+        expect(result.keyConflict).toEqual({ observedFingerprint: observed.fingerprint, observedAt: 2000, source: "header" });
     });
 
-    it("Auto-replaces without a conflict when the pinned key is expired AND the new one shares its issuer.", async () => {
-        const certDer = await makeCertDer("shared-issuer@example.com");
-        const pinned = makeKey({ publicKey: certDer, fingerprint: "fp-old", notAfter: 500 });
-        const observed = makeKey({ publicKey: certDer, fingerprint: "fp-new" });
+    it("Auto-replaces without a conflict when the pinned key is expired AND the new one is genuinely CA-issued sharing its issuer.", async () => {
+        const { first, second } = await makeCaIssuedCertPair();
+        const pinned = await makeKey({ publicKey: first, notAfter: 500 });
+        const observed = await makeKey({ publicKey: second });
 
         const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery");
 
@@ -94,10 +149,10 @@ describe("applyDiscoveredKeys() Tests", () => {
         expect(result.keyConflict).toBeUndefined();
     });
 
-    it("Auto-replaces without a conflict when the pinned key is revoked AND the new one shares its issuer.", async () => {
-        const certDer = await makeCertDer("shared-issuer-2@example.com");
-        const pinned = makeKey({ publicKey: certDer, fingerprint: "fp-old", notAfter: Date.now() + 1_000_000, revokedAt: 999 });
-        const observed = makeKey({ publicKey: certDer, fingerprint: "fp-new" });
+    it("Auto-replaces without a conflict when the pinned key is revoked AND the new one is genuinely CA-issued sharing its issuer.", async () => {
+        const { first, second } = await makeCaIssuedCertPair();
+        const pinned = await makeKey({ publicKey: first, notAfter: Date.now() + 1_000_000, revokedAt: 999 });
+        const observed = await makeKey({ publicKey: second });
 
         const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery");
 
@@ -105,31 +160,94 @@ describe("applyDiscoveredKeys() Tests", () => {
         expect(result.keyConflict).toBeUndefined();
     });
 
-    it("Records a conflict (does not auto-replace) when the pinned key is expired but the issuers differ.", async () => {
+    it("Records a conflict (does not auto-replace) when the pinned key is expired but the issuers genuinely differ.", async () => {
         const pinnedCertDer = await makeCertDer("issuer-a@example.com");
         const observedCertDer = await makeCertDer("issuer-b@example.com");
-        const pinned = makeKey({ publicKey: pinnedCertDer, fingerprint: "fp-old", notAfter: 500 });
-        const observed = makeKey({ publicKey: observedCertDer, fingerprint: "fp-new" });
+        const pinned = await makeKey({ publicKey: pinnedCertDer, notAfter: 500 });
+        const observed = await makeKey({ publicKey: observedCertDer });
 
         const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery");
 
         expect(result.keys).toEqual([pinned]);
-        expect(result.keyConflict?.observedFingerprint).toBe("fp-new");
+        expect(result.keyConflict?.observedFingerprint).toBe(observed.fingerprint);
     });
 
-    it("Treats an unparseable pinned/observed certificate as a conflict rather than throwing.", () => {
-        const pinned = makeKey({ publicKey: "not-a-real-cert", fingerprint: "fp-old", notAfter: 500 });
-        const observed = makeKey({ publicKey: "also-not-a-cert", fingerprint: "fp-new" });
+    it("Records a conflict rather than silently replacing when the pinned key is expired and a self-signed replacement forges the same issuer DN - self-signed is never trusted as 'same CA' evidence, regardless of what the DN claims.", async () => {
+        // The concrete attack `sameIssuingCa()` exists to stop: both certificates claim `CN=shared@example.com`
+        // as their issuer (a plain string, copyable by anyone), but each is independently self-signed by a
+        // different key - a naive issuer-DN string comparison would treat this pair as "same CA" and silently
+        // substitute the pinned key; `checkIssued()` correctly identifies each as self-signed instead.
+        const pinnedCertDer = await makeCertDer("shared@example.com");
+        const forgedCertDer = await makeCertDer("shared@example.com");
+        const pinned = await makeKey({ publicKey: pinnedCertDer, notAfter: 500 });
+        const observed = await makeKey({ publicKey: forgedCertDer });
 
         const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery");
 
         expect(result.keys).toEqual([pinned]);
-        expect(result.keyConflict).toBeDefined();
+        expect(result.keyConflict?.observedFingerprint).toBe(observed.fingerprint);
     });
 
-    it("Anti-Downgrade: a discovered of undefined leaves keys/preference/keysFirstSeen/keyConflict untouched.", () => {
+    it("Records a conflict when the pinned certificate is unparseable, even though the observed one is valid - sameIssuingCa() fails closed rather than throwing.", async () => {
+        const pinned = await makeKey({ publicKey: "not-a-real-cert", fingerprint: "fp-unparseable-pinned", notAfter: 500 });
+        const observed = await makeKey();
+
+        const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery");
+
+        expect(result.keys).toEqual([pinned]);
+        expect(result.keyConflict?.observedFingerprint).toBe(observed.fingerprint);
+    });
+
+    it("Silently drops (never pins, never conflicts) a discovered key whose certificate doesn't parse at all.", async () => {
+        const pinned = await makeKey();
+        const existing: ContactKeyState = { keys: [pinned] };
+        const unparseable: PublicKey = { publicKey: "also-not-a-cert", type: "x509", useType: "encrypt", fingerprint: "fp-whatever", notBefore: 0, notAfter: Date.now() + 1_000_000 };
+
+        const result = applyDiscoveredKeys(existing, makeDiscovery([unparseable]), 1000, "discovery");
+
+        expect(result.keys).toEqual([pinned]);
+        expect(result.keyConflict).toBeUndefined();
+    });
+
+    it("Silently drops a discovered key whose useType isn't 'sign'/'encrypt'.", async () => {
+        const realKey = await makeKey();
+        const bogus: PublicKey = { ...realKey, useType: "decode" as any };
+
+        const result = applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery");
+
+        expect(result.keys).toEqual([]);
+    });
+
+    it("Silently drops a discovered key whose publicKey is missing/empty.", async () => {
+        const realKey = await makeKey();
+        const bogus: PublicKey = { ...realKey, publicKey: "" };
+
+        const result = applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery");
+
+        expect(result.keys).toEqual([]);
+    });
+
+    it("Silently drops a discovered key whose publicKey exceeds the maximum allowed length (oversized-blob DoS guard).", async () => {
+        const realKey = await makeKey();
+        const bogus: PublicKey = { ...realKey, publicKey: "A".repeat(9000) };
+
+        const result = applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery");
+
+        expect(result.keys).toEqual([]);
+    });
+
+    it("Silently drops a discovered key whose notBefore/notAfter aren't finite numbers.", async () => {
+        const realKey = await makeKey();
+        const bogus: PublicKey = { ...realKey, notAfter: NaN };
+
+        const result = applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery");
+
+        expect(result.keys).toEqual([]);
+    });
+
+    it("Anti-Downgrade: a discovered of undefined leaves keys/preference/keysFirstSeen/keyConflict untouched.", async () => {
         const existing: ContactKeyState = {
-            keys: [makeKey()],
+            keys: [await makeKey()],
             encryptPreference: { preferEncrypt: "mutual", lastSeen: 500 },
             keysFirstSeen: 100,
             keyConflict: { observedFingerprint: "x", observedAt: 1, source: "header" },
@@ -162,11 +280,25 @@ describe("applyDiscoveredKeys() Tests", () => {
         expect(result.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 1 });
     });
 
-    it("Preserves an already-set keysFirstSeen rather than overwriting it on a later call.", () => {
-        const existing: ContactKeyState = { keys: [makeKey({ fingerprint: "fp-1" })], keysFirstSeen: 42 };
-        const result = applyDiscoveredKeys(existing, makeDiscovery([makeKey({ fingerprint: "fp-1" })]), 9999, "discovery");
+    it("Preserves an already-set keysFirstSeen rather than overwriting it on a later call.", async () => {
+        const key = await makeKey();
+        const existing: ContactKeyState = { keys: [key], keysFirstSeen: 42 };
+        const result = applyDiscoveredKeys(existing, makeDiscovery([{ ...key }]), 9999, "discovery");
 
         expect(result.keysFirstSeen).toBe(42);
+    });
+
+    it("Caps the number of keys considered from one discovery response, ignoring anything past the limit.", async () => {
+        // `MAX_DISCOVERED_KEYS` (8) - one real cert, repeated past the cap; each entry has the same `useType`,
+        // so only the first ever gets pinned regardless (the useType-indexed merge caps stored state at 2
+        // entries on its own) - this specifically exercises the `.slice()` bound itself running without error
+        // over an oversized array, not a distinguishable stored-state difference.
+        const key = await makeKey();
+        const manyKeys: PublicKey[] = Array.from({ length: 50 }, () => ({ ...key }));
+
+        const result = applyDiscoveredKeys(undefined, makeDiscovery(manyKeys), 1000, "discovery");
+
+        expect(result.keys).toEqual([key]);
     });
 });
 
@@ -201,7 +333,8 @@ describe("discoverAndMergeKeys() Tests", () => {
 
     it("Resolves the peer, fetches its keys, and merges them via applyDiscoveredKeys().", async () => {
         (dnsResolver.resolveTxt as any).mockResolvedValue([["v=RMXv1; id=1; host=mail.participating-2.example.com;"]]);
-        const discovered = makeDiscovery([makeKey({ fingerprint: "fp-remote" })], 100);
+        const remoteKey = await makeKey();
+        const discovered = makeDiscovery([remoteKey], 100);
         mockFetch.mockResolvedValue({
             ok: true,
             status: 200,
@@ -211,7 +344,7 @@ describe("discoverAndMergeKeys() Tests", () => {
 
         const result = await discoverAndMergeKeys(dnsResolver, "alice@participating-2.example.com", undefined, 5000);
 
-        expect(result?.keys).toEqual([makeKey({ fingerprint: "fp-remote" })]);
+        expect(result?.keys).toEqual([remoteKey]);
         expect(result?.keysFirstSeen).toBe(5000);
     });
 });

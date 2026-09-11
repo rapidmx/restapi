@@ -125,12 +125,23 @@ export class ContactSQL extends RecoverableBaseEntity implements Contact {
     @Nullable
     public keys?: PublicKey[];
 
-    @Column({ nullable: true })
+    // `type: "double"`: without an explicit `type`, this framework's persistence layer resolves the column
+    // type from TypeScript's own reflected design type (`Number`), which TypeORM maps to a 32-bit SQL
+    // `integer`/`int` on Postgres/MySQL - max ~2.1 billion, while `Date.now()` (what this column actually
+    // stores) is ~1.79 trillion and rising. Every inbound message from a sender already in this mailbox's
+    // Contacts writes this value unguarded (`ScanQueueJob.persistContactKeyUpdate()`), so on Postgres this
+    // throws "integer out of range" and the whole message fails to deliver - invisible in this repo's test
+    // suite, which runs `better-sqlite3` only (a 64-bit `INTEGER` there regardless of declared width). `double`
+    // (IEEE 754 double precision) exactly represents every integer up to 2^53 - millions of years of epoch-ms
+    // headroom - and, unlike `bigint`, TypeORM hydrates it back as a real JS `number` rather than a `string`
+    // (this framework's `@Column` has no `transformer` option to convert a `bigint` column's string result
+    // back, so `bigint` is not actually usable here without one).
+    @Column({ type: "double", nullable: true })
     @Description("UTC timestamp (epoch ms) at which this contact's keys were first observed (TOFU anchor).")
     @Nullable
     public keysFirstSeen?: number;
 
-    @Column({ nullable: true })
+    @Column({ type: "double", nullable: true })
     @Description("UTC timestamp (epoch ms) of the most recent message observed from this contact.")
     @Nullable
     public lastMessageSeen?: number;

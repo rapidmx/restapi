@@ -1026,6 +1026,9 @@ export enum AuditAction {
     KEY_VAULT_WRAP_ADD = "key_vault.wrap_add",
     KEY_VAULT_WRAP_REMOVE = "key_vault.wrap_remove",
     KEY_VAULT_REKEY = "key_vault.rekey",
+    /** `GET /mailbox/:id/keyvault` - the one key-vault operation that reads wrapped key material (including,
+     * via `masterKeyWraps`, an escrow wrap) rather than writing it. See `BaseKeyVaultRoute.get()`. */
+    KEY_VAULT_READ = "key_vault.read",
 }
 
 /**

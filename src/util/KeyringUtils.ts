@@ -33,9 +33,65 @@ function sameIssuingCa(pinnedCertDer: string, newCertDer: string): boolean {
     try {
         const pinned = new crypto.X509Certificate(Buffer.from(pinnedCertDer, "base64"));
         const fresh = new crypto.X509Certificate(Buffer.from(newCertDer, "base64"));
+        // A self-signed certificate's `issuer` field is just an attacker-chosen string in a certificate the
+        // attacker minted themselves - equal to a pinned certificate's own `issuer` proves nothing. Reject
+        // that case cryptographically (not by comparing `issuer`/`subject` strings, which is the same class
+        // of naive check being replaced here) via `checkIssued()` - Node's binding to OpenSSL's
+        // `X509_check_issued`, which for `cert.checkIssued(cert)` is `true` only when the certificate
+        // genuinely, verifiably signed itself. This is the concrete attack this function exists to stop: wait
+        // for (or induce) the pinned key to expire, mint a self-signed replacement with a copied `issuer` DN,
+        // and get silently substituted with no conflict recorded.
+        if (fresh.checkIssued(fresh) || pinned.checkIssued(pinned)) {
+            return false;
+        }
         return pinned.issuer === fresh.issuer;
     } catch {
         return false;
+    }
+}
+
+/** Bounds how many keys one `KeyDiscoveryResponse` can contribute to a single merge - `applyDiscoveredKeys()`
+ * only ever pins at most one key per `useType` ("sign"/"encrypt") regardless of how many entries a response
+ * contains (see the loop below), so this exists purely to bound processing cost against a hostile/misbehaving
+ * peer's oversized response, not to cap stored state (which the useType-indexed merge already bounds to 2). */
+const MAX_DISCOVERED_KEYS = 8;
+
+/** Generous upper bound, in characters, for a base64-encoded DER certificate - a real P-256 certificate is a
+ * few hundred bytes (~700 base64 characters); this is wide enough for an RSA-4096 certificate with a large
+ * extension set and small enough to block a deliberately oversized blob. */
+const MAX_PUBLIC_KEY_BASE64_LENGTH = 8192;
+
+/**
+ * Validates and normalizes one `PublicKey` from a `KeyDiscoveryResponse` before `applyDiscoveredKeys()` ever
+ * considers pinning it - applied uniformly regardless of whether the response came from a live Discovery
+ * fetch (`util/KeyDiscoveryClient.ts`'s `fetchRemoteKeys()`, an untrusted remote peer's own JSON) or a parsed
+ * `RapidMX-Key` header (`util/RapidMxKeyHeaderUtils.ts`, which already does this same recomputation itself -
+ * redoing it here is deliberate defense in depth for the one call path, Discovery, that didn't).
+ *
+ * `fingerprint` is always recomputed from the certificate itself, never trusted as asserted - it's the one
+ * field the entire TOFU trust model turns on (`specs/end-to-end_encryption.md`: "Used for TOFU pinning and
+ * out-of-band verification"). A peer that serves an attacker's certificate paired with the real certificate's
+ * fingerprint would otherwise defeat out-of-band verification outright: the user reads out a fingerprint that
+ * matches what they were told to expect, while the key actually pinned and used to encrypt is a different one.
+ *
+ * Returns `undefined` (dropped, never pinned) for anything that doesn't parse as a real X.509 certificate,
+ * whose `useType` isn't `"sign"`/`"encrypt"`, or whose `notBefore`/`notAfter` aren't finite numbers.
+ */
+function sanitizeDiscoveredKey(key: PublicKey): PublicKey | undefined {
+    if (key.useType !== "sign" && key.useType !== "encrypt") {
+        return undefined;
+    }
+    if (typeof key.publicKey !== "string" || key.publicKey.length === 0 || key.publicKey.length > MAX_PUBLIC_KEY_BASE64_LENGTH) {
+        return undefined;
+    }
+    if (!Number.isFinite(key.notBefore) || !Number.isFinite(key.notAfter)) {
+        return undefined;
+    }
+    try {
+        const cert = new crypto.X509Certificate(Buffer.from(key.publicKey, "base64"));
+        return { ...key, fingerprint: cert.fingerprint256.replace(/:/g, "").toLowerCase() };
+    } catch {
+        return undefined;
     }
 }
 
@@ -73,7 +129,12 @@ export function applyDiscoveredKeys(
     let conflict: Contact["keyConflict"] = existing?.keyConflict;
     let firstPinnedNow = false;
 
-    for (const discoveredKey of discovered.keys) {
+    const sanitizedKeys: PublicKey[] = (discovered.keys ?? [])
+        .slice(0, MAX_DISCOVERED_KEYS)
+        .map(sanitizeDiscoveredKey)
+        .filter((k): k is PublicKey => k !== undefined);
+
+    for (const discoveredKey of sanitizedKeys) {
         const pinnedIndex: number = resultKeys.findIndex((k) => k.useType === discoveredKey.useType);
         if (pinnedIndex === -1) {
             resultKeys.push(discoveredKey);

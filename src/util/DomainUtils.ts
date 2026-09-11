@@ -44,9 +44,19 @@ export function isReservedDomainName(name: string): boolean {
  * `BaseMailIngestRoute` alike. An empty result means "unconfigured, no restriction" everywhere it's
  * consumed, matching this library's previous empty-`mail:domains` behavior.
  */
+/** Well above any real deployment's domain count - `RepoUtils.find()` defaults to a 100-row page otherwise
+ * (`ModelUtils.buildSearchQuerySQL`'s own default, which ignores `options.limit` and must be baked into the
+ * query object itself - see the identical note on `ScanQueueJob`'s own queries), which would otherwise
+ * silently drop every domain past the 100th from "this server's domains" everywhere that list gates mailbox
+ * creation and recipient-tier classification. */
+const MAX_VERIFIED_DOMAINS = 10_000;
+
 export async function getVerifiedDomainNames(objectFactory: ObjectFactory, domainClass: any): Promise<string[]> {
     const repo = await getDomainRepo(objectFactory, domainClass);
-    const domains = await repo.find({ enabled: true, verified: true }, { ignoreACL: true });
+    const domains = await repo.find({ enabled: true, verified: true, limit: MAX_VERIFIED_DOMAINS } as any, {
+        ignoreACL: true,
+        limit: MAX_VERIFIED_DOMAINS,
+    });
     return domains.map((d: any) => d.name);
 }
 
@@ -57,12 +67,20 @@ export async function getVerifiedDomainNames(objectFactory: ObjectFactory, domai
  * maybeSendReceipt()`/`BaseMessageRoute.send()`/its `update()` override - see `Mailbox.
  * alwaysRequestReceiptInternal`/`autoSendReceiptsInternal` et al.).
  */
-export async function isInternalAddress(objectFactory: ObjectFactory, domainClass: any, address: string): Promise<boolean> {
+export async function isInternalAddress(
+    objectFactory: ObjectFactory,
+    domainClass: any,
+    address: string,
+    verifiedDomainNames?: string[],
+): Promise<boolean> {
     const domain: string | undefined = address.split("@")[1]?.toLowerCase();
     if (!domain) {
         return false;
     }
-    const domains = await getVerifiedDomainNames(objectFactory, domainClass);
+    // `verifiedDomainNames`, when passed, skips the `Domain` query entirely - a caller classifying several
+    // addresses in the same operation (e.g. `BaseMessageRoute.send()` over every recipient) can fetch it once
+    // and reuse it, rather than this function re-querying "this server's domains" from scratch per address.
+    const domains = verifiedDomainNames ?? (await getVerifiedDomainNames(objectFactory, domainClass));
     return domains.includes(domain);
 }
 
@@ -111,8 +129,9 @@ export async function classifyRecipientTier(
     domainClass: any,
     address: string,
     isFederatedPeer: FederatedPeerCheck = neverFederated,
+    verifiedDomainNames?: string[],
 ): Promise<RecipientTier> {
-    if (await isInternalAddress(objectFactory, domainClass, address)) {
+    if (await isInternalAddress(objectFactory, domainClass, address, verifiedDomainNames)) {
         return "same-org";
     }
     return (await isFederatedPeer(address)) ? "federated" : "external";

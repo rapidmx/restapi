@@ -124,7 +124,11 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
     @Description("`true` if the message has one or more attachments.")
     public hasAttachments: boolean = false;
 
-    @Column()
+    // `nullable: true`: added after the table already existed in deployed installations, and this framework's
+    // `@Column` decorator has no SQL-level `DEFAULT` option (see `ColumnOptions`) - without `nullable: true`,
+    // `synchronize: true`'s `ALTER TABLE ... ADD COLUMN ... NOT NULL` fails outright against a populated table
+    // on Postgres/MySQL. A legacy row's `NULL` reads back as falsy, same as this flag's intended default.
+    @Column({ nullable: true })
     @Description("`true` if this message's body is S/MIME (CMS) encrypted.")
     public encrypted: boolean = false;
 

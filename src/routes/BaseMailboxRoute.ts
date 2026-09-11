@@ -24,6 +24,31 @@ import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 const { Auth, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 const { Config } = ObjectDecorators;
 
+/** `Mailbox` fields that only server-side code may set - the CA-issued `keys` (`BaseKeyVaultRoute.enrollKey()`/
+ * `rekey()`) and the address-derived `keyDiscoveryHash` (this route's own `validateUpdate()`/`create()`). A
+ * client setting either directly would let any mailbox owner publish an arbitrary certificate at the public
+ * discovery endpoint - bypassing the CA entirely - or collide their mailbox's discovery hash with another
+ * address's, impersonating it there. Mirrors `BaseContactRoute`'s `DISCOVERY_MANAGED_FIELDS` guard, applied
+ * here for the same reason. `encryptPreference` is deliberately NOT included: unlike `Contact.
+ * encryptPreference` (learned *about a third party* via Discovery, and so never self-asserted), a mailbox's
+ * own `encryptPreference` is a genuine first-person setting ("I want to advertise mutual encryption") the
+ * owner is meant to set directly. Rejected outright (400) rather than silently stripped - same rationale as
+ * `BaseContactRoute`'s identical choice.
+ *
+ * Checked by *value*, not merely by key presence - unlike `BaseContactRoute`'s equivalent guard. A request
+ * body built from a full `Mailbox`-shaped object (as opposed to a hand-built partial patch) legitimately
+ * carries `keys: []` - the class field's own default, not a caller attempting to assert anything - and an
+ * absent/empty value can't bypass the CA regardless; only a genuinely non-empty `keys` array or non-empty
+ * `keyDiscoveryHash` string is ever worth rejecting. */
+function rejectServerManagedFields(obj: Record<string, unknown>): void {
+    if (Array.isArray(obj.keys) && obj.keys.length > 0) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'keys' is managed by the server and cannot be set directly.");
+    }
+    if (typeof obj.keyDiscoveryHash === "string" && obj.keyDiscoveryHash.length > 0) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'keyDiscoveryHash' is managed by the server and cannot be set directly.");
+    }
+}
+
 /** One (name alias, domain) combination the caller could register as their mailbox address — the full
  * cross product of their auth-server name aliases and this server's verified `Domain`s. */
 export interface MailboxAutoProvisionAliasOption {
@@ -181,6 +206,9 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
+        for (const o of objs) {
+            rejectServerManagedFields(o as Record<string, unknown>);
+        }
         if (!isTrusted) {
             for (const o of objs) {
                 if ((o as any).isResource) {
@@ -290,15 +318,61 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     }
 
     /**
-     * Keeps `keyDiscoveryHash` in sync whenever a caller's patch actually touches `primarySmtpAddress` -
-     * `RepoUtils.update()` is a genuine partial patch, so an absent `primarySmtpAddress` means "leave it
-     * alone" and must leave the hash alone too, not recompute it from a value that was never sent.
+     * Single override point for every CRUD update path: `CRUDRoute.update()` runs this via its `@Validate
+     * ("validateUpdate")` decorator, `updateBulk()` runs it once per element via `validateUpdateBulk()`, and
+     * `updateProperty()` calls it explicitly before persisting - see `node_modules/@rapidrest/service-core`'s
+     * `CRUDRoute.js`. Overriding `update()` alone (the previous approach here) missed `updateBulk()` entirely,
+     * since it calls `super.doBulkUpdate()` directly rather than going through `update()` - `validateUpdate()`
+     * is the one hook all three genuinely share.
+     *
+     * Does two things:
+     * 1. Rejects a client-supplied `keys`/`keyDiscoveryHash` outright (`SERVER_MANAGED_FIELDS`, mirroring
+     * `BaseContactRoute`'s identical guard for `Contact`'s own discovery-managed fields).
+     * 2. Keeps `keyDiscoveryHash` in sync whenever a patch actually touches `primarySmtpAddress` -
+     * `RepoUtils.update()`/`updateBulk()` are a genuine partial patch, so an absent `primarySmtpAddress`
+     * means "leave it alone" and must leave the hash alone too, not recompute it from a value that was
+     * never sent. This works for `update()`/`updateBulk()` because the framework validates the *actual*
+     * update object by reference (mutating it here is what `update()`'s own former override relied on
+     * too) - but NOT for `updateProperty()`, which validates a throwaway `{ [propertyName]: obj }` wrapper
+     * `doUpdateProperty()` never actually persists; see this class's own `updateProperty()` override below
+     * for how that path is handled instead.
      */
-    public async update(id: string, obj: UpdateObject<T>, req: HttpRequest, user?: JWTUser): Promise<T> {
+    protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser): Promise<void> {
+        rejectServerManagedFields(obj);
         if (obj.primarySmtpAddress !== undefined) {
             (obj as any).keyDiscoveryHash = computeKeyDiscoveryHash(obj.primarySmtpAddress.split("@")[0]);
         }
-        return super.update(id, obj, req, user);
+        return super.validateUpdate(id, obj, user);
+    }
+
+    /**
+     * `keys`/`keyDiscoveryHash` are rejected outright, same as every other update path (`validateUpdate()`
+     * above) - `updateProperty()` calls `validateUpdate()` itself before this runs, so those two are already
+     * covered; this override exists only for `primarySmtpAddress`, which `validateUpdate()` *can't* keep
+     * `keyDiscoveryHash` in sync for here (see its own doc comment) - redirected to the full `update()` path
+     * instead, which can. `update()`'s underlying `doUpdate()` enforces optimistic-concurrency locking against
+     * `version`, which a single-property PUT's caller never supplies (its own route contract has no such
+     * field) - the record is re-fetched here specifically to supply it, not merely to validate existence.
+     */
+    public async updateProperty(id: string, propertyName: string, obj: any, user?: JWTUser): Promise<T> {
+        if (propertyName === "primarySmtpAddress") {
+            const current: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+            if (!current) {
+                throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+            }
+            return this.update(
+                id,
+                {
+                    uid: id,
+                    primarySmtpAddress: obj,
+                    keyDiscoveryHash: computeKeyDiscoveryHash(String(obj).split("@")[0]),
+                    version: (current as any).version,
+                } as UpdateObject<T>,
+                undefined as unknown as HttpRequest,
+                user,
+            );
+        }
+        return super.updateProperty(id, propertyName, obj, user);
     }
 
     /**

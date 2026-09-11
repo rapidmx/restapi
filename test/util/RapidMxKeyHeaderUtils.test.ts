@@ -105,6 +105,17 @@ describe("parseRapidMxKeyHeader() Tests", () => {
         expect(parseRapidMxKeyHeader([header], "alice@example.com")).toBeUndefined();
     });
 
+    it("Ignores the header when keydata contains characters outside the base64 alphabet.", async () => {
+        const keydata = await makeCertBase64("alice@example.com");
+        const header = `addr=alice@example.com; type=x509; keydata=${keydata}!!not-base64!!`;
+        expect(parseRapidMxKeyHeader([header], "alice@example.com")).toBeUndefined();
+    });
+
+    it("Ignores the header when keydata exceeds the maximum allowed length.", () => {
+        const header = `addr=alice@example.com; type=x509; keydata=${"A".repeat(9000)}`;
+        expect(parseRapidMxKeyHeader([header], "alice@example.com")).toBeUndefined();
+    });
+
     it("Tolerates an empty attribute segment from a stray double semicolon.", async () => {
         const keydata = await makeCertBase64("alice@example.com");
         const header = `addr=alice@example.com;; type=x509; keydata=${keydata}`;

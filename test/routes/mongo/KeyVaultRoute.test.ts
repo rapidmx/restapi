@@ -22,6 +22,9 @@ const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
 });
 
+// `BaseKeyVaultRoute.enrollKey()`'s identity-binding check (`cert.checkEmail(mailboxAddress)`) requires a real
+// `rfc822Name` SAN naming the mailbox's own address, not just a matching CN - added here for every signing
+// cert this file builds.
 async function generateSelfSignedCert(identity: string): Promise<string> {
     const keys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
         "sign",
@@ -33,6 +36,7 @@ async function generateSelfSignedCert(identity: string): Promise<string> {
         notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
         keys,
         signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+        extensions: [new x509.SubjectAlternativeNameExtension([{ type: "email", value: identity }])],
     });
     return cert.toString("pem");
 }
@@ -290,7 +294,10 @@ describe("Route:KeyVaultMongo Tests", () => {
                 .set("Authorization", "jwt " + ownerToken)
                 .send({
                     useType: "sign",
-                    certificate: await generateSelfSignedCert(`other-${mailbox.primarySmtpAddress}`),
+                    // A second, distinct certificate for the same mailbox address (a fresh signing key, not a
+                    // re-enrollment of the first) - the identity-binding check requires the SAN to match the
+                    // mailbox's own address, which a genuinely different identity would now (correctly) fail.
+                    certificate: await generateSelfSignedCert(mailbox.primarySmtpAddress),
                     wrappedKey: { ciphertext: "ct2", nonce: "n2", algorithm: "AES-256-GCM" },
                     masterKeyWraps: [
                         { method: "recovery", ciphertext: "should-be-ignored", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() },
@@ -349,6 +356,18 @@ describe("Route:KeyVaultMongo Tests", () => {
                 .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
                 .set("Authorization", "jwt " + ownerToken)
                 .send({ useType: "sign", certificate: "not a cert", wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects a genuinely valid, parseable certificate for useType 'sign' when its SAN names a different address than the mailbox's own (400) - identity binding, not just parseability.", async () => {
+            const mailbox = await createMailbox();
+            const certificate = await generateSelfSignedCert("someone-else@example.com");
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ useType: "sign", certificate, wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } });
 
             expect(result.status).toBe(400);
         });
@@ -464,10 +483,87 @@ describe("Route:KeyVaultMongo Tests", () => {
 
             expect(result.status).toBe(404);
         });
+
+        it("Rejects an unrecognized wrap method (400).", async () => {
+            const mailbox = await createMailbox();
+            await enrollFirstKey(mailbox);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/wraps`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ method: "carrier-pigeon", ciphertext: "ct", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects a wrap missing a required field (400).", async () => {
+            const mailbox = await createMailbox();
+            await enrollFirstKey(mailbox);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/wraps`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ method: "recovery", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects a wrap whose methodId isn't a string (400).", async () => {
+            const mailbox = await createMailbox();
+            await enrollFirstKey(mailbox);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/wraps`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ method: "passkey", methodId: 12345, ciphertext: "ct", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects a wrap with a non-numeric schemeVersion (400).", async () => {
+            const mailbox = await createMailbox();
+            await enrollFirstKey(mailbox);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/wraps`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ method: "recovery", ciphertext: "ct", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: "not-a-number", createdAt: Date.now() });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects adding a method: 'escrow' wrap through this endpoint (403) - escrow is managed by the compliance/eDiscovery role, not the mailbox owner.", async () => {
+            const mailbox = await createMailbox();
+            await enrollFirstKey(mailbox);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/wraps`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ method: "escrow", ciphertext: "ct", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() });
+
+            expect(result.status).toBe(403);
+        });
+
+        it("Rejects removing a method: 'escrow' wrap through this endpoint (403) - the mailbox owner/delegate must never be able to drop compliance-installed escrow coverage themselves.", async () => {
+            const mailbox = await createMailbox();
+            await enrollFirstKey(mailbox);
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${mailbox.uid}/keyvault/wraps/escrow`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(403);
+        });
     });
 
     describe("PUT /:id/keyvault/rekey", () => {
-        const enrollFirstKey = async function (mailbox: MailboxMongo): Promise<void> {
+        // Returns the mailbox's own resulting `PublicKey` (not just the enroll response's `WrappedPrivateKey`,
+        // which omits `publicKey`/`notBefore`/`notAfter`) - `rekey()` now validates that every entry in its
+        // own `keys` matches an already-enrolled fingerprint with every other field identical (see
+        // `BaseKeyVaultRoute.rekey()`'s own doc comment on why: it closed a CA-bypass path where `rekey()`
+        // used to publish an arbitrary, unvalidated "certificate"), so a test exercising a legitimate rekey
+        // needs the real enrolled `PublicKey` object to send back, not an invented one.
+        const enrollFirstKey = async function (mailbox: MailboxMongo): Promise<any> {
             await request(server.getApplication())
                 .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
                 .set("Authorization", "jwt " + ownerToken)
@@ -479,26 +575,22 @@ describe("Route:KeyVaultMongo Tests", () => {
                         { method: "password", ciphertext: "mkct", nonce: "mkn", salt: "salt", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() },
                     ],
                 });
+            const updated = await mailboxRepo.findOne({ uid: mailbox.uid } as any);
+            return updated!.keys[0];
         };
 
-        it("Atomically replaces wrappedKeys/masterKeyWraps and the mailbox's published keys.", async () => {
+        it("Re-wraps wrappedKeys/masterKeyWraps under a new master key, keeping the already-enrolled key's published fields intact.", async () => {
             const mailbox = await createMailbox();
-            await enrollFirstKey(mailbox);
+            const enrolledKey = await enrollFirstKey(mailbox);
 
-            const newPublicKey = {
-                publicKey: "new-b64",
-                type: "x509",
-                useType: "encrypt" as const,
-                fingerprint: "new-fingerprint",
-                notBefore: Date.now(),
-                notAfter: Date.now() + 1000,
-            };
             const result = await request(server.getApplication())
                 .put(`${baseUrl}/${mailbox.uid}/keyvault/rekey`)
                 .set("Authorization", "jwt " + ownerToken)
                 .send({
-                    keys: [newPublicKey],
-                    wrappedKeys: [{ ciphertext: "new-ct", nonce: "new-n", algorithm: "AES-256-GCM", fingerprint: "new-fingerprint", useType: "encrypt" }],
+                    keys: [enrolledKey],
+                    wrappedKeys: [
+                        { ciphertext: "re-wrapped-ct", nonce: "re-wrapped-n", algorithm: "AES-256-GCM", fingerprint: enrolledKey.fingerprint, useType: "encrypt" },
+                    ],
                     masterKeyWraps: [
                         { method: "recovery", ciphertext: "rc", nonce: "rn", salt: "rs", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() },
                     ],
@@ -506,15 +598,34 @@ describe("Route:KeyVaultMongo Tests", () => {
 
             expect(result.status).toBe(200);
             expect(result.body.wrappedKeys).toHaveLength(1);
-            expect(result.body.wrappedKeys[0].fingerprint).toBe("new-fingerprint");
+            expect(result.body.wrappedKeys[0].fingerprint).toBe(enrolledKey.fingerprint);
+            expect(result.body.wrappedKeys[0].ciphertext).toBe("re-wrapped-ct");
             expect(result.body.masterKeyWraps).toHaveLength(1);
             expect(result.body.masterKeyWraps[0].method).toBe("recovery");
 
             const updatedMailbox = await mailboxRepo.findOne({ uid: mailbox.uid } as any);
-            expect(updatedMailbox?.keys).toEqual([newPublicKey]);
+            expect(updatedMailbox?.keys).toEqual([enrolledKey]);
 
             const entries = await auditLogRepo.find({ action: AuditAction.KEY_VAULT_REKEY }).toArray();
             expect(entries).toHaveLength(1);
+        });
+
+        it("Rejects a rekey that introduces a fingerprint never enrolled via enrollKey (400) - closes the CA-bypass path an unvalidated rekey() used to allow.", async () => {
+            const mailbox = await createMailbox();
+            await enrollFirstKey(mailbox);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${mailbox.uid}/keyvault/rekey`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    keys: [
+                        { publicKey: "forged-b64", type: "x509", useType: "encrypt", fingerprint: "never-enrolled", notBefore: Date.now(), notAfter: Date.now() + 1000 },
+                    ],
+                    wrappedKeys: [],
+                    masterKeyWraps: [],
+                });
+
+            expect(result.status).toBe(400);
         });
 
         it("Returns 404 re-keying a mailbox with no vault yet.", async () => {
@@ -534,6 +645,18 @@ describe("Route:KeyVaultMongo Tests", () => {
             const result = await request(server.getApplication())
                 .put(`${baseUrl}/${mailbox.uid}/keyvault/rekey`)
                 .set("Authorization", "jwt " + otherUserToken)
+                .send({ keys: [], wrappedKeys: [], masterKeyWraps: [] });
+
+            expect(result.status).toBe(403);
+        });
+
+        it("A delegate with only UPDATE access (not the owner) cannot re-key (403) - rekey can permanently destroy the owner's own access, so it requires actual ownership.", async () => {
+            const mailbox = await createMailbox();
+            await enrollFirstKey(mailbox);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${mailbox.uid}/keyvault/rekey`)
+                .set("Authorization", "jwt " + delegateToken)
                 .send({ keys: [], wrappedKeys: [], masterKeyWraps: [] });
 
             expect(result.status).toBe(403);

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { BaseEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
+import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
 import { EncryptionPolicy, PolicyState } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
@@ -27,7 +27,7 @@ const { Column, Entity } = PersistenceDecorators;
     },
     false,
 )
-export class EncryptionPolicyMongo extends BaseEntity implements EncryptionPolicy {
+export class EncryptionPolicyMongo extends BaseMongoEntity implements EncryptionPolicy {
     @Column()
     @Description("Encryption policy for same-organisation recipients.")
     public encryptSameOrg: PolicyState = "optional";

@@ -103,7 +103,11 @@ describe("Route:KeyDiscoveryMongo Tests", () => {
             keys: [publicKey],
         });
 
-        const result = await request(server.getApplication()).get(`${baseUrl}/${mailbox.keyDiscoveryHash}`);
+        // `Host` set explicitly: `lookup()` scopes a `keyDiscoveryHash` match to the domain named by the
+        // request's `Host` header (the spec's own domain-disambiguation mechanism for a multi-domain
+        // deployment - see `BaseKeyDiscoveryRoute`'s own "Domain scoping" doc comment), which supertest's
+        // default `Host` (the test server's own listen address) would not otherwise match.
+        const result = await request(server.getApplication()).get(`${baseUrl}/${mailbox.keyDiscoveryHash}`).set("Host", "example.com");
 
         expect(result.status).toBe(200);
         expect(result.body).toEqual({ encryptPreference: { preferEncrypt: "mutual", lastSeen: 100 }, keys: [publicKey], escrow: false });
@@ -130,7 +134,7 @@ describe("Route:KeyDiscoveryMongo Tests", () => {
             }),
         );
 
-        const result = await request(server.getApplication()).get(`${baseUrl}/${mailbox.keyDiscoveryHash}`);
+        const result = await request(server.getApplication()).get(`${baseUrl}/${mailbox.keyDiscoveryHash}`).set("Host", "example.com");
 
         expect(result.body.escrow).toBe(true);
     });
@@ -147,7 +151,7 @@ describe("Route:KeyDiscoveryMongo Tests", () => {
             }),
         );
 
-        const result = await request(server.getApplication()).get(`${baseUrl}/${mailbox.keyDiscoveryHash}`);
+        const result = await request(server.getApplication()).get(`${baseUrl}/${mailbox.keyDiscoveryHash}`).set("Host", "example.com");
 
         expect(result.body.escrow).toBe(false);
     });

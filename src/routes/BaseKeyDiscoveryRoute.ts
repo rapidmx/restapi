@@ -43,11 +43,18 @@ const NOT_PUBLISHED_RESPONSE = {
  * plain boolean) is its own deferred follow-up roadmap - this is only the boolean the spec's current "Public
  * Endpoint" section already requires, unaffected by that deferral.
  *
- * **Timing note, not glossed over**: the not-found and no-keys-published cases both pay the identical primary
- * cost (a `Mailbox` lookup by `keyDiscoveryHash`), which is the dominant cost and the one real implementations
- * of WKD-style endpoints actually control for. The found-mailbox path pays one additional `KeyVault` lookup
- * the not-found path skips (there is no `mailboxUid` to query by) - a real, if second-order, residual timing
- * differential this pass does not attempt to mask with artificial padding.
+ * **Timing.** `buildResponse()` always performs exactly one `KeyVault` lookup, even when no mailbox was found
+ * (using a `mailboxUid` no real mailbox can ever have) - so the not-found and no-keys-published cases pay the
+ * identical number/shape of DB round trips, closing the timing side channel an attacker could otherwise use
+ * to test candidate addresses against this "indistinguishable" endpoint (the spec calls this out explicitly:
+ * hashing the local part alone does not stop candidate testing, only raises its cost).
+ *
+ * **Domain scoping.** `keyDiscoveryHash` hashes the local part only (WKD-style) - the spec places the domain
+ * in the request's `Host` header instead, specifically so a multi-domain deployment doesn't collide two
+ * different mailboxes (`ceo@acme.com` / `ceo@contoso.com`) sharing the same local part onto the same lookup.
+ * `keyDiscoveryHash` is therefore not, on its own, unique - `lookup()` fetches every mailbox matching the hash
+ * and picks the one whose `primarySmtpAddress` domain matches `Host`, rather than trusting an arbitrary first
+ * match (which would let a peer querying `mail.acme.com` be served `ceo@contoso.com`'s keys).
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -83,12 +90,24 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
     }
 
     private async buildResponse(mailbox: M | undefined): Promise<typeof NOT_PUBLISHED_RESPONSE> {
+        // Always exactly one `KeyVault` lookup, found or not (see this class's own "Timing" doc comment) - a
+        // mailbox `uid` is derived from a real address (`BaseMailboxRoute.create()`), so `""` can never
+        // collide with a genuine one, and querying by it simply returns no rows.
+        const vaults: K[] = await this.keyVaultRepo!.find({ mailboxUid: mailbox?.uid ?? "" } as any, {
+            ignoreACL: true,
+            limit: 1,
+        });
         if (!mailbox) {
             return NOT_PUBLISHED_RESPONSE;
         }
-        const vaults: K[] = await this.keyVaultRepo!.find({ mailboxUid: mailbox.uid } as any, { ignoreACL: true, limit: 1 });
         const escrow: boolean = !!vaults[0]?.masterKeyWraps.some((w) => w.method === "escrow");
-        return { encryptPreference: mailbox.encryptPreference, keys: mailbox.keys, escrow };
+        return { encryptPreference: mailbox.encryptPreference ?? NOT_PUBLISHED_RESPONSE.encryptPreference, keys: mailbox.keys ?? [], escrow };
+    }
+
+    /** Lowercases and strips any `:port` suffix from a `Host` header value - `req.headers.host` on an
+     * HTTP/1.1 request, or the `:authority` pseudo-header's value as `HttpRequest` normalizes it for HTTP/2. */
+    private hostDomain(req: HttpRequest): string {
+        return (req.headers["host"] ?? "").toString().split(":")[0].toLowerCase();
     }
 
     @RateLimit()
@@ -96,8 +115,16 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
     public async lookup(@Param("hash") hash: string, @Request req: HttpRequest, @Response res: HttpResponse): Promise<void> {
         await this.init();
 
-        const matches: M[] = await this.mailboxRepo!.find({ keyDiscoveryHash: hash } as any, { ignoreACL: true, limit: 1 });
-        const body = await this.buildResponse(matches[0]);
+        // `keyDiscoveryHash` hashes the local part only - not unique across domains on a multi-domain
+        // deployment (see this class's own "Domain scoping" doc comment) - so every match is fetched and
+        // narrowed to the one whose address domain matches the requested `Host`, rather than trusting
+        // whichever row a bare `limit: 1` happens to return first. Bounded (not unbounded) since a hash
+        // collision within one deployment should only ever be a handful of rows at most - a large match count
+        // would itself be a signal something is wrong, not a case worth paying for with an unbounded scan.
+        const candidates: M[] = await this.mailboxRepo!.find({ keyDiscoveryHash: hash } as any, { ignoreACL: true, limit: 20 });
+        const hostDomain: string = this.hostDomain(req);
+        const match: M | undefined = candidates.find((m) => m.primarySmtpAddress?.split("@")[1]?.toLowerCase() === hostDomain);
+        const body = await this.buildResponse(match);
 
         const etag = `"${crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")}"`;
         res.setHeader("etag", etag).setHeader("cache-control", `max-age=${this.maxAgeSeconds}`);

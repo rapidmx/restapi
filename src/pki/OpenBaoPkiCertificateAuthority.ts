@@ -68,7 +68,38 @@ export class OpenBaoPkiCertificateAuthority implements EncryptionCertificateAuth
     @Logger
     private logger: any;
 
+    /** Serializes `recordSerial()` calls within this process - see that method's own doc comment. */
+    private serialMapQueue: Promise<unknown> = Promise.resolve();
+
+    /** `mail:pki:openbao:address` defaults to loopback, which is a safe default, but nothing previously
+     * stopped it from being pointed at a remote, non-TLS address - `request()` always sends `X-Vault-Token`
+     * (a live PKI-signing credential) as a plain header, so a plaintext `http://` address anywhere off
+     * loopback would leak that token to the network on every call. Rejects anything else: a non-`https://`
+     * scheme is only ever acceptable talking to this same host. */
+    private assertSafeAddress(): void {
+        let parsed: URL;
+        try {
+            parsed = new URL(this.address);
+        } catch {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, `mail:pki:openbao:address ('${this.address}') is not a valid URL.`);
+        }
+        if (parsed.protocol === "https:") {
+            return;
+        }
+        const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
+        if (parsed.protocol === "http:" && loopbackHosts.has(parsed.hostname)) {
+            return;
+        }
+        throw new ApiError(
+            ApiErrors.INTERNAL_ERROR,
+            500,
+            "mail:pki:openbao:address must use https:// unless it targets loopback - refusing to send the " +
+                "configured Vault token over plaintext HTTP to a non-loopback host.",
+        );
+    }
+
     private async request<T>(urlPath: string, body: Record<string, unknown>): Promise<T> {
+        this.assertSafeAddress();
         const controller = new AbortController();
         const timeoutHandle = setTimeout(() => controller.abort(), this.timeoutMs);
         let response: Response;
@@ -108,11 +139,25 @@ export class OpenBaoPkiCertificateAuthority implements EncryptionCertificateAuth
         }
     }
 
+    /**
+     * Read-modify-write against the serial map file - queued behind `serialMapQueue` so two `issue()` calls
+     * completing concurrently *within this process* can't race (the second read observing the file before the
+     * first's write lands, then overwriting it and dropping the first's entry - which would later make
+     * `revoke()` 404 for a certificate that really was issued). This closes the in-process race; it does not
+     * protect against two separate OS processes writing the same path (would need real file locking, e.g.
+     * `flock`/`proper-lockfile` - out of scope for this deployment's usual one-process-per-PKI-config shape).
+     */
     private async recordSerial(fingerprint: string, serialNumber: string): Promise<void> {
-        const map: Record<string, string> = await this.loadSerialMap();
-        map[fingerprint] = serialNumber;
-        await fs.mkdir(path.dirname(this.serialMapPath), { recursive: true });
-        await fs.writeFile(this.serialMapPath, JSON.stringify(map), { mode: 0o600 });
+        const next = this.serialMapQueue.then(async () => {
+            const map: Record<string, string> = await this.loadSerialMap();
+            map[fingerprint] = serialNumber;
+            await fs.mkdir(path.dirname(this.serialMapPath), { recursive: true });
+            await fs.writeFile(this.serialMapPath, JSON.stringify(map), { mode: 0o600 });
+        });
+        // Swallow a failure here so it doesn't poison the queue for the *next* call - the failure still
+        // propagates to `next`'s own caller via the `await next` below.
+        this.serialMapQueue = next.catch(() => undefined);
+        await next;
     }
 
     public async issue(identity: string, csr: string): Promise<IssuedCertificate> {
