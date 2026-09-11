@@ -11,6 +11,7 @@ export * from "./BaseCalendarEventRoute.js";
 export * from "./BaseCalendarShareLinkRoute.js";
 export * from "./BaseDistributionListRoute.js";
 export * from "./BaseDomainRoute.js";
+export * from "./BaseEncryptionPolicyRoute.js";
 export * from "./BaseFolderRoute.js";
 export * from "./BaseMailboxRoute.js";
 export * from "./BaseMailIngestRoute.js";

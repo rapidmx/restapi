@@ -10,6 +10,7 @@ export * from "./ContactListSQL.js";
 export * from "./DeviceSyncStateSQL.js";
 export * from "./DistributionListSQL.js";
 export * from "./DomainSQL.js";
+export * from "./EncryptionPolicySQL.js";
 export * from "./FocusedInboxOverrideSQL.js";
 export * from "./FolderSQL.js";
 export * from "./IngestQueueEntrySQL.js";

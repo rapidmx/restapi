@@ -10,6 +10,7 @@ export * from "./ContactListMongo.js";
 export * from "./DeviceSyncStateMongo.js";
 export * from "./DistributionListMongo.js";
 export * from "./DomainMongo.js";
+export * from "./EncryptionPolicyMongo.js";
 export * from "./FocusedInboxOverrideMongo.js";
 export * from "./FolderMongo.js";
 export * from "./IngestQueueEntryMongo.js";

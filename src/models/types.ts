@@ -76,6 +76,28 @@ export interface KeyDiscoveryResponse {
 }
 
 /**
+ * The three encryption-policy states `specs/end-to-end_encryption.md`'s "Encryption Policy States" section
+ * requires - deliberately three, not a boolean: `optional` ("not by default") and `prohibited` ("not
+ * allowed") are materially different administrative intents (privileged/legal-hold communication needs
+ * `optional` even when routine encryption is otherwise off; supervisory-review obligations need
+ * `prohibited`, which a plain "off" setting can't distinguish from `optional`).
+ */
+export type PolicyState = "automatic" | "optional" | "prohibited";
+
+/**
+ * The system-wide encryption policy, configured independently per recipient tier (see `util/DomainUtils.ts`'s
+ * `RecipientTier`) - a singleton row, one per deployment, admin-editable via `PUT` and readable by any
+ * authenticated user (a compose UI needs it to decide what encryption controls to offer, not just an admin).
+ * The separate digital-signing enable/disable toggle is a plain deployment `@Config` boolean, not part of
+ * this entity - the spec only requires tri-state granularity for *encryption*, not signing.
+ */
+export interface EncryptionPolicy extends BaseEntity {
+    encryptSameOrg: PolicyState;
+    encryptFederated: PolicyState;
+    encryptExternal: PolicyState;
+}
+
+/**
  * Defines a single mailbox belonging to a `User`. A mailbox is the root of a user's Folder hierarchy and the
  * unit that MAPI/EAS clients log on to.
  *
@@ -878,6 +900,7 @@ export enum AuditAction {
     DOMAIN_DELETE = "domain.delete",
     DOMAIN_VERIFIED = "domain.verified",
     BRANDING_UPDATE = "branding.update",
+    ENCRYPTION_POLICY_UPDATE = "encryption_policy.update",
 }
 
 /**
