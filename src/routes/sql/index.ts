@@ -14,6 +14,7 @@ export * from "./FocusedInboxOverrideRouteSQL.js";
 export * from "./FolderRouteSQL.js";
 export * from "./IngestQueueRouteSQL.js";
 export * from "./KeyDiscoveryRouteSQL.js";
+export * from "./KeyLookupRouteSQL.js";
 export * from "./KeyVaultRouteSQL.js";
 export * from "./MailboxRouteSQL.js";
 export * from "./MailFilterRuleRouteSQL.js";

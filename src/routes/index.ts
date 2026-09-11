@@ -15,6 +15,7 @@ export * from "./BaseDomainRoute.js";
 export * from "./BaseEncryptionPolicyRoute.js";
 export * from "./BaseFolderRoute.js";
 export * from "./BaseKeyDiscoveryRoute.js";
+export * from "./BaseKeyLookupRoute.js";
 export * from "./BaseKeyVaultRoute.js";
 export * from "./BaseMailboxRoute.js";
 export * from "./BaseMailIngestRoute.js";
