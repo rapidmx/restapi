@@ -14,10 +14,14 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import * as x509 from "@peculiar/x509";
 import * as acme from "acme-client";
+import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
+import { BlobStore } from "../blob/BlobStore.js";
+import { ScanPipeline } from "../scan/ScanPipeline.js";
+import { scanAndRelay } from "../util/MailSendUtils.js";
 import { EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
-const { Config, Logger } = ObjectDecorators;
+const { Config, Inject, Logger } = ObjectDecorators;
 
 x509.cryptoProvider.set(crypto);
 
@@ -27,6 +31,10 @@ interface PendingEnrollment {
     identity: string;
     csr: string;
     orderUrl: string;
+    /** The order's `finalize` URL - `finalizeOrder()` needs this in addition to `orderUrl` itself (see
+     * `advanceEnrollment()`), and unlike `orderUrl`/`challengeUrl` it isn't derivable from anything else
+     * this record already keeps. */
+    orderFinalizeUrl: string;
     authorizationUrl: string;
     challengeUrl: string;
     /** The `from` address the CA's own challenge email will arrive from - `recordChallengeToken()`'s
@@ -47,6 +55,9 @@ interface PendingEnrollment {
      * Computed once by `recordChallengeToken()`; a later piece of this feature sends the reply email
      * and drives `completeChallenge()`/finalize once this is set. */
     digest?: string;
+    /** Set once the reply email has actually been sent and `completeChallenge()` called - `advanceEnrollment()`'s
+     * cue to stop resending the reply and start polling the order/authorization instead. */
+    replySentAt?: string;
     certificate?: string;
     error?: string;
     createdAt: string;
@@ -103,6 +114,17 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
 
     @Logger
     private logger: any;
+
+    /** Same DI tokens `ScanQueueJob`/`BaseMessageRoute` already consume for `MailSendUtils.scanAndRelay()` -
+     * needed here to actually send the RFC 8823 reply email `advanceEnrollment()` composes. */
+    @Inject("MailTransport")
+    private mailTransport?: any;
+
+    @Inject(ScanPipeline)
+    private scanPipeline?: ScanPipeline;
+
+    @Inject("BlobStore")
+    private blobStore?: BlobStore;
 
     private accountKeyPath(): string {
         return path.join(this.storeDir, "account.key.pem");
@@ -218,6 +240,7 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
             identity,
             csr,
             orderUrl: order.url,
+            orderFinalizeUrl: order.finalize,
             authorizationUrl: authorization.url,
             challengeUrl: challenge.url,
             challengeFrom: challenge.from,
@@ -325,5 +348,86 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
         const store: Record<string, PendingEnrollment> = await this.loadStore();
         const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
         return { status: enrollment.status, certificate: enrollment.certificate, error: enrollment.error };
+    }
+
+    /**
+     * Advances `enrollmentId` by exactly one state-machine step, then returns - never blocks waiting on
+     * the CA (unlike `acme-client`'s own `waitForValidStatus()`, deliberately not used here), and is
+     * always safe to call again later (a background driver job, this feature's own follow-on piece, is
+     * expected to call this repeatedly for every non-terminal enrollment until it reaches `"issued"`/
+     * `"failed"`). A no-op (returns immediately) when there's nothing yet to do:
+     * - `status !== "pending"` - already terminal.
+     * - `digest === undefined` - still waiting on `recordChallengeToken()` (the challenge email hasn't
+     * arrived/correlated yet).
+     *
+     * The one step taken, in order:
+     * 1. `replySentAt === undefined`: compose and send the RFC 8823 reply email (`MailComposer` +
+     * `scanAndRelay()`, matching this codebase's own established outbound-mail pattern), then notify
+     * the CA via `completeChallenge()` - both must succeed together, so `replySentAt` is only
+     * persisted afterward, and a failure here leaves the enrollment exactly as it was for a later
+     * retry (never a reply sent with no corresponding `completeChallenge()` call, or vice versa).
+     * 2. Otherwise, re-fetch the order (`getOrder()`, a plain single GET - not a retrying wait) and
+     * branch on its `status`: `"invalid"` marks this enrollment `"failed"`; `"pending"`/`"processing"`
+     * does nothing (still waiting on the CA); `"ready"` finalizes with the original CSR; `"valid"`
+     * downloads the certificate and marks this enrollment `"issued"`.
+     */
+    public async advanceEnrollment(enrollmentId: string): Promise<void> {
+        const store: Record<string, PendingEnrollment> = await this.loadStore();
+        const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+        if (enrollment.status !== "pending" || enrollment.digest === undefined) {
+            return;
+        }
+
+        const client: acme.Client = await this.ensureAccount();
+
+        if (enrollment.replySentAt === undefined) {
+            await this.sendChallengeReply(enrollment);
+            await client.completeChallenge({ url: enrollment.challengeUrl, status: "pending" } as any);
+            enrollment.replySentAt = new Date().toISOString();
+            await this.saveStore(store);
+            return;
+        }
+
+        const order: acme.Order = await client.getOrder({ url: enrollment.orderUrl } as any);
+        if (order.status === "invalid") {
+            enrollment.status = "failed";
+            enrollment.error = order.error ? JSON.stringify(order.error) : "The certificate authority marked this order invalid.";
+            await this.saveStore(store);
+        } else if (order.status === "ready") {
+            await client.finalizeOrder({ url: enrollment.orderUrl, finalize: enrollment.orderFinalizeUrl } as any, enrollment.csr);
+            // Finalizing transitions the order to "processing" server-side - the next call to this method
+            // re-fetches and observes that, no local state to persist here.
+        } else if (order.status === "valid") {
+            const certificate: string = await client.getCertificate({ url: enrollment.orderUrl, status: "valid" } as any);
+            enrollment.status = "issued";
+            enrollment.certificate = certificate;
+            await this.saveStore(store);
+        }
+        // "pending"/"processing": still waiting on the CA - nothing to do until the next call.
+    }
+
+    /**
+     * Composes and sends the RFC 8823 reply email exactly per spec: `To` is the challenge email's own
+     * `Reply-To` (falling back to its `From`, already resolved into `enrollment.replyTo` by
+     * `recordChallengeToken()`), `Subject` is `Re: ` plus the challenge's own subject (the RFC permits,
+     * without requiring, a reply prefix), `In-Reply-To` is the challenge's `Message-ID`, and the
+     * `text/plain` body carries the digest inside the exact `BEGIN`/`END ACME RESPONSE` marker lines the
+     * CA parses for. Sent via `scanAndRelay()` (not a raw `mailTransport.send()`) since, unlike a
+     * best-effort notification (`sendRecallReport()`'s own precedent), this is the one message a failure
+     * to relay would silently stall the entire enrollment on.
+     */
+    private async sendChallengeReply(enrollment: PendingEnrollment): Promise<void> {
+        const composed: Buffer = await new MailComposer({
+            from: enrollment.identity,
+            to: enrollment.replyTo,
+            subject: `Re: ${enrollment.challengeSubject}`,
+            inReplyTo: enrollment.challengeMessageId,
+            references: enrollment.challengeMessageId,
+            text: `-----BEGIN ACME RESPONSE-----\n${enrollment.digest}\n-----END ACME RESPONSE-----\n`,
+        })
+            .compile()
+            .build();
+
+        await scanAndRelay(composed, enrollment.identity, [enrollment.replyTo!], this.scanPipeline!, this.mailTransport, this.blobStore!);
     }
 }

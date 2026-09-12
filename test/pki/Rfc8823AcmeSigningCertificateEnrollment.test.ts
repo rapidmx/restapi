@@ -16,6 +16,8 @@ import * as path from "path";
 import * as x509 from "@peculiar/x509";
 import { Rfc8823AcmeSigningCertificateEnrollment } from "../../src/pki/Rfc8823AcmeSigningCertificateEnrollment.js";
 import { EnrollmentResult } from "../../src/pki/SigningCertificateEnrollment.js";
+import { ScanPipeline } from "../../src/scan/ScanPipeline.js";
+import { AvVerdict, SpamVerdict } from "../../src/models/types.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -38,6 +40,13 @@ async function generateCsr(identity: string): Promise<string> {
 class FakeAcmeClient {
     public static createAccountCallCount = 0;
     public static challengeOverride: any = undefined;
+    /** Controls what `getOrder()` reports on the next call - tests drive `advanceEnrollment()`'s state
+     * machine by mutating this between calls. */
+    public static orderStatus = "pending";
+    public static orderErrorDetail: boolean = true;
+    public static completeChallengeCallCount = 0;
+    public static finalizeCallCount = 0;
+    public static certificatePem = "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n";
 
     constructor(public opts: any) {}
 
@@ -84,6 +93,29 @@ class FakeAcmeClient {
         }
         return `${challenge.token}.test-account-thumbprint`;
     }
+
+    public async completeChallenge(challenge: any): Promise<any> {
+        FakeAcmeClient.completeChallengeCallCount++;
+        return { ...challenge, status: "processing" };
+    }
+
+    public async getOrder(order: any): Promise<any> {
+        return {
+            url: order.url,
+            status: FakeAcmeClient.orderStatus,
+            error: FakeAcmeClient.orderStatus === "invalid" && FakeAcmeClient.orderErrorDetail ? { detail: "test failure" } : undefined,
+            certificate: FakeAcmeClient.orderStatus === "valid" ? "https://acme.test/cert/1" : undefined,
+        };
+    }
+
+    public async finalizeOrder(order: any, _csr: any): Promise<any> {
+        FakeAcmeClient.finalizeCallCount++;
+        return { url: order.url, status: "processing" };
+    }
+
+    public async getCertificate(_order: any): Promise<string> {
+        return FakeAcmeClient.certificatePem;
+    }
 }
 
 class TestEnrollment extends Rfc8823AcmeSigningCertificateEnrollment {
@@ -107,8 +139,19 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
     beforeEach(() => {
         FakeAcmeClient.createAccountCallCount = 0;
         FakeAcmeClient.challengeOverride = undefined;
+        FakeAcmeClient.orderStatus = "pending";
+        FakeAcmeClient.orderErrorDetail = true;
+        FakeAcmeClient.completeChallengeCallCount = 0;
+        FakeAcmeClient.finalizeCallCount = 0;
         enrollment = new TestEnrollment();
         (enrollment as any).storeDir = path.join(tmpDir, `store-${Math.random()}`);
+
+        const pipeline = new ScanPipeline();
+        (pipeline as any).spamScanProvider = { name: "test-spam", scoreMessage: async () => ({ score: 0, verdict: SpamVerdict.CLEAN, symbols: [] }) };
+        (pipeline as any).avScanProvider = { name: "test-av", scanBuffer: async () => ({ verdict: AvVerdict.CLEAN }) };
+        (enrollment as any).scanPipeline = pipeline;
+        (enrollment as any).mailTransport = { send: vi.fn().mockResolvedValue({ accepted: ["x"], rejected: [] }) };
+        (enrollment as any).blobStore = { put: vi.fn().mockResolvedValue(undefined) };
     });
 
     it("Reports its own name.", () => {
@@ -333,5 +376,120 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
         expect(resultB.enrollmentId).toBeTruthy();
         await expect(fs.access(path.join((enrollment as any).storeDir, "account.key.pem"))).resolves.toBeUndefined();
         await expect(fs.access(path.join((enrollment as any).storeDir, "account.url"))).resolves.toBeUndefined();
+    });
+
+    describe("advanceEnrollment()", () => {
+        async function seedReadyEnrollment(): Promise<string> {
+            const { enrollmentId } = await enrollment.startEnrollment("advance@example.com", await generateCsr("advance@example.com"));
+            await enrollment.recordChallengeToken(enrollmentId, "token-part-1", "reply-to@acme.test", "<challenge@acme.test>", "ACME: token-part-1");
+            return enrollmentId;
+        }
+
+        it("Is a no-op when the enrollment is already terminal.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("terminal@example.com", await generateCsr("terminal@example.com"));
+            const storePath = path.join((enrollment as any).storeDir, "enrollments.json");
+            const store = JSON.parse(await fs.readFile(storePath, "utf-8"));
+            store[enrollmentId].status = "issued";
+            await fs.writeFile(storePath, JSON.stringify(store));
+
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            expect(FakeAcmeClient.completeChallengeCallCount).toBe(0);
+            expect((enrollment as any).mailTransport.send).not.toHaveBeenCalled();
+        });
+
+        it("Is a no-op when the challenge email hasn't been correlated yet (no digest).", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("nodigest@example.com", await generateCsr("nodigest@example.com"));
+
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            expect(FakeAcmeClient.completeChallengeCallCount).toBe(0);
+            expect((enrollment as any).mailTransport.send).not.toHaveBeenCalled();
+            await expect(enrollment.checkStatus(enrollmentId)).resolves.toEqual({ status: "pending", certificate: undefined, error: undefined });
+        });
+
+        it("Sends the RFC 8823 reply email and calls completeChallenge() exactly once, then persists replySentAt.", async () => {
+            const enrollmentId = await seedReadyEnrollment();
+
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            expect((enrollment as any).mailTransport.send).toHaveBeenCalledTimes(1);
+            const sentRaw: Buffer = (enrollment as any).mailTransport.send.mock.calls[0][0].raw;
+            const sentText = sentRaw.toString("utf-8");
+            expect(sentText).toContain("-----BEGIN ACME RESPONSE-----");
+            expect(sentText).toContain("-----END ACME RESPONSE-----");
+            expect(sentText).toMatch(/Subject: Re: ACME: token-part-1/);
+            expect(FakeAcmeClient.completeChallengeCallCount).toBe(1);
+
+            const storePath = path.join((enrollment as any).storeDir, "enrollments.json");
+            const store = JSON.parse(await fs.readFile(storePath, "utf-8"));
+            expect(store[enrollmentId].replySentAt).toBeTruthy();
+
+            // Calling again after the reply was already sent must not resend it - the next state
+            // transition (order polling) takes over instead.
+            await enrollment.advanceEnrollment(enrollmentId);
+            expect((enrollment as any).mailTransport.send).toHaveBeenCalledTimes(1);
+        });
+
+        it("Leaves the enrollment pending while the order is still pending/processing.", async () => {
+            const enrollmentId = await seedReadyEnrollment();
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            FakeAcmeClient.orderStatus = "processing";
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            await expect(enrollment.checkStatus(enrollmentId)).resolves.toEqual({ status: "pending", certificate: undefined, error: undefined });
+            expect(FakeAcmeClient.finalizeCallCount).toBe(0);
+        });
+
+        it("Finalizes the order once it reaches 'ready'.", async () => {
+            const enrollmentId = await seedReadyEnrollment();
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            FakeAcmeClient.orderStatus = "ready";
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            expect(FakeAcmeClient.finalizeCallCount).toBe(1);
+            await expect(enrollment.checkStatus(enrollmentId)).resolves.toEqual({ status: "pending", certificate: undefined, error: undefined });
+        });
+
+        it("Downloads the certificate and marks the enrollment issued once the order is valid.", async () => {
+            const enrollmentId = await seedReadyEnrollment();
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            FakeAcmeClient.orderStatus = "valid";
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            await expect(enrollment.checkStatus(enrollmentId)).resolves.toEqual({
+                status: "issued",
+                certificate: FakeAcmeClient.certificatePem,
+                error: undefined,
+            });
+        });
+
+        it("Marks the enrollment failed once the order becomes invalid.", async () => {
+            const enrollmentId = await seedReadyEnrollment();
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            FakeAcmeClient.orderStatus = "invalid";
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            const status = await enrollment.checkStatus(enrollmentId);
+            expect(status.status).toBe("failed");
+            expect(status.error).toContain("test failure");
+        });
+
+        it("Marks the enrollment failed with a generic message when the CA's invalid order carries no error detail.", async () => {
+            const enrollmentId = await seedReadyEnrollment();
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            FakeAcmeClient.orderStatus = "invalid";
+            FakeAcmeClient.orderErrorDetail = false;
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            const status = await enrollment.checkStatus(enrollmentId);
+            expect(status.status).toBe("failed");
+            expect(status.error).toBe("The certificate authority marked this order invalid.");
+        });
     });
 });
