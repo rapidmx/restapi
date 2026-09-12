@@ -173,6 +173,11 @@ export class MailboxMongo extends BaseMongoEntity implements Mailbox {
     @Nullable
     public keyDiscoveryHash?: string = undefined;
 
+    @Column()
+    @Description("This mailbox's assigned escrow scope, if any.")
+    @Nullable
+    public escrowScopeId?: string = undefined;
+
     constructor(other?: Partial<MailboxMongo>) {
         super(other);
 
@@ -217,6 +222,7 @@ export class MailboxMongo extends BaseMongoEntity implements Mailbox {
             this.encryptPreference = other.encryptPreference !== undefined ? other.encryptPreference : this.encryptPreference;
             this.keys = other.keys !== undefined ? other.keys : this.keys;
             this.keyDiscoveryHash = "keyDiscoveryHash" in other ? other.keyDiscoveryHash : this.keyDiscoveryHash;
+            this.escrowScopeId = "escrowScopeId" in other ? other.escrowScopeId : this.escrowScopeId;
         }
     }
 }

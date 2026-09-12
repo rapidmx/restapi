@@ -14,7 +14,7 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import { AuditAction, DistributionList, FolderType, Mailbox } from "../models/types.js";
+import { AuditAction, DistributionList, EscrowScope, FolderType, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { getVerifiedDomainNames } from "../util/DomainUtils.js";
@@ -167,9 +167,16 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so `validateUpdate()` can check a caller-supplied
+     * `escrowScopeId` actually refers to an existing `EscrowScope` without depending on either backend
+     * directly - see `util/AuditLogUtils.ts`-style lazy-repo pattern used throughout this file. */
+    protected abstract escrowScopeClass: any;
+
     private folderRepo?: RecoverableRepoUtils<any>;
 
     private distributionListRepo?: RepoUtils<DistributionList>;
+
+    private escrowScopeRepo?: RepoUtils<EscrowScope>;
 
     /**
      * Returns the uids of every mailbox this user has any ACL grant on — as owner, as a shared delegate, or
@@ -200,6 +207,55 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         return this.distributionListRepo;
     }
 
+    private async getEscrowScopeRepo(): Promise<RepoUtils<EscrowScope>> {
+        if (!this.escrowScopeRepo) {
+            this.escrowScopeRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.escrowScopeClass.name,
+                args: [this.escrowScopeClass],
+            });
+        }
+        return this.escrowScopeRepo;
+    }
+
+    /**
+     * Assigning a mailbox to an escrow scope is a trusted-administrator action (`specs/end-to-end_encryption.md`'s
+     * "Separation of duties" - a mailbox's own owner never picks their own escrow scope). A patch that
+     * doesn't touch `escrowScopeId` at all is left alone; `null`/`""` unassigns (allowed for a trusted
+     * caller with no further check); any other value must resolve to a real `EscrowScope`.
+     *
+     * Only enforced on a genuine change from `existing.escrowScopeId` - same "only act on a real change"
+     * guard `validateUpdate()` already applies to `primarySmtpAddress` above, needed for the identical
+     * reason: a full-object PUT round-trips every field including this one, and on SQL a `nullable: true`
+     * column with nothing set reads back as literal `null` (not `undefined`) - without this check, that
+     * harmless round-trip of an already-unassigned mailbox would look identical to a non-trusted caller
+     * newly attempting to assign one, and get rejected with a 403 it never asked for.
+     */
+    private async validateEscrowScopeAssignment(id: string, obj: Record<string, unknown>, isTrusted: boolean): Promise<void> {
+        if (obj.escrowScopeId === undefined) {
+            return;
+        }
+        const normalizedNew: string | undefined = (obj.escrowScopeId as string | null) || undefined;
+        const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+        const normalizedExisting: string | undefined = existing?.escrowScopeId || undefined;
+        if (normalizedNew === normalizedExisting) {
+            return;
+        }
+        if (!isTrusted) {
+            throw new ApiError(
+                ApiErrors.AUTH_PERMISSION_FAILURE,
+                403,
+                "Assigning a mailbox to an escrow scope is a trusted-administrator action.",
+            );
+        }
+        if (normalizedNew !== undefined) {
+            const repo: RepoUtils<EscrowScope> = await this.getEscrowScopeRepo();
+            const scope: EscrowScope | undefined = await repo.findOne(normalizedNew, { ignoreACL: true });
+            if (!scope) {
+                throw new ApiError(ApiErrors.NOT_FOUND, 404, "The referenced escrow scope does not exist.");
+            }
+        }
+    }
+
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         if (!user) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
@@ -208,6 +264,16 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
         for (const o of objs) {
             rejectServerManagedFields(o as Record<string, unknown>);
+            // A brand-new mailbox always starts unscoped - assignment only ever happens afterward via
+            // `update()`/`validateEscrowScopeAssignment()`, which also checks the referenced scope actually
+            // exists. Rejected for every caller, trusted or not, rather than silently ignored.
+            if ((o as any).escrowScopeId !== undefined) {
+                throw new ApiError(
+                    ApiErrors.INVALID_REQUEST,
+                    400,
+                    "A new mailbox cannot be created with an escrow scope already assigned - set it via update() instead.",
+                );
+            }
         }
         if (!isTrusted) {
             for (const o of objs) {
@@ -338,6 +404,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * for how that path is handled instead.
      */
     protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser): Promise<void> {
+        await this.validateEscrowScopeAssignment(id, obj, UserUtils.hasRoles(user, this.trustedRoles));
         rejectServerManagedFields(obj);
         if (obj.primarySmtpAddress !== undefined) {
             // Only re-validate when the address is genuinely changing, not merely present in the patch (a

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
-import { AuditLogEntryMongo, KeyVaultMongo, MailboxMongo } from "../../mongo.js";
+import { AuditLogEntryMongo, EscrowScopeMongo, KeyVaultMongo, MailboxMongo } from "../../mongo.js";
 import { BaseKeyVaultRoute } from "../BaseKeyVaultRoute.js";
 const { Model } = RouteDecorators;
 
@@ -14,4 +14,5 @@ export class KeyVaultRouteMongo extends BaseKeyVaultRoute<KeyVaultMongo, Mailbox
     protected keyVaultClass: any = KeyVaultMongo;
     protected mailboxClass: any = MailboxMongo;
     protected auditLogClass: any = AuditLogEntryMongo;
+    protected escrowScopeClass: any = EscrowScopeMongo;
 }

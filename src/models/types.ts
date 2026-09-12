@@ -134,6 +134,57 @@ export interface KeyVault extends BaseEntity {
     masterKeyWraps: MasterKeyWrap[];
 }
 
+/** A scope's own public key, used only so a client can wrap a mailbox's master key against it - the server
+ * never holds (or needs) the corresponding private key. Narrower than `PublicKey`: no `useType`, since a
+ * scope's key is only ever used to wrap (encrypt) a master key, never to sign anything. */
+export interface EscrowScopePublicKey {
+    /** Base64 encoded public key (DER-encoded X.509 certificate, or raw key material). */
+    publicKey: string;
+    /** The key's type/format (e.g. `x509`). */
+    type: string;
+    /** SHA-256 fingerprint of the key, hex encoded. */
+    fingerprint: string;
+    /** UTC timestamp (epoch ms) at which this key becomes valid. */
+    notBefore: number;
+    /** UTC timestamp (epoch ms) at which this key expires. */
+    notAfter: number;
+    /** UTC timestamp (epoch ms) at which this key was revoked, if applicable. */
+    revokedAt?: number;
+}
+
+/**
+ * An eDiscovery/compliance escrow scope (`specs/end-to-end_encryption.md`'s "Escrow scopes") - a named key,
+ * its own role holders, and an optional M-of-N dual-control threshold. Deliberately a distinct role from
+ * server administration (the spec's "Separation of duties") - holder-ness is checked directly against
+ * `holderUserUids` in every route that needs it, never through the ACL/trusted-role system (see
+ * `BaseEscrowScopeRoute`'s own doc comment). This server never holds the scope's private key and never
+ * decrypts anything itself - the actual unwrap of an escrowed master key happens entirely on a holder's own
+ * external tooling, using key material this server never sees.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface EscrowScope extends BaseEntity {
+    name: string;
+
+    description?: string;
+
+    /** This scope's own public key - a mailbox assigned to this scope (`Mailbox.escrowScopeId`) wraps its
+     * master key against this, client-side, the same way it already wraps against a password/passkey. */
+    publicKey: EscrowScopePublicKey;
+
+    /** Uids of every user in the eDiscovery/compliance role for this scope. At least one required. */
+    holderUserUids: string[];
+
+    /** M in "M-of-N dual control" - must be between 1 and `holderUserUids.length` inclusive. `1` means no
+     * dual control (any single holder may act alone). */
+    requiredHolders: number;
+
+    /** Per-scope subject-notification config (the spec's "Subject notification" - often legally prohibited
+     * to enable during an active investigation). Stored/exposed only - no notification-sending logic exists
+     * yet. */
+    notifySubjectOnAccess: boolean;
+}
+
 /**
  * The JSON body served from (and consumed from) the federation discovery endpoint,
  * `GET /.well-known/rapidmx/keys/:hash` - see `specs/end-to-end_encryption.md`'s "Public Endpoint" section.
@@ -311,6 +362,15 @@ export interface Mailbox extends BaseEntity {
      * mailbox that existed before this field was introduced is simply not yet discoverable rather than every
      * pre-existing row colliding on the same default value under a uniqueness constraint. */
     keyDiscoveryHash?: string;
+
+    /** This mailbox's assigned escrow scope, if any (`undefined`/absent = the spec's "scope: none" - no
+     * escrow, recoverable only via the user's own recovery codes). Distinct from `MasterKeyWrap.escrowScopeId`
+     * (which tags which scope a specific client-side wrap ARTIFACT was generated for) - the two can
+     * transiently disagree until a re-wrap background operation catches up after a scope reassignment or key
+     * rotation, per `specs/end-to-end_encryption.md`'s "Membership and rotation" note. Assignable only by a
+     * trusted administrator (see `BaseMailboxRoute.validateUpdate()`) - a mailbox's own owner never picks
+     * their own escrow scope. */
+    escrowScopeId?: string;
 }
 
 /**
@@ -1058,6 +1118,9 @@ export enum AuditAction {
     /** `GET /mailbox/:id/keyvault` - the one key-vault operation that reads wrapped key material (including,
      * via `masterKeyWraps`, an escrow wrap) rather than writing it. See `BaseKeyVaultRoute.get()`. */
     KEY_VAULT_READ = "key_vault.read",
+    ESCROW_SCOPE_CREATE = "escrow_scope.create",
+    ESCROW_SCOPE_UPDATE = "escrow_scope.update",
+    ESCROW_SCOPE_DELETE = "escrow_scope.delete",
 }
 
 /**

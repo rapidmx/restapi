@@ -10,6 +10,7 @@ import { JWTUtils, Logger } from "@rapidrest/core";
 import * as x509 from "@peculiar/x509";
 import * as uuid from "uuid";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
+import { EscrowScopeMongo } from "../../../src/models/mongo/EscrowScopeMongo.js";
 import { KeyVaultMongo } from "../../../src/models/mongo/KeyVaultMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { AuditAction } from "../../../src/models/types.js";
@@ -50,6 +51,7 @@ describe("Route:KeyVaultMongo Tests", () => {
     let keyVaultRepo: MongoRepository<KeyVaultMongo>;
     let aclRepo: MongoRepository<any>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
+    let escrowScopeRepo: MongoRepository<EscrowScopeMongo>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -107,6 +109,7 @@ describe("Route:KeyVaultMongo Tests", () => {
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
             keyVaultRepo = conn.getMongoRepository("KeyVaultMongo");
             auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
+            escrowScopeRepo = conn.getMongoRepository("EscrowScopeMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -118,8 +121,18 @@ describe("Route:KeyVaultMongo Tests", () => {
         await objectFactory.destroy();
     });
 
+    const createEscrowScope = async function (): Promise<EscrowScopeMongo> {
+        const obj = new EscrowScopeMongo({
+            name: "legal",
+            publicKey: { publicKey: "cert", type: "x509", fingerprint: "fp1", notBefore: 0, notAfter: 1 },
+            holderUserUids: [uuid.v4()],
+            requiredHolders: 1,
+        });
+        return await escrowScopeRepo.save(obj);
+    };
+
     beforeEach(async () => {
-        for (const r of [mailboxRepo, keyVaultRepo, auditLogRepo]) {
+        for (const r of [mailboxRepo, keyVaultRepo, auditLogRepo, escrowScopeRepo]) {
             try {
                 await r.clear();
             } catch (err: any) {
@@ -626,6 +639,81 @@ describe("Route:KeyVaultMongo Tests", () => {
 
             expect(result.status).toBe(403);
         });
+
+        it("Allows adding a method: 'escrow' wrap once the mailbox is assigned to a scope and the wrap's escrowScopeId matches it.", async () => {
+            const scope = await createEscrowScope();
+            const mailbox = await createMailbox();
+            mailbox.escrowScopeId = scope.uid;
+            await mailboxRepo.save(mailbox);
+            await enrollFirstKey(mailbox);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/wraps`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    method: "escrow",
+                    escrowScopeId: scope.uid,
+                    ciphertext: "ct",
+                    nonce: "n",
+                    salt: "s",
+                    kdf: "argon2id",
+                    schemeVersion: 1,
+                    createdAt: Date.now(),
+                });
+
+            expect(result.status).toBe(200);
+            expect(result.body.masterKeyWraps.some((w: any) => w.method === "escrow" && w.escrowScopeId === scope.uid)).toBe(true);
+        });
+
+        it("Still rejects a method: 'escrow' wrap whose escrowScopeId does not match the mailbox's assigned scope (403).", async () => {
+            const scope = await createEscrowScope();
+            const otherScope = await createEscrowScope();
+            const mailbox = await createMailbox();
+            mailbox.escrowScopeId = scope.uid;
+            await mailboxRepo.save(mailbox);
+            await enrollFirstKey(mailbox);
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/wraps`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    method: "escrow",
+                    escrowScopeId: otherScope.uid,
+                    ciphertext: "ct",
+                    nonce: "n",
+                    salt: "s",
+                    kdf: "argon2id",
+                    schemeVersion: 1,
+                    createdAt: Date.now(),
+                });
+
+            expect(result.status).toBe(403);
+        });
+
+        it("Still rejects a method: 'escrow' wrap when the referenced EscrowScope no longer exists (403).", async () => {
+            const scope = await createEscrowScope();
+            const mailbox = await createMailbox();
+            mailbox.escrowScopeId = scope.uid;
+            await mailboxRepo.save(mailbox);
+            await enrollFirstKey(mailbox);
+            await escrowScopeRepo.deleteOne({ uid: scope.uid });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/wraps`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    method: "escrow",
+                    escrowScopeId: scope.uid,
+                    ciphertext: "ct",
+                    nonce: "n",
+                    salt: "s",
+                    kdf: "argon2id",
+                    schemeVersion: 1,
+                    createdAt: Date.now(),
+                });
+
+            expect(result.status).toBe(403);
+        });
     });
 
     describe("PUT /:id/keyvault/rekey", () => {
@@ -680,6 +768,38 @@ describe("Route:KeyVaultMongo Tests", () => {
 
             const entries = await auditLogRepo.find({ action: AuditAction.KEY_VAULT_REKEY }).toArray();
             expect(entries).toHaveLength(1);
+        });
+
+        it("Still rejects an escrow-tagged wrap in the rekey request body (403), even when the mailbox is assigned to a real scope - resolveAllowEscrow() is never consulted here by design.", async () => {
+            const scope = await createEscrowScope();
+            const mailbox = await createMailbox();
+            mailbox.escrowScopeId = scope.uid;
+            await mailboxRepo.save(mailbox);
+            const enrolledKey = await enrollFirstKey(mailbox);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${mailbox.uid}/keyvault/rekey`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    keys: [enrolledKey],
+                    wrappedKeys: [
+                        { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM", fingerprint: enrolledKey.fingerprint, useType: "encrypt" },
+                    ],
+                    masterKeyWraps: [
+                        {
+                            method: "escrow",
+                            escrowScopeId: scope.uid,
+                            ciphertext: "ct",
+                            nonce: "n",
+                            salt: "s",
+                            kdf: "argon2id",
+                            schemeVersion: 1,
+                            createdAt: Date.now(),
+                        },
+                    ],
+                });
+
+            expect(result.status).toBe(403);
         });
 
         it("Rejects a rekey that introduces a fingerprint never enrolled via enrollKey (400) - closes the CA-bypass path an unvalidated rekey() used to allow.", async () => {

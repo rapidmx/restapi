@@ -713,6 +713,114 @@ describe("Route:MailboxMongo Tests", () => {
         expectMatchingFields(result.body, obj);
     });
 
+    describe("escrowScopeId assignment", () => {
+        it("Rejects creating a mailbox with escrowScopeId already set (400), even for a trusted admin.", async () => {
+            const obj: any = {
+                ownerUserUid: admin.uid,
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Test Mailbox",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+                escrowScopeId: uuid.v4(),
+            };
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send(obj);
+
+            expect(result.status).toBe(400);
+        });
+
+        it("A non-trusted owner cannot assign their own mailbox to an escrow scope (403).", async () => {
+            const obj = await createMailboxMongo();
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: obj.uid, version: obj.version, escrowScopeId: uuid.v4() });
+
+            expect(result.status).toBe(403);
+        });
+
+        it("A trusted admin cannot assign a mailbox to a nonexistent escrow scope (404).", async () => {
+            const obj = await createMailboxMongo();
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: obj.uid, version: obj.version, escrowScopeId: uuid.v4() });
+
+            expect(result.status).toBe(404);
+        });
+
+        it("A trusted admin can assign a mailbox to an existing escrow scope.", async () => {
+            const obj = await createMailboxMongo();
+            const scopeResult = await request(server.getApplication())
+                .post("/mongo/escrow-scopes")
+                .set("Authorization", "jwt " + adminToken)
+                .send({
+                    name: "legal",
+                    publicKey: { publicKey: "cert", type: "x509", fingerprint: "fp1", notBefore: 0, notAfter: 1 },
+                    holderUserUids: [uuid.v4()],
+                    requiredHolders: 1,
+                });
+            expect(scopeResult.status).toBeGreaterThanOrEqual(200);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: obj.uid, version: obj.version, escrowScopeId: scopeResult.body.uid });
+
+            expect(result.status).toBe(200);
+            expect(result.body.escrowScopeId).toBe(scopeResult.body.uid);
+        });
+
+        it("A trusted admin can unassign a mailbox's escrow scope by setting it back to null.", async () => {
+            const scopeResult = await request(server.getApplication())
+                .post("/mongo/escrow-scopes")
+                .set("Authorization", "jwt " + adminToken)
+                .send({
+                    name: "legal",
+                    publicKey: { publicKey: "cert", type: "x509", fingerprint: "fp1", notBefore: 0, notAfter: 1 },
+                    holderUserUids: [uuid.v4()],
+                    requiredHolders: 1,
+                });
+            const obj = await createMailboxMongo({ escrowScopeId: scopeResult.body.uid });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: obj.uid, version: obj.version, escrowScopeId: null });
+
+            expect(result.status).toBe(200);
+            expect(result.body.escrowScopeId == null).toBe(true);
+        });
+
+        it("Leaves escrowScopeId alone when a patch doesn't touch it.", async () => {
+            const scopeResult = await request(server.getApplication())
+                .post("/mongo/escrow-scopes")
+                .set("Authorization", "jwt " + adminToken)
+                .send({
+                    name: "legal",
+                    publicKey: { publicKey: "cert", type: "x509", fingerprint: "fp1", notBefore: 0, notAfter: 1 },
+                    holderUserUids: [uuid.v4()],
+                    requiredHolders: 1,
+                });
+            const obj = await createMailboxMongo({ escrowScopeId: scopeResult.body.uid });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: obj.uid, version: obj.version, displayName: "Renamed" });
+
+            expect(result.status).toBe(200);
+            expect(result.body.escrowScopeId).toBe(scopeResult.body.uid);
+        });
+    });
+
     it("An authenticated user with no mailboxes/ACL grants at all sees an empty list, not every mailbox.", async () => {
         await createMailboxMongo();
         const freshUser: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };

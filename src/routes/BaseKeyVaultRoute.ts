@@ -19,7 +19,7 @@ import {
 } from "@rapidrest/service-core";
 import { EncryptionCertificateAuthority } from "../pki/EncryptionCertificateAuthority.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { AuditAction, KeyVault, Mailbox, MasterKeyWrap, PublicKey, WrappedPrivateKey } from "../models/types.js";
+import { AuditAction, EscrowScope, KeyVault, Mailbox, MasterKeyWrap, PublicKey, WrappedPrivateKey } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
 const { Delete, Get, Param, Post, Put, Query, User: AuthUser } = RouteDecorators;
@@ -77,9 +77,11 @@ const MAX_MASTER_KEY_WRAPS = 20;
  * `allowEscrow: false` additionally rejects `method: "escrow"` outright. `specs/end-to-end_encryption.md`'s
  * Escrow Scoping section requires escrow to be a distinct, separately-granted compliance role - "A user with
  * ... the administrative role in RapidMX MUST NOT thereby be able to decrypt mail" - so the ordinary mailbox
- * owner/delegate path (every caller of this validation today) must never be able to add, remove, or fake an
- * escrow wrap itself. Full escrow-scope/role management (a distinct admin surface that would pass
- * `allowEscrow: true`) is a deferred follow-up roadmap item; until it exists, this is the enforcement point.
+ * owner/delegate path must never be able to add, remove, or fake an escrow wrap itself. `enrollKey()`/
+ * `addMasterKeyWrap()` pass `allowEscrow: true` only when `resolveAllowEscrow()` confirms the wrap's own
+ * `escrowScopeId` matches the mailbox's actually-assigned `Mailbox.escrowScopeId` and that `EscrowScope`
+ * still exists - see that method's own doc comment. `rekey()` always passes `false`; see its own doc
+ * comment on why an escrow wrap is preserved verbatim across a rekey instead.
  */
 function validateMasterKeyWrap(wrap: MasterKeyWrap, { allowEscrow }: { allowEscrow: boolean }): void {
     if (!wrap || !MASTER_KEY_WRAP_METHODS.includes(wrap.method)) {
@@ -151,11 +153,16 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     protected abstract mailboxClass: any;
     protected abstract auditLogClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so `resolveAllowEscrow()` can confirm a wrap's claimed
+     * `escrowScopeId` refers to a real `EscrowScope` without depending on either backend directly. */
+    protected abstract escrowScopeClass: any;
+
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     private keyVaultRepo?: RepoUtils<K>;
     private mailboxRepo?: RepoUtils<M>;
+    private escrowScopeRepo?: RepoUtils<EscrowScope>;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
@@ -190,6 +197,32 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                 args: [this.mailboxClass],
             });
         }
+        if (!this.escrowScopeRepo) {
+            this.escrowScopeRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.escrowScopeClass.name,
+                args: [this.escrowScopeClass],
+            });
+        }
+    }
+
+    /**
+     * Whether `wrap` (a caller-supplied `method: "escrow"` entry) may actually be persisted - only when the
+     * mailbox is currently assigned to the exact `EscrowScope` the wrap claims (`Mailbox.escrowScopeId ===
+     * wrap.escrowScopeId`, both required) and that scope still exists. This is the one place a mailbox
+     * owner/delegate's own `enrollKey()`/`addMasterKeyWrap()` call can succeed in adding an escrow wrap -
+     * client-side, they wrap their master key against `EscrowScope.publicKey` the same way they already wrap
+     * it against a password/passkey; this method only confirms the server-side assignment actually permits
+     * it, never inspects the wrap's ciphertext (opaque to this server either way).
+     */
+    private async resolveAllowEscrow(mailbox: M, wrap: MasterKeyWrap): Promise<boolean> {
+        if (wrap.method !== "escrow") {
+            return false;
+        }
+        if (!mailbox.escrowScopeId || wrap.escrowScopeId !== mailbox.escrowScopeId) {
+            return false;
+        }
+        const scope: EscrowScope | undefined = await this.escrowScopeRepo!.findOne(mailbox.escrowScopeId, { ignoreACL: true });
+        return !!scope;
     }
 
     private async requireMailbox(mailboxId: string): Promise<M> {
@@ -352,7 +385,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `masterKeyWraps cannot exceed ${MAX_MASTER_KEY_WRAPS} entries.`);
         }
         for (const wrap of requestedMasterKeyWraps) {
-            validateMasterKeyWrap(wrap, { allowEscrow: false });
+            validateMasterKeyWrap(wrap, { allowEscrow: await this.resolveAllowEscrow(mailbox, wrap) });
         }
         if ((mailbox.keys ?? []).length >= MAX_ENROLLED_KEYS) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox cannot enroll more than ${MAX_ENROLLED_KEYS} keys.`);
@@ -458,7 +491,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         await this.requireMailboxAccess(mailbox, user, ACLAction.UPDATE);
-        validateMasterKeyWrap(body, { allowEscrow: false });
+        validateMasterKeyWrap(body, { allowEscrow: await this.resolveAllowEscrow(mailbox, body) });
 
         const keyVault: K | undefined = await this.findKeyVault(mailboxId);
         if (!keyVault) {
