@@ -8,6 +8,7 @@ export * from "./CalendarShareLinkRouteSQL.js";
 export * from "./ContactListRouteSQL.js";
 export * from "./ContactRouteSQL.js";
 export * from "./DataExportRequestRouteSQL.js";
+export * from "./DataSubjectErasureRequestRouteSQL.js";
 export * from "./DistributionListRouteSQL.js";
 export * from "./DomainRouteSQL.js";
 export * from "./EncryptionPolicyRouteSQL.js";

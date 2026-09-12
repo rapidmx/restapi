@@ -1,0 +1,242 @@
+///////////////////////////////////////////////////////////////////////////////
+// Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
+// SPDX-License-Identifier: MPL-2.0
+///////////////////////////////////////////////////////////////////////////////
+import { ObjectDecorators } from "@rapidrest/core";
+import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { BlobStore } from "../blob/BlobStore.js";
+import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
+import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditAction, DataSubjectErasureRequest, Mailbox } from "../models/types.js";
+const { Config, Init, Inject, Logger } = ObjectDecorators;
+
+/**
+ * Processes `DataSubjectErasureRequest` rows an admin has already approved (see that entity's own doc
+ * comment for why the cascade is async rather than synchronous inside `approve()`) - mirrors
+ * `DataExportJob`'s/`MailboxImportJob`'s single-page-per-run shape. `batchSize` defaults to one request
+ * per run, same reasoning as `MailboxImportJob`: each run is a potentially large, one-mailbox cascade, not
+ * a routine sweep across many small rows.
+ *
+ * Re-checks `LegalHoldUtils.assertNotOnLegalHold()` immediately before the actual cascade (`approve()`
+ * already checked it once, but a hold can be placed in the gap between that approval and this job
+ * actually running) - a request found still held is skipped, not errored, and retried automatically on a
+ * later run once the matter closes, the same "skip, don't error" shape `RetentionEnforcementJob`'s own
+ * `Message` purge already uses.
+ *
+ * Every purged `Message`/`Attachment`/`Contact` also has its `BlobStore` content explicitly deleted
+ * (`bodyBlobKey`/`sanitizedHtmlBlobKey`, `blobKey`/`extractedTextBlobKey`, `photoBlobKey` respectively) -
+ * the ORM layer has no idea these opaque byte payloads exist, so leaving them behind after the owning row
+ * is gone would defeat the entire point of a "leave no trace" feature. `BlobStore.delete()` is
+ * documented as a no-op for a key that doesn't exist, so no existence check is needed first.
+ *
+ * Cascades across every `mailboxUid`-scoped entity type - `Message`/`Contact`/`ContactList`/
+ * `CalendarEvent`/`Task`/`Note`/`Attachment`, same set `DataExportJob`'s own JSON bundle collects - plus
+ * `Folder`, which that job deliberately leaves out ("low audit value" for a portability export) but this
+ * one includes: leaving orphaned folders behind after their owning mailbox is gone would be a real
+ * data-hygiene gap for a feature whose whole point is leaving no trace.
+ *
+ * Concrete entity classes are supplied by the Mongo/SQL subclasses (`ErasureExecutionJobMongo`/
+ * `ErasureExecutionJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob`/
+ * `DataExportJob` use.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, MB extends Mailbox> extends BackgroundService {
+    protected abstract dataSubjectErasureRequestClass: any;
+    protected abstract mailboxClass: any;
+    protected abstract folderClass: any;
+    protected abstract messageClass: any;
+    protected abstract contactClass: any;
+    protected abstract contactListClass: any;
+    protected abstract calendarEventClass: any;
+    protected abstract taskClass: any;
+    protected abstract noteClass: any;
+    protected abstract attachmentClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so this job's own hold re-check can resolve without
+     * depending on either backend directly - see `util/LegalHoldUtils.ts`. */
+    protected abstract matterClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so this job can persist an `AuditLogEntry` without
+     * depending on either backend directly - see `util/AuditLogUtils.ts`. */
+    protected abstract auditLogClass: any;
+
+    // Automatically injected by ObjectFactory on instantiation
+    private _objectFactory?: ObjectFactory;
+
+    private requestRepo?: RepoUtils<T>;
+    private mailboxRepo?: RepoUtils<MB>;
+
+    @Inject("BlobStore")
+    private blobStore?: BlobStore;
+
+    @Config("mail:jobs:erasure_execution:schedule", "*/30 * * * * *")
+    private scheduleExpr: string = "*/30 * * * * *";
+
+    // One approved mailbox per run - see this class's own doc comment for why (unlike `DataExportJob`'s 10).
+    @Config("mail:jobs:erasure_execution:batch_size", 1)
+    private batchSize: number = 1;
+
+    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
+    @Config()
+    private config: any;
+
+    @Logger
+    private logger: any;
+
+    public get schedule(): string | undefined {
+        return this.scheduleExpr;
+    }
+
+    @Init
+    public async init(): Promise<void> {
+        this.requestRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.dataSubjectErasureRequestClass.name,
+            args: [this.dataSubjectErasureRequestClass],
+        });
+        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.mailboxClass.name,
+            args: [this.mailboxClass],
+        });
+    }
+
+    public async start(): Promise<void> {
+        // Nothing to do at startup beyond `init()` above; processing happens entirely in `run()`.
+    }
+
+    public stop(): Promise<void> | void {
+        // Do nothing
+    }
+
+    public async run(): Promise<void> {
+        if (!this.requestRepo || !this.mailboxRepo || !this.blobStore) {
+            return;
+        }
+
+        const approved: T[] = await this.requestRepo.find(
+            { status: "approved", limit: this.batchSize } as any,
+            { ignoreACL: true, limit: this.batchSize },
+        );
+
+        for (const request of approved) {
+            try {
+                await this.processRequest(request);
+            } catch (err: any) {
+                this.logger?.error(`ErasureExecutionJob: failed to process erasure request ${request.uid}: ${err.message}`);
+            }
+        }
+    }
+
+    private async processRequest(request: T): Promise<void> {
+        try {
+            await assertNotOnLegalHold(this._objectFactory!, this.matterClass, request.mailboxUid);
+        } catch {
+            // Still held - skip, don't error. Retried automatically on a later run once the matter closes.
+            return;
+        }
+
+        const mailbox: MB | undefined = await this.mailboxRepo!.findOne(request.mailboxUid, { ignoreACL: true });
+
+        let purgedCount = 0;
+        // `blobKey`/`bodyBlobKey` are required (non-optional) fields on `Attachment`/`Message` - deleted
+        // unconditionally, trusting that invariant rather than defensively re-checking it. Only the
+        // genuinely optional companions (`extractedTextBlobKey`/`sanitizedHtmlBlobKey`) need a presence
+        // check first.
+        purgedCount += await this.purgeEntityType(this.attachmentClass, request.mailboxUid, async (row: any) => {
+            await this.blobStore!.delete(row.blobKey);
+            if (row.extractedTextBlobKey) {
+                await this.blobStore!.delete(row.extractedTextBlobKey);
+            }
+        });
+        purgedCount += await this.purgeEntityType(this.messageClass, request.mailboxUid, async (row: any) => {
+            await this.blobStore!.delete(row.bodyBlobKey);
+            if (row.sanitizedHtmlBlobKey) {
+                await this.blobStore!.delete(row.sanitizedHtmlBlobKey);
+            }
+        });
+        purgedCount += await this.purgeEntityType(this.contactClass, request.mailboxUid, async (row: any) => {
+            if (row.photoBlobKey) {
+                await this.blobStore!.delete(row.photoBlobKey);
+            }
+        });
+        purgedCount += await this.purgeEntityType(this.contactListClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.calendarEventClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.taskClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.noteClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.folderClass, request.mailboxUid);
+
+        if (mailbox) {
+            try {
+                await this.mailboxRepo!.delete(mailbox.uid, { ignoreACL: true, purge: true });
+                purgedCount++;
+            } catch (err: any) {
+                this.logger?.warn(`ErasureExecutionJob: failed to purge mailbox ${mailbox.uid}: ${err.message}`);
+            }
+        }
+
+        await this.markCompleted(request, purgedCount);
+    }
+
+    /** Purges every `mailboxUid`-matching row of one entity type, best-effort per row (a single row's
+     * failure is logged and skipped, not fatal to the rest of the cascade - the same tolerance
+     * `RetentionEnforcementJob`'s own per-record purge loop already accepts). `onBeforeDelete`, when
+     * given, deletes that row's own `BlobStore` content first. */
+    private async purgeEntityType(entityClass: any, mailboxUid: string, onBeforeDelete?: (row: any) => Promise<void>): Promise<number> {
+        const repo: RepoUtils<any> = await this.getRepo(entityClass);
+        const rows: any[] = await this.findAllPages(repo, { mailboxUid });
+
+        let purgedCount = 0;
+        for (const row of rows) {
+            try {
+                if (onBeforeDelete) {
+                    await onBeforeDelete(row);
+                }
+                await repo.delete(row.uid, { ignoreACL: true, purge: true });
+                purgedCount++;
+            } catch (err: any) {
+                this.logger?.warn(`ErasureExecutionJob: failed to purge ${entityClass.name} ${row.uid}: ${err.message}`);
+            }
+        }
+        return purgedCount;
+    }
+
+    private async getRepo(entityClass: any): Promise<RepoUtils<any>> {
+        return await this._objectFactory!.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
+    }
+
+    /** Fetches every page of `repo.find(criteria, ...)` results - see `DataExportJob.findAllPages()`'s
+     * identical rationale (a bare, unpaginated `find()` silently truncates at 100 rows). An erasure must
+     * be complete, not a sample. */
+    private async findAllPages(repo: RepoUtils<any>, criteria: Record<string, any>, pageSize: number = 500): Promise<any[]> {
+        const all: any[] = [];
+        for (let page = 0; ; page++) {
+            const batch: any[] = await repo.find({ ...criteria, limit: pageSize, page } as any, { ignoreACL: true, limit: pageSize, page });
+            all.push(...batch);
+            if (batch.length < pageSize) {
+                break;
+            }
+        }
+        return all;
+    }
+
+    private async markCompleted(request: T, purgedCount: number): Promise<void> {
+        const refetched: T = (await this.requestRepo!.findOne(request.uid, { ignoreACL: true }))!;
+        const updated: T = await this.requestRepo!.update(
+            { uid: refetched.uid, version: (refetched as any).version, status: "completed", purgedCount } as any,
+            refetched,
+            { ignoreACL: true },
+        );
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, logger: this.logger },
+            {
+                action: AuditAction.ERASURE_REQUEST_COMPLETED,
+                targetType: "DataSubjectErasureRequest",
+                targetUid: updated.uid,
+                mailboxUid: updated.mailboxUid,
+                details: { purgedCount },
+            },
+        );
+    }
+}

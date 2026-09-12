@@ -4,6 +4,7 @@ export * from "./CalendarReminderJobMongo.js";
 export * from "./DataExportJobMongo.js";
 export * from "./DomainVerificationJobMongo.js";
 export * from "./EasDeviceStateCleanupJobMongo.js";
+export * from "./ErasureExecutionJobMongo.js";
 export * from "./ExternalShareExpirationJobMongo.js";
 export * from "./MailboxImportJobMongo.js";
 export * from "./MailboxQuotaRecalcJobMongo.js";

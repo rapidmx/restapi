@@ -8,6 +8,7 @@ export * from "./CalendarShareLinkMongo.js";
 export * from "./ContactMongo.js";
 export * from "./ContactListMongo.js";
 export * from "./DataExportRequestMongo.js";
+export * from "./DataSubjectErasureRequestMongo.js";
 export * from "./DeviceSyncStateMongo.js";
 export * from "./DistributionListMongo.js";
 export * from "./DomainMongo.js";

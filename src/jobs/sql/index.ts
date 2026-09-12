@@ -4,6 +4,7 @@ export * from "./CalendarReminderJobSQL.js";
 export * from "./DataExportJobSQL.js";
 export * from "./DomainVerificationJobSQL.js";
 export * from "./EasDeviceStateCleanupJobSQL.js";
+export * from "./ErasureExecutionJobSQL.js";
 export * from "./ExternalShareExpirationJobSQL.js";
 export * from "./MailboxImportJobSQL.js";
 export * from "./MailboxQuotaRecalcJobSQL.js";

@@ -434,6 +434,44 @@ export interface MailboxImportRequest extends BaseEntity {
     errorMessage?: string;
 }
 
+export type DataSubjectErasureStatus = "pending" | "approved" | "denied" | "completed";
+
+/**
+ * A GDPR Article 17 ("right to erasure") request for one mailbox - mirrors `EscrowAccessRequest`'s
+ * create/approve/deny shape, the pattern this codebase already has fully worked out for a review-gated
+ * destructive action. Erasure of one's own account is a *request*, not an instant self-serve nuke (real
+ * operational consequences for shared calendars/lists an owner's departure would otherwise silently
+ * break) - `create()` is self-service only (unlike `DataExportRequest`/`MailboxImportRequest`, there is no
+ * admin-mediated "create on someone else's behalf" path, since only the account owner can meaningfully
+ * consent to their own erasure).
+ *
+ * `approve()` only clears the legal-hold check and transitions to `"approved"` - the actual cascading
+ * delete is performed asynchronously by `ErasureExecutionJob`, the same "state transition is instant, the
+ * real work happens in a job" split `DataExportJob`/`MailboxImportJob` already establish, so a large
+ * mailbox's cascade can't time out an admin's HTTP request.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface DataSubjectErasureRequest extends BaseEntity {
+    mailboxUid: string;
+
+    requestedByUserUid: string;
+
+    status: DataSubjectErasureStatus;
+
+    /** The trusted user who approved or denied this request, set by `approve()`/`deny()`. */
+    reviewedByUserUid?: string;
+
+    /** Required on `deny()` - the reason an admin is refusing this erasure (e.g. an unresolved billing
+     * dispute, a pending legal hold the requester should be told about directly). Never required on
+     * `approve()`, which needs no more justification than the requester's own original ask. */
+    reason?: string;
+
+    /** The total number of rows `ErasureExecutionJob` permanently deleted across every `mailboxUid`-
+     * scoped entity type plus the mailbox itself - set once `status` becomes `"completed"`. */
+    purgedCount?: number;
+}
+
 /**
  * Defines a single mailbox belonging to a `User`. A mailbox is the root of a user's Folder hierarchy and the
  * unit that MAPI/EAS clients log on to.
@@ -1369,6 +1407,10 @@ export enum AuditAction {
     MAILBOX_IMPORT_REQUESTED = "mailbox_import.requested",
     MAILBOX_IMPORT_COMPLETED = "mailbox_import.completed",
     MAILBOX_IMPORT_FAILED = "mailbox_import.failed",
+    ERASURE_REQUEST_CREATED = "erasure_request.created",
+    ERASURE_REQUEST_APPROVED = "erasure_request.approved",
+    ERASURE_REQUEST_DENIED = "erasure_request.denied",
+    ERASURE_REQUEST_COMPLETED = "erasure_request.completed",
 }
 
 /**
