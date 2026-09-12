@@ -9,11 +9,12 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    RepoUtils,
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { AuditAction, EscrowScope } from "../models/types.js";
+import { AuditAction, EscrowScope, Matter } from "../models/types.js";
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /** Validates the parts of an `EscrowScope` a client can actually set, against the merged (existing +
@@ -73,6 +74,22 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so `delete()` can check for a referencing `Matter`
+     * without depending on either backend directly. */
+    protected abstract matterClass: any;
+
+    private matterRepo?: RepoUtils<Matter>;
+
+    private async getMatterRepo(): Promise<RepoUtils<Matter>> {
+        if (!this.matterRepo) {
+            this.matterRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.matterClass.name,
+                args: [this.matterClass],
+            });
+        }
+        return this.matterRepo;
+    }
+
     @RequiresTrustedRole()
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
@@ -131,6 +148,18 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         const existing: T | undefined = await this.repoUtils!.findOne(id, { version, ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        const matterRepo: RepoUtils<Matter> = await this.getMatterRepo();
+        const referencingMatters: Matter[] = await matterRepo.find(
+            { escrowScopeId: existing.uid, limit: 1 } as any,
+            { ignoreACL: true, limit: 1 },
+        );
+        if (referencingMatters.length > 0) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                "This escrow scope is referenced by an existing Matter and cannot be deleted.",
+            );
         }
         await this.repoUtils!.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });
 

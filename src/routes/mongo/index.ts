@@ -22,6 +22,7 @@ export * from "./MailboxRouteMongo.js";
 export * from "./MailFilterRuleRouteMongo.js";
 export * from "./MailIngestRouteMongo.js";
 export * from "./MailSignatureRouteMongo.js";
+export * from "./MatterRouteMongo.js";
 export * from "./MessageRouteMongo.js";
 export * from "./NoteRouteMongo.js";
 export * from "./QuarantineRouteMongo.js";

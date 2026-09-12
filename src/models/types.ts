@@ -186,6 +186,39 @@ export interface EscrowScope extends BaseEntity {
 }
 
 /**
+ * A named investigation or legal hold with an explicit custodian list and date range -
+ * `specs/end-to-end_encryption.md`'s "Matter scoping": escrow access SHOULD be exercised against a defined
+ * matter rather than as blanket decryption authority. Holder-gated, not admin-gated - see
+ * `BaseMatterRoute`'s own doc comment on why this deliberately never uses `@RequiresTrustedRole()`.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface Matter extends BaseEntity {
+    name: string;
+
+    description?: string;
+
+    /** The one `EscrowScope` whose holders may open an `EscrowAccessRequest` against this matter.
+     * Immutable after creation - see `BaseMatterRoute.update()`. */
+    escrowScopeId: string;
+
+    /** Mailboxes in scope for this matter. Membership here is a separate check from
+     * `Mailbox.escrowScopeId` - both must agree at `EscrowAccessRequest` creation time, not here, since a
+     * mailbox can legitimately be listed on a matter slightly ahead of its own scope reassignment
+     * finishing (the same "Membership and rotation" eventual-consistency case `Mailbox.escrowScopeId`'s
+     * own doc comment already describes). */
+    custodianMailboxUids: string[];
+
+    dateRangeStart: Date;
+
+    dateRangeEnd: Date;
+
+    /** Once set, this matter is permanently closed - no further update, and no new `EscrowAccessRequest`
+     * may target it. One-way - see `BaseMatterRoute.close()`. */
+    closedAt?: Date;
+}
+
+/**
  * The JSON body served from (and consumed from) the federation discovery endpoint,
  * `GET /.well-known/rapidmx/keys/:hash` - see `specs/end-to-end_encryption.md`'s "Public Endpoint" section.
  * `escrow` is a self-reported, unverifiable honesty signal (whether the serving domain holds a key capable
@@ -1121,6 +1154,10 @@ export enum AuditAction {
     ESCROW_SCOPE_CREATE = "escrow_scope.create",
     ESCROW_SCOPE_UPDATE = "escrow_scope.update",
     ESCROW_SCOPE_DELETE = "escrow_scope.delete",
+    MATTER_CREATE = "matter.create",
+    MATTER_UPDATE = "matter.update",
+    MATTER_CLOSE = "matter.close",
+    MATTER_DELETE = "matter.delete",
 }
 
 /**

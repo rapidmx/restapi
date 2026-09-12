@@ -20,6 +20,7 @@ export * from "./LabelSQL.js";
 export * from "./MailboxSQL.js";
 export * from "./MailFilterRuleSQL.js";
 export * from "./MailSignatureSQL.js";
+export * from "./MatterSQL.js";
 export * from "./MessageSQL.js";
 export * from "./NoteSQL.js";
 export * from "./OofReplySuppressionSQL.js";

@@ -9,6 +9,7 @@ import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { EscrowScopeMongo } from "../../../src/models/mongo/EscrowScopeMongo.js";
+import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
@@ -27,6 +28,7 @@ describe("Route:EscrowScopeMongo Tests", () => {
     const baseUrl = "/mongo/escrow-scopes";
     let repo: MongoRepository<EscrowScopeMongo>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
+    let matterRepo: MongoRepository<MatterMongo>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -57,6 +59,7 @@ describe("Route:EscrowScopeMongo Tests", () => {
         if (conn instanceof MongoConnection) {
             repo = conn.getMongoRepository("EscrowScopeMongo");
             auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
+            matterRepo = conn.getMongoRepository("MatterMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -69,7 +72,7 @@ describe("Route:EscrowScopeMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const r of [repo, auditLogRepo]) {
+        for (const r of [repo, auditLogRepo, matterRepo]) {
             try {
                 await r.clear();
             } catch (err: any) {
@@ -272,5 +275,45 @@ describe("Route:EscrowScopeMongo Tests", () => {
 
         const entries = await auditLogRepo.find({ targetUid: scope.uid }).toArray();
         expect(entries.map((e) => e.action).sort()).toEqual([AuditAction.ESCROW_SCOPE_DELETE, AuditAction.ESCROW_SCOPE_UPDATE].sort());
+    });
+
+    it("Blocks deleting a scope that a Matter still references (409).", async () => {
+        const scope = await createEscrowScope();
+        await matterRepo.save(
+            new MatterMongo({
+                name: "Investigation A",
+                escrowScopeId: scope.uid,
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: new Date("2026-01-01"),
+                dateRangeEnd: new Date("2026-06-01"),
+            }),
+        );
+
+        const result = await request(server.getApplication())
+            .delete(`${baseUrl}/${scope.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+
+        expect(result.status).toBe(409);
+    });
+
+    it("Allows deleting a scope once its referencing Matter is itself deleted.", async () => {
+        const scope = await createEscrowScope();
+        const matter = await matterRepo.save(
+            new MatterMongo({
+                name: "Investigation A",
+                escrowScopeId: scope.uid,
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: new Date("2026-01-01"),
+                dateRangeEnd: new Date("2026-06-01"),
+            }),
+        );
+        await matterRepo.deleteOne({ uid: matter.uid });
+
+        const result = await request(server.getApplication())
+            .delete(`${baseUrl}/${scope.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
     });
 });

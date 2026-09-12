@@ -10,6 +10,7 @@ import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { EscrowScopeSQL } from "../../../src/models/sql/EscrowScopeSQL.js";
+import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
@@ -20,6 +21,7 @@ describe("Route:EscrowScopeSQL Tests", () => {
     const baseUrl = "/sql/escrow-scopes";
     let repo: Repository<EscrowScopeSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
+    let matterRepo: Repository<MatterSQL>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -49,6 +51,7 @@ describe("Route:EscrowScopeSQL Tests", () => {
         if (isSqlDataSource(conn)) {
             repo = conn.getRepository(EscrowScopeSQL);
             auditLogRepo = conn.getRepository(AuditLogEntrySQL);
+            matterRepo = conn.getRepository(MatterSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -62,6 +65,7 @@ describe("Route:EscrowScopeSQL Tests", () => {
     beforeEach(async () => {
         await repo.clear();
         await auditLogRepo.clear();
+        await matterRepo.clear();
     });
 
     it("A non-trusted caller cannot create/list/count/read/update/delete escrow scopes (403).", async () => {
@@ -256,5 +260,45 @@ describe("Route:EscrowScopeSQL Tests", () => {
 
         const entries = await auditLogRepo.find({ where: { targetUid: scope.uid } });
         expect(entries.map((e) => e.action).sort()).toEqual([AuditAction.ESCROW_SCOPE_DELETE, AuditAction.ESCROW_SCOPE_UPDATE].sort());
+    });
+
+    it("Blocks deleting a scope that a Matter still references (409).", async () => {
+        const scope = await createEscrowScope();
+        await matterRepo.save(
+            new MatterSQL({
+                name: "Investigation A",
+                escrowScopeId: scope.uid,
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: new Date("2026-01-01"),
+                dateRangeEnd: new Date("2026-06-01"),
+            }),
+        );
+
+        const result = await request(server.getApplication())
+            .delete(`${baseUrl}/${scope.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+
+        expect(result.status).toBe(409);
+    });
+
+    it("Allows deleting a scope once its referencing Matter is itself deleted.", async () => {
+        const scope = await createEscrowScope();
+        const matter = await matterRepo.save(
+            new MatterSQL({
+                name: "Investigation A",
+                escrowScopeId: scope.uid,
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: new Date("2026-01-01"),
+                dateRangeEnd: new Date("2026-06-01"),
+            }),
+        );
+        await matterRepo.delete({ uid: matter.uid });
+
+        const result = await request(server.getApplication())
+            .delete(`${baseUrl}/${scope.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
     });
 });

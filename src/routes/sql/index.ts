@@ -22,6 +22,7 @@ export * from "./MailboxRouteSQL.js";
 export * from "./MailFilterRuleRouteSQL.js";
 export * from "./MailIngestRouteSQL.js";
 export * from "./MailSignatureRouteSQL.js";
+export * from "./MatterRouteSQL.js";
 export * from "./MessageRouteSQL.js";
 export * from "./NoteRouteSQL.js";
 export * from "./QuarantineRouteSQL.js";

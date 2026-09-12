@@ -20,6 +20,7 @@ export * from "./LabelMongo.js";
 export * from "./MailboxMongo.js";
 export * from "./MailFilterRuleMongo.js";
 export * from "./MailSignatureMongo.js";
+export * from "./MatterMongo.js";
 export * from "./MessageMongo.js";
 export * from "./NoteMongo.js";
 export * from "./OofReplySuppressionMongo.js";

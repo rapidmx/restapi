@@ -4,12 +4,12 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { AuditLogEntryMongo, EscrowScopeMongo, MatterMongo } from "../../mongo.js";
-import { BaseEscrowScopeRoute } from "../BaseEscrowScopeRoute.js";
+import { BaseMatterRoute } from "../BaseMatterRoute.js";
 const { Model } = RouteDecorators;
 
-@Model(EscrowScopeMongo)
-export class EscrowScopeRouteMongo extends BaseEscrowScopeRoute<EscrowScopeMongo> {
+@Model(MatterMongo)
+export class MatterRouteMongo extends BaseMatterRoute<MatterMongo> {
     protected readonly repoUtilsClass: any = RepoUtils;
+    protected escrowScopeClass: any = EscrowScopeMongo;
     protected auditLogClass: any = AuditLogEntryMongo;
-    protected matterClass: any = MatterMongo;
 }

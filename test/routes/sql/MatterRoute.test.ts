@@ -1,0 +1,313 @@
+///////////////////////////////////////////////////////////////////////////////
+// Copyright (C) 2026 Jean-Philippe Steinmetz
+// SPDX-License-Identifier: MPL-2.0
+///////////////////////////////////////////////////////////////////////////////
+import config from "../../config.sql.js";
+import { request } from "@rapidrest/service-core/test";
+import { Server, ObjectFactory, ConnectionManager, isSqlDataSource } from "@rapidrest/service-core";
+import { JWTUtils, Logger } from "@rapidrest/core";
+import * as uuid from "uuid";
+import { Repository } from "typeorm";
+import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
+import { EscrowScopeSQL } from "../../../src/models/sql/EscrowScopeSQL.js";
+import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
+import { AuditAction } from "../../../src/models/types.js";
+import { registerTestDoubles } from "../../testDoubles.js";
+
+describe("Route:MatterSQL Tests", () => {
+    const logger = Logger();
+    const objectFactory: ObjectFactory = new ObjectFactory(config, logger);
+    const server: Server = new Server({ config, basePath: "./test/server-sql", logger, objectFactory });
+    const baseUrl = "/sql/matters";
+    let escrowScopeRepo: Repository<EscrowScopeSQL>;
+    let matterRepo: Repository<MatterSQL>;
+    let auditLogRepo: Repository<AuditLogEntrySQL>;
+
+    const holderA: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
+    const holderAToken = JWTUtils.createTokenSync(config.get("auth"), holderA);
+    const holderB: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
+    const holderBToken = JWTUtils.createTokenSync(config.get("auth"), holderB);
+    const admin: any = { uid: uuid.v4(), roles: ["admin"], elevated: Date.now() };
+    const adminToken = JWTUtils.createTokenSync(config.get("auth"), admin);
+
+    const validPublicKey = { publicKey: "base64cert", type: "x509", fingerprint: "abc123", notBefore: 1000, notAfter: 2000 };
+
+    const createEscrowScope = async function (data?: any): Promise<EscrowScopeSQL> {
+        const obj: EscrowScopeSQL = new EscrowScopeSQL({
+            name: "legal",
+            publicKey: validPublicKey,
+            holderUserUids: [holderA.uid],
+            requiredHolders: 1,
+            notifySubjectOnAccess: false,
+            ...data,
+        });
+        return await escrowScopeRepo.save(obj);
+    };
+
+    const createMatter = async function (escrowScopeId: string, data?: any): Promise<MatterSQL> {
+        const obj: MatterSQL = new MatterSQL({
+            name: "Investigation A",
+            escrowScopeId,
+            custodianMailboxUids: [uuid.v4()],
+            dateRangeStart: new Date("2026-01-01"),
+            dateRangeEnd: new Date("2026-06-01"),
+            ...data,
+        });
+        return await matterRepo.save(obj);
+    };
+
+    beforeAll(async () => {
+        registerTestDoubles(objectFactory);
+        await server.start();
+
+        const connMgr: ConnectionManager | undefined = objectFactory.getInstance(ConnectionManager);
+        const conn: any = connMgr?.connections.get("sql");
+        if (isSqlDataSource(conn)) {
+            escrowScopeRepo = conn.getRepository(EscrowScopeSQL);
+            matterRepo = conn.getRepository(MatterSQL);
+            auditLogRepo = conn.getRepository(AuditLogEntrySQL);
+        } else {
+            throw new Error("Could not find sql connection");
+        }
+    });
+
+    afterAll(async () => {
+        await server.stop();
+        await objectFactory.destroy();
+    });
+
+    beforeEach(async () => {
+        await matterRepo.clear();
+        await escrowScopeRepo.clear();
+        await auditLogRepo.clear();
+    });
+
+    it("Rejects creating a matter as a non-holder of the referenced scope (403).", async () => {
+        const scope = await createEscrowScope();
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + holderBToken)
+            .send({
+                name: "Investigation A",
+                escrowScopeId: scope.uid,
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: "2026-01-01",
+                dateRangeEnd: "2026-06-01",
+            });
+
+        expect(result.status).toBe(403);
+    });
+
+    it("Rejects creating a matter as a holder of a different scope (403).", async () => {
+        const scope = await createEscrowScope();
+        await createEscrowScope({ holderUserUids: [holderB.uid] });
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + holderBToken)
+            .send({
+                name: "Investigation A",
+                escrowScopeId: scope.uid,
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: "2026-01-01",
+                dateRangeEnd: "2026-06-01",
+            });
+
+        expect(result.status).toBe(403);
+    });
+
+    it("Rejects creating a matter referencing a nonexistent scope (404).", async () => {
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({
+                name: "Investigation A",
+                escrowScopeId: uuid.v4(),
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: "2026-01-01",
+                dateRangeEnd: "2026-06-01",
+            });
+
+        expect(result.status).toBe(404);
+    });
+
+    it("A trusted admin who is not a holder gets 403 on create/read/update/close/delete - proves separation of duties.", async () => {
+        const scope = await createEscrowScope();
+        const matter = await createMatter(scope.uid);
+
+        const createResult = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({
+                name: "Investigation B",
+                escrowScopeId: scope.uid,
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: "2026-01-01",
+                dateRangeEnd: "2026-06-01",
+            });
+        expect(createResult.status).toBe(403);
+
+        const readResult = await request(server.getApplication())
+            .get(`${baseUrl}/${matter.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(readResult.status).toBe(403);
+
+        const updateResult = await request(server.getApplication())
+            .put(`${baseUrl}/${matter.uid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: matter.uid, version: matter.version, name: "renamed" });
+        expect(updateResult.status).toBe(403);
+
+        const closeResult = await request(server.getApplication())
+            .post(`${baseUrl}/${matter.uid}/close`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(closeResult.status).toBe(403);
+
+        const deleteResult = await request(server.getApplication())
+            .delete(`${baseUrl}/${matter.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(deleteResult.status).toBe(403);
+    });
+
+    it("Rejects a dateRangeStart on or after dateRangeEnd (400).", async () => {
+        const scope = await createEscrowScope();
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({
+                name: "Investigation A",
+                escrowScopeId: scope.uid,
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: "2026-06-01",
+                dateRangeEnd: "2026-01-01",
+            });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Rejects an empty custodianMailboxUids (400).", async () => {
+        const scope = await createEscrowScope();
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({
+                name: "Investigation A",
+                escrowScopeId: scope.uid,
+                custodianMailboxUids: [],
+                dateRangeStart: "2026-01-01",
+                dateRangeEnd: "2026-06-01",
+            });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("A holder can create, read, update, close, and delete a matter under their own scope.", async () => {
+        const scope = await createEscrowScope();
+
+        const createResult = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({
+                name: "Investigation A",
+                escrowScopeId: scope.uid,
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: "2026-01-01",
+                dateRangeEnd: "2026-06-01",
+            });
+        expect(createResult.status).toBeGreaterThanOrEqual(200);
+        expect(createResult.status).toBeLessThan(300);
+
+        const entries = await auditLogRepo.find({ where: { targetUid: createResult.body.uid } });
+        expect(entries.some((e) => e.action === AuditAction.MATTER_CREATE)).toBe(true);
+
+        const readResult = await request(server.getApplication())
+            .get(`${baseUrl}/${createResult.body.uid}`)
+            .set("Authorization", "jwt " + holderAToken);
+        expect(readResult.status).toBe(200);
+
+        const updateResult = await request(server.getApplication())
+            .put(`${baseUrl}/${createResult.body.uid}`)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({ uid: createResult.body.uid, version: createResult.body.version, name: "renamed" });
+        expect(updateResult.status).toBe(200);
+        expect(updateResult.body.name).toBe("renamed");
+
+        const closeResult = await request(server.getApplication())
+            .post(`${baseUrl}/${createResult.body.uid}/close`)
+            .set("Authorization", "jwt " + holderAToken);
+        expect(closeResult.status).toBe(200);
+        expect(closeResult.body.closedAt).toBeTruthy();
+
+        const deleteResult = await request(server.getApplication())
+            .delete(`${baseUrl}/${createResult.body.uid}`)
+            .set("Authorization", "jwt " + holderAToken);
+        expect(deleteResult.status).toBeGreaterThanOrEqual(200);
+        expect(deleteResult.status).toBeLessThan(300);
+    });
+
+    it("Rejects changing escrowScopeId on update (400).", async () => {
+        const scope = await createEscrowScope();
+        const otherScope = await createEscrowScope({ name: "other" });
+        const matter = await createMatter(scope.uid);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${matter.uid}`)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({ uid: matter.uid, version: matter.version, escrowScopeId: otherScope.uid });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Rejects any update once a matter is closed (400).", async () => {
+        const scope = await createEscrowScope();
+        const matter = await createMatter(scope.uid, { closedAt: new Date() });
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${matter.uid}`)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({ uid: matter.uid, version: matter.version, name: "renamed" });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Rejects closing an already-closed matter (400).", async () => {
+        const scope = await createEscrowScope();
+        const matter = await createMatter(scope.uid, { closedAt: new Date() });
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/${matter.uid}/close`)
+            .set("Authorization", "jwt " + holderAToken);
+
+        expect(result.status).toBe(400);
+    });
+
+    it("find()/count() return only matters for scopes the caller holds.", async () => {
+        const scopeA = await createEscrowScope();
+        const scopeB = await createEscrowScope({ name: "other", holderUserUids: [holderB.uid] });
+        await createMatter(scopeA.uid, { name: "Matter A" });
+        await createMatter(scopeB.uid, { name: "Matter B" });
+
+        const listResult = await request(server.getApplication()).get(baseUrl).set("Authorization", "jwt " + holderAToken);
+        expect(listResult.status).toBe(200);
+        expect(listResult.body.length).toBe(1);
+        expect(listResult.body[0].name).toBe("Matter A");
+
+        const countResult = await request(server.getApplication()).head(baseUrl).set("Authorization", "jwt " + holderAToken);
+        expect(countResult.headers["content-length"]).toBe("1");
+    });
+
+    it("find()/count() return empty for a caller who holds no scope at all.", async () => {
+        const scope = await createEscrowScope();
+        await createMatter(scope.uid);
+
+        const listResult = await request(server.getApplication()).get(baseUrl).set("Authorization", "jwt " + holderBToken);
+        expect(listResult.status).toBe(200);
+        expect(listResult.body).toEqual([]);
+
+        const countResult = await request(server.getApplication()).head(baseUrl).set("Authorization", "jwt " + holderBToken);
+        expect(countResult.headers["content-length"]).toBe("0");
+    });
+});
