@@ -256,13 +256,50 @@ export interface EscrowAccessRequest extends BaseEntity {
     deniedAt?: Date;
 }
 
+export type MatterExportStatus = "pending" | "ready" | "failed";
+
+/**
+ * A holder-invoked eDiscovery export of a `Matter`'s full custodian set - the same kind of downloadable
+ * bundle `DataExportRequest`'s `"json"` format produces for one mailbox (see `util/
+ * MailboxContentUtils.ts`'s `collectMailboxContentLines()`, the aggregation step both share), but spanning
+ * every one of the matter's `custodianMailboxUids`, each narrowed to the matter's own `dateRangeStart`/
+ * `dateRangeEnd`. Unlike `DataExportRequest`, only the `"json"` bundle format is offered - concatenating
+ * multiple custodians' raw mail into one `mbox` file would blur whose message is whose, which matters for
+ * a legal-review audience in a way it doesn't for an individual's own portability export.
+ *
+ * No dual-control approval gate (unlike `EscrowAccessRequest`) - exporting already-at-rest mailbox
+ * content is a materially different risk than releasing the actual escrow-wrapped decryption key, so any
+ * single holder of the matter's `EscrowScope` may trigger one directly (`requireEscrowHolder()`). Still
+ * logged through the hash-chained `EscrowAuditLogEntry` ledger, not the general `AuditLogEntry` - one
+ * entry per custodian mailbox actually included, since that ledger's own schema is inherently
+ * one-mailbox-per-entry (mirroring every other escrow audit action).
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface MatterExportRequest extends BaseEntity {
+    matterId: string;
+
+    requestedByUserUid: string;
+
+    status: MatterExportStatus;
+
+    /** The `BlobStore` key the finished export bundle is stored under, once `status` is `"ready"`. */
+    blobKey?: string;
+
+    errorMessage?: string;
+}
+
 /** The lifecycle event an `EscrowAuditLogEntry` records - the three moments real escrow-wrapped key
- * material, or the authority over it, changes hands or comes into existence. Deliberately excludes a
- * denied request (nothing was ever granted or used there) - that goes through the ordinary
- * `AuditAction`/`recordAuditLog()` instead. */
+ * material, or the authority over it, changes hands or comes into existence, plus a Matter-scoped
+ * eDiscovery export (not key material, but still an escrow-holder-gated bulk content disclosure worth the
+ * same tamper-evident trail). Deliberately excludes a denied `EscrowAccessRequest` (nothing was ever
+ * granted or used there) - that goes through the ordinary `AuditAction`/`recordAuditLog()` instead. */
 export enum EscrowAuditAction {
     REQUEST_CREATED = "escrow_access_request.created",
     REQUEST_APPROVED = "escrow_access_request.approved",
+    MATTER_EXPORT_REQUESTED = "matter_export.requested",
+    MATTER_EXPORT_READY = "matter_export.ready",
+    MATTER_EXPORT_FAILED = "matter_export.failed",
     MATERIAL_READ = "escrow_access_request.material_read",
 }
 
@@ -1411,6 +1448,11 @@ export enum AuditAction {
     ERASURE_REQUEST_APPROVED = "erasure_request.approved",
     ERASURE_REQUEST_DENIED = "erasure_request.denied",
     ERASURE_REQUEST_COMPLETED = "erasure_request.completed",
+    /** Recorded only when a `MatterExportJob` request fails at the whole-request level (e.g. its `Matter`
+     * was deleted before the job could run) - no single mailbox to attribute it to, unlike the per-mailbox
+     * `EscrowAuditAction.MATTER_EXPORT_REQUESTED`/`READY` entries a successful export's own mailboxes get
+     * instead (see `MatterExportRequest`'s own doc comment for why). */
+    MATTER_EXPORT_FAILED = "matter_export.failed",
 }
 
 /**

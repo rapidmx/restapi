@@ -25,6 +25,7 @@ export * from "./MailboxImportRequestSQL.js";
 export * from "./MailboxSQL.js";
 export * from "./MailFilterRuleSQL.js";
 export * from "./MailSignatureSQL.js";
+export * from "./MatterExportRequestSQL.js";
 export * from "./MatterSQL.js";
 export * from "./MessageSQL.js";
 export * from "./NoteSQL.js";

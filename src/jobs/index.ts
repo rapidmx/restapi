@@ -8,6 +8,7 @@ export * from "./ErasureExecutionJob.js";
 export * from "./ExternalShareExpirationJob.js";
 export * from "./MailboxImportJob.js";
 export * from "./MailboxQuotaRecalcJob.js";
+export * from "./MatterExportJob.js";
 export * from "./MeetingSchedulingJob.js";
 export * from "./OofReplySuppressionCleanupJob.js";
 export * from "./QuarantineRetentionJob.js";

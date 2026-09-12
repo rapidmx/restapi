@@ -8,6 +8,7 @@ export * from "./ErasureExecutionJobMongo.js";
 export * from "./ExternalShareExpirationJobMongo.js";
 export * from "./MailboxImportJobMongo.js";
 export * from "./MailboxQuotaRecalcJobMongo.js";
+export * from "./MatterExportJobMongo.js";
 export * from "./MeetingSchedulingJobMongo.js";
 export * from "./OofReplySuppressionCleanupJobMongo.js";
 export * from "./QuarantineRetentionJobMongo.js";

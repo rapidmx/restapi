@@ -22,6 +22,8 @@ export * from "./BaseKeyVaultRoute.js";
 export * from "./BaseMailboxImportRoute.js";
 export * from "./BaseMailboxRoute.js";
 export * from "./BaseMailIngestRoute.js";
+export * from "./BaseMatterExportRequestRoute.js";
+export * from "./BaseMatterSearchRoute.js";
 export * from "./BaseMessageRoute.js";
 export * from "./BaseRetentionPolicyRoute.js";
 export * from "./BaseScopedChildRoute.js";

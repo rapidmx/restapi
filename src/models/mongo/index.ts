@@ -25,6 +25,7 @@ export * from "./MailboxImportRequestMongo.js";
 export * from "./MailboxMongo.js";
 export * from "./MailFilterRuleMongo.js";
 export * from "./MailSignatureMongo.js";
+export * from "./MatterExportRequestMongo.js";
 export * from "./MatterMongo.js";
 export * from "./MessageMongo.js";
 export * from "./NoteMongo.js";

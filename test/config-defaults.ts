@@ -120,6 +120,7 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
                 data_export: { schedule: "*/15 * * * * *", batch_size: 10 },
                 mailbox_import: { schedule: "*/15 * * * * *", batch_size: 1 },
                 erasure_execution: { schedule: "*/15 * * * * *", batch_size: 1 },
+                matter_export: { schedule: "*/15 * * * * *", batch_size: 5 },
                 mailbox_quota_recalc: { schedule: "0 0 7 * * *", batch_size: 100 },
                 scheduled_send: { schedule: "*/30 * * * * *", batch_size: 50 },
                 oof_suppression_cleanup: { schedule: "0 30 6 * * *", batch_size: 500, retention_days: 30 },

@@ -6,13 +6,10 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { collectMailboxContentLines, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
 import { buildMboxEntry } from "../util/MboxUtils.js";
 import { AuditAction, DataExportRequest, Mailbox, Message } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
-
-/** Every entity type (besides `Mailbox` itself) the `"json"` bundle collects - each denormalizes
- * `mailboxUid` directly, so no `Folder` join is needed to scope any of them. */
-type JsonBundleEntity = "message" | "contact" | "contactList" | "calendarEvent" | "task" | "note" | "attachment";
 
 /**
  * Processes pending `DataExportRequest` rows (see that entity's own doc comment) - a mailbox's full
@@ -28,8 +25,9 @@ type JsonBundleEntity = "message" | "contact" | "contactList" | "calendarEvent" 
  * many-target-types concept than a direct `mailboxUid` filter, and a clear fast-follow rather than
  * something to approximate poorly now.
  *
- * The aggregation step (`collectMailboxContent()`) is deliberately not hard-wired to "one mailbox" -
- * it's reused, parameterized differently, for a Matter-scoped eDiscovery export.
+ * The aggregation step (`util/MailboxContentUtils.ts`'s `collectMailboxContentLines()`) is deliberately
+ * not hard-wired to "one mailbox" - `MatterExportJob` reuses it per custodian mailbox for a Matter-scoped
+ * eDiscovery export.
  *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`DataExportJobMongo`/
  * `DataExportJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob` uses.
@@ -194,12 +192,8 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
         return Buffer.concat(entries);
     }
 
-    /** Reused, parameterized differently, by a future Matter-scoped eDiscovery export - see this class's
-     * own doc comment. */
-    protected async collectMailboxContent(mailboxUid: string, mailbox: MB): Promise<string[]> {
-        const lines: string[] = [JSON.stringify({ entityType: "Mailbox", ...mailbox })];
-
-        const entityClasses: Record<JsonBundleEntity, any> = {
+    private get contentEntityClasses(): MailboxContentEntityClasses {
+        return {
             message: this.messageClass,
             contact: this.contactClass,
             contactList: this.contactListClass,
@@ -208,18 +202,10 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
             note: this.noteClass,
             attachment: this.attachmentClass,
         };
-        for (const [entityType, entityClass] of Object.entries(entityClasses)) {
-            const repo: RepoUtils<any> = await this.getRepo(entityClass);
-            const rows: any[] = await this.findAllPages(repo, { mailboxUid });
-            for (const row of rows) {
-                lines.push(JSON.stringify({ entityType, ...row }));
-            }
-        }
-        return lines;
     }
 
     private async buildJsonBundle(mailboxUid: string, mailbox: MB): Promise<Buffer> {
-        const lines: string[] = await this.collectMailboxContent(mailboxUid, mailbox);
+        const lines: string[] = await collectMailboxContentLines(this._objectFactory!, this.contentEntityClasses, mailboxUid, mailbox);
         return Buffer.from(lines.join("\n"), "utf-8");
     }
 }
