@@ -366,6 +366,74 @@ export interface RetentionPolicy extends BaseEntity {
     auditLogRetentionDays?: number;
 }
 
+export type DataExportFormat = "json" | "mbox";
+export type DataExportStatus = "pending" | "ready" | "failed";
+
+/**
+ * A GDPR data-portability/access request for one mailbox's content - created pending, processed
+ * asynchronously by `DataExportJob` (a mailbox's full content can be large), and downloadable once
+ * `status` reaches `"ready"`. Created either by the mailbox's own owner (self-service) or by a trusted
+ * administrator on a data subject's behalf (support-driven request) - see `BaseDataExportRoute.create()`.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface DataExportRequest extends BaseEntity {
+    mailboxUid: string;
+
+    /** The caller who created this request - the mailbox owner themselves, or an admin acting on their
+     * behalf. Distinct from `mailboxUid`'s own owner for the admin-mediated case. */
+    requestedByUserUid: string;
+
+    /** `"json"`: every entity type this mailbox owns, newline-delimited JSON per type - the GDPR
+     * portability bundle. `"mbox"`: a real, interoperable mailbox export (`util/MboxUtils.ts`) any mail
+     * client can import. PST export is deliberately not offered - see `util/MboxUtils.ts`'s own doc
+     * comment for why. */
+    format: DataExportFormat;
+
+    status: DataExportStatus;
+
+    /** The `BlobStore` key the finished export bundle is stored under, once `status` is `"ready"`. */
+    blobKey?: string;
+
+    errorMessage?: string;
+}
+
+export type MailboxImportFormat = "mbox" | "pst";
+export type MailboxImportStatus = "pending" | "processing" | "completed" | "failed";
+
+/**
+ * A request to import historical mail from an uploaded Mbox or PST file into a mailbox's folder tree -
+ * the portability counterpart to `DataExportRequest`. Created either by the mailbox's own owner
+ * (self-service data migration) or by a trusted administrator (support-assisted import). Processed
+ * asynchronously by `MailboxImportJob`.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface MailboxImportRequest extends BaseEntity {
+    mailboxUid: string;
+
+    requestedByUserUid: string;
+
+    /** Every imported message lands here - PST's own internal folder hierarchy is deliberately not
+     * recreated (a fast-follow if a real need for it shows up); Mbox has no folder concept of its own
+     * either way. */
+    targetFolderUid: string;
+
+    format: MailboxImportFormat;
+
+    /** The `BlobStore` key the caller's originally-uploaded file is stored under. */
+    sourceBlobKey: string;
+
+    status: MailboxImportStatus;
+
+    /** Set once processing finishes (`status` `"completed"` or `"failed"`). */
+    importedCount?: number;
+
+    failedCount?: number;
+
+    errorMessage?: string;
+}
+
 /**
  * Defines a single mailbox belonging to a `User`. A mailbox is the root of a user's Folder hierarchy and the
  * unit that MAPI/EAS clients log on to.
@@ -1295,6 +1363,12 @@ export enum AuditAction {
      * entry per record - a routine background job purging thousands of expired rows would otherwise
      * flood the audit trail it's supposed to keep readable). */
     RETENTION_PURGE_EXECUTED = "retention_policy.purge_executed",
+    DATA_EXPORT_REQUESTED = "data_export.requested",
+    DATA_EXPORT_READY = "data_export.ready",
+    DATA_EXPORT_FAILED = "data_export.failed",
+    MAILBOX_IMPORT_REQUESTED = "mailbox_import.requested",
+    MAILBOX_IMPORT_COMPLETED = "mailbox_import.completed",
+    MAILBOX_IMPORT_FAILED = "mailbox_import.failed",
 }
 
 /**

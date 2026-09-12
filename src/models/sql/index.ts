@@ -7,6 +7,7 @@ export * from "./CalendarEventSQL.js";
 export * from "./CalendarShareLinkSQL.js";
 export * from "./ContactSQL.js";
 export * from "./ContactListSQL.js";
+export * from "./DataExportRequestSQL.js";
 export * from "./DeviceSyncStateSQL.js";
 export * from "./DistributionListSQL.js";
 export * from "./DomainSQL.js";
