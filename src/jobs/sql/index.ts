@@ -8,6 +8,7 @@ export * from "./MailboxQuotaRecalcJobSQL.js";
 export * from "./MeetingSchedulingJobSQL.js";
 export * from "./OofReplySuppressionCleanupJobSQL.js";
 export * from "./QuarantineRetentionJobSQL.js";
+export * from "./RetentionEnforcementJobSQL.js";
 export * from "./ScanQueueJobSQL.js";
 export * from "./ScheduledSendJobSQL.js";
 export * from "./SearchIndexJobSQL.js";

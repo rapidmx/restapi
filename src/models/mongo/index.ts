@@ -27,6 +27,7 @@ export * from "./MessageMongo.js";
 export * from "./NoteMongo.js";
 export * from "./OofReplySuppressionMongo.js";
 export * from "./QuarantineEntryMongo.js";
+export * from "./RetentionPolicyMongo.js";
 export * from "./ScanResultMongo.js";
 export * from "./SearchIndexStateMongo.js";
 export * from "./TaskListMongo.js";

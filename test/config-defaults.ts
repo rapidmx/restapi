@@ -116,6 +116,7 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
                 eas_device_cleanup: { schedule: "0 0 4 * * *", batch_size: 500, device_ttl_days: 90 },
                 external_share_expiration: { schedule: "0 0 5 * * *", batch_size: 500 },
                 quarantine_retention: { schedule: "0 0 6 * * *", batch_size: 500, retention_days: 30 },
+                retention_enforcement: { schedule: "0 0 4 * * *", batch_size: 500 },
                 mailbox_quota_recalc: { schedule: "0 0 7 * * *", batch_size: 100 },
                 scheduled_send: { schedule: "*/30 * * * * *", batch_size: 50 },
                 oof_suppression_cleanup: { schedule: "0 30 6 * * *", batch_size: 500, retention_days: 30 },

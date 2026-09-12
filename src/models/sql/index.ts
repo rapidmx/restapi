@@ -27,6 +27,7 @@ export * from "./MessageSQL.js";
 export * from "./NoteSQL.js";
 export * from "./OofReplySuppressionSQL.js";
 export * from "./QuarantineEntrySQL.js";
+export * from "./RetentionPolicySQL.js";
 export * from "./ScanResultSQL.js";
 export * from "./SearchIndexStateSQL.js";
 export * from "./TaskListSQL.js";

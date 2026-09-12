@@ -338,6 +338,34 @@ export interface EncryptionPolicy extends BaseEntity {
     encryptExternal: PolicyState;
 }
 
+/** The minimum enforceable `RetentionPolicy.auditLogRetentionDays` - approximates HIPAA's typical
+ * six-year audit-trail retention expectation (`365 * 6`). A configured value below this is rejected
+ * outright (400), not silently clamped - see `BaseRetentionPolicyRoute.validateUpdate()`. */
+export const MIN_AUDIT_LOG_RETENTION_DAYS = 2190;
+
+/**
+ * This deployment's data-retention policy - a singleton row, admin-editable, readable by any
+ * authenticated user, same shape as `EncryptionPolicy` above. Enforced by `RetentionEnforcementJob`, not
+ * merely documented: GDPR's storage-limitation principle and most HIPAA retention schedules expect data
+ * to actually stop existing once no longer needed, not just a written policy nobody's system enforces.
+ * Every field defaults to `undefined` ("no automatic purge configured") - this repo never deletes a
+ * deployment's mail on its own initiative until an administrator explicitly opts in.
+ */
+export interface RetentionPolicy extends BaseEntity {
+    /** Org-wide max age, in days, for ANY `Message` regardless of which folder it's in (Trash included) -
+     * `undefined` means no automatic purge. A message an active `Matter` legal hold covers (see
+     * `util/LegalHoldUtils.ts`) is skipped, not purged, and retried on a later run once the hold lifts. */
+    messageRetentionDays?: number;
+
+    /** Max age, in days, for `AuditLogEntry` rows - `undefined` means keep forever; when set, must be at
+     * least `MIN_AUDIT_LOG_RETENTION_DAYS`. Deliberately does NOT apply to `EscrowAuditLogEntry`: that
+     * entity is a hash-chained, tamper-evident ledger (`util/EscrowAuditUtils.ts`) where every entry's
+     * `hash` depends on the previous one's - deleting any entry out of the middle of the chain would
+     * break `verifyEscrowAuditChain()` for every entry after it. It has no retention-driven deletion path
+     * at all, by design - it is meant to be permanent. */
+    auditLogRetentionDays?: number;
+}
+
 /**
  * Defines a single mailbox belonging to a `User`. A mailbox is the root of a user's Folder hierarchy and the
  * unit that MAPI/EAS clients log on to.
@@ -1262,6 +1290,11 @@ export enum AuditAction {
     /** Recorded on `GET /mailboxes/:id` ONLY when the caller isn't the mailbox's own owner - same
      * reasoning as `MESSAGE_CONTENT_ACCESSED` above, applied to viewing a mailbox's own profile. */
     MAILBOX_ACCESSED = "mailbox.accessed",
+    RETENTION_POLICY_UPDATE = "retention_policy.update",
+    /** Recorded once per `RetentionEnforcementJob` run per entity type actually purged (a count, not one
+     * entry per record - a routine background job purging thousands of expired rows would otherwise
+     * flood the audit trail it's supposed to keep readable). */
+    RETENTION_PURGE_EXECUTED = "retention_policy.purge_executed",
 }
 
 /**
