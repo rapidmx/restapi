@@ -53,6 +53,7 @@
     },
     "dependencies": {
         "@peculiar/x509": "^2.1.0",
+        "acme-client": "^5.4.0",
         "html-to-text": "^10.0.1",
         "mailparser": "^3.9.23",
         "nodemailer": "^10.0.1",

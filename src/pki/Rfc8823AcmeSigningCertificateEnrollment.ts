@@ -1,0 +1,298 @@
+///////////////////////////////////////////////////////////////////////////////
+// Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
+// SPDX-License-Identifier: MPL-2.0
+///////////////////////////////////////////////////////////////////////////////
+// See LocalX509CertificateAuthority.ts's identical note: `@peculiar/x509` requires `reflect-metadata`
+// loaded before it is imported.
+import "reflect-metadata";
+// Node's `crypto` module (for `createHash`/`randomUUID`) is imported under its own name, NOT `crypto` -
+// `x509.cryptoProvider.set()` below needs the *ambient global* `crypto` (WebCrypto, available with no
+// import since Node 19), which is typed against `lib.dom` and subtly incompatible with `node:crypto`'s
+// own `webcrypto` export - see `LocalX509CertificateAuthority.ts`'s identical note.
+import * as nodeCrypto from "crypto";
+import * as fs from "fs/promises";
+import * as path from "path";
+import * as x509 from "@peculiar/x509";
+import * as acme from "acme-client";
+import { ApiError, ObjectDecorators } from "@rapidrest/core";
+import { ApiErrors } from "@rapidrest/service-core";
+import { EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
+const { Config, Logger } = ObjectDecorators;
+
+x509.cryptoProvider.set(crypto);
+
+/** One in-progress RFC 8823 enrollment, from `startEnrollment()` through to a downloaded certificate.
+ * Everything needed to resume across a process restart lives here - see `loadStore()`/`saveStore()`. */
+interface PendingEnrollment {
+    identity: string;
+    csr: string;
+    orderUrl: string;
+    authorizationUrl: string;
+    challengeUrl: string;
+    /** The `from` address the CA's own challenge email will arrive from - `recordChallengeToken()`'s
+     * caller (the inbound correlator, a later piece of this feature) uses this to recognize which
+     * pending enrollment an inbound message belongs to. */
+    challengeFrom: string;
+    /** "token-part2" - the half of the RFC 8823 token this server already knows from the challenge
+     * object itself, before the CA's challenge email (carrying "token-part1") ever arrives. */
+    tokenPart2: string;
+    status: "pending" | "issued" | "failed";
+    tokenPart1?: string;
+    /** The address the reply email must be sent `To:` - the challenge email's own `Reply-To` header,
+     * falling back to its `From` (see `recordChallengeToken()`'s own doc comment). */
+    replyTo?: string;
+    challengeMessageId?: string;
+    challengeSubject?: string;
+    /** base64url(SHA-256(keyAuthorization)) - the exact value RFC 8823's reply email body carries.
+     * Computed once by `recordChallengeToken()`; a later piece of this feature sends the reply email
+     * and drives `completeChallenge()`/finalize once this is set. */
+    digest?: string;
+    certificate?: string;
+    error?: string;
+    createdAt: string;
+}
+
+/**
+ * Real RFC 8823 `email-reply-00` ACME automation - `specs/end-to-end_encryption.md`'s "MUST be
+ * automated" requirement for public signing-certificate enrollment, replacing
+ * `ManualSigningCertificateEnrollment`'s admin-pastes-a-CSR-into-a-portal flow with a real ACME
+ * client talking to any RFC 8823-compliant CA (`directoryUrl` is configurable, not hardcoded to one
+ * vendor - CASTLE Platform's `https://acme.castle.cloud/acme/directory` is the documented default,
+ * matching this codebase's existing "avoid vendor lock-in" precedent for `OpenBaoPkiCertificateAuthority`
+ * vs. the rejected paid-CA option, see `EncryptionCertificateAuthority`'s own doc comment history).
+ *
+ * Built on the `acme-client` npm package for the generic RFC 8555 plumbing (account key management,
+ * JWS request signing, nonce/replay handling, directory discovery, order finalize + certificate
+ * download) - all real, security-sensitive protocol code with no RFC 8823-specific logic of its own,
+ * better reused than hand-rolled. Driven via its low-level/manual API only (`createOrder()`,
+ * `getAuthorizations()`, `completeChallenge()`, `finalizeOrder()`, `getCertificate()`) - never its
+ * `auto()` helper, which only recognizes `http-01`/`dns-01` and has no notion of `email-reply-00`.
+ *
+ * **This class alone does not complete an enrollment.** RFC 8823's `email-reply-00` challenge
+ * requires receiving an inbound challenge email (correlated against a pending enrollment by a
+ * separate piece of this feature, since that's this codebase's mail-ingest pipeline's job, not this
+ * class's) and sending a reply email (also a separate piece, since composing/sending mail is
+ * `MailSendUtils`'s job) before the CA will ever mark the challenge valid. This class owns exactly
+ * the ACME-protocol half of the flow:
+ * - `startEnrollment()`: creates/reuses this deployment's one persisted ACME account, opens an order
+ * for the `email` identifier, and extracts the `email-reply-00` challenge's `from`/token-part2.
+ * - `recordChallengeToken()`: once the inbound correlator recognizes the CA's challenge email and
+ * extracts token-part1 from its `Subject`, computes and persists the exact digest the reply email's
+ * body must carry.
+ * - `checkStatus()`: a pure read of the persisted enrollment's current state - it does not itself
+ * drive `completeChallenge()`/poll/finalize (a background job, once the reply has actually been sent,
+ * does that - see this feature's own follow-on pieces).
+ *
+ * State (the ACME account key/URL, and every pending enrollment) is persisted as small local JSON/PEM
+ * files - the same "own a small piece of local state on disk" shape `LocalX509CertificateAuthority`'s
+ * CA key and `ManualSigningCertificateEnrollment`'s enrollment store already use in this codebase.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertificateEnrollment {
+    public readonly name: string = "rfc8823-acme";
+
+    @Config("mail:pki:rfc8823:directory_url", "https://acme.castle.cloud/acme/directory")
+    private directoryUrl: string = "https://acme.castle.cloud/acme/directory";
+
+    @Config("mail:pki:rfc8823:contact_email")
+    private contactEmail?: string;
+
+    @Config("mail:pki:rfc8823:store_dir", "/var/lib/rapidmx/pki/rfc8823")
+    private storeDir: string = "/var/lib/rapidmx/pki/rfc8823";
+
+    @Logger
+    private logger: any;
+
+    private accountKeyPath(): string {
+        return path.join(this.storeDir, "account.key.pem");
+    }
+
+    private accountUrlPath(): string {
+        return path.join(this.storeDir, "account.url");
+    }
+
+    private enrollmentsPath(): string {
+        return path.join(this.storeDir, "enrollments.json");
+    }
+
+    /** Overridable seam for tests - constructs the real `acme-client` `Client` in production, a fake
+     * in tests (no real network calls, no dependency on a live CA). */
+    protected createClient(opts: acme.ClientOptions): acme.Client {
+        return new acme.Client(opts);
+    }
+
+    /** Loads this deployment's one persisted ACME account (key + account URL), registering a new one
+     * on first use. Idempotent and safe to call before every operation - once minted, the account is
+     * stable for the deployment's lifetime, the same reasoning `LocalX509CertificateAuthority.
+     * ensureCa()` already documents for its own root key. */
+    private async ensureAccount(): Promise<acme.Client> {
+        try {
+            const [accountKey, accountUrl] = await Promise.all([
+                fs.readFile(this.accountKeyPath(), "utf-8"),
+                fs.readFile(this.accountUrlPath(), "utf-8"),
+            ]);
+            return this.createClient({ directoryUrl: this.directoryUrl, accountKey, accountUrl: accountUrl.trim() });
+        } catch (err: any) {
+            if (err.code !== "ENOENT") {
+                throw err;
+            }
+        }
+
+        const accountKey: Buffer = await acme.crypto.createPrivateEcdsaKey("P-256");
+        const client: acme.Client = this.createClient({ directoryUrl: this.directoryUrl, accountKey });
+        await client.createAccount({
+            termsOfServiceAgreed: true,
+            contact: this.contactEmail ? [`mailto:${this.contactEmail}`] : undefined,
+        });
+
+        await fs.mkdir(this.storeDir, { recursive: true, mode: 0o700 });
+        try {
+            // Atomic create-or-fail, same TOCTOU-tolerant reasoning as `LocalX509CertificateAuthority.
+            // ensureCa()` - two concurrent first-ever calls can both observe `ENOENT` above; the loser
+            // re-reads the winner's already-registered account instead of orphaning a second one.
+            await fs.writeFile(this.accountKeyPath(), accountKey, { mode: 0o600, flag: "wx" });
+        } catch (err: any) {
+            if (err.code === "EEXIST") {
+                return this.ensureAccount();
+            }
+            throw err;
+        }
+        await fs.writeFile(this.accountUrlPath(), client.getAccountUrl(), { mode: 0o600, flag: "wx" });
+        this.logger?.info(`Rfc8823AcmeSigningCertificateEnrollment: registered new ACME account at '${this.directoryUrl}'.`);
+
+        return client;
+    }
+
+    private async loadStore(): Promise<Record<string, PendingEnrollment>> {
+        try {
+            return JSON.parse(await fs.readFile(this.enrollmentsPath(), "utf-8"));
+        } catch (err: any) {
+            if (err.code !== "ENOENT") {
+                throw err;
+            }
+            return {};
+        }
+    }
+
+    private async saveStore(store: Record<string, PendingEnrollment>): Promise<void> {
+        await fs.mkdir(this.storeDir, { recursive: true, mode: 0o700 });
+        await fs.writeFile(this.enrollmentsPath(), JSON.stringify(store), { mode: 0o600 });
+    }
+
+    private async requireEnrollment(store: Record<string, PendingEnrollment>, enrollmentId: string): Promise<PendingEnrollment> {
+        const enrollment: PendingEnrollment | undefined = store[enrollmentId];
+        if (!enrollment) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, `No enrollment found with id '${enrollmentId}'.`);
+        }
+        return enrollment;
+    }
+
+    public async startEnrollment(identity: string, csr: string): Promise<{ enrollmentId: string }> {
+        let parsedCsr: x509.Pkcs10CertificateRequest;
+        try {
+            parsedCsr = new x509.Pkcs10CertificateRequest(csr);
+        } catch {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The provided CSR could not be parsed.");
+        }
+        if (!(await parsedCsr.verify())) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The provided CSR's self-signature does not verify.");
+        }
+
+        const client: acme.Client = await this.ensureAccount();
+        const order: acme.Order = await client.createOrder({ identifiers: [{ type: "email", value: identity }] });
+        const [authorization] = await client.getAuthorizations(order);
+        // `email-reply-00` isn't part of `acme-client`'s own `rfc8555.Challenge` union (it only models
+        // `http-01`/`dns-01`) - the object is real at runtime (any RFC 8823-compliant CA returns it),
+        // just not typed by this dependency, hence the cast.
+        const challenge: { type: string; url: string; from?: string; token?: string } | undefined = (
+            authorization.challenges as unknown as Array<{ type: string; url: string; from?: string; token?: string }>
+        ).find((c) => c.type === "email-reply-00");
+        if (!challenge?.from || !challenge.token) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The certificate authority did not offer an email-reply-00 challenge.");
+        }
+
+        const enrollmentId: string = crypto.randomUUID();
+        const store: Record<string, PendingEnrollment> = await this.loadStore();
+        store[enrollmentId] = {
+            identity,
+            csr,
+            orderUrl: order.url,
+            authorizationUrl: authorization.url,
+            challengeUrl: challenge.url,
+            challengeFrom: challenge.from,
+            tokenPart2: challenge.token,
+            status: "pending",
+            createdAt: new Date().toISOString(),
+        };
+        await this.saveStore(store);
+
+        this.logger?.info(`Rfc8823AcmeSigningCertificateEnrollment: started enrollment '${enrollmentId}' for '${identity}'.`);
+        return { enrollmentId };
+    }
+
+    /**
+     * Records the RFC 8823 challenge email's own contribution - token-part1, plus the headers the
+     * reply needs (`replyTo`/`messageId`/`subject`) - once the inbound correlator recognizes it, and
+     * computes the digest the reply email's body must carry.
+     *
+     * Per RFC 8823 §3, `keyAuthorization = token + "." + accountKey.thumbprint` where `token =
+     * token-part1 + token-part2`, and the reply carries `base64url(SHA-256(keyAuthorization))`.
+     * `acme-client`'s own `getChallengeKeyAuthorization()` has no `email-reply-00` case (it throws for
+     * any type it doesn't recognize - confirmed by reading its source), but its `http-01` case
+     * computes exactly the un-hashed `token + "." + thumbprint` this RFC also needs (unlike `dns-01`,
+     * which hashes an extra time for a DNS TXT record) - so a challenge object with `type` spoofed to
+     * `"http-01"` and `token` set to the concatenated token-part1+part2 gets the right formula out of
+     * a dependency that has no native notion of this RFC's own challenge type, without reaching into
+     * its private internals.
+     *
+     * Idempotent - a duplicate delivery of the same challenge email (or a retry) leaves an
+     * already-recorded token-part1 untouched rather than recomputing (and potentially invalidating,
+     * were the two deliveries to ever differ) the digest.
+     *
+     * @param enrollmentId An identifier previously returned by `startEnrollment()`.
+     * @throws If `enrollmentId` is not recognized.
+     */
+    public async recordChallengeToken(
+        enrollmentId: string,
+        tokenPart1: string,
+        replyTo: string,
+        messageId: string,
+        subject: string,
+    ): Promise<void> {
+        const store: Record<string, PendingEnrollment> = await this.loadStore();
+        const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+        if (enrollment.tokenPart1 !== undefined) {
+            return;
+        }
+
+        const client: acme.Client = await this.ensureAccount();
+        // `acme-client`'s own `rfc8555.Challenge` type (not part of this package's public exports,
+        // hence the local `FakeHttpChallenge` shape rather than importing it) only models
+        // `http-01`/`dns-01`/`tls-alpn-01` - see this method's own doc comment on why `type` is
+        // deliberately spoofed as `"http-01"` so `getChallengeKeyAuthorization()` applies that case's
+        // un-hashed `token + "." + thumbprint` formula, exactly what RFC 8823 needs, rather than
+        // throwing on an `email-reply-00` type it has no case for.
+        const fakeHttpChallenge = {
+            type: "http-01" as const,
+            url: enrollment.challengeUrl,
+            status: "pending" as const,
+            token: tokenPart1 + enrollment.tokenPart2,
+        };
+        const keyAuthorization: string = await client.getChallengeKeyAuthorization(fakeHttpChallenge);
+        const digest: string = nodeCrypto.createHash("sha256").update(keyAuthorization).digest("base64url");
+
+        enrollment.tokenPart1 = tokenPart1;
+        enrollment.replyTo = replyTo;
+        enrollment.challengeMessageId = messageId;
+        enrollment.challengeSubject = subject;
+        enrollment.digest = digest;
+        await this.saveStore(store);
+    }
+
+    public async checkStatus(enrollmentId: string): Promise<EnrollmentResult> {
+        const store: Record<string, PendingEnrollment> = await this.loadStore();
+        const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+        return { status: enrollment.status, certificate: enrollment.certificate, error: enrollment.error };
+    }
+}

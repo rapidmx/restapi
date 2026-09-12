@@ -9,3 +9,4 @@ export * from "./OpenBaoPkiCertificateAuthority.js";
 export * from "./SigningCertificateEnrollment.js";
 export * from "./NullSigningCertificateEnrollment.js";
 export * from "./ManualSigningCertificateEnrollment.js";
+export * from "./Rfc8823AcmeSigningCertificateEnrollment.js";
