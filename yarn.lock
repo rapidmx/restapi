@@ -1297,6 +1297,7 @@ __metadata:
     openapi3-ts: "npm:^4.6.1"
     pdf-parse: "npm:^2.4.5"
     prom-client: "npm:^15.1.3"
+    pst-extractor: "npm:^1.12.0"
     redis: "npm:^6.2.1"
     reflect-metadata: "npm:^0.2.2"
     rimraf: "npm:^6.1.3"
@@ -4189,7 +4190,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"iconv-lite@npm:0.7.3":
+"iconv-lite@npm:0.7.3, iconv-lite@npm:^0.7.1":
   version: 0.7.3
   resolution: "iconv-lite@npm:0.7.3"
   dependencies:
@@ -4962,6 +4963,13 @@ __metadata:
   version: 0.1.1
   resolution: "long-timeout@npm:0.1.1"
   checksum: 10c0/a62240cc8f449d7a00081e817ae543fb1ded4d9fc05492e9fa8d6868cb33b2c9d5d71176a6f8be4473df7ba4b208460b3073b0e05069c3ec286122f3e4b5747f
+  languageName: node
+  linkType: hard
+
+"long@npm:^5.3.2":
+  version: 5.3.2
+  resolution: "long@npm:5.3.2"
+  checksum: 10c0/7130fe1cbce2dca06734b35b70d380ca3f70271c7f8852c922a7c62c86c4e35f0c39290565eca7133c625908d40e126ac57c02b1b1a4636b9457d77e1e60b981
   languageName: node
   linkType: hard
 
@@ -5743,6 +5751,17 @@ __metadata:
   version: 2.1.0
   resolution: "proxy-from-env@npm:2.1.0"
   checksum: 10c0/ed01729fd4d094eab619cd7e17ce3698b3413b31eb102c4904f9875e677cd207392795d5b4adee9cec359dfd31c44d5ad7595a3a3ad51c40250e141512281c58
+  languageName: node
+  linkType: hard
+
+"pst-extractor@npm:^1.12.0":
+  version: 1.12.0
+  resolution: "pst-extractor@npm:1.12.0"
+  dependencies:
+    iconv-lite: "npm:^0.7.1"
+    long: "npm:^5.3.2"
+    uuid-parse: "npm:^1.1.0"
+  checksum: 10c0/51fb36a2a012fb08d6a3bc965ec97fa9168d31009464a191eec9a934fe6027ac446f74829c5df76a1fd7c5ffc53a853db614c97a567acd139769c1cae62f017c
   languageName: node
   linkType: hard
 
@@ -6933,6 +6952,13 @@ __metadata:
   version: 1.0.2
   resolution: "util-deprecate@npm:1.0.2"
   checksum: 10c0/41a5bdd214df2f6c3ecf8622745e4a366c4adced864bc3c833739791aeeeb1838119af7daed4ba36428114b5c67dcda034a79c882e97e43c03e66a4dd7389942
+  languageName: node
+  linkType: hard
+
+"uuid-parse@npm:^1.1.0":
+  version: 1.1.0
+  resolution: "uuid-parse@npm:1.1.0"
+  checksum: 10c0/513d5b0407b8929c54d452e8e286a1f6f00d40a2ebf6607fc7297b9caa40eee35230dcc4ce3f178f84d89704e8147e24d1a33d680a8afb7e12a5700714db7f51
   languageName: node
   linkType: hard
 

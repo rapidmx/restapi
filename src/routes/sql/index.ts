@@ -21,6 +21,7 @@ export * from "./KeyDiscoveryRouteSQL.js";
 export * from "./KeyLookupRouteSQL.js";
 export * from "./KeyVaultRouteSQL.js";
 export * from "./LabelRouteSQL.js";
+export * from "./MailboxImportRequestRouteSQL.js";
 export * from "./MailboxRouteSQL.js";
 export * from "./MailFilterRuleRouteSQL.js";
 export * from "./MailIngestRouteSQL.js";

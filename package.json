@@ -57,6 +57,7 @@
         "html-to-text": "^10.0.1",
         "mailparser": "^3.9.23",
         "nodemailer": "^10.0.1",
+        "pst-extractor": "^1.12.0",
         "sanitize-html": "^2.17.7"
     },
     "devDependencies": {

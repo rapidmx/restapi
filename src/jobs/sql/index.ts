@@ -5,6 +5,7 @@ export * from "./DataExportJobSQL.js";
 export * from "./DomainVerificationJobSQL.js";
 export * from "./EasDeviceStateCleanupJobSQL.js";
 export * from "./ExternalShareExpirationJobSQL.js";
+export * from "./MailboxImportJobSQL.js";
 export * from "./MailboxQuotaRecalcJobSQL.js";
 export * from "./MeetingSchedulingJobSQL.js";
 export * from "./OofReplySuppressionCleanupJobSQL.js";
