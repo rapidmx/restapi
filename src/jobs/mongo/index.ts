@@ -1,3 +1,4 @@
+export * from "./AcmeEnrollmentDriverJobMongo.js";
 export * from "./AttachmentExtractionJobMongo.js";
 export * from "./CalendarReminderJobMongo.js";
 export * from "./DomainVerificationJobMongo.js";

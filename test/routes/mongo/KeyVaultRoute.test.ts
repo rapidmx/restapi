@@ -462,6 +462,85 @@ describe("Route:KeyVaultMongo Tests", () => {
         });
     });
 
+    describe("POST/GET /:id/keyvault/keys/sign-enrollment (automated, default deployment)", () => {
+        it("startSignEnrollment() reports 500 'not available' when no automated enrollment is configured (the default NullSigningCertificateEnrollment).", async () => {
+            const mailbox = await createMailbox();
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/keys/sign-enrollment`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ csr: await generateTestCsr(mailbox.primarySmtpAddress), wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } });
+
+            expect(result.status).toBe(500);
+        });
+
+        it("checkSignEnrollmentStatus() reports 500 'not available' when no automated enrollment is configured.", async () => {
+            const mailbox = await createMailbox();
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/${mailbox.uid}/keyvault/keys/sign-enrollment/some-id`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(500);
+        });
+
+        it("Rejects a request with no csr at all (400) - never reaches the enrollment service.", async () => {
+            const mailbox = await createMailbox();
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/keys/sign-enrollment`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects a request with an invalid wrappedKey (400) - never reaches the enrollment service.", async () => {
+            const mailbox = await createMailbox();
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/keys/sign-enrollment`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ csr: await generateTestCsr(mailbox.primarySmtpAddress), wrappedKey: { ciphertext: "", nonce: "n", algorithm: "AES-256-GCM" } });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects a caller without UPDATE access (403) for startSignEnrollment().", async () => {
+            const mailbox = await createMailbox();
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/keys/sign-enrollment`)
+                .set("Authorization", "jwt " + otherUserToken)
+                .send({ csr: await generateTestCsr(mailbox.primarySmtpAddress), wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } });
+
+            expect(result.status).toBe(403);
+        });
+
+        it("Rejects a caller with no access at all (403) for checkSignEnrollmentStatus().", async () => {
+            const mailbox = await createMailbox();
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/${mailbox.uid}/keyvault/keys/sign-enrollment/some-id`)
+                .set("Authorization", "jwt " + otherUserToken);
+
+            expect(result.status).toBe(403);
+        });
+
+        it("404s for a nonexistent mailbox on both endpoints.", async () => {
+            const startResult = await request(server.getApplication())
+                .post(`${baseUrl}/${uuid.v4()}/keyvault/keys/sign-enrollment`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ csr: await generateTestCsr("x@example.com"), wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } });
+            expect(startResult.status).toBe(404);
+
+            const statusResult = await request(server.getApplication())
+                .get(`${baseUrl}/${uuid.v4()}/keyvault/keys/sign-enrollment/some-id`)
+                .set("Authorization", "jwt " + ownerToken);
+            expect(statusResult.status).toBe(404);
+        });
+    });
+
     describe("POST /:id/keyvault/wraps and DELETE /:id/keyvault/wraps/:method", () => {
         const enrollFirstKey = async function (mailbox: MailboxMongo): Promise<void> {
             await request(server.getApplication())

@@ -18,7 +18,9 @@ import {
     RouteDecorators,
 } from "@rapidrest/service-core";
 import { EncryptionCertificateAuthority } from "../pki/EncryptionCertificateAuthority.js";
+import { EnrollmentResult, SigningCertificateEnrollment } from "../pki/SigningCertificateEnrollment.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { publicKeyFromCertificatePem } from "../util/CertificateInstallUtils.js";
 import { AuditAction, EscrowScope, KeyVault, Mailbox, MasterKeyWrap, PublicKey, WrappedPrivateKey } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
@@ -53,6 +55,19 @@ export interface EnrollKeyRequest {
 
 /** Request body for `addMasterKeyWrap()`. */
 export type AddMasterKeyWrapRequest = MasterKeyWrap;
+
+/** Request body for `startSignEnrollment()`. `wrappedKey` is submitted upfront, alongside the CSR, so a
+ * driver job (a real `SigningCertificateEnrollment` implementation may support one - see that method's
+ * own doc comment) can auto-install the finished certificate the moment the CA issues it, with no further
+ * client action - the same E2E boundary `EnrollKeyRequest.wrappedKey` already keeps (this server never
+ * sees an unwrapped private key). `fingerprint`/`useType` are omitted for the identical reason
+ * `EnrollKeyRequest`'s own field omits them: the server derives both from the certificate once it exists,
+ * never trusting a client-asserted value for either. */
+export interface SignEnrollmentRequest {
+    /** A PEM-encoded PKCS#10 CSR for the signing key pair to enroll. */
+    csr: string;
+    wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">;
+}
 
 const MASTER_KEY_WRAP_METHODS = ["password", "passkey", "recovery", "escrow"] as const;
 
@@ -169,6 +184,12 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
 
     @Inject("EncryptionCertificateAuthority")
     private encryptionCa?: EncryptionCertificateAuthority;
+
+    /** Same DI token `ManualSigningCertificateEnrollment`'s eventual admin-upload route and this class's
+     * own `startSignEnrollment()`/`checkSignEnrollmentStatus()` consume - see `SigningCertificateEnrollment`'s
+     * own doc comment on why the default (`NullSigningCertificateEnrollment`) makes both endpoints throw. */
+    @Inject("SigningCertificateEnrollment")
+    private signingCertificateEnrollment?: SigningCertificateEnrollment;
 
     /** Exposes the `@Model(...)`-supplied entity class so `@Transactional()` on `enrollKey()`/`rekey()` can
      * resolve which datasource to open a transaction against - identical reasoning to `BaseBookingRoute`'s own
@@ -305,53 +326,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         return existing ? { wrappedKeys: existing.wrappedKeys, masterKeyWraps: existing.masterKeyWraps } : EMPTY_KEY_VAULT;
     }
 
-    /** Normalizes a `crypto.X509Certificate`'s colon-separated-hex fingerprint to the same lowercase,
-     * no-separator hex format `EncryptionCertificateAuthority.issue()` already produces (see
-     * `LocalX509CertificateAuthority`/`OpenBaoPkiCertificateAuthority`'s own `getThumbprint()`-derived
-     * fingerprints), so a `PublicKey.fingerprint` looks the same regardless of which code path derived it. */
-    private static normalizeFingerprint(fingerprint256: string): string {
-        return fingerprint256.replace(/:/g, "").toLowerCase();
-    }
-
-    private static publicKeyFromCertificatePem(
-        certificatePem: string,
-        useType: "sign" | "encrypt",
-        mailboxAddress: string,
-    ): { publicKey: PublicKey; fingerprint: string } {
-        let cert: crypto.X509Certificate;
-        try {
-            cert = new crypto.X509Certificate(certificatePem);
-        } catch {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The provided certificate could not be parsed.");
-        }
-        // Identity binding: "matches the mailbox identity is left to the CA that issued it" (this method's own
-        // doc comment) is true for chain-of-trust validity, but was previously also true for whether the
-        // certificate names this mailbox at all - nothing checked that, so any mailbox owner could publish any
-        // third party's genuinely-valid signing certificate (e.g. lifted from any signed email they received)
-        // as their own. `checkEmail()` is Node's own RFC 5280 `rfc822Name` SAN matcher (falls back to a
-        // CN-based comparison per its documented legacy behavior) - this does not re-litigate the issuing
-        // CA's trust decision, only that the certificate the CA vouched for actually names *this* mailbox.
-        if (!cert.checkEmail(mailboxAddress)) {
-            throw new ApiError(
-                ApiErrors.INVALID_REQUEST,
-                400,
-                "The provided certificate does not identify this mailbox's address.",
-            );
-        }
-        const fingerprint: string = BaseKeyVaultRoute.normalizeFingerprint(cert.fingerprint256);
-        return {
-            fingerprint,
-            publicKey: {
-                publicKey: cert.raw.toString("base64"),
-                type: "x509",
-                useType,
-                fingerprint,
-                notBefore: new Date(cert.validFrom).getTime(),
-                notAfter: new Date(cert.validTo).getTime(),
-            },
-        };
-    }
-
     /**
      * Enrolls a new signing or encryption key for `mailboxId`. For `useType: "encrypt"`, this endpoint itself
      * calls the injected `EncryptionCertificateAuthority.issue()` against the caller-supplied CSR - the server
@@ -412,7 +386,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             if (!body.certificate) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "certificate is required for useType 'sign'.");
             }
-            const result = BaseKeyVaultRoute.publicKeyFromCertificatePem(body.certificate, "sign", mailbox.primarySmtpAddress);
+            const result = publicKeyFromCertificatePem(body.certificate, "sign", mailbox.primarySmtpAddress);
             publicKey = result.publicKey;
             fingerprint = result.fingerprint;
         } else {
@@ -474,6 +448,64 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         );
 
         return { mailbox: updatedMailbox, keyVault: updatedKeyVault };
+    }
+
+    /**
+     * Starts automated public signing-certificate enrollment against whichever `SigningCertificateEnrollment`
+     * is registered (`Rfc8823AcmeSigningCertificateEnrollment` in production; the default
+     * `NullSigningCertificateEnrollment` simply throws "not available", matching every other optional
+     * pluggable interface in this codebase). `csr` is the only thing `startEnrollment()`'s own shared
+     * interface needs; `wrappedKey` is submitted here too (not part of that interface) so a real
+     * implementation that supports it (feature-detected via `attachWrappedKey`) can hold onto it and, once
+     * the CA actually issues the certificate, auto-install the finished key pair into this mailbox's
+     * `KeyVault` with no further client action - `getIssuedMaterial()`'s own doc comment (on the RFC 8823
+     * implementation) has the full reasoning. An implementation without that method (the manual-CA
+     * default, or `Null`) simply never receives the wrapped key here - its own existing `enrollKey()` call
+     * (once an admin has the certificate in hand) is unaffected either way.
+     *
+     * Deliberately not itself `@Transactional()`/audit-logged: unlike `enrollKey()`, nothing is installed
+     * into this mailbox's own data yet - only a pending enrollment starts existing in a separate store.
+     * The eventual install (this feature's own driver job, once the CA issues the certificate) reuses
+     * `persistEnrollment()` above and is audited exactly like `enrollKey()`'s own manual path.
+     */
+    @Post("/:id/keyvault/keys/sign-enrollment")
+    public async startSignEnrollment(
+        @Param("id") mailboxId: string,
+        body: SignEnrollmentRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<{ enrollmentId: string }> {
+        await this.init();
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        await this.requireMailboxAccess(mailbox, user, ACLAction.UPDATE);
+
+        if (!body?.csr) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "csr is required.");
+        }
+        validateWrappedPrivateKey(body.wrappedKey);
+
+        const { enrollmentId } = await this.signingCertificateEnrollment!.startEnrollment(mailbox.primarySmtpAddress, body.csr);
+        const attachWrappedKey: ((enrollmentId: string, wrappedKey: unknown) => Promise<void>) | undefined = (
+            this.signingCertificateEnrollment as any
+        ).attachWrappedKey;
+        if (typeof attachWrappedKey === "function") {
+            await attachWrappedKey.call(this.signingCertificateEnrollment, enrollmentId, body.wrappedKey);
+        }
+
+        return { enrollmentId };
+    }
+
+    /** Reports the current status of a previously started automated enrollment - see `startSignEnrollment()`. */
+    @Get("/:id/keyvault/keys/sign-enrollment/:enrollmentId")
+    public async checkSignEnrollmentStatus(
+        @Param("id") mailboxId: string,
+        @Param("enrollmentId") enrollmentId: string,
+        @AuthUser user?: JWTUser,
+    ): Promise<EnrollmentResult> {
+        await this.init();
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
+
+        return await this.signingCertificateEnrollment!.checkStatus(enrollmentId);
     }
 
     /**

@@ -378,6 +378,98 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
         await expect(fs.access(path.join((enrollment as any).storeDir, "account.url"))).resolves.toBeUndefined();
     });
 
+    describe("attachWrappedKey()/listPendingEnrollments()/getIssuedMaterial()/markInstalled()", () => {
+        const wrappedKey = { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" };
+
+        it("attachWrappedKey() persists the wrapped key onto the enrollment.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("attach@example.com", await generateCsr("attach@example.com"));
+
+            await enrollment.attachWrappedKey(enrollmentId, wrappedKey);
+
+            const storePath = path.join((enrollment as any).storeDir, "enrollments.json");
+            const store = JSON.parse(await fs.readFile(storePath, "utf-8"));
+            expect(store[enrollmentId].wrappedKey).toEqual(wrappedKey);
+        });
+
+        it("attachWrappedKey() throws 404 for an unknown enrollment id.", async () => {
+            await expect(enrollment.attachWrappedKey("does-not-exist", wrappedKey)).rejects.toThrow(/No enrollment found/);
+        });
+
+        it("listPendingEnrollments() returns an empty array when there are no enrollments at all.", async () => {
+            await expect(enrollment.listPendingEnrollments()).resolves.toEqual([]);
+        });
+
+        it("listPendingEnrollments() includes pending enrollments and issued-but-not-yet-installed ones, excluding installed/failed ones.", async () => {
+            const pending = await enrollment.startEnrollment("list-pending@example.com", await generateCsr("list-pending@example.com"));
+
+            const issuedNotInstalled = await enrollment.startEnrollment("list-issued@example.com", await generateCsr("list-issued@example.com"));
+            await enrollment.recordChallengeToken(issuedNotInstalled.enrollmentId, "t1", "r@acme.test", "<i1@acme.test>", "ACME: t1");
+            await enrollment.advanceEnrollment(issuedNotInstalled.enrollmentId);
+            FakeAcmeClient.orderStatus = "valid";
+            await enrollment.advanceEnrollment(issuedNotInstalled.enrollmentId);
+            FakeAcmeClient.orderStatus = "pending";
+
+            const installed = await enrollment.startEnrollment("list-installed@example.com", await generateCsr("list-installed@example.com"));
+            await enrollment.recordChallengeToken(installed.enrollmentId, "t2", "r@acme.test", "<i2@acme.test>", "ACME: t2");
+            await enrollment.advanceEnrollment(installed.enrollmentId);
+            FakeAcmeClient.orderStatus = "valid";
+            await enrollment.advanceEnrollment(installed.enrollmentId);
+            FakeAcmeClient.orderStatus = "pending";
+            await enrollment.markInstalled(installed.enrollmentId);
+
+            const failed = await enrollment.startEnrollment("list-failed@example.com", await generateCsr("list-failed@example.com"));
+            await enrollment.recordChallengeToken(failed.enrollmentId, "t3", "r@acme.test", "<i3@acme.test>", "ACME: t3");
+            await enrollment.advanceEnrollment(failed.enrollmentId);
+            FakeAcmeClient.orderStatus = "invalid";
+            await enrollment.advanceEnrollment(failed.enrollmentId);
+            FakeAcmeClient.orderStatus = "pending";
+
+            const list = await enrollment.listPendingEnrollments();
+            const ids = list.map((e) => e.enrollmentId).sort();
+            expect(ids).toEqual([pending.enrollmentId, issuedNotInstalled.enrollmentId].sort());
+        });
+
+        it("markInstalled() throws 404 for an unknown enrollment id.", async () => {
+            await expect(enrollment.markInstalled("does-not-exist")).rejects.toThrow(/No enrollment found/);
+        });
+
+        it("getIssuedMaterial() returns undefined for a still-pending enrollment.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("not-issued@example.com", await generateCsr("not-issued@example.com"));
+
+            await expect(enrollment.getIssuedMaterial(enrollmentId)).resolves.toBeUndefined();
+        });
+
+        it("getIssuedMaterial() returns undefined for an issued enrollment that never had a wrappedKey attached.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("no-wrapped-key@example.com", await generateCsr("no-wrapped-key@example.com"));
+            await enrollment.recordChallengeToken(enrollmentId, "t4", "r@acme.test", "<i4@acme.test>", "ACME: t4");
+            await enrollment.advanceEnrollment(enrollmentId);
+            FakeAcmeClient.orderStatus = "valid";
+            await enrollment.advanceEnrollment(enrollmentId);
+            FakeAcmeClient.orderStatus = "pending";
+
+            await expect(enrollment.getIssuedMaterial(enrollmentId)).resolves.toBeUndefined();
+        });
+
+        it("getIssuedMaterial() returns the certificate + wrappedKey once issued and attached.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("with-key@example.com", await generateCsr("with-key@example.com"));
+            await enrollment.attachWrappedKey(enrollmentId, wrappedKey);
+            await enrollment.recordChallengeToken(enrollmentId, "t5", "r@acme.test", "<i5@acme.test>", "ACME: t5");
+            await enrollment.advanceEnrollment(enrollmentId);
+            FakeAcmeClient.orderStatus = "valid";
+            await enrollment.advanceEnrollment(enrollmentId);
+            FakeAcmeClient.orderStatus = "pending";
+
+            await expect(enrollment.getIssuedMaterial(enrollmentId)).resolves.toEqual({
+                certificate: FakeAcmeClient.certificatePem,
+                wrappedKey,
+            });
+        });
+
+        it("getIssuedMaterial() throws 404 for an unknown enrollment id.", async () => {
+            await expect(enrollment.getIssuedMaterial("does-not-exist")).rejects.toThrow(/No enrollment found/);
+        });
+    });
+
     describe("advanceEnrollment()", () => {
         async function seedReadyEnrollment(): Promise<string> {
             const { enrollmentId } = await enrollment.startEnrollment("advance@example.com", await generateCsr("advance@example.com"));

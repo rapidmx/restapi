@@ -1237,6 +1237,10 @@ export enum AuditAction {
     /** `GET /mailbox/:id/keyvault` - the one key-vault operation that reads wrapped key material (including,
      * via `masterKeyWraps`, an escrow wrap) rather than writing it. See `BaseKeyVaultRoute.get()`. */
     KEY_VAULT_READ = "key_vault.read",
+    /** `AcmeEnrollmentDriverJob`'s own periodic flag for a mailbox's signing certificate nearing `notAfter`
+     * with no newer non-revoked one already enrolled - detection only, this server can't originate a fresh
+     * CSR itself (the signing key pair is always client-side). */
+    SIGNING_CERT_EXPIRING = "key_vault.signing_cert_expiring",
     ESCROW_SCOPE_CREATE = "escrow_scope.create",
     ESCROW_SCOPE_UPDATE = "escrow_scope.update",
     ESCROW_SCOPE_DELETE = "escrow_scope.delete",

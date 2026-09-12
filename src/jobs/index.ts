@@ -1,3 +1,4 @@
+export * from "./AcmeEnrollmentDriverJob.js";
 export * from "./AttachmentExtractionJob.js";
 export * from "./CalendarReminderJob.js";
 export * from "./DomainVerificationJob.js";

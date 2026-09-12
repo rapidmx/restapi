@@ -18,6 +18,7 @@ import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
+import { WrappedPrivateKey } from "../models/types.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
@@ -45,6 +46,12 @@ interface PendingEnrollment {
      * object itself, before the CA's challenge email (carrying "token-part1") ever arrives. */
     tokenPart2: string;
     status: "pending" | "issued" | "failed";
+    /** The client's own already-wrapped private key for the CSR's key pair, submitted upfront alongside
+     * the CSR (`attachWrappedKey()`) - held here until the certificate is issued, so the driver job
+     * (this feature's own follow-on piece) can auto-install the finished `PublicKey`/`WrappedPrivateKey`
+     * pair into the mailbox's `KeyVault` with no further client action, the same E2E boundary
+     * `BaseKeyVaultRoute.enrollKey()` already keeps (this server never sees an unwrapped private key). */
+    wrappedKey?: Omit<WrappedPrivateKey, "fingerprint" | "useType">;
     tokenPart1?: string;
     /** The address the reply email must be sent `To:` - the challenge email's own `Reply-To` header,
      * falling back to its `From` (see `recordChallengeToken()`'s own doc comment). */
@@ -58,6 +65,11 @@ interface PendingEnrollment {
     /** Set once the reply email has actually been sent and `completeChallenge()` called - `advanceEnrollment()`'s
      * cue to stop resending the reply and start polling the order/authorization instead. */
     replySentAt?: string;
+    /** Set once `AcmeEnrollmentDriverJob` has successfully installed the issued certificate into the
+     * mailbox's `KeyVault` - `listPendingEnrollments()` keeps returning an `"issued"` enrollment until
+     * this is set, so a failed install attempt (network blip, a since-deleted mailbox, etc.) gets retried
+     * on the next tick rather than being silently lost the moment `status` leaves `"pending"`. */
+    installedAt?: string;
     certificate?: string;
     error?: string;
     createdAt: string;
@@ -348,6 +360,69 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
         const store: Record<string, PendingEnrollment> = await this.loadStore();
         const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
         return { status: enrollment.status, certificate: enrollment.certificate, error: enrollment.error };
+    }
+
+    /**
+     * Records the client's already-wrapped private key for this enrollment's CSR, submitted upfront by
+     * the REST endpoint that calls `startEnrollment()` - see `PendingEnrollment.wrappedKey`'s own doc
+     * comment on why this is a separate call rather than a third `startEnrollment()` parameter (this
+     * data is specific to the automated flow's own auto-install step, not something
+     * `ManualSigningCertificateEnrollment`/`NullSigningCertificateEnrollment` have any use for, so it
+     * stays off the shared `SigningCertificateEnrollment` interface entirely).
+     *
+     * @throws If `enrollmentId` is not recognized.
+     */
+    public async attachWrappedKey(enrollmentId: string, wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">): Promise<void> {
+        const store: Record<string, PendingEnrollment> = await this.loadStore();
+        const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+        enrollment.wrappedKey = wrappedKey;
+        await this.saveStore(store);
+    }
+
+    /**
+     * Every enrollment a driver job still has work to do for: either `status === "pending"` (needs
+     * `advanceEnrollment()`) or `status === "issued"` with no `installedAt` yet (needs installing) - see
+     * `AcmeEnrollmentDriverJob`, this feature's own follow-on piece. Keeping both in one list means a
+     * failed install attempt (network blip, a since-deleted mailbox) naturally gets retried on the next
+     * tick rather than being lost the moment `status` leaves `"pending"`. Never includes the CSR/wrapped-
+     * key contents themselves - a caller that needs those re-reads via `checkStatus()`/`getIssuedMaterial()`.
+     */
+    public async listPendingEnrollments(): Promise<Array<{ enrollmentId: string; identity: string; status: PendingEnrollment["status"] }>> {
+        const store: Record<string, PendingEnrollment> = await this.loadStore();
+        return Object.entries(store)
+            .filter(([, enrollment]) => enrollment.status === "pending" || (enrollment.status === "issued" && enrollment.installedAt === undefined))
+            .map(([enrollmentId, enrollment]) => ({ enrollmentId, identity: enrollment.identity, status: enrollment.status }));
+    }
+
+    /**
+     * Records that `AcmeEnrollmentDriverJob` has successfully installed this `"issued"` enrollment's
+     * certificate into the mailbox's `KeyVault` - `listPendingEnrollments()` stops returning it afterward.
+     *
+     * @throws If `enrollmentId` is not recognized.
+     */
+    public async markInstalled(enrollmentId: string): Promise<void> {
+        const store: Record<string, PendingEnrollment> = await this.loadStore();
+        const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+        enrollment.installedAt = new Date().toISOString();
+        await this.saveStore(store);
+    }
+
+    /**
+     * Returns the exact `{publicKeyPem: certificate, wrappedKey}` pair `AcmeEnrollmentDriverJob` needs to
+     * auto-install an `"issued"` enrollment - `undefined` if the enrollment isn't `"issued"` yet, has no
+     * certificate on file, or never had a `wrappedKey` attached (an enrollment started before this
+     * feature existed, or through a caller that never called `attachWrappedKey()` - install falls back
+     * to the existing manual `enrollKey()` path for those, same as before this feature existed).
+     */
+    public async getIssuedMaterial(
+        enrollmentId: string,
+    ): Promise<{ certificate: string; wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType"> } | undefined> {
+        const store: Record<string, PendingEnrollment> = await this.loadStore();
+        const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+        if (enrollment.status !== "issued" || !enrollment.certificate || !enrollment.wrappedKey) {
+            return undefined;
+        }
+        return { certificate: enrollment.certificate, wrappedKey: enrollment.wrappedKey };
     }
 
     /**
