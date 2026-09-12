@@ -11,9 +11,10 @@ import { ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { BaseMatterSearchRoute } from "../../src/routes/BaseMatterSearchRoute.js";
 
-class TestMatterSearchRoute extends BaseMatterSearchRoute<any> {
+class TestMatterSearchRoute extends BaseMatterSearchRoute<any, any> {
     protected matterClass: any = class {};
     protected escrowScopeClass: any = class {};
+    protected mailboxClass: any = class {};
 }
 
 describe("BaseMatterSearchRoute Tests (searchProvider guard clause only)", () => {

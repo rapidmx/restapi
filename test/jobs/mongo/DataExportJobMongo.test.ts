@@ -291,6 +291,25 @@ describe("DataExportJobMongo Tests (real DB + DI)", () => {
         expect(updated!.errorMessage).toBe("simulated failure");
     });
 
+    it("Marks the request failed when the mailbox's content exceeds the configured max_content_rows cap, rather than risking unbounded memory growth.", async () => {
+        const mailbox = await createMailbox();
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "A" }));
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "B" }));
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "json" });
+
+        const original = (job as any).maxContentRows;
+        (job as any).maxContentRows = 1;
+        try {
+            await expect(job.run()).resolves.toBeUndefined();
+
+            const updated = await requestRepo.findOne({ uid: request.uid } as any);
+            expect(updated!.status).toBe("failed");
+            expect(updated!.errorMessage).toContain("exceeds the maximum");
+        } finally {
+            (job as any).maxContentRows = original;
+        }
+    });
+
     it("Skips a message whose body blob can't be read, still exporting the rest.", async () => {
         const mailbox = await createMailbox();
         const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;

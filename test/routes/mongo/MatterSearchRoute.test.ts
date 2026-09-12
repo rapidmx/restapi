@@ -8,6 +8,7 @@ import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionMana
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { EscrowScopeMongo } from "../../../src/models/mongo/EscrowScopeMongo.js";
+import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles, NoopSearchProvider } from "../../testDoubles.js";
@@ -23,6 +24,7 @@ describe("Route:MatterSearchMongo Tests", () => {
     const baseUrl = "/mongo/matter-search";
     let escrowScopeRepo: MongoRepository<EscrowScopeMongo>;
     let matterRepo: MongoRepository<MatterMongo>;
+    let mailboxRepo: MongoRepository<MailboxMongo>;
 
     const holder: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const holderToken = JWTUtils.createTokenSync(config.get("auth"), holder);
@@ -36,12 +38,30 @@ describe("Route:MatterSearchMongo Tests", () => {
             new EscrowScopeMongo({ name: "legal", publicKey: validPublicKey, holderUserUids: [holder.uid], requiredHolders: 1, ...data }),
         );
 
+    // A custodian mailbox is only actually searched when its own `escrowScopeId` matches the matter's -
+    // see `BaseMatterSearchRoute`'s own doc comment. Real `Mailbox` rows (rather than bare `uuid.v4()`
+    // placeholders) are required here so that check can pass.
+    const createMailbox = async (escrowScopeId: string, data?: Partial<MailboxMongo>): Promise<MailboxMongo> =>
+        await mailboxRepo.save(
+            new MailboxMongo({
+                ownerUserUid: uuid.v4(),
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Custodian Mailbox",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+                escrowScopeId,
+                ...data,
+            }),
+        );
+
     const createMatter = async (escrowScopeId: string, data?: Partial<MatterMongo>): Promise<MatterMongo> =>
         await matterRepo.save(
             new MatterMongo({
                 name: "Investigation A",
                 escrowScopeId,
-                custodianMailboxUids: [uuid.v4(), uuid.v4()],
+                custodianMailboxUids: [(await createMailbox(escrowScopeId)).uid, (await createMailbox(escrowScopeId)).uid],
                 dateRangeStart: new Date("2026-01-01"),
                 dateRangeEnd: new Date("2026-06-01"),
                 ...data,
@@ -58,6 +78,7 @@ describe("Route:MatterSearchMongo Tests", () => {
         if (conn instanceof MongoConnection) {
             escrowScopeRepo = conn.getMongoRepository("EscrowScopeMongo");
             matterRepo = conn.getMongoRepository("MatterMongo");
+            mailboxRepo = conn.getMongoRepository("MailboxMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -72,6 +93,7 @@ describe("Route:MatterSearchMongo Tests", () => {
     beforeEach(async () => {
         await matterRepo.clear();
         await escrowScopeRepo.clear();
+        await mailboxRepo.clear();
     });
 
     afterEach(() => {
@@ -139,6 +161,25 @@ describe("Route:MatterSearchMongo Tests", () => {
         expect(result.body[matter.custodianMailboxUids[1]].results.length).toBe(0);
     });
 
+    it("Excludes a listed custodian mailbox whose own escrowScopeId doesn't actually match the matter's - a holder cannot search a mailbox just by naming it as a custodian.", async () => {
+        // Real, not hypothetical: `custodianMailboxUids` is holder-set, unvalidated free text
+        // (`BaseMatterRoute.validateMatter()` only checks it's a non-empty array of non-empty strings) -
+        // without this check, any holder could list an arbitrary mailbox (one never assigned to their
+        // scope at all) as a "custodian" and search its full content with no dual-control approval, the
+        // exact bypass `BaseEscrowAccessRequestRoute.create()`'s own escrowScopeId-matching check exists
+        // to prevent for the real escrow-access workflow.
+        const scope = await createEscrowScope();
+        const outOfScopeMailbox = await createMailbox(uuid.v4());
+        const matter = await createMatter(scope.uid, { custodianMailboxUids: [outOfScopeMailbox.uid] });
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}?matterId=${matter.uid}&q=hello`)
+            .set("Authorization", "jwt " + holderToken);
+
+        expect(result.status).toBe(200);
+        expect(result.body).toEqual({});
+    });
+
     it("Clamps a caller-supplied before/after to the matter's own date range.", async () => {
         const scope = await createEscrowScope();
         const matter = await createMatter(scope.uid, { dateRangeStart: new Date("2026-02-01"), dateRangeEnd: new Date("2026-04-01") });
@@ -192,6 +233,51 @@ describe("Route:MatterSearchMongo Tests", () => {
         for (const call of searchSpy.mock.calls) {
             expect(call[0].before!.getTime()).toBe(narrowBefore.getTime());
             expect(call[0].after!.getTime()).toBe(narrowAfter.getTime());
+        }
+    });
+
+    it("Threads types/hasAttachment/is/label filters through to the search provider, and ignores an unparseable before/after.", async () => {
+        const scope = await createEscrowScope();
+        const matter = await createMatter(scope.uid);
+
+        const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+        const searchSpy = vi.spyOn(searchProvider, "search");
+
+        const result = await request(server.getApplication())
+            .get(
+                `${baseUrl}?matterId=${matter.uid}&q=hello&types=message,contact&limit=5&hasAttachment=true&is=flagged&label=urgent&before=not-a-date&after=not-a-date`,
+            )
+            .set("Authorization", "jwt " + holderToken);
+
+        expect(result.status).toBe(200);
+        expect(searchSpy).toHaveBeenCalled();
+        for (const call of searchSpy.mock.calls) {
+            expect(call[0].entityTypes).toEqual(["message", "contact"]);
+            expect(call[0].limit).toBe(5);
+            expect(call[0].hasAttachment).toBe(true);
+            expect(call[0].flags).toEqual(["flagged"]);
+            expect(call[0].labels).toEqual(["urgent"]);
+            // An unparseable before/after is treated the same as absent - clamped to the matter's own range.
+            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime());
+            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime());
+        }
+    });
+
+    it("Searches with only a structured filter and no q at all, passing an empty text to the provider.", async () => {
+        const scope = await createEscrowScope();
+        const matter = await createMatter(scope.uid);
+
+        const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+        const searchSpy = vi.spyOn(searchProvider, "search");
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}?matterId=${matter.uid}&subject=quarterly`)
+            .set("Authorization", "jwt " + holderToken);
+
+        expect(result.status).toBe(200);
+        for (const call of searchSpy.mock.calls) {
+            expect(call[0].text).toBe("");
+            expect(call[0].subject).toBe("quarterly");
         }
     });
 });

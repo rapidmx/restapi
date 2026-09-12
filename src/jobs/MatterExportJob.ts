@@ -7,7 +7,7 @@ import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
-import { collectMailboxContentLines, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
+import { collectMailboxContentLines, DEFAULT_MAX_MAILBOX_CONTENT_ROWS, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
 import { AuditAction, EscrowAuditAction, Mailbox, Matter, MatterExportRequest } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
@@ -72,6 +72,14 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
     // Smaller than DataExportJob's own 10 - each request here can span many custodian mailboxes, not one.
     @Config("mail:jobs:matter_export:batch_size", 5)
     private batchSize: number = 5;
+
+    // See `MailboxContentUtils.collectMailboxContentLines()`'s own doc comment for why this exists - applied
+    // per custodian mailbox, the same as `DataExportJob`'s identical field, not to the combined bundle across
+    // every custodian (a `Matter`'s custodian list is holder/admin-curated, not attacker-controlled, so
+    // bounding each mailbox individually is the right compounding boundary here rather than a single
+    // whole-request total).
+    @Config("mail:jobs:matter_export:max_content_rows", DEFAULT_MAX_MAILBOX_CONTENT_ROWS)
+    private maxContentRows: number = DEFAULT_MAX_MAILBOX_CONTENT_ROWS;
 
     /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
     @Config()
@@ -155,7 +163,26 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
                 this.logger?.warn(`MatterExportJob: skipping custodian mailbox ${mailboxUid} for request ${request.uid} - it no longer exists.`);
                 continue;
             }
-            const lines: string[] = await collectMailboxContentLines(this._objectFactory!, this.contentEntityClasses, mailboxUid, mailbox, dateRange);
+            // `custodianMailboxUids` is holder-set, unvalidated free text (`BaseMatterRoute`'s own
+            // `validateMatter()` only checks it's a non-empty array of non-empty strings) - without this
+            // check, any holder of any `EscrowScope` could list an arbitrary mailbox as a "custodian" on
+            // their own matter and export its full content, bypassing the real "both must agree" binding
+            // `BaseEscrowAccessRequestRoute.create()` already enforces before opening genuine escrow
+            // access (see `Matter.custodianMailboxUids`'s own doc comment).
+            if (mailbox.escrowScopeId !== matter.escrowScopeId) {
+                this.logger?.warn(
+                    `MatterExportJob: skipping custodian mailbox ${mailboxUid} for request ${request.uid} - it is not actually assigned to this matter's escrow scope.`,
+                );
+                continue;
+            }
+            const lines: string[] = await collectMailboxContentLines(
+                this._objectFactory!,
+                this.contentEntityClasses,
+                mailboxUid,
+                mailbox,
+                dateRange,
+                this.maxContentRows,
+            );
             allLines.push(...lines);
             await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
                 action: EscrowAuditAction.MATTER_EXPORT_READY,

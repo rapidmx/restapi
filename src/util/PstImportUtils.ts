@@ -32,7 +32,10 @@ export async function extractPstMessages(pstBuffer: Buffer): Promise<Buffer[]> {
 
     const raw: Buffer[] = [];
     for (const message of messages) {
-        raw.push(await buildRawMimeFromPstMessage(message));
+        // An attachment can never legitimately be larger than the PST file containing it - bounding
+        // `readAttachmentContent()`'s allocation by this file's own size is what keeps a corrupted or
+        // maliciously crafted `filesize` property from driving an unbounded `Buffer.alloc()`.
+        raw.push(await buildRawMimeFromPstMessage(message, pstBuffer.length));
     }
     return raw;
 }
@@ -63,11 +66,20 @@ export function collectMailItems(folder: PSTFolder, out: PSTMessage[]): void {
 /** Reads one attachment's binary content in full - `PSTNodeInputStream.readCompletely()` needs a
  * pre-sized destination buffer (`filesize`), unlike a Node stream's own chunked `read()`. Exported for the
  * same reason as `collectMailItems()` above - the real fixture's every attachment has a readable stream. */
-export function readAttachmentContent(attachment: PSTAttachment): Buffer | undefined {
+export function readAttachmentContent(attachment: PSTAttachment, maxSize: number = Infinity): Buffer | undefined {
     const stream = attachment.fileInputStream;
     if (!stream) {
         // An attachment with no readable content stream (e.g. an OLE-embedded object PST stores in a form
         // this library has no use for) - skipped rather than persisted as a zero-byte attachment.
+        return undefined;
+    }
+    if (attachment.filesize > maxSize) {
+        // `filesize` is a PST property, not a value this code has independently verified - a corrupted or
+        // maliciously crafted PST could claim an arbitrarily large one, driving an unbounded
+        // `Buffer.alloc()` below. An attachment can never legitimately be larger than the PST file that
+        // contains it, so `maxSize` (the caller's own file size) is a hard, always-true ceiling. Skipped
+        // the same way an unreadable stream is, rather than trusting an unverified size enough to
+        // pre-allocate from it.
         return undefined;
     }
     const content = Buffer.alloc(attachment.filesize);
@@ -81,7 +93,7 @@ export function readAttachmentContent(attachment: PSTAttachment): Buffer | undef
  * `multipart/alternative` when the item has both. Exported for the same reason as `collectMailItems()`
  * above - lets a unit test assert on one message's exact reconstructed headers/body without needing to
  * also exercise the folder-walking/attachment-reading logic around it. */
-export function buildRawMimeFromPstMessage(message: PSTMessage): Promise<Buffer> {
+export function buildRawMimeFromPstMessage(message: PSTMessage, maxAttachmentSize: number = Infinity): Promise<Buffer> {
     const hasHtml = !!message.bodyHTML;
     const hasPlain = !!message.body;
 
@@ -102,7 +114,7 @@ export function buildRawMimeFromPstMessage(message: PSTMessage): Promise<Buffer>
         root.appendChild(bodyNode);
         for (let i = 0; i < message.numberOfAttachments; i++) {
             const attachment: PSTAttachment = message.getAttachment(i);
-            const content: Buffer | undefined = readAttachmentContent(attachment);
+            const content: Buffer | undefined = readAttachmentContent(attachment, maxAttachmentSize);
             if (!content) {
                 continue;
             }

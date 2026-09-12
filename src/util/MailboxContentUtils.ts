@@ -12,6 +12,14 @@ export type MailboxContentEntity = "message" | "contact" | "contactList" | "cale
 
 export type MailboxContentEntityClasses = Record<MailboxContentEntity, any>;
 
+/** Default ceiling on the number of NDJSON lines (rows, across every entity type combined)
+ * `collectMailboxContentLines()` will accumulate in memory for a single mailbox before giving up - see
+ * that function's own doc comment for why. Callers (`DataExportJob`/`MatterExportJob`) expose this as
+ * their own `@Config`-overridable field rather than hard-coding it here, since what counts as "too large"
+ * depends on the deployment's available memory, not a value this library can confidently pick for every
+ * installation. */
+export const DEFAULT_MAX_MAILBOX_CONTENT_ROWS = 250_000;
+
 async function getRepo(objectFactory: ObjectFactory, entityClass: any): Promise<RepoUtils<any>> {
     return await objectFactory.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
 }
@@ -48,6 +56,14 @@ async function findAllPages(repo: RepoUtils<any>, criteria: Record<string, any>,
  * pushed into the query itself (`gte(...)`); the upper bound is applied in-process, matching
  * `CalendarReminderJob`'s own documented reason for avoiding the query-DSL's two-sided `range(...)`
  * operator (unconfirmed cross-backend Date coercion) in favor of a single-sided one.
+ *
+ * `maxRows` bounds the total number of lines (across every entity type combined) this function will hold
+ * in memory at once - an unbounded mailbox (or, for `MatterExportJob`, an unbounded custodian mailbox
+ * within a larger matter) could otherwise grow this array without limit. Exceeding it throws rather than
+ * silently truncating the export, since a partial eDiscovery/GDPR bundle that looks complete is worse than
+ * one that visibly failed - both `DataExportJob.run()`/`MatterExportJob.run()` already catch a thrown
+ * `processRequest()` error and route it through their own `markFailed()`, the same path a missing
+ * mailbox/matter already takes, so no new error handling is needed at the call site.
  */
 export async function collectMailboxContentLines(
     objectFactory: ObjectFactory,
@@ -55,6 +71,7 @@ export async function collectMailboxContentLines(
     mailboxUid: string,
     mailbox: Mailbox,
     messageDateRange?: { start: Date; end: Date },
+    maxRows: number = DEFAULT_MAX_MAILBOX_CONTENT_ROWS,
 ): Promise<string[]> {
     const lines: string[] = [JSON.stringify({ entityType: "Mailbox", ...mailbox })];
 
@@ -70,6 +87,9 @@ export async function collectMailboxContentLines(
         }
         for (const row of rows) {
             lines.push(JSON.stringify({ entityType, ...row }));
+            if (lines.length > maxRows) {
+                throw new Error(`Mailbox ${mailboxUid}'s content exceeds the maximum of ${maxRows} exportable rows.`);
+            }
         }
     }
     return lines;

@@ -29,11 +29,29 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * is gone would defeat the entire point of a "leave no trace" feature. `BlobStore.delete()` is
  * documented as a no-op for a key that doesn't exist, so no existence check is needed first.
  *
- * Cascades across every `mailboxUid`-scoped entity type - `Message`/`Contact`/`ContactList`/
- * `CalendarEvent`/`Task`/`Note`/`Attachment`, same set `DataExportJob`'s own JSON bundle collects - plus
- * `Folder`, which that job deliberately leaves out ("low audit value" for a portability export) but this
- * one includes: leaving orphaned folders behind after their owning mailbox is gone would be a real
- * data-hygiene gap for a feature whose whole point is leaving no trace.
+ * Cascades across every real `mailboxUid`-scoped entity type this codebase has - not just the
+ * `Message`/`Contact`/`ContactList`/`CalendarEvent`/`Task`/`Note`/`Attachment` set `DataExportJob`'s own
+ * JSON bundle collects (a deliberately narrower "useful portability content" scope that doesn't apply
+ * here), plus `Folder` (which that job also leaves out as "low audit value" for a portability export, but
+ * an orphaned folder after its owning mailbox is gone would be a real data-hygiene gap for a feature whose
+ * whole point is leaving no trace). Verified against every interface in `models/types.ts` that declares a
+ * `mailboxUid` field, this also purges `FocusedInboxOverride`/`TaskList`/`Label`/`MailFilterRule`/
+ * `MailSignature`/`BookingType`/`Booking`/`OofReplySuppression`/`DeviceSyncState`/`QuarantineEntry`/
+ * `IngestQueueEntry` (each carries real personal data - sender addresses, a signature's name/contact
+ * details, booking attendee details, filter-rule conditions naming other people - that would otherwise
+ * silently survive an "erasure" that reports itself complete), and `DataExportRequest`/
+ * `MailboxImportRequest` (each can reference a `BlobStore`-held copy of this mailbox's own content - a
+ * past export bundle or an import's original source file - that must not outlive the mailbox it was taken
+ * from).
+ *
+ * Deliberately still NOT purged: `KeyVault` (the mailbox's E2E-encryption key material - a distinct
+ * subsystem with its own lifecycle/escrow interactions this job doesn't own, a scoped fast-follow rather
+ * than something to touch without that subsystem's own review) and `EscrowAccessRequest`/
+ * `EscrowAuditLogEntry` (this mailbox's own escrow-access audit trail, which - like `AuditLogEntry`
+ * elsewhere in this codebase - must outlive the record it audits, not disappear the moment that record
+ * does). `CalendarShareLink` is `folderUid`-scoped, not `mailboxUid`-scoped, so it isn't caught by this
+ * job's per-mailbox-uid sweep either - purging it would need iterating the mailbox's own (already-deleted-
+ * by-the-time-anyone-would-look) folder uids instead, a narrower, separate fast-follow.
  *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`ErasureExecutionJobMongo`/
  * `ErasureExecutionJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob`/
@@ -52,6 +70,19 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     protected abstract taskClass: any;
     protected abstract noteClass: any;
     protected abstract attachmentClass: any;
+    protected abstract focusedInboxOverrideClass: any;
+    protected abstract taskListClass: any;
+    protected abstract labelClass: any;
+    protected abstract mailFilterRuleClass: any;
+    protected abstract mailSignatureClass: any;
+    protected abstract bookingTypeClass: any;
+    protected abstract bookingClass: any;
+    protected abstract oofReplySuppressionClass: any;
+    protected abstract deviceSyncStateClass: any;
+    protected abstract quarantineEntryClass: any;
+    protected abstract ingestQueueEntryClass: any;
+    protected abstract dataExportRequestClass: any;
+    protected abstract mailboxImportRequestClass: any;
 
     /** Supplied by the Mongo/SQL concrete subclasses so this job's own hold re-check can resolve without
      * depending on either backend directly - see `util/LegalHoldUtils.ts`. */
@@ -164,8 +195,52 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         purgedCount += await this.purgeEntityType(this.taskClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.noteClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.folderClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.focusedInboxOverrideClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.taskListClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.labelClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.mailFilterRuleClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.mailSignatureClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.bookingTypeClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.bookingClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.oofReplySuppressionClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.deviceSyncStateClass, request.mailboxUid);
+        // `rawBlobKey` is required (non-optional) on both `QuarantineEntry` and `IngestQueueEntry` -
+        // deleted unconditionally, same reasoning as `Attachment.blobKey`/`Message.bodyBlobKey` above.
+        purgedCount += await this.purgeEntityType(this.quarantineEntryClass, request.mailboxUid, async (row: any) => {
+            await this.blobStore!.delete(row.rawBlobKey);
+        });
+        purgedCount += await this.purgeEntityType(this.ingestQueueEntryClass, request.mailboxUid, async (row: any) => {
+            await this.blobStore!.delete(row.rawBlobKey);
+        });
+        purgedCount += await this.purgeEntityType(this.dataExportRequestClass, request.mailboxUid, async (row: any) => {
+            if (row.blobKey) {
+                await this.blobStore!.delete(row.blobKey);
+            }
+        });
+        purgedCount += await this.purgeEntityType(this.mailboxImportRequestClass, request.mailboxUid, async (row: any) => {
+            await this.blobStore!.delete(row.sourceBlobKey);
+        });
 
         if (mailbox) {
+            try {
+                // A final re-check: the top-of-method hold check only catches a hold already in place
+                // before this run started, not one placed WHILE this potentially-long cascade was already
+                // running. This mailbox's own content is already gone by this point regardless (a
+                // narrow, documented TOCTOU window - see this class's own doc comment), but stopping here
+                // at least keeps the anchor `Mailbox` record itself in place rather than also destroying
+                // the one thing a hold is meant to keep discoverable. `status` is deliberately left
+                // `"approved"` (not advanced to `"completed"`) so a later run retries this exact final
+                // step once the hold resolves - every entity type purged above is already empty by then,
+                // so the retry is a cheap no-op cascade followed by just this one remaining check, the
+                // same "skip, don't error, retry automatically" shape the top-of-method check already
+                // uses.
+                await assertNotOnLegalHold(this._objectFactory!, this.matterClass, request.mailboxUid);
+            } catch {
+                this.logger?.error(
+                    `ErasureExecutionJob: a legal hold appeared on mailbox ${request.mailboxUid} while erasure request ${request.uid} was already running - ${purgedCount} rows were purged before it was detected; the mailbox record itself was preserved pending the hold's resolution.`,
+                );
+                return;
+            }
             try {
                 await this.mailboxRepo!.delete(mailbox.uid, { ignoreACL: true, purge: true });
                 purgedCount++;

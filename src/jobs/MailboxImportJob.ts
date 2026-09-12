@@ -8,6 +8,7 @@ import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline, ScanPipelineResult } from "../scan/ScanPipeline.js";
 import { deriveConversationId } from "../util/ConversationUtils.js";
+import { extractHeader } from "../util/MimeHeaderUtils.js";
 import { parseMbox } from "../util/MboxUtils.js";
 import { extractPstMessages } from "../util/PstImportUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
@@ -267,7 +268,19 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
 
         const messageId: string = result.messageIdHeader ?? crypto.randomUUID();
         const conversationId: string = deriveConversationId(result.references, result.inReplyTo, messageId);
-        const sentDate = new Date();
+        // `ScanPipelineResult` doesn't parse/expose the message's own `Date:` header (nothing about live
+        // inbound delivery ever needed it - `ScanQueueJob.deliverMessage()` also just stamps `new Date()`,
+        // fine there since delivery time and send time are seconds apart). For an IMPORTED historical
+        // message that gap can be years, and `sentDate` is exactly the field `LegalHoldUtils.
+        // assertNotOnLegalHold()`/`MatterExportJob`'s date-range narrowing check - silently stamping
+        // "today" on a 2019 message would let it slip past a 2019-dated legal hold or eDiscovery date
+        // range entirely. Extracted directly via the lightweight header-only scan (`util/
+        // MimeHeaderUtils.ts`) rather than a second full MIME parse; falls back to "now" only when the
+        // header is genuinely absent or unparseable, same tolerance `BaseSearchRoute.parseDateParam()`
+        // already applies to a caller-supplied date string.
+        const dateHeader: string | undefined = extractHeader(raw, "Date");
+        const parsedDate: Date | undefined = dateHeader ? new Date(dateHeader) : undefined;
+        const sentDate: Date = parsedDate && !Number.isNaN(parsedDate.getTime()) ? parsedDate : new Date();
 
         const message: M = await this.messageRepo!.create(
             new this.messageClass({

@@ -48,7 +48,7 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
     let escrowAuditLogRepo: MongoRepository<EscrowAuditLogEntryMongo>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
 
-    const createMailbox = async (): Promise<MailboxMongo> =>
+    const createMailbox = async (data?: Partial<MailboxMongo>): Promise<MailboxMongo> =>
         await mailboxRepo.save(
             new MailboxMongo({
                 ownerUserUid: uuid.v4(),
@@ -58,6 +58,7 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
                 timezone: "UTC",
                 quotaBytes: 1_000_000_000,
                 usedBytes: 0,
+                ...data,
             }),
         );
 
@@ -173,9 +174,11 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
     });
 
     it("Builds a combined bundle across every custodian mailbox, narrowed to the matter's date range for messages.", async () => {
-        const mailboxA = await createMailbox();
-        const mailboxB = await createMailbox();
+        const escrowScopeId = uuid.v4();
+        const mailboxA = await createMailbox({ escrowScopeId });
+        const mailboxB = await createMailbox({ escrowScopeId });
         const matter = await createMatter({
+            escrowScopeId,
             custodianMailboxUids: [mailboxA.uid, mailboxB.uid],
             dateRangeStart: new Date("2026-03-01"),
             dateRangeEnd: new Date("2026-03-31"),
@@ -239,8 +242,9 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
     });
 
     it("Skips a custodian mailbox that no longer exists, still exporting the rest.", async () => {
-        const mailbox = await createMailbox();
-        const matter = await createMatter({ custodianMailboxUids: [uuid.v4(), mailbox.uid] });
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId });
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [uuid.v4(), mailbox.uid] });
         const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
         const request = await createRequest({ matterId: matter.uid });
 
@@ -254,6 +258,30 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
 
         const entries = await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_READY }).toArray();
         expect(entries).toHaveLength(1);
+    });
+
+    it("Skips a custodian mailbox whose own escrowScopeId doesn't actually match the matter's - a holder cannot export a mailbox just by naming it as a custodian.", async () => {
+        // Real, not hypothetical: `custodianMailboxUids` is holder-set, unvalidated free text
+        // (`BaseMatterRoute.validateMatter()` only checks it's a non-empty array of non-empty strings) -
+        // without this check, any holder could list an arbitrary mailbox (one never assigned to their
+        // scope at all) as a "custodian" and export its full content with no dual-control approval, the
+        // exact bypass `BaseEscrowAccessRequestRoute.create()`'s own escrowScopeId-matching check exists
+        // to prevent for the real escrow-access workflow.
+        const mailboxInScope = await createMailbox({ escrowScopeId: undefined });
+        const matter = await createMatter({ custodianMailboxUids: [mailboxInScope.uid] });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const request = await createRequest({ matterId: matter.uid });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.status).toBe("ready");
+        const bundle = (await blobStore.get(updated!.blobKey!)).toString("utf-8");
+        const lines = bundle.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+        expect(lines).toHaveLength(0);
+
+        const entries = await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_READY }).toArray();
+        expect(entries).toHaveLength(0);
     });
 
     it("Produces an empty bundle (still marked ready) when the matter has no custodian mailboxes.", async () => {
@@ -278,6 +306,27 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
         const updated = await requestRepo.findOne({ uid: request.uid } as any);
         expect(updated!.status).toBe("failed");
         expect(updated!.errorMessage).toBe("simulated failure");
+    });
+
+    it("Marks the request failed when a custodian mailbox's content exceeds the configured max_content_rows cap, rather than risking unbounded memory growth.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId });
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "A" }));
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "B" }));
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailbox.uid] });
+        const request = await createRequest({ matterId: matter.uid });
+
+        const original = (job as any).maxContentRows;
+        (job as any).maxContentRows = 1;
+        try {
+            await expect(job.run()).resolves.toBeUndefined();
+
+            const updated = await requestRepo.findOne({ uid: request.uid } as any);
+            expect(updated!.status).toBe("failed");
+            expect(updated!.errorMessage).toContain("exceeds the maximum");
+        } finally {
+            (job as any).maxContentRows = original;
+        }
     });
 
     it("Logs an error when even marking a request failed itself throws.", async () => {

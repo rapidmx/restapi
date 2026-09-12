@@ -6,7 +6,7 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { collectMailboxContentLines, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
+import { collectMailboxContentLines, DEFAULT_MAX_MAILBOX_CONTENT_ROWS, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
 import { buildMboxEntry } from "../util/MboxUtils.js";
 import { AuditAction, DataExportRequest, Mailbox, Message } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
@@ -60,6 +60,10 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
 
     @Config("mail:jobs:data_export:batch_size", 10)
     private batchSize: number = 10;
+
+    // See `MailboxContentUtils.collectMailboxContentLines()`'s own doc comment for why this exists.
+    @Config("mail:jobs:data_export:max_content_rows", DEFAULT_MAX_MAILBOX_CONTENT_ROWS)
+    private maxContentRows: number = DEFAULT_MAX_MAILBOX_CONTENT_ROWS;
 
     /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
     @Config()
@@ -205,7 +209,14 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
     }
 
     private async buildJsonBundle(mailboxUid: string, mailbox: MB): Promise<Buffer> {
-        const lines: string[] = await collectMailboxContentLines(this._objectFactory!, this.contentEntityClasses, mailboxUid, mailbox);
+        const lines: string[] = await collectMailboxContentLines(
+            this._objectFactory!,
+            this.contentEntityClasses,
+            mailboxUid,
+            mailbox,
+            undefined,
+            this.maxContentRows,
+        );
         return Buffer.from(lines.join("\n"), "utf-8");
     }
 }

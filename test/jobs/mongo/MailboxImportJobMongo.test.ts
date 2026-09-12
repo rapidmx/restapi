@@ -217,6 +217,44 @@ describe("MailboxImportJobMongo Tests (real DB + DI)", () => {
         expect(entries.length).toBe(1);
     });
 
+    it("Preserves a message's own real Date: header as sentDate/receivedDate, rather than stamping import time.", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        // A real historical date, years before "now" - if this job silently stamped import time instead
+        // (the bug this test guards against), a legal hold whose date range covers 2019 would fail to
+        // recognize this message as ever having been in scope for it.
+        const mbox = buildMboxEntry(makeRawMessage({ extraHeader: "Date: Tue, 15 Jan 2019 10:30:00 +0000" }), "alice@example.com", new Date());
+        await blobStore.put(sourceBlobKey, mbox);
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+
+        await job.run();
+
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.importedCount).toBe(1);
+        const messages = await messageRepo.find({ folderUid: folder.uid } as any).toArray();
+        expect(messages.length).toBe(1);
+        expect(new Date(messages[0].sentDate).toISOString()).toBe(new Date("2019-01-15T10:30:00.000Z").toISOString());
+        expect(new Date(messages[0].receivedDate).toISOString()).toBe(new Date("2019-01-15T10:30:00.000Z").toISOString());
+    });
+
+    it("Falls back to the import time when a message has no Date: header at all.", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        const mbox = buildMboxEntry(makeRawMessage(), "alice@example.com", new Date());
+        await blobStore.put(sourceBlobKey, mbox);
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+        const before = Date.now();
+
+        await job.run();
+
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.importedCount).toBe(1);
+        const messages = await messageRepo.find({ folderUid: folder.uid } as any).toArray();
+        expect(new Date(messages[0].sentDate).getTime()).toBeGreaterThanOrEqual(before);
+    });
+
     it("Skips an AV-infected message instead of importing it, counting it as failed.", async () => {
         const mailbox = await createMailbox();
         const folder = await createFolder(mailbox.uid);

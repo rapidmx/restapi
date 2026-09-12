@@ -12,7 +12,7 @@ import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { SearchEntityType, SearchProvider, SearchResultPage } from "../search/SearchProvider.js";
 import { requireEscrowHolder } from "../util/EscrowUtils.js";
-import { Matter } from "../models/types.js";
+import { Mailbox, Matter } from "../models/types.js";
 const { Inject, Logger } = ObjectDecorators;
 const { Get, Query, User: AuthUser } = RouteDecorators;
 
@@ -43,16 +43,28 @@ function parseDateParam(value: string | undefined): Date | undefined {
  * sets at once) or a Tier 3 `/candidates` mode - both real, disclosed scope narrowings, not oversights,
  * left for a future pass if reviewing beyond one page per custodian turns out to matter in practice.
  *
+ * A custodian mailbox is only ever actually searched when its own `Mailbox.escrowScopeId` matches this
+ * matter's `escrowScopeId` - the same "both must agree" check `BaseEscrowAccessRequestRoute.create()`
+ * already enforces before opening real escrow access (see `Matter.custodianMailboxUids`'s own doc
+ * comment). `custodianMailboxUids` alone is holder-set, unvalidated free text (`BaseMatterRoute`'s own
+ * `validateMatter()` only checks it's a non-empty array of non-empty strings) - without this check, any
+ * holder of any `EscrowScope` could list an arbitrary mailbox as a "custodian" on their own matter and
+ * search its full content, with no dual-control approval and no real relationship between that mailbox
+ * and the scope at all. A mismatched/no-longer-existing mailbox is skipped with a warning, the same
+ * tolerance `MatterExportJob`'s own per-custodian loop already shows.
+ *
  * @author Jean-Philippe Steinmetz
  */
-export abstract class BaseMatterSearchRoute<M extends Matter> {
+export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox> {
     protected abstract matterClass: any;
     protected abstract escrowScopeClass: any;
+    protected abstract mailboxClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     private matterRepo?: RepoUtils<M>;
+    private mailboxRepo?: RepoUtils<MB>;
 
     @Inject("SearchProvider")
     private searchProvider?: SearchProvider;
@@ -68,6 +80,16 @@ export abstract class BaseMatterSearchRoute<M extends Matter> {
             });
         }
         return this.matterRepo;
+    }
+
+    private async getMailboxRepo(): Promise<RepoUtils<MB>> {
+        if (!this.mailboxRepo) {
+            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
+        return this.mailboxRepo;
     }
 
     private async requireHolderMatter(matterId: string, user: JWTUser | undefined): Promise<M> {
@@ -128,8 +150,16 @@ export abstract class BaseMatterSearchRoute<M extends Matter> {
 
         const entityTypes: SearchEntityType[] | undefined = typesParam ? (typesParam.split(",") as SearchEntityType[]) : undefined;
 
+        const mailboxRepo: RepoUtils<MB> = await this.getMailboxRepo();
         const resultsByMailbox: Record<string, SearchResultPage> = {};
         for (const mailboxUid of matter.custodianMailboxUids) {
+            const mailbox: MB | undefined = await mailboxRepo.findOne(mailboxUid, { ignoreACL: true });
+            if (!mailbox || mailbox.escrowScopeId !== matter.escrowScopeId) {
+                this.logger?.warn(
+                    `BaseMatterSearchRoute: skipping custodian mailbox ${mailboxUid} for matter ${matter.uid} - it no longer exists or is not actually assigned to this matter's escrow scope.`,
+                );
+                continue;
+            }
             resultsByMailbox[mailboxUid] = await this.searchProvider.search({
                 mailboxUid,
                 text: text ?? "",

@@ -120,6 +120,17 @@ describe("PstImportUtils Tests", () => {
             const attachment = { fileInputStream: null, filesize: 0 } as any;
             expect(readAttachmentContent(attachment)).toBeUndefined();
         });
+
+        it("Reads the attachment's content when filesize is within the given max size.", () => {
+            const attachment = { fileInputStream: { readCompletely: (buf: Buffer) => buf.fill(7) }, filesize: 4 } as any;
+            const content = readAttachmentContent(attachment, 1_000);
+            expect(content).toEqual(Buffer.alloc(4, 7));
+        });
+
+        it("Skips (rather than allocating from) a filesize larger than the given max size - a corrupted or malicious PST claiming an attachment bigger than the file itself.", () => {
+            const attachment = { fileInputStream: { readCompletely: () => {} }, filesize: 1_000_000 } as any;
+            expect(readAttachmentContent(attachment, 100)).toBeUndefined();
+        });
     });
 
     describe("buildRawMimeFromPstMessage()", () => {
@@ -257,6 +268,27 @@ describe("PstImportUtils Tests", () => {
             const text = raw.toString("latin1");
             expect(text).toContain("multipart/mixed");
             expect(text).not.toContain('filename="x"');
+        });
+
+        it("Skips an attachment whose claimed filesize exceeds the given maxAttachmentSize bound, without failing the whole message.", async () => {
+            const raw = await buildRawMimeFromPstMessage(
+                fakeMessage({
+                    body: "hi",
+                    hasAttachments: true,
+                    numberOfAttachments: 1,
+                    getAttachment: () => ({
+                        fileInputStream: { readCompletely: () => {} },
+                        filesize: 1_000_000,
+                        filename: "huge.bin",
+                        longFilename: "huge.bin",
+                        mimeTag: "",
+                    }),
+                }),
+                100,
+            );
+            const text = raw.toString("latin1");
+            expect(text).toContain("multipart/mixed");
+            expect(text).not.toContain("huge.bin");
         });
     });
 });

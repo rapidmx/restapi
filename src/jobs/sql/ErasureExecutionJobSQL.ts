@@ -6,15 +6,28 @@ import { ErasureExecutionJob } from "../ErasureExecutionJob.js";
 import {
     AttachmentSQL,
     AuditLogEntrySQL,
+    BookingSQL,
+    BookingTypeSQL,
     CalendarEventSQL,
     ContactListSQL,
     ContactSQL,
+    DataExportRequestSQL,
     DataSubjectErasureRequestSQL,
+    DeviceSyncStateSQL,
+    FocusedInboxOverrideSQL,
     FolderSQL,
+    IngestQueueEntrySQL,
+    LabelSQL,
+    MailboxImportRequestSQL,
     MailboxSQL,
+    MailFilterRuleSQL,
+    MailSignatureSQL,
     MatterSQL,
     MessageSQL,
     NoteSQL,
+    OofReplySuppressionSQL,
+    QuarantineEntrySQL,
+    TaskListSQL,
     TaskSQL,
 } from "../../sql.js";
 
@@ -29,6 +42,19 @@ export class ErasureExecutionJobSQL extends ErasureExecutionJob<DataSubjectErasu
     protected taskClass: any = TaskSQL;
     protected noteClass: any = NoteSQL;
     protected attachmentClass: any = AttachmentSQL;
+    protected focusedInboxOverrideClass: any = FocusedInboxOverrideSQL;
+    protected taskListClass: any = TaskListSQL;
+    protected labelClass: any = LabelSQL;
+    protected mailFilterRuleClass: any = MailFilterRuleSQL;
+    protected mailSignatureClass: any = MailSignatureSQL;
+    protected bookingTypeClass: any = BookingTypeSQL;
+    protected bookingClass: any = BookingSQL;
+    protected oofReplySuppressionClass: any = OofReplySuppressionSQL;
+    protected deviceSyncStateClass: any = DeviceSyncStateSQL;
+    protected quarantineEntryClass: any = QuarantineEntrySQL;
+    protected ingestQueueEntryClass: any = IngestQueueEntrySQL;
+    protected dataExportRequestClass: any = DataExportRequestSQL;
+    protected mailboxImportRequestClass: any = MailboxImportRequestSQL;
     protected matterClass: any = MatterSQL;
     protected auditLogClass: any = AuditLogEntrySQL;
 }

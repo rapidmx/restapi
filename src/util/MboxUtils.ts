@@ -67,13 +67,19 @@ export function parseMbox(mbox: Buffer): Buffer[] {
     // (which always starts with one), so drop it; a real leading fragment (a malformed file) is intentionally
     // discarded rather than mistaken for a message with no separator of its own.
     const messages = parts.slice(1);
-    return messages.map((entry) => {
-        // Drop exactly the one trailing blank-line separator `buildMboxEntry()` adds between messages -
-        // every entry but the very last one already ends in `\n\n` from the newline the split regex itself
-        // consumed plus this one; the last entry may or may not, depending on whether the source file ended
-        // with a trailing blank line, so this only strips a trailing `\n` when one is actually present.
+    return messages.map((entry, index) => {
         const unescaped = entry.replace(/^> From /gm, "From ");
-        const trimmed = unescaped.endsWith("\n") ? unescaped.slice(0, -1) : unescaped;
+        // `buildMboxEntry()` appends exactly one blank-line `\n` after each message's own raw content, to
+        // serve as the separator's leading blank line. For every message but the last, that `\n` is
+        // consumed by the NEXT message's own `(?:^|\n)From ...\n` separator match - it never appears in
+        // THIS message's own captured segment at all, which is therefore already byte-identical to the
+        // original raw content and must NOT be touched further. Only the last message has no following
+        // separator to consume its own trailing `\n`, so it alone needs it stripped back off (previously
+        // this stripped one trailing `\n` from EVERY message, silently truncating the final byte of every
+        // non-last message's own raw content whenever that content itself ended in `\n` - true of virtually
+        // every real RFC 5322 message, whose last body line ends `\r\n`).
+        const isLast = index === messages.length - 1;
+        const trimmed = isLast && unescaped.endsWith("\n") ? unescaped.slice(0, -1) : unescaped;
         return Buffer.from(trimmed, "latin1");
     });
 }

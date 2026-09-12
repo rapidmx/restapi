@@ -6,15 +6,28 @@ import { ErasureExecutionJob } from "../ErasureExecutionJob.js";
 import {
     AttachmentMongo,
     AuditLogEntryMongo,
+    BookingMongo,
+    BookingTypeMongo,
     CalendarEventMongo,
     ContactListMongo,
     ContactMongo,
+    DataExportRequestMongo,
     DataSubjectErasureRequestMongo,
+    DeviceSyncStateMongo,
+    FocusedInboxOverrideMongo,
     FolderMongo,
+    IngestQueueEntryMongo,
+    LabelMongo,
+    MailboxImportRequestMongo,
     MailboxMongo,
+    MailFilterRuleMongo,
+    MailSignatureMongo,
     MatterMongo,
     MessageMongo,
     NoteMongo,
+    OofReplySuppressionMongo,
+    QuarantineEntryMongo,
+    TaskListMongo,
     TaskMongo,
 } from "../../mongo.js";
 
@@ -29,6 +42,19 @@ export class ErasureExecutionJobMongo extends ErasureExecutionJob<DataSubjectEra
     protected taskClass: any = TaskMongo;
     protected noteClass: any = NoteMongo;
     protected attachmentClass: any = AttachmentMongo;
+    protected focusedInboxOverrideClass: any = FocusedInboxOverrideMongo;
+    protected taskListClass: any = TaskListMongo;
+    protected labelClass: any = LabelMongo;
+    protected mailFilterRuleClass: any = MailFilterRuleMongo;
+    protected mailSignatureClass: any = MailSignatureMongo;
+    protected bookingTypeClass: any = BookingTypeMongo;
+    protected bookingClass: any = BookingMongo;
+    protected oofReplySuppressionClass: any = OofReplySuppressionMongo;
+    protected deviceSyncStateClass: any = DeviceSyncStateMongo;
+    protected quarantineEntryClass: any = QuarantineEntryMongo;
+    protected ingestQueueEntryClass: any = IngestQueueEntryMongo;
+    protected dataExportRequestClass: any = DataExportRequestMongo;
+    protected mailboxImportRequestClass: any = MailboxImportRequestMongo;
     protected matterClass: any = MatterMongo;
     protected auditLogClass: any = AuditLogEntryMongo;
 }

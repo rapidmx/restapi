@@ -13,17 +13,30 @@ import config from "../../config.sql.js";
 import { ErasureExecutionJobSQL } from "../../../src/jobs/sql/ErasureExecutionJobSQL.js";
 import { AttachmentSQL } from "../../../src/models/sql/AttachmentSQL.js";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
+import { BookingSQL } from "../../../src/models/sql/BookingSQL.js";
+import { BookingTypeSQL } from "../../../src/models/sql/BookingTypeSQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
 import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
 import { ContactListSQL } from "../../../src/models/sql/ContactListSQL.js";
+import { DataExportRequestSQL } from "../../../src/models/sql/DataExportRequestSQL.js";
 import { DataSubjectErasureRequestSQL } from "../../../src/models/sql/DataSubjectErasureRequestSQL.js";
+import { DeviceSyncStateSQL } from "../../../src/models/sql/DeviceSyncStateSQL.js";
+import { FocusedInboxOverrideSQL } from "../../../src/models/sql/FocusedInboxOverrideSQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
+import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
+import { LabelSQL } from "../../../src/models/sql/LabelSQL.js";
+import { MailboxImportRequestSQL } from "../../../src/models/sql/MailboxImportRequestSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { MailFilterRuleSQL } from "../../../src/models/sql/MailFilterRuleSQL.js";
+import { MailSignatureSQL } from "../../../src/models/sql/MailSignatureSQL.js";
 import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
 import { NoteSQL } from "../../../src/models/sql/NoteSQL.js";
+import { OofReplySuppressionSQL } from "../../../src/models/sql/OofReplySuppressionSQL.js";
+import { QuarantineEntrySQL } from "../../../src/models/sql/QuarantineEntrySQL.js";
+import { TaskListSQL } from "../../../src/models/sql/TaskListSQL.js";
 import { TaskSQL } from "../../../src/models/sql/TaskSQL.js";
-import { AuditAction, RecipientType } from "../../../src/models/types.js";
+import { AuditAction, MailFilterActionType, MessageClassification, QuarantineReason, RecipientType } from "../../../src/models/types.js";
 import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 
 describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
@@ -41,6 +54,19 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
     let taskRepo: Repository<TaskSQL>;
     let noteRepo: Repository<NoteSQL>;
     let attachmentRepo: Repository<AttachmentSQL>;
+    let focusedInboxOverrideRepo: Repository<FocusedInboxOverrideSQL>;
+    let taskListRepo: Repository<TaskListSQL>;
+    let labelRepo: Repository<LabelSQL>;
+    let mailFilterRuleRepo: Repository<MailFilterRuleSQL>;
+    let mailSignatureRepo: Repository<MailSignatureSQL>;
+    let bookingTypeRepo: Repository<BookingTypeSQL>;
+    let bookingRepo: Repository<BookingSQL>;
+    let oofReplySuppressionRepo: Repository<OofReplySuppressionSQL>;
+    let deviceSyncStateRepo: Repository<DeviceSyncStateSQL>;
+    let quarantineEntryRepo: Repository<QuarantineEntrySQL>;
+    let ingestQueueEntryRepo: Repository<IngestQueueEntrySQL>;
+    let dataExportRequestRepo: Repository<DataExportRequestSQL>;
+    let mailboxImportRequestRepo: Repository<MailboxImportRequestSQL>;
     let matterRepo: Repository<MatterSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
 
@@ -78,6 +104,19 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         models.set("TaskSQL", TaskSQL);
         models.set("NoteSQL", NoteSQL);
         models.set("AttachmentSQL", AttachmentSQL);
+        models.set("FocusedInboxOverrideSQL", FocusedInboxOverrideSQL);
+        models.set("TaskListSQL", TaskListSQL);
+        models.set("LabelSQL", LabelSQL);
+        models.set("MailFilterRuleSQL", MailFilterRuleSQL);
+        models.set("MailSignatureSQL", MailSignatureSQL);
+        models.set("BookingTypeSQL", BookingTypeSQL);
+        models.set("BookingSQL", BookingSQL);
+        models.set("OofReplySuppressionSQL", OofReplySuppressionSQL);
+        models.set("DeviceSyncStateSQL", DeviceSyncStateSQL);
+        models.set("QuarantineEntrySQL", QuarantineEntrySQL);
+        models.set("IngestQueueEntrySQL", IngestQueueEntrySQL);
+        models.set("DataExportRequestSQL", DataExportRequestSQL);
+        models.set("MailboxImportRequestSQL", MailboxImportRequestSQL);
         models.set("MatterSQL", MatterSQL);
         models.set("AuditLogEntrySQL", AuditLogEntrySQL);
         await connectionManager.connect(config.get("datastores"), models);
@@ -96,6 +135,19 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         taskRepo = conn.getRepository(TaskSQL);
         noteRepo = conn.getRepository(NoteSQL);
         attachmentRepo = conn.getRepository(AttachmentSQL);
+        focusedInboxOverrideRepo = conn.getRepository(FocusedInboxOverrideSQL);
+        taskListRepo = conn.getRepository(TaskListSQL);
+        labelRepo = conn.getRepository(LabelSQL);
+        mailFilterRuleRepo = conn.getRepository(MailFilterRuleSQL);
+        mailSignatureRepo = conn.getRepository(MailSignatureSQL);
+        bookingTypeRepo = conn.getRepository(BookingTypeSQL);
+        bookingRepo = conn.getRepository(BookingSQL);
+        oofReplySuppressionRepo = conn.getRepository(OofReplySuppressionSQL);
+        deviceSyncStateRepo = conn.getRepository(DeviceSyncStateSQL);
+        quarantineEntryRepo = conn.getRepository(QuarantineEntrySQL);
+        ingestQueueEntryRepo = conn.getRepository(IngestQueueEntrySQL);
+        dataExportRequestRepo = conn.getRepository(DataExportRequestSQL);
+        mailboxImportRequestRepo = conn.getRepository(MailboxImportRequestSQL);
         matterRepo = conn.getRepository(MatterSQL);
         auditLogRepo = conn.getRepository(AuditLogEntrySQL);
 
@@ -118,6 +170,19 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
             taskRepo,
             noteRepo,
             attachmentRepo,
+            focusedInboxOverrideRepo,
+            taskListRepo,
+            labelRepo,
+            mailFilterRuleRepo,
+            mailSignatureRepo,
+            bookingTypeRepo,
+            bookingRepo,
+            oofReplySuppressionRepo,
+            deviceSyncStateRepo,
+            quarantineEntryRepo,
+            ingestQueueEntryRepo,
+            dataExportRequestRepo,
+            mailboxImportRequestRepo,
             matterRepo,
             auditLogRepo,
         ]) {
@@ -215,14 +280,100 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         await taskRepo.save(new TaskSQL({ mailboxUid: mailbox.uid, folderUid: folder.uid, title: "A Task" }));
         await noteRepo.save(new NoteSQL({ mailboxUid: mailbox.uid, folderUid: folder.uid, title: "A Note", body: "Note body" }));
 
+        await focusedInboxOverrideRepo.save(
+            new FocusedInboxOverrideSQL({ mailboxUid: mailbox.uid, senderAddress: "vip@example.com", classifyAs: MessageClassification.FOCUSED }),
+        );
+        await taskListRepo.save(new TaskListSQL({ mailboxUid: mailbox.uid, name: "A Task List" }));
+        const label = await labelRepo.save(new LabelSQL({ mailboxUid: mailbox.uid, name: "A Label" }));
+        await mailFilterRuleRepo.save(
+            new MailFilterRuleSQL({
+                mailboxUid: mailbox.uid,
+                name: "A Rule",
+                enabled: true,
+                sequence: 0,
+                stopProcessingRules: false,
+                conditions: { subjectContains: ["Hi"] },
+                actions: [{ type: MailFilterActionType.APPLY_LABEL, labelUid: label.uid }],
+            }),
+        );
+        await mailSignatureRepo.save(
+            new MailSignatureSQL({ mailboxUid: mailbox.uid, name: "A Signature", contentHtml: "<p>Sig</p>", isDefaultForNewMessages: true, isDefaultForReplyForward: false }),
+        );
+        const bookingType = await bookingTypeRepo.save(
+            new BookingTypeSQL({
+                mailboxUid: mailbox.uid,
+                calendarFolderUid: folder.uid,
+                slug: "intro-call",
+                name: "Intro Call",
+                hostDisplayName: "Host",
+            }),
+        );
+        await bookingRepo.save(
+            new BookingSQL({
+                bookingTypeUid: bookingType.uid,
+                mailboxUid: mailbox.uid,
+                folderUid: folder.uid,
+                calendarEventUid: uuid.v4(),
+                bookerName: "Booker",
+                bookerEmail: "booker@example.com",
+                startDate: new Date(),
+                endDate: new Date(),
+                manageToken: uuid.v4(),
+            }),
+        );
+        await oofReplySuppressionRepo.save(new OofReplySuppressionSQL({ mailboxUid: mailbox.uid, senderAddress: "sender@example.com", lastRepliedAt: new Date() }));
+        await deviceSyncStateRepo.save(
+            new DeviceSyncStateSQL({ mailboxUid: mailbox.uid, deviceId: uuid.v4(), deviceType: "iPhone", folderSyncKeys: {}, folderCollectionClasses: {}, provisioned: true }),
+        );
+
+        const quarantineRawBlobKey = `quarantine/${uuid.v4()}`;
+        await blobStore.put(quarantineRawBlobKey, Buffer.from("quarantined raw"));
+        await quarantineEntryRepo.save(
+            new QuarantineEntrySQL({ mailboxUid: mailbox.uid, reason: QuarantineReason.OTHER, scanResultUid: uuid.v4(), rawBlobKey: quarantineRawBlobKey }),
+        );
+
+        const ingestRawBlobKey = `ingest/${uuid.v4()}`;
+        await blobStore.put(ingestRawBlobKey, Buffer.from("ingest raw"));
+        await ingestQueueEntryRepo.save(
+            new IngestQueueEntrySQL({
+                mailboxUid: mailbox.uid,
+                envelopeFrom: "sender@example.com",
+                envelopeTo: ["recipient@example.com"],
+                rawBlobKey: ingestRawBlobKey,
+                status: "pending" as any,
+            }),
+        );
+
+        const exportBlobKey = `exports/${uuid.v4()}`;
+        await blobStore.put(exportBlobKey, Buffer.from("export bundle"));
+        await dataExportRequestRepo.save(
+            new DataExportRequestSQL({ mailboxUid: mailbox.uid, requestedByUserUid: uuid.v4(), format: "json", status: "ready", blobKey: exportBlobKey }),
+        );
+
+        const importSourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        await blobStore.put(importSourceBlobKey, Buffer.from("mbox source"));
+        await mailboxImportRequestRepo.save(
+            new MailboxImportRequestSQL({
+                mailboxUid: mailbox.uid,
+                requestedByUserUid: uuid.v4(),
+                targetFolderUid: folder.uid,
+                format: "mbox",
+                sourceBlobKey: importSourceBlobKey,
+                status: "completed",
+            }),
+        );
+
         const request = await createRequest({ mailboxUid: mailbox.uid });
 
         await job.run();
 
         const updated = await requestRepo.findOne({ where: { uid: request.uid } });
         expect(updated!.status).toBe("completed");
-        // folder, message, attachment, contact, contactList, calendarEvent, task, note, mailbox = 9
-        expect(updated!.purgedCount).toBe(9);
+        // folder, message, attachment, contact, contactList, calendarEvent, task, note,
+        // focusedInboxOverride, taskList, label, mailFilterRule, mailSignature, bookingType, booking,
+        // oofReplySuppression, deviceSyncState, quarantineEntry, ingestQueueEntry, dataExportRequest,
+        // mailboxImportRequest, mailbox = 22
+        expect(updated!.purgedCount).toBe(22);
 
         expect(await mailboxRepo.findOne({ where: { uid: mailbox.uid } })).toBeNull();
         expect(await folderRepo.findOne({ where: { uid: folder.uid } })).toBeNull();
@@ -233,15 +384,68 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect((await taskRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await noteRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await attachmentRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await focusedInboxOverrideRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await taskListRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await labelRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await mailFilterRuleRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await mailSignatureRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await bookingTypeRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await bookingRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await oofReplySuppressionRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await deviceSyncStateRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await quarantineEntryRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await ingestQueueEntryRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await dataExportRequestRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await mailboxImportRequestRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
 
         expect(await blobStore.exists(bodyBlobKey)).toBe(false);
         expect(await blobStore.exists(sanitizedHtmlBlobKey)).toBe(false);
         expect(await blobStore.exists(attachmentBlobKey)).toBe(false);
         expect(await blobStore.exists(extractedTextBlobKey)).toBe(false);
         expect(await blobStore.exists(photoBlobKey)).toBe(false);
+        expect(await blobStore.exists(quarantineRawBlobKey)).toBe(false);
+        expect(await blobStore.exists(ingestRawBlobKey)).toBe(false);
+        expect(await blobStore.exists(exportBlobKey)).toBe(false);
+        expect(await blobStore.exists(importSourceBlobKey)).toBe(false);
 
         const entries = await auditLogRepo.find({ where: { action: AuditAction.ERASURE_REQUEST_COMPLETED } });
         expect(entries).toHaveLength(1);
+    });
+
+    it("Leaves the request 'approved' and preserves the mailbox row when a legal hold appears mid-cascade.", async () => {
+        const mailbox = await createMailbox();
+        await contactRepo.save(new ContactSQL({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "A Contact" }));
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+
+        const originalFindOne = (job as any).mailboxRepo.findOne.bind((job as any).mailboxRepo);
+        vi.spyOn((job as any).mailboxRepo, "findOne").mockImplementationOnce(async (...args: any[]) => {
+            const result = await originalFindOne(...args);
+            // Simulates a hold being placed on this mailbox in the window between the top-of-method check
+            // and the job's own final re-check, right before the cascade itself runs.
+            await matterRepo.save(
+                new MatterSQL({
+                    name: "Hold placed mid-cascade",
+                    escrowScopeId: uuid.v4(),
+                    custodianMailboxUids: [mailbox.uid],
+                    dateRangeStart: new Date("2020-01-01"),
+                    dateRangeEnd: new Date("2030-01-01"),
+                }),
+            );
+            return result;
+        });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("approved");
+
+        // The cascade already purged the contact before the hold was detected - only the final,
+        // most-irreversible step (deleting the mailbox row itself) was actually stopped.
+        expect((await contactRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect(await mailboxRepo.findOne({ where: { uid: mailbox.uid } })).toBeDefined();
+
+        const entries = await auditLogRepo.find({ where: { action: AuditAction.ERASURE_REQUEST_COMPLETED } });
+        expect(entries).toHaveLength(0);
     });
 
     it("Skips deleting a sanitizedHtmlBlobKey/extractedTextBlobKey that was never set.", async () => {
@@ -274,6 +478,9 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
                 mimeType: "text/plain",
                 blobKey: attachmentBlobKey,
             }),
+        );
+        await dataExportRequestRepo.save(
+            new DataExportRequestSQL({ mailboxUid: mailbox.uid, requestedByUserUid: uuid.v4(), format: "json", status: "pending" }),
         );
         const request = await createRequest({ mailboxUid: mailbox.uid });
 
