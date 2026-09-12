@@ -11,6 +11,7 @@ export * from "./DeviceSyncStateSQL.js";
 export * from "./DistributionListSQL.js";
 export * from "./DomainSQL.js";
 export * from "./EncryptionPolicySQL.js";
+export * from "./EscrowAccessRequestSQL.js";
 export * from "./EscrowAuditLogEntrySQL.js";
 export * from "./EscrowScopeSQL.js";
 export * from "./FocusedInboxOverrideSQL.js";

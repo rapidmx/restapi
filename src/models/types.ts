@@ -218,6 +218,44 @@ export interface Matter extends BaseEntity {
     closedAt?: Date;
 }
 
+export interface EscrowAccessRequestApproval {
+    holderUserUid: string;
+    approvedAt: Date;
+}
+
+export type EscrowAccessRequestStatus = "pending" | "approved" | "denied" | "fulfilled";
+
+/**
+ * One request by an escrow holder to access a mailbox's escrow-wrapped master key under a `Matter`. The
+ * requester's own creation counts as their first approval (see `BaseEscrowAccessRequestRoute.create()`) -
+ * `requiredHoldersAtCreation` is snapshotted from `EscrowScope.requiredHolders` rather than re-read live
+ * on every `/approve` call, so an admin editing the scope's threshold mid-flight can't retroactively
+ * loosen or tighten an already-in-progress request's own requirement.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface EscrowAccessRequest extends BaseEntity {
+    matterId: string;
+
+    mailboxUid: string;
+
+    requestedByUserUid: string;
+
+    approvals: EscrowAccessRequestApproval[];
+
+    requiredHoldersAtCreation: number;
+
+    status: EscrowAccessRequestStatus;
+
+    /** Set the first time `material()` is successfully read - informational only, does not gate anything
+     * (a request stays readable indefinitely once approved). */
+    fulfilledAt?: Date;
+
+    deniedByUserUid?: string;
+
+    deniedAt?: Date;
+}
+
 /** The lifecycle event an `EscrowAuditLogEntry` records - the three moments real escrow-wrapped key
  * material, or the authority over it, changes hands or comes into existence. Deliberately excludes a
  * denied request (nothing was ever granted or used there) - that goes through the ordinary
@@ -1206,6 +1244,7 @@ export enum AuditAction {
     MATTER_UPDATE = "matter.update",
     MATTER_CLOSE = "matter.close",
     MATTER_DELETE = "matter.delete",
+    ESCROW_ACCESS_REQUEST_DENIED = "escrow_access_request.denied",
 }
 
 /**

@@ -310,4 +310,128 @@ describe("Route:MatterSQL Tests", () => {
         const countResult = await request(server.getApplication()).head(baseUrl).set("Authorization", "jwt " + holderBToken);
         expect(countResult.headers["content-length"]).toBe("0");
     });
+
+    it("Rejects creating a matter with no escrowScopeId (400).", async () => {
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({
+                name: "Investigation A",
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: "2026-01-01",
+                dateRangeEnd: "2026-06-01",
+            });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Rejects creating a matter with an empty name (400).", async () => {
+        const scope = await createEscrowScope();
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({
+                name: "",
+                escrowScopeId: scope.uid,
+                custodianMailboxUids: [uuid.v4()],
+                dateRangeStart: "2026-01-01",
+                dateRangeEnd: "2026-06-01",
+            });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Rejects patching a matter's name to an empty string (400) - validateMatter's own check, distinct from create()'s upstream schema validation.", async () => {
+        const scope = await createEscrowScope();
+        const matter = await createMatter(scope.uid);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${matter.uid}`)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({ uid: matter.uid, version: matter.version, name: "" });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Allows creating a matter with custodianMailboxUids omitted entirely (skips that validation, defaults to an empty array).", async () => {
+        const scope = await createEscrowScope();
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({ name: "Investigation A", escrowScopeId: scope.uid, dateRangeStart: "2026-01-01", dateRangeEnd: "2026-06-01" });
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+        expect(result.body.custodianMailboxUids).toEqual([]);
+    });
+
+    it("Allows creating a matter with only one of dateRangeStart/dateRangeEnd set (skips the ordering check for an absent field).", async () => {
+        const scope = await createEscrowScope();
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({ name: "Investigation A", escrowScopeId: scope.uid, custodianMailboxUids: [uuid.v4()], dateRangeStart: "2026-01-01" });
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+    });
+
+    it("Accepts a bulk create of distinct matters under the caller's own scope.", async () => {
+        const scope = await createEscrowScope();
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + holderAToken)
+            .send([
+                {
+                    name: "Investigation A",
+                    escrowScopeId: scope.uid,
+                    custodianMailboxUids: [uuid.v4()],
+                    dateRangeStart: "2026-01-01",
+                    dateRangeEnd: "2026-06-01",
+                },
+                {
+                    name: "Investigation B",
+                    escrowScopeId: scope.uid,
+                    custodianMailboxUids: [uuid.v4()],
+                    dateRangeStart: "2026-01-01",
+                    dateRangeEnd: "2026-06-01",
+                },
+            ]);
+
+        expect(result.status).toBe(200);
+        expect(result.body.map((m: any) => m.name).sort()).toEqual(["Investigation A", "Investigation B"]);
+    });
+
+    it("Rejects closing a nonexistent matter (404).", async () => {
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/${uuid.v4()}/close`)
+            .set("Authorization", "jwt " + holderAToken);
+        expect(result.status).toBe(404);
+    });
+
+    it("Rejects updating a nonexistent matter (404).", async () => {
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${uuid.v4()}`)
+            .set("Authorization", "jwt " + holderAToken)
+            .send({ uid: uuid.v4(), version: 0, name: "renamed" });
+        expect(result.status).toBe(404);
+    });
+
+    it("Rejects deleting a nonexistent matter (404).", async () => {
+        const result = await request(server.getApplication())
+            .delete(`${baseUrl}/${uuid.v4()}`)
+            .set("Authorization", "jwt " + holderAToken);
+        expect(result.status).toBe(404);
+    });
+
+    it("Rejects finding a nonexistent matter by id (404).", async () => {
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${uuid.v4()}`)
+            .set("Authorization", "jwt " + holderAToken);
+        expect(result.status).toBe(404);
+    });
 });

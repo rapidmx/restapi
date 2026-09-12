@@ -9,6 +9,7 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    RepoUtils,
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
@@ -57,6 +58,10 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
     /** Supplied by the Mongo/SQL concrete subclasses so `recordAuditLog()` can persist an `AuditLogEntry`
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so `delete()` can check for referencing
+     * `EscrowAccessRequest`s without depending on either backend directly. */
+    protected abstract escrowAccessRequestClass: any;
 
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
@@ -154,6 +159,16 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
         await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, existing.escrowScopeId, user);
+
+        const accessRequestRepo: RepoUtils<any> = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.escrowAccessRequestClass.name,
+            args: [this.escrowAccessRequestClass],
+        });
+        const referencing = await accessRequestRepo.find({ matterId: existing.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+        if (referencing.length > 0) {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This matter has EscrowAccessRequests referencing it and cannot be deleted.");
+        }
+
         await this.repoUtils!.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });
 
         await recordAuditLog(

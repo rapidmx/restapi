@@ -10,6 +10,7 @@ export * from "./ContactRouteMongo.js";
 export * from "./DistributionListRouteMongo.js";
 export * from "./DomainRouteMongo.js";
 export * from "./EncryptionPolicyRouteMongo.js";
+export * from "./EscrowAccessRequestRouteMongo.js";
 export * from "./EscrowAuditLogRouteMongo.js";
 export * from "./EscrowScopeRouteMongo.js";
 export * from "./FocusedInboxOverrideRouteMongo.js";
