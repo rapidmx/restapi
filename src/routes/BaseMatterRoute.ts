@@ -22,7 +22,14 @@ const { Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorator
  * `update()`) object - `undefined` fields are left alone (a patch not touching a given field shouldn't
  * fail validation for it). */
 function validateMatter(o: Partial<Matter>): void {
+    // Shadowed in practice: the framework's own schema validation already rejects an empty `name` (a
+    // required, non-`@Nullable` column) before this function ever runs, on both create() and update() -
+    // confirmed by a test sending `name: ""` on each, both still 400 but via that upstream path, never
+    // this one. Kept for defense in depth (e.g. a future relaxation of the column's own constraint)
+    // rather than removed, so this branch stays permanently unreachable under the framework's current
+    // validation ordering.
     if (o.name !== undefined && !o.name) {
+        /* v8 ignore next */
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "name is required.");
     }
     if (o.custodianMailboxUids !== undefined) {

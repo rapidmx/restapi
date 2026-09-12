@@ -18,6 +18,7 @@ import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { DistributionListSQL } from "../../../src/models/sql/DistributionListSQL.js";
+import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { computeKeyDiscoveryHash } from "../../../src/util/KeyDiscoveryClient.js";
 import { AuditAction } from "../../../src/models/types.js";
@@ -32,6 +33,7 @@ describe("Route:MailboxSQL Tests", () => {
     let aclRepo: Repository<AccessControlListSQL>;
     let distributionListRepo: Repository<DistributionListSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
+    let domainRepo: Repository<DomainSQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -121,6 +123,7 @@ describe("Route:MailboxSQL Tests", () => {
             repo = conn.getRepository(MailboxSQL);
             distributionListRepo = conn.getRepository(DistributionListSQL);
             auditLogRepo = conn.getRepository(AuditLogEntrySQL);
+            domainRepo = conn.getRepository(DomainSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -135,6 +138,7 @@ describe("Route:MailboxSQL Tests", () => {
         await repo.clear();
         await distributionListRepo.clear();
         await auditLogRepo.clear();
+        await domainRepo.clear();
     });
 
     it("Listing mailboxes anonymously (no Authorization header) returns an empty list, not another user's data.", async () => {
@@ -205,6 +209,38 @@ describe("Route:MailboxSQL Tests", () => {
         expect(Array.isArray(result.body)).toBe(true);
         expect(result.body.length).toBe(1);
         expect(result.body[0].displayName).toBe("Owner's mailbox");
+    });
+
+    it("Escapes %/_ in a role-based ACL grant's userOrRoleId so it can't accidentally wildcard-match an unrelated role's mailbox.", async () => {
+        const wildcardRole = "support%team";
+        const lookalikeRole = "supportXteam";
+        const wanted = await createMailboxSQL({ displayName: "Shared with support%team" });
+        const lookalike = await createMailboxSQL({ displayName: "Shared with supportXteam" });
+        await aclRepo.save({
+            uid: wanted.uid,
+            dateCreated: new Date(),
+            dateModified: new Date(),
+            version: 0,
+            records: [{ userOrRoleId: wildcardRole, actions: [ACLAction.READ] }],
+            parentUid: "Mailbox",
+        } as any);
+        await aclRepo.save({
+            uid: lookalike.uid,
+            dateCreated: new Date(),
+            dateModified: new Date(),
+            version: 0,
+            records: [{ userOrRoleId: lookalikeRole, actions: [ACLAction.READ] }],
+            parentUid: "Mailbox",
+        } as any);
+        const supportUser: any = { uid: uuid.v4(), roles: [wildcardRole], elevated: Date.now() };
+        const supportToken = JWTUtils.createTokenSync(config.get("auth"), supportUser);
+
+        const result = await request(server.getApplication())
+            .get(baseUrl)
+            .set("Authorization", "jwt " + supportToken);
+
+        expect(result.status).toBe(200);
+        expect(result.body.map((m: any) => m.uid)).toEqual([wanted.uid]);
     });
 
     it("Owner can update their own mailbox.", async () => {
@@ -337,6 +373,32 @@ describe("Route:MailboxSQL Tests", () => {
             .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: other.primarySmtpAddress });
 
         expect(result.status).toBe(409);
+    });
+
+    it("Rejects renaming primarySmtpAddress to an unverified domain once this server has at least one verified domain (400).", async () => {
+        await domainRepo.save(new DomainSQL({ name: "example.com", enabled: true, verified: true }));
+        const obj = await createMailboxSQL({ primarySmtpAddress: `${uuid.v4()}@example.com` });
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: `${uuid.v4()}@not-verified.com` });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Allows renaming primarySmtpAddress to an address on a verified domain.", async () => {
+        await domainRepo.save(new DomainSQL({ name: "example.com", enabled: true, verified: true }));
+        const obj = await createMailboxSQL({ primarySmtpAddress: `${uuid.v4()}@example.com` });
+        const newAddress = `${uuid.v4()}@example.com`;
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: newAddress });
+
+        expect(result.status).toBe(200);
+        expect(result.body.primarySmtpAddress).toBe(newAddress);
     });
 
     it("Allows a PUT that resends the mailbox's own current, unchanged primarySmtpAddress (200) - re-validating only on a genuine change.", async () => {

@@ -10,6 +10,7 @@ import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { DistributionListSQL } from "../../../src/models/sql/DistributionListSQL.js";
+import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
@@ -22,6 +23,7 @@ describe("Route:DistributionListSQL Tests", () => {
     let repo: Repository<DistributionListSQL>;
     let mailboxRepo: Repository<MailboxSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
+    let domainRepo: Repository<DomainSQL>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -51,6 +53,7 @@ describe("Route:DistributionListSQL Tests", () => {
             repo = conn.getRepository(DistributionListSQL);
             mailboxRepo = conn.getRepository(MailboxSQL);
             auditLogRepo = conn.getRepository(AuditLogEntrySQL);
+            domainRepo = conn.getRepository(DomainSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -65,6 +68,7 @@ describe("Route:DistributionListSQL Tests", () => {
         await repo.clear();
         await mailboxRepo.clear();
         await auditLogRepo.clear();
+        await domainRepo.clear();
     });
 
     it("A non-trusted caller cannot create a distribution list (403).", async () => {
@@ -254,6 +258,32 @@ describe("Route:DistributionListSQL Tests", () => {
 
         const unchanged = await repo.findOne({ where: { uid: list.uid } });
         expect(unchanged?.primarySmtpAddress).toBe(list.primarySmtpAddress);
+    });
+
+    it("Rejects updating primarySmtpAddress to an unverified domain once this server has at least one verified domain (400).", async () => {
+        await domainRepo.save(new DomainSQL({ name: "example.com", enabled: true, verified: true }));
+        const list = await createList({ primarySmtpAddress: `${uuid.v4()}@example.com` });
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${list.uid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: list.uid, version: list.version, primarySmtpAddress: `${uuid.v4()}@not-verified.com` });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Allows updating primarySmtpAddress to an address on a verified domain.", async () => {
+        await domainRepo.save(new DomainSQL({ name: "example.com", enabled: true, verified: true }));
+        const list = await createList({ primarySmtpAddress: `${uuid.v4()}@example.com` });
+        const newAddress = `${uuid.v4()}@example.com`;
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${list.uid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: list.uid, version: list.version, primarySmtpAddress: newAddress });
+
+        expect(result.status).toBe(200);
+        expect(result.body.primarySmtpAddress).toBe(newAddress);
     });
 
     it("Allows a PUT that resends the list's own current, unchanged primarySmtpAddress (200) - re-validating only on a genuine change.", async () => {

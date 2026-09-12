@@ -15,7 +15,7 @@
 import config from "../config.js";
 import { ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
-import { BaseBrandingRoute } from "../../src/routes/BaseBrandingRoute.js";
+import { BaseBrandingRoute, fetchBrandingPropsForSSR, readPublicBranding } from "../../src/routes/BaseBrandingRoute.js";
 
 class TestBrandingRoute extends BaseBrandingRoute<any> {
     protected brandingClass: any = class {
@@ -51,5 +51,58 @@ describe("BaseBrandingRoute Tests (findOrCreate() TOCTOU race only)", () => {
         };
 
         await expect((route as any).findOrCreate()).rejects.toThrow("connection reset");
+    });
+});
+
+class TestBranding {}
+
+describe("readPublicBranding() / fetchBrandingPropsForSSR() Tests (no route instance of their own - see doc comments)", () => {
+    it("readPublicBranding() returns the all-empty defaults when no row exists yet.", async () => {
+        const objectFactory: any = { newInstance: vi.fn().mockResolvedValue({ findOne: vi.fn().mockResolvedValue(undefined) }) };
+
+        const result = await readPublicBranding(objectFactory, TestBranding);
+
+        expect(result).toEqual({ companyName: "", title: "" });
+    });
+
+    it("readPublicBranding() maps an existing row into the public DTO, normalizing null to undefined.", async () => {
+        const existing: any = {
+            companyName: "Acme",
+            title: "Acme Mail",
+            logoUrl: "https://example.com/logo.png",
+            iconUrl: null,
+            stylesheetUrl: undefined,
+            headerHtml: "<div>header</div>",
+            footerHtml: null,
+        };
+        const objectFactory: any = { newInstance: vi.fn().mockResolvedValue({ findOne: vi.fn().mockResolvedValue(existing) }) };
+
+        const result = await readPublicBranding(objectFactory, TestBranding);
+
+        expect(result).toEqual({
+            companyName: "Acme",
+            title: "Acme Mail",
+            logoUrl: "https://example.com/logo.png",
+            iconUrl: undefined,
+            stylesheetUrl: undefined,
+            headerHtml: "<div>header</div>",
+            footerHtml: undefined,
+        });
+    });
+
+    it("fetchBrandingPropsForSSR() wraps a successful read in { branding }.", async () => {
+        const objectFactory: any = { newInstance: vi.fn().mockResolvedValue({ findOne: vi.fn().mockResolvedValue(undefined) }) };
+
+        const result = await fetchBrandingPropsForSSR(objectFactory, TestBranding);
+
+        expect(result).toEqual({ branding: { companyName: "", title: "" } });
+    });
+
+    it("fetchBrandingPropsForSSR() falls back to empty branding instead of throwing when the read fails.", async () => {
+        const objectFactory: any = { newInstance: vi.fn().mockRejectedValue(new Error("connection reset")) };
+
+        const result = await fetchBrandingPropsForSSR(objectFactory, TestBranding);
+
+        expect(result).toEqual({ branding: { companyName: "", title: "" } });
     });
 });

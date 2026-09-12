@@ -123,6 +123,22 @@ describe("Route:DomainSQL DKIM auto-generation Tests", () => {
         expect(typeof updated?.dkimPublicKey).toBe("string");
     });
 
+    it("Best-effort: a backfill failure logs a warning but doesn't fail the otherwise read-only dns-setup() request.", async () => {
+        const domain = await createDomain({ name: "backfill-fails.com" });
+        const dkimProvider = objectFactory.getInstance<FsDkimKeyProvider>("DkimKeyProvider")!;
+        const ensureKeyPairSpy = vi.spyOn(dkimProvider, "ensureKeyPair").mockRejectedValueOnce(new Error("disk full"));
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${domain.uid}/dns-setup`)
+            .set("Authorization", "jwt " + adminToken);
+
+        expect(result.status).toBe(200);
+        const updated = await repo.findOne({ where: { uid: domain.uid } });
+        expect(updated?.dkimSelector).toBeFalsy();
+
+        ensureKeyPairSpy.mockRestore();
+    });
+
     it("Does not regenerate a key pair for a domain that already has one.", async () => {
         const created = await request(server.getApplication())
             .post(baseUrl)

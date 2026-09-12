@@ -173,6 +173,96 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
         expect(result.body.length).toBe(2);
     });
 
+    it("A holder of scope A sees only scope A's count via count(), a trusted admin sees every entry's count.", async () => {
+        const scopeA = await createEscrowScope([holderA.uid]);
+        const scopeB = await createEscrowScope([holderB.uid]);
+        const matterA = await createMatter(scopeA.uid);
+        const matterB = await createMatter(scopeB.uid);
+
+        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+            action: EscrowAuditAction.REQUEST_CREATED,
+            holderUserUid: holderA.uid,
+            matterId: matterA.uid,
+            mailboxUid: uuid.v4(),
+            requestId: uuid.v4(),
+        });
+        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+            action: EscrowAuditAction.REQUEST_CREATED,
+            holderUserUid: holderB.uid,
+            matterId: matterB.uid,
+            mailboxUid: uuid.v4(),
+            requestId: uuid.v4(),
+        });
+
+        const holderResult = await request(server.getApplication()).head(baseUrl).set("Authorization", "jwt " + holderAToken);
+        expect(holderResult.headers["content-length"]).toBe("1");
+
+        const adminResult = await request(server.getApplication()).head(baseUrl).set("Authorization", "jwt " + adminToken);
+        expect(adminResult.headers["content-length"]).toBe("2");
+    });
+
+    it("A holder who holds no scope at all gets a zero count via count(), without ever calling repoUtils.count().", async () => {
+        const scopeA = await createEscrowScope([holderA.uid]);
+        const matterA = await createMatter(scopeA.uid);
+        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+            action: EscrowAuditAction.REQUEST_CREATED,
+            holderUserUid: holderA.uid,
+            matterId: matterA.uid,
+            mailboxUid: uuid.v4(),
+            requestId: uuid.v4(),
+        });
+
+        const result = await request(server.getApplication()).head(baseUrl).set("Authorization", "jwt " + holderBToken);
+
+        expect(result.headers["content-length"]).toBe("0");
+    });
+
+    it("A holder of scope A can read scope A's entry by id via findById(), but gets 404 for scope B's.", async () => {
+        const scopeA = await createEscrowScope([holderA.uid]);
+        const scopeB = await createEscrowScope([holderB.uid]);
+        const matterA = await createMatter(scopeA.uid);
+        const matterB = await createMatter(scopeB.uid);
+
+        const entryA = await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+            action: EscrowAuditAction.REQUEST_CREATED,
+            holderUserUid: holderA.uid,
+            matterId: matterA.uid,
+            mailboxUid: uuid.v4(),
+            requestId: uuid.v4(),
+        });
+        const entryB = await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+            action: EscrowAuditAction.REQUEST_CREATED,
+            holderUserUid: holderB.uid,
+            matterId: matterB.uid,
+            mailboxUid: uuid.v4(),
+            requestId: uuid.v4(),
+        });
+
+        const ownResult = await request(server.getApplication())
+            .get(`${baseUrl}/${entryA.uid}`)
+            .set("Authorization", "jwt " + holderAToken);
+        expect(ownResult.status).toBe(200);
+        expect(ownResult.body.matterId).toBe(matterA.uid);
+
+        const otherResult = await request(server.getApplication())
+            .get(`${baseUrl}/${entryB.uid}`)
+            .set("Authorization", "jwt " + holderAToken);
+        expect(otherResult.status).toBe(404);
+
+        const adminResult = await request(server.getApplication())
+            .get(`${baseUrl}/${entryB.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(adminResult.status).toBe(200);
+    });
+
+    it("A trusted admin reading a nonexistent escrow audit log entry by id gets 404.", async () => {
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${uuid.v4()}`)
+            .set("Authorization", "jwt " + adminToken);
+
+        expect(result.status).toBe(404);
+    });
+
     it("A holder gets 403 on GET /verify.", async () => {
         const result = await request(server.getApplication())
             .get(`${baseUrl}/verify`)

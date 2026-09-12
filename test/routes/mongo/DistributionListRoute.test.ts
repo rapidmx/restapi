@@ -9,6 +9,7 @@ import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { DistributionListMongo } from "../../../src/models/mongo/DistributionListMongo.js";
+import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
@@ -29,6 +30,7 @@ describe("Route:DistributionListMongo Tests", () => {
     let repo: MongoRepository<DistributionListMongo>;
     let mailboxRepo: MongoRepository<MailboxMongo>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
+    let domainRepo: MongoRepository<DomainMongo>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -59,6 +61,7 @@ describe("Route:DistributionListMongo Tests", () => {
             repo = conn.getMongoRepository("DistributionListMongo");
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
             auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
+            domainRepo = conn.getMongoRepository("DomainMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -71,7 +74,7 @@ describe("Route:DistributionListMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const r of [repo, mailboxRepo, auditLogRepo]) {
+        for (const r of [repo, mailboxRepo, auditLogRepo, domainRepo]) {
             try {
                 await r.clear();
             } catch (err: any) {
@@ -269,6 +272,32 @@ describe("Route:DistributionListMongo Tests", () => {
 
         const unchanged = await repo.findOne({ uid: list.uid } as any);
         expect(unchanged?.primarySmtpAddress).toBe(list.primarySmtpAddress);
+    });
+
+    it("Rejects updating primarySmtpAddress to an unverified domain once this server has at least one verified domain (400).", async () => {
+        await domainRepo.save(new DomainMongo({ name: "example.com", enabled: true, verified: true }) as any);
+        const list = await createList({ primarySmtpAddress: `${uuid.v4()}@example.com` });
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${list.uid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: list.uid, version: list.version, primarySmtpAddress: `${uuid.v4()}@not-verified.com` });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Allows updating primarySmtpAddress to an address on a verified domain.", async () => {
+        await domainRepo.save(new DomainMongo({ name: "example.com", enabled: true, verified: true }) as any);
+        const list = await createList({ primarySmtpAddress: `${uuid.v4()}@example.com` });
+        const newAddress = `${uuid.v4()}@example.com`;
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${list.uid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: list.uid, version: list.version, primarySmtpAddress: newAddress });
+
+        expect(result.status).toBe(200);
+        expect(result.body.primarySmtpAddress).toBe(newAddress);
     });
 
     it("Allows a PUT that resends the list's own current, unchanged primarySmtpAddress (200) - re-validating only on a genuine change.", async () => {

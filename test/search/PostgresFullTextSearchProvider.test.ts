@@ -365,22 +365,40 @@ describe("PostgresFullTextSearchProvider Tests", () => {
             mockConnection.query.mockClear();
             mockConnection.query.mockResolvedValueOnce([{ entity_type: "message", entity_uid: "msg-1" }]);
 
+            const before = new Date("2026-06-01");
+            const after = new Date("2026-01-01");
             const result = await provider.candidates({
                 mailboxUid: "mbx-1",
                 entityTypes: ["message"],
                 participants: ["bob@example.com", "carol@example.com"],
                 folderUid: "folder-1",
+                flags: ["read", "flagged"],
                 labels: ["label-a"],
+                before,
+                after,
             });
 
             const [sql, params] = mockConnection.query.mock.calls[0];
             expect(sql).toMatch(/SELECT entity_type, entity_uid/);
             expect(sql).not.toMatch(/search_vector|rank/);
             expect(sql).toMatch(/participants ILIKE '%' \|\| \$\d+ \|\| '%' OR participants ILIKE '%' \|\| \$\d+ \|\| '%'/);
+            expect(sql).toMatch(/flags @> \$\d+::text\[\]/);
             expect(sql).toMatch(/label_uids @> \$\d+::text\[\]/);
+            expect(sql).toMatch(/date_for_sort < \$\d+/);
+            expect(sql).toMatch(/date_for_sort > \$\d+/);
             expect(sql).toMatch(/ORDER BY date_for_sort DESC NULLS LAST/);
             expect(params).toEqual(
-                expect.arrayContaining(["mbx-1", ["message"], "bob@example.com", "carol@example.com", "folder-1", ["label-a"]]),
+                expect.arrayContaining([
+                    "mbx-1",
+                    ["message"],
+                    "bob@example.com",
+                    "carol@example.com",
+                    "folder-1",
+                    ["read", "flagged"],
+                    ["label-a"],
+                    before,
+                    after,
+                ]),
             );
             expect(result).toEqual({ candidates: [{ entityType: "message", entityUid: "msg-1" }], nextCursor: undefined });
         });

@@ -114,12 +114,17 @@ export class LocalX509CertificateAuthority implements EncryptionCertificateAutho
             // and silently unverifiable. On `EEXIST`, some other call already won - re-run this method to
             // read and return *its* result instead of generating a second, orphaned root.
             await fs.writeFile(this.caKeyPath(), keyPem, { mode: 0o600, flag: "wx" });
+            /* v8 ignore start -- the concurrent-loser retry (and the "some other real fs error" rethrow)
+               described above can't be reproduced deterministically against a real filesystem without
+               fabricating exact concurrent timing, and this class's own test file deliberately uses no
+               mocking (see its doc comment) - both a genuinely untestable branch pair. */
         } catch (err: any) {
             if (err.code === "EEXIST") {
                 return this.ensureCa();
             }
             throw err;
         }
+        /* v8 ignore stop */
         await fs.writeFile(this.caCertPath(), certificate.toString("pem"), { mode: 0o644, flag: "wx" });
         this.logger?.info(`LocalX509CertificateAuthority: generated new local CA root at '${this.caDir}'.`);
 

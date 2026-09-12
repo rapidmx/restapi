@@ -164,4 +164,36 @@ describe("verifyEscrowAuditChain() Tests", () => {
         expect(result.valid).toBe(false);
         expect(result.brokenAtSequence).toBe(1);
     });
+
+    it("Detects a broken previousHash link (a deleted/reordered entry), distinct from a per-entry hash mismatch.", async () => {
+        const stubClass = makeStubClass();
+        let stored: any[] = [];
+        const repo = {
+            find: vi.fn().mockImplementation(async (query: any) => {
+                if (query.page !== undefined) {
+                    return query.page === 0 ? stored : [];
+                }
+                return stored.length ? [stored[stored.length - 1]] : [];
+            }),
+            create: vi.fn().mockImplementation(async (entry) => {
+                stored.push(entry);
+                return entry;
+            }),
+        };
+        const objectFactory = makeObjectFactory(repo);
+
+        await recordEscrowAuditEntry(objectFactory, stubClass, makeParams());
+        await recordEscrowAuditEntry(objectFactory, stubClass, makeParams({ action: EscrowAuditAction.REQUEST_APPROVED }));
+
+        // Directly delete the first entry from the backing store, as if it were purged out from under the
+        // chain - the second entry's own `hash` is still internally consistent with its own fields, but its
+        // `previousHash` no longer matches any entry actually present (`expectedPreviousHash` starts
+        // `undefined` for the first entry seen, which is now the second one, whose `previousHash` is set).
+        stored.shift();
+
+        const result = await verifyEscrowAuditChain(objectFactory, stubClass);
+
+        expect(result.valid).toBe(false);
+        expect(result.brokenAtSequence).toBe(1);
+    });
 });

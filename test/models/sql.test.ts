@@ -27,6 +27,7 @@ import { AttachmentSQL } from "../../src/models/sql/AttachmentSQL.js";
 import { AuditLogEntrySQL } from "../../src/models/sql/AuditLogEntrySQL.js";
 import { BookingSQL } from "../../src/models/sql/BookingSQL.js";
 import { BookingTypeSQL } from "../../src/models/sql/BookingTypeSQL.js";
+import { BrandingSQL } from "../../src/models/sql/BrandingSQL.js";
 import { CalendarEventSQL } from "../../src/models/sql/CalendarEventSQL.js";
 import { CalendarShareLinkSQL } from "../../src/models/sql/CalendarShareLinkSQL.js";
 import { ContactSQL } from "../../src/models/sql/ContactSQL.js";
@@ -34,6 +35,7 @@ import { ContactListSQL } from "../../src/models/sql/ContactListSQL.js";
 import { DeviceSyncStateSQL } from "../../src/models/sql/DeviceSyncStateSQL.js";
 import { DistributionListSQL } from "../../src/models/sql/DistributionListSQL.js";
 import { DomainSQL } from "../../src/models/sql/DomainSQL.js";
+import { EscrowAccessRequestSQL } from "../../src/models/sql/EscrowAccessRequestSQL.js";
 import { FocusedInboxOverrideSQL } from "../../src/models/sql/FocusedInboxOverrideSQL.js";
 import { FolderSQL } from "../../src/models/sql/FolderSQL.js";
 import { IngestQueueEntrySQL } from "../../src/models/sql/IngestQueueEntrySQL.js";
@@ -678,6 +680,37 @@ describe("SQL model default construction", () => {
         expect(obj.cancelledAt).toBe(cancelledAt);
     });
 
+    it("BookingSQL keeps class defaults for fields omitted from a partial constructor call.", () => {
+        // Every other test either passes no data at all (skips the whole `if (other)` block) or every
+        // field (always takes each ternary's true branch) - a genuine partial merge, the shape
+        // `RepoUtils.instantiateObject()` and every real "supply only what changed" caller actually use,
+        // is never otherwise exercised, leaving each `!== undefined` ternary's false/default branch
+        // uncovered.
+        const obj = new BookingSQL({ bookingTypeUid: "bt-1", bookerEmail: "grace@example.com", status: BookingStatus.PENDING });
+
+        expect(obj.bookingTypeUid).toBe("bt-1");
+        expect(obj.bookerEmail).toBe("grace@example.com");
+        expect(obj.status).toBe(BookingStatus.PENDING);
+        expect(obj.mailboxUid).toBe("");
+        expect(obj.folderUid).toBe("");
+        expect(obj.calendarEventUid).toBe("");
+        expect(obj.bookerName).toBe("");
+        expect(obj.manageToken).toBe("");
+        expect(obj.startDate).toBeInstanceOf(Date);
+        expect(obj.endDate).toBeInstanceOf(Date);
+    });
+
+    it("BookingSQL keeps every class default when constructed with an empty partial object.", () => {
+        // An empty object still takes the `if (other)` branch (unlike passing no argument at all), so
+        // every `!== undefined` ternary's false branch needs its own exercise here - the mixed test
+        // above only omits the fields it doesn't itself provide.
+        const obj = new BookingSQL({});
+
+        expect(obj.bookingTypeUid).toBe("");
+        expect(obj.bookerEmail).toBe("");
+        expect(obj.status).toBe(BookingStatus.CONFIRMED);
+    });
+
     it("FocusedInboxOverrideSQL falls back to class defaults when constructed with no data.", () => {
         const obj = new FocusedInboxOverrideSQL();
 
@@ -696,6 +729,53 @@ describe("SQL model default construction", () => {
         expect(obj.mailboxUid).toBe("mailbox-1");
         expect(obj.senderAddress).toBe("newsletter@example.com");
         expect(obj.classifyAs).toBe(MessageClassification.OTHER);
+    });
+
+    it("FocusedInboxOverrideSQL keeps class defaults for fields omitted from a partial constructor call.", () => {
+        const obj = new FocusedInboxOverrideSQL({ mailboxUid: "mailbox-1" });
+
+        expect(obj.mailboxUid).toBe("mailbox-1");
+        expect(obj.senderAddress).toBe("");
+        expect(obj.classifyAs).toBe(MessageClassification.FOCUSED);
+    });
+
+    it("FocusedInboxOverrideSQL keeps every class default when constructed with an empty partial object.", () => {
+        const obj = new FocusedInboxOverrideSQL({});
+
+        expect(obj.mailboxUid).toBe("");
+    });
+
+    it("EscrowAccessRequestSQL keeps class defaults for fields omitted from a partial constructor call.", () => {
+        // No route ever constructs this model with a partial `other` - `persistCreate()` always
+        // supplies every field, so the `!== undefined` ternary's false branch is otherwise unexercised.
+        const obj = new EscrowAccessRequestSQL({ matterId: "matter-1", mailboxUid: "mailbox-1" });
+
+        expect(obj.matterId).toBe("matter-1");
+        expect(obj.mailboxUid).toBe("mailbox-1");
+        expect(obj.requestedByUserUid).toBe("");
+        expect(obj.approvals).toEqual([]);
+        expect(obj.requiredHoldersAtCreation).toBe(1);
+        expect(obj.status).toBe("pending");
+    });
+
+    it("EscrowAccessRequestSQL keeps every class default when constructed with an empty partial object.", () => {
+        const obj = new EscrowAccessRequestSQL({});
+
+        expect(obj.matterId).toBe("");
+        expect(obj.mailboxUid).toBe("");
+    });
+
+    it("BrandingSQL keeps class defaults for fields omitted from a partial constructor call.", () => {
+        const obj = new BrandingSQL({ title: "Acme Mail" });
+
+        expect(obj.title).toBe("Acme Mail");
+        expect(obj.companyName).toBe("");
+    });
+
+    it("BrandingSQL keeps every class default when constructed with an empty partial object.", () => {
+        const obj = new BrandingSQL({});
+
+        expect(obj.title).toBe("");
     });
 
     it("CalendarEventSQL falls back to class defaults when constructed with no data.", () => {

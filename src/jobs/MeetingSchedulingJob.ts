@@ -111,6 +111,12 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                 if (!event.attendees || event.attendees.length === 0) {
                     continue;
                 }
+                // Defense in depth only: `find()`'s own `status: ne(CANCELLED)` filter above already excludes
+                // every candidate this could match, and this job's own test files use a real database (not a
+                // mocked repo) - so short of a genuine cancel racing in in between the query and this loop
+                // reaching the row (a timing window this test suite can't force deterministically), no test
+                // can make this `continue` actually fire.
+                /* v8 ignore next */
                 if (event.status === CalendarEventStatus.CANCELLED) {
                     continue;
                 }

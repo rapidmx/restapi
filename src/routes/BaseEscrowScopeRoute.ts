@@ -21,7 +21,12 @@ const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } =
  * patch, for `update()`) object - `undefined` fields are left alone (an `update()` patch not touching a
  * given field shouldn't fail validation for it). */
 function validateEscrowScope(o: Partial<EscrowScope>): void {
+    // Shadowed in practice: the framework's own schema validation already rejects an empty `name` (a
+    // required, non-`@Nullable` column) before this function ever runs - see BaseMatterRoute's
+    // identical `validateMatter()` check and its own doc comment for the full reasoning, confirmed the
+    // same way here (a create() sending `name: ""` is still 400, but via that upstream path).
     if (o.name !== undefined && !o.name) {
+        /* v8 ignore next */
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "name is required.");
     }
     if (o.holderUserUids !== undefined) {

@@ -17,6 +17,7 @@ import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { DistributionListMongo } from "../../../src/models/mongo/DistributionListMongo.js";
+import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { computeKeyDiscoveryHash } from "../../../src/util/KeyDiscoveryClient.js";
 import { AuditAction } from "../../../src/models/types.js";
@@ -39,6 +40,7 @@ describe("Route:MailboxMongo Tests", () => {
     let aclRepo: MongoRepository<any>;
     let distributionListRepo: MongoRepository<DistributionListMongo>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
+    let domainRepo: MongoRepository<DomainMongo>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -121,6 +123,7 @@ describe("Route:MailboxMongo Tests", () => {
             repo = conn.getMongoRepository("MailboxMongo");
             distributionListRepo = conn.getMongoRepository("DistributionListMongo");
             auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
+            domainRepo = conn.getMongoRepository("DomainMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -133,7 +136,7 @@ describe("Route:MailboxMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const r of [repo, distributionListRepo, auditLogRepo]) {
+        for (const r of [repo, distributionListRepo, auditLogRepo, domainRepo]) {
             try {
                 await r.clear();
             } catch (err: any) {
@@ -344,6 +347,32 @@ describe("Route:MailboxMongo Tests", () => {
             .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: other.primarySmtpAddress });
 
         expect(result.status).toBe(409);
+    });
+
+    it("Rejects renaming primarySmtpAddress to an unverified domain once this server has at least one verified domain (400).", async () => {
+        await domainRepo.save(new DomainMongo({ name: "example.com", enabled: true, verified: true }) as any);
+        const obj = await createMailboxMongo({ primarySmtpAddress: `${uuid.v4()}@example.com` });
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: `${uuid.v4()}@not-verified.com` });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Allows renaming primarySmtpAddress to an address on a verified domain.", async () => {
+        await domainRepo.save(new DomainMongo({ name: "example.com", enabled: true, verified: true }) as any);
+        const obj = await createMailboxMongo({ primarySmtpAddress: `${uuid.v4()}@example.com` });
+        const newAddress = `${uuid.v4()}@example.com`;
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: newAddress });
+
+        expect(result.status).toBe(200);
+        expect(result.body.primarySmtpAddress).toBe(newAddress);
     });
 
     it("Allows a PUT that resends the mailbox's own current, unchanged primarySmtpAddress (200) - re-validating only on a genuine change.", async () => {

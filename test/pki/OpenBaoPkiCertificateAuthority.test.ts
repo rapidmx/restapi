@@ -106,6 +106,29 @@ describe("OpenBaoPkiCertificateAuthority Tests", () => {
         expect(map[issued.fingerprint]).toBe(serialNumber);
     });
 
+    it("A failed recordSerial() write doesn't poison serialMapQueue for the next issue() call.", async () => {
+        const dirAsFile: string = path.join(tmpDir, `a-directory-not-a-file-${Math.random()}.json`);
+        await fs.mkdir(dirAsFile, { recursive: true });
+        (authority as any).serialMapPath = dirAsFile;
+
+        const first = await makeSignedCertPem("ivy@example.com");
+        mockFetch.mockResolvedValue(
+            makeFetchResponse({ json: vi.fn().mockResolvedValue({ data: { certificate: first.pem, serial_number: first.serialNumber } }) }),
+        );
+        await expect(authority.issue("ivy@example.com", "csr")).rejects.toThrow();
+
+        const validPath: string = path.join(tmpDir, `serials-recovered-${Math.random()}.json`);
+        (authority as any).serialMapPath = validPath;
+        const second = await makeSignedCertPem("jack@example.com");
+        mockFetch.mockResolvedValue(
+            makeFetchResponse({ json: vi.fn().mockResolvedValue({ data: { certificate: second.pem, serial_number: second.serialNumber } }) }),
+        );
+        const issued: IssuedCertificate = await authority.issue("jack@example.com", "csr");
+
+        const map = JSON.parse(await fs.readFile(validPath, "utf-8"));
+        expect(map[issued.fingerprint]).toBe(second.serialNumber);
+    });
+
     it("Throws a 502 when the server response is missing a certificate or serial number.", async () => {
         mockFetch.mockResolvedValue(makeFetchResponse({ json: vi.fn().mockResolvedValue({ data: {} }) }));
         await expect(authority.issue("dave@example.com", "csr")).rejects.toThrow(/incomplete response/);

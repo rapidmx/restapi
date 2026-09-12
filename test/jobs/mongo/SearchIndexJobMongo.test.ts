@@ -212,7 +212,7 @@ describe("SearchIndexJobMongo Tests (real DB + DI)", () => {
                 { address: "cc1@example.com", type: RecipientType.CC },
             ],
             hasAttachments: false,
-            flags: { read: true, flagged: true, answered: false, forwarded: false },
+            flags: { read: true, flagged: true, answered: true, forwarded: true },
         });
 
         await job.run();
@@ -225,7 +225,7 @@ describe("SearchIndexJobMongo Tests (real DB + DI)", () => {
                 to: ["to1@example.com", "to2@example.com"],
                 cc: ["cc1@example.com"],
                 folderUid: message.folderUid,
-                flags: ["read", "flagged"],
+                flags: ["read", "flagged", "answered", "forwarded"],
                 hasAttachments: false,
                 metadataOnly: false,
             }),

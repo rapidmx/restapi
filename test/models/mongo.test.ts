@@ -27,6 +27,7 @@ import { AttachmentMongo } from "../../src/models/mongo/AttachmentMongo.js";
 import { AuditLogEntryMongo } from "../../src/models/mongo/AuditLogEntryMongo.js";
 import { BookingMongo } from "../../src/models/mongo/BookingMongo.js";
 import { BookingTypeMongo } from "../../src/models/mongo/BookingTypeMongo.js";
+import { BrandingMongo } from "../../src/models/mongo/BrandingMongo.js";
 import { CalendarEventMongo } from "../../src/models/mongo/CalendarEventMongo.js";
 import { CalendarShareLinkMongo } from "../../src/models/mongo/CalendarShareLinkMongo.js";
 import { ContactMongo } from "../../src/models/mongo/ContactMongo.js";
@@ -34,6 +35,7 @@ import { ContactListMongo } from "../../src/models/mongo/ContactListMongo.js";
 import { DeviceSyncStateMongo } from "../../src/models/mongo/DeviceSyncStateMongo.js";
 import { DistributionListMongo } from "../../src/models/mongo/DistributionListMongo.js";
 import { DomainMongo } from "../../src/models/mongo/DomainMongo.js";
+import { EscrowAccessRequestMongo } from "../../src/models/mongo/EscrowAccessRequestMongo.js";
 import { FocusedInboxOverrideMongo } from "../../src/models/mongo/FocusedInboxOverrideMongo.js";
 import { FolderMongo } from "../../src/models/mongo/FolderMongo.js";
 import { IngestQueueEntryMongo } from "../../src/models/mongo/IngestQueueEntryMongo.js";
@@ -678,6 +680,32 @@ describe("Mongo model default construction", () => {
         expect(obj.cancelledAt).toBe(cancelledAt);
     });
 
+    it("BookingMongo keeps class defaults for fields omitted from a partial constructor call.", () => {
+        // See BookingSQL's identical test in sql.test.ts for the full reasoning - a genuine partial
+        // merge is never otherwise exercised by any real caller in this test suite.
+        const obj = new BookingMongo({ bookingTypeUid: "bt-1", bookerEmail: "grace@example.com", status: BookingStatus.PENDING });
+
+        expect(obj.bookingTypeUid).toBe("bt-1");
+        expect(obj.bookerEmail).toBe("grace@example.com");
+        expect(obj.status).toBe(BookingStatus.PENDING);
+        expect(obj.mailboxUid).toBe("");
+        expect(obj.folderUid).toBe("");
+        expect(obj.calendarEventUid).toBe("");
+        expect(obj.bookerName).toBe("");
+        expect(obj.manageToken).toBe("");
+        expect(obj.startDate).toBeInstanceOf(Date);
+        expect(obj.endDate).toBeInstanceOf(Date);
+    });
+
+    it("BookingMongo keeps every class default when constructed with an empty partial object.", () => {
+        // See BookingSQL's identical test in sql.test.ts for the full reasoning.
+        const obj = new BookingMongo({});
+
+        expect(obj.bookingTypeUid).toBe("");
+        expect(obj.bookerEmail).toBe("");
+        expect(obj.status).toBe(BookingStatus.CONFIRMED);
+    });
+
     it("FocusedInboxOverrideMongo falls back to class defaults when constructed with no data.", () => {
         const obj = new FocusedInboxOverrideMongo();
 
@@ -696,6 +724,52 @@ describe("Mongo model default construction", () => {
         expect(obj.mailboxUid).toBe("mailbox-1");
         expect(obj.senderAddress).toBe("newsletter@example.com");
         expect(obj.classifyAs).toBe(MessageClassification.OTHER);
+    });
+
+    it("FocusedInboxOverrideMongo keeps class defaults for fields omitted from a partial constructor call.", () => {
+        const obj = new FocusedInboxOverrideMongo({ mailboxUid: "mailbox-1" });
+
+        expect(obj.mailboxUid).toBe("mailbox-1");
+        expect(obj.senderAddress).toBe("");
+        expect(obj.classifyAs).toBe(MessageClassification.FOCUSED);
+    });
+
+    it("FocusedInboxOverrideMongo keeps every class default when constructed with an empty partial object.", () => {
+        const obj = new FocusedInboxOverrideMongo({});
+
+        expect(obj.mailboxUid).toBe("");
+    });
+
+    it("EscrowAccessRequestMongo keeps class defaults for fields omitted from a partial constructor call.", () => {
+        // See EscrowAccessRequestSQL's identical test in sql.test.ts for the full reasoning.
+        const obj = new EscrowAccessRequestMongo({ matterId: "matter-1", mailboxUid: "mailbox-1" });
+
+        expect(obj.matterId).toBe("matter-1");
+        expect(obj.mailboxUid).toBe("mailbox-1");
+        expect(obj.requestedByUserUid).toBe("");
+        expect(obj.approvals).toEqual([]);
+        expect(obj.requiredHoldersAtCreation).toBe(1);
+        expect(obj.status).toBe("pending");
+    });
+
+    it("EscrowAccessRequestMongo keeps every class default when constructed with an empty partial object.", () => {
+        const obj = new EscrowAccessRequestMongo({});
+
+        expect(obj.matterId).toBe("");
+        expect(obj.mailboxUid).toBe("");
+    });
+
+    it("BrandingMongo keeps class defaults for fields omitted from a partial constructor call.", () => {
+        const obj = new BrandingMongo({ title: "Acme Mail" });
+
+        expect(obj.title).toBe("Acme Mail");
+        expect(obj.companyName).toBe("");
+    });
+
+    it("BrandingMongo keeps every class default when constructed with an empty partial object.", () => {
+        const obj = new BrandingMongo({});
+
+        expect(obj.title).toBe("");
     });
 
     it("CalendarEventMongo falls back to class defaults when constructed with no data.", () => {

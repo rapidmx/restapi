@@ -229,6 +229,25 @@ describe("Route:SearchRouteMongo Tests", () => {
         expect(result.body.results.map((r: any) => r.entityUid)).toEqual(["msg-1"]);
     });
 
+    it("Parses before/after into real Date objects before handing them to the search provider.", async () => {
+        await createMailbox(owner.uid);
+        const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+        const searchSpy = vi.spyOn(searchProvider, "search");
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}?q=hello&before=2026-06-01T00:00:00.000Z&after=2026-01-01T00:00:00.000Z`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(200);
+        const query = searchSpy.mock.calls[0][0];
+        expect(query.before).toBeInstanceOf(Date);
+        expect(query.before!.toISOString()).toBe("2026-06-01T00:00:00.000Z");
+        expect(query.after).toBeInstanceOf(Date);
+        expect(query.after!.toISOString()).toBe("2026-01-01T00:00:00.000Z");
+
+        searchSpy.mockRestore();
+    });
+
     describe("GET /search/candidates", () => {
         it("Requires authentication.", async () => {
             const result = await request(server.getApplication()).get(`${baseUrl}/candidates`);

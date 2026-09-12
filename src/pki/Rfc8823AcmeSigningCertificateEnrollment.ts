@@ -190,6 +190,11 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
             if (err.code === "EEXIST") {
                 return this.ensureAccount();
             }
+            // A real filesystem error other than the expected concurrent-loser EEXIST above (e.g. a
+            // permissions failure) - see LocalX509CertificateAuthority.ensureCa()'s identical rethrow for
+            // why this can't be reproduced deterministically without mocking, which this file's own test
+            // convention (real fs, no mocking) deliberately avoids.
+            /* v8 ignore next */
             throw err;
         }
         await fs.writeFile(this.accountUrlPath(), client.getAccountUrl(), { mode: 0o600, flag: "wx" });

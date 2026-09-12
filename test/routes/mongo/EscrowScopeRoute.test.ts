@@ -316,4 +316,21 @@ describe("Route:EscrowScopeMongo Tests", () => {
         expect(result.status).toBeGreaterThanOrEqual(200);
         expect(result.status).toBeLessThan(300);
     });
+
+    it("A trusted admin updating a nonexistent escrow scope gets 404.", async () => {
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${uuid.v4()}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ name: "renamed" });
+
+        expect(result.status).toBe(404);
+    });
+
+    it("A trusted admin deleting a nonexistent escrow scope gets 404.", async () => {
+        const result = await request(server.getApplication())
+            .delete(`${baseUrl}/${uuid.v4()}`)
+            .set("Authorization", "jwt " + adminToken);
+
+        expect(result.status).toBe(404);
+    });
 });
