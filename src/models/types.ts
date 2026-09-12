@@ -218,6 +218,54 @@ export interface Matter extends BaseEntity {
     closedAt?: Date;
 }
 
+/** The lifecycle event an `EscrowAuditLogEntry` records - the three moments real escrow-wrapped key
+ * material, or the authority over it, changes hands or comes into existence. Deliberately excludes a
+ * denied request (nothing was ever granted or used there) - that goes through the ordinary
+ * `AuditAction`/`recordAuditLog()` instead. */
+export enum EscrowAuditAction {
+    REQUEST_CREATED = "escrow_access_request.created",
+    REQUEST_APPROVED = "escrow_access_request.approved",
+    MATERIAL_READ = "escrow_access_request.material_read",
+}
+
+/**
+ * One hash-chained, tamper-evident record of an escrow *access* lifecycle event - deliberately separate
+ * from the general-purpose `AuditLogEntry`/`recordAuditLog()` (best-effort, not chained, used for
+ * `EscrowScope`/`Matter` config-change events instead - see those routes). `previousHash`/`hash` form a
+ * chain: editing or deleting any row directly against the database breaks `hash` for that row and
+ * `previousHash` for every row after it - see `util/EscrowAuditUtils.ts`'s `verifyEscrowAuditChain()`.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface EscrowAuditLogEntry extends BaseEntity {
+    /** Monotonic, global (not per-scope) sequence number - see `EscrowAuditUtils.recordEscrowAuditEntry()`. */
+    sequence: number;
+
+    /** The immediately-preceding entry's `hash`. `undefined` only for the very first entry (`sequence === 0`). */
+    previousHash?: string;
+
+    /** SHA-256 hex digest over this entry's own content plus `previousHash`. */
+    hash: string;
+
+    action: EscrowAuditAction;
+
+    /** The holder who performed the action. */
+    holderUserUid: string;
+
+    matterId: string;
+
+    mailboxUid: string;
+
+    /** The `EscrowAccessRequest` this event pertains to. */
+    requestId: string;
+
+    /** Captured explicitly (rather than relying on `BaseEntity.dateCreated`, whose assignment timing
+     * relative to the hash computation isn't guaranteed) and included in the hash. */
+    occurredAt: Date;
+
+    details?: Record<string, any>;
+}
+
 /**
  * The JSON body served from (and consumed from) the federation discovery endpoint,
  * `GET /.well-known/rapidmx/keys/:hash` - see `specs/end-to-end_encryption.md`'s "Public Endpoint" section.

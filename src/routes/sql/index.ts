@@ -10,6 +10,7 @@ export * from "./ContactRouteSQL.js";
 export * from "./DistributionListRouteSQL.js";
 export * from "./DomainRouteSQL.js";
 export * from "./EncryptionPolicyRouteSQL.js";
+export * from "./EscrowAuditLogRouteSQL.js";
 export * from "./EscrowScopeRouteSQL.js";
 export * from "./FocusedInboxOverrideRouteSQL.js";
 export * from "./FolderRouteSQL.js";
