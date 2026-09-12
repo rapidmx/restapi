@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## v0.7.0
 
 ### HIPAA / GDPR / eDiscovery compliance suite
 

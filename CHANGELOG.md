@@ -7,6 +7,325 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-12
+
+### Added
+- Added Label entity (LabelSQL/LabelMongo) with mailbox-scoped CRUD routes
+- Added Message.labelUids to reference applied labels by uid
+- Added cascade cleanup removing a deleted label's uid from every referencing message
+- Added MailFilterActionType.APPLY_LABEL mail filter action
+- Added label: search operator to SearchProvider, BaseSearchRoute, and all three search providers
+- Added S3BlobStore, an S3/S3-compatible BlobStore backend
+- Added FolderType.ARCHIVE and its default display name
+- Added a POST /:id/archive action on BaseMessageRoute, mirroring recall()'s shape
+- Added EscrowScope entity with admin-only CRUD (holders, dual-control threshold, notify flag)
+- Added Mailbox.escrowScopeId assignment, restricted to a trusted administrator
+- Added BaseKeyVaultRoute.resolveAllowEscrow(), the prerequisite for a real escrow-method MasterKeyWrap
+- Added Matter entity, holder-gated CRUD rather than admin-gated (separation of duties)
+- Added EscrowUtils.requireEscrowHolder()/findHeldScopeIds(), shared holder-check helpers
+- Added hash-chained EscrowAuditLogEntry, tamper-evident against direct DB edits
+- Added EscrowAuditUtils.recordEscrowAuditEntry()/verifyEscrowAuditChain()
+- Added read-only BaseEscrowAuditLogRoute, holder-scoped or unfiltered for a trusted admin
+- Added EscrowAccessRequest dual-control workflow for escrow key material access
+- Added create/approve/deny/material endpoints gated by EscrowScope holder status and M-of-N approval thresholds
+- Added hash-chained escrow audit entries recorded atomically alongside every create/approve/material-read action
+- Added a 409 guard blocking Matter deletion while EscrowAccessRequests still reference it
+- Added coverage for pre-existing untested branches in BaseMatterRoute (not-found guards, bulk create, validation-skip paths)
+- Added Rfc8823AcmeSigningCertificateEnrollment (F4b sub-item 1 of 4)
+- Added real RFC 8823 email-reply-00 ACME automation via the acme-client package, driven through its manual API since email-reply-00 has no native support
+- Added persisted ACME account key/URL and per-enrollment state, mirroring the existing local-CA disk-persistence pattern
+- Added recordChallengeToken() as the seam a later inbound-mail correlator will call once the CA's challenge email arrives
+- Added inbound RFC 8823 challenge-email correlation (F4b sub-item 2 of 4)
+- Added ScanQueueJob.tryCorrelateAcmeChallenge(), recognizing a CA challenge email by its Auto-Submitted/Subject shape and matching it against an outstanding enrollment before ever treating it as CA plumbing
+- Added ScanPipelineResult.replyToAddress, needed to address the eventual reply per RFC 8823's own Reply-To-else-From rule
+- Added Rfc8823AcmeSigningCertificateEnrollment.findPendingEnrollmentId(), the reverse lookup the correlator needs since nothing in the challenge email itself carries this server's own enrollmentId
+- Added outbound RFC 8823 reply and challenge-completion pipeline (F4b sub-item 3 of 4)
+- Added Rfc8823AcmeSigningCertificateEnrollment.advanceEnrollment(), a single non-blocking state-machine step per call: send the reply email and complete the challenge, then poll/finalize/download the certificate once the CA validates it
+- Added sendChallengeReply(), composing the exact RFC 8823 reply shape (Re:-prefixed subject, In-Reply-To, the BEGIN/END ACME RESPONSE body block) and relaying it via the same scanAndRelay() path every other real outbound message uses
+- Added MailTransport/ScanPipeline/BlobStore injection to Rfc8823AcmeSigningCertificateEnrollment, needed to actually send that reply
+- Added sign-enrollment REST endpoints and the ACME driver job (F4b sub-item 4 of 4)
+- Added BaseKeyVaultRoute.startSignEnrollment()/checkSignEnrollmentStatus(), accepting the wrapped private key upfront alongside the CSR so the eventual install needs no further client action
+- Added AcmeEnrollmentDriverJob, advancing every outstanding RFC 8823 enrollment and auto-installing the certificate into the mailbox's KeyVault once the CA issues it, idempotently via a fingerprint-collision guard
+- Added AcmeEnrollmentDriverJob's expiry-check pass, flagging a mailbox's signing certificate nearing notAfter with nothing newer already enrolled
+- Added Rfc8823AcmeSigningCertificateEnrollment.attachWrappedKey()/listPendingEnrollments()/getIssuedMaterial()/markInstalled(), the seams the job and route need
+- Added model constructor partial-data tests closing !== undefined ternary false-branch gaps in Booking/FocusedInboxOverride/EscrowAccessRequest/Branding (SQL+Mongo)
+- Added direct-call tests for BaseAuditLogRoute/BaseEscrowAuditLogRoute's rejectWrite()-guarded bodies, dead via HTTP since @Before intercepts before the handler runs
+- Added real count()/findById() holder-scoping tests for BaseEscrowAuditLogRoute, previously only exercised via find()
+- Added unit tests for BaseBrandingRoute's SSR-only readPublicBranding()/fetchBrandingPropsForSSR() helpers
+- Added shared.ts's AWS SDK dynamic-import failure-path tests via vi.doMock
+- Added PostgresFullTextSearchProvider's untested flags/before/after candidate filters
+- Added BaseKeyVaultRoute's five MAX_*_EXCEEDED validation tests
+- Added BaseSearchRoute's candidates() guard clause, requireCallerMailboxUid()'s !user guard, and before/after date-parsing tests
+- Added verified-domain-on-rename tests for BaseMailboxRoute/BaseDistributionListRoute, and 404 tests for BaseEscrowScopeRoute's update()/delete()
+- Added MailboxRouteSQL's %/_/\ ACL-role escaping test, a real wildcard-injection correctness check
+- Added OpenBaoPkiCertificateAuthority's serialMapQueue self-recovery test after a write failure
+- Added EscrowAuditUtils's broken-previousHash chain-detection test, distinct from a per-entry hash mismatch
+- Added BaseMessageRoute.archive()'s missing guard-clause test
+- Added SearchIndexJob's answered/forwarded flag coverage
+- Added BaseDomainRoute's best-effort DKIM-backfill-failure test
+- Added Legal Hold enforcement, extending Matter (compliance roadmap Group A)
+- Added util/LegalHoldUtils.ts's findActiveHoldsFor()/assertNotOnLegalHold() - an open Matter's custodianMailboxUids/dateRangeStart/dateRangeEnd/closedAt already describe a litigation hold, just not wired to block anything until now
+- Added BaseScopedChildRoute.checkLegalHold() hook (no-op default, purge-only) so a permanent delete of a held record is blocked while an ordinary soft-delete stays unaffected
+- Added BaseMailboxRoute's first delete() override (Mailbox has no soft-delete of its own) blocking a whole-mailbox delete against any open hold regardless of date range
+- Added AuditAction.LEGAL_HOLD_BLOCKED_DELETE, recorded whenever a hold actually blocks a destructive attempt
+- Added util/AuditLogUtils.isNonOwnerAccess() - true when the caller isn't the mailbox's own owner (an admin reaching in via a trusted-role grant, or a delegate), the one signal distinguishing a compliance-relevant access from a user's own ordinary, unaudited activity
+- Added AuditAction.MESSAGE_CONTENT_ACCESSED, recorded on GET /messages/:id/content only for a non-owner read
+- Added AuditAction.MAILBOX_ACCESSED via a new BaseMailboxRoute.findById() override, recorded only for a non-owner mailbox profile view
+- Added configurable data-retention engine, legal-hold-aware (compliance roadmap Group C)
+- Added RetentionPolicy singleton settings entity + BaseRetentionPolicyRoute, modeled directly on BaseEncryptionPolicyRoute/BaseBrandingRoute - GET open to any authenticated user, PUT trusted-role-only, every field unset by default (no automatic purge configured until an admin opts in)
+- Added MIN_AUDIT_LOG_RETENTION_DAYS floor (2190 days / 6 years) - auditLogRetentionDays cannot be configured below it, approximating HIPAA's typical audit-trail retention expectation
+- Added RetentionEnforcementJob (cron, mirrors QuarantineRetentionJob's single-page-per-run shape) enforcing messageRetentionDays/auditLogRetentionDays - a Message purge checks LegalHoldUtils.assertNotOnLegalHold() first and skips (not errors) a held record, naturally retried once its Matter closes
+- Added GDPR data export (JSON + Mbox), self-service and admin-mediated (compliance roadmap Group D1)
+- Added DataExportRequest entity + BaseDataExportRoute (bespoke, same shape as BaseEscrowAccessRequestRoute) - create() is both the self-service and admin-mediated endpoint, mirroring BaseMailboxRoute.create()'s "trusted caller may act for someone else, an ordinary caller's own identity always wins" idiom for mailboxUid
+- Added util/MboxUtils.ts's buildMboxEntry()/parseMbox() - a real, interoperable mailbox export (Thunderbird/Apple Mail/Gmail Takeout all read it), hand-rolled since Mbox is a simple documented text format needing no dependency
+- Added DataExportJob (cron) building either format: mbox concatenates each Message.bodyBlobKey's raw source; json aggregates every entity type that denormalizes mailboxUid (Mailbox/Message/Contact/ContactList/CalendarEvent/Task/Note/Attachment) as newline-delimited JSON
+- Added mailbox import (Mbox + PST): Group D2
+- Added GDPR right-to-erasure workflow: Group E
+- Added eDiscovery enhancements (Matter export + search): Group F
+- Added Unreleased section to RELEASE_NOTES.md
+
+### Changed
+- Wire APPLY_LABEL label application into ScanQueueJob's delivery and copy paths
+- Document label: operator in specs/search.md
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Support custom endpoint and forcePathStyle for MinIO/R2/Spaces targets
+- Support an optional key prefix for sharing one bucket across environments
+- Support an explicit access key pair, falling back to the standard AWS credential chain
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Block archiving a message currently in Drafts or Outbox
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Guard the escrow-scope-assignment check against a harmless round-tripped SQL null
+- Wire resolveAllowEscrow() into enrollKey()/addMasterKeyWrap(), leaving rekey() unchanged by design
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Block deleting an EscrowScope while a Matter still references it
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Restrict chain verification to a trusted admin, since the chain is global across scopes
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Extract BaseKeyVaultRoute's certificate-parsing/identity-binding logic into util/CertificateInstallUtils.ts, shared by the manual install path and the new automated one
+- This completes the entire CASTLE/RFC 8823 automated signing-certificate enrollment feature (item 4 of the 4-item batch).
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Close the pre-existing coverage gap (100%/96.31%/100%/100% stmt/branch/fn/line)
+- Mark 6 genuinely untestable/tool-quirk branches with justified /* v8 ignore */ comments (LocalX509CertificateAuthority and Rfc8823AcmeSigningCertificateEnrollment's TOCTOU retries, BaseMatterRoute/BaseEscrowScopeRoute's framework-shadowed name validation, S3BlobStore's v8-coverage-provider statement/branch miscount, MeetingSchedulingJob's query-shadowed status recheck)
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Override checkLegalHold() on BaseMessageRoute against its own mailboxUid/sentDate - the one entity a Matter's custodian list actually protects
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Audit non-owner access to mailbox content/profile (compliance roadmap Group B)
+- An owner reading their own inbox/profile - the overwhelming majority of traffic - stays deliberately unaudited, matching this repo's existing audit-scope boundary
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Deliberately does NOT apply retention to EscrowAuditLogEntry - it's a hash-chained tamper-evident ledger where deleting any entry would break verifyEscrowAuditChain() for everything after it; permanent retention is by design, not an oversight
+- Records one AuditAction.RETENTION_PURGE_EXECUTED summary entry per entity type per run (count, not one per record) to avoid flooding the audit trail
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Deliberately does NOT offer PST export - confirmed via research that no free/open Node library can write valid PST bytes, only paid SDKs; Mbox already satisfies the portability need without a new paid dependency
+- GET /:id/download streams the finished bundle directly (BlobStore-backed), gated to the requester, the target mailbox's owner, or a trusted admin
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- MailboxImportRequest entity + BaseMailboxImportRoute (self/admin-mediated
+- upload via req.rawBody, mirrors BaseDataExportRoute's create() idiom) and
+- MailboxImportJob, completing the GDPR portability pair started by D1's export.
+- Mbox import reuses D1's parseMbox(); PST import adds the free pst-extractor
+- dependency and a new util/PstImportUtils.ts that reconstructs each PST mail
+- item into a raw RFC 5322 buffer via nodemailer's MimeNode, so both formats
+- feed the same ScanPipeline-based persistence step in MailboxImportJob (deliberately
+- not ScanQueueJob.deliverMessage(), which is entangled with live-mail-only
+- concerns). An infected attachment or message causes the whole item to be
+- skipped and counted in failedCount, never partially imported.
+- silently drops the From header for a non-address-shaped sender (common in
+- older PST data), now synthesized into a valid address; and an optimistic-lock
+- version mismatch that left a request stuck at "processing" forever if work
+- failed after that status transition.
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- DataSubjectErasureRequest + BaseDataSubjectErasureRequestRoute implements the
+- create/approve/deny review workflow (mirrors BaseEscrowAccessRequestRoute's
+- shape). create() is self-service only (no admin-on-behalf-of path, unlike the
+- export/import routes) and rejects a duplicate pending request for the same
+- mailbox. approve() checks LegalHoldUtils.assertNotOnLegalHold() synchronously
+- (409 if held) and only transitions status to "approved" - the actual cascade
+- is performed asynchronously by ErasureExecutionJob so a large mailbox can't
+- time out the admin's request, the same instant-transition/async-job split
+- already used for export and import.
+- ErasureExecutionJob re-checks the legal hold immediately before cascading
+- (skip and retry later if a hold appeared in the interim), then purges every
+- mailboxUid-scoped entity plus Folder and the Mailbox row itself, explicitly
+- deleting each row's own BlobStore content (message bodies, attachment blobs,
+- contact photos) so no orphaned bytes survive the erasure. Every row purge is
+- best-effort - one failure doesn't abort the rest of the cascade.
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Group F closes the two remaining eDiscovery gaps beyond what Escrow Scoping
+- already shipped, completing the HIPAA/GDPR/eDiscovery compliance roadmap
+- (Groups A-F).
+- MatterExportRequest + BaseMatterExportRequestRoute lets any holder of a
+- Matter's EscrowScope (no dual-control approval needed, unlike
+- EscrowAccessRequest - exporting at-rest content is a different risk than
+- releasing key material) trigger an eDiscovery export spanning every
+- custodian mailbox. MatterExportJob reuses DataExportJob's own aggregation
+- step, now genuinely extracted into util/MailboxContentUtils.ts so both share
+- it, narrowing only Message rows to the matter's date range. Each custodian
+- mailbox actually exported is logged as its own hash-chained
+- EscrowAuditLogEntry.
+- BaseMatterSearchRoute adds holder-only full-text search across a Matter's
+- custodian mailboxes, reusing the existing SearchProvider unchanged (one call
+- per mailbox, keyed results, no merged cross-mailbox cursor invented) and
+- always clamping before/after to the matter's own date range so a holder can
+- never search outside the litigation hold's defined scope.
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Two parallel adversarial agents (correctness/concurrency, security/perf)
+- reviewed the full A-F diff; every finding was independently re-verified
+- against source before fixing.
+- - MboxUtils: parseMbox() truncated the last byte of every non-final
+- message on round-trip, not just the last one.
+- - MailboxImportJob: imported mail was stamped with import time instead
+- of its real Date: header, silently breaking Legal Hold and Matter
+- date-range narrowing for historical mail.
+- - ErasureExecutionJob: cascade missed 13 of 25 mailboxUid-scoped entity
+- types; added a final legal-hold re-check before the mailbox's own
+- delete to close a TOCTOU window.
+- - MailboxContentUtils/DataExportJob/MatterExportJob: unbounded
+- in-memory aggregation now capped via a configurable max_content_rows.
+- - PstImportUtils: Buffer.alloc(attachment.filesize) trusted an
+- unverified PST property; now bounded against the PST file's own size.
+- - MatterExportJob/BaseMatterSearchRoute: any escrow holder could list
+- an arbitrary mailbox as a matter "custodian" and read/search its full
+- content, bypassing the dual-control EscrowAccessRequest workflow -
+- now requires the mailbox's own escrowScopeId to match the matter's,
+- mirroring the check BaseEscrowAccessRequestRoute already enforced.
+- Full suite: 205/205 files, 3237/3237 tests, 100%/96.37%/100%/100%.
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Same two-agent methodology (correctness/concurrency, security/perf)
+- run again after committing round one's fixes (1d4f713).
+- - BaseScopedChildRoute/BaseMailboxRoute: Legal Hold was only wired
+- into the singular delete() path under purge:true. The inherited
+- bulk truncate() endpoint (DELETE /messages?folderUid=X, DELETE
+- /mailboxes) is unconditionally a hard, permanent delete with no
+- purge option at all, and had no hold check - a caller could destroy
+- held records simply by using the bulk endpoint instead. Fixed by
+- having truncate() check every matched record before deleting.
+- - BaseMatterRoute: updateBulk/updateProperty/truncate were left
+- un-overridden and fell through to the framework's generic ACL,
+- which unconditionally grants any trusted-role (admin) caller access
+- before consulting a record ACL - bypassing the holder-only
+- separation-of-duties model this class exists to enforce, including
+- truncate()'s ability to wipe every Matter (and thus every active
+- legal hold) in one call. Fixed by overriding all three.
+- - ErasureExecutionJob.markCompleted() refetched the request row
+- immediately before its final update(), defeating its own optimistic
+- lock against two job instances racing on the same request. Fixed by
+- using the originally-fetched version, matching its sibling jobs.
+- - MatterExportJob recorded a hash-chained escrow audit entry per
+- mailbox inside the collection loop, before the export bundle was
+- written/marked ready - a later custodian's failure left an earlier
+- mailbox's entry permanently attesting to an export that never
+- completed. Fixed by recording entries only after the bundle is
+- ready. Applied the same escrowScopeId-match check (from round one)
+- to BaseMatterExportRequestRoute.create()'s own audit loop.
+- - RetentionEnforcementJob.purgeExpiredAuditLogEntries() had no
+- legal-hold check, unlike its sibling purgeExpiredMessages() - a
+- years-old investigation's own audit trail could be purged out from
+- under it. Fixed with the identical per-entry hold check.
+- - BaseDataExportRoute/BaseMailboxImportRoute find() only checked
+- requestedByUserUid, so an admin-mediated request was invisible to
+- the actual mailbox owner it was made for. Fixed to also include
+- requests for mailboxes the caller owns.
+- Full suite: 205/205 files, 3288/3288 tests, 100%/96.33%/100%/100%.
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Round two's security agent had already named exists() alongside
+- updateBulk/updateProperty/truncate as left un-overridden and thus
+- falling through to the framework's generic ACL - I only fixed the
+- other three. RepoUtils.exists() checks Matter's class-level ACL
+- (deny-all, since holder-ness lives in EscrowScope.holderUserUids,
+- not an ACL record) before any per-record check, and unconditionally
+- bypasses that for a trusted role - letting a non-holder admin probe
+- arbitrary matter uids for existence via HEAD /matters/:id.
+- Mirrors findById()'s own holder check, translated into
+- BaseScopedChildRoute.exists()'s found/not-found response shape
+- (404 either way, so a non-holder can't distinguish "doesn't exist"
+- from "exists, not yours").
+- Full suite: 205/205 files, 3291/3291 tests, 100%/96.33%/100%/100%.
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Same two-agent methodology, run again at the user's request after two
+- prior rounds (1d4f713, 678b945, 723da84). Found real bugs even after
+- an exhaustive per-method authorization sweep confirmed the "un-overridden
+- CRUD method" bug class was otherwise closed:
+- - BaseScopedChildRoute/BaseMatterRoute/BaseMailboxRoute: truncate()'s
+- own round-2 fix checked a snapshot of matched records for legal-hold/
+- reference violations, but then let the actual delete re-run the
+- ORIGINAL query live via RepoUtils.truncate() - which re-executes its
+- own search independently of that snapshot. A record matching the same
+- filter that starts existing in the gap between the snapshot and the
+- delete (e.g. mail delivered mid-request) would be deleted having
+- never been checked at all. Fixed by re-scoping the actual delete to
+- exactly the snapshotted/checked uids in all three copies.
+- - RetentionEnforcementJob purged expired Messages but never their
+- Attachment rows or either entity's own BlobStore content - PHI/PII a
+- RetentionPolicy represents as deleted stayed fully stored and
+- independently downloadable indefinitely, since Attachment has no
+- DB-level cascade from Message (the same reason ErasureExecutionJob
+- already treats this as an explicit step). Fixed with the identical
+- cleanup that job already established.
+- - MatterExportJob could get stuck at "ready" with a silently incomplete
+- escrow audit trail: recordEscrowAuditEntry() genuinely throws after
+- exhausting its own retry budget under real sequence contention, and
+- that throw reached markFailed(), which tried to write a stale
+- pre-"ready" version and failed silently - leaving an already-disclosed
+- export with a permanently incomplete hash-chained ledger and no path
+- to retry. Fixed by making the per-mailbox audit-recording loop
+- best-effort (log loudly, continue) instead of re-entering the
+- request's own state machine.
+- - BaseDataSubjectErasureRequestRoute.create()'s pending-request check
+- is a genuine TOCTOU (no transaction, and this codebase has no
+- existing partial-unique-index precedent that wouldn't also block a
+- legitimate resubmission after an earlier denial). Mitigated (narrowed,
+- documented as not fully eliminated) via a post-create race check that
+- auto-supersedes the losing side instead of leaving two pending rows.
+- Full suite: 206/206 files, 3309/3309 tests, 100%/96.34%/100%/100%.
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Fourth adversarial review round found and fixed:
+- - LegalHoldUtils.findActiveHoldsFor() used a bare, unpaginated find() that
+- silently truncates at the framework's 100-row default (confirmed against
+- RepoUtils.js source) - once the global Matter table exceeds that count,
+- assertNotOnLegalHold() (the choke point every irreversible-purge path
+- depends on) could miss a real, active hold. Fixed with the same
+- findAllPages()-style pagination already used elsewhere in this codebase.
+- - Message/Attachment/Contact/CalendarEvent/Task/Note all let a client set an
+- independent, unverified mailboxUid via create()/update(), completely
+- divorced from the record's real folderUid-derived mailbox - none of these
+- entities' scopeProperty is mailboxUid, so the existing re-parent permission
+- check never fired on it. Every compliance job this roadmap shipped trusts
+- mailboxUid as authoritative (ErasureExecutionJob, RetentionEnforcementJob,
+- LegalHoldUtils), so this let a record silently evade or be wrongly swept
+- into an erasure/retention-purge/legal-hold scoped to a mailbox it was never
+- really in. Fixed at the root: BaseScopedChildRoute.resolveMailboxUidFor()
+- now force-resolves mailboxUid from the actual target folder on every
+- affected route, via a new util/FolderUtils.getMailboxUidForFolder() helper.
+- - DataExportJob had no claim/processing state (unlike its sibling
+- MailboxImportJob), so two overlapping runs could both build a bundle and
+- race a non-transactional BlobStore.put() under the same deterministic key.
+- - BaseMessageRoute.content() skipped its non-owner-access audit entirely
+- when the message's mailbox couldn't be resolved (a dangling mailboxUid,
+- e.g. after a mailbox delete with no cascade), even though content was
+- still served. Fixed to audit defensively on unresolved ownership.
+- - MailboxImportJob's folder-counter bump shared a try/catch with message
+- persistence and the final "completed" write, so a benign version conflict
+- there reported a fully-successful import as failed, inviting a duplicate
+- re-run. Isolated it into its own try/catch.
+- - MboxUtils.buildMboxEntry() interpolated fromAddress into the mbox
+- separator line unsanitized, allowing an embedded CR/LF to inject a fake
+- From separator and corrupt later re-parsing. Stripped CR/LF, matching the
+- existing sanitizeFilename() convention.
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+### Fixed
+- Fixed two bugs surfaced by testing against a real PST fixture: MimeNode
+- Fixed bugs found in adversarial review of compliance roadmap (Groups A-F)
+- Fixed bugs found in second adversarial review round
+- Fixed BaseMatterRoute.exists() bypassing separation of duties
+- Fixed bugs found in third adversarial review round
+- Fixed legal-hold pagination, mailboxUid integrity, and export/import races (round 4 adversarial review)
+- Fixed with the same claim-then-work pattern MailboxImportJob already uses.
+
 ## [0.6.0] - 2026-09-11
 
 ### Added
@@ -352,7 +671,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/RapidMX/restapi/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/RapidMX/restapi/compare/v0.4.0...v0.6.0
 [0.4.0]: https://github.com/RapidMX/restapi/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/RapidMX/restapi/compare/v0.3.0...v0.3.1
