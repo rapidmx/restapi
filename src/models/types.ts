@@ -1253,6 +1253,15 @@ export enum AuditAction {
      * would otherwise have destroyed in-scope data - see `util/LegalHoldUtils.ts`. A blocked destructive
      * attempt is itself compliance-relevant signal, not just a 409 the caller sees. */
     LEGAL_HOLD_BLOCKED_DELETE = "legal_hold.blocked_delete",
+    /** Recorded on `GET /messages/:id/content` ONLY when the caller isn't the message's own mailbox
+     * owner (see `util/AuditLogUtils.ts`'s `isNonOwnerAccess()`) - an admin or a delegate reading someone
+     * else's mail content. An owner reading their own inbox is the overwhelming majority of traffic
+     * through this endpoint and is deliberately never audited - this repo's audit trail is scoped to
+     * admin/policy actions and sensitive non-owner access, not a user's own ordinary activity. */
+    MESSAGE_CONTENT_ACCESSED = "message.content_accessed",
+    /** Recorded on `GET /mailboxes/:id` ONLY when the caller isn't the mailbox's own owner - same
+     * reasoning as `MESSAGE_CONTENT_ACCESSED` above, applied to viewing a mailbox's own profile. */
+    MAILBOX_ACCESSED = "mailbox.accessed",
 }
 
 /**

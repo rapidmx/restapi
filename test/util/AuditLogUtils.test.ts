@@ -9,7 +9,7 @@
 // its own doc comment) - shared across every call in this process, not reset between tests. Each test
 // below therefore declares its own fresh, locally-scoped stub class rather than a single shared one, so
 // no test's cache entry can leak into (and mask a missing `newInstance()` call in) another.
-import { recordAuditLog } from "../../src/util/AuditLogUtils.js";
+import { isNonOwnerAccess, recordAuditLog } from "../../src/util/AuditLogUtils.js";
 import { AuditAction } from "../../src/models/types.js";
 
 function makeStubClass(): any {
@@ -122,5 +122,25 @@ describe("recordAuditLog() Tests", () => {
 
         expect(objectFactory.newInstance).toHaveBeenCalledTimes(1);
         expect(repo.create).toHaveBeenCalledTimes(2);
+    });
+});
+
+describe("isNonOwnerAccess() Tests", () => {
+    it("Returns false for the mailbox's own owner.", () => {
+        const mailbox: any = { ownerUserUid: "user-1" };
+
+        expect(isNonOwnerAccess(mailbox, { uid: "user-1" } as any)).toBe(false);
+    });
+
+    it("Returns true for a different authenticated user.", () => {
+        const mailbox: any = { ownerUserUid: "user-1" };
+
+        expect(isNonOwnerAccess(mailbox, { uid: "user-2" } as any)).toBe(true);
+    });
+
+    it("Returns true when no user is given at all.", () => {
+        const mailbox: any = { ownerUserUid: "user-1" };
+
+        expect(isNonOwnerAccess(mailbox, undefined)).toBe(true);
     });
 });

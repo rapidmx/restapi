@@ -213,6 +213,32 @@ describe("Route:MailboxSQL Tests", () => {
         expect(result.status).toBe(403);
     });
 
+    it("Does not audit an owner reading their own mailbox profile.", async () => {
+        const obj = await createMailboxSQL();
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(200);
+        const entries = await auditLogRepo.find({ where: { targetUid: obj.uid } });
+        expect(entries.some((e) => e.action === AuditAction.MAILBOX_ACCESSED)).toBe(false);
+    });
+
+    it("Audits a trusted admin reading another user's mailbox profile.", async () => {
+        const obj = await createMailboxSQL();
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+
+        expect(result.status).toBe(200);
+        const entries = await auditLogRepo.find({ where: { targetUid: obj.uid } });
+        expect(entries.length).toBe(1);
+        expect(entries[0].action).toBe(AuditAction.MAILBOX_ACCESSED);
+        expect(entries[0].actorUserUid).toBe(admin.uid);
+    });
+
     it("A different authenticated user's list of mailboxes does not include another user's mailbox.", async () => {
         await createMailboxSQL({ displayName: "Owner's mailbox" });
         await createMailboxSQL({ displayName: "Other user's mailbox" }, otherUser.uid);

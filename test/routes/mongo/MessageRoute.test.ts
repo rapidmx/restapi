@@ -50,6 +50,8 @@ describe("Route:MessageMongo Tests", () => {
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
     const otherUser: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const otherUserToken = JWTUtils.createTokenSync(config.get("auth"), otherUser);
+    const admin: any = { uid: uuid.v4(), roles: ["admin"], elevated: Date.now() };
+    const adminToken = JWTUtils.createTokenSync(config.get("auth"), admin);
 
     const createMailbox = async function (ownerUid: string): Promise<MailboxMongo> {
         const obj: MailboxMongo = new MailboxMongo({
@@ -882,6 +884,37 @@ describe("Route:MessageMongo Tests", () => {
             .set("Authorization", "jwt " + ownerToken);
 
         expect(result.status).toBe(404);
+    });
+
+    it("Does not audit an owner reading their own message content.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+        const message = await createMessage(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${message.uid}/content`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(200);
+        const entries = await auditLogRepo.find({ targetUid: message.uid }).toArray();
+        expect(entries.some((e) => e.action === AuditAction.MESSAGE_CONTENT_ACCESSED)).toBe(false);
+    });
+
+    it("Audits a trusted admin reading a message's content in another user's mailbox.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+        const message = await createMessage(mailbox.uid, folder.uid, { subject: "Confidential" });
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${message.uid}/content`)
+            .set("Authorization", "jwt " + adminToken);
+
+        expect(result.status).toBe(200);
+        const entries = await auditLogRepo.find({ targetUid: message.uid }).toArray();
+        expect(entries.length).toBe(1);
+        expect(entries[0].action).toBe(AuditAction.MESSAGE_CONTENT_ACCESSED);
+        expect(entries[0].mailboxUid).toBe(mailbox.uid);
+        expect(entries[0].actorUserUid).toBe(admin.uid);
     });
 
     it("Owner can list messages in a folder they have access to.", async () => {

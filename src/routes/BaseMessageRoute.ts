@@ -19,7 +19,7 @@ import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
@@ -944,6 +944,22 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
         if (!message || !(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.READ))) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+
+        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
+        if (mailbox && isNonOwnerAccess(mailbox, user)) {
+            await recordAuditLog(
+                this._objectFactory!,
+                this.auditLogClass,
+                { config: this.config, user, logger: this.logger },
+                {
+                    action: AuditAction.MESSAGE_CONTENT_ACCESSED,
+                    targetType: "Message",
+                    targetUid: message.uid,
+                    mailboxUid: message.mailboxUid,
+                    details: { subject: message.subject },
+                },
+            );
         }
 
         if (message.sanitizedHtmlBlobKey) {

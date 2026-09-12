@@ -4,7 +4,20 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { Event, EventUtils, type JWTUser, type ObjectFactory } from "@rapidrest/core";
 import { HttpRequest, NetUtils, RepoUtils } from "@rapidrest/service-core";
-import { AuditAction } from "../models/types.js";
+import { AuditAction, Mailbox } from "../models/types.js";
+
+/**
+ * `true` when `user` is reading `mailbox`'s content as someone other than its own owner - an admin
+ * reaching in via a trusted-role grant, or a delegate reading mail shared with them. This is the one
+ * signal that distinguishes "a compliance-relevant access to someone else's mail" from the ordinary,
+ * unaudited case of a user reading their own inbox - see `AuditAction.MESSAGE_CONTENT_ACCESSED`'s/
+ * `MAILBOX_ACCESSED`'s own doc comments for where this gates a new audit entry. An unauthenticated
+ * caller never reaches this check in practice (the read itself would already have been denied by ACL),
+ * but is still treated as "non-owner" defensively rather than assumed to be the owner.
+ */
+export function isNonOwnerAccess(mailbox: Mailbox, user: JWTUser | undefined): boolean {
+    return !user || mailbox.ownerUserUid !== user.uid;
+}
 
 /** The caller-identifying context every `recordAuditLog()` call needs - the same fields `ModelRoute`'s own
  * `recordEvent` path (`node_modules/@rapidrest/service-core/dist/lib/routes/ModelRoute.js`) reads off a

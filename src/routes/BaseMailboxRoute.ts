@@ -16,7 +16,7 @@ import {
 } from "@rapidrest/service-core";
 import { AuditAction, DistributionList, EscrowScope, FolderType, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
 import { getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
@@ -718,6 +718,30 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         return permitted
             ? res.status(200).setHeader("content-length", 1)
             : res.status(404).setHeader("content-length", 0);
+    }
+
+    /**
+     * Wraps the inherited `CRUDRoute.findById()` (unchanged) with an `AuditLogEntry` when the caller
+     * isn't this mailbox's own owner - an admin or a delegate viewing someone else's mailbox profile. See
+     * `util/AuditLogUtils.ts`'s `isNonOwnerAccess()`.
+     */
+    @Get("/:id")
+    public async findById(@Param("id") id: string, @Query() query: any, @AuthUser user?: JWTUser): Promise<T | null> {
+        const result: T | null = await super.findById(id, query, user);
+        if (result && isNonOwnerAccess(result, user)) {
+            await recordAuditLog(
+                this._objectFactory!,
+                this.auditLogClass,
+                { config: this.config, user, logger: this.logger },
+                {
+                    action: AuditAction.MAILBOX_ACCESSED,
+                    targetType: "Mailbox",
+                    targetUid: result.uid,
+                    details: { primarySmtpAddress: result.primarySmtpAddress },
+                },
+            );
+        }
+        return result;
     }
 
     /**
