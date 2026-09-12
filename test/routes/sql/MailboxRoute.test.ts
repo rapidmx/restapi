@@ -20,6 +20,7 @@ import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { DistributionListSQL } from "../../../src/models/sql/DistributionListSQL.js";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { computeKeyDiscoveryHash } from "../../../src/util/KeyDiscoveryClient.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
@@ -34,6 +35,7 @@ describe("Route:MailboxSQL Tests", () => {
     let distributionListRepo: Repository<DistributionListSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
     let domainRepo: Repository<DomainSQL>;
+    let matterRepo: Repository<MatterSQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -84,6 +86,18 @@ describe("Route:MailboxSQL Tests", () => {
         return result;
     };
 
+    const createMatter = async function (data?: any): Promise<MatterSQL> {
+        const obj: MatterSQL = new MatterSQL({
+            name: "Test Matter",
+            escrowScopeId: uuid.v4(),
+            custodianMailboxUids: [],
+            dateRangeStart: new Date("2020-01-01"),
+            dateRangeEnd: new Date("2030-01-01"),
+            ...data,
+        });
+        return await matterRepo.save(obj);
+    };
+
     // dateCreated, dateModified, uid and version are assigned by the server. `_id` never applies to a SQL
     // model but is harmless to keep excluded for parity with the Mongo original.
     // `keyDiscoveryHash` is derived from `primarySmtpAddress` by `BaseMailboxRoute.create()`, the same way
@@ -124,6 +138,7 @@ describe("Route:MailboxSQL Tests", () => {
             distributionListRepo = conn.getRepository(DistributionListSQL);
             auditLogRepo = conn.getRepository(AuditLogEntrySQL);
             domainRepo = conn.getRepository(DomainSQL);
+            matterRepo = conn.getRepository(MatterSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -139,6 +154,7 @@ describe("Route:MailboxSQL Tests", () => {
         await distributionListRepo.clear();
         await auditLogRepo.clear();
         await domainRepo.clear();
+        await matterRepo.clear();
     });
 
     it("Listing mailboxes anonymously (no Authorization header) returns an empty list, not another user's data.", async () => {
@@ -447,6 +463,14 @@ describe("Route:MailboxSQL Tests", () => {
         expect(result.body.displayName).toBe("Renamed Via Property");
     });
 
+    it("Deleting a nonexistent mailbox returns 404.", async () => {
+        const result = await request(server.getApplication())
+            .delete(`${baseUrl}/${uuid.v4()}`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(404);
+    });
+
     it("Owner can delete their own mailbox.", async () => {
         const obj = await createMailboxSQL();
 
@@ -459,6 +483,48 @@ describe("Route:MailboxSQL Tests", () => {
 
         const existing: MailboxSQL | null = await repo.findOne({ where: { uid: obj.uid } });
         expect(existing).toBeNull();
+    });
+
+    describe("legal hold", () => {
+        it("Blocks deleting a mailbox under an open Matter's hold, auditing the block.", async () => {
+            const obj = await createMailboxSQL();
+            await createMatter({ custodianMailboxUids: [obj.uid] });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(409);
+            const stillExists: MailboxSQL | null = await repo.findOne({ where: { uid: obj.uid } });
+            expect(stillExists).toBeTruthy();
+
+            const entries = await auditLogRepo.find({ where: { targetUid: obj.uid } });
+            expect(entries.some((e) => e.action === AuditAction.LEGAL_HOLD_BLOCKED_DELETE)).toBe(true);
+        });
+
+        it("Allows deleting a mailbox once the matter is closed.", async () => {
+            const obj = await createMailboxSQL();
+            await createMatter({ custodianMailboxUids: [obj.uid], closedAt: new Date() });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+        });
+
+        it("Allows deleting a mailbox not named as a custodian on any open matter.", async () => {
+            const obj = await createMailboxSQL();
+            await createMatter({ custodianMailboxUids: [uuid.v4()] });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+        });
     });
 
     it("Can make a count request scoped to the caller's own mailboxes.", async () => {

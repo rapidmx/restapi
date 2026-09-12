@@ -95,6 +95,18 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * `this.notificationUtils` is inherited from `ModelRoute` (`@Inject(NotificationUtils)` there already) —
      * publishing is fire-and-forget (see `NotificationUtils.sendMessage()`) and never blocks or fails a request.
      */
+    /**
+     * Hook for a permanent (`purge: true`) delete to check whether `existing` is protected by an active
+     * legal hold (`util/LegalHoldUtils.ts`) before it's irrecoverably destroyed - throws a `409` if so. A
+     * no-op by default, so scoped-child entities uninvolved in eDiscovery (`Contact`/`Task`/`Note`/etc.)
+     * are unaffected; `BaseMessageRoute` is the one override today, since email is what a `Matter`'s
+     * `custodianMailboxUids` actually protects. An ordinary soft-delete never calls this - see `delete()`
+     * below.
+     */
+    protected async checkLegalHold(existing: T): Promise<void> {
+        // no-op by default
+    }
+
     private notify(scopeUid: string | undefined, action: "create" | "update" | "delete", data: any): void {
         /* v8 ignore else -- unreachable via real usage: every call site derives `scopeUid` from a record that
            already passed `requirePermission()` (which throws on a falsy scope) earlier in the same method, so
@@ -167,7 +179,11 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
         await this.requirePermission(this.scopeUidOf(existing), user, ACLAction.DELETE);
-        await this.repoUtils.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });
+        const purgeRequested: boolean = purge === "true";
+        if (purgeRequested) {
+            await this.checkLegalHold(existing);
+        }
+        await this.repoUtils.delete(existing.uid, { user, version, purge: purgeRequested, ignoreACL: true });
         this.notify(this.scopeUidOf(existing), "delete", { uid: existing.uid });
     }
 

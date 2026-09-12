@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
-import { AuditLogEntrySQL, DomainSQL, FocusedInboxOverrideSQL, FolderSQL, MailboxSQL, MessageSQL } from "../../sql.js";
+import { AuditLogEntrySQL, DomainSQL, FocusedInboxOverrideSQL, FolderSQL, MailboxSQL, MatterSQL, MessageSQL } from "../../sql.js";
 import { BaseMessageRoute } from "../BaseMessageRoute.js";
 import { RecoverableRepoUtils } from "../../util/RecoverableRepoUtils.js";
 const { Model } = RouteDecorators;
@@ -16,4 +16,5 @@ export class MessageRouteSQL extends BaseMessageRoute<MessageSQL> {
     protected focusedInboxOverrideClass: any = FocusedInboxOverrideSQL;
     protected mailboxClass: any = MailboxSQL;
     protected domainClass: any = DomainSQL;
+    protected matterClass: any = MatterSQL;
 }

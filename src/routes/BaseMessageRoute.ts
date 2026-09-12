@@ -22,6 +22,7 @@ import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
+import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { prependHeaders } from "../util/MimeHeaderUtils.js";
 import { buildRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
@@ -127,6 +128,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * request's recipient/requester without depending on either backend directly - same field
      * `ScanQueueJob`/`BaseMailIngestRoute` already carry for the identical purpose. */
     protected abstract domainClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so `checkLegalHold()` can resolve an active `Matter`
+     * without depending on either backend directly - see `util/LegalHoldUtils.ts`. */
+    protected abstract matterClass: any;
 
     private folderRepo?: RecoverableRepoUtils<any>;
 
@@ -855,11 +860,22 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         return { message, type };
     }
 
+    /** See `BaseScopedChildRoute.checkLegalHold()`'s own doc comment - `Message` is the one entity a
+     * `Matter`'s `custodianMailboxUids` actually protects, checked against its own denormalized
+     * `mailboxUid` and `sentDate` (the date a hold's `dateRangeStart`/`dateRangeEnd` is scoped by). */
+    protected async checkLegalHold(existing: T): Promise<void> {
+        await assertNotOnLegalHold(this._objectFactory!, this.matterClass, existing.mailboxUid, existing.sentDate);
+    }
+
     /**
      * Wraps the inherited `BaseScopedChildRoute.delete()` (soft/hard-delete, unchanged) with an
      * `AuditLogEntry` - Exchange's own Mailbox Audit Log flags message deletion as one of its two most
      * sensitive tracked mailbox-content actions (recall being the other, see `recall()` above). Fetches
      * the record first since `super.delete()` returns nothing to audit against once it's gone.
+     *
+     * Also audits a legal-hold-blocked purge attempt separately, before ever reaching `super.delete()`
+     * (which re-checks the same hold itself - the authoritative enforcement point either way; this
+     * earlier check exists only so the exact record attempted is available to audit).
      */
     @Delete("/:id")
     public async delete(
@@ -870,6 +886,26 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         @AuthUser user?: JWTUser,
     ): Promise<void> {
         const existing: T | undefined = this.repoUtils ? await this.repoUtils.findOne(id, { version, ignoreACL: true }) : undefined;
+
+        if (existing && purge === "true") {
+            try {
+                await this.checkLegalHold(existing);
+            } catch (err) {
+                await recordAuditLog(
+                    this._objectFactory!,
+                    this.auditLogClass,
+                    { config: this.config, req, user, logger: this.logger },
+                    {
+                        action: AuditAction.LEGAL_HOLD_BLOCKED_DELETE,
+                        targetType: "Message",
+                        targetUid: existing.uid,
+                        mailboxUid: existing.mailboxUid,
+                        details: { subject: existing.subject },
+                    },
+                );
+                throw err;
+            }
+        }
 
         await super.delete(id, version, purge, req, user);
 

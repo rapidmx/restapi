@@ -78,4 +78,12 @@ describe("BaseMailboxRoute Tests (repoUtils guard clauses only)", () => {
             /internal error/i,
         );
     });
+
+    it("delete() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
+        const route = objectFactory.newInstance<TestMailboxRoute>(TestMailboxRoute, { initialize: false });
+
+        await expect(route.delete("id-1", undefined, undefined, {} as any, { uid: "user-1" } as any)).rejects.toThrow(
+            /internal error/i,
+        );
+    });
 });

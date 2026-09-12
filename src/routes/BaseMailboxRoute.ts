@@ -20,8 +20,9 @@ import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
+import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-const { Auth, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
+const { Auth, Delete, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 const { Config } = ObjectDecorators;
 
 /** `Mailbox` fields that only server-side code may set - the CA-issued `keys` (`BaseKeyVaultRoute.enrollKey()`/
@@ -171,6 +172,10 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * `escrowScopeId` actually refers to an existing `EscrowScope` without depending on either backend
      * directly - see `util/AuditLogUtils.ts`-style lazy-repo pattern used throughout this file. */
     protected abstract escrowScopeClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so `delete()` can resolve an active `Matter` without
+     * depending on either backend directly - see `util/LegalHoldUtils.ts`. */
+    protected abstract matterClass: any;
 
     private folderRepo?: RecoverableRepoUtils<any>;
 
@@ -713,5 +718,48 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         return permitted
             ? res.status(200).setHeader("content-length", 1)
             : res.status(404).setHeader("content-length", 0);
+    }
+
+    /**
+     * Adds a legal-hold check ahead of the inherited `CRUDRoute.delete()` - `Mailbox` isn't a
+     * `RecoverableBaseEntity` (no soft-delete option exists for it at all, unlike `Message`/`Contact`/
+     * etc.), so every delete here is already an unconditional, irreversible removal; there is no
+     * "ordinary soft-delete stays unaffected" carve-out for this one entity the way
+     * `BaseScopedChildRoute.checkLegalHold()`'s own doc comment describes. Checked with no reference
+     * date - a whole-mailbox delete removes everything in it regardless of date, so it must be blocked by
+     * ANY open hold on the mailbox, not just one whose date range happens to be checked against a single
+     * record.
+     */
+    @Delete("/:id")
+    public async delete(
+        @Param("id") id: string,
+        @Query("version") version: string | undefined,
+        @Query("purge") purge: string | undefined,
+        @Request req: HttpRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<void> {
+        if (!this.repoUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const existing: T | undefined = await this.repoUtils.findOne(id, { version, ignoreACL: true });
+        if (existing) {
+            try {
+                await assertNotOnLegalHold(this._objectFactory!, this.matterClass, existing.uid);
+            } catch (err) {
+                await recordAuditLog(
+                    this._objectFactory!,
+                    this.auditLogClass,
+                    { config: this.config, req, user, logger: this.logger },
+                    {
+                        action: AuditAction.LEGAL_HOLD_BLOCKED_DELETE,
+                        targetType: "Mailbox",
+                        targetUid: existing.uid,
+                        details: { primarySmtpAddress: existing.primarySmtpAddress },
+                    },
+                );
+                throw err;
+            }
+        }
+        await super.delete(id, version, purge, req, user);
     }
 }

@@ -19,6 +19,7 @@ import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { FocusedInboxOverrideSQL } from "../../../src/models/sql/FocusedInboxOverrideSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
+import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
 import {
     AuditAction,
@@ -42,6 +43,7 @@ describe("Route:MessageSQL Tests", () => {
     let auditLogRepo: Repository<AuditLogEntrySQL>;
     let overrideRepo: Repository<FocusedInboxOverrideSQL>;
     let domainRepo: Repository<DomainSQL>;
+    let matterRepo: Repository<MatterSQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -112,6 +114,18 @@ describe("Route:MessageSQL Tests", () => {
         return await messageRepo.save(obj);
     };
 
+    const createMatter = async function (data?: any): Promise<MatterSQL> {
+        const obj: MatterSQL = new MatterSQL({
+            name: "Test Matter",
+            escrowScopeId: uuid.v4(),
+            custodianMailboxUids: [],
+            dateRangeStart: new Date("2020-01-01"),
+            dateRangeEnd: new Date("2030-01-01"),
+            ...data,
+        });
+        return await matterRepo.save(obj);
+    };
+
     beforeAll(async () => {
         registerTestDoubles(objectFactory);
         await server.start();
@@ -131,6 +145,7 @@ describe("Route:MessageSQL Tests", () => {
             auditLogRepo = conn.getRepository(AuditLogEntrySQL);
             overrideRepo = conn.getRepository(FocusedInboxOverrideSQL);
             domainRepo = conn.getRepository(DomainSQL);
+            matterRepo = conn.getRepository(MatterSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -148,6 +163,7 @@ describe("Route:MessageSQL Tests", () => {
         await auditLogRepo.clear();
         await overrideRepo.clear();
         await domainRepo.clear();
+        await matterRepo.clear();
         // The recording transport accumulates across tests otherwise, since it's a singleton for the life of
         // this file's one `server` instance.
         const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport");
@@ -790,6 +806,75 @@ describe("Route:MessageSQL Tests", () => {
         expect(entries[0].targetType).toBe("Message");
         expect(entries[0].mailboxUid).toBe(mailbox.uid);
         expect(entries[0].actorUserUid).toBe(owner.uid);
+    });
+
+    describe("legal hold", () => {
+        it("Blocks a permanent (purge) delete of a message under an open Matter's hold, auditing the block.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, { sentDate: new Date("2025-06-01") });
+            await createMatter({ custodianMailboxUids: [mailbox.uid] });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${message.uid}?purge=true`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(409);
+            const stillExists = await messageRepo.findOne({ where: { uid: message.uid } });
+            expect(stillExists).toBeTruthy();
+
+            const entries = await auditLogRepo.find({ where: { targetUid: message.uid } });
+            expect(entries.some((e) => e.action === AuditAction.LEGAL_HOLD_BLOCKED_DELETE)).toBe(true);
+        });
+
+        it("Allows an ordinary (non-purge) delete of a message under an open hold - only permanent destruction is blocked.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, { sentDate: new Date("2025-06-01") });
+            await createMatter({ custodianMailboxUids: [mailbox.uid] });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            // The row is still present (a raw TypeORM query sees it regardless of the `deleted` flag),
+            // but is now marked soft-deleted rather than gone - the hold blocks permanent loss, not this.
+            const stillPresent = await messageRepo.findOne({ where: { uid: message.uid } });
+            expect(stillPresent).toBeTruthy();
+            expect(stillPresent!.deleted).toBe(true);
+        });
+
+        it("Allows a purge outside the hold's date range.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, { sentDate: new Date("2010-01-01") });
+            await createMatter({ custodianMailboxUids: [mailbox.uid], dateRangeStart: new Date("2020-01-01"), dateRangeEnd: new Date("2030-01-01") });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${message.uid}?purge=true`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            const stillExists = await messageRepo.findOne({ where: { uid: message.uid } });
+            expect(stillExists).toBeFalsy();
+        });
+
+        it("Allows a purge once the matter is closed.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, { sentDate: new Date("2025-06-01") });
+            await createMatter({ custodianMailboxUids: [mailbox.uid], closedAt: new Date() });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${message.uid}?purge=true`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+        });
     });
 
     describe("classify()", () => {

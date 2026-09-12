@@ -1249,6 +1249,10 @@ export enum AuditAction {
     MATTER_CLOSE = "matter.close",
     MATTER_DELETE = "matter.delete",
     ESCROW_ACCESS_REQUEST_DENIED = "escrow_access_request.denied",
+    /** Recorded whenever an active `Matter` legal hold blocks a permanent (`purge: true`) delete that
+     * would otherwise have destroyed in-scope data - see `util/LegalHoldUtils.ts`. A blocked destructive
+     * attempt is itself compliance-relevant signal, not just a 409 the caller sees. */
+    LEGAL_HOLD_BLOCKED_DELETE = "legal_hold.blocked_delete",
 }
 
 /**
