@@ -281,6 +281,26 @@ describe("Route:TaskSQL Tests", () => {
         expect(result.status).toBe(403);
     });
 
+    // `ErasureExecutionJob` purges `Task` by `mailboxUid` directly - see
+    // `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment for why an independently
+    // client-writable `mailboxUid` would let a task silently escape a GDPR erasure scoped to a mailbox it
+    // was never really in.
+    it("Silently corrects a client-supplied mailboxUid on update() to the task's real folder's mailbox, rather than trusting it.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const task = await createTask(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${task.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: task.uid, version: task.version, mailboxUid: "attacker-supplied-uid" });
+
+        expect(result.status).toBe(200);
+        expect(result.body.mailboxUid).toBe(mailbox.uid);
+        const persisted = await taskRepo.findOne({ where: { uid: task.uid } });
+        expect(persisted!.mailboxUid).toBe(mailbox.uid);
+    });
+
     it("Owner can delete a task they have access to.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid);

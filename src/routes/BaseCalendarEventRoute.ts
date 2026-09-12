@@ -14,6 +14,7 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
+import { getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { buildEventIcs } from "../util/IcsUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { Attendee, AttendeeResponseStatus, CalendarEvent, Mailbox } from "../models/types.js";
@@ -55,6 +56,10 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
 
     protected abstract mailboxClass: any;
 
+    /** The concrete `Folder` entity class, supplied by the Mongo/SQL concrete subclass - used only by
+     * `resolveMailboxUidFor()` below. */
+    protected abstract folderClass: any;
+
     private mailboxRepo?: RepoUtils<any>;
 
     @Inject("MailTransport")
@@ -68,6 +73,12 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             });
         }
         return this.mailboxRepo;
+    }
+
+    /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `CalendarEvent` carries its
+     * own denormalized `mailboxUid` that must never diverge from its actual folder's mailbox. */
+    protected async resolveMailboxUidFor(scopeUid: string): Promise<string | undefined> {
+        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid);
     }
 
     public async update(id: string, obj: UpdateObject<T>, req?: HttpRequest, user?: JWTUser): Promise<T> {

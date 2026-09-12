@@ -795,6 +795,25 @@ describe("Route:MessageSQL Tests", () => {
         expect(entries[0].actorUserUid).toBe(admin.uid);
     });
 
+    it("Audits content access defensively when the message's mailbox record can't be resolved (e.g. deleted with no cascade), rather than silently skipping the audit.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+        const message = await createMessage(mailbox.uid, folder.uid, { subject: "Orphaned" });
+        // The folder's own ACL (which still grants the owner READ) is independent of the Mailbox row - see
+        // the architecture note on Message.mailboxUid. Deleting just the row simulates a dangling
+        // mailboxUid without touching the ACL that still makes the message itself reachable.
+        await mailboxRepo.delete({ uid: mailbox.uid });
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${message.uid}/content`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(200);
+        const entries = await auditLogRepo.find({ where: { targetUid: message.uid } });
+        expect(entries.length).toBe(1);
+        expect(entries[0].action).toBe(AuditAction.MESSAGE_CONTENT_ACCESSED);
+    });
+
     it("Owner can list messages in a folder they have access to.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid, FolderType.INBOX);
@@ -938,6 +957,45 @@ describe("Route:MessageSQL Tests", () => {
             expect(result.status).toBeLessThan(300);
             const stillExists = await messageRepo.findOne({ where: { uid: message.uid } });
             expect(stillExists).toBeFalsy();
+        });
+    });
+
+    describe("mailboxUid integrity", () => {
+        // `RetentionEnforcementJob`/`ErasureExecutionJob`/`util/LegalHoldUtils.ts` all trust `Message.mailboxUid`
+        // as authoritative - if a client could set it independently of the message's real folder, a message
+        // could silently evade (or be wrongly swept into) a legal hold or GDPR erasure scoped to a mailbox it
+        // was never really in. See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment.
+        it("Silently corrects a client-supplied mailboxUid on update() to the message's real folder's mailbox, rather than trusting it.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid);
+            const otherMailbox = await createMailbox(owner.uid);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, mailboxUid: otherMailbox.uid });
+
+            expect(result.status).toBe(200);
+            expect(result.body.mailboxUid).toBe(mailbox.uid);
+            const persisted = await messageRepo.findOne({ where: { uid: message.uid } });
+            expect(persisted!.mailboxUid).toBe(mailbox.uid);
+        });
+
+        it("Sets mailboxUid to the DESTINATION folder's mailbox (not the client-supplied value) when a message is re-parented across folders.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid);
+            const destinationFolder = await createFolder(mailbox.uid, FolderType.ARCHIVE);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, folderUid: destinationFolder.uid, mailboxUid: "attacker-supplied-uid" });
+
+            expect(result.status).toBe(200);
+            expect(result.body.folderUid).toBe(destinationFolder.uid);
+            expect(result.body.mailboxUid).toBe(mailbox.uid);
         });
     });
 

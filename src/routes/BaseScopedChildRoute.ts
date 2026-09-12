@@ -111,6 +111,43 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         // no-op by default
     }
 
+    /**
+     * Hook resolving the authoritative `mailboxUid` for a record scoped to `scopeUid` (its `folderUid`) -
+     * a no-op (`undefined`) by default, which is already correct for every concrete entity whose
+     * `scopeProperty` IS `mailboxUid` (any change to it is already gated by the `newScopeUid` permission
+     * check in `update()` below, since it's exactly what that check compares) and for the one
+     * `folderUid`-scoped entity with no independent `mailboxUid` field at all (`CalendarShareLink`).
+     *
+     * Every OTHER `folderUid`-scoped entity also carries its own denormalized `mailboxUid`
+     * (`Message`/`Attachment`/`Contact`/`CalendarEvent`/`Task`/`Note` - see the architecture note on
+     * `Message.mailboxUid` in `models/types.ts`) and overrides this to resolve it from the actual target
+     * folder via `FolderUtils.getMailboxUidForFolder()`, so `create()`/`update()` below can force-set it
+     * rather than ever trusting a client-supplied value. Every compliance job that queries or purges by
+     * `mailboxUid` (`ErasureExecutionJob`, `RetentionEnforcementJob`, `util/LegalHoldUtils.ts`) treats that
+     * field as authoritative - leaving it independently client-writable would let a record silently escape
+     * (or be wrongly swept into) an erasure/retention-purge/legal-hold scoped to a mailbox it was never
+     * really in, simply by setting `mailboxUid` in a create/update body to something other than its real
+     * folder's mailbox.
+     */
+    protected async resolveMailboxUidFor(scopeUid: string): Promise<string | undefined> {
+        return undefined;
+    }
+
+    private async enforceMailboxUid(obj: any, scopeUid: string | undefined): Promise<void> {
+        /* v8 ignore if -- unreachable via real usage: both call sites (`create()`/`update()`) only reach
+           this method after their own `requirePermission()` call already threw on a falsy scope, so
+           `scopeUid` is always truthy by the time it gets here. The `string | undefined` parameter type
+           (matching `scopeUidOf()`'s own return type) is what requires this guard to typecheck, the same
+           reasoning `notify()`'s own identical guard above documents. */
+        if (scopeUid === undefined) {
+            return;
+        }
+        const mailboxUid: string | undefined = await this.resolveMailboxUidFor(scopeUid);
+        if (mailboxUid !== undefined) {
+            obj.mailboxUid = mailboxUid;
+        }
+    }
+
     private notify(scopeUid: string | undefined, action: "create" | "update" | "delete", data: any): void {
         /* v8 ignore else -- unreachable via real usage: every call site derives `scopeUid` from a record that
            already passed `requirePermission()` (which throws on a falsy scope) earlier in the same method, so
@@ -154,6 +191,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
         for (const single of objs) {
             await this.requirePermission(this.scopeUidOf(single), user, ACLAction.CREATE);
+            await this.enforceMailboxUid(single, this.scopeUidOf(single));
         }
         if (Array.isArray(obj)) {
             const created: T[] = await this.doBulkCreate(obj, { req, user, ignoreACL: true });
@@ -334,6 +372,15 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         const newScopeUid: string | undefined = this.scopeUidOf(obj);
         if (newScopeUid !== undefined && newScopeUid !== this.scopeUidOf(existing)) {
             await this.requirePermission(newScopeUid, user, ACLAction.CREATE);
+        }
+
+        // Only pays for a folder lookup when it can actually matter: the folder is genuinely changing (so
+        // a denormalized `mailboxUid` may need to move with it), or the client's own body directly names
+        // `mailboxUid` (an ordinary no-op re-send of the existing value, or an attempt to set it to
+        // something else entirely - `resolveMailboxUidFor()`'s doc comment explains why that must never be
+        // trusted). An update that touches neither skips this entirely, same cost as before this fix.
+        if (newScopeUid !== undefined || "mailboxUid" in (obj as any)) {
+            await this.enforceMailboxUid(obj, newScopeUid !== undefined ? newScopeUid : this.scopeUidOf(existing));
         }
 
         await this.validate(obj, { user });

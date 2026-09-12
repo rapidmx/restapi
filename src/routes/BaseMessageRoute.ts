@@ -21,7 +21,7 @@ import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
-import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
+import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { prependHeaders } from "../util/MimeHeaderUtils.js";
@@ -867,6 +867,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         await assertNotOnLegalHold(this._objectFactory!, this.matterClass, existing.mailboxUid, existing.sentDate);
     }
 
+    /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `Message` is exactly the
+     * entity that doc comment's compliance-job list (`ErasureExecutionJob`/`RetentionEnforcementJob`/
+     * `LegalHoldUtils`) names as trusting `mailboxUid` directly. */
+    protected async resolveMailboxUidFor(scopeUid: string): Promise<string | undefined> {
+        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid);
+    }
+
     /**
      * Wraps the inherited `BaseScopedChildRoute.delete()` (soft/hard-delete, unchanged) with an
      * `AuditLogEntry` - Exchange's own Mailbox Audit Log flags message deletion as one of its two most
@@ -946,8 +953,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
 
+        // A missing `mailbox` (a dangling `message.mailboxUid` - e.g. the mailbox was deleted, which has no
+        // cascade to its messages, per `ErasureExecutionJob`'s own doc comment) must NOT skip this audit
+        // entirely - content is still served below regardless of whether the mailbox lookup succeeded, so
+        // failing to resolve ownership is exactly the uncertain case `isNonOwnerAccess()`'s own doc comment
+        // says to treat defensively as non-owner, not to silently pass over.
         const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
-        if (mailbox && isNonOwnerAccess(mailbox, user)) {
+        if (!mailbox || isNonOwnerAccess(mailbox, user)) {
             await recordAuditLog(
                 this._objectFactory!,
                 this.auditLogClass,

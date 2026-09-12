@@ -20,6 +20,17 @@ describe("buildMboxEntry() / parseMbox() Tests", () => {
         expect(entry.toString("latin1")).toMatch(/^From MAILER-DAEMON /);
     });
 
+    it("Strips an embedded CR/LF from fromAddress before building the separator line, rather than letting it inject a fake From separator that would corrupt parseMbox()'s re-parsing.", () => {
+        const raw = Buffer.from("Subject: Hello\r\n\r\nBody text.", "utf-8");
+        const entry = buildMboxEntry(raw, "attacker@example.com\nFrom injected@evil.com Mon Jan 01 00:00:00 2026", new Date("2026-01-15T10:30:00Z"));
+
+        const text = entry.toString("latin1");
+        expect(text).toMatch(/^From attacker@example\.comFrom injected@evil\.com Mon Jan 01 00:00:00 2026 Thu Jan 15 10:30:00 2026\n/);
+        // Only ONE real separator line exists in the whole entry - the injected fragment landed inline on
+        // that same first line rather than starting a second, spoofed message boundary.
+        expect(text.match(/^From /gm)!.length).toBe(1);
+    });
+
     it("Escapes a body line that starts with 'From ' so it can't be mistaken for a separator.", () => {
         const raw = Buffer.from("Subject: Test\r\n\r\nFrom the desk of Bob.", "utf-8");
         const entry = buildMboxEntry(raw, "bob@example.com", new Date("2026-01-01T00:00:00Z"));

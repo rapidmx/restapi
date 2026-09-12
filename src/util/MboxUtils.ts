@@ -44,7 +44,14 @@ function formatAsctime(date: Date): string {
  * charsets) that `utf-8` decoding would corrupt.
  */
 export function buildMboxEntry(rawMime: Buffer, fromAddress: string, date: Date): Buffer {
-    const separator = `From ${fromAddress || "MAILER-DAEMON"} ${formatAsctime(date)}\n`;
+    // CR/LF-stripped before it's ever interpolated into the separator line - matches
+    // `BaseAttachmentRoute.ts`'s identical `sanitizeFilename()` convention for any other value that ends up
+    // built into a structural line. Without this, an embedded newline in `fromAddress` (a message's own
+    // `From:` header, not necessarily sanitized upstream) would inject a fake `From ` separator line,
+    // corrupting `parseMbox()`'s re-parsing of this bundle - and potentially every later reader's - into
+    // the wrong message boundaries.
+    const safeFromAddress = fromAddress.replace(/[\r\n]/g, "");
+    const separator = `From ${safeFromAddress || "MAILER-DAEMON"} ${formatAsctime(date)}\n`;
     const escapedBody = rawMime.toString("latin1").replace(/^From /gm, "> From ");
     return Buffer.from(separator + escapedBody + "\n", "latin1");
 }

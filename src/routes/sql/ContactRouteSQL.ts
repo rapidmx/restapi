@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
-import { ContactSQL } from "../../sql.js";
+import { ContactSQL, FolderSQL } from "../../sql.js";
 import { BaseContactRoute } from "../BaseContactRoute.js";
 import { RecoverableRepoUtils } from "../../util/RecoverableRepoUtils.js";
 const { Model } = RouteDecorators;
@@ -12,4 +12,5 @@ const { Model } = RouteDecorators;
 export class ContactRouteSQL extends BaseContactRoute<ContactSQL> {
     protected readonly repoUtilsClass: any = RecoverableRepoUtils;
     protected readonly scopeProperty: string = "folderUid";
+    protected folderClass: any = FolderSQL;
 }

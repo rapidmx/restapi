@@ -479,6 +479,26 @@ describe("Route:ContactMongo Tests", () => {
         expect(result.body.folderUid).toBe(destinationFolder.uid);
     });
 
+    // `ErasureExecutionJob` purges `Contact` by `mailboxUid` directly - see
+    // `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment for why an independently
+    // client-writable `mailboxUid` would let a contact silently escape a GDPR erasure scoped to a
+    // mailbox it was never really in.
+    it("Silently corrects a client-supplied mailboxUid on update() to the contact's real folder's mailbox, rather than trusting it.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const contact = await createContact(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${contact.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: contact.uid, version: contact.version, mailboxUid: "attacker-supplied-uid" });
+
+        expect(result.status).toBe(200);
+        expect(result.body.mailboxUid).toBe(mailbox.uid);
+        const persisted = await contactRepo.findOne({ uid: contact.uid } as any);
+        expect(persisted!.mailboxUid).toBe(mailbox.uid);
+    });
+
     it("Publishes live-update notifications to BOTH the old and new folder channels when a re-parenting update moves a contact.", async () => {
         const sendMessageSpy = vi.spyOn(NotificationUtils.prototype, "sendMessage");
         const mailbox = await createMailbox(owner.uid);

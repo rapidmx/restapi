@@ -404,7 +404,7 @@ export interface RetentionPolicy extends BaseEntity {
 }
 
 export type DataExportFormat = "json" | "mbox";
-export type DataExportStatus = "pending" | "ready" | "failed";
+export type DataExportStatus = "pending" | "processing" | "ready" | "failed";
 
 /**
  * A GDPR data-portability/access request for one mailbox's content - created pending, processed

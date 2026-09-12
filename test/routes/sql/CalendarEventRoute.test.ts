@@ -301,6 +301,26 @@ describe("Route:CalendarEventSQL Tests", () => {
         expect(result.status).toBe(403);
     });
 
+    // `ErasureExecutionJob` purges `CalendarEvent` by `mailboxUid` directly - see
+    // `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment for why an independently
+    // client-writable `mailboxUid` would let an event silently escape a GDPR erasure scoped to a mailbox
+    // it was never really in.
+    it("Silently corrects a client-supplied mailboxUid on update() to the event's real folder's mailbox, rather than trusting it.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const event = await createCalendarEvent(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${event.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: event.uid, version: event.version, mailboxUid: "attacker-supplied-uid" });
+
+        expect(result.status).toBe(200);
+        expect(result.body.mailboxUid).toBe(mailbox.uid);
+        const persisted = await calendarEventRepo.findOne({ where: { uid: event.uid } });
+        expect(persisted!.mailboxUid).toBe(mailbox.uid);
+    });
+
     it("Owner can delete a calendar event they have access to.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid);

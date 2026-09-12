@@ -291,6 +291,26 @@ describe("Route:NoteMongo Tests", () => {
         expect(result.status).toBe(403);
     });
 
+    // `ErasureExecutionJob` purges `Note` by `mailboxUid` directly - see
+    // `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment for why an independently
+    // client-writable `mailboxUid` would let a note silently escape a GDPR erasure scoped to a mailbox it
+    // was never really in.
+    it("Silently corrects a client-supplied mailboxUid on update() to the note's real folder's mailbox, rather than trusting it.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const note = await createNote(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${note.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: note.uid, version: note.version, mailboxUid: "attacker-supplied-uid" });
+
+        expect(result.status).toBe(200);
+        expect(result.body.mailboxUid).toBe(mailbox.uid);
+        const persisted = await noteRepo.findOne({ uid: note.uid } as any);
+        expect(persisted!.mailboxUid).toBe(mailbox.uid);
+    });
+
     it("Owner can delete a note they have access to.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid);

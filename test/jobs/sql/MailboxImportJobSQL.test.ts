@@ -363,6 +363,28 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
         expect(updated!.importedCount).toBe(1);
     });
 
+    it("Still reports the import as completed (not failed) when the folder counter update itself throws - e.g. a real version conflict against mail concurrently delivered into the same folder.", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        await blobStore.put(sourceBlobKey, buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01")));
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+
+        const folderRepoUtils = (job as any).folderRepo;
+        vi.spyOn(folderRepoUtils, "update").mockRejectedValueOnce(new Error("version conflict"));
+
+        await job.run();
+
+        // Every message was already durably persisted before the counter bump ran - a caller trusting a
+        // "failed" status here would be invited to re-run the same import, duplicating every message.
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("completed");
+        expect(updated!.importedCount).toBe(1);
+        const messages = await messageRepo.find({ where: { folderUid: folder.uid } });
+        expect(messages.length).toBe(1);
+    });
+
     it("Defaults subject/from-address to empty strings and an attachment's filename to 'attachment' when the message provides none.", async () => {
         const mailbox = await createMailbox();
         const folder = await createFolder(mailbox.uid);

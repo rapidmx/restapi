@@ -188,18 +188,31 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                 }
             }
 
+            // Isolated in its own try/catch, deliberately NOT sharing the outer one below: every message has
+            // already been durably persisted by this point, so a failure bumping the folder's own
+            // (denormalized, best-effort) counters - e.g. a version conflict against a real piece of mail
+            // concurrently delivered into the same folder by ScanQueueJob, a realistic race during a live
+            // mailbox migration - must not turn a fully-successful import into a reported "failed" one. A
+            // caller trusting that status would otherwise be invited to re-run the same import against the
+            // same source file, duplicating every message (no dedup on messageId/source exists for imports).
             if (importedCount > 0) {
-                const currentFolder: F | undefined = await this.folderRepo!.findOne(folder.uid, { ignoreACL: true });
-                if (currentFolder) {
-                    await this.folderRepo!.update(
-                        {
-                            uid: currentFolder.uid,
-                            version: (currentFolder as any).version,
-                            totalCount: currentFolder.totalCount + importedCount,
-                            syncKeyVersion: currentFolder.syncKeyVersion + 1,
-                        } as any,
-                        currentFolder,
-                        { ignoreACL: true },
+                try {
+                    const currentFolder: F | undefined = await this.folderRepo!.findOne(folder.uid, { ignoreACL: true });
+                    if (currentFolder) {
+                        await this.folderRepo!.update(
+                            {
+                                uid: currentFolder.uid,
+                                version: (currentFolder as any).version,
+                                totalCount: currentFolder.totalCount + importedCount,
+                                syncKeyVersion: currentFolder.syncKeyVersion + 1,
+                            } as any,
+                            currentFolder,
+                            { ignoreACL: true },
+                        );
+                    }
+                } catch (err: any) {
+                    this.logger?.warn(
+                        `MailboxImportJob: failed to update folder counters for ${folder.uid} after importing request ${processing.uid}: ${err.message}`,
                     );
                 }
             }

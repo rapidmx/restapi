@@ -123,24 +123,54 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
             return;
         }
 
-        const content: Buffer =
-            request.format === "mbox" ? await this.buildMboxBundle(request.mailboxUid) : await this.buildJsonBundle(request.mailboxUid, mailbox);
-        const blobKey = `data-exports/${request.uid}.${request.format === "mbox" ? "mbox" : "ndjson"}`;
-        await this.blobStore!.put(blobKey, content, {
-            contentType: request.format === "mbox" ? "application/mbox" : "application/x-ndjson",
-        });
-
-        const updated: DER = await this.dataExportRequestRepo!.update(
-            { uid: request.uid, version: (request as any).version, status: "ready", blobKey } as any,
+        // Claimed via an optimistic-locked transition to "processing" BEFORE any bundle building/blob
+        // writing happens - the same "claim first, work second" discipline `MailboxImportJob.
+        // processRequest()` already establishes. Without this, two overlapping runs (a real possibility in
+        // a multi-node deployment, or one run overlapping the next poll) could both build a bundle and both
+        // `blobStore.put()` the SAME deterministic key - a non-transactional side effect independent of
+        // whichever run's own `update()` to "ready" wins the DB's optimistic lock, so the request could end
+        // up "ready" with an audit entry describing one run's completion while the downloadable bytes are
+        // actually the other run's output. Claiming first means a losing run's own `update()` here throws
+        // immediately (caught by `run()`'s own catch) and never reaches the bundle/blob step at all.
+        const processing: DER = await this.dataExportRequestRepo!.update(
+            { uid: request.uid, version: (request as any).version, status: "processing" } as any,
             request,
             { ignoreACL: true },
         );
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, logger: this.logger },
-            { action: AuditAction.DATA_EXPORT_READY, targetType: "DataExportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid },
-        );
+
+        // Wrapped in its own try/catch, deliberately NOT left to `run()`'s own outer catch (which would
+        // call `markFailed(request, ...)` using `request`'s now-stale pre-claim version and simply fail a
+        // second time) - every failure from here on must mark against `processing`'s own version, the same
+        // discipline `MailboxImportJob.processRequest()` already establishes for its identical shape.
+        try {
+            const content: Buffer =
+                processing.format === "mbox"
+                    ? await this.buildMboxBundle(processing.mailboxUid)
+                    : await this.buildJsonBundle(processing.mailboxUid, mailbox);
+            const blobKey = `data-exports/${processing.uid}.${processing.format === "mbox" ? "mbox" : "ndjson"}`;
+            await this.blobStore!.put(blobKey, content, {
+                contentType: processing.format === "mbox" ? "application/mbox" : "application/x-ndjson",
+            });
+
+            // Re-fetched rather than reusing `processing`'s own version - `MailboxImportJob.
+            // processRequest()`'s identical final transition documents why: the bundle build above can take
+            // long enough that trusting a version fetched before it risks a spurious conflict against a
+            // completely unrelated concurrent write to this same row, even though nothing here actually raced.
+            const refetched: DER = (await this.dataExportRequestRepo!.findOne(processing.uid, { ignoreACL: true }))!;
+            const updated: DER = await this.dataExportRequestRepo!.update(
+                { uid: refetched.uid, version: (refetched as any).version, status: "ready", blobKey } as any,
+                refetched,
+                { ignoreACL: true },
+            );
+            await recordAuditLog(
+                this._objectFactory!,
+                this.auditLogClass,
+                { config: this.config, logger: this.logger },
+                { action: AuditAction.DATA_EXPORT_READY, targetType: "DataExportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid },
+            );
+        } catch (err: any) {
+            await this.markFailed(processing, err.message);
+        }
     }
 
     private async markFailed(request: DER, errorMessage: string): Promise<void> {

@@ -2,9 +2,40 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import type { JWTUser } from "@rapidrest/core";
+import type { JWTUser, ObjectFactory } from "@rapidrest/core";
 import { RepoUtils } from "@rapidrest/service-core";
 import { Folder, FolderType } from "../models/types.js";
+
+/** Caches one `RepoUtils` per concrete `Folder` class (Mongo vs SQL) - mirrors `EscrowUtils.ts`'s
+ * identical `getEscrowScopeRepo()` pattern. */
+const folderRepoCache = new WeakMap<any, Promise<RepoUtils<Folder>>>();
+
+function getCachedFolderRepo(objectFactory: ObjectFactory, folderClass: any): Promise<RepoUtils<Folder>> {
+    let cached = folderRepoCache.get(folderClass);
+    if (!cached) {
+        cached = Promise.resolve(objectFactory.newInstance(RepoUtils, { name: folderClass.name, args: [folderClass] }));
+        folderRepoCache.set(folderClass, cached);
+    }
+    return cached;
+}
+
+/**
+ * The real, authoritative `mailboxUid` of `folderUid` (`undefined` if no such folder exists) - looked up
+ * with `ignoreACL: true` and no soft-delete filtering (a plain `RepoUtils`, not `RecoverableRepoUtils`),
+ * so a folder that was soft-deleted mid-request still resolves correctly rather than appearing not found.
+ *
+ * This is the one place `BaseScopedChildRoute.resolveMailboxUidFor()`'s overrides
+ * (`BaseMessageRoute`/`BaseAttachmentRoute`/`BaseContactRoute`/`BaseCalendarEventRoute`/`TaskRoute*`/
+ * `NoteRoute*`) resolve a folder-scoped record's `mailboxUid` through, rather than trusting whatever value
+ * a client supplied directly - see that hook's own doc comment for why an independently client-writable
+ * `mailboxUid` is a real problem (every compliance job that purges/queries by `mailboxUid` treats it as
+ * authoritative).
+ */
+export async function getMailboxUidForFolder(objectFactory: ObjectFactory, folderClass: any, folderUid: string): Promise<string | undefined> {
+    const repo: RepoUtils<Folder> = await getCachedFolderRepo(objectFactory, folderClass);
+    const folder: Folder | undefined = await repo.findOne(folderUid, { ignoreACL: true });
+    return folder?.mailboxUid;
+}
 
 const DEFAULT_FOLDER_NAMES: Record<FolderType, string> = {
     [FolderType.INBOX]: "Inbox",

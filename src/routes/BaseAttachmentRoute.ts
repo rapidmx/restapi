@@ -14,6 +14,7 @@ import {
     RouteDecorators,
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
+import { getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { Attachment, Message } from "../models/types.js";
@@ -54,6 +55,10 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
     /** The class of the owning `Message` entity, supplied by the Mongo/SQL concrete subclass. */
     protected abstract messageClass: any;
 
+    /** The concrete `Folder` entity class, supplied by the Mongo/SQL concrete subclass - used only by
+     * `resolveMailboxUidFor()` below. */
+    protected abstract folderClass: any;
+
     private messageRepo?: RecoverableRepoUtils<M>;
 
     @Inject("BlobStore")
@@ -67,6 +72,13 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
             });
         }
         return this.messageRepo;
+    }
+
+    /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `Attachment` carries its own
+     * denormalized `mailboxUid` (`Attachment.mailboxUid`'s own doc comment) that must never diverge from
+     * its actual folder's mailbox, the same reasoning already applied to `upload()`'s own comment above. */
+    protected async resolveMailboxUidFor(scopeUid: string): Promise<string | undefined> {
+        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid);
     }
 
     @Summary("Upload attachment")

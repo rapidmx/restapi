@@ -86,6 +86,33 @@ describe("findActiveHoldsFor() Tests", () => {
 
         expect(result.map((m) => m.uid).sort()).toEqual(["matter-a", "matter-b"]);
     });
+
+    // A bare, unpaginated `find()` silently truncates at the framework's default limit (100 rows) - see
+    // DataExportJob.findAllPages()'s identical rationale. This proves findActiveHoldsFor() walks every
+    // page rather than trusting a single call, by returning a hold-matching matter ONLY on a page past
+    // where a naive single-call implementation would have stopped looking.
+    it("Detects a hold on a matter beyond the first page, proving the query is paginated.", async () => {
+        const pageSize = 500;
+        const heldMatter = makeMatter({ uid: "matter-late", custodianMailboxUids: ["mailbox-1"] });
+        const find = vi.fn().mockImplementation(async (_criteria: any, options: any) => {
+            const page = options.page ?? 0;
+            if (page === 0) {
+                return Array.from({ length: pageSize }, (_, i) => makeMatter({ uid: `matter-page0-${i}`, custodianMailboxUids: ["someone-else"] }));
+            }
+            if (page === 1) {
+                return [heldMatter];
+            }
+            return [];
+        });
+        const repo = { find };
+        const objectFactory = makeObjectFactory(repo);
+
+        const result = await findActiveHoldsFor(objectFactory, makeStubClass(), "mailbox-1");
+
+        expect(result.map((m) => m.uid)).toEqual(["matter-late"]);
+        // Page 1 returns fewer than `pageSize` rows, so the loop correctly stops there without a 3rd call.
+        expect(find).toHaveBeenCalledTimes(2);
+    });
 });
 
 describe("assertNotOnLegalHold() Tests", () => {

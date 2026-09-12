@@ -19,6 +19,25 @@ function getMatterRepo(objectFactory: ObjectFactory, matterClass: any): Promise<
     return cached;
 }
 
+/** Fetches every page of `repo.find()` results - see `DataExportJob.findAllPages()`'s identical rationale
+ * (a bare, unpaginated `find()` silently truncates at 100 rows). Unlike `EscrowScope` (admin-only,
+ * `@RequiresTrustedRole()`-gated creation, so genuinely a handful of rows in practice - see
+ * `EscrowUtils.findHeldScopeIds()`), `Matter` is holder-gated CRUD, not admin-gated: any holder can create
+ * one, so the global count can plausibly exceed the default page size in a real deployment. A hold check
+ * that silently misses a real, active hold past the 100th row would be a legal-hold-enforcement failure,
+ * not just an incomplete listing. */
+async function findAllMatters(repo: RepoUtils<Matter>, pageSize: number = 500): Promise<Matter[]> {
+    const all: Matter[] = [];
+    for (let page = 0; ; page++) {
+        const batch: Matter[] = await repo.find({ limit: pageSize, page } as any, { ignoreACL: true, limit: pageSize, page });
+        all.push(...batch);
+        if (batch.length < pageSize) {
+            break;
+        }
+    }
+    return all;
+}
+
 /**
  * Every open `Matter` that places `mailboxUid` under legal hold - a `Matter` names its
  * `custodianMailboxUids`, a `dateRangeStart`/`dateRangeEnd`, and is open until `closedAt` is set (see
@@ -27,9 +46,11 @@ function getMatterRepo(objectFactory: ObjectFactory, matterClass: any): Promise<
  * in scope for it); omit it for a whole-record operation with no single date to check (e.g. deleting an
  * entire `Mailbox`), which matches any open hold on that mailbox regardless of range.
  *
- * Fetches every `Matter` and filters client-side rather than querying by `custodianMailboxUids` directly
- * - same reasoning `EscrowUtils.findHeldScopeIds()` already documents: the number of matters in a real
- * deployment (open litigation/compliance holds) is nothing like record-count scale.
+ * Fetches every `Matter` (paginated - see `findAllMatters()`) and filters client-side rather than querying
+ * by `custodianMailboxUids` directly - client-side filtering is still fine at this scale (a real
+ * deployment's open litigation/compliance holds are nothing like message-count scale), but unlike
+ * `EscrowUtils.findHeldScopeIds()`'s admin-only `EscrowScope`, `Matter` is holder-gated CRUD, so the row
+ * count isn't bounded the same way and a bare, unpaginated `find()` could silently miss a real hold.
  */
 export async function findActiveHoldsFor(
     objectFactory: ObjectFactory,
@@ -38,7 +59,7 @@ export async function findActiveHoldsFor(
     referenceDate?: Date,
 ): Promise<Matter[]> {
     const repo: RepoUtils<Matter> = await getMatterRepo(objectFactory, matterClass);
-    const matters: Matter[] = await repo.find({}, { ignoreACL: true });
+    const matters: Matter[] = await findAllMatters(repo);
     return matters.filter((matter) => {
         if (matter.closedAt || !matter.custodianMailboxUids.includes(mailboxUid)) {
             return false;

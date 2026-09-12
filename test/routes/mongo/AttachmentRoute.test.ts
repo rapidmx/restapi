@@ -391,4 +391,25 @@ describe("Route:AttachmentMongo Tests", () => {
         const existing = await attachmentRepo.findOne({ uid: attachment.uid } as any);
         expect(existing).toBeNull();
     });
+
+    // `ErasureExecutionJob` purges `Attachment` by `mailboxUid` directly - see
+    // `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment for why an independently
+    // client-writable `mailboxUid` would let an attachment silently escape a GDPR erasure scoped to a
+    // mailbox it was never really in. `upload()` already derives `mailboxUid` server-side (see above), but
+    // the generic inherited `update()` (PUT) is a separate, still-reachable entry point.
+    it("Silently corrects a client-supplied mailboxUid on update() to the attachment's real folder's mailbox, rather than trusting it.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const attachment = await createAttachment(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${attachment.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: attachment.uid, version: attachment.version, mailboxUid: "attacker-supplied-uid" });
+
+        expect(result.status).toBe(200);
+        expect(result.body.mailboxUid).toBe(mailbox.uid);
+        const persisted = await attachmentRepo.findOne({ uid: attachment.uid } as any);
+        expect(persisted!.mailboxUid).toBe(mailbox.uid);
+    });
 });

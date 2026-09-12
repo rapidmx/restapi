@@ -347,6 +347,43 @@ describe("DataExportJobSQL Tests (real DB + DI)", () => {
         expect(bundle).not.toContain("Missing Blob");
     });
 
+    it("run()'s own outer catch marks the request failed when the claim-to-'processing' transition itself throws.", async () => {
+        const mailbox = await createMailbox();
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "json" });
+
+        vi.spyOn((job as any).dataExportRequestRepo, "update").mockRejectedValueOnce(new Error("simulated claim failure"));
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("failed");
+        expect(updated!.errorMessage).toBe("simulated claim failure");
+    });
+
+    it("A second, concurrently-racing call using the same originally-fetched request object fails at the claim step - before ever building a bundle or writing to BlobStore - rather than racing all the way to a duplicate/inconsistent blob write.", async () => {
+        const mailbox = await createMailbox();
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "json" });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const putSpy = vi.spyOn(blobStore, "put");
+
+        await (job as any).processRequest(request);
+        const firstResult = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(firstResult!.status).toBe("ready");
+        expect(putSpy).toHaveBeenCalledTimes(1);
+
+        // Simulates a second, concurrently-racing job instance's own call - it would hold the SAME
+        // originally-fetched `request` object (from its own top-of-run() find()), now stale relative to
+        // what the first call above just wrote.
+        await expect((job as any).processRequest(request)).rejects.toThrow();
+
+        // The claim step itself is what rejected the second call - it never got far enough to build a
+        // second bundle or write a second (possibly different) blob under the same key.
+        expect(putSpy).toHaveBeenCalledTimes(1);
+        const stillFirst = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(stillFirst!.status).toBe("ready");
+        expect(stillFirst!.blobKey).toBe(firstResult!.blobKey);
+    });
+
     it("Logs an error when even marking a request failed itself throws.", async () => {
         const request = await createRequest({ mailboxUid: uuid.v4() });
         const repoUtils = (job as any).dataExportRequestRepo;
