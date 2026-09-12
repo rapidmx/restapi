@@ -16,7 +16,7 @@ import {
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
 import { AuditAction, Matter } from "../models/types.js";
-const { Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
+const { Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** Validates the parts of a `Matter` a client can actually set, against the merged (existing + patch, for
  * `update()`) object - `undefined` fields are left alone (a patch not touching a given field shouldn't
@@ -334,5 +334,32 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         }
         await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, result.escrowScopeId, user);
         return result;
+    }
+
+    /** `CRUDRoute.exists()`'s own generic implementation (`RepoUtils.exists()`) checks the CLASS-level ACL
+     * (`Matter`'s own policy denies `.*` entirely - holder-ness is checked in application code via
+     * `EscrowScope.holderUserUids`, never through an ACL record) before ever reaching a per-record check -
+     * for a trusted admin that class-level check is bypassed entirely (same generic trusted-role bypass
+     * behind every other finding in this class), letting a non-holder admin probe arbitrary matter uids
+     * for existence. Mirrors `findById()`'s own holder check immediately above, translated into
+     * `BaseScopedChildRoute.exists()`'s found/not-found response shape (a 403 here would tell a non-holder
+     * a matter exists at all, which - unlike `findById()` returning full content - existence alone still
+     * isn't information this class should leak to anyone but an actual holder). */
+    @Head("/:id")
+    public async exists(@Param("id") id: string, @Query() query: any, @Response res: HttpResponse, @AuthUser user?: JWTUser): Promise<any> {
+        const result: T | undefined = await this.repoUtils!.findOne(id, {
+            version: query?.version,
+            includeDeleted: query?.deleted === true || query?.deleted === "true",
+            ignoreACL: true,
+        });
+        if (!result) {
+            return res.status(404).setHeader("content-length", 0);
+        }
+        try {
+            await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, result.escrowScopeId, user);
+        } catch {
+            return res.status(404).setHeader("content-length", 0);
+        }
+        return res.status(200).setHeader("content-length", 1);
     }
 }

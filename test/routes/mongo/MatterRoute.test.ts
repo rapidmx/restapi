@@ -461,6 +461,50 @@ describe("Route:MatterMongo Tests", () => {
         expect(result.status).toBe(404);
     });
 
+    describe("HEAD /matters/:id (exists)", () => {
+        it("A holder gets a positive exists check for their own matter.", async () => {
+            const scope = await createEscrowScope();
+            const matter = await createMatter(scope.uid);
+
+            const result = await request(server.getApplication())
+                .head(`${baseUrl}/${matter.uid}`)
+                .set("Authorization", "jwt " + holderAToken);
+
+            expect(result.status).toBe(200);
+            expect(result.headers["content-length"]).toBe("1");
+        });
+
+        it("Returns 404 for a nonexistent matter.", async () => {
+            const result = await request(server.getApplication())
+                .head(`${baseUrl}/${uuid.v4()}`)
+                .set("Authorization", "jwt " + holderAToken);
+
+            expect(result.status).toBe(404);
+        });
+
+        it("Returns 404 (not a permission error) for a caller who doesn't hold the matter's scope, so existence itself isn't leaked to a non-holder.", async () => {
+            const scope = await createEscrowScope();
+            const matter = await createMatter(scope.uid);
+
+            const result = await request(server.getApplication())
+                .head(`${baseUrl}/${matter.uid}`)
+                .set("Authorization", "jwt " + holderBToken);
+
+            expect(result.status).toBe(404);
+        });
+
+        it("A trusted admin who is not a holder cannot confirm a matter's existence (404) - proves separation of duties extends to this endpoint too, unlike the framework's own generic trusted-role bypass.", async () => {
+            const scope = await createEscrowScope();
+            const matter = await createMatter(scope.uid);
+
+            const result = await request(server.getApplication())
+                .head(`${baseUrl}/${matter.uid}`)
+                .set("Authorization", "jwt " + adminToken);
+
+            expect(result.status).toBe(404);
+        });
+    });
+
     describe("PUT /matters (updateBulk)", () => {
         it("A holder can bulk-update matters under their own scope.", async () => {
             const scope = await createEscrowScope();
