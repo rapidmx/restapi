@@ -222,7 +222,13 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
      * either of this class's own per-record guards (holder status, the EscrowAccessRequest-reference
      * check `delete()` above enforces) - narrows to the caller's own held scopes first (the same pattern
      * `find()`/`count()` below already use), then applies the referencing-request guard to every matched
-     * matter before actually deleting any of them. */
+     * matter before actually deleting any of them. The final delete is re-scoped to exactly the uids just
+     * checked (not the original query re-run live) - `RepoUtils.truncate()` re-executes its own search
+     * query at the moment it runs, independent of `matched` above; passing the original filter through
+     * again would let a matter created in the gap between the snapshot and that call (matching the same
+     * held-scope filter) be deleted having never been through the referencing-request check at all. A
+     * matter that only starts matching after this snapshot is simply left for a later truncate() call to
+     * pick up (and check) instead. */
     public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
         const heldScopeIds: string[] = await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user);
         if (heldScopeIds.length === 0) {
@@ -250,7 +256,10 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             }
         }
 
-        await this.repoUtils!.truncate(scopedQuery, findOptions);
+        await this.repoUtils!.truncate({ uid: `in(${matched.map((existing) => existing.uid).join(",")})` } as any, {
+            user,
+            ignoreACL: true,
+        });
 
         for (const existing of matched) {
             await recordAuditLog(

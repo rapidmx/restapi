@@ -205,14 +205,28 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
             { ignoreACL: true },
         );
 
+        // Best-effort per mailbox, deliberately NOT allowed to throw out of `processRequest()` - the
+        // request is already genuinely `"ready"` (the bundle above is real, stored, and downloadable) by
+        // this point, so a failure here (e.g. `recordEscrowAuditEntry()`'s own sequence-contention retries
+        // exhausted under a concurrent writer) must not route through `run()`'s `catch`/`markFailed()`:
+        // that would try to write a STALE pre-"ready" version, itself fail its own optimistic-lock check,
+        // and get silently swallowed - leaving the request stuck at "ready" forever with no path to retry
+        // the one mailbox whose attestation never got recorded. Logged loudly instead, so the gap is at
+        // least operator-visible rather than a silent, permanent hole in the hash-chained ledger.
         for (const mailboxUid of includedMailboxUids) {
-            await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
-                action: EscrowAuditAction.MATTER_EXPORT_READY,
-                holderUserUid: request.requestedByUserUid,
-                matterId: matter.uid,
-                mailboxUid,
-                requestId: request.uid,
-            });
+            try {
+                await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
+                    action: EscrowAuditAction.MATTER_EXPORT_READY,
+                    holderUserUid: request.requestedByUserUid,
+                    matterId: matter.uid,
+                    mailboxUid,
+                    requestId: request.uid,
+                });
+            } catch (err: any) {
+                this.logger?.error(
+                    `MatterExportJob: request ${request.uid} is ready and its bundle already includes mailbox ${mailboxUid}'s content, but recording that mailbox's own EscrowAuditLogEntry attestation failed and will NOT be retried: ${err.message}`,
+                );
+            }
         }
     }
 

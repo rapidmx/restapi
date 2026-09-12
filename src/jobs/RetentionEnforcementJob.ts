@@ -4,11 +4,12 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { BlobStore } from "../blob/BlobStore.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-import { AuditAction, AuditLogEntry, Message, RetentionPolicy } from "../models/types.js";
-const { Config, Init, Logger } = ObjectDecorators;
+import { Attachment, AuditAction, AuditLogEntry, Message, RetentionPolicy } from "../models/types.js";
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** The fixed, well-known identifier of the one `RetentionPolicy` row - mirrors
  * `BaseRetentionPolicyRoute.ts`'s own `RETENTION_POLICY_UID` constant (kept as a separate literal here,
@@ -30,16 +31,27 @@ const RETENTION_POLICY_UID = "retention-policy";
  * `EscrowAuditLogEntry` (a hash-chained ledger) is never a target here at all, by design - see
  * `RetentionPolicy.auditLogRetentionDays`'s own doc comment.
  *
+ * An expiring `Message` also has every `Attachment` referencing it (and both entities' own `BlobStore`
+ * content - `bodyBlobKey`/`sanitizedHtmlBlobKey`/`blobKey`/`extractedTextBlobKey`) purged right alongside
+ * it - mirroring `ErasureExecutionJob`'s own identical reasoning ("the ORM layer has no idea these opaque
+ * byte payloads exist, so leaving them behind after the owning row is gone would defeat the entire point
+ * of" a retention policy that represents itself as actually deleting the content it ages out). Deleting a
+ * `Message` row has no database-level cascade onto its `Attachment`s (confirmed the same way
+ * `ErasureExecutionJob` already had to purge them as an independent step) - without this, PHI/PII a
+ * deployment's own compliance policy asserts is gone after N days would in fact remain fully stored and
+ * independently downloadable via `BaseAttachmentRoute` indefinitely.
+ *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`RetentionEnforcementJobMongo`/
  * `RetentionEnforcementJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob`/
  * `MailboxQuotaRecalcJob` use.
  *
  * @author Jean-Philippe Steinmetz
  */
-export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M extends Message, AL extends AuditLogEntry> extends BackgroundService {
+export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M extends Message, AL extends AuditLogEntry, AT extends Attachment> extends BackgroundService {
     protected abstract retentionPolicyClass: any;
     protected abstract messageClass: any;
     protected abstract auditLogClass: any;
+    protected abstract attachmentClass: any;
 
     /** Supplied by the Mongo/SQL concrete subclasses so a `Message` purge candidate's legal-hold status
      * can be resolved without depending on either backend directly - see `util/LegalHoldUtils.ts`. */
@@ -51,6 +63,10 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
     private retentionPolicyRepo?: RepoUtils<RP>;
     private messageRepo?: RecoverableRepoUtils<M>;
     private auditLogRepo?: RepoUtils<AL>;
+    private attachmentRepo?: RepoUtils<AT>;
+
+    @Inject("BlobStore")
+    private blobStore?: BlobStore;
 
     @Config("mail:jobs:retention_enforcement:schedule", "0 0 4 * * *")
     private scheduleExpr: string = "0 0 4 * * *";
@@ -83,6 +99,10 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
             name: this.auditLogClass.name,
             args: [this.auditLogClass],
         });
+        this.attachmentRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.attachmentClass.name,
+            args: [this.attachmentClass],
+        });
     }
 
     public async start(): Promise<void> {
@@ -94,7 +114,7 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
     }
 
     public async run(): Promise<void> {
-        if (!this.retentionPolicyRepo || !this.messageRepo || !this.auditLogRepo) {
+        if (!this.retentionPolicyRepo || !this.messageRepo || !this.auditLogRepo || !this.attachmentRepo || !this.blobStore) {
             return;
         }
 
@@ -131,6 +151,34 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
                 continue;
             }
             try {
+                // Every `Attachment` referencing this message first - `Message` deletion has no
+                // database-level cascade onto them (see this class's own doc comment), and each one's own
+                // `blobKey`/`extractedTextBlobKey` content must be explicitly removed the same way
+                // `ErasureExecutionJob` already does for its own cascade. Best-effort per attachment - one
+                // failing here shouldn't block the parent message's own purge below, matching this job's
+                // existing per-record tolerance elsewhere.
+                const attachments: AT[] = await this.attachmentRepo!.find({ messageUid: message.uid, limit: 1000 } as any, {
+                    ignoreACL: true,
+                    limit: 1000,
+                });
+                for (const attachment of attachments) {
+                    try {
+                        await this.blobStore!.delete((attachment as any).blobKey);
+                        if ((attachment as any).extractedTextBlobKey) {
+                            await this.blobStore!.delete((attachment as any).extractedTextBlobKey);
+                        }
+                        await this.attachmentRepo!.delete(attachment.uid, { ignoreACL: true, purge: true });
+                    } catch (err: any) {
+                        this.logger?.warn(
+                            `RetentionEnforcementJob: failed to purge attachment ${attachment.uid} for expired message ${message.uid}: ${err.message}`,
+                        );
+                    }
+                }
+
+                await this.blobStore!.delete((message as any).bodyBlobKey);
+                if ((message as any).sanitizedHtmlBlobKey) {
+                    await this.blobStore!.delete((message as any).sanitizedHtmlBlobKey);
+                }
                 await this.messageRepo!.delete(message.uid, { ignoreACL: true, purge: true });
                 purgedCount++;
             } catch (err: any) {

@@ -577,6 +577,13 @@ describe("Route:MailboxSQL Tests", () => {
             const stillExists: MailboxSQL | null = await repo.findOne({ where: { uid: obj.uid } });
             expect(stillExists).toBeNull();
         });
+
+        it("A bulk truncate() that matches no mailboxes at all succeeds as a no-op.", async () => {
+            const result = await request(server.getApplication()).delete(baseUrl).set("Authorization", "jwt " + adminToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+        });
     });
 
     it("Can make a count request scoped to the caller's own mailboxes.", async () => {

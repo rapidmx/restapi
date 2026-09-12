@@ -285,12 +285,23 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         // over the equivalent one-at-a-time `delete(..., { purge: true })` calls.
         const { shareToken: _shareToken, ...filterQuery } = query ?? {};
         const matched: T[] = await this.findAllForTruncate({ ...filterQuery, ...params }, user);
+        if (matched.length === 0) {
+            return;
+        }
         for (const existing of matched) {
             await this.checkLegalHold(existing);
         }
+        // Deliberately re-scoped to the EXACT uids just checked, not the original query re-run live -
+        // `RepoUtils.truncate()` re-executes its own search query at the moment it runs, independent of
+        // `matched` above; passing the original filter through again would let a record that starts
+        // matching it in the gap between the snapshot and this call (e.g. a message delivered into the
+        // same folder by `ScanQueueJob` while this request is still in flight) be deleted having never
+        // been through `checkLegalHold()` at all - the exact protection this override exists to add. A
+        // record that only starts matching after this snapshot is simply left for a later truncate() call
+        // to pick up (and check), rather than being deleted unchecked by this one.
         await this.repoUtils.truncate(
-            { ...query, ...params },
-            { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
+            { uid: `in(${matched.map((existing) => existing.uid).join(",")})` } as any,
+            { user, ignoreACL: true },
         );
     }
 

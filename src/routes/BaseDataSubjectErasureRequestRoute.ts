@@ -106,6 +106,35 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
             new this.dataSubjectErasureRequestClass({ mailboxUid, requestedByUserUid: user.uid, status: "pending" }),
             { ignoreACL: true },
         );
+
+        // The check above and this row's own creation are not atomic - this codebase has no existing
+        // precedent for a partial-unique-index scoped to `status = "pending"` (every other unique index
+        // in this codebase is unconditional on its column set, which would incorrectly block a legitimate
+        // second request after an earlier one was denied), so a genuinely raced double-submit for the SAME
+        // mailbox could still create two independent pending rows. Narrows (rather than eliminates) that
+        // window: if another pending request for this mailbox now also exists, the earlier of the two
+        // (by creation time) wins and this call's own row is immediately superseded instead of being left
+        // to sit alongside it as a second, redundant in-flight request a trusted admin could independently
+        // approve, queuing the mailbox for `ErasureExecutionJob` twice.
+        const stillPending: T[] = await this.requestRepo!.find({ mailboxUid, status: "pending" } as any, { ignoreACL: true, limit: 2 });
+        if (stillPending.length > 1) {
+            const [winner] = [...stillPending].sort((a, b) => new Date(a.dateCreated).getTime() - new Date(b.dateCreated).getTime());
+            if (winner.uid !== created.uid) {
+                await this.requestRepo!.update(
+                    {
+                        uid: created.uid,
+                        version: (created as any).version,
+                        status: "denied",
+                        reviewedByUserUid: created.requestedByUserUid,
+                        reason: "Superseded by an earlier concurrent erasure request for the same mailbox.",
+                    } as any,
+                    created,
+                    { ignoreACL: true },
+                );
+                throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "An erasure request for this mailbox is already pending review.");
+            }
+        }
+
         await recordAuditLog(
             this._objectFactory!,
             this.auditLogClass,

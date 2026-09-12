@@ -11,11 +11,13 @@ import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import config from "../../config.js";
 import { RetentionEnforcementJobMongo } from "../../../src/jobs/mongo/RetentionEnforcementJobMongo.js";
+import { AttachmentMongo } from "../../../src/models/mongo/AttachmentMongo.js";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
 import { RetentionPolicyMongo } from "../../../src/models/mongo/RetentionPolicyMongo.js";
 import { AuditAction, AuditLogEntry, RecipientType } from "../../../src/models/types.js";
+import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
@@ -32,6 +34,7 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
     let messageRepo: MongoRepository<MessageMongo>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
     let matterRepo: MongoRepository<MatterMongo>;
+    let attachmentRepo: MongoRepository<AttachmentMongo>;
 
     const createMessage = async (data?: Partial<MessageMongo>): Promise<MessageMongo> => {
         const obj = new MessageMongo({
@@ -79,6 +82,7 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
         await mongod.start();
         objectFactory = new ObjectFactory(config, logger);
         objectFactory.register(ACLUtils);
+        registerTestDoubles(objectFactory);
 
         connectionManager = await objectFactory.newInstance(ConnectionManager, { name: "default" });
         const models = new Map<string, any>();
@@ -86,6 +90,7 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
         models.set("MessageMongo", MessageMongo);
         models.set("AuditLogEntryMongo", AuditLogEntryMongo);
         models.set("MatterMongo", MatterMongo);
+        models.set("AttachmentMongo", AttachmentMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("mongo");
@@ -96,6 +101,7 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
         messageRepo = conn.getMongoRepository("MessageMongo");
         auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
         matterRepo = conn.getMongoRepository("MatterMongo");
+        attachmentRepo = conn.getMongoRepository("AttachmentMongo");
 
         job = await objectFactory.newInstance(RetentionEnforcementJobMongo, { name: "default" });
     });
@@ -106,7 +112,7 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [retentionPolicyRepo, messageRepo, auditLogRepo, matterRepo]) {
+        for (const repo of [retentionPolicyRepo, messageRepo, auditLogRepo, matterRepo, attachmentRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -173,6 +179,92 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
         expect(entries.length).toBe(1);
         expect(entries[0].targetType).toBe("Message");
         expect(entries[0].details).toEqual({ count: 1, maxAgeDays: 30 });
+    });
+
+    it("Purging an expired message also purges every Attachment referencing it, plus both entities' own BlobStore content - PHI/PII a retention policy asserts is gone must not survive as an orphaned, independently-downloadable row or blob.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", messageRetentionDays: 30 }));
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        const sanitizedHtmlBlobKey = `sanitized/${uuid.v4()}`;
+        await blobStore.put(bodyBlobKey, Buffer.from("raw"));
+        await blobStore.put(sanitizedHtmlBlobKey, Buffer.from("<p>html</p>"));
+        const old = await createMessage({
+            sentDate: new Date(Date.now() - 35 * DAY_MS),
+            bodyBlobKey,
+            sanitizedHtmlBlobKey,
+            hasAttachments: true,
+        });
+
+        const attachmentBlobKey = `attachments/${uuid.v4()}`;
+        const extractedTextBlobKey = `extracted/${uuid.v4()}`;
+        await blobStore.put(attachmentBlobKey, Buffer.from("attachment bytes"));
+        await blobStore.put(extractedTextBlobKey, Buffer.from("extracted text"));
+        const attachment = await attachmentRepo.save(
+            new AttachmentMongo({
+                mailboxUid: old.mailboxUid,
+                folderUid: old.folderUid,
+                messageUid: old.uid,
+                filename: "file.txt",
+                mimeType: "text/plain",
+                blobKey: attachmentBlobKey,
+                extractedTextBlobKey,
+            }),
+        );
+
+        await job.run();
+
+        expect(await messageRepo.findOne({ uid: old.uid } as any)).toBeFalsy();
+        expect(await attachmentRepo.findOne({ uid: attachment.uid } as any)).toBeFalsy();
+        expect(await blobStore.exists(bodyBlobKey)).toBe(false);
+        expect(await blobStore.exists(sanitizedHtmlBlobKey)).toBe(false);
+        expect(await blobStore.exists(attachmentBlobKey)).toBe(false);
+        expect(await blobStore.exists(extractedTextBlobKey)).toBe(false);
+    });
+
+    it("Skips deleting a sanitizedHtmlBlobKey/extractedTextBlobKey that was never set, and still purges an attachment with no extractedTextBlobKey.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", messageRetentionDays: 30 }));
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        await blobStore.put(bodyBlobKey, Buffer.from("raw"));
+        const old = await createMessage({ sentDate: new Date(Date.now() - 35 * DAY_MS), bodyBlobKey, hasAttachments: true });
+        const attachmentBlobKey = `attachments/${uuid.v4()}`;
+        await blobStore.put(attachmentBlobKey, Buffer.from("attachment bytes"));
+        const attachment = await attachmentRepo.save(
+            new AttachmentMongo({
+                mailboxUid: old.mailboxUid,
+                folderUid: old.folderUid,
+                messageUid: old.uid,
+                filename: "file.txt",
+                mimeType: "text/plain",
+                blobKey: attachmentBlobKey,
+            }),
+        );
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        expect(await messageRepo.findOne({ uid: old.uid } as any)).toBeFalsy();
+        expect(await attachmentRepo.findOne({ uid: attachment.uid } as any)).toBeFalsy();
+    });
+
+    it("Logs a warning and still purges the parent message when one of its attachments fails to purge.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", messageRetentionDays: 30 }));
+        const old = await createMessage({ sentDate: new Date(Date.now() - 35 * DAY_MS), hasAttachments: true });
+        await attachmentRepo.save(
+            new AttachmentMongo({
+                mailboxUid: old.mailboxUid,
+                folderUid: old.folderUid,
+                messageUid: old.uid,
+                filename: "file.txt",
+                mimeType: "text/plain",
+                blobKey: `attachments/${uuid.v4()}-does-not-exist`,
+            }),
+        );
+
+        vi.spyOn((job as any).attachmentRepo, "delete").mockRejectedValueOnce(new Error("simulated delete failure"));
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        expect(await messageRepo.findOne({ uid: old.uid } as any)).toBeFalsy();
     });
 
     it("Keeps a message within the retention window.", async () => {

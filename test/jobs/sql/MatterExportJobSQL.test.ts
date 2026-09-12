@@ -5,7 +5,7 @@
 // Real-DB + real-DI integration test for MatterExportJobSQL - see DataExportJobSQL.test.ts's/
 // QuarantineRetentionJobSQL.test.ts's file headers for the full rationale (bypasses `Server`, wires a real
 // ObjectFactory/ConnectionManager directly).
-import { ACLUtils, AccessControlListSQL, ConnectionManager, ObjectFactory, isSqlDataSource } from "@rapidrest/service-core";
+import { ACLUtils, AccessControlListSQL, ConnectionManager, ObjectFactory, RepoUtils, isSqlDataSource } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
@@ -349,6 +349,43 @@ describe("MatterExportJobSQL Tests (real DB + DI)", () => {
         } finally {
             (job as any).maxContentRows = original;
         }
+    });
+
+    it("Leaves the request 'ready' (not stuck/failed) when recording one mailbox's own escrow audit entry fails after the bundle is already stored - the disclosure already happened and must not be silently un-attested nor mistaken for a failed export.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailboxA = await createMailbox({ escrowScopeId });
+        const mailboxB = await createMailbox({ escrowScopeId });
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailboxA.uid, mailboxB.uid] });
+        const request = await createRequest({ matterId: matter.uid });
+
+        // `recordEscrowAuditEntry()`'s own internal `EscrowAuditLogEntrySQL` `RepoUtils` instance is
+        // constructed and cached (`EscrowAuditUtils.ts`'s own module-level `WeakMap`) independently of
+        // this test file's own `escrowAuditLogRepo` - patched at the shared `RepoUtils.prototype.create`
+        // level instead, filtered to that one target class, so mailboxA's first 5 attempts
+        // (MAX_APPEND_ATTEMPTS, see EscrowAuditUtils.ts) genuinely exhaust its retry loop and throw,
+        // simulating real concurrent `sequence` contention without needing to actually win that race;
+        // mailboxB's own later attempt (and every other entity type's own `RepoUtils.create()` call this
+        // job makes) is unaffected and behaves normally.
+        const originalCreate = RepoUtils.prototype.create;
+        let escrowCreateAttempts = 0;
+        vi.spyOn(RepoUtils.prototype, "create").mockImplementation(async function (this: any, obj: any, options: any) {
+            if (this.modelClass?.name === "EscrowAuditLogEntrySQL" && escrowCreateAttempts < 5) {
+                escrowCreateAttempts++;
+                throw new Error("simulated sequence contention");
+            }
+            return originalCreate.call(this, obj, options);
+        });
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("ready");
+        expect(updated!.blobKey).toBeTruthy();
+
+        // mailboxA's own attestation failed and was not retried; mailboxB's own later attestation still
+        // succeeded despite mailboxA's failure not blocking the rest of the loop.
+        const entries = await escrowAuditLogRepo.find({ where: { action: EscrowAuditAction.MATTER_EXPORT_READY } });
+        expect(entries.map((e) => e.mailboxUid)).toEqual([mailboxB.uid]);
     });
 
     it("Logs an error when even marking a request failed itself throws.", async () => {

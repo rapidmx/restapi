@@ -807,7 +807,15 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * adds to `CRUDRoute.delete()` - `truncate()` has no `purge` option at all (it is unconditionally a
      * hard, permanent delete for every mailbox it matches, the same as `delete()`'s own irreversibility
      * here), so leaving it unchecked would let a caller destroy a held mailbox simply by preferring this
-     * bulk endpoint over the equivalent singular `delete()` call.
+     * bulk endpoint over the equivalent singular `delete()` call. The final delete is re-scoped to exactly
+     * the uids just checked, never delegated to `super.truncate()` with the original `params`/`query` -
+     * `RepoUtils.truncate()` re-executes that filter live at the moment it runs, independent of `matched`
+     * above; passing it through unchanged would let a mailbox that starts matching in the gap between the
+     * snapshot and this call be deleted having never been through `assertNotOnLegalHold()` at all. Safe to
+     * pair with `ignoreACL: true` here specifically because this method is only ever reachable by a
+     * trusted caller in the first place (`Mailbox`'s own deny-by-default class ACL fast-fails anyone else
+     * before this method's body ever runs) - `matched` already reflects exactly what that trusted caller's
+     * own unconditional bypass would return either way.
      */
     @Delete()
     public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
@@ -815,6 +823,9 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         const matched: T[] = await this.findAllForTruncate(params, query, user);
+        if (matched.length === 0) {
+            return;
+        }
         for (const existing of matched) {
             try {
                 await assertNotOnLegalHold(this._objectFactory!, this.matterClass, existing.uid);
@@ -833,6 +844,9 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 throw err;
             }
         }
-        await super.truncate(params, query, user);
+        await this.repoUtils.truncate({ uid: `in(${matched.map((existing) => existing.uid).join(",")})` } as any, {
+            user,
+            ignoreACL: true,
+        });
     }
 }
