@@ -175,6 +175,41 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
         expect(FakeAcmeClient.createAccountCallCount).toBe(1);
     });
 
+    describe("findPendingEnrollmentId()", () => {
+        it("Returns undefined when no enrollments exist at all.", async () => {
+            await expect(enrollment.findPendingEnrollmentId("nobody@example.com", "acme-challenge@acme.test")).resolves.toBeUndefined();
+        });
+
+        it("Finds the id for a matching pending enrollment, case-insensitively.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("find-me@example.com", await generateCsr("find-me@example.com"));
+
+            await expect(
+                enrollment.findPendingEnrollmentId("FIND-ME@EXAMPLE.COM", "ACME-CHALLENGE+ABC123@ACME.TEST"),
+            ).resolves.toBe(enrollmentId);
+        });
+
+        it("Returns undefined when an enrollment exists but the identity doesn't match (loop continues past it).", async () => {
+            await enrollment.startEnrollment("someone-else@example.com", await generateCsr("someone-else@example.com"));
+
+            await expect(enrollment.findPendingEnrollmentId("not-a-match@example.com", "acme-challenge+abc123@acme.test")).resolves.toBeUndefined();
+        });
+
+        it("Returns undefined when an enrollment exists but the challenge from-address doesn't match.", async () => {
+            await enrollment.startEnrollment("mismatched-from@example.com", await generateCsr("mismatched-from@example.com"));
+
+            await expect(enrollment.findPendingEnrollmentId("mismatched-from@example.com", "someone-else@acme.test")).resolves.toBeUndefined();
+        });
+
+        it("Returns undefined once the enrollment has already recorded its token-part1.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("already-tokened@example.com", await generateCsr("already-tokened@example.com"));
+            await enrollment.recordChallengeToken(enrollmentId, "token-part-1", "reply@acme.test", "<id@acme.test>", "ACME: token-part-1");
+
+            await expect(
+                enrollment.findPendingEnrollmentId("already-tokened@example.com", "acme-challenge+abc123@acme.test"),
+            ).resolves.toBeUndefined();
+        });
+    });
+
     describe("recordChallengeToken()", () => {
         it("Computes and persists the RFC 8823 digest from token-part1 + token-part2.", async () => {
             const csr: string = await generateCsr("digest@example.com");

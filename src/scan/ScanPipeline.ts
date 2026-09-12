@@ -68,6 +68,10 @@ export interface ScanPipelineResult {
     /** The RFC 2369/8058 `List-Unsubscribe` header value, if present - the strongest single bulk-mail
      * indicator, used by `classifyMessage()` (`util/FocusedInboxUtils.ts`). */
     listUnsubscribeHeader?: string;
+    /** The bare address from the message's `Reply-To` header, if present - RFC 8823's `email-reply-00`
+     * challenge reply must be addressed here (falling back to `fromAddress` when absent), see
+     * `ScanQueueJob`'s ACME challenge-email correlation. */
+    replyToAddress?: string;
     /** The message's parsed `Message-ID` header, angle brackets stripped (mailparser's own `parsed.messageId`
      * does NOT strip them, unlike its `parsed.from`/etc. normalization - stripped explicitly here so a value
      * from this field compares equal to `MailSendUtils.scanAndRelay()`'s own bracket-stripped `messageId`,
@@ -187,6 +191,7 @@ export class ScanPipeline {
         const autoSubmittedHeader: string | undefined = this.getHeaderString(parsed, "auto-submitted");
         const precedenceHeader: string | undefined = this.getHeaderString(parsed, "precedence");
         const listUnsubscribeHeader: string | undefined = this.getRawHeaderLine(parsed, "list-unsubscribe");
+        const replyToAddress: string | undefined = this.getHeaderAddress(parsed, "reply-to");
         const icsPart: string | undefined = this.deriveIcsPart(parsed);
         const recallOfMessageId: string | undefined = this.getHeaderString(parsed, "x-rapidmx-recall-of");
         const dispositionNotificationTo: string | undefined = this.getHeaderAddress(parsed, "disposition-notification-to");
@@ -216,6 +221,7 @@ export class ScanPipeline {
             autoSubmittedHeader,
             precedenceHeader,
             listUnsubscribeHeader,
+            replyToAddress,
             messageIdHeader,
             icsPart,
             recallOfMessageId,

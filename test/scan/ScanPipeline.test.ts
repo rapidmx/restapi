@@ -367,6 +367,37 @@ describe("ScanPipeline Tests", () => {
         });
     });
 
+    describe("run() - Reply-To extraction", () => {
+        beforeEach(() => {
+            (pipeline as any).spamScanProvider = spamScanProvider;
+            (pipeline as any).avScanProvider = avScanProvider;
+        });
+
+        it("Extracts replyToAddress from a Reply-To header.", async () => {
+            const raw = Buffer.from(
+                [
+                    "From: sender@example.com",
+                    "To: recipient@example.com",
+                    "Reply-To: Someone Else <someone-else@example.com>",
+                    "Subject: Test message",
+                    "",
+                    "Body.",
+                    "",
+                ].join("\r\n"),
+            );
+
+            const result = await pipeline.run(raw, makeEnvelope());
+
+            expect(result.replyToAddress).toBe("someone-else@example.com");
+        });
+
+        it("Leaves replyToAddress undefined when no Reply-To header is present.", async () => {
+            const result = await pipeline.run(makePlainRawMessage(), makeEnvelope());
+
+            expect(result.replyToAddress).toBeUndefined();
+        });
+    });
+
     describe("run() - In-Reply-To/References extraction", () => {
         beforeEach(() => {
             (pipeline as any).spamScanProvider = spamScanProvider;

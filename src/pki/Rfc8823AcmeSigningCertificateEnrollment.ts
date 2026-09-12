@@ -232,6 +232,37 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
     }
 
     /**
+     * Finds the pending enrollment (if any) still awaiting its RFC 8823 challenge email for
+     * `identity`, whose challenge is expected to arrive `from` that exact address - the inbound
+     * mail-ingest pipeline's own correlator (`ScanQueueJob`) calls this for every candidate message
+     * (one whose `Auto-Submitted`/`Subject` shape already looks like an ACME challenge) before ever
+     * treating it as CA plumbing, since nothing in the challenge email itself carries this server's
+     * own `enrollmentId` - only a real, still-outstanding enrollment for this exact (identity, from)
+     * pair should ever be matched. Comparison is case-insensitive (email addresses' domain part is
+     * always case-insensitive, and the local part is, in practice, treated the same way by virtually
+     * every real mailbox).
+     *
+     * Returns `undefined` - never throws - when nothing matches, so a spoofed or stale
+     * lookalike message safely falls through to normal delivery instead of being silently dropped.
+     */
+    public async findPendingEnrollmentId(identity: string, from: string): Promise<string | undefined> {
+        const store: Record<string, PendingEnrollment> = await this.loadStore();
+        const normalizedIdentity: string = identity.toLowerCase();
+        const normalizedFrom: string = from.toLowerCase();
+        for (const [enrollmentId, enrollment] of Object.entries(store)) {
+            if (
+                enrollment.status === "pending" &&
+                enrollment.tokenPart1 === undefined &&
+                enrollment.identity.toLowerCase() === normalizedIdentity &&
+                enrollment.challengeFrom.toLowerCase() === normalizedFrom
+            ) {
+                return enrollmentId;
+            }
+        }
+        return undefined;
+    }
+
+    /**
      * Records the RFC 8823 challenge email's own contribution - token-part1, plus the headers the
      * reply needs (`replyTo`/`messageId`/`subject`) - once the inbound correlator recognizes it, and
      * computes the digest the reply email's body must carry.

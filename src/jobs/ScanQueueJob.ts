@@ -72,6 +72,20 @@ function recurrenceIdsMatch(a: Date | undefined, b: Date | undefined): boolean {
 }
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
+/** The two `Rfc8823AcmeSigningCertificateEnrollment`-specific methods `tryCorrelateAcmeChallenge()`
+ * needs - see `signingCertificateEnrollment`'s own doc comment on why this is a local, narrow shape
+ * rather than an import of that concrete class (this file has no other reason to depend on `src/pki/`
+ * at all) or an addition to the shared `SigningCertificateEnrollment` interface. */
+interface AcmeChallengeCorrelator {
+    findPendingEnrollmentId?(identity: string, from: string): Promise<string | undefined>;
+    recordChallengeToken?(enrollmentId: string, tokenPart1: string, replyTo: string, messageId: string, subject: string): Promise<void>;
+}
+
+/** RFC 8823's own challenge-email format - see `Rfc8823AcmeSigningCertificateEnrollment`'s doc comment
+ * and the RFC itself: `Subject: ACME: <token-part1>`, optionally `Re: `-prefixed once a mail client
+ * (not relevant here, but real ones exist) replies-of-a-reply. */
+const ACME_CHALLENGE_SUBJECT = /^(?:Re: )?ACME: (.+)$/;
+
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 /** How far past a booking request's own start `decideResourceBooking()` looks for conflicts against an
  * indefinitely-recurring existing booking - a bound on worst-case cost, not a real policy limit. */
@@ -175,6 +189,17 @@ export abstract class ScanQueueJob<
      * register/consume, so every deployment and test environment already has one. */
     @Inject("DnsResolver")
     private dnsResolver?: DnsResolver;
+
+    /** Same DI token every `SigningCertificateEnrollment` consumer registers under (see
+     * `BaseKeyVaultRoute`'s identical `EncryptionCertificateAuthority` pattern) - typed loosely here
+     * rather than as the shared `SigningCertificateEnrollment` interface, since
+     * `findPendingEnrollmentId()`/`recordChallengeToken()` are specific to the real RFC 8823
+     * implementation, not something `NullSigningCertificateEnrollment`/`ManualSigningCertificateEnrollment`
+     * have any business declaring. `tryCorrelateAcmeChallenge()` feature-detects both methods before
+     * calling either, so a deployment running a different implementation (including the `Null` default)
+     * simply never matches - every inbound message falls through to normal delivery unchanged. */
+    @Inject("SigningCertificateEnrollment")
+    private signingCertificateEnrollment?: AcmeChallengeCorrelator;
 
     @Config("mail:jobs:scan_queue:schedule", "*/10 * * * * *")
     private scheduleExpr: string = "*/10 * * * * *";
@@ -369,6 +394,12 @@ export abstract class ScanQueueJob<
             // An inbound MDN receipt is never filed either - only the indicator it stamps onto the original
             // sent message, if any is found - see processReceipt()'s own doc comment.
             await this.processReceipt(entry, raw, result.dispositionNotificationPart);
+        } else if (verdict === "deliver" && (await this.tryCorrelateAcmeChallenge(entry, result))) {
+            // A real RFC 8823 challenge email is CA-internal plumbing, never filed either - same treatment
+            // recall control messages and inbound MDNs already get. Unlike those two, correlation here can
+            // genuinely fail (a spoofed or stale lookalike, or no outstanding enrollment at all) - in that
+            // case `tryCorrelateAcmeChallenge()` itself returns `false` and this branch is never taken, so
+            // the message falls through to ordinary delivery below rather than being silently dropped.
         } else {
             await this.deliverMessage(entry, raw, targetUid, scanResult, result, verdict === "junk");
 
@@ -1044,6 +1075,59 @@ export abstract class ScanQueueJob<
         } catch (err: any) {
             this.logger?.warn(`ScanQueueJob: failed to send recall report for mailbox ${entry.mailboxUid}: ${err.message}`);
         }
+    }
+
+    /**
+     * Recognizes an inbound RFC 8823 `email-reply-00` challenge email and, if it correlates to a real
+     * outstanding enrollment, records its token-part1 via `recordChallengeToken()` - see this class's
+     * own `signingCertificateEnrollment` field doc comment and `processEntry()`'s calling branch for
+     * why a `false` return (never filed, never treated as ACME plumbing either) is the safe default
+     * for anything that doesn't fully correlate.
+     *
+     * Cheap checks first (`Auto-Submitted` header, `Subject` shape) before ever touching the injected
+     * enrollment service or performing its lookup - the overwhelming majority of inbound mail never
+     * has this header at all.
+     */
+    private async tryCorrelateAcmeChallenge(entry: Q, result: ScanPipelineResult): Promise<boolean> {
+        if (result.autoSubmittedHeader !== "auto-generated; type=acme") {
+            return false;
+        }
+        const subjectMatch: RegExpMatchArray | null = result.subject ? ACME_CHALLENGE_SUBJECT.exec(result.subject) : null;
+        if (!subjectMatch || !result.fromAddress || !result.messageIdHeader) {
+            return false;
+        }
+        if (
+            typeof this.signingCertificateEnrollment?.findPendingEnrollmentId !== "function" ||
+            typeof this.signingCertificateEnrollment.recordChallengeToken !== "function"
+        ) {
+            return false;
+        }
+        // `entry.envelopeTo` is the raw SMTP `RCPT TO` address(es) for this delivery, which need not be
+        // this mailbox's own `primarySmtpAddress` (an alias, or another recipient in the same
+        // transaction) - `startEnrollment()`'s `identity` is always submitted as the mailbox's real
+        // primary address (see the REST endpoint that calls it), so that's what correlation matches
+        // against here, not the envelope.
+        const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            return false;
+        }
+
+        const enrollmentId: string | undefined = await this.signingCertificateEnrollment.findPendingEnrollmentId(
+            mailbox.primarySmtpAddress,
+            result.fromAddress,
+        );
+        if (!enrollmentId) {
+            return false;
+        }
+
+        await this.signingCertificateEnrollment.recordChallengeToken(
+            enrollmentId,
+            subjectMatch[1],
+            result.replyToAddress ?? result.fromAddress,
+            result.messageIdHeader,
+            result.subject!,
+        );
+        return true;
     }
 
     /**
