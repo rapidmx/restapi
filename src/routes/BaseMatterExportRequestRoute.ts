@@ -45,6 +45,7 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
 
     private requestRepo?: RepoUtils<T>;
     private matterRepo?: RepoUtils<M>;
+    private mailboxRepo?: RepoUtils<MB>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -63,6 +64,12 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
             this.matterRepo = await this._objectFactory!.newInstance(RepoUtils, {
                 name: this.matterClass.name,
                 args: [this.matterClass],
+            });
+        }
+        if (!this.mailboxRepo) {
+            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
             });
         }
     }
@@ -94,6 +101,16 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
             { ignoreACL: true },
         );
         for (const mailboxUid of matter.custodianMailboxUids) {
+            // Same "both must agree" check `MatterExportJob`/`BaseMatterSearchRoute` apply before actually
+            // touching a custodian mailbox's content - `custodianMailboxUids` is holder-set, unvalidated
+            // free text, so a mismatched mailbox here would never end up in the export those two skip it
+            // for anyway. Recording a `MATTER_EXPORT_REQUESTED` entry for it regardless would leave the
+            // hash-chained escrow ledger permanently, falsely implying that mailbox was ever actually in
+            // scope for this request.
+            const mailbox: MB | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
+            if (!mailbox || mailbox.escrowScopeId !== matter.escrowScopeId) {
+                continue;
+            }
             await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
                 action: EscrowAuditAction.MATTER_EXPORT_REQUESTED,
                 holderUserUid: user!.uid,

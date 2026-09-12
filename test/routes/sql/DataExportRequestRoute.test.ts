@@ -146,12 +146,15 @@ describe("Route:DataExportRequestSQL Tests", () => {
     });
 
     describe("GET /data-export-requests", () => {
-        it("An ordinary user sees only their own requests.", async () => {
+        it("An ordinary user sees their own requests, plus any other request made for a mailbox they own (e.g. an admin-mediated one).", async () => {
             const mailbox = await createMailbox(owner.uid);
-            await requestRepo.save(
+            const ownRequest = await requestRepo.save(
                 new DataExportRequestSQL({ mailboxUid: mailbox.uid, requestedByUserUid: owner.uid, format: "json", status: "pending" }),
             );
-            await requestRepo.save(
+            // Simulates an admin-mediated request for the owner's own mailbox - `requestedByUserUid` here
+            // is the requester's uid (an admin, in practice), never the owner's, so the owner could
+            // otherwise never discover this request exists via this list endpoint at all.
+            const requestForOwnedMailbox = await requestRepo.save(
                 new DataExportRequestSQL({ mailboxUid: mailbox.uid, requestedByUserUid: otherUser.uid, format: "json", status: "pending" }),
             );
 
@@ -160,8 +163,25 @@ describe("Route:DataExportRequestSQL Tests", () => {
                 .set("Authorization", "jwt " + ownerToken);
 
             expect(result.status).toBe(200);
+            expect(result.body.map((r: any) => r.uid).sort()).toEqual([ownRequest.uid, requestForOwnedMailbox.uid].sort());
+        });
+
+        it("A caller who made a request for someone else's mailbox sees only their own request, not the mailbox owner's other requests.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await requestRepo.save(
+                new DataExportRequestSQL({ mailboxUid: mailbox.uid, requestedByUserUid: owner.uid, format: "json", status: "pending" }),
+            );
+            const requestByOtherUser = await requestRepo.save(
+                new DataExportRequestSQL({ mailboxUid: mailbox.uid, requestedByUserUid: otherUser.uid, format: "json", status: "pending" }),
+            );
+
+            const result = await request(server.getApplication())
+                .get(baseUrl)
+                .set("Authorization", "jwt " + otherUserToken);
+
+            expect(result.status).toBe(200);
             expect(result.body.length).toBe(1);
-            expect(result.body[0].requestedByUserUid).toBe(owner.uid);
+            expect(result.body[0].uid).toBe(requestByOtherUser.uid);
         });
 
         it("A trusted admin sees every request.", async () => {

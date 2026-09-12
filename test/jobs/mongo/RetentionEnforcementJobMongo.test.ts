@@ -229,6 +229,39 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
         expect(found).toBeTruthy();
     });
 
+    it("Skips (does not purge) an expired AuditLogEntry under an active legal hold, and retries it on a later run once the hold lifts.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", auditLogRetentionDays: 2190 }));
+        const mailboxUid = uuid.v4();
+        const oldDate = new Date(Date.now() - 2200 * DAY_MS);
+        const old = await createAuditLogEntry({ mailboxUid, dateCreated: oldDate });
+        const matter = await createMatter({
+            custodianMailboxUids: [mailboxUid],
+            dateRangeStart: new Date(oldDate.getTime() - DAY_MS),
+            dateRangeEnd: new Date(oldDate.getTime() + DAY_MS),
+        });
+
+        await job.run();
+
+        const stillHeld = await auditLogRepo.findOne({ uid: old.uid } as any);
+        expect(stillHeld).toBeTruthy();
+
+        await matterRepo.updateOne({ uid: matter.uid } as any, { $set: { closedAt: new Date() } } as any);
+        await job.run();
+
+        const nowPurged = await auditLogRepo.findOne({ uid: old.uid } as any);
+        expect(nowPurged).toBeFalsy();
+    });
+
+    it("Purges an expired AuditLogEntry with a mailboxUid that isn't under any active hold, same as one with no mailboxUid at all.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", auditLogRetentionDays: 2190 }));
+        const old = await createAuditLogEntry({ mailboxUid: uuid.v4(), dateCreated: new Date(Date.now() - 2200 * DAY_MS) });
+
+        await job.run();
+
+        const found = await auditLogRepo.findOne({ uid: old.uid } as any);
+        expect(found).toBeFalsy();
+    });
+
     it("Bounds how many expired messages are purged per run to the configured batch size.", async () => {
         await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", messageRetentionDays: 30 }));
         (job as any).batchSize = 2;

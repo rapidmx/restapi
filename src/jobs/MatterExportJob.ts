@@ -157,6 +157,15 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
 
         const dateRange = { start: matter.dateRangeStart, end: matter.dateRangeEnd };
         const allLines: string[] = [];
+        // Collected here and only actually recorded (below) once the export bundle as a whole has been
+        // successfully written and the request marked "ready" - see this class's own doc comment. Each
+        // `EscrowAuditLogEntry` is a permanent, hash-chained attestation that a specific mailbox's content
+        // was included in a completed, downloadable export; recording it any earlier (e.g. immediately
+        // after that one mailbox's own content was collected) would let a LATER custodian's failure - a
+        // `collectMailboxContentLines()` row-cap overrun, a transient DB/blob error - mark the whole
+        // request "failed" while leaving behind a permanent, unfixable record falsely attesting that an
+        // export completed for the mailboxes already processed.
+        const includedMailboxUids: string[] = [];
         for (const mailboxUid of matter.custodianMailboxUids) {
             const mailbox: MB | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
             if (!mailbox) {
@@ -184,13 +193,7 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
                 this.maxContentRows,
             );
             allLines.push(...lines);
-            await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
-                action: EscrowAuditAction.MATTER_EXPORT_READY,
-                holderUserUid: request.requestedByUserUid,
-                matterId: matter.uid,
-                mailboxUid,
-                requestId: request.uid,
-            });
+            includedMailboxUids.push(mailboxUid);
         }
 
         const blobKey = `matter-exports/${request.uid}.ndjson`;
@@ -201,6 +204,16 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
             request,
             { ignoreACL: true },
         );
+
+        for (const mailboxUid of includedMailboxUids) {
+            await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
+                action: EscrowAuditAction.MATTER_EXPORT_READY,
+                holderUserUid: request.requestedByUserUid,
+                matterId: matter.uid,
+                mailboxUid,
+                requestId: request.uid,
+            });
+        }
     }
 
     private async markFailed(request: T, errorMessage: string): Promise<void> {

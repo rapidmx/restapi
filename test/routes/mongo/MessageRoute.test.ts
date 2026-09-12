@@ -1028,6 +1028,37 @@ describe("Route:MessageMongo Tests", () => {
             expect(result.status).toBeGreaterThanOrEqual(200);
             expect(result.status).toBeLessThan(300);
         });
+
+        it("Blocks a bulk truncate() of messages in a folder under an open Matter's hold - a caller cannot route around the singular purge-delete guard by using the bulk endpoint instead.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, { sentDate: new Date("2025-06-01") });
+            await createMatter({ custodianMailboxUids: [mailbox.uid] });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}?folderUid=${folder.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(409);
+            const stillExists = await messageRepo.findOne({ uid: message.uid } as any);
+            expect(stillExists).toBeTruthy();
+        });
+
+        it("Allows a bulk truncate() of messages in a folder once the matter is closed.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, { sentDate: new Date("2025-06-01") });
+            await createMatter({ custodianMailboxUids: [mailbox.uid], closedAt: new Date() });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}?folderUid=${folder.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            const stillExists = await messageRepo.findOne({ uid: message.uid } as any);
+            expect(stillExists).toBeFalsy();
+        });
     });
 
     describe("classify()", () => {

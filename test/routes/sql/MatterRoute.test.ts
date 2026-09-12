@@ -9,6 +9,7 @@ import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
+import { EscrowAccessRequestSQL } from "../../../src/models/sql/EscrowAccessRequestSQL.js";
 import { EscrowScopeSQL } from "../../../src/models/sql/EscrowScopeSQL.js";
 import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { AuditAction } from "../../../src/models/types.js";
@@ -22,6 +23,7 @@ describe("Route:MatterSQL Tests", () => {
     let escrowScopeRepo: Repository<EscrowScopeSQL>;
     let matterRepo: Repository<MatterSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
+    let escrowAccessRequestRepo: Repository<EscrowAccessRequestSQL>;
 
     const holderA: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const holderAToken = JWTUtils.createTokenSync(config.get("auth"), holderA);
@@ -66,6 +68,7 @@ describe("Route:MatterSQL Tests", () => {
             escrowScopeRepo = conn.getRepository(EscrowScopeSQL);
             matterRepo = conn.getRepository(MatterSQL);
             auditLogRepo = conn.getRepository(AuditLogEntrySQL);
+            escrowAccessRequestRepo = conn.getRepository(EscrowAccessRequestSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -80,6 +83,7 @@ describe("Route:MatterSQL Tests", () => {
         await matterRepo.clear();
         await escrowScopeRepo.clear();
         await auditLogRepo.clear();
+        await escrowAccessRequestRepo.clear();
     });
 
     it("Rejects creating a matter as a non-holder of the referenced scope (403).", async () => {
@@ -246,6 +250,26 @@ describe("Route:MatterSQL Tests", () => {
             .set("Authorization", "jwt " + holderAToken);
         expect(deleteResult.status).toBeGreaterThanOrEqual(200);
         expect(deleteResult.status).toBeLessThan(300);
+    });
+
+    it("Rejects deleting a single matter that still has EscrowAccessRequests referencing it (409).", async () => {
+        const scope = await createEscrowScope();
+        const matter = await createMatter(scope.uid);
+        await escrowAccessRequestRepo.save(
+            new EscrowAccessRequestSQL({
+                matterId: matter.uid,
+                mailboxUid: matter.custodianMailboxUids[0],
+                requestedByUserUid: holderA.uid,
+                status: "pending",
+            }),
+        );
+
+        const result = await request(server.getApplication())
+            .delete(`${baseUrl}/${matter.uid}`)
+            .set("Authorization", "jwt " + holderAToken);
+
+        expect(result.status).toBe(409);
+        expect(await matterRepo.findOne({ where: { uid: matter.uid } })).not.toBeNull();
     });
 
     it("Rejects changing escrowScopeId on update (400).", async () => {
@@ -433,5 +457,188 @@ describe("Route:MatterSQL Tests", () => {
             .get(`${baseUrl}/${uuid.v4()}`)
             .set("Authorization", "jwt " + holderAToken);
         expect(result.status).toBe(404);
+    });
+
+    describe("PUT /matters (updateBulk)", () => {
+        it("A holder can bulk-update matters under their own scope.", async () => {
+            const scope = await createEscrowScope();
+            const matterA = await createMatter(scope.uid, { name: "A" });
+            const matterB = await createMatter(scope.uid, { name: "B" });
+
+            const result = await request(server.getApplication())
+                .put(baseUrl)
+                .set("Authorization", "jwt " + holderAToken)
+                .send([
+                    { uid: matterA.uid, version: matterA.version, name: "A renamed" },
+                    { uid: matterB.uid, version: matterB.version, name: "B renamed" },
+                ]);
+
+            expect(result.status).toBe(200);
+            expect(result.body.map((m: any) => m.name).sort()).toEqual(["A renamed", "B renamed"]);
+        });
+
+        it("A trusted admin who is not a holder cannot bulk-update matters (403) - proves separation of duties extends to the bulk endpoint, not just the singular one.", async () => {
+            const scope = await createEscrowScope();
+            const matter = await createMatter(scope.uid);
+
+            const result = await request(server.getApplication())
+                .put(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send([{ uid: matter.uid, version: matter.version, name: "renamed" }]);
+
+            expect(result.status).toBe(403);
+            const stillOriginal = await matterRepo.findOne({ where: { uid: matter.uid } });
+            expect(stillOriginal!.name).toBe("Investigation A");
+        });
+
+        it("Stops (403) at the first matter in the batch not held by the caller, without touching any entry after it - matches this endpoint's own simple sequential-loop semantics (not a rollback of entries already applied earlier in the same batch).", async () => {
+            const scope = await createEscrowScope();
+            const otherScope = await createEscrowScope({ name: "other", holderUserUids: [holderB.uid] });
+            const notHeldMatter = await createMatter(otherScope.uid, { name: "Not Held" });
+            const neverReached = await createMatter(scope.uid, { name: "Never Reached" });
+
+            const result = await request(server.getApplication())
+                .put(baseUrl)
+                .set("Authorization", "jwt " + holderAToken)
+                .send([
+                    { uid: notHeldMatter.uid, version: notHeldMatter.version, name: "Not Held renamed" },
+                    { uid: neverReached.uid, version: neverReached.version, name: "Never Reached renamed" },
+                ]);
+
+            expect(result.status).toBe(403);
+            expect((await matterRepo.findOne({ where: { uid: notHeldMatter.uid } }))!.name).toBe("Not Held");
+            expect((await matterRepo.findOne({ where: { uid: neverReached.uid } }))!.name).toBe("Never Reached");
+        });
+
+        it("Rejects a closed matter within a bulk update (400).", async () => {
+            const scope = await createEscrowScope();
+            const matter = await createMatter(scope.uid, { closedAt: new Date() });
+
+            const result = await request(server.getApplication())
+                .put(baseUrl)
+                .set("Authorization", "jwt " + holderAToken)
+                .send([{ uid: matter.uid, version: matter.version, name: "renamed" }]);
+
+            expect(result.status).toBe(400);
+        });
+    });
+
+    describe("PUT /matters/:id/:property (updateProperty)", () => {
+        it("A holder can update a single property of their own matter.", async () => {
+            const scope = await createEscrowScope();
+            const matter = await createMatter(scope.uid);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${matter.uid}/name`)
+                .set("Authorization", "jwt " + holderAToken)
+                .send("renamed via property");
+
+            expect(result.status).toBe(200);
+            expect(result.body.name).toBe("renamed via property");
+        });
+
+        it("A trusted admin who is not a holder cannot update a single property (403) - proves separation of duties extends to this endpoint too.", async () => {
+            const scope = await createEscrowScope();
+            const matter = await createMatter(scope.uid);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${matter.uid}/name`)
+                .set("Authorization", "jwt " + adminToken)
+                .send("renamed");
+
+            expect(result.status).toBe(403);
+            const stillOriginal = await matterRepo.findOne({ where: { uid: matter.uid } });
+            expect(stillOriginal!.name).toBe("Investigation A");
+        });
+
+        it("Rejects changing escrowScopeId via updateProperty (400).", async () => {
+            const scope = await createEscrowScope();
+            const otherScope = await createEscrowScope({ name: "other" });
+            const matter = await createMatter(scope.uid);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${matter.uid}/escrowScopeId`)
+                .set("Authorization", "jwt " + holderAToken)
+                .send(otherScope.uid);
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects updateProperty on an already-closed matter (400).", async () => {
+            const scope = await createEscrowScope();
+            const matter = await createMatter(scope.uid, { closedAt: new Date() });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${matter.uid}/name`)
+                .set("Authorization", "jwt " + holderAToken)
+                .send("renamed");
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Returns 404 for updateProperty on a nonexistent matter.", async () => {
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${uuid.v4()}/name`)
+                .set("Authorization", "jwt " + holderAToken)
+                .send("renamed");
+
+            expect(result.status).toBe(404);
+        });
+    });
+
+    describe("DELETE /matters (truncate)", () => {
+        it("A holder truncating matters only deletes ones under their own held scope(s), leaving other holders' matters untouched.", async () => {
+            const scope = await createEscrowScope();
+            const otherScope = await createEscrowScope({ name: "other", holderUserUids: [holderB.uid] });
+            const ownMatter = await createMatter(scope.uid);
+            const notHeldMatter = await createMatter(otherScope.uid);
+
+            const result = await request(server.getApplication()).delete(baseUrl).set("Authorization", "jwt " + holderAToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(await matterRepo.findOne({ where: { uid: ownMatter.uid } })).toBeNull();
+            expect(await matterRepo.findOne({ where: { uid: notHeldMatter.uid } })).not.toBeNull();
+        });
+
+        it("A holder of a scope with no matters at all under it succeeds with a no-op, not an error.", async () => {
+            await createEscrowScope();
+
+            const result = await request(server.getApplication()).delete(baseUrl).set("Authorization", "jwt " + holderAToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+        });
+
+        it("A trusted admin who is not a holder of any scope truncates nothing - proves separation of duties extends to this endpoint too.", async () => {
+            const scope = await createEscrowScope();
+            const matter = await createMatter(scope.uid);
+
+            const result = await request(server.getApplication()).delete(baseUrl).set("Authorization", "jwt " + adminToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(await matterRepo.findOne({ where: { uid: matter.uid } })).not.toBeNull();
+        });
+
+        it("Rejects truncating a matter that still has EscrowAccessRequests referencing it (409), leaving it and any other held matter alone.", async () => {
+            const scope = await createEscrowScope();
+            const referenced = await createMatter(scope.uid, { name: "Referenced" });
+            const unreferenced = await createMatter(scope.uid, { name: "Unreferenced" });
+            await escrowAccessRequestRepo.save(
+                new EscrowAccessRequestSQL({
+                    matterId: referenced.uid,
+                    mailboxUid: referenced.custodianMailboxUids[0],
+                    requestedByUserUid: holderA.uid,
+                    status: "pending",
+                }),
+            );
+
+            const result = await request(server.getApplication()).delete(baseUrl).set("Authorization", "jwt " + holderAToken);
+
+            expect(result.status).toBe(409);
+            expect(await matterRepo.findOne({ where: { uid: referenced.uid } })).not.toBeNull();
+            expect(await matterRepo.findOne({ where: { uid: unreferenced.uid } })).not.toBeNull();
+        });
     });
 });

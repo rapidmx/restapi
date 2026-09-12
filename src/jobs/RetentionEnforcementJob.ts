@@ -22,11 +22,13 @@ const RETENTION_POLICY_UID = "retention-policy";
  * entity types instead of one, each independently gated by whether the corresponding policy field is
  * set at all.
  *
- * `Message` purges are legal-hold-aware (`util/LegalHoldUtils.ts`) - a held message is skipped, not
- * purged, and naturally retried on a later run once its `Matter` closes, the same "skip, don't error"
- * shape `RetentionEnforcementJob`'s own doc comment promises. `AuditLogEntry` purges are not - see
- * `RetentionPolicy.auditLogRetentionDays`'s own doc comment for why `EscrowAuditLogEntry` (a
- * hash-chained ledger) is never a target here at all, by design.
+ * Both `Message` AND `AuditLogEntry` purges are legal-hold-aware (`util/LegalHoldUtils.ts`) - a held
+ * record is skipped, not purged, and naturally retried on a later run once its `Matter` closes, the same
+ * "skip, don't error" shape this class's own doc comment promises throughout. An `AuditLogEntry` with no
+ * `mailboxUid` at all (an org-wide action - a `DistributionList`/`TransportRule` change isn't scoped to
+ * one mailbox) has nothing to check a hold against and is purged unconditionally, same as always.
+ * `EscrowAuditLogEntry` (a hash-chained ledger) is never a target here at all, by design - see
+ * `RetentionPolicy.auditLogRetentionDays`'s own doc comment.
  *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`RetentionEnforcementJobMongo`/
  * `RetentionEnforcementJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob`/
@@ -151,6 +153,18 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
 
         let purgedCount = 0;
         for (const entry of expired) {
+            if (entry.mailboxUid) {
+                try {
+                    await assertNotOnLegalHold(this._objectFactory!, this.matterClass, entry.mailboxUid, entry.dateCreated);
+                } catch {
+                    // Under an active hold - skip, don't error. Retried automatically on a later run once
+                    // the matter closes. Without this check, a `Matter`'s own date range predating this
+                    // policy's enforced minimum (`MIN_AUDIT_LOG_RETENTION_DAYS`) could have its audit
+                    // trail purged out from under it - the exact record the hold exists to preserve -
+                    // while that same mailbox's `Message`s stay correctly protected above.
+                    continue;
+                }
+            }
             try {
                 await this.auditLogRepo!.delete(entry.uid, { ignoreACL: true, purge: true });
                 purgedCount++;

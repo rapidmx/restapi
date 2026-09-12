@@ -86,4 +86,10 @@ describe("BaseMailboxRoute Tests (repoUtils guard clauses only)", () => {
             /internal error/i,
         );
     });
+
+    it("truncate() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
+        const route = objectFactory.newInstance<TestMailboxRoute>(TestMailboxRoute, { initialize: false });
+
+        await expect(route.truncate({}, {}, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
+    });
 });

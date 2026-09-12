@@ -220,6 +220,39 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
         expect(found).not.toBeNull();
     });
 
+    it("Skips (does not purge) an expired AuditLogEntry under an active legal hold, and retries it on a later run once the hold lifts.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", auditLogRetentionDays: 2190 }));
+        const mailboxUid = uuid.v4();
+        const oldDate = new Date(Date.now() - 2200 * DAY_MS);
+        const old = await createAuditLogEntry({ mailboxUid, dateCreated: oldDate });
+        const matter = await createMatter({
+            custodianMailboxUids: [mailboxUid],
+            dateRangeStart: new Date(oldDate.getTime() - DAY_MS),
+            dateRangeEnd: new Date(oldDate.getTime() + DAY_MS),
+        });
+
+        await job.run();
+
+        const stillHeld = await auditLogRepo.findOne({ where: { uid: old.uid } });
+        expect(stillHeld).not.toBeNull();
+
+        await matterRepo.update({ uid: matter.uid }, { closedAt: new Date() });
+        await job.run();
+
+        const nowPurged = await auditLogRepo.findOne({ where: { uid: old.uid } });
+        expect(nowPurged).toBeNull();
+    });
+
+    it("Purges an expired AuditLogEntry with a mailboxUid that isn't under any active hold, same as one with no mailboxUid at all.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", auditLogRetentionDays: 2190 }));
+        const old = await createAuditLogEntry({ mailboxUid: uuid.v4(), dateCreated: new Date(Date.now() - 2200 * DAY_MS) });
+
+        await job.run();
+
+        const found = await auditLogRepo.findOne({ where: { uid: old.uid } });
+        expect(found).toBeNull();
+    });
+
     it("Bounds how many expired messages are purged per run to the configured batch size.", async () => {
         await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
         (job as any).batchSize = 2;

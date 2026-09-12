@@ -177,7 +177,26 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         if (UserUtils.hasRoles(user, this.trustedRoles)) {
             return await this.requestRepo!.find({}, { ignoreACL: true });
         }
-        return await this.requestRepo!.find({ requestedByUserUid: user.uid } as any, { ignoreACL: true });
+        // A non-trusted caller sees every request they see under `canView()`'s own broader definition
+        // (they made it, OR it's for a mailbox they own) - not just ones `requestedByUserUid` names, the
+        // same gap `BaseDataExportRoute.find()`'s identical fix documents in full: an admin-mediated
+        // request's `requestedByUserUid` is the ADMIN's uid, never the owner's, so filtering by that field
+        // alone would leave it invisible to the very owner `findById()` already lets view.
+        const ownRequests: T[] = await this.requestRepo!.find({ requestedByUserUid: user.uid } as any, { ignoreACL: true });
+        const ownedMailboxes: MB[] = await this.mailboxRepo!.find({ ownerUserUid: user.uid } as any, { ignoreACL: true });
+        if (ownedMailboxes.length === 0) {
+            return ownRequests;
+        }
+        const ownedMailboxUids: string[] = ownedMailboxes.map((m) => m.uid);
+        const requestsForOwnedMailboxes: T[] = await this.requestRepo!.find(
+            { mailboxUid: `in(${ownedMailboxUids.join(",")})` } as any,
+            { ignoreACL: true },
+        );
+        const byUid = new Map<string, T>();
+        for (const request of [...ownRequests, ...requestsForOwnedMailboxes]) {
+            byUid.set(request.uid, request);
+        }
+        return Array.from(byUid.values());
     }
 
     @Get("/:id")

@@ -329,6 +329,33 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
         }
     });
 
+    it("Records no escrow audit entries at all when a LATER custodian mailbox fails - an earlier mailbox's own successful collection must not be permanently attested to an export that, as a whole, never completed.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailboxA = await createMailbox({ escrowScopeId });
+        const mailboxB = await createMailbox({ escrowScopeId });
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailboxB.uid, folderUid: uuid.v4(), displayName: "A" }));
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailboxB.uid, folderUid: uuid.v4(), displayName: "B" }));
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailboxA.uid, mailboxB.uid] });
+        const request = await createRequest({ matterId: matter.uid });
+
+        const original = (job as any).maxContentRows;
+        // mailboxA has no content beyond its own "Mailbox" line (1, within the cap); mailboxB's two
+        // contacts push its own total to 3, over the cap - mailboxA is processed (and would previously
+        // have gotten its own MATTER_EXPORT_READY entry) BEFORE mailboxB's failure aborts the whole request.
+        (job as any).maxContentRows = 2;
+        try {
+            await expect(job.run()).resolves.toBeUndefined();
+
+            const updated = await requestRepo.findOne({ uid: request.uid } as any);
+            expect(updated!.status).toBe("failed");
+
+            const entries = await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_READY }).toArray();
+            expect(entries).toHaveLength(0);
+        } finally {
+            (job as any).maxContentRows = original;
+        }
+    });
+
     it("Logs an error when even marking a request failed itself throws.", async () => {
         const request = await createRequest({ matterId: uuid.v4() });
         const repoUtils = (job as any).requestRepo;

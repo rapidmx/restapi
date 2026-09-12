@@ -503,6 +503,33 @@ describe("Route:MailboxMongo Tests", () => {
             expect(result.status).toBeGreaterThanOrEqual(200);
             expect(result.status).toBeLessThan(300);
         });
+
+        it("Blocks a bulk truncate() of a mailbox under an open Matter's hold - a caller cannot route around the singular delete guard by using the bulk endpoint instead.", async () => {
+            // `Mailbox`'s class-level ACL denies everyone but a trusted (admin) caller by default (see
+            // `MailboxMongo`'s own `@Protect` policy) - a bulk `DELETE /mailboxes` is only actually
+            // reachable by that trusted caller, unlike the per-mailbox `DELETE /mailboxes/:id` any owner
+            // can reach.
+            const obj = await createMailboxMongo();
+            await createMatter({ custodianMailboxUids: [obj.uid] });
+
+            const result = await request(server.getApplication()).delete(baseUrl).set("Authorization", "jwt " + adminToken);
+
+            expect(result.status).toBe(409);
+            const stillExists: MailboxMongo | null = await repo.findOne({ uid: obj.uid } as any);
+            expect(stillExists).toBeTruthy();
+        });
+
+        it("Allows a bulk truncate() of a mailbox once the matter is closed.", async () => {
+            const obj = await createMailboxMongo();
+            await createMatter({ custodianMailboxUids: [obj.uid], closedAt: new Date() });
+
+            const result = await request(server.getApplication()).delete(baseUrl).set("Authorization", "jwt " + adminToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            const stillExists: MailboxMongo | null = await repo.findOne({ uid: obj.uid } as any);
+            expect(stillExists).toBeNull();
+        });
     });
 
     it("Can make a count request scoped to the caller's own mailboxes.", async () => {

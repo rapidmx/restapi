@@ -786,4 +786,53 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         await super.delete(id, version, purge, req, user);
     }
+
+    /** Fetches every page of `repoUtils.find(criteria, ...)` results - `truncate()`'s legal-hold check
+     * below must see every matched record, not a sample truncated at this framework's own default page
+     * size - mirrors `ErasureExecutionJob.findAllPages()`'s identical rationale. */
+    private async findAllForTruncate(params: any, query: any, user: JWTUser | undefined, pageSize: number = 500): Promise<T[]> {
+        const all: T[] = [];
+        for (let page = 0; ; page++) {
+            const batch: T[] = await this.repoUtils!.find({ ...query, ...params, limit: pageSize, page } as any, { limit: pageSize, page, user });
+            all.push(...batch);
+            if (batch.length < pageSize) {
+                break;
+            }
+        }
+        return all;
+    }
+
+    /**
+     * Adds the identical legal-hold check to the inherited `CRUDRoute.truncate()` that `delete()` above
+     * adds to `CRUDRoute.delete()` - `truncate()` has no `purge` option at all (it is unconditionally a
+     * hard, permanent delete for every mailbox it matches, the same as `delete()`'s own irreversibility
+     * here), so leaving it unchecked would let a caller destroy a held mailbox simply by preferring this
+     * bulk endpoint over the equivalent singular `delete()` call.
+     */
+    @Delete()
+    public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
+        if (!this.repoUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const matched: T[] = await this.findAllForTruncate(params, query, user);
+        for (const existing of matched) {
+            try {
+                await assertNotOnLegalHold(this._objectFactory!, this.matterClass, existing.uid);
+            } catch (err) {
+                await recordAuditLog(
+                    this._objectFactory!,
+                    this.auditLogClass,
+                    { config: this.config, user, logger: this.logger },
+                    {
+                        action: AuditAction.LEGAL_HOLD_BLOCKED_DELETE,
+                        targetType: "Mailbox",
+                        targetUid: existing.uid,
+                        details: { primarySmtpAddress: existing.primarySmtpAddress },
+                    },
+                );
+                throw err;
+            }
+        }
+        await super.truncate(params, query, user);
+    }
 }

@@ -128,6 +128,14 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
         return created;
     }
 
+    /** A non-trusted caller sees every request they see under `canView()`'s own broader definition (they
+     * made it, OR it's for a mailbox they own) - not just ones `requestedByUserUid` names. An admin-
+     * mediated request's `requestedByUserUid` is the ADMIN's uid, never the owner's, so filtering by that
+     * field alone would leave an admin-initiated request invisible to the very owner `findById()`/
+     * `download()` already let view/download, the moment they learned its uid some other way (there is no
+     * notification path) - this endpoint's own contract (this class's doc comment: "an admin may have
+     * requested an export on an owner's behalf - the owner can still see/download it themselves") is
+     * otherwise silently broken for the one entry point meant to let them discover it exists at all. */
     @Get()
     public async find(@AuthUser user?: JWTUser): Promise<T[]> {
         await this.init();
@@ -137,7 +145,21 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
         if (UserUtils.hasRoles(user, this.trustedRoles)) {
             return await this.requestRepo!.find({}, { ignoreACL: true });
         }
-        return await this.requestRepo!.find({ requestedByUserUid: user.uid } as any, { ignoreACL: true });
+        const ownRequests: T[] = await this.requestRepo!.find({ requestedByUserUid: user.uid } as any, { ignoreACL: true });
+        const ownedMailboxes: MB[] = await this.mailboxRepo!.find({ ownerUserUid: user.uid } as any, { ignoreACL: true });
+        if (ownedMailboxes.length === 0) {
+            return ownRequests;
+        }
+        const ownedMailboxUids: string[] = ownedMailboxes.map((m) => m.uid);
+        const requestsForOwnedMailboxes: T[] = await this.requestRepo!.find(
+            { mailboxUid: `in(${ownedMailboxUids.join(",")})` } as any,
+            { ignoreACL: true },
+        );
+        const byUid = new Map<string, T>();
+        for (const request of [...ownRequests, ...requestsForOwnedMailboxes]) {
+            byUid.set(request.uid, request);
+        }
+        return Array.from(byUid.values());
     }
 
     @Get("/:id")

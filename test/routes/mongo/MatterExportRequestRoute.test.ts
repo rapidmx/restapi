@@ -9,6 +9,7 @@ import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { EscrowAuditLogEntryMongo } from "../../../src/models/mongo/EscrowAuditLogEntryMongo.js";
 import { EscrowScopeMongo } from "../../../src/models/mongo/EscrowScopeMongo.js";
+import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MatterExportRequestMongo } from "../../../src/models/mongo/MatterExportRequestMongo.js";
 import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { EscrowAuditAction } from "../../../src/models/types.js";
@@ -26,6 +27,7 @@ describe("Route:MatterExportRequestMongo Tests", () => {
     const baseUrl = "/mongo/matter-export-requests";
     let escrowScopeRepo: MongoRepository<EscrowScopeMongo>;
     let matterRepo: MongoRepository<MatterMongo>;
+    let mailboxRepo: MongoRepository<MailboxMongo>;
     let requestRepo: MongoRepository<MatterExportRequestMongo>;
     let escrowAuditLogRepo: MongoRepository<EscrowAuditLogEntryMongo>;
 
@@ -41,12 +43,31 @@ describe("Route:MatterExportRequestMongo Tests", () => {
             new EscrowScopeMongo({ name: "legal", publicKey: validPublicKey, holderUserUids: [holder.uid], requiredHolders: 1, ...data }),
         );
 
+    // A custodian mailbox is only actually attested (recorded in the escrow audit ledger) when its own
+    // `escrowScopeId` matches the matter's - see `BaseMatterExportRequestRoute.create()`'s own doc
+    // comment. Real `Mailbox` rows (rather than bare `uuid.v4()` placeholders) are required so that check
+    // can pass.
+    const createMailbox = async (escrowScopeId: string, data?: Partial<MailboxMongo>): Promise<MailboxMongo> =>
+        await mailboxRepo.save(
+            new MailboxMongo({
+                ownerUserUid: uuid.v4(),
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Custodian Mailbox",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+                escrowScopeId,
+                ...data,
+            }),
+        );
+
     const createMatter = async (escrowScopeId: string, data?: Partial<MatterMongo>): Promise<MatterMongo> =>
         await matterRepo.save(
             new MatterMongo({
                 name: "Investigation A",
                 escrowScopeId,
-                custodianMailboxUids: [uuid.v4(), uuid.v4()],
+                custodianMailboxUids: [(await createMailbox(escrowScopeId)).uid, (await createMailbox(escrowScopeId)).uid],
                 dateRangeStart: new Date("2026-01-01"),
                 dateRangeEnd: new Date("2026-06-01"),
                 ...data,
@@ -63,6 +84,7 @@ describe("Route:MatterExportRequestMongo Tests", () => {
         if (conn instanceof MongoConnection) {
             escrowScopeRepo = conn.getMongoRepository("EscrowScopeMongo");
             matterRepo = conn.getMongoRepository("MatterMongo");
+            mailboxRepo = conn.getMongoRepository("MailboxMongo");
             requestRepo = conn.getMongoRepository("MatterExportRequestMongo");
             escrowAuditLogRepo = conn.getMongoRepository("EscrowAuditLogEntryMongo");
         } else {
@@ -79,6 +101,7 @@ describe("Route:MatterExportRequestMongo Tests", () => {
     beforeEach(async () => {
         await requestRepo.clear();
         await matterRepo.clear();
+        await mailboxRepo.clear();
         await escrowScopeRepo.clear();
         await escrowAuditLogRepo.clear();
     });
@@ -127,6 +150,23 @@ describe("Route:MatterExportRequestMongo Tests", () => {
             const entries = await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_REQUESTED }).toArray();
             expect(entries.length).toBe(matter.custodianMailboxUids.length);
             expect(entries.map((e) => e.mailboxUid).sort()).toEqual([...matter.custodianMailboxUids].sort());
+        });
+
+        it("Does not record an escrow audit entry for a listed custodian mailbox whose own escrowScopeId doesn't actually match the matter's.", async () => {
+            const scope = await createEscrowScope();
+            const outOfScopeMailbox = await createMailbox(uuid.v4());
+            const matter = await createMatter(scope.uid, { custodianMailboxUids: [outOfScopeMailbox.uid] });
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + holderToken)
+                .send({ matterId: matter.uid });
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+
+            const entries = await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_REQUESTED }).toArray();
+            expect(entries).toHaveLength(0);
         });
     });
 

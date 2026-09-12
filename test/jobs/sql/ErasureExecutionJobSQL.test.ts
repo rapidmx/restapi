@@ -564,6 +564,24 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect(stillApproved!.status).toBe("approved");
     });
 
+    it("Rejects a second markCompleted() call using the originally-fetched (now-stale) request object, rather than silently overwriting the first call's purgedCount - the optimistic-lock protection a multi-instance deployment relies on to keep two concurrent job runs from double-processing the same request.", async () => {
+        const mailbox = await createMailbox();
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+
+        await (job as any).markCompleted(request, 5);
+        const firstResult = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(firstResult!.status).toBe("completed");
+        expect(firstResult!.purgedCount).toBe(5);
+
+        // Simulates a second, concurrently-racing job instance's own call - it would hold the SAME
+        // originally-fetched `request` object (from its own top-of-run() `find()`), now stale relative to
+        // what the first call above just wrote.
+        await expect((job as any).markCompleted(request, 1)).rejects.toThrow();
+
+        const stillFirst = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(stillFirst!.purgedCount).toBe(5);
+    });
+
     it("Does nothing when the repos are not yet initialized.", async () => {
         const original = (job as any).requestRepo;
         (job as any).requestRepo = undefined;

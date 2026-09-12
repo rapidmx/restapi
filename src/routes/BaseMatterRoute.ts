@@ -55,6 +55,16 @@ function validateMatter(o: Partial<Matter>): void {
  * only holders create, read, update, close, or delete them, and `find()`/`count()` only ever show a caller
  * the matters under scopes they actually hold.
  *
+ * `updateBulk`/`updateProperty`/`truncate` are ALSO overridden below, even though `CRUDRoute` would
+ * otherwise serve them unmodified - `@rapidrest/service-core`'s own generic `ACLUtils.hasPermission()`
+ * unconditionally grants any `trustedRoles` holder (default `"admin"`) access before ever consulting a
+ * per-record ACL, which is correct for every other admin-managed entity in this codebase but exactly
+ * backwards for `Matter`. Left unoverridden, a plain admin with no `EscrowScope` holdership at all could
+ * reach `PUT /matters`, `PUT /matters/:id/:property`, or `DELETE /matters` directly and bypass every guard
+ * this class exists to enforce - including, for `truncate()`, the EscrowAccessRequest-reference guard
+ * `delete()` below already has, since `RepoUtils.truncate()` has no way to run that per-record check
+ * itself.
+ *
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
@@ -152,6 +162,104 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         );
 
         return updated;
+    }
+
+    /** `CRUDRoute.updateBulk()`'s own generic implementation (`doBulkUpdate()`) loops calling `doUpdate()`
+     * per object - this instead loops calling the already-fully-guarded `update()` above per object, so
+     * every one of its checks (holder status, closed-matter, escrowScopeId immutability) applies to each
+     * bulk entry exactly as it would to an equivalent individual `PUT /matters/:id` call. A single
+     * failing entry aborts the whole batch (simpler and strictly safer than the generic endpoint's
+     * partial-success `BulkError` aggregation - this endpoint is a rare, holder-invoked admin action, not
+     * a high-volume batch import worth that extra complexity). */
+    public async updateBulk(objs: T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
+        const updated: T[] = [];
+        for (const obj of objs) {
+            updated.push(await this.update((obj as any).uid, obj as UpdateObject<T>, req, user));
+        }
+        return updated;
+    }
+
+    /** `CRUDRoute.updateProperty()`'s own generic implementation deliberately bypasses optimistic locking
+     * (see `ModelRoute.doUpdateProperty()`'s own doc comment) by defaulting to the record's current
+     * version - mirrored here via the same `version: existing.version` pattern `close()` above already
+     * uses, rather than reusing `update()` (which requires a caller-supplied version). */
+    public async updateProperty(
+        @Param("id") id: string,
+        @Param("property") propertyName: string,
+        obj: any,
+        @AuthUser user?: JWTUser,
+    ): Promise<T> {
+        const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+        if (!existing) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, existing.escrowScopeId, user);
+        if (existing.closedAt) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A closed matter cannot be modified.");
+        }
+        if (propertyName === "escrowScopeId" && obj !== existing.escrowScopeId) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A matter's escrow scope cannot be changed after creation.");
+        }
+        validateMatter({ ...existing, [propertyName]: obj });
+
+        const updated: T = await this.repoUtils!.update(
+            { uid: existing.uid, version: (existing as any).version, [propertyName]: obj } as any,
+            existing,
+            { user, ignoreACL: true },
+        );
+
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, user, logger: this.logger },
+            { action: AuditAction.MATTER_UPDATE, targetType: "Matter", targetUid: updated.uid, details: { name: updated.name } },
+        );
+
+        return updated;
+    }
+
+    /** `CRUDRoute.truncate()`'s own generic implementation (`RepoUtils.truncate()`) has no way to run
+     * either of this class's own per-record guards (holder status, the EscrowAccessRequest-reference
+     * check `delete()` above enforces) - narrows to the caller's own held scopes first (the same pattern
+     * `find()`/`count()` below already use), then applies the referencing-request guard to every matched
+     * matter before actually deleting any of them. */
+    public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
+        const heldScopeIds: string[] = await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user);
+        if (heldScopeIds.length === 0) {
+            return;
+        }
+        const scopedQuery = { ...query, ...params, escrowScopeId: `in(${heldScopeIds.join(",")})` };
+        const findOptions = { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true };
+        const matched: T[] = await this.repoUtils!.find(scopedQuery, findOptions);
+        if (matched.length === 0) {
+            return;
+        }
+
+        const accessRequestRepo: RepoUtils<any> = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.escrowAccessRequestClass.name,
+            args: [this.escrowAccessRequestClass],
+        });
+        for (const existing of matched) {
+            const referencing = await accessRequestRepo.find({ matterId: existing.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+            if (referencing.length > 0) {
+                throw new ApiError(
+                    ApiErrors.IDENTIFIER_EXISTS,
+                    409,
+                    "This matter has EscrowAccessRequests referencing it and cannot be deleted.",
+                );
+            }
+        }
+
+        await this.repoUtils!.truncate(scopedQuery, findOptions);
+
+        for (const existing of matched) {
+            await recordAuditLog(
+                this._objectFactory!,
+                this.auditLogClass,
+                { config: this.config, user, logger: this.logger },
+                { action: AuditAction.MATTER_DELETE, targetType: "Matter", targetUid: existing.uid, details: { name: existing.name } },
+            );
+        }
     }
 
     public async delete(

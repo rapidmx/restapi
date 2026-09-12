@@ -96,12 +96,16 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * publishing is fire-and-forget (see `NotificationUtils.sendMessage()`) and never blocks or fails a request.
      */
     /**
-     * Hook for a permanent (`purge: true`) delete to check whether `existing` is protected by an active
-     * legal hold (`util/LegalHoldUtils.ts`) before it's irrecoverably destroyed - throws a `409` if so. A
-     * no-op by default, so scoped-child entities uninvolved in eDiscovery (`Contact`/`Task`/`Note`/etc.)
-     * are unaffected; `BaseMessageRoute` is the one override today, since email is what a `Matter`'s
+     * Hook for a permanent delete to check whether `existing` is protected by an active legal hold
+     * (`util/LegalHoldUtils.ts`) before it's irrecoverably destroyed - throws a `409` if so. A no-op by
+     * default, so scoped-child entities uninvolved in eDiscovery (`Contact`/`Task`/`Note`/etc.) are
+     * unaffected; `BaseMessageRoute` is the one override today, since email is what a `Matter`'s
      * `custodianMailboxUids` actually protects. An ordinary soft-delete never calls this - see `delete()`
-     * below.
+     * below. Called for `delete()` only under `purge: true` (the only way that method is irrecoverable),
+     * and for EVERY record `truncate()` matches (that method has no `purge` option at all - it is always
+     * a hard, permanent delete, see `truncate()`'s own doc comment - so skipping this check there would
+     * let a caller destroy held records simply by preferring the bulk endpoint over the equivalent
+     * one-at-a-time `delete(..., { purge: true })` calls).
      */
     protected async checkLegalHold(existing: T): Promise<void> {
         // no-op by default
@@ -248,12 +252,42 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         return existing!;
     }
 
+    /** Fetches every page of `repoUtils.find(criteria, ...)` results - a bare, unpaginated `find()` call
+     * silently truncates at this framework's own default page size, and `truncate()`'s own legal-hold
+     * check below must see every matched record, not a sample - mirrors `ErasureExecutionJob.
+     * findAllPages()`'s identical rationale. */
+    private async findAllForTruncate(criteria: Record<string, any>, user: JWTUser | undefined, pageSize: number = 500): Promise<T[]> {
+        const all: T[] = [];
+        for (let page = 0; ; page++) {
+            const batch: T[] = await this.repoUtils!.find({ ...criteria, limit: pageSize, page } as any, {
+                limit: pageSize,
+                page,
+                user,
+                ignoreACL: true,
+            });
+            all.push(...batch);
+            if (batch.length < pageSize) {
+                break;
+            }
+        }
+        return all;
+    }
+
     @Delete()
     public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
         if (!this.repoUtils) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         await this.requirePermission(this.scopeUidOf(query), user, ACLAction.TRUNCATE);
+        // `truncate()` is ALWAYS a hard, permanent delete (unlike singular `delete()`, which only purges
+        // under `purge: true`) - see `checkLegalHold()`'s own doc comment. Every matched record must be
+        // checked, the same protection a caller can't route around by simply preferring this bulk endpoint
+        // over the equivalent one-at-a-time `delete(..., { purge: true })` calls.
+        const { shareToken: _shareToken, ...filterQuery } = query ?? {};
+        const matched: T[] = await this.findAllForTruncate({ ...filterQuery, ...params }, user);
+        for (const existing of matched) {
+            await this.checkLegalHold(existing);
+        }
         await this.repoUtils.truncate(
             { ...query, ...params },
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },

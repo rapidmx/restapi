@@ -30,6 +30,7 @@ describe("BaseMatterExportRequestRoute Tests (blobStore guard clause only)", () 
         // guard-clause test uses, isolating this test to the `!blobStore` branch alone.
         (route as any).requestRepo = {};
         (route as any).matterRepo = {};
+        (route as any).mailboxRepo = {};
         const res: any = { setHeader: vi.fn().mockReturnThis(), send: vi.fn() };
 
         await expect(route.download("id-1", res, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);

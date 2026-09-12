@@ -295,10 +295,21 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     }
 
     private async markCompleted(request: T, purgedCount: number): Promise<void> {
-        const refetched: T = (await this.requestRepo!.findOne(request.uid, { ignoreACL: true }))!;
+        // Deliberately uses `request`'s own ORIGINALLY-fetched `version` (from the `find()` call at the
+        // top of `run()`), never a version refetched right before this write - the same "let a stale
+        // version be genuinely rejected" discipline `DataExportJob`/`MatterExportJob`'s own final `update()`
+        // calls already use. A refetch-then-write here would defeat optimistic locking entirely: two
+        // concurrent job instances (a real possibility in a multi-node deployment - `BackgroundService`'s
+        // own overlap guard is per-process, not cross-instance) racing on the same request would each
+        // refetch the OTHER's just-written row and pass its own version check trivially, silently
+        // overwriting a correct `purgedCount` with a stale, incomplete one and recording a second
+        // `ERASURE_REQUEST_COMPLETED` audit entry - a wrong, permanent compliance record with no error
+        // raised anywhere. Using the original version instead makes the SECOND concurrent writer's own
+        // `update()` genuinely fail its version check, propagating up through `run()`'s own `catch` exactly
+        // like any other real processing failure.
         const updated: T = await this.requestRepo!.update(
-            { uid: refetched.uid, version: (refetched as any).version, status: "completed", purgedCount } as any,
-            refetched,
+            { uid: request.uid, version: (request as any).version, status: "completed", purgedCount } as any,
+            request,
             { ignoreACL: true },
         );
         await recordAuditLog(
