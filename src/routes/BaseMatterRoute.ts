@@ -174,7 +174,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
     public async updateBulk(objs: T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
         const updated: T[] = [];
         for (const obj of objs) {
-            updated.push(await this.update((obj as any).uid, obj as UpdateObject<T>, req, user));
+            updated.push(await this.update((obj as any).uid, obj, req, user));
         }
         return updated;
     }

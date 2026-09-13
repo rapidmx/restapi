@@ -197,12 +197,22 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
 
     /** Fetches every page of `repo.find(criteria, ...)` results - see `MailboxQuotaRecalcJob.
      * findAllPages()`'s identical rationale (a bare, unpaginated `find()` silently truncates at 100
-     * rows). A mailbox's own export must be complete, not a sample. */
+     * rows). A mailbox's own export must be complete, not a sample.
+     *
+     * Bounded by `this.maxContentRows`, the same ceiling `buildJsonBundle()` already applies via
+     * `collectMailboxContentLines()` - without this, an mbox-format export had no size cap at all (unlike
+     * its JSON sibling), so an unbounded mailbox could grow `entries`/the final `Buffer.concat()` in
+     * `buildMboxBundle()` without limit. Throws rather than silently truncating, matching
+     * `collectMailboxContentLines()`'s own reasoning: a partial export that looks complete is worse than
+     * one that visibly failed. */
     private async findAllPages(repo: RepoUtils<any>, criteria: Record<string, any>, pageSize: number = 500): Promise<any[]> {
         const all: any[] = [];
         for (let page = 0; ; page++) {
             const batch: any[] = await repo.find({ ...criteria, limit: pageSize, page } as any, { ignoreACL: true, limit: pageSize, page });
             all.push(...batch);
+            if (all.length > this.maxContentRows) {
+                throw new Error(`Mailbox ${criteria.mailboxUid}'s content exceeds the maximum of ${this.maxContentRows} exportable rows.`);
+            }
             if (batch.length < pageSize) {
                 break;
             }

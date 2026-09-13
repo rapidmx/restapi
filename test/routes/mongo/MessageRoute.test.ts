@@ -924,7 +924,7 @@ describe("Route:MessageMongo Tests", () => {
         // The folder's own ACL (which still grants the owner READ) is independent of the Mailbox row - see
         // the architecture note on Message.mailboxUid. Deleting just the row simulates a dangling
         // mailboxUid without touching the ACL that still makes the message itself reachable.
-        await mailboxRepo.deleteOne({ uid: mailbox.uid } as any);
+        await mailboxRepo.deleteOne({ uid: mailbox.uid });
 
         const result = await request(server.getApplication())
             .get(`${baseUrl}/${message.uid}/content`)

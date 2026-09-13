@@ -793,7 +793,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     private async findAllForTruncate(params: any, query: any, user: JWTUser | undefined, pageSize: number = 500): Promise<T[]> {
         const all: T[] = [];
         for (let page = 0; ; page++) {
-            const batch: T[] = await this.repoUtils!.find({ ...query, ...params, limit: pageSize, page } as any, { limit: pageSize, page, user });
+            const batch: T[] = await this.repoUtils!.find({ ...query, ...params, limit: pageSize, page }, { limit: pageSize, page, user });
             all.push(...batch);
             if (batch.length < pageSize) {
                 break;

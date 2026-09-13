@@ -232,7 +232,7 @@ describe("MailboxImportJobMongo Tests (real DB + DI)", () => {
         await job.run();
 
         expect((await requestRepo.findOne({ uid: request.uid } as any))!.importedCount).toBe(1);
-        const messages = await messageRepo.find({ folderUid: folder.uid } as any).toArray();
+        const messages = await messageRepo.find({ folderUid: folder.uid }).toArray();
         expect(messages.length).toBe(1);
         expect(new Date(messages[0].sentDate).toISOString()).toBe(new Date("2019-01-15T10:30:00.000Z").toISOString());
         expect(new Date(messages[0].receivedDate).toISOString()).toBe(new Date("2019-01-15T10:30:00.000Z").toISOString());
@@ -251,7 +251,7 @@ describe("MailboxImportJobMongo Tests (real DB + DI)", () => {
         await job.run();
 
         expect((await requestRepo.findOne({ uid: request.uid } as any))!.importedCount).toBe(1);
-        const messages = await messageRepo.find({ folderUid: folder.uid } as any).toArray();
+        const messages = await messageRepo.find({ folderUid: folder.uid }).toArray();
         expect(new Date(messages[0].sentDate).getTime()).toBeGreaterThanOrEqual(before);
     });
 
@@ -386,7 +386,7 @@ describe("MailboxImportJobMongo Tests (real DB + DI)", () => {
         const updated = await requestRepo.findOne({ uid: request.uid } as any);
         expect(updated!.status).toBe("completed");
         expect(updated!.importedCount).toBe(1);
-        const messages = await messageRepo.find({ folderUid: folder.uid } as any).toArray();
+        const messages = await messageRepo.find({ folderUid: folder.uid }).toArray();
         expect(messages.length).toBe(1);
     });
 

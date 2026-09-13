@@ -470,3 +470,57 @@ narrative (docker-compose/Postfix/mta-bridge design); this entry covers only wha
   that would have caught this originally. **Any other `@Config` field added to this codebase in future
   without an explicit default risks the exact same silent failure mode** — worth a lint rule or code-review
   habit, not just this one-off fix.
+
+### 2026-09-12 — Fixed a critical send-after-cancel race in `ScheduledSendJob`, an unbounded mbox-export
+gap, and this repo's own lint gate - all three found and validated by an adversarial review pass run from
+`@rapidmx/server`'s own session against the `v0.7.0` (`e0dccec`) cut, then fixed here at JP's request
+
+- **`ScheduledSendJob.relayDueMessage()` sent the email via `scanAndRelay()` *before* its own
+  optimistic-lock check.** A user cancelling or editing a scheduled send at the exact moment the job
+  polled it could still result in the email being delivered - an irreversible external side effect -
+  while the version-checked final `update()` then lost the race against the already-bumped version and
+  simply failed (caught by `run()`'s own catch, just a warning log), leaving the DB reflecting the
+  cancel/edit as if nothing had been sent. Silent and permanent: `scheduledSendTime` was already cleared
+  by the (never-actually-committed) intended final write, so nothing ever revisited it. Fixed with the
+  same "claim first, work second" discipline `DataExportJob.processRequest()`/`MailboxImportJob.
+  processRequest()` already use: a version-checked clear of `scheduledSendTime` now happens *before*
+  `scanAndRelay()` runs, so whichever side's version is stale loses cleanly - either this claim fails
+  immediately (a concurrent cancel/edit already won) and nothing below it, `scanAndRelay()` included,
+  ever runs, or this claim wins first and the concurrent cancel/edit fails on the user's own side instead
+  of racing silently against an in-flight send. On a relay failure *after* a successful claim,
+  `scheduledSendTime` is restored (best-effort, re-fetching first) so the job's own documented "leave it
+  for retry, no backoff" behavior on failure is preserved exactly - confirmed via the existing "Leaves a
+  message that fails to relay as-is" test still passing, now strengthened to assert the restored value
+  equals the *original* due time, not just that some truthy value exists. Added a new test per backend
+  (`test/jobs/{mongo,sql}/ScheduledSendJob{Mongo,SQL}.test.ts`) that bumps a message's version directly in
+  the DB before calling `relayDueMessage()` with the now-stale in-memory object, asserting the claim
+  itself throws and nothing is sent - the exact race this fix closes.
+- **`DataExportJob.buildMboxBundle()` had no row cap at all**, unlike its sibling `buildJsonBundle()`
+  (which already passes `this.maxContentRows` through `collectMailboxContentLines()`). An mbox-format
+  self-service GDPR export of an unbounded mailbox could grow `findAllPages()`'s in-memory array and the
+  final `Buffer.concat()` without limit. Fixed by threading the same `maxContentRows` cap into
+  `findAllPages()` itself (checked incrementally per page, throwing rather than silently truncating - the
+  same reasoning `collectMailboxContentLines()`'s own doc comment already gives). Added a new test per
+  backend mirroring the existing JSON-format cap test exactly, confirming the mbox path now fails the
+  same way once its own row count exceeds the configured cap.
+  - **Investigated but did NOT change**: `MatterExportJob`'s `maxContentRows` is applied per custodian
+    mailbox, not to the combined export across every custodian on a Matter. This looked like an
+    analogous gap at first, but its own doc comment (already present before this session, at `59f2393`)
+    explicitly documents this as deliberate: a Matter's custodian list is holder/admin-curated, not
+    attacker-controlled, so bounding each mailbox individually is the intended compounding boundary here,
+    not a single whole-request total. Re-verified this reasoning holds and left it alone rather than
+    "fixing" an already-considered design decision.
+- **This repo's own `yarn build` (`lint && rimraf dist && tsc`) was failing its own lint gate** - 8
+  `typescript/no-unnecessary-type-assertion`/`typescript/no-empty-function` errors, most already
+  pre-existing at `59f2393` before this session's own two new job fixes added two more. Auto-fixed the six
+  unnecessary-assertion ones via `eslint --fix` (reviewed the diff - each was a genuinely redundant `as
+  any`/`as UpdateObject<T>` a prior refactor left behind, no behavior change). Manually fixed the two
+  `no-empty-function` cases in `test/util/PstImportUtils.test.ts` (a stub `readCompletely: () => {}`
+  deliberately never invoked by the test - given a trivial real body matching its actual `(buf: Buffer) =>
+  Buffer` signature instead of an empty one, rather than suppressing the rule). `yarn build` now passes
+  end to end for the first time this session found it broken.
+- Full suite re-verified green after all three fixes (mongo + sql, real DB + DI integration tests
+  throughout, matching this repo's own established test-doubling convention). Not touching
+  `RELEASE_NOTES.md` - that file is JP's own manually-curated, release-level summary (distinct from the
+  `@rapidrest/cli`-generated `CHANGELOG.md`, which *does* come from this commit's own message), and none
+  of these three fixes are new user-facing features worth a release-notes bullet of their own.

@@ -164,7 +164,9 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
     });
 
     it("Leaves a message that fails to relay as-is (still carrying its due scheduledSendTime) for retry next poll.", async () => {
-        // No blob was ever put at this key, so `blobStore.get()` inside `relayDueMessage()` rejects.
+        // No blob was ever put at this key, so `blobStore.get()` inside `relayDueMessage()` rejects,
+        // after the claim (its own version-checked clear of scheduledSendTime) has already succeeded -
+        // this exercises the restore-on-failure path, not just "the field was never touched".
         const message = await createMessage({
             bodyBlobKey: `bodies/${uuid.v4()}`,
             scheduledSendTime: new Date(Date.now() - 60 * 1000),
@@ -174,9 +176,53 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
 
         const updated = await messageRepo.findOne({ uid: message.uid } as any);
         expect(updated!.scheduledSendTime).toBeTruthy();
+        expect(new Date(updated!.scheduledSendTime as any).getTime()).toBe((message.scheduledSendTime as Date).getTime());
         expect(updated!.folderUid).toBe(message.folderUid);
 
         const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
         expect(transport.sent.length).toBe(0);
+    });
+
+    it("Does not relay when the message was already modified since it was fetched - the claim itself fails, before any email is sent.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        await blobStore.put(bodyBlobKey, Buffer.from("From: owner@example.com\r\nTo: recipient@example.com\r\n\r\nHi\r\n"));
+        const message = await createMessage({ bodyBlobKey, scheduledSendTime: new Date(Date.now() - 60 * 1000) });
+
+        // Simulates a concurrent cancel/edit that already bumped this row's version in the DB, between
+        // this job's own find() and relayDueMessage() being called with the now-stale `message` object -
+        // exactly the race relayDueMessage()'s own claim step is meant to close.
+        await messageRepo.updateOne({ uid: message.uid } as any, { $inc: { version: 1 } });
+
+        await expect((job as any).relayDueMessage(message)).rejects.toThrow();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(0);
+
+        const current = await messageRepo.findOne({ uid: message.uid } as any);
+        expect(current!.folderUid).toBe(message.folderUid);
+    });
+
+    it("Logs a warning (without throwing) when even restoring scheduledSendTime after a relay failure itself fails.", async () => {
+        // No blob was ever put at this key, so the relay itself fails after the claim succeeds for real;
+        // the claim's own update() call is then made to reject too, on the restore attempt specifically.
+        const message = await createMessage({
+            bodyBlobKey: `bodies/${uuid.v4()}`,
+            scheduledSendTime: new Date(Date.now() - 60 * 1000),
+        });
+
+        const repoUtils = (job as any).messageRepo;
+        const realUpdate = repoUtils.update.bind(repoUtils);
+        vi.spyOn(repoUtils, "update").mockImplementationOnce(realUpdate).mockRejectedValueOnce(new Error("restore also failed"));
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        expect(transport.sent.length).toBe(0);
+        // The failed restore never wrote anything back, so scheduledSendTime stays cleared (the claim's
+        // own successful write) - a real, if rare, gap this best-effort restore doesn't attempt to close
+        // further (see relayDueMessage()'s own doc comment for why not).
+        const current = await messageRepo.findOne({ uid: message.uid } as any);
+        expect(current!.scheduledSendTime).toBeFalsy();
     });
 });

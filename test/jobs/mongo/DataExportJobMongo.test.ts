@@ -310,6 +310,44 @@ describe("DataExportJobMongo Tests (real DB + DI)", () => {
         }
     });
 
+    it("Marks the request failed when an mbox-format export's own message count exceeds the configured max_content_rows cap.", async () => {
+        // Mbox-format exports go through buildMboxBundle()/findAllPages(), a separate code path from
+        // buildJsonBundle()'s collectMailboxContentLines() above - each needs its own cap enforcement, and
+        // buildMboxBundle() previously had none at all.
+        const mailbox = await createMailbox();
+        for (let i = 0; i < 2; i++) {
+            await messageRepo.save(
+                new MessageMongo({
+                    mailboxUid: mailbox.uid,
+                    folderUid: uuid.v4(),
+                    messageId: `${uuid.v4()}@example.com`,
+                    subject: `Message ${i}`,
+                    from: { address: "alice@example.com", type: RecipientType.TO },
+                    recipients: [{ address: "bob@example.com", type: RecipientType.TO }],
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey: `bodies/${uuid.v4()}`,
+                    flags: { read: false, flagged: false, answered: false, forwarded: false },
+                    references: [],
+                    hasAttachments: false,
+                }),
+            );
+        }
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "mbox" });
+
+        const original = (job as any).maxContentRows;
+        (job as any).maxContentRows = 1;
+        try {
+            await expect(job.run()).resolves.toBeUndefined();
+
+            const updated = await requestRepo.findOne({ uid: request.uid } as any);
+            expect(updated!.status).toBe("failed");
+            expect(updated!.errorMessage).toContain("exceeds the maximum");
+        } finally {
+            (job as any).maxContentRows = original;
+        }
+    });
+
     it("Skips a message whose body blob can't be read, still exporting the rest.", async () => {
         const mailbox = await createMailbox();
         const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;

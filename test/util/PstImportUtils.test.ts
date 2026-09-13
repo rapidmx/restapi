@@ -128,7 +128,9 @@ describe("PstImportUtils Tests", () => {
         });
 
         it("Skips (rather than allocating from) a filesize larger than the given max size - a corrupted or malicious PST claiming an attachment bigger than the file itself.", () => {
-            const attachment = { fileInputStream: { readCompletely: () => {} }, filesize: 1_000_000 } as any;
+            // Never actually invoked - the filesize check must short-circuit before reaching it - so its
+            // body only needs to satisfy the real (buf: Buffer) => Buffer signature, not do anything.
+            const attachment = { fileInputStream: { readCompletely: (buf: Buffer) => buf }, filesize: 1_000_000 } as any;
             expect(readAttachmentContent(attachment, 100)).toBeUndefined();
         });
     });
@@ -277,7 +279,9 @@ describe("PstImportUtils Tests", () => {
                     hasAttachments: true,
                     numberOfAttachments: 1,
                     getAttachment: () => ({
-                        fileInputStream: { readCompletely: () => {} },
+                        // Never actually invoked - the filesize check must short-circuit before reaching
+                        // it - so its body only needs to satisfy the real (buf: Buffer) => Buffer signature.
+                        fileInputStream: { readCompletely: (buf: Buffer) => buf },
                         filesize: 1_000_000,
                         filename: "huge.bin",
                         longFilename: "huge.bin",
