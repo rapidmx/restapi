@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-13
+
+### Added
+- Added findAllPages() row capping to DataExportJob.buildMboxBundle(), which previously had no size cap at all unlike its JSON sibling
+- Added tests for the claim-before-relay race, the restore-on-failure path, and the double-failure (restore also fails) path, plus an mbox-format max_content_rows cap test mirroring the existing JSON one
+
+### Changed
+- Restore scheduledSendTime (best-effort, re-fetching first) when the relay fails after a successful claim, preserving this job's own documented leave-it-for-retry behavior on failure
+- Investigate MatterExportJob's per-custodian-only cap and confirm it is a deliberate, already-documented design decision, not a gap - leave it unchanged
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+### Fixed
+- Fixed a critical send-after-cancel race in ScheduledSendJob: relayDueMessage() now claims the message via a version-checked clear of scheduledSendTime before calling scanAndRelay(), the same claim-first-work-second discipline DataExportJob/MailboxImportJob already use
+- Fixed this repo's own broken lint gate: auto-fix six unnecessary-type-assertion errors via eslint --fix, manually fix two empty-function stubs in PstImportUtils.test.ts by giving them a real, harmless body matching their actual signature
+
 ## [0.7.0] - 2026-09-12
 
 ### Added
@@ -671,7 +686,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/RapidMX/restapi/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/RapidMX/restapi/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/RapidMX/restapi/compare/v0.4.0...v0.6.0
 [0.4.0]: https://github.com/RapidMX/restapi/compare/v0.3.1...v0.4.0
