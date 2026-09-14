@@ -554,3 +554,18 @@ gap, and this repo's own lint gate - all three found and validated by an adversa
   `startedAt`; `POST /complete`; `POST /reopen` clears completion and step. Non-admins get 403, which the web apps use to
   decide not to redirect.
 - `findOrCreateSingleton()` (util/MailboxPolicyUtils.ts) is the shared create-or-fetch for singleton rows.
+
+## 2026-09-13 — Plugin dependencies (`requires`)
+
+- A manifest may declare `requires: { "<package>": "<semver range>" }` - plugin-to-plugin, deliberately not npm
+  `dependencies` (those would install a nested, never-loaded copy). `parsePluginManifest` rejects bad ranges and
+  self-requires. `semver` is now a direct dependency.
+- `src/plugins/PluginDependencies.ts` is pure (registry passed in): `planPluginChange` resolves requirements recursively
+  (install missing at `maxSatisfying`, dependencies first; enable disabled in-range ones; conflict on out-of-range
+  installed, no satisfying version, not allowed, cycles, or a version change outside an enabled dependent's range).
+  Per JP: conflicts are refused and explained, never auto-upgraded/downgraded; disabling/uninstalling a plugin an
+  enabled plugin requires is blocked with a 409 naming the dependents. `orderByDependencies`/`pruneUnmetRequirements`
+  are used by the server host at load time.
+- Route: new `GET /plan?name=&packageVersion=`; `POST /` now returns `{ plugin, dependencies }` (breaking shape change,
+  react-shared updated); `PUT` plans on version change or enable; stale-lock check happens before dependencies are
+  touched. 409s use `ApiErrors.IDENTIFIER_EXISTS` like the rest of the codebase.

@@ -64,13 +64,14 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
         publishFakePackage(name, "1.0.0", { plugin: EAS_MANIFEST });
         const result = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name });
         expect(result.status).toBe(200);
-        return result.body;
+        return result.body.plugin;
     }
 
     async function addEas(packageVersion?: string): Promise<any> {
         const result = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/activesync", packageVersion });
         expect(result.status).toBe(200);
-        return result.body;
+        expect(result.body.dependencies).toEqual([]);
+        return result.body.plugin;
     }
 
     describe("access", () => {
@@ -79,6 +80,7 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             const auth = (req: any) => req.set("Authorization", "jwt " + userToken);
             expect((await auth(request(app).get(ctx.baseUrl))).status).toBe(403);
             expect((await auth(request(app).get(`${ctx.baseUrl}/status`))).status).toBe(403);
+            expect((await auth(request(app).get(`${ctx.baseUrl}/plan?name=%40rapidmx%2Factivesync`))).status).toBe(403);
             expect((await auth(request(app).get(`${ctx.baseUrl}/registry/%40rapidmx%2Factivesync`))).status).toBe(403);
             expect((await auth(request(app).post(ctx.baseUrl)).send({ name: "@rapidmx/activesync" })).status).toBe(403);
             expect((await auth(request(app).put(`${ctx.baseUrl}/x`)).send({ enabled: false })).status).toBe(403);
@@ -114,7 +116,7 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
                     name: "@rapidmx/activesync-plugin",
                     version: "2.0.0",
                     allowed: true,
-                    installedUid: installed.body.uid,
+                    installedUid: installed.body.plugin.uid,
                     installedVersion: "1.0.0",
                     updateAvailable: true,
                 },
@@ -160,8 +162,8 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect(result.status).toBe(200);
             expect(result.body).toEqual([
                 { uid: current.uid, name: "@rapidmx/activesync", installedVersion: "1.1.0", latestVersion: "1.1.0", updateAvailable: false },
-                { uid: flaky.body.uid, name: "@rapidmx/flaky-plugin", installedVersion: "1.0.0", updateAvailable: false, error: "registry offline" },
-                { uid: old.body.uid, name: "@rapidmx/old-plugin", installedVersion: "1.0.0", latestVersion: "1.0.1", updateAvailable: true },
+                { uid: flaky.body.plugin.uid, name: "@rapidmx/flaky-plugin", installedVersion: "1.0.0", updateAvailable: false, error: "registry offline" },
+                { uid: old.body.plugin.uid, name: "@rapidmx/old-plugin", installedVersion: "1.0.0", latestVersion: "1.0.1", updateAvailable: true },
             ]);
         });
     });
@@ -358,6 +360,126 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
                 expect.objectContaining({ packageVersion: "1.1.0", enabled: true, removed: false, settings: { "mail:eas:sync_window_size": 100 } }),
             );
             expect((await asAdmin(request(ctx.app()).get(ctx.baseUrl))).body).toHaveLength(1);
+        });
+    });
+
+    describe("plugin dependencies", () => {
+        const MAPI_MANIFEST = { apiVersion: PLUGIN_API_VERSION, displayName: "MAPI over HTTP" };
+        const AUTODISCOVER_MANIFEST = {
+            apiVersion: PLUGIN_API_VERSION,
+            displayName: "Autodiscover",
+            requires: { "@rapidmx/activesync": "^1.0.0", "@rapidmx/mapi-plugin": "^1.0.0" },
+        };
+
+        beforeEach(() => {
+            publishFakePackage("@rapidmx/activesync", "2.0.0", { plugin: EAS_MANIFEST });
+            publishFakePackage("@rapidmx/mapi-plugin", "1.0.0", { plugin: MAPI_MANIFEST });
+            publishFakePackage("@rapidmx/mapi-plugin", "1.3.0", { plugin: { ...MAPI_MANIFEST, requires: { "@rapidmx/activesync": "^1.1.0" } } });
+            publishFakePackage("@rapidmx/autodiscover-plugin", "1.0.0", { plugin: AUTODISCOVER_MANIFEST });
+        });
+
+        const add = (name: string, packageVersion?: string) => asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name, packageVersion });
+        const put = (uid: string, body: any) => asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${uid}`)).send(body);
+        const installed = async (): Promise<Record<string, any>> =>
+            Object.fromEntries((await asAdmin(request(ctx.app()).get(ctx.baseUrl))).body.map((row: any) => [row.name, row]));
+
+        it("plans an add without changing anything", async () => {
+            const result = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/plan?name=%40rapidmx%2Fautodiscover-plugin`));
+            expect(result.status).toBe(200);
+            expect(result.body.plugin).toEqual(expect.objectContaining({ name: "@rapidmx/autodiscover-plugin", version: "1.0.0" }));
+            expect(result.body.install.map((i: any) => `${i.name}@${i.version}`)).toEqual(["@rapidmx/activesync@1.1.0", "@rapidmx/mapi-plugin@1.3.0"]);
+            expect(result.body.enable).toEqual([]);
+            expect(result.body.conflicts).toEqual([]);
+            expect(await installed()).toEqual({});
+            expect((await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/plan`))).status).toBe(400);
+        });
+
+        it("installs what a plugin requires first, at the highest version in range, and announces once", async () => {
+            const result = await add("@rapidmx/autodiscover-plugin");
+            expect(result.status).toBe(200);
+            expect(result.body.plugin.name).toBe("@rapidmx/autodiscover-plugin");
+            expect(result.body.dependencies.map((row: any) => `${row.name}@${row.packageVersion}`)).toEqual([
+                "@rapidmx/activesync@1.1.0",
+                "@rapidmx/mapi-plugin@1.3.0",
+            ]);
+            expect(Object.keys(await installed())).toEqual(["@rapidmx/activesync", "@rapidmx/autodiscover-plugin", "@rapidmx/mapi-plugin"]);
+            expect(publishedHashes).toHaveLength(1);
+            expect(await ctx.auditActions()).toEqual([AuditAction.PLUGIN_INSTALL, AuditAction.PLUGIN_INSTALL, AuditAction.PLUGIN_INSTALL]);
+        });
+
+        it("enables a disabled requirement and refuses one installed out of range", async () => {
+            const eas = await addEas("1.1.0");
+            expect((await put(eas.uid, { enabled: false })).status).toBe(200);
+            const enabled = await add("@rapidmx/autodiscover-plugin");
+            expect(enabled.status).toBe(200);
+            expect(enabled.body.dependencies.map((row: any) => [row.name, row.enabled])).toEqual([
+                ["@rapidmx/mapi-plugin", true],
+                ["@rapidmx/activesync", true],
+            ]);
+
+            await ctx.clear();
+            await addEas("2.0.0");
+            const refused = await add("@rapidmx/autodiscover-plugin");
+            expect(refused.status).toBe(409);
+            expect(refused.body.message).toMatch(/Autodiscover requires Exchange ActiveSync \^1\.0\.0, but 2\.0\.0 is installed/);
+            expect(Object.keys(await installed())).toEqual(["@rapidmx/activesync"]);
+        });
+
+        it("refuses a requirement that isn't allowed on this server", async () => {
+            publishFakePackage("@rapidmx/needs-evil-plugin", "1.0.0", { plugin: { ...MAPI_MANIFEST, requires: { evil: "*" } } });
+            const refused = await add("@rapidmx/needs-evil-plugin");
+            expect(refused.status).toBe(409);
+            expect(refused.body.message).toMatch(/evil, which isn't an allowed plugin package/);
+        });
+
+        it("blocks disabling or uninstalling a plugin an enabled plugin requires", async () => {
+            const { body } = await add("@rapidmx/autodiscover-plugin");
+            const eas = body.dependencies[0];
+            const disable = await put(eas.uid, { enabled: false });
+            expect(disable.status).toBe(409);
+            expect(disable.body.message).toBe("Autodiscover, MAPI over HTTP require Exchange ActiveSync, so it can't be disabled. Disable Autodiscover, MAPI over HTTP first.");
+            const remove = await asAdmin(request(ctx.app()).delete(`${ctx.baseUrl}/${eas.uid}`));
+            expect(remove.status).toBe(409);
+            expect(remove.body.message).toMatch(/Autodiscover, MAPI over HTTP require Exchange ActiveSync, so it can't be uninstalled/);
+
+            expect((await put(body.plugin.uid, { enabled: false })).status).toBe(200);
+            const single = await put(eas.uid, { enabled: false });
+            expect(single.status).toBe(409);
+            expect(single.body.message).toBe("MAPI over HTTP requires Exchange ActiveSync, so it can't be disabled. Disable MAPI over HTTP first.");
+            expect((await put(body.dependencies[1].uid, { enabled: false })).status).toBe(200);
+            expect((await put(eas.uid, { enabled: false })).status).toBe(200);
+            // Disabling what's already disabled needs no check.
+            expect((await put(eas.uid, { enabled: false })).status).toBe(200);
+        });
+
+        it("refuses a version change that breaks a dependent's range, and installs what a new version requires", async () => {
+            const { body } = await add("@rapidmx/autodiscover-plugin");
+            const eas = body.dependencies[0];
+            const upgrade = await put(eas.uid, { packageVersion: "2.0.0" });
+            expect(upgrade.status).toBe(409);
+            expect(upgrade.body.message).toMatch(/Autodiscover requires @rapidmx\/activesync \^1\.0\.0, which 2\.0\.0 doesn't satisfy/);
+            expect((await installed())["@rapidmx/activesync"].packageVersion).toBe("1.1.0");
+
+            await ctx.clear();
+            const mapi = (await add("@rapidmx/mapi-plugin", "1.0.0")).body.plugin;
+            const upgraded = await put(mapi.uid, { packageVersion: "1.3.0" });
+            expect(upgraded.status).toBe(200);
+            expect((await installed())["@rapidmx/activesync"].packageVersion).toBe("1.1.0");
+        });
+
+        it("enables what a plugin requires when it's enabled, and refuses a stale edit before touching anything", async () => {
+            const { body } = await add("@rapidmx/autodiscover-plugin");
+            expect((await put(body.plugin.uid, { enabled: false })).status).toBe(200);
+            expect((await put(body.dependencies[1].uid, { enabled: false })).status).toBe(200);
+
+            const current = (await installed())["@rapidmx/autodiscover-plugin"];
+            const stale = await put(current.uid, { enabled: true, version: current.version + 5 });
+            expect(stale.status).toBe(409);
+            expect((await installed())["@rapidmx/mapi-plugin"].enabled).toBe(false);
+
+            const enabled = await put(current.uid, { enabled: true, version: current.version });
+            expect(enabled.status).toBe(200);
+            expect((await installed())["@rapidmx/mapi-plugin"].enabled).toBe(true);
         });
     });
 

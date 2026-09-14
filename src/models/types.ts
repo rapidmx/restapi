@@ -2313,6 +2313,9 @@ export interface PluginManifest {
     displayName: string;
     description?: string;
     settings?: PluginSettingDefinition[];
+    /** Other plugins this one needs, as package name to npm version range. They are installed and enabled along with
+     * it and loaded before it, and can't be disabled or uninstalled while it's enabled. */
+    requires?: Record<string, string>;
 }
 
 /**

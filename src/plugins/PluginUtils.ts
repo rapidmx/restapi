@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import crypto from "crypto";
+import semver from "semver";
 import { Plugin, PluginManifest, PluginSettingDefinition } from "../models/types.js";
 
 /** The plugin contract version this library implements. A plugin whose manifest declares any other
@@ -144,11 +145,24 @@ export function parsePluginManifest(pkg: any): PluginManifest | string {
             return `This plugin's manifest has an invalid setting: ${problem}`;
         }
     }
+    const requires: unknown = manifest.requires ?? {};
+    if (typeof requires !== "object" || requires === null || Array.isArray(requires)) {
+        return "This plugin's manifest requires must map plugin package names to version ranges.";
+    }
+    for (const [name, range] of Object.entries(requires)) {
+        if (name === pkg.name) {
+            return "This plugin's manifest requires itself.";
+        }
+        if (typeof range !== "string" || semver.validRange(range) === null) {
+            return `This plugin's manifest requires ${name} with an invalid version range.`;
+        }
+    }
     return {
         apiVersion: manifest.apiVersion,
         displayName: manifest.displayName,
         description: typeof manifest.description === "string" ? manifest.description : undefined,
         settings: settings as PluginSettingDefinition[],
+        ...(Object.keys(requires).length > 0 ? { requires: requires as Record<string, string> } : {}),
     };
 }
 

@@ -10,3 +10,4 @@
 export * from "./NpmRegistryClient.js";
 export * from "./PluginRegistry.js";
 export * from "./PluginUtils.js";
+export * from "./PluginDependencies.js";

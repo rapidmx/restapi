@@ -44,6 +44,14 @@ describe("parsePluginManifest", () => {
         });
     });
 
+    it("keeps a non-empty requires map", () => {
+        const requires = { "@rapidmx/a": "^1.0.0-beta.2", "@rapidmx/b": "1.x" };
+        expect(parsePluginManifest({ name: "@rapidmx/x", rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires } } })).toEqual(
+            expect.objectContaining({ requires }),
+        );
+        expect(parsePluginManifest({ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: {} } } })).not.toHaveProperty("requires");
+    });
+
     it.each([
         [undefined, /not a RapidMX plugin/],
         [{ rapidmx: { plugin: "nope" } }, /not a RapidMX plugin/],
@@ -53,6 +61,10 @@ describe("parsePluginManifest", () => {
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [null] } } }, /key and a label/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "date" }] } } }, /unknown type 'date'/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "select" }] } } }, /select with no options/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: ["@rapidmx/a"] } } }, /requires must map/],
+        [{ name: "@rapidmx/x", rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: { "@rapidmx/x": "^1.0.0" } } } }, /requires itself/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: { "@rapidmx/a": "not a range!" } } } }, /@rapidmx\/a with an invalid version range/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: { "@rapidmx/a": 1 } } } }, /invalid version range/],
     ])("rejects %j", (pkg, message) => {
         expect(parsePluginManifest(pkg)).toMatch(message);
     });
