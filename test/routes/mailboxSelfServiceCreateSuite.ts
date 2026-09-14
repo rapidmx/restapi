@@ -102,6 +102,27 @@ export function mailboxSelfServiceCreateSuite(ctx: MailboxSelfServiceCreateSuite
             expect(own.body.aliasAddresses).toEqual(["jp@example.org"]);
         });
 
+        it("lets the owner rename their primary address onto one of their own usernames, but not onto someone else's (round 5)", async () => {
+            ctx.mockAliases(["JSteinmetz", "JP"]);
+            const created = await post(ctx.userToken, mailbox());
+            expect(created.status).toBe(200);
+            const put = (body: unknown) => ctx.withAuth(request(ctx.app()).put(`${ctx.baseUrl}/${created.body.uid}`), ctx.userToken).send(body);
+            const putProperty = (address: string) =>
+                ctx.withAuth(request(ctx.app()).put(`${ctx.baseUrl}/${created.body.uid}/primarySmtpAddress`), ctx.userToken).send(address);
+
+            const unowned = await put({ uid: created.body.uid, version: created.body.version, primarySmtpAddress: "ceo@example.com" });
+            expect(unowned.status).toBe(403);
+            expect(unowned.body.message).toBe("You can only change your mailbox's address to one of your own usernames on this server's domains.");
+            expect((await putProperty("ceo@example.org")).status).toBe(403);
+
+            const own = await put({ uid: created.body.uid, version: created.body.version, primarySmtpAddress: "JP@example.org" });
+            expect(own.status).toBe(200);
+            expect(own.body.primarySmtpAddress).toBe("jp@example.org");
+            const back = await putProperty("jsteinmetz@example.com");
+            expect(back.status).toBe(200);
+            expect(back.body.primarySmtpAddress).toBe("jsteinmetz@example.com");
+        });
+
         it("checks a trusted caller's owner uid: a user uid (stored lowercase), their own uid, or none", async () => {
             const upper: string = uuid.v4().toUpperCase();
             const owned = await post(ctx.adminToken, mailbox({ primarySmtpAddress: "a@example.com", ownerUserUid: upper }));

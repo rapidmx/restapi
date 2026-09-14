@@ -3311,8 +3311,8 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         });
 
         describe("J15: mailbox under erasure", () => {
-            it("Drops (never files) mail for a mailbox with an approved erasure request, closing the entry.", async () => {
-                await erasureRequestRepo.save(new DataSubjectErasureRequestSQL({ mailboxUid, requestedByUserUid: uuid.v4(), status: "approved" }));
+            it("Drops (never files) mail for a mailbox whose erasure is running (in progress, live claim), closing the entry.", async () => {
+                await erasureRequestRepo.save(new DataSubjectErasureRequestSQL({ mailboxUid, requestedByUserUid: uuid.v4(), status: "in_progress" }));
                 const entry = await createIngestEntry({ rawBlobKey: await putRaw(makeRawMessage()) });
 
                 await job.run();
@@ -3414,21 +3414,6 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
                 expect(booked.deleted).toBe(false);
             });
 
-            it("Declines a requested series too long to expand completely (a truncated expansion can't prove there's no conflict).", async () => {
-                await createMailbox({ isResource: true, autoAcceptBookings: true });
-                const warnSpy = vi.spyOn((job as any).logger, "warn");
-                const startDate = new Date(Date.now() + 60 * 60 * 1000);
-
-                const booked = await requestBooking({
-                    icalUid: uuid.v4(),
-                    startDate,
-                    endDate: new Date(startDate.getTime() + 30 * 60 * 1000),
-                    recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] },
-                });
-
-                expect(booked.deleted).toBe(true);
-                expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("too many requested occurrences"));
-            });
         });
 
         describe("J17: stale iTIP REPLY/CANCEL", () => {
@@ -3785,27 +3770,527 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
                 expect(rows[0].deleted).toBe(false);
             });
 
-            it("Declines when an existing recurring booking has too many occurrences in the requested window to check.", async () => {
-                await createMailbox({ isResource: true, autoAcceptBookings: true });
+        });
+    });
+
+    describe("Round 5 (part A): erasure disposition, receipt claims, auto-reply tracking, forward laundering, booking windows", () => {
+        afterEach(() => {
+            vi.restoreAllMocks();
+        });
+
+        const putRaw = async (raw: Buffer | string): Promise<string> => {
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await objectFactory.getInstance<any>("BlobStore")!.put(rawBlobKey, Buffer.isBuffer(raw) ? raw : Buffer.from(raw));
+            return rawBlobKey;
+        };
+        const transport = (): RecordingMailTransport => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const HOUR_MS = 60 * 60 * 1000;
+        const rawSet = async (repo: any, uid: string, fields: Record<string, any>): Promise<void> => {
+            await repo.update({ uid }, fields);
+        };
+        const rowsWhere = async (repo: any, where: Record<string, any>): Promise<any[]> => await repo.find({ where });
+        const entryRow = async (uid: string): Promise<any> => (await rowsWhere(ingestQueueRepo, { uid }))[0];
+        const messagesInMailbox = async (): Promise<any[]> => await rowsWhere(messageRepo, { mailboxUid });
+        const makeDue = async (uid: string): Promise<void> => {
+            await rawSet(ingestQueueRepo, uid, { nextAttemptAt: new Date(Date.now() - 1000) });
+        };
+        const saveErasure = async (status: string, fields: Record<string, any> = {}): Promise<any> => {
+            const saved: any = await erasureRequestRepo.save(new DataSubjectErasureRequestSQL({ mailboxUid, requestedByUserUid: uuid.v4(), status: status as any }));
+            if (Object.keys(fields).length > 0) {
+                await rawSet(erasureRequestRepo, saved.uid, fields);
+            }
+            return saved;
+        };
+
+        describe("erasure disposition (finding 2)", () => {
+            it("Defers (never drops) mail while a request is only approved - e.g. blocked by a legal hold - then delivers it once the deferral bound passes.", async () => {
+                await createMailbox();
+                await saveErasure("approved");
+                const entry = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
+
+                await job.run();
+
+                const deferred = await entryRow(entry.uid);
+                expect(deferred.status).toBe(IngestStatus.FAILED);
+                expect(deferred.errorMessage).toContain("Deferred");
+                expect(deferred.attempts).toBe(0);
+                expect(new Date(deferred.nextAttemptAt).getTime()).toBeGreaterThan(Date.now());
+                expect(await messagesInMailbox()).toHaveLength(0);
+
+                // Deferrals don't use up attempts.
+                (job as any).maxAttempts = 1;
+                await makeDue(entry.uid);
+                await job.run();
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.FAILED);
+                expect((await entryRow(entry.uid)).attempts).toBe(0);
+
+                const originalMax = (job as any).erasureDeferMaxSeconds;
+                (job as any).erasureDeferMaxSeconds = 0;
+                try {
+                    await makeDue(entry.uid);
+                    await job.run();
+                } finally {
+                    (job as any).erasureDeferMaxSeconds = originalMax;
+                    (job as any).maxAttempts = 5;
+                }
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.DELIVERED);
+                expect(await messagesInMailbox()).toHaveLength(1);
+            });
+
+            it("Drops mail only while the cascade is running under a live claim; a stale claim defers.", async () => {
+                await createMailbox();
+                const request = await saveErasure("in_progress");
+                const dropped = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
+
+                await job.run();
+
+                expect((await entryRow(dropped.uid)).status).toBe(IngestStatus.DELIVERED);
+                expect((await entryRow(dropped.uid)).errorMessage).toContain("erased");
+                expect(await messagesInMailbox()).toHaveLength(0);
+
+                await rawSet(erasureRequestRepo, request.uid, { dateModified: new Date(Date.now() - 2 * HOUR_MS) });
+                const deferred = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
+                await job.run();
+                expect((await entryRow(deferred.uid)).status).toBe(IngestStatus.FAILED);
+                expect((await entryRow(deferred.uid)).errorMessage).toContain("Deferred");
+            });
+
+            it("Ignores an erasure of an earlier mailbox at the same address (the request predates the mailbox row).", async () => {
+                await createMailbox();
+                await saveErasure("completed", { dateCreated: new Date(Date.now() - 30 * DAY_MS) });
+                await saveErasure("approved", { dateCreated: new Date(Date.now() - 30 * DAY_MS) });
+                const entry = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
+
+                await job.run();
+
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.DELIVERED);
+                expect(await messagesInMailbox()).toHaveLength(1);
+            });
+
+            it("Drops mail for a completed erasure whose mailbox row is gone, and delivers when the mailbox row survived.", async () => {
+                await saveErasure("completed");
+                const gone = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
+                await job.run();
+                expect((await entryRow(gone.uid)).errorMessage).toContain("erased");
+                expect(await messagesInMailbox()).toHaveLength(0);
+
+                // Once a mailbox is (re-)created at the address, the older completed request no longer applies.
+                await createMailbox();
+                const entry = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
+                await job.run();
+                expect(await messagesInMailbox()).toHaveLength(1);
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.DELIVERED);
+            });
+        });
+
+        describe("delivery receipts and automatic replies (finding 5)", () => {
+            const verifiedDomain = async (): Promise<void> => {
+                await domainRepo.save(new DomainSQL({ uid: "example.com", name: "example.com", enabled: true, verified: true, verificationToken: uuid.v4() }));
+            };
+            const receiptRequest = (extra: string = "Authentication-Results: mx.example.com; dkim=pass header.d=example.com"): string =>
+                "From: colleague@example.com\r\nTo: recipient@example.com\r\nSubject: Plain message\r\n" +
+                `Disposition-Notification-To: colleague@example.com\r\n${extra}\r\n\r\nHello there.\r\n`;
+            const receiptsSent = (): number => transport().sent.filter((m) => m.envelopeTo.includes("colleague@example.com") && m.raw.toString().includes("Delivered:")).length;
+
+            it("Claims the receipt before sending it, so the client marking the message read mid-send can't cause a second receipt.", async () => {
+                await createMailbox();
+                await verifiedDomain();
+                const repo = (job as any).messageRepo;
+                const realSend = transport().send.bind(transport());
+                vi.spyOn(transport(), "send").mockImplementation(async (outbound: any) => {
+                    if (outbound.envelopeTo.includes("colleague@example.com")) {
+                        const [message] = await messagesInMailbox();
+                        const current = await repo.findOne(message.uid, { ignoreACL: true });
+                        await repo.update({ uid: current.uid, version: current.version, flags: { ...current.flags, read: true } }, current, { ignoreACL: true });
+                    }
+                    return await realSend(outbound);
+                });
+                const entry = await createIngestEntry({ rawBlobKey: await putRaw(receiptRequest()), envelopeFrom: "colleague@example.com" });
+
+                await job.run();
+                await makeDue(entry.uid);
+                await job.run();
+
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.DELIVERED);
+                expect(receiptsSent()).toBe(1);
+                const [message] = await messagesInMailbox();
+                expect(message.flags.read).toBe(true);
+                expect(message.deliveryReceiptSentAt).toBeTruthy();
+            });
+
+            it("Re-reads and retries the claim when an unrelated write bumped the version first.", async () => {
+                await createMailbox();
+                await verifiedDomain();
+                const repo = (job as any).messageRepo;
+                const realUpdate = repo.update.bind(repo);
+                let bumped = false;
+                vi.spyOn(repo, "update").mockImplementation(async (obj: any, ...rest: any[]) => {
+                    if (obj.deliveryReceiptSentAt && !bumped) {
+                        bumped = true;
+                        const current = await repo.findOne(obj.uid, { ignoreACL: true });
+                        await realUpdate({ uid: current.uid, version: current.version, flags: { ...current.flags, flagged: true } }, current, { ignoreACL: true });
+                    }
+                    return await realUpdate(obj, ...rest);
+                });
+                const entry = await createIngestEntry({ rawBlobKey: await putRaw(receiptRequest()), envelopeFrom: "colleague@example.com" });
+
+                await job.run();
+
+                expect(bumped).toBe(true);
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.DELIVERED);
+                expect(receiptsSent()).toBe(1);
+                const [message] = await messagesInMailbox();
+                expect(message.flags.flagged).toBe(true);
+                expect(message.deliveryReceiptSentAt).toBeTruthy();
+            });
+
+            it("Sends nothing when a concurrent claim of the same receipt wins the race.", async () => {
+                await createMailbox();
+                await verifiedDomain();
+                const repo = (job as any).messageRepo;
+                const realUpdate = repo.update.bind(repo);
+                let raced = false;
+                vi.spyOn(repo, "update").mockImplementation(async (obj: any, ...rest: any[]) => {
+                    if (obj.deliveryReceiptSentAt && !raced) {
+                        raced = true;
+                        // Another attempt decides the same receipt first (here: holding it pending approval).
+                        const current = await repo.findOne(obj.uid, { ignoreACL: true });
+                        await realUpdate({ uid: current.uid, version: current.version, deliveryReceiptPending: true }, current, { ignoreACL: true });
+                    }
+                    return await realUpdate(obj, ...rest);
+                });
+                const entry = await createIngestEntry({ rawBlobKey: await putRaw(receiptRequest()), envelopeFrom: "colleague@example.com" });
+
+                await job.run();
+
+                expect(raced).toBe(true);
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.DELIVERED);
+                expect(receiptsSent()).toBe(0);
+                const [message] = await messagesInMailbox();
+                expect(message.deliveryReceiptPending).toBe(true);
+                expect(message.deliveryReceiptSentAt).toBeFalsy();
+            });
+
+            it("Gives up the claim after three version conflicts, failing the entry; its retry sends the receipt once.", async () => {
+                await createMailbox();
+                await verifiedDomain();
+                const repo = (job as any).messageRepo;
+                const realUpdate = repo.update.bind(repo);
+                let conflicts = 0;
+                const spy = vi.spyOn(repo, "update").mockImplementation(async (obj: any, ...rest: any[]) => {
+                    if (obj.deliveryReceiptSentAt) {
+                        conflicts++;
+                        const current = await repo.findOne(obj.uid, { ignoreACL: true });
+                        await realUpdate({ uid: current.uid, version: current.version, flags: { ...current.flags, flagged: !current.flags.flagged } }, current, { ignoreACL: true });
+                    }
+                    return await realUpdate(obj, ...rest);
+                });
+                const entry = await createIngestEntry({ rawBlobKey: await putRaw(receiptRequest()), envelopeFrom: "colleague@example.com" });
+
+                await job.run();
+
+                expect(conflicts).toBe(3);
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.FAILED);
+                expect(receiptsSent()).toBe(0);
+                expect((await messagesInMailbox())[0].deliveryReceiptSentAt).toBeFalsy();
+
+                spy.mockRestore();
+                await makeDue(entry.uid);
+                await job.run();
+
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.DELIVERED);
+                expect(receiptsSent()).toBe(1);
+                expect(await messagesInMailbox()).toHaveLength(1);
+            });
+
+            it("Leaves a receipt claim that changed while its send was failing alone.", async () => {
+                await createMailbox();
+                await verifiedDomain();
+                const repo = (job as any).messageRepo;
+                const otherClaim = new Date("2030-01-01T00:00:00.000Z");
+                const realSend = transport().send.bind(transport());
+                vi.spyOn(transport(), "send").mockImplementation(async (outbound: any) => {
+                    if (outbound.envelopeTo.includes("colleague@example.com")) {
+                        const [message] = await messagesInMailbox();
+                        const current = await repo.findOne(message.uid, { ignoreACL: true });
+                        await repo.update({ uid: current.uid, version: current.version, deliveryReceiptSentAt: otherClaim }, current, { ignoreACL: true });
+                        throw new Error("smtp is down");
+                    }
+                    return await realSend(outbound);
+                });
+                const entry = await createIngestEntry({ rawBlobKey: await putRaw(receiptRequest()), envelopeFrom: "colleague@example.com" });
+
+                await job.run();
+
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.DELIVERED);
+                const [message] = await messagesInMailbox();
+                expect(new Date(message.deliveryReceiptSentAt).getTime()).toBe(otherClaim.getTime());
+            });
+
+            it("Logs, without failing delivery, when releasing a failed receipt's claim keeps failing.", async () => {
+                await createMailbox();
+                await verifiedDomain();
+                const repo = (job as any).messageRepo;
                 const warnSpy = vi.spyOn((job as any).logger, "warn");
+                const realSend = transport().send.bind(transport());
+                vi.spyOn(transport(), "send").mockImplementation(async (outbound: any) => {
+                    if (outbound.envelopeTo.includes("colleague@example.com")) {
+                        throw new Error("smtp is down");
+                    }
+                    return await realSend(outbound);
+                });
+                const realUpdate = repo.update.bind(repo);
+                vi.spyOn(repo, "update").mockImplementation(async (obj: any, ...rest: any[]) => {
+                    if ("deliveryReceiptSentAt" in obj && obj.deliveryReceiptSentAt === null) {
+                        throw new Error("simulated database failure");
+                    }
+                    return await realUpdate(obj, ...rest);
+                });
+                const entry = await createIngestEntry({ rawBlobKey: await putRaw(receiptRequest()), envelopeFrom: "colleague@example.com" });
+
+                await job.run();
+
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.DELIVERED);
+                const releaseWarnings = warnSpy.mock.calls.filter(([text]) => String(text).includes("failed to release the delivery receipt claim"));
+                expect(releaseWarnings).toHaveLength(3);
+                // The claim stays: the receipt is never sent twice, only possibly not at all.
+                expect((await messagesInMailbox())[0].deliveryReceiptSentAt).toBeTruthy();
+            });
+
+            it("Only trusts the topmost trusted Authentication-Results: an older trusted pass below a newer fail sends no receipt.", async () => {
+                await createMailbox();
+                await verifiedDomain();
+                await createIngestEntry({
+                    rawBlobKey: await putRaw(
+                        receiptRequest(
+                            "Authentication-Results: mx.example.com; dkim=fail header.d=example.com\r\nAuthentication-Results: mx.example.com; dkim=pass header.d=example.com",
+                        ),
+                    ),
+                    envelopeFrom: "colleague@example.com",
+                });
+
+                await job.run();
+
+                expect(await messagesInMailbox()).toHaveLength(1);
+                expect(receiptsSent()).toBe(0);
+            });
+
+            it("Sends the automatic reply on a retry of an attempt that filed the message but failed before replying - and only once.", async () => {
+                await createMailbox({ oofEnabled: true, oofMessage: "I'm currently out of office." });
+                const folders = (job as any).folderRepo;
+                const realUpdate = folders.update.bind(folders);
+                let failed = false;
+                vi.spyOn(folders, "update").mockImplementation(async (obj: any, ...rest: any[]) => {
+                    if (obj.totalCount !== undefined && !failed) {
+                        failed = true;
+                        throw new Error("simulated counter failure");
+                    }
+                    return await realUpdate(obj, ...rest);
+                });
+                const autoReplies = (): number => transport().sent.filter((m) => m.raw.toString().includes("Automatic reply")).length;
+                const entry = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
+
+                await job.run();
+                expect(await messagesInMailbox()).toHaveLength(1);
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.FAILED);
+                expect(autoReplies()).toBe(0);
+
+                await makeDue(entry.uid);
+                await job.run();
+                expect((await entryRow(entry.uid)).status).toBe(IngestStatus.DELIVERED);
+                expect(autoReplies()).toBe(1);
+                expect(await objectFactory.getInstance<any>("BlobStore")!.exists(`ingest-markers/${entry.uid}/auto-replied`)).toBe(false);
+
+                // A retry of an attempt that already replied (its marker still there) doesn't reply again.
+                await objectFactory.getInstance<any>("BlobStore")!.put(`ingest-markers/${entry.uid}/auto-replied`, Buffer.from("x"));
+                await rawSet(ingestQueueRepo, entry.uid, { status: IngestStatus.PENDING });
+                await rawSet(oofReplySuppressionRepo, (await rowsWhere(oofReplySuppressionRepo, { mailboxUid }))[0].uid, { lastRepliedAt: new Date(0) });
+                await job.run();
+                expect(autoReplies()).toBe(1);
+            });
+        });
+
+        describe("forward rules don't launder spoofed mail (finding 8)", () => {
+            const forwardRule = async (): Promise<void> => {
+                await createMailbox();
+                await mailFilterRuleRepo.save(
+                    new MailFilterRuleSQL({
+                        mailboxUid,
+                        name: "Forward everything",
+                        enabled: true,
+                        sequence: 0,
+                        stopProcessingRules: false,
+                        conditions: {},
+                        actions: [{ type: MailFilterActionType.FORWARD, forwardTo: "assistant@elsewhere.example" }],
+                    }),
+                );
+            };
+            const forwarded = (): any[] => transport().sent.filter((m) => m.envelopeTo.includes("assistant@elsewhere.example"));
+            const headerBlock = (raw: Buffer): string => {
+                const text: string = raw.toString("binary");
+                return text.slice(0, text.indexOf("\r\n\r\n"));
+            };
+
+            it("Rewrites an unauthenticated From to the forwarding mailbox and strips trust-bearing headers.", async () => {
+                await forwardRule();
+                await createIngestEntry({
+                    rawBlobKey: await putRaw(
+                        [
+                            "Authentication-Results: mx.example.com; dkim=fail header.d=example.com",
+                            "From: CEO <ceo@example.com>",
+                            "To: recipient@example.com",
+                            "Subject: urgent",
+                            "RapidMX-Key: addr=ceo@example.com; keydata=AAAA",
+                            "X-RapidMX-Recall-Of: <victim@example.com>",
+                            "Disposition-Notification-To: ceo@example.com",
+                            "",
+                            "Pay this.",
+                            "",
+                        ].join("\r\n"),
+                    ),
+                    envelopeFrom: "attacker@evil.example",
+                });
+
+                await job.run();
+
+                expect(forwarded()).toHaveLength(1);
+                expect(forwarded()[0].envelopeFrom).toBe("recipient@example.com");
+                const headers: string = headerBlock(forwarded()[0].raw);
+                expect(headers).toMatch(/^From: .*<recipient@example\.com>$/m);
+                expect(headers).toContain("X-Original-From: CEO <ceo@example.com>");
+                expect(headers).toContain("Reply-To: CEO <ceo@example.com>");
+                expect(headers).toContain("X-RapidMX-Loop: recipient@example.com");
+                expect(headers).not.toMatch(/^(authentication-results|rapidmx-key|x-rapidmx-recall-of|disposition-notification-to)\s*:/im);
+            });
+
+            it("Keeps an authenticated From, and doesn't forward unauthenticated calendar content (still filing it).", async () => {
+                await forwardRule();
+                await createIngestEntry({
+                    rawBlobKey: await putRaw("Authentication-Results: mx.example.com; dkim=pass header.d=partner.example\r\nFrom: Bob <bob@partner.example>\r\nTo: recipient@example.com\r\nSubject: hi\r\n\r\nHello\r\n"),
+                    envelopeFrom: "bob@partner.example",
+                });
+                await job.run();
+                expect(forwarded()).toHaveLength(1);
+                expect(headerBlock(forwarded()[0].raw)).toContain("From: Bob <bob@partner.example>");
+
+                await createIngestEntry({
+                    rawBlobKey: await putRaw(makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid: uuid.v4() }), "CANCEL"), { from: "ceo@example.com", dkim: false })),
+                    envelopeFrom: "attacker@evil.example",
+                });
+                await job.run();
+                expect(forwarded()).toHaveLength(1);
+                expect(await messagesInMailbox()).toHaveLength(2);
+            });
+        });
+
+        describe("resource booking windows (finding 9)", () => {
+            const wholeSecondsFromNow = (ms: number): Date => new Date(Math.ceil((Date.now() + ms) / 1000) * 1000);
+            const requestBooking = async (overrides: Partial<CalendarEvent>): Promise<any[]> => {
+                await createIngestEntry({
+                    rawBlobKey: await putRaw(makeItipRawMessage(buildEventIcs(makeIcsEventFixture(overrides), "REQUEST"))),
+                    envelopeFrom: "organizer@example.com",
+                });
+                await job.run();
+                return await rowsWhere(calendarEventRepo, { mailboxUid, icalUid: overrides.icalUid });
+            };
+            const saveBooking = async (data: Record<string, any>): Promise<void> => {
+                await calendarEventRepo.save(
+                    new CalendarEventSQL({
+                        folderUid: "calendar-folder",
+                        mailboxUid,
+                        title: "Booking",
+                        timezone: "UTC",
+                        organizer: { address: "other@example.com", type: RecipientType.TO },
+                        attendees: [],
+                        status: CalendarEventStatus.CONFIRMED,
+                        busyStatus: BusyStatus.BUSY,
+                        icalUid: uuid.v4(),
+                        ...data,
+                    }),
+                );
+            };
+
+            it("An open-ended weekday booking no longer makes an open-ended request at another time decline.", async () => {
+                await createMailbox({ isResource: true, autoAcceptBookings: true });
                 const startDate = wholeSecondsFromNow(2 * HOUR_MS);
-                // A daily booking at a different time of day never overlaps the request, but over the ~1.5 years the
-                // weekly request spans it has more occurrences than the expansion safety cap.
-                const bookingStart = new Date(startDate.getTime() + 6 * HOUR_MS - DAY_MS);
+                const bookingStart = new Date(startDate.getTime() + 4 * HOUR_MS - 7 * DAY_MS);
+                // ~522 occurrences over the two-year horizon - more than one expansion returns.
                 await saveBooking({
                     startDate: bookingStart,
-                    endDate: new Date(bookingStart.getTime() + 30 * 60 * 1000),
+                    endDate: new Date(bookingStart.getTime() + HOUR_MS),
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, byDay: ["MO", "TU", "WE", "TH", "FR"], exceptions: [] },
+                });
+
+                const weekly = await requestBooking({
+                    icalUid: uuid.v4(),
+                    startDate,
+                    endDate: new Date(startDate.getTime() + HOUR_MS),
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+                });
+                expect(weekly[0].deleted).toBe(false);
+
+                // An open-ended daily request (731 occurrences) is expanded completely too.
+                const daily = await requestBooking({
+                    icalUid: uuid.v4(),
+                    startDate: new Date(startDate.getTime() + 2 * HOUR_MS),
+                    endDate: new Date(startDate.getTime() + 3 * HOUR_MS),
                     recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] },
+                });
+                expect(daily[0].deleted).toBe(false);
+            });
+
+            it("Still finds a conflict far into an open-ended request's horizon.", async () => {
+                await createMailbox({ isResource: true, autoAcceptBookings: true });
+                const startDate = wholeSecondsFromNow(2 * HOUR_MS);
+                const clash = new Date(startDate.getTime() + 600 * DAY_MS);
+                await saveBooking({ startDate: clash, endDate: new Date(clash.getTime() + HOUR_MS) });
+
+                const rows = await requestBooking({
+                    icalUid: uuid.v4(),
+                    startDate,
+                    endDate: new Date(startDate.getTime() + HOUR_MS),
+                    recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] },
+                });
+
+                expect(rows[0].deleted).toBe(true);
+            });
+
+            it("Declines an open-ended request that collides with an open-ended booking early in its horizon.", async () => {
+                await createMailbox({ isResource: true, autoAcceptBookings: true });
+                const startDate = wholeSecondsFromNow(2 * HOUR_MS);
+                const bookingStart = new Date(startDate.getTime() - 7 * DAY_MS);
+                // Same time of day as the request, every weekday: too many occurrences to expand across the whole horizon
+                // at once, so the check is split - and the collision is in its first half.
+                await saveBooking({
+                    startDate: bookingStart,
+                    endDate: new Date(bookingStart.getTime() + HOUR_MS),
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, byDay: ["MO", "TU", "WE", "TH", "FR"], exceptions: [] },
                 });
 
                 const rows = await requestBooking({
                     icalUid: uuid.v4(),
                     startDate,
                     endDate: new Date(startDate.getTime() + HOUR_MS),
-                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, count: 80, exceptions: [] },
+                    recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] },
                 });
 
-                expect(rows).toHaveLength(1);
+                expect(rows[0].deleted).toBe(true);
+            });
+
+            it("Declines when even a single requested occurrence spans more existing occurrences than one expansion can check.", async () => {
+                await createMailbox({ isResource: true, autoAcceptBookings: true });
+                const warnSpy = vi.spyOn((job as any).logger, "warn");
+                const startDate = wholeSecondsFromNow(2 * HOUR_MS);
+                const bookingStart = new Date(startDate.getTime() - DAY_MS);
+                await saveBooking({
+                    startDate: bookingStart,
+                    endDate: new Date(bookingStart.getTime() + 30 * 60 * 1000),
+                    recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] },
+                });
+
+                const rows = await requestBooking({ icalUid: uuid.v4(), startDate, endDate: new Date(startDate.getTime() + 600 * DAY_MS) });
+
                 expect(rows[0].deleted).toBe(true);
                 expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("has too many occurrences to check for conflicts"));
             });

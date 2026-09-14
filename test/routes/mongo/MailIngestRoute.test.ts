@@ -694,4 +694,110 @@ describe("Route:MailIngestRouteMongo Tests", () => {
         expect(entries.length).toBe(1);
         expect(entries[0].quarantineReason).toBe(QuarantineReason.TRANSPORT_RULE);
     });
+
+    describe("Round 5: distribution-list relay can't launder spoofed mail", () => {
+        const deliver = (from: string, to: string, raw: string) =>
+            request(server.getApplication())
+                .post(`${baseUrl}/deliver`)
+                .set("Authorization", `Bearer ${secret}`)
+                .set("X-Envelope-From", from)
+                .set("X-Envelope-To", to)
+                .set("Content-Type", "message/rfc822")
+                .send(Buffer.from(raw));
+        const entriesFor = async (mailboxUid: string): Promise<any[]> => await ingestQueueRepo.find({ mailboxUid }).toArray();
+        const transport = (): RecordingMailTransport => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const headerBlock = (raw: Buffer): string => {
+            const text: string = raw.toString("binary");
+            return text.slice(0, text.indexOf("\r\n\r\n"));
+        };
+
+        it("restrictSenders needs a DKIM-verified From naming a member - a forged envelope sender or From is dropped.", async () => {
+            const member = await createMailbox();
+            const list = await createList({ memberAddresses: [member.primarySmtpAddress], restrictSenders: true });
+            const forged = await deliver(member.primarySmtpAddress, list.primarySmtpAddress, `From: ${member.primarySmtpAddress}\r\nSubject: hi\r\n\r\nHello\r\n`);
+            expect(forged.body.results).toEqual([{ rcpt: list.primarySmtpAddress, queued: false }]);
+            expect(await entriesFor(member.uid)).toHaveLength(0);
+
+            const verified = await deliver(
+                "bounces@somewhere.example",
+                list.primarySmtpAddress,
+                `Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\nFrom: ${member.primarySmtpAddress}\r\nSubject: hi\r\n\r\nHello\r\n`,
+            );
+            expect(verified.body.results).toEqual([{ rcpt: list.primarySmtpAddress, queued: true }]);
+            expect(await entriesFor(member.uid)).toHaveLength(1);
+        });
+
+        it("An unauthenticated From is rewritten to the list for external members, and trust-bearing headers are stripped.", async () => {
+            const internal = await createMailbox();
+            const list = await createList({ memberAddresses: [internal.primarySmtpAddress, "external@outside.com"] });
+            const raw = [
+                "Authentication-Results: mx.example.com; dkim=fail header.d=example.com",
+                "From: CEO <ceo@example.com>",
+                "RapidMX-Key: addr=ceo@example.com; keydata=AAAA",
+                "X-RapidMX-Recall-Of: <victim@example.com>",
+                "Disposition-Notification-To: ceo@example.com",
+                `To: ${list.primarySmtpAddress}`,
+                "Subject: urgent",
+                "",
+                "Pay this invoice.",
+                "",
+            ].join("\r\n");
+
+            const result = await deliver("attacker@evil.example", list.primarySmtpAddress, raw);
+
+            expect(result.body.results).toEqual([{ rcpt: list.primarySmtpAddress, queued: true }]);
+            expect(transport().sent).toHaveLength(1);
+            const relayed: string = headerBlock(transport().sent[0].raw);
+            expect(relayed).toMatch(/^From: "Test List" <[^>]+>$/m);
+            expect(relayed).toContain(`<${list.primarySmtpAddress}>`);
+            expect(relayed).toContain("X-Original-From: CEO <ceo@example.com>");
+            expect(relayed).not.toMatch(/^(authentication-results|rapidmx-key|x-rapidmx-recall-of|disposition-notification-to)\s*:/im);
+            expect(transport().sent[0].raw.toString()).toContain("Pay this invoice.");
+
+            // The internal member's copy keeps the original headers for ScanQueueJob to judge.
+            const entries = await entriesFor(internal.uid);
+            expect(entries).toHaveLength(1);
+            const stored: string = (await objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!.get(entries[0].rawBlobKey)).toString();
+            expect(stored).toContain("From: CEO <ceo@example.com>");
+        });
+
+        it("An authenticated From is relayed unchanged (Authentication-Results still stripped).", async () => {
+            const list = await createList({ memberAddresses: ["external@outside.com"] });
+            const raw = `Authentication-Results: mx.example.com; dkim=pass header.d=partner.example\r\nFrom: Bob <bob@partner.example>\r\nSubject: hi\r\n\r\nHello\r\n`;
+
+            await deliver("bob@partner.example", list.primarySmtpAddress, raw);
+
+            expect(transport().sent).toHaveLength(1);
+            const relayed: string = headerBlock(transport().sent[0].raw);
+            expect(relayed).toContain("From: Bob <bob@partner.example>");
+            expect(relayed).not.toContain("X-Original-From");
+            expect(relayed).not.toMatch(/^authentication-results\s*:/im);
+        });
+
+        it("Unauthenticated calendar content isn't relayed to external members; internal members still get it.", async () => {
+            const internal = await createMailbox();
+            const list = await createList({ memberAddresses: [internal.primarySmtpAddress, "external@outside.com"] });
+            const raw = [
+                "From: ceo@example.com",
+                "Subject: Cancelled",
+                'Content-Type: text/calendar; method=CANCEL; charset="utf-8"',
+                "",
+                "BEGIN:VCALENDAR",
+                "METHOD:CANCEL",
+                "END:VCALENDAR",
+                "",
+            ].join("\r\n");
+
+            const result = await deliver("attacker@evil.example", list.primarySmtpAddress, raw);
+
+            expect(result.body.results).toEqual([{ rcpt: list.primarySmtpAddress, queued: true }]);
+            expect(transport().sent).toHaveLength(0);
+            expect(await entriesFor(internal.uid)).toHaveLength(1);
+
+            const externalOnly = await createList({ memberAddresses: ["external@outside.com"] });
+            const skipped = await deliver("attacker@evil.example", externalOnly.primarySmtpAddress, raw);
+            expect(skipped.body.results).toEqual([{ rcpt: externalOnly.primarySmtpAddress, queued: false }]);
+            expect(transport().sent).toHaveLength(0);
+        });
+    });
 });

@@ -5,6 +5,7 @@
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import {
     ACLAction,
+    type ACLRecord,
     ApiErrorMessages,
     ApiErrors,
     CRUDRoute,
@@ -27,6 +28,18 @@ import { normalizeUserUid } from "../util/UserUidUtils.js";
 import { coerceDateFields } from "../util/DateCoercionUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 const { Auth, Delete, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
+
+/** One mailbox's owner change: `ownerUserUid` before (`previous`) and after (`next`) the update; `undefined` for none. */
+interface OwnerChange {
+    mailboxUid: string;
+    previous: string | undefined;
+    next: string | undefined;
+}
+
+/** Whether two owner uids name the same owner (case-insensitively; `undefined` for none). */
+function sameOwner(a: string | undefined, b: string | undefined): boolean {
+    return a?.toLowerCase() === b?.toLowerCase();
+}
 
 /** Every top-level `Date` field of `Mailbox` a client writes - coerced on create/update (see `util/DateCoercionUtils.ts`). */
 const MAILBOX_DATE_FIELDS = ["oofStartTime", "oofEndTime"] as const;
@@ -83,6 +96,25 @@ function isPlainAddress(address: unknown): address is string {
 function assertPlainAddresses(addresses: unknown[]): void {
     if (addresses.some((address) => !isPlainAddress(address))) {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Mailbox addresses must be single plain addresses.");
+    }
+}
+
+/**
+ * Refuses (400) a `displayName` that isn't a string, or that contains `@` or a line break. It becomes the display name
+ * of the `From` header on every message the mailbox sends (server compose and the web client both build it from here),
+ * and the send path rejects a `From` whose display name looks like an address - so a mailbox named
+ * `support@example.com` could never send anything. `null`/`undefined` (no display name) is allowed.
+ */
+function assertValidDisplayName(value: unknown): void {
+    if (value === undefined || value === null) {
+        return;
+    }
+    if (typeof value !== "string" || /[@\r\n]/.test(value)) {
+        throw new ApiError(
+            ApiErrors.INVALID_REQUEST,
+            400,
+            "'displayName' must be text without '@' or line breaks - it is shown as the sender name on mail from this mailbox.",
+        );
     }
 }
 
@@ -481,6 +513,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * well-known folders. */
     private async createMailboxes(obj: T | T[], objs: T[], req: HttpRequest, user: JWTUser, isTrusted: boolean): Promise<T | T[]> {
         for (const o of objs) {
+            assertValidDisplayName((o as any).displayName);
             normalizeAddressFields(o as Record<string, unknown>);
             if (o.aliasAddresses !== undefined && !Array.isArray(o.aliasAddresses)) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'aliasAddresses' must be a list of addresses.");
@@ -562,7 +595,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         if (isTrusted) {
             for (const mailbox of created) {
                 if (mailbox.ownerUserUid) {
-                    await this.syncOwnerAcl(mailbox.uid, undefined, mailbox.ownerUserUid);
+                    await this.moveOwnerAcl({ mailboxUid: mailbox.uid, previous: undefined, next: mailbox.ownerUserUid });
                 }
             }
         }
@@ -630,6 +663,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         await this.validateEscrowScopeAssignment(id, obj, isTrusted);
         rejectServerManagedFields(obj);
         await this.validateTrustedOnlyFields(id, obj, user, isTrusted);
+        await this.validateDisplayNameChange(id, obj);
         normalizeAddressFields(obj);
         if (obj.aliasAddresses !== undefined) {
             await this.validateAliasChange(id, obj, isTrusted, req);
@@ -641,11 +675,25 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             // `BaseDomainRoute.update()` applies to its own uid-derived `name` field).
             const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
             if (existing && normalizeAddress(existing.primarySmtpAddress) !== obj.primarySmtpAddress) {
-                await this.validateAddressChange(id, obj.primarySmtpAddress);
+                await this.validateAddressChange(id, obj.primarySmtpAddress, isTrusted, req);
             }
             (obj as any).keyDiscoveryHash = computeKeyDiscoveryHash(obj.primarySmtpAddress.split("@")[0]);
         }
         return super.validateUpdate(id, obj, user);
+    }
+
+    /** `assertValidDisplayName()` on a `displayName` the patch actually changes - a full-object `PUT` round-tripping a
+     * name stored before this check existed still works, so the mailbox's other settings can be edited while the owner
+     * is asked to fix the name. */
+    private async validateDisplayNameChange(id: string, obj: Record<string, any>): Promise<void> {
+        if (obj.displayName === undefined) {
+            return;
+        }
+        const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+        if (existing?.displayName === obj.displayName) {
+            return;
+        }
+        assertValidDisplayName(obj.displayName);
     }
 
     /**
@@ -739,7 +787,14 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * query), not `uid` - the whole point is that `uid` no longer reliably tracks the current address post-
      * rename, so a `uid`-keyed collision check alone wouldn't catch this.
      */
-    private async validateAddressChange(id: string, newAddress: string): Promise<void> {
+    //
+    // A non-trusted caller may only rename onto one of their own auth-server usernames on a verified domain - the same
+    // rule `validateAliasChange()` applies to an added alias and `assertSelfServiceCreate()` to a new mailbox. The
+    // primary address is what mail is delivered to, what the mailbox sends as, what the internal CA and ACME issue
+    // S/MIME certificates for and what key discovery publishes keys under, so without it an owner could rename their
+    // mailbox to any unused address (`ceo@corp.com`) and become it. Fails closed (403) when no alias source or verified
+    // domain is configured, and for a bulk update (which gets no `req` to forward) unless static aliases are configured.
+    private async validateAddressChange(id: string, newAddress: string, isTrusted: boolean, req: HttpRequest | undefined): Promise<void> {
         assertPlainAddresses([newAddress]);
         const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
         if (domains.length > 0) {
@@ -749,6 +804,17 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                     ApiErrors.INVALID_REQUEST,
                     400,
                     `Mailbox addresses must be on one of this server's verified domains: ${domains.join(", ")}.`,
+                );
+            }
+        }
+        if (!isTrusted) {
+            const hasAliasSource: boolean = this.staticAliases.length > 0 || !!this.authServerUrl;
+            const usernames: string[] = hasAliasSource && domains.length > 0 ? (await this.fetchNameAliases(req)).map((a) => a.toLowerCase()) : [];
+            if (!ownsAddress(usernames, domains, newAddress)) {
+                throw new ApiError(
+                    ApiErrors.AUTH_PERMISSION_FAILURE,
+                    403,
+                    "You can only change your mailbox's address to one of your own usernames on this server's domains.",
                 );
             }
         }
@@ -790,7 +856,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             // PUT never fires for this path. `validateAddressChange()` must therefore be called explicitly
             // here too, the same "only on a genuine change" guard `validateUpdate()` itself applies.
             if (normalizeAddress(current.primarySmtpAddress) !== obj) {
-                await this.validateAddressChange(id, obj);
+                await this.validateAddressChange(id, obj, UserUtils.hasRoles(user, this.trustedRoles), req);
             }
             return this.update(
                 id,
@@ -808,40 +874,33 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // a normalized alias list or owner uid, not the raw one.
         const patch: Record<string, any> = { [propertyName]: obj };
         await this.validateUpdate(id, patch as UpdateObject<T>, user, req);
-        const previousOwner: string | undefined = propertyName === "ownerUserUid" ? await this.ownerOf(id) : undefined;
-        const updated: T = await this.doUpdateProperty(id, propertyName, patch[propertyName], { user });
-        if (propertyName === "ownerUserUid") {
-            await this.syncOwnerAcl(updated.uid, previousOwner, updated.ownerUserUid);
+        if (propertyName !== "ownerUserUid") {
+            return this.doUpdateProperty(id, propertyName, patch[propertyName], { user });
         }
-        return updated;
+        const change: OwnerChange = { mailboxUid: id, previous: await this.ownerOf(id), next: patch.ownerUserUid || undefined };
+        return this.withOwnerAclMoved([change], () => this.doUpdateProperty(id, propertyName, patch[propertyName], { user }));
     }
 
-    /** As `CRUDRoute.update()`, moving the owner's ACL record when the update changed `ownerUserUid`. */
+    /** As `CRUDRoute.update()`, moving the owner's ACL record when the update changes `ownerUserUid` (see
+     * `withOwnerAclMoved()`). */
     public async update(id: string, obj: UpdateObject<T>, req: HttpRequest, user?: JWTUser): Promise<T> {
-        const ownerChange: boolean = Object.keys(Object(obj)).includes("ownerUserUid");
-        const previousOwner: string | undefined = ownerChange ? await this.ownerOf(id) : undefined;
-        const updated: T = await super.update(id, obj, req, user);
-        if (ownerChange) {
-            await this.syncOwnerAcl(updated.uid, previousOwner, updated.ownerUserUid);
+        if (!Object.keys(Object(obj)).includes("ownerUserUid")) {
+            return super.update(id, obj, req, user);
         }
-        return updated;
+        const change: OwnerChange = { mailboxUid: id, previous: await this.ownerOf(id), next: (obj as any).ownerUserUid || undefined };
+        return this.withOwnerAclMoved([change], () => super.update(id, obj, req, user));
     }
 
-    /** As `CRUDRoute.updateBulk()`, moving each changed owner's ACL record. */
+    /** As `CRUDRoute.updateBulk()`, moving each changed owner's ACL record (see `withOwnerAclMoved()`). */
     public async updateBulk(obj: UpdateObject<T>[], req: HttpRequest, user?: JWTUser): Promise<T[]> {
-        const previousOwners: Map<string, string | undefined> = new Map();
+        const changes: OwnerChange[] = [];
         for (const single of obj) {
             if (Object.keys(Object(single)).includes("ownerUserUid")) {
-                previousOwners.set(String(single.uid), await this.ownerOf(String(single.uid)));
+                const mailboxUid: string = String(single.uid);
+                changes.push({ mailboxUid, previous: await this.ownerOf(mailboxUid), next: (single as any).ownerUserUid || undefined });
             }
         }
-        const updated: T[] = await super.updateBulk(obj, req, user);
-        for (const mailbox of updated) {
-            if (previousOwners.has(mailbox.uid)) {
-                await this.syncOwnerAcl(mailbox.uid, previousOwners.get(mailbox.uid), mailbox.ownerUserUid);
-            }
-        }
-        return updated;
+        return this.withOwnerAclMoved(changes, () => super.updateBulk(obj, req, user));
     }
 
     private async ownerOf(id: string): Promise<string | undefined> {
@@ -850,33 +909,90 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     }
 
     /**
-     * Keeps the mailbox's owner grant on its `AccessControlList` in step with `ownerUserUid`: removes `previousOwner`'s
-     * record and gives `newOwner` a `FULL` record (replacing any narrower one). A no-op when the owner didn't change
-     * (case-insensitive) or the mailbox has no ACL. Retried on a concurrent ACL save.
+     * Runs `write` - an update that changes the owner of each of `changes`' mailboxes - with each mailbox's owner grant
+     * already moved on its `AccessControlList` (`moveOwnerAcl()`). The ACL is changed FIRST so a failure can always be
+     * repaired by retrying: the stored `ownerUserUid` still names the old owner until `write` commits, so a retry
+     * recomputes the same move (which is idempotent). The earlier order - commit the owner, then move the grant - left
+     * a failed ACL save unrepairable: the retry saw the new owner as the "previous" one, did nothing, and the ex-owner
+     * kept `FULL` access.
+     *
+     * If `write` (or a later move) fails, each moved mailbox whose stored owner is still not the new one gets back the
+     * two members' records it had before (`restoreOwnerAcl()`); one whose `write` already committed (a partial bulk
+     * update) keeps its move. A failed restore is logged, never thrown over the original error - retrying the update
+     * repairs it.
+     *
+     * Owner grants can't be told apart from delegate grants on the ACL itself (a `manager` delegate is also a `FULL`
+     * record, and `ACLRecord` carries no other field), so "remove every owner-granted record of anyone but the current
+     * owner" isn't possible against stored state alone - hence moving the grant before the owner changes instead.
      */
-    private async syncOwnerAcl(mailboxUid: string, previousOwner: string | undefined, newOwner: string | undefined): Promise<void> {
-        const previous: string | undefined = previousOwner?.toLowerCase();
-        const next: string | undefined = newOwner?.toLowerCase();
-        if (previous === next) {
-            return;
+    private async withOwnerAclMoved<R>(changes: OwnerChange[], write: () => Promise<R>): Promise<R> {
+        const moved: { change: OwnerChange; snapshot: ACLRecord[] }[] = [];
+        try {
+            for (const change of changes) {
+                if (sameOwner(change.previous, change.next)) {
+                    continue;
+                }
+                const snapshot: ACLRecord[] | undefined = await this.moveOwnerAcl(change);
+                /* v8 ignore else -- every mailbox is created with an ACL */
+                if (snapshot) {
+                    moved.push({ change, snapshot });
+                }
+            }
+            return await write();
+        } catch (err) {
+            for (const { change, snapshot } of moved) {
+                try {
+                    if (!sameOwner(await this.ownerOf(change.mailboxUid), change.next)) {
+                        await this.restoreOwnerAcl(change, snapshot);
+                    }
+                    /* v8 ignore start -- only a failing ACL store reaches here */
+                } catch (restoreErr: any) {
+                    this.logger?.error(
+                        `BaseMailboxRoute: failed to restore the owner ACL of mailbox ${change.mailboxUid} after a failed update: ${restoreErr?.message}`,
+                    );
+                }
+                /* v8 ignore stop */
+            }
+            throw err;
         }
+    }
+
+    /**
+     * Removes `change.previous`'s records from the mailbox's `AccessControlList` and gives `change.next` a single `FULL`
+     * record (replacing any narrower one), returning both members' records as they were beforehand (`undefined` when
+     * the mailbox has no ACL). Idempotent. Retried on a concurrent ACL save.
+     */
+    private async moveOwnerAcl(change: OwnerChange): Promise<ACLRecord[] | undefined> {
+        return this.rewriteOwnerAcl(change, (others) =>
+            change.next ? [...others, { userOrRoleId: change.next, actions: [ACLAction.FULL] }] : others,
+        );
+    }
+
+    /** Puts back the records `moveOwnerAcl()` returned for `change`'s two members. */
+    private async restoreOwnerAcl(change: OwnerChange, snapshot: ACLRecord[]): Promise<void> {
+        await this.rewriteOwnerAcl(change, (others) => [...others, ...snapshot]);
+    }
+
+    /** Replaces the records of `change`'s previous and next owner with `rebuild(everyone else's records)`, returning the
+     * records it replaced. */
+    private async rewriteOwnerAcl(change: OwnerChange, rebuild: (others: ACLRecord[]) => ACLRecord[]): Promise<ACLRecord[] | undefined> {
+        const members: Set<string> = new Set(
+            [change.previous, change.next].filter((member): member is string => !!member).map((member) => member.toLowerCase()),
+        );
+        const isMember = (record: ACLRecord): boolean => members.has(String(record.userOrRoleId).toLowerCase());
         for (let attempt = 1; ; attempt++) {
-            const acl = await this.aclUtils!.findACL(mailboxUid, [], { skipCache: true });
+            const acl = await this.aclUtils!.findACL(change.mailboxUid, [], { skipCache: true });
             /* v8 ignore if -- every mailbox is created with an ACL */
             if (!acl) {
-                return;
+                return undefined;
             }
-            const records = acl.records.filter((record) => {
-                const member: string = String(record.userOrRoleId).toLowerCase();
-                return member !== previous && member !== next;
-            });
-            if (newOwner) {
-                records.push({ userOrRoleId: newOwner, actions: [ACLAction.FULL] });
-            }
-            acl.records = records;
+            const replaced: ACLRecord[] = acl.records
+                .filter(isMember)
+                .map((record) => ({ userOrRoleId: record.userOrRoleId, actions: [...record.actions] }));
+            acl.records = rebuild(acl.records.filter((record) => !isMember(record)));
             try {
                 await this.aclUtils!.saveACL(acl);
-                return;
+                return replaced;
                 /* v8 ignore start -- only a concurrent ACL write between the read and the save reaches here */
             } catch (err) {
                 if (attempt >= 3) {

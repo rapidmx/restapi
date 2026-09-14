@@ -8,6 +8,7 @@ import {
     isHeaderOversignedByAlignedDkim,
     oversignsHeader,
     parseDkimSignature,
+    topmostTrustedAuthenticationResults,
     verifiedDkimSignatures,
 } from "../../src/util/DkimOversignUtils.js";
 
@@ -169,5 +170,42 @@ describe("isHeaderOversignedByAlignedDkim() Tests", () => {
         const raw = message(["From: a@example.com", "RapidMX-Key: x", signature("example.com", "from:rapidmx-key:rapidmx-key")]);
         expect(isHeaderOversignedByAlignedDkim(raw, "RapidMX-Key", "", ar(), TRUSTED)).toBe(false);
         expect(isHeaderOversignedByAlignedDkim(raw, "RapidMX-Key", "example.com", ar(), "")).toBe(false);
+    });
+});
+
+describe("topmostTrustedAuthenticationResults() / duplicate trusted results (round 5)", () => {
+    const sigGenuine = parseDkimSignature("d=example.com; h=from:subject; b=R2VudWluZQ")!;
+    const sigForged = parseDkimSignature("d=example.com; h=from:rapidmx-key:rapidmx-key; b=Rm9yZ2VkIQ")!;
+
+    it("Returns only the topmost trusted instance, skipping other authserv-ids above it.", () => {
+        const values = ["filter.internal; spam=pass", `${TRUSTED}; dkim=fail header.d=example.com`, `${TRUSTED}; dkim=pass header.d=example.com`];
+        expect(topmostTrustedAuthenticationResults(values, TRUSTED)).toEqual([values[1]]);
+        expect(topmostTrustedAuthenticationResults(`${TRUSTED}; none`, "MX.example.com")).toEqual([`${TRUSTED}; none`]);
+        expect(topmostTrustedAuthenticationResults(["other; dkim=pass"], TRUSTED)).toEqual([]);
+        expect(topmostTrustedAuthenticationResults(values, "")).toEqual([]);
+        expect(topmostTrustedAuthenticationResults(undefined, TRUSTED)).toEqual([]);
+    });
+
+    it("Skips a non-string value (e.g. from an untyped header map) like parseAuthenticationResults() does.", () => {
+        const pass = `${TRUSTED}; dkim=pass header.d=example.com`;
+        expect(topmostTrustedAuthenticationResults([42 as any, pass], TRUSTED)).toEqual([pass]);
+        expect(topmostTrustedAuthenticationResults([null as any], TRUSTED)).toEqual([]);
+    });
+
+    it("Fails closed at a value whose authserv-id can't be read.", () => {
+        expect(topmostTrustedAuthenticationResults(["(unterminated comment", `${TRUSTED}; dkim=pass header.d=example.com`], TRUSTED)).toEqual([]);
+    });
+
+    it("A re-ingested message's second trusted instance can't double-count a pass for a forged oversigning signature.", () => {
+        // Each hop verified the genuine signature once; together they'd look like two passes for two signatures.
+        const results = [`${TRUSTED}; dkim=pass header.d=example.com`, `${TRUSTED}; dkim=pass header.d=example.com`];
+        expect(verifiedDkimSignatures([sigGenuine, sigForged], results, TRUSTED)).toEqual([]);
+        const raw = message(["From: a@example.com", "RapidMX-Key: appended", signature("example.com", "from:subject", "R2VudWluZQ"), signature("example.com", "from:rapidmx-key:rapidmx-key", "Rm9yZ2VkIQ")]);
+        expect(isHeaderOversignedByAlignedDkim(raw, "RapidMX-Key", "example.com", results, TRUSTED)).toBe(false);
+    });
+
+    it("Requires exactly one pass per signature - more passes than signatures verify nothing.", () => {
+        expect(verifiedDkimSignatures([sigForged], `${TRUSTED}; dkim=pass header.d=example.com; dkim=pass header.d=example.com`, TRUSTED)).toEqual([]);
+        expect(verifiedDkimSignatures([sigForged], `${TRUSTED}; dkim=pass header.d=example.com`, TRUSTED)).toEqual([sigForged]);
     });
 });

@@ -51,6 +51,11 @@ export class KeyVaultMongo extends BaseMongoEntity implements KeyVault {
     @Nullable
     public expiryAuditedFingerprint?: string;
 
+    @Column()
+    @Description("How many times this vault's master key has been rotated (server-managed).")
+    @Nullable
+    public masterKeyGeneration?: number;
+
     constructor(other?: Partial<KeyVaultMongo>) {
         super(other);
 
@@ -59,6 +64,7 @@ export class KeyVaultMongo extends BaseMongoEntity implements KeyVault {
             this.wrappedKeys = other.wrappedKeys !== undefined ? other.wrappedKeys : this.wrappedKeys;
             this.masterKeyWraps = other.masterKeyWraps !== undefined ? other.masterKeyWraps : this.masterKeyWraps;
             this.expiryAuditedFingerprint = "expiryAuditedFingerprint" in other ? other.expiryAuditedFingerprint : this.expiryAuditedFingerprint;
+            this.masterKeyGeneration = "masterKeyGeneration" in other ? other.masterKeyGeneration : this.masterKeyGeneration;
         }
     }
 }

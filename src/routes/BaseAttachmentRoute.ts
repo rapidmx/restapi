@@ -12,15 +12,40 @@ import {
     HttpRequest,
     HttpResponse,
     RouteDecorators,
+    type UpdateObject,
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
-import { getMailboxUidForFolder } from "../util/FolderUtils.js";
+import { asEntity } from "../util/EntityUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { Attachment, Message } from "../models/types.js";
 const { Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
-const { Delete, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
+const { Delete, Get, Head, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
+
+/** The client query minus `$`-operator keys and `shareToken` - the same rule as `BaseScopedChildRoute`'s own (module-
+ * private) `stripUnsafeQueryKeys()` - and minus the location keys `messageFilter()` sets itself. */
+function stripUnsafeQueryKeys(query: any): Record<string, any> {
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(query)) {
+        if (
+            ["shareToken", "folderUid", "mailboxUid", "messageUid"].includes(key) ||
+            key.split(".").some((segment) => segment.startsWith("$"))
+        ) {
+            continue;
+        }
+        result[key] = value;
+    }
+    return result;
+}
+
+/** Where an attachment really is: its owning message's current folder and mailbox. */
+interface AttachmentLocation {
+    folderUid: string;
+    mailboxUid: string;
+}
+
+
 
 /** Strips CR/LF (header injection) from a client-supplied filename before it's ever stored - matches
  * `DistributionListUtils.rewriteHeadersForList()`'s identical `safeName` convention for any other value
@@ -69,6 +94,20 @@ const INLINE_SAFE_MIME_TYPES: ReadonlySet<string> = new Set(["image/png", "image
  * client to already have a `blobKey`, which only this route can mint) — `upload` replaces it as the way a new
  * attachment record is created.
  *
+ * **Access follows the owning message's CURRENT folder**, not `Attachment.folderUid`. That field is stamped from the
+ * message at upload and nothing re-stamps it when the message is sent, moved or archived, so checking it would hide
+ * a sent message's attachments from its own listing and refuse a delegate who can read Sent Items but not Drafts -
+ * or, the other way round, keep granting a delegate of the old folder access to a message moved out of their reach.
+ * So every read (`find`/`count` by `messageUid`, `findById`, `exists`, `download`) resolves the message and checks
+ * its folder, and returns the attachment with `folderUid`/`mailboxUid` set to where it really is. Every write
+ * (`update`/`delete`/`truncate`) first re-stamps a stale attachment (`realign()`) so `BaseScopedChildRoute`'s own
+ * checks run against the right folder; an attachment is never moved on its own (a client `folderUid`/`mailboxUid`
+ * is dropped). An attachment whose message no longer exists keeps its stored location.
+ *
+ * Listing by `messageUid` is the supported way to list a message's attachments (`folderUid` may be sent too and is
+ * ignored). A `folderUid`-only list still requires LIST on that folder and only returns attachments whose message is
+ * in it now - never ones stamped with it whose message has since moved elsewhere.
+ *
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseAttachmentRoute<T extends Attachment, M extends Message = Message> extends BaseScopedChildRoute<T> {
@@ -81,11 +120,10 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
     /** The class of the owning `Message` entity, supplied by the Mongo/SQL concrete subclass. */
     protected abstract messageClass: any;
 
-    /** The concrete `Folder` entity class, supplied by the Mongo/SQL concrete subclass - used only by
-     * `resolveMailboxUidFor()` below. */
-    protected abstract folderClass: any;
-
     private messageRepo?: RecoverableRepoUtils<M>;
+
+    /** Page size for the folder-scoped scans that filter or re-stamp in memory (`count()`/`truncate()`). */
+    protected folderScanPageSize: number = 500;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -100,11 +138,235 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         return this.messageRepo;
     }
 
-    /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `Attachment` carries its own
-     * denormalized `mailboxUid` (`Attachment.mailboxUid`'s own doc comment) that must never diverge from
-     * its actual folder's mailbox, the same reasoning already applied to `upload()`'s own comment above. */
-    protected async resolveMailboxUidFor(scopeUid: string): Promise<string | undefined> {
-        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid);
+
+    /** The message `messageUid` names, soft-deleted included. */
+    private async findMessage(messageUid: string): Promise<M | undefined> {
+        const messageRepo: RecoverableRepoUtils<M> = await this.getMessageRepo();
+        return messageRepo.findOne(messageUid, { ignoreACL: true, includeDeleted: true });
+    }
+
+    /** Where `attachment` really is - its message's current folder and mailbox, or its stored ones if the message is
+     * gone. `messages` caches lookups across one request. */
+    private async locate(attachment: T, messages?: Map<string, M | undefined>): Promise<AttachmentLocation> {
+        let message: M | undefined;
+        if (messages?.has(attachment.messageUid)) {
+            message = messages.get(attachment.messageUid);
+        } else {
+            message = await this.findMessage(attachment.messageUid);
+            messages?.set(attachment.messageUid, message);
+        }
+        return message
+            ? { folderUid: message.folderUid, mailboxUid: message.mailboxUid }
+            : { folderUid: attachment.folderUid, mailboxUid: attachment.mailboxUid };
+    }
+
+    /** A copy of `attachment` showing `location`, for responses - the stored record is left alone. */
+    private located(attachment: T, location: AttachmentLocation): T {
+        return Object.assign(Object.create(Object.getPrototypeOf(attachment)), attachment, location);
+    }
+
+    /** The data filter for listing `message`'s attachments: the client query minus anything that could widen it, with
+     * `messageUid` forced as a literal. Attachments aren't soft-deleted, so a `deleted` filter is dropped too. */
+    private messageFilter(params: any, query: any, message: M): any {
+        const filter: any = { ...stripUnsafeQueryKeys(query), ...params, messageUid: `eq(${message.uid})` };
+        delete filter.folderUid;
+        delete filter.mailboxUid;
+        delete filter.deleted;
+        return filter;
+    }
+
+    /** `query.messageUid` as the one message a list is for; `undefined` when absent, 400 when not a single value. */
+    private messageUidOf(query: any): string | undefined {
+        const messageUid: unknown = query?.messageUid;
+        if (messageUid === undefined) {
+            return undefined;
+        }
+        if (typeof messageUid !== "string" || messageUid.length === 0) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        return messageUid;
+    }
+
+    /** Of a folder-scoped page of attachments, those whose message is in `folderUid` now, shown there. */
+    private async keepInFolder(rows: T[], folderUid: string): Promise<T[]> {
+        const messages: Map<string, M | undefined> = new Map();
+        const kept: T[] = [];
+        for (const row of rows) {
+            const location: AttachmentLocation = await this.locate(row, messages);
+            if (location.folderUid === folderUid) {
+                kept.push(this.located(row, location));
+            }
+        }
+        return kept;
+    }
+
+    /**
+     * Re-stamps `attachment`'s stored `folderUid`/`mailboxUid` from its message when they've gone stale, so the
+     * inherited write checks see where it really is. Version-checked and retried on a concurrent write; returns the
+     * record as stored afterwards.
+     */
+    private async realign(attachment: T): Promise<T> {
+        let current: T = attachment;
+        for (let attempt = 1; ; attempt++) {
+            const location: AttachmentLocation = await this.locate(current);
+            if (location.folderUid === current.folderUid && location.mailboxUid === current.mailboxUid) {
+                return current;
+            }
+            try {
+                return await this.repoUtils!.update(
+                    { uid: current.uid, version: (current as any).version, ...location } as any,
+                    asEntity(this.repoUtils!, current),
+                    { ignoreACL: true },
+                );
+                /* v8 ignore start -- only a concurrent write to the same attachment reaches here */
+            } catch (err: any) {
+                const reread: T | undefined = await this.repoUtils!.findOne(current.uid, { ignoreACL: true, skipCache: true });
+                if (attempt >= 3 || err?.status !== 409 || !reread) {
+                    throw err;
+                }
+                current = reread;
+            }
+            /* v8 ignore stop */
+        }
+    }
+
+    /** Lists attachments by their message's current folder - see this class's doc comment. */
+    @Get()
+    public async find(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<T[]> {
+        const messageUid: string | undefined = this.messageUidOf(query);
+        if (messageUid === undefined) {
+            // `super.find()` answers anything but one plain `folderUid` with a 400.
+            return this.keepInFolder(await super.find(params, query, user), String(query.folderUid));
+        }
+        const message: M | undefined = await this.findMessage(messageUid);
+        if (!message || !(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.LIST))) {
+            return [];
+        }
+        const rows: T[] = await this.repoUtils!.find(this.messageFilter(params, query, message), {
+            limit: query?.limit,
+            page: query?.page,
+            version: query?.version,
+            user,
+            ignoreACL: true,
+        });
+        const location: AttachmentLocation = { folderUid: message.folderUid, mailboxUid: message.mailboxUid };
+        return rows.map((row) => this.located(row, location));
+    }
+
+    /** Counts attachments by their message's current folder - see `find()`. */
+    @Head()
+    public async count(@Param() params: any, @Query() query: any, @Response res: HttpResponse, @AuthUser user?: JWTUser): Promise<any> {
+        const messageUid: string | undefined = this.messageUidOf(query);
+        if (messageUid === undefined) {
+            const folderUid: unknown = query?.folderUid;
+            if (typeof folderUid !== "string" || !folderUid || !(await this.aclUtils!.hasPermission(user, folderUid, ACLAction.COUNT))) {
+                return super.count(params, query, res, user);
+            }
+            // Filtered in memory like `find()`, so every page is read.
+            let total: number = 0;
+            for (let page = 0; ; page++) {
+                const rows: T[] = await super.find(params, { ...query, limit: this.folderScanPageSize, page }, user);
+                total += (await this.keepInFolder(rows, folderUid)).length;
+                if (rows.length < this.folderScanPageSize) {
+                    break;
+                }
+            }
+            return res.status(200).setHeader("content-length", total);
+        }
+        const message: M | undefined = await this.findMessage(messageUid);
+        if (!message || !(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.COUNT))) {
+            return res.status(200).setHeader("content-length", 0);
+        }
+        const result: number = await this.repoUtils!.count(this.messageFilter(params, query, message), {
+            limit: query?.limit,
+            page: query?.page,
+            version: query?.version,
+            user,
+            ignoreACL: true,
+        });
+        return res.status(200).setHeader("content-length", result);
+    }
+
+    /** `attachment` if `user` may perform `action` where it really is, else `undefined`. (Attachments aren't
+     * soft-deleted, so there is no `?deleted=true` case.) */
+    private async readable(id: string, query: any, user: JWTUser | undefined, action: string): Promise<T | undefined> {
+        const existing: T | undefined = await this.repoUtils!.findOne(id, { version: query?.version, ignoreACL: true });
+        if (!existing) {
+            return undefined;
+        }
+        const location: AttachmentLocation = await this.locate(existing);
+        return (await this.aclUtils!.hasPermission(user, location.folderUid, action)) ? this.located(existing, location) : undefined;
+    }
+
+    @Get("/:id")
+    public async findById(@Param("id") id: string, @Query() query: any, @AuthUser user?: JWTUser): Promise<T | null> {
+        const attachment: T | undefined = await this.readable(id, query, user, ACLAction.READ);
+        if (!attachment) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        return attachment;
+    }
+
+    @Head("/:id")
+    public async exists(@Param("id") id: string, @Query() query: any, @Response res: HttpResponse, @AuthUser user?: JWTUser): Promise<any> {
+        return (await this.readable(id, query, user, ACLAction.EXISTS))
+            ? res.status(200).setHeader("content-length", 1)
+            : res.status(404).setHeader("content-length", 0);
+    }
+
+    /** 403 unless `user` may perform `action` in `attachment`'s message's current folder - checked before `realign()`,
+     * so a refused caller's attempt changes nothing, and so a caller who can write only the folder the message left is
+     * refused even though the stored (stale) `folderUid` would let `BaseScopedChildRoute` through. */
+    private async requireAccessWhereItIs(attachment: T, user: JWTUser | undefined, action: string): Promise<void> {
+        if (!(await this.aclUtils!.hasPermission(user, (await this.locate(attachment)).folderUid, action))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+    }
+
+    /** As `BaseScopedChildRoute.update()` (which `updateBulk()`/`updateProperty()` also reach), checked against where the
+     * attachment really is (`requireAccessWhereItIs()`) and after re-stamping it; the client's `folderUid`/`mailboxUid`
+     * are dropped - an attachment moves only with its message. (So `BaseScopedChildRoute`'s client-`mailboxUid`
+     * enforcement never runs for an attachment, whose `create()` is refused too: its `folderUid`/`mailboxUid` are only
+     * ever written from its message, by `upload()` and `realign()`.) */
+    @Put("/:id")
+    public async update(@Param("id") id: string, obj: UpdateObject<T>, @Request req?: HttpRequest, @AuthUser user?: JWTUser): Promise<T> {
+        if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+            delete (obj as any).folderUid;
+            delete (obj as any).mailboxUid;
+            const existing: T | undefined = await this.repoUtils!.findOne(id, { skipCache: true, ignoreACL: true });
+            if (existing) {
+                await this.requireAccessWhereItIs(existing, user, ACLAction.UPDATE);
+                const realigned: T = await this.realign(existing);
+                // The client's copy was current until the re-stamp bumped the version.
+                if ((obj as any).version !== undefined && String((obj as any).version) === String((existing as any).version)) {
+                    (obj as any).version = (realigned as any).version;
+                }
+            }
+        }
+        return super.update(id, obj, req, user);
+    }
+
+    /** As `BaseScopedChildRoute.truncate()`, after re-stamping the scope folder's stale attachments, so one whose
+     * message has moved out of the folder isn't deleted by a caller who may truncate only the old folder. */
+    @Delete()
+    public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
+        const folderUid: unknown = query?.folderUid;
+        if (typeof folderUid === "string" && folderUid && (await this.aclUtils!.hasPermission(user, folderUid, ACLAction.TRUNCATE))) {
+            for (let page = 0; ; page++) {
+                const rows: T[] = await this.repoUtils!.find({ folderUid: `eq(${folderUid})`, limit: this.folderScanPageSize, page } as any, {
+                    limit: this.folderScanPageSize,
+                    page,
+                    ignoreACL: true,
+                });
+                for (const row of rows) {
+                    await this.realign(row);
+                }
+                if (rows.length < this.folderScanPageSize) {
+                    break;
+                }
+            }
+        }
+        return super.truncate(params, query, user);
     }
 
     /** Refused (400): an attachment record is only ever created by `upload()`, which stores the content and mints the
@@ -223,6 +485,13 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         @AuthUser user?: JWTUser,
     ): Promise<void> {
         const existing: T | undefined = await this.repoUtils!.findOne(id, { version, ignoreACL: true });
+        // Checked against where it really is (see this class's doc comment) - re-stamped only for a caller who may delete it
+        // there, so a refused caller's attempt changes nothing.
+        if (existing) {
+            await this.requireAccessWhereItIs(existing, user, ACLAction.DELETE);
+            const realigned: T = await this.realign(existing);
+            version = version !== undefined ? String((realigned as any).version) : undefined;
+        }
         await super.delete(id, version, purge, req, user);
         // `super.delete()` has already answered 404 when there was nothing to delete.
         await this.syncMessageHasAttachments(existing!.messageUid);
@@ -240,8 +509,9 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
 
-        const attachment: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
-        if (!attachment || !(await this.aclUtils!.hasPermission(user, attachment.folderUid, ACLAction.READ))) {
+        // Checked against the message's current folder (see this class's doc comment).
+        const attachment: T | undefined = await this.readable(id, {}, user, ACLAction.READ);
+        if (!attachment) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
 

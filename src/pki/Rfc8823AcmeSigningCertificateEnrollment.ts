@@ -21,7 +21,7 @@ import { WrappedPrivateKey } from "../models/types.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { createFileExclusive, lockKeyForPath, readFileIfExists, updateJsonFile, withLock, writeFileAtomic } from "./FileStoreUtils.js";
-import { EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
+import { EnrollmentBinding, EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 
 x509.cryptoProvider.set(crypto);
@@ -67,6 +67,12 @@ interface PendingEnrollment {
      * pair into the mailbox's `KeyVault` with no further client action, the same E2E boundary
      * `BaseKeyVaultRoute.enrollKey()` already keeps (this server never sees an unwrapped private key). */
     wrappedKey?: Omit<WrappedPrivateKey, "fingerprint" | "useType">;
+    /** The mailbox that attached `wrappedKey` - `BaseKeyVaultRoute` binds enrollment ids to it, and the driver job
+     * installs only into it. */
+    mailboxUid?: string;
+    /** `KeyVault.masterKeyGeneration` when `wrappedKey` was attached: the key is sealed under that master key, and the
+     * driver job refuses to install it once the vault has rotated past it. */
+    masterKeyGeneration?: number;
     tokenPart1?: string;
     /** The address the reply email must be sent `To:` - the challenge email's own `Reply-To` header,
      * falling back to its `From` (see `recordChallengeToken()`'s own doc comment). */
@@ -434,9 +440,41 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      *
      * @throws If `enrollmentId` is not recognized.
      */
-    public async attachWrappedKey(enrollmentId: string, wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">): Promise<void> {
+    //
+    // `binding` records the mailbox and its vault's master-key generation alongside the key - see
+    // `PendingEnrollment.mailboxUid`/`masterKeyGeneration`.
+    public async attachWrappedKey(
+        enrollmentId: string,
+        wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">,
+        binding?: { mailboxUid: string; masterKeyGeneration: number },
+    ): Promise<void> {
         await this.updateStore(async (store) => {
-            (await this.requireEnrollment(store, enrollmentId)).wrappedKey = wrappedKey;
+            const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+            enrollment.wrappedKey = wrappedKey;
+            if (binding) {
+                enrollment.mailboxUid = binding.mailboxUid;
+                enrollment.masterKeyGeneration = binding.masterKeyGeneration;
+            }
+        });
+    }
+
+    /** See `SigningCertificateEnrollment.describeEnrollment()`. */
+    public async describeEnrollment(enrollmentId: string): Promise<EnrollmentBinding> {
+        const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
+        return { identity: enrollment.identity, mailboxUid: enrollment.mailboxUid };
+    }
+
+    /** See `SigningCertificateEnrollment.cancelEnrollment()` - a pending, or issued but not installed, enrollment is
+     * marked failed, so `listPendingEnrollments()` drops it and nothing is installed from it. */
+    public async cancelEnrollment(enrollmentId: string, reason: string): Promise<void> {
+        await this.withEnrollmentLock(enrollmentId, async () => {
+            await this.updateStore(async (store) => {
+                const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+                if (enrollment.status === "pending" || (enrollment.status === "issued" && enrollment.installedAt === undefined)) {
+                    enrollment.status = "failed";
+                    enrollment.error = reason;
+                }
+            });
         });
     }
 
@@ -448,11 +486,19 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * tick rather than being lost the moment `status` leaves `"pending"`. Never includes the CSR/wrapped-
      * key contents themselves - a caller that needs those re-reads via `checkStatus()`/`getIssuedMaterial()`.
      */
-    public async listPendingEnrollments(): Promise<Array<{ enrollmentId: string; identity: string; status: PendingEnrollment["status"] }>> {
+    public async listPendingEnrollments(): Promise<
+        Array<{ enrollmentId: string; identity: string; status: PendingEnrollment["status"]; mailboxUid?: string; hasWrappedKey: boolean }>
+    > {
         const store: Record<string, PendingEnrollment> = await this.loadStore();
         return Object.entries(store)
             .filter(([, enrollment]) => enrollment.status === "pending" || (enrollment.status === "issued" && enrollment.installedAt === undefined))
-            .map(([enrollmentId, enrollment]) => ({ enrollmentId, identity: enrollment.identity, status: enrollment.status }));
+            .map(([enrollmentId, enrollment]) => ({
+                enrollmentId,
+                identity: enrollment.identity,
+                status: enrollment.status,
+                mailboxUid: enrollment.mailboxUid,
+                hasWrappedKey: !!enrollment.wrappedKey,
+            }));
     }
 
     /**
@@ -476,13 +522,21 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      */
     public async getIssuedMaterial(
         enrollmentId: string,
-    ): Promise<{ certificate: string; wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType"> } | undefined> {
+    ): Promise<
+        | { certificate: string; wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">; mailboxUid?: string; masterKeyGeneration?: number }
+        | undefined
+    > {
         const store: Record<string, PendingEnrollment> = await this.loadStore();
         const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
         if (enrollment.status !== "issued" || !enrollment.certificate || !enrollment.wrappedKey) {
             return undefined;
         }
-        return { certificate: enrollment.certificate, wrappedKey: enrollment.wrappedKey };
+        return {
+            certificate: enrollment.certificate,
+            wrappedKey: enrollment.wrappedKey,
+            mailboxUid: enrollment.mailboxUid,
+            masterKeyGeneration: enrollment.masterKeyGeneration,
+        };
     }
 
     /**

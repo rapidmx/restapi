@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
-import { EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
+import { EnrollmentBinding, EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
 
 /**
  * The default `SigningCertificateEnrollment` - throws rather than silently doing nothing.
@@ -35,6 +35,15 @@ export class NullSigningCertificateEnrollment implements SigningCertificateEnrol
     }
 
     public async checkStatus(_enrollmentId: string): Promise<EnrollmentResult> {
+        throw new ApiError(
+            ApiErrors.INTERNAL_ERROR,
+            500,
+            "Signing certificate enrollment is not available for this deployment.",
+        );
+    }
+
+    /** Throws, like every other method - there are no enrollments to describe. */
+    public async describeEnrollment(_enrollmentId: string): Promise<EnrollmentBinding> {
         throw new ApiError(
             ApiErrors.INTERNAL_ERROR,
             500,

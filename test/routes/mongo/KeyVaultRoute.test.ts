@@ -288,7 +288,7 @@ describe("Route:KeyVaultMongo Tests", () => {
             expect(updatedMailbox?.keys[0].useType).toBe("sign");
         });
 
-        it("A second enrollment does not overwrite masterKeyWraps established by the first.", async () => {
+        it("A second enrollment that sends masterKeyWraps again is refused (409) - the vault is already set up under another master key - and one without them adds the key.", async () => {
             const mailbox = await createMailbox();
             await request(server.getApplication())
                 .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
@@ -302,6 +302,7 @@ describe("Route:KeyVaultMongo Tests", () => {
                     ],
                 });
 
+            const certificate = await generateSelfSignedCert(mailbox.primarySmtpAddress);
             const second = await request(server.getApplication())
                 .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
                 .set("Authorization", "jwt " + ownerToken)
@@ -310,17 +311,30 @@ describe("Route:KeyVaultMongo Tests", () => {
                     // A second, distinct certificate for the same mailbox address (a fresh signing key, not a
                     // re-enrollment of the first) - the identity-binding check requires the SAN to match the
                     // mailbox's own address, which a genuinely different identity would now (correctly) fail.
-                    certificate: await generateSelfSignedCert(mailbox.primarySmtpAddress),
+                    certificate,
                     wrappedKey: { ciphertext: "ct2", nonce: "n2", algorithm: "AES-256-GCM" },
                     masterKeyWraps: [
-                        { method: "recovery", ciphertext: "should-be-ignored", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() },
+                        { method: "recovery", ciphertext: "another-master-key", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() },
                     ],
                 });
 
-            expect(second.status).toBe(200);
-            expect(second.body.wrappedKeys).toHaveLength(2);
-            expect(second.body.masterKeyWraps).toHaveLength(1);
-            expect(second.body.masterKeyWraps[0].method).toBe("password");
+            expect(second.status).toBe(409);
+            // Nothing was written: no published key, no wrapped key, no wrap.
+            expect((await mailboxRepo.findOne({ uid: mailbox.uid } as any))?.keys).toHaveLength(1);
+            const vault = await request(server.getApplication())
+                .get(`${baseUrl}/${mailbox.uid}/keyvault`)
+                .set("Authorization", "jwt " + ownerToken);
+            expect(vault.body.wrappedKeys).toHaveLength(1);
+            expect(vault.body.masterKeyWraps).toHaveLength(1);
+
+            const withoutWraps = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ useType: "sign", certificate, wrappedKey: { ciphertext: "ct2", nonce: "n2", algorithm: "AES-256-GCM" } });
+            expect(withoutWraps.status).toBe(200);
+            expect(withoutWraps.body.wrappedKeys).toHaveLength(2);
+            expect(withoutWraps.body.masterKeyWraps).toHaveLength(1);
+            expect(withoutWraps.body.masterKeyWraps[0].method).toBe("password");
         });
 
         it("Rejects a request with no wrappedKey at all (400).", async () => {
@@ -849,36 +863,41 @@ describe("Route:KeyVaultMongo Tests", () => {
             expect(entries).toHaveLength(1);
         });
 
-        it("Still rejects an escrow-tagged wrap in the rekey request body (403), even when the mailbox is assigned to a real scope - resolveAllowEscrow() is never consulted here by design.", async () => {
+        it("Accepts an escrow wrap in a rekey only for the mailbox's assigned scope, alongside an owner wrap (403 for another scope, 400 with escrow alone).", async () => {
             const scope = await createEscrowScope();
             const mailbox = await createMailbox();
             mailbox.escrowScopeId = scope.uid;
             await mailboxRepo.save(mailbox);
             const enrolledKey = await enrollFirstKey(mailbox);
 
-            const result = await request(server.getApplication())
-                .put(`${baseUrl}/${mailbox.uid}/keyvault/rekey`)
-                .set("Authorization", "jwt " + ownerToken)
-                .send({
-                    keys: [enrolledKey],
-                    wrappedKeys: [
-                        { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM", fingerprint: enrolledKey.fingerprint, useType: "encrypt" },
-                    ],
-                    masterKeyWraps: [
-                        {
-                            method: "escrow",
-                            escrowScopeId: scope.uid,
-                            ciphertext: "ct",
-                            nonce: "n",
-                            salt: "s",
-                            kdf: "argon2id",
-                            schemeVersion: 1,
-                            createdAt: Date.now(),
-                        },
-                    ],
-                });
+            const escrowWrap = (escrowScopeId: string) => ({
+                method: "escrow",
+                escrowScopeId,
+                ciphertext: "ct",
+                nonce: "n",
+                salt: "s",
+                kdf: "argon2id",
+                schemeVersion: 1,
+                createdAt: Date.now(),
+            });
+            const ownerWrap = { method: "password", ciphertext: "new-mk", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() };
+            const rekey = (masterKeyWraps: any[]) =>
+                request(server.getApplication())
+                    .put(`${baseUrl}/${mailbox.uid}/keyvault/rekey`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .send({
+                        keys: [enrolledKey],
+                        wrappedKeys: [
+                            { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM", fingerprint: enrolledKey.fingerprint, useType: "encrypt" },
+                        ],
+                        masterKeyWraps,
+                    });
 
-            expect(result.status).toBe(403);
+            expect((await rekey([escrowWrap(scope.uid)])).status).toBe(400);
+            expect((await rekey([ownerWrap, escrowWrap("some-other-scope")])).status).toBe(403);
+            const result = await rekey([ownerWrap, escrowWrap(scope.uid)]);
+            expect(result.status).toBe(200);
+            expect(result.body.masterKeyWraps.map((wrap: any) => wrap.method)).toEqual(["password", "escrow"]);
         });
 
         it("Rejects a rekey that introduces a fingerprint never enrolled via enrollKey (400) - closes the CA-bypass path an unvalidated rekey() used to allow.", async () => {

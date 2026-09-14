@@ -147,7 +147,9 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
             const property = await as(adminToken, request(ctx.app()).put(mailboxUrl(mailbox.uid, "aliasAddresses"))).send(["Alias.Two@Example.com"]);
             expect(property.status).toBe(200);
             expect(property.body.aliasAddresses).toEqual(["alias.two@example.com"]);
-            const renamed = await as(ctx.ownerToken, request(ctx.app()).put(mailboxUrl(mailbox.uid, "primarySmtpAddress"))).send(`New.${mailbox.primarySmtpAddress.toUpperCase()}`);
+            // Renaming is held to the same rule (see `validateAddressChange()`) - an admin again; the owner below only
+            // resends the current address, which isn't a change.
+            const renamed = await as(adminToken, request(ctx.app()).put(mailboxUrl(mailbox.uid, "primarySmtpAddress"))).send(`New.${mailbox.primarySmtpAddress.toUpperCase()}`);
             expect(renamed.status).toBe(200);
             expect(renamed.body.primarySmtpAddress).toBe(`new.${mailbox.primarySmtpAddress}`);
             // Resending the current address in another case isn't a change.

@@ -4,7 +4,6 @@
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
-import addressparser from "nodemailer/lib/addressparser/index.js";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import {
     ApiErrorMessages,
@@ -23,8 +22,7 @@ import { DistributionList, IngestQueueEntry, IngestStatus, Mailbox, QuarantineRe
 import { normalizeAddress, stripPlusTag } from "../util/AddressUtils.js";
 import { rewriteHeadersForList } from "../util/DistributionListUtils.js";
 import { getVerifiedDomainNames } from "../util/DomainUtils.js";
-import { extractHeader, extractHeaders, prependHeaders } from "../util/MimeHeaderUtils.js";
-import { hasAlignedPassingDkim } from "../util/AuthenticationResultsUtils.js";
+import { extractHeader, prepareRelayCopy, prependHeaders, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { buildTransportRuleContext, evaluateTransportRules } from "../util/TransportRuleUtils.js";
 const { Config, Inject, Logger } = ObjectDecorators;
@@ -57,6 +55,10 @@ const { Get, Post, Query, Request, Response } = RouteDecorators;
  * mailbox, all sharing a single blob-stored copy of the (list-header-rewritten) message; external members are
  * relayed directly via `MailTransport`, bypassing the ingest queue entirely - a distribution list is not itself
  * a "mailbox" `ScanQueueJob` ever delivers to.
+ *
+ * A list with `restrictSenders` only accepts a message whose `From` is DKIM-verified (`verifiedFromAddress()`) and names
+ * a member. The copy relayed to external members goes through `prepareRelayCopy()` (see `deliver()`), so the MTA's
+ * signature on it can't launder a spoofed `From`, recall/key headers or an iTIP request.
  *
  * !!Note!! that, like `BasePushRoute`/`BaseStatusRoute`, this class is not automatically registered with a
  * server — the consuming application must apply `@Route("/internal/mta")` to its own subclass. The
@@ -245,7 +247,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
      */
     private async expandDistributionList(
         list: DistributionList,
-        envelopeFromNormalized: string,
+        verifiedSender: string | undefined,
         visitedListUids: Set<string>,
         depth: number,
     ): Promise<{ mailboxes: M[]; externalAddresses: string[] }> {
@@ -253,10 +255,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             this.logger?.warn(`MailIngestRoute: distribution list expansion exceeded max depth at '${list.primarySmtpAddress}'.`);
             return { mailboxes: [], externalAddresses: [] };
         }
-        if (
-            list.restrictSenders &&
-            !(list.memberAddresses ?? []).some((m) => normalizeAddress(m) === envelopeFromNormalized)
-        ) {
+        if (list.restrictSenders && !this.isListMember(list, verifiedSender)) {
             this.logger?.warn(
                 `MailIngestRoute: dropping expansion of restricted list '${list.primarySmtpAddress}' for non-member sender.`,
             );
@@ -301,7 +300,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                     continue;
                 }
                 visitedListUids.add(nestedList.uid);
-                const nested = await this.expandDistributionList(nestedList, envelopeFromNormalized, visitedListUids, depth + 1);
+                const nested = await this.expandDistributionList(nestedList, verifiedSender, visitedListUids, depth + 1);
                 for (const mb of nested.mailboxes) {
                     if (!seenMailboxUids.has(mb.uid)) {
                         seenMailboxUids.add(mb.uid);
@@ -338,12 +337,13 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
      * (`mail:security:trusted_authserv_id`) reported a passing DKIM signature aligned with the member's domain.
      */
     private isVerifiedMemberMessage(raw: Buffer, member: string): boolean {
-        const parsed = extractHeaders(raw, "From").flatMap((value) => addressparser(value, { flatten: true }));
-        if (parsed.length !== 1 || normalizeAddress(String(parsed[0].address)) !== member) {
-            return false;
-        }
-        const domain: string = member.slice(member.lastIndexOf("@") + 1);
-        return hasAlignedPassingDkim(extractHeaders(raw, "Authentication-Results"), domain, this.trustedAuthservId);
+        return verifiedFromAddress(raw, this.trustedAuthservId) === normalizeAddress(member);
+    }
+
+    /** Whether `sender` - the message's DKIM-verified `From` (`verifiedFromAddress()`), never the forgeable envelope
+     * sender - is one of `list`'s members. `restrictSenders` lets only such messages through. */
+    private isListMember(list: DistributionList, sender: string | undefined): boolean {
+        return !!sender && (list.memberAddresses ?? []).some((m) => normalizeAddress(m) === sender);
     }
 
     private async handleUnsubscribe(list: DistributionList, envelopeFrom: string): Promise<void> {
@@ -557,6 +557,8 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         raw = transportRuleOutcome.raw;
         envelopeTo = transportRuleOutcome.envelopeTo;
         const quarantineReason = transportRuleOutcome.quarantineReason;
+        // The message's DKIM-verified `From`, if any - what `restrictSenders` checks list membership against.
+        const verifiedSender: string | undefined = verifiedFromAddress(raw, this.trustedAuthservId);
 
         // A single SMTP transaction can carry more than one RCPT TO — resolve and stage one IngestQueueEntry
         // per addressed mailbox so `ScanQueueJob` delivers independently to each, and one unknown/unresolvable
@@ -629,20 +631,17 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 continue;
             }
 
-            if (list.restrictSenders && !isMember) {
+            // `restrictSenders` needs proof the sender is a member: a DKIM-verified `From` naming one. The envelope sender
+            // (and an unauthenticated `From`) can be forged by anyone.
+            if (list.restrictSenders && !this.isListMember(list, verifiedSender)) {
                 this.logger?.warn(
-                    `MailIngestRoute: dropping delivery to restricted list '${address}' from non-member sender '${envelopeFrom}'.`,
+                    `MailIngestRoute: dropping delivery to restricted list '${address}' from a sender not verified as a member ('${envelopeFrom}').`,
                 );
                 results.push({ rcpt: address, queued: false });
                 continue;
             }
 
-            const { mailboxes, externalAddresses } = await this.expandDistributionList(
-                list,
-                envelopeFromNormalized,
-                new Set([list.uid]),
-                0,
-            );
+            const { mailboxes, externalAddresses } = await this.expandDistributionList(list, verifiedSender, new Set([list.uid]), 0);
 
             if (mailboxes.length === 0 && externalAddresses.length === 0) {
                 results.push({ rcpt: address, queued: false });
@@ -670,11 +669,25 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 );
             }
 
-            for (const external of externalAddresses) {
+            // External members get a copy the MTA signs as this server's domain, so it must not launder a spoofed message
+            // (`prepareRelayCopy()`): trust-bearing headers stripped, an unauthenticated `From` rewritten to the list, and
+            // unauthenticated calendar content not relayed at all. Internal members keep `listRaw` - their copies are
+            // judged by `ScanQueueJob` against the `Authentication-Results` this server's MTA stamped on arrival.
+            const externalRaw: Buffer | undefined =
+                externalAddresses.length > 0
+                    ? prepareRelayCopy(listRaw, { trustedAuthservId: this.trustedAuthservId, rewriteFrom: { address: list.primarySmtpAddress, name: list.name } })
+                    : undefined;
+            if (externalAddresses.length > 0 && !externalRaw) {
+                this.logger?.warn(
+                    `MailIngestRoute: not relaying calendar content from an unauthenticated sender to the external members of '${list.primarySmtpAddress}'.`,
+                );
+            }
+
+            for (const external of externalRaw ? externalAddresses : []) {
                 try {
                     // Throws on a transport rejection too, so a relay that reached nobody is logged like an error.
                     await sendOrThrow(this.mailTransport!, {
-                        raw: listRaw,
+                        raw: externalRaw!,
                         envelopeFrom: list.primarySmtpAddress,
                         envelopeTo: [external],
                     });
@@ -685,7 +698,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 }
             }
 
-            results.push({ rcpt: address, queued: mailboxes.length > 0 || externalAddresses.length > 0 });
+            results.push({ rcpt: address, queued: mailboxes.length > 0 || (!!externalRaw && externalAddresses.length > 0) });
         }
 
         res.status(202).json({ results });

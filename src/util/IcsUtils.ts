@@ -820,7 +820,7 @@ export interface OccurrenceExpansion {
     occurrences: OccurrenceWindow[];
     /**
      * `true` when a safety cap (`MAX_OCCURRENCES`/`MAX_PERIODS`) stopped the expansion before the window was fully
-     * covered, so `occurrences` is known to be incomplete. A caller doing conflict detection must treat this as
+     * covered, so `occurrences` is known to be incomplete (for `MAX_OCCURRENCES`: another occurrence past the cap was found). A caller doing conflict detection must treat this as
      * "cannot prove there's no conflict" rather than as "no conflict".
      */
     truncated: boolean;
@@ -1026,11 +1026,13 @@ function expandOccurrencesInternal(
             if (!excluded.has(candidateStart.getTime())) {
                 const candidateEnd = new Date(candidateStart.getTime() + durationMs);
                 if (occurrenceOverlapsWindow(candidateStart, candidateEnd, windowStart, windowEnd)) {
-                    occurrences.push({ start: candidateStart, end: candidateEnd });
+                    // Truncated only when an occurrence beyond the cap actually exists - exactly `MAX_OCCURRENCES` in the
+                    // window is a complete expansion.
                     if (occurrences.length >= MAX_OCCURRENCES) {
                         info.truncated = true;
                         return occurrences;
                     }
+                    occurrences.push({ start: candidateStart, end: candidateEnd });
                 }
             }
         }

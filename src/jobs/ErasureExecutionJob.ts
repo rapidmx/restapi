@@ -22,8 +22,11 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * when the cascade has to wait (a legal hold, an unloaded plugin, an error). Not (yet) part of the
  * `DataSubjectErasureStatus` union in `models/types.ts`; the column is a plain string on both backends.
  *
- * Anything that must not add content to a mailbox being erased (e.g. delivery) should treat a request with status
- * `"approved"` or `"in_progress"` for that `mailboxUid` as "erasure pending".
+ * Anything that must not add content to a mailbox being erased (e.g. delivery) should treat only an `"in_progress"`
+ * request whose claim is live (`dateModified` within `claim_lease_seconds`) as "cascade running". An `"approved"` request
+ * may wait indefinitely (a legal hold, an unloaded plugin), so it can justify deferring content for a bounded time at
+ * most, never dropping it; and a request created before the mailbox row it names belongs to an earlier mailbox at the
+ * same address (the uid is the address). See `ScanQueueJob.erasureDisposition()`.
  */
 export const ERASURE_IN_PROGRESS = "in_progress" as DataSubjectErasureRequest["status"];
 

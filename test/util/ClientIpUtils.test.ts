@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { isIpInCidrs, normalizeIp, resolveClientIp } from "../../src/util/ClientIpUtils.js";
+import { isIpInCidrs, normalizeIp, rateLimitKeyForIp, resolveClientIp } from "../../src/util/ClientIpUtils.js";
 
 function req(remoteAddress: string | undefined, headers: Record<string, any> = {}): any {
     return { headers, socket: { remoteAddress } };
@@ -106,6 +106,21 @@ describe("ClientIpUtils Tests", () => {
         it("Returns undefined without a socket address.", () => {
             expect(resolveClientIp(req(undefined, { "x-forwarded-for": "1.1.1.1" }), ["0.0.0.0/0"])).toBeUndefined();
             expect(resolveClientIp({}, undefined)).toBeUndefined();
+        });
+    });
+    describe("rateLimitKeyForIp()", () => {
+        it("Keys IPv4 by the full address and IPv6 by its /64.", () => {
+            expect(rateLimitKeyForIp("198.51.100.7")).toBe("198.51.100.7");
+            expect(rateLimitKeyForIp("::ffff:198.51.100.7")).toBe("198.51.100.7");
+            expect(rateLimitKeyForIp("2001:DB8:1:2:ffff:abcd:1234:5678")).toBe("2001:db8:1:2::/64");
+            expect(rateLimitKeyForIp("2001:db8:1:2::1")).toBe("2001:db8:1:2::/64");
+            expect(rateLimitKeyForIp("[2001:db8::5]:443")).toBe("2001:db8:0:0::/64");
+            expect(rateLimitKeyForIp("::1")).toBe("0:0:0:0::/64");
+            expect(rateLimitKeyForIp("fe80::1%eth0")).toBe("fe80:0:0:0::/64");
+            expect(rateLimitKeyForIp("64:ff9b:1:2::198.51.100.7")).toBe("64:ff9b:1:2::/64");
+            expect(rateLimitKeyForIp("1:2:3:4:5:6:7:8")).toBe("1:2:3:4::/64");
+            expect(rateLimitKeyForIp("1::")).toBe("1:0:0:0::/64");
+            expect(rateLimitKeyForIp("not-an-ip")).toBe("not-an-ip");
         });
     });
 });

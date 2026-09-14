@@ -15,6 +15,7 @@ import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
 import { FolderType, MessageImportance, RecipientType } from "../../../src/models/types.js";
+import { boundIndexedValue } from "../../../src/util/ConversationUtils.js";
 
 describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
     const logger = Logger();
@@ -478,6 +479,13 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
             expect(updated.scheduledSendError).toContain("Sender header");
         });
 
+        it("Refuses a stored From whose display name carries an address (the same rule as BaseMessageRoute.send()).", async () => {
+            const updated = await runWithBody('From : "ceo@victim.com" <owner@example.com>\r\nTo: recipient@example.com\r\n\r\nHi\r\n');
+            expect(transport().sent.length).toBe(0);
+            expect(updated.scheduledSendError).toContain("display name");
+            expect(updated.scheduledSendLeaseExpiresAt).toBeFalsy();
+        });
+
         it("Refuses a stored message with no From header at all.", async () => {
             const updated = await runWithBody("To: recipient@example.com\r\n\r\nHi\r\n");
             expect(transport().sent.length).toBe(0);
@@ -486,10 +494,172 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
 
         it("Relays when every From/Sender address (quoted display names, group syntax, aliases, any case) is the mailbox's own.", async () => {
             const updated = await runWithBody(
-                'From: "Doe, Owner (ceo@example.com)" <Owner@Example.com>, team: =?utf-8?Q?Alias?= <alias@example.com>;\r\nSender: owner@example.com\r\nTo: recipient@example.com\r\n\r\nHi\r\n',
+                'From: "Doe, Owner (the boss)" <Owner@Example.com>, team: =?utf-8?Q?Alias?= <alias@example.com>;\r\nSender: owner@example.com\r\nTo: recipient@example.com\r\n\r\nHi\r\n',
             );
             expect(transport().sent.length).toBe(1);
             expect(updated.scheduledSendError).toBeFalsy();
+        });
+    });
+
+    describe("Round 5: in-flight claim, relayed marker, bounded ids", () => {
+        const repoUtils = (): any => (job as any).messageRepo;
+        const past = (): Date => new Date(Date.now() - 60 * 1000);
+
+        it("Marks the claim in flight, and doesn't file a message that left Outbox under the claim mid-relay.", async () => {
+            const drafts = await folderRepo.save(new FolderSQL({ mailboxUid, name: "Drafts", type: FolderType.DRAFTS }));
+            const message = await createMessage({ bodyBlobKey: await putBody(), scheduledSendTime: past() });
+            let midFlight: any;
+            const realSend = transport().send.bind(transport());
+            vi.spyOn(transport(), "send").mockImplementationOnce(async (outbound: any) => {
+                midFlight = await findMessage(message.uid);
+                // A move that got past the in-flight marker (e.g. once a slow relay outlived its lease).
+                const current = await repoUtils().findOne(message.uid, { ignoreACL: true });
+                await repoUtils().update(
+                    { uid: current.uid, version: current.version, folderUid: drafts.uid, scheduledSendTime: null, scheduledSendLeaseExpiresAt: null },
+                    current,
+                    { ignoreACL: true },
+                );
+                return realSend(outbound);
+            });
+
+            await job.run();
+
+            expect(midFlight.scheduledSendLeaseExpiresAt).toBeTruthy();
+            expect(new Date(midFlight.scheduledSendLeaseExpiresAt).getTime()).toBe(new Date(midFlight.scheduledSendTime).getTime());
+            expect(transport().sent.length).toBe(1);
+            const after = await findMessage(message.uid);
+            expect(after.folderUid).toBe(drafts.uid);
+            // The relay is still recorded, so the message can't be sent a second time.
+            expect(after.scheduledSendRelayedAt).toBeTruthy();
+        });
+
+        it("Stores an over-long relayed Message-ID bounded, so a varchar(255) column can't fail the filing.", async () => {
+            const longId = `${"x".repeat(300)}@example.com`;
+            const message = await createMessage({
+                bodyBlobKey: await putBody(`Message-ID: <${longId}>\r\nFrom: owner@example.com\r\nTo: recipient@example.com\r\n\r\nHi\r\n`),
+                scheduledSendTime: past(),
+            });
+            const realUpdate = repoUtils().update.bind(repoUtils());
+            const writes: string[][] = [];
+            vi.spyOn(repoUtils(), "update").mockImplementation(async (obj: any, ...rest: any[]) => {
+                writes.push(Object.keys(obj).sort());
+                // What MySQL/MariaDB does with a varchar(255) column.
+                for (const field of ["messageId", "conversationId"]) {
+                    if (typeof obj[field] === "string" && obj[field].length > 255) {
+                        throw new Error(`ER_DATA_TOO_LONG: ${field}`);
+                    }
+                }
+                return realUpdate(obj, ...rest);
+            });
+
+            await job.run();
+
+            expect(transport().sent.length).toBe(1);
+            const updated = await findMessage(message.uid);
+            expect(updated.folderUid).not.toBe(outboxUid);
+            expect(updated.scheduledSendTime).toBeFalsy();
+            expect(updated.scheduledSendLeaseExpiresAt).toBeFalsy();
+            expect(updated.scheduledSendRelayedAt).toBeFalsy();
+            expect(updated.messageId).toBe(boundIndexedValue(longId));
+            expect(updated.conversationId).toBe(boundIndexedValue(longId));
+            // Claim, then the relayed marker on its own, then the filing.
+            expect(writes[1]).toEqual(["scheduledSendRelayedAt", "uid", "version"]);
+        });
+
+        it("Persists the relayed marker the moment the transport accepts, so even a filing and bookkeeping failure never relays twice.", async () => {
+            const message = await createMessage({ bodyBlobKey: await putBody(), scheduledSendTime: past() });
+            const realUpdate = repoUtils().update.bind(repoUtils());
+            vi.spyOn(repoUtils(), "update").mockImplementation(async (obj: any, ...rest: any[]) => {
+                if ("folderUid" in obj || "scheduledSendAttempts" in obj) {
+                    throw new Error("simulated database failure");
+                }
+                return realUpdate(obj, ...rest);
+            });
+
+            await job.run();
+
+            expect(transport().sent.length).toBe(1);
+            const afterFailure = await findMessage(message.uid);
+            expect(afterFailure.scheduledSendRelayedAt).toBeTruthy();
+            expect(afterFailure.folderUid).toBe(outboxUid);
+            vi.restoreAllMocks();
+
+            await expireLease(message.uid);
+            await job.run();
+
+            expect(transport().sent.length).toBe(1);
+            const filed = await findMessage(message.uid);
+            expect(filed.folderUid).not.toBe(outboxUid);
+            expect(filed.scheduledSendRelayedAt).toBeFalsy();
+            expect(filed.scheduledSendLeaseExpiresAt).toBeFalsy();
+        });
+
+        it("Retries the relayed marker after a version conflict with an unrelated write.", async () => {
+            const message = await createMessage({ bodyBlobKey: await putBody(), scheduledSendTime: past() });
+            const realSend = transport().send.bind(transport());
+            vi.spyOn(transport(), "send").mockImplementationOnce(async (outbound: any) => {
+                // The user flags the message while it is on the wire - the claim's version is now stale.
+                const current = await repoUtils().findOne(message.uid, { ignoreACL: true });
+                await repoUtils().update({ uid: current.uid, version: current.version, flags: { ...current.flags, flagged: true } }, current, { ignoreACL: true });
+                return realSend(outbound);
+            });
+            const realUpdate = repoUtils().update.bind(repoUtils());
+            vi.spyOn(repoUtils(), "update").mockImplementation(async (obj: any, ...rest: any[]) => {
+                if ("folderUid" in obj || "scheduledSendAttempts" in obj) {
+                    throw new Error("simulated database failure");
+                }
+                return realUpdate(obj, ...rest);
+            });
+
+            await job.run();
+
+            const updated = await findMessage(message.uid);
+            expect(transport().sent.length).toBe(1);
+            expect(updated.flags.flagged).toBe(true);
+            expect(updated.scheduledSendRelayedAt).toBeTruthy();
+        });
+
+        it("Stops retrying the relayed marker once a concurrent writer already stamped it.", async () => {
+            const message = await createMessage({ bodyBlobKey: await putBody(), scheduledSendTime: past() });
+            const concurrentStamp = new Date("2030-01-01T00:00:00.000Z");
+            const realSend = transport().send.bind(transport());
+            vi.spyOn(transport(), "send").mockImplementationOnce(async (outbound: any) => {
+                // Another writer records the relay while the message is on the wire - the claim's version is now stale.
+                const current = await repoUtils().findOne(message.uid, { ignoreACL: true });
+                await repoUtils().update({ uid: current.uid, version: current.version, scheduledSendRelayedAt: concurrentStamp }, current, { ignoreACL: true });
+                return realSend(outbound);
+            });
+            const realUpdate = repoUtils().update.bind(repoUtils());
+            const markerAttempts: Date[] = [];
+            vi.spyOn(repoUtils(), "update").mockImplementation(async (obj: any, ...rest: any[]) => {
+                if (obj.scheduledSendRelayedAt && obj.scheduledSendRelayedAt !== concurrentStamp) {
+                    markerAttempts.push(obj.scheduledSendRelayedAt);
+                }
+                return realUpdate(obj, ...rest);
+            });
+
+            await job.run();
+
+            expect(transport().sent.length).toBe(1);
+            // One stale attempt (a version conflict), then the re-read finds the marker and stops.
+            expect(markerAttempts).toHaveLength(1);
+            // Filed as usual - the filing clears the marker along with the claim.
+            const filed = await findMessage(message.uid);
+            expect(filed.folderUid).not.toBe(outboxUid);
+            expect(filed.scheduledSendRelayedAt).toBeFalsy();
+        });
+
+        it("Refuses (without relaying or retrying) a message with no To, Cc or Bcc recipient.", async () => {
+            for (const recipients of [[], [{ address: "", type: RecipientType.BCC }]]) {
+                const message = await createMessage({ recipients, bodyBlobKey: await putBody(), scheduledSendTime: past() });
+                await job.run();
+                const updated = await findMessage(message.uid);
+                expect(updated.scheduledSendError).toContain("recipients");
+                expect(updated.scheduledSendTime).toBeFalsy();
+                expect(updated.scheduledSendAttempts).toBeFalsy();
+                expect(updated.folderUid).toBe(outboxUid);
+            }
+            expect(transport().sent.length).toBe(0);
         });
     });
 });

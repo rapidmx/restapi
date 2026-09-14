@@ -126,3 +126,38 @@ export function resolveClientIp(req: any, trustedProxies: TrustedProxies): strin
     const realIp: string | undefined = realIpHeader ? normalizeIp(realIpHeader.split(",")[0]) : undefined;
     return realIp && net.isIP(realIp) ? realIp : remote;
 }
+
+/** The eight 16-bit groups of a valid IPv6 address (`::` expanded, an embedded dotted IPv4 tail converted), or
+ * `undefined` if `address` isn't one. */
+function ipv6Groups(address: string): number[] | undefined {
+    if (net.isIP(address) !== 6) {
+        return undefined;
+    }
+    let text: string = address.toLowerCase();
+    const v4Tail: RegExpMatchArray | null = text.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+    if (v4Tail) {
+        const octets: number[] = v4Tail[2].split(".").map(Number);
+        text = `${v4Tail[1]}${((octets[0] << 8) | octets[1]).toString(16)}:${((octets[2] << 8) | octets[3]).toString(16)}`;
+    }
+    const [head, tail] = text.includes("::") ? text.split("::") : [text, undefined];
+    const headGroups: string[] = head ? head.split(":") : [];
+    const tailGroups: string[] = tail ? tail.split(":") : [];
+    const missing: number = 8 - headGroups.length - tailGroups.length;
+    const groups: string[] = tail === undefined ? headGroups : [...headGroups, ...new Array(missing).fill("0"), ...tailGroups];
+    return groups.map((group) => parseInt(group, 16));
+}
+
+/**
+ * The key a per-client rate limit should count `ip` under: the IPv4 address itself, or - for IPv6 - its `/64` network
+ * (`2001:db8:1:2::/64`). A single IPv6 subscriber is routinely handed a whole `/64` (or more), so counting each full
+ * address separately lets one client rotate through billions of "different" addresses and never hit a limit.
+ * IPv4-mapped IPv6 addresses count as their IPv4 form. Anything that isn't an IP address is returned normalized as-is.
+ */
+export function rateLimitKeyForIp(ip: string): string {
+    const address: string = normalizeIp(ip);
+    const groups: number[] | undefined = ipv6Groups(address);
+    if (!groups) {
+        return address;
+    }
+    return `${groups.slice(0, 4).map((group) => group.toString(16)).join(":")}::/64`;
+}

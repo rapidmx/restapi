@@ -25,8 +25,9 @@ const mongod: MongoMemoryServer = new MongoMemoryServer({
 interface FakeEntry {
     identity: string;
     status: "pending" | "issued" | "failed";
-    material?: { certificate: string; wrappedKey: any };
+    material?: { certificate: string; wrappedKey: any; mailboxUid?: string; masterKeyGeneration?: number };
     installed?: boolean;
+    cancelledReason?: string;
     advanceCallCount: number;
 }
 
@@ -66,6 +67,14 @@ class FakeDrivenEnrollment implements SigningCertificateEnrollment {
         const entry = FakeDrivenEnrollment.entries.get(enrollmentId);
         if (entry) {
             entry.installed = true;
+        }
+    }
+
+    public async cancelEnrollment(enrollmentId: string, reason: string): Promise<void> {
+        const entry = FakeDrivenEnrollment.entries.get(enrollmentId);
+        if (entry) {
+            entry.status = "failed";
+            entry.cancelledReason = reason;
         }
     }
 }
@@ -199,6 +208,63 @@ describe("AcmeEnrollmentDriverJobMongo Tests (real DB + DI)", () => {
 
         const auditEntries = await auditLogRepo.find({ targetUid: keyVault!.uid }).toArray();
         expect(auditEntries.some((e) => e.action === AuditAction.KEY_VAULT_ENROLL)).toBe(true);
+    });
+
+    it("Never installs a wrapped key sealed under a master key the vault has since rotated away from - it cancels the enrollment instead (round 5).", async () => {
+        const mailbox = await createMailbox();
+        await keyVaultRepo.save(new KeyVaultMongo({ mailboxUid: mailbox.uid, wrappedKeys: [], masterKeyWraps: [], masterKeyGeneration: 2 }));
+        const certificate = await generateSelfSignedCertPem(mailbox.primarySmtpAddress);
+        const wrappedKey = { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" };
+        FakeDrivenEnrollment.entries.set("stale", {
+            identity: mailbox.primarySmtpAddress,
+            status: "issued",
+            material: { certificate, wrappedKey, mailboxUid: mailbox.uid, masterKeyGeneration: 1 },
+            advanceCallCount: 0,
+        });
+        // Started before generations were recorded, onto a vault that has rotated since.
+        FakeDrivenEnrollment.entries.set("legacy", {
+            identity: mailbox.primarySmtpAddress,
+            status: "issued",
+            material: { certificate, wrappedKey },
+            advanceCallCount: 0,
+        });
+
+        await job.run();
+
+        for (const id of ["stale", "legacy"]) {
+            expect(FakeDrivenEnrollment.entries.get(id)!.installed).toBeFalsy();
+            expect(FakeDrivenEnrollment.entries.get(id)!.cancelledReason).toMatch(/keys were rotated/);
+        }
+        expect((await keyVaultRepo.findOne({ mailboxUid: mailbox.uid } as any))?.wrappedKeys).toHaveLength(0);
+        expect((await mailboxRepo.findOne({ uid: mailbox.uid } as any))?.keys ?? []).toHaveLength(0);
+
+        // The current generation installs.
+        FakeDrivenEnrollment.entries.set("current", {
+            identity: mailbox.primarySmtpAddress,
+            status: "issued",
+            material: { certificate, wrappedKey, mailboxUid: mailbox.uid, masterKeyGeneration: 2 },
+            advanceCallCount: 0,
+        });
+        await job.run();
+        expect(FakeDrivenEnrollment.entries.get("current")!.installed).toBe(true);
+        expect((await keyVaultRepo.findOne({ mailboxUid: mailbox.uid } as any))?.wrappedKeys).toHaveLength(1);
+    });
+
+    it("Never installs into a different mailbox than the one that started the enrollment, even at the same address (round 5).", async () => {
+        const mailbox = await createMailbox();
+        const certificate = await generateSelfSignedCertPem(mailbox.primarySmtpAddress);
+        FakeDrivenEnrollment.entries.set("moved", {
+            identity: mailbox.primarySmtpAddress,
+            status: "issued",
+            material: { certificate, wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" }, mailboxUid: "some-other-mailbox" },
+            advanceCallCount: 0,
+        });
+
+        await job.run();
+
+        expect(FakeDrivenEnrollment.entries.get("moved")!.installed).toBeFalsy();
+        expect(FakeDrivenEnrollment.entries.get("moved")!.cancelledReason).toMatch(/different mailbox/);
+        expect((await keyVaultRepo.findOne({ mailboxUid: mailbox.uid } as any))).toBeFalsy();
     });
 
     it("Appends to an existing KeyVault's wrappedKeys rather than creating a second one.", async () => {

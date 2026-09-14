@@ -140,6 +140,19 @@ describe("ManualSigningCertificateEnrollment Tests", () => {
         expect(status).toEqual({ status: "failed", certificate: undefined, error: "CA rejected the request." });
     });
 
+    it("describeEnrollment() reports the identity, and cancelEnrollment() fails only a still-pending enrollment (round 5).", async () => {
+        const { enrollmentId } = await enrollment.startEnrollment("frank@example.com", await generateCsr("frank@example.com"));
+        await expect(enrollment.describeEnrollment(enrollmentId)).resolves.toEqual({ identity: "frank@example.com" });
+
+        await enrollment.cancelEnrollment(enrollmentId, "Cancelled by the mailbox owner.");
+        expect(await enrollment.checkStatus(enrollmentId)).toEqual({ status: "failed", certificate: undefined, error: "Cancelled by the mailbox owner." });
+        await enrollment.cancelEnrollment(enrollmentId, "again");
+        expect((await enrollment.checkStatus(enrollmentId)).error).toBe("Cancelled by the mailbox owner.");
+
+        await expect(enrollment.describeEnrollment("does-not-exist")).rejects.toThrow(/No enrollment found/);
+        await expect(enrollment.cancelEnrollment("does-not-exist", "x")).rejects.toThrow(/No enrollment found/);
+    });
+
     it("markFailed() throws 404 for an unknown enrollment id.", async () => {
         await expect(enrollment.markFailed("does-not-exist", "reason")).rejects.toThrow(/No enrollment found/);
     });

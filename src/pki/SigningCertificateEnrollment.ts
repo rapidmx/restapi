@@ -59,4 +59,30 @@ export interface SigningCertificateEnrollment {
      * @throws If `enrollmentId` is not recognized.
      */
     checkStatus(enrollmentId: string): Promise<EnrollmentResult>;
+
+    /**
+     * Which mailbox a previously started enrollment belongs to: the `identity` it was started for, and - when the
+     * implementation recorded one (`Rfc8823AcmeSigningCertificateEnrollment.attachWrappedKey()`) - the mailbox uid.
+     * `BaseKeyVaultRoute` binds every enrollment-id endpoint to the path mailbox through this, and refuses (404) them all
+     * on an implementation without it.
+     *
+     * @throws If `enrollmentId` is not recognized.
+     */
+    describeEnrollment?(enrollmentId: string): Promise<EnrollmentBinding>;
+
+    /**
+     * Abandons a pending (or issued but not yet installed) enrollment: it is marked `"failed"` with `reason` and nothing
+     * is ever installed from it. A no-op for an enrollment that already failed or was installed.
+     *
+     * @throws If `enrollmentId` is not recognized.
+     */
+    cancelEnrollment?(enrollmentId: string, reason: string): Promise<void>;
+}
+
+/** What `describeEnrollment()` reports about the mailbox an enrollment belongs to. */
+export interface EnrollmentBinding {
+    /** The mailbox address the enrollment was started for. */
+    identity: string;
+    /** The uid of the mailbox that started it, when recorded. */
+    mailboxUid?: string;
 }

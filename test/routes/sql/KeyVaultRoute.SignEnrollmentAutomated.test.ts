@@ -13,39 +13,11 @@ import { ACLRecord, Server, ObjectFactory, ConnectionManager, ACLAction, AccessC
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
+import { EscrowScopeSQL } from "../../../src/models/sql/EscrowScopeSQL.js";
+import { KeyVaultSQL } from "../../../src/models/sql/KeyVaultSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
-import { EnrollmentResult, SigningCertificateEnrollment } from "../../../src/pki/SigningCertificateEnrollment.js";
 import { generateTestCsr, registerTestDoubles } from "../../testDoubles.js";
-
-/** A minimal, real (in-memory) `SigningCertificateEnrollment` supporting `attachWrappedKey()` - enough to
- * exercise `startSignEnrollment()`'s feature-detection call and prove the wrapped key actually reaches
- * the enrollment service, without needing a real ACME CA or the full `Rfc8823AcmeSigningCertificateEnrollment`
- * machinery (already covered on its own in test/pki/Rfc8823AcmeSigningCertificateEnrollment.test.ts). */
-class FakeAutomatedEnrollment implements SigningCertificateEnrollment {
-    public readonly name = "fake-automated";
-    public static enrollments = new Map<string, { identity: string; csr: string; wrappedKey?: any; status: string }>();
-
-    public async startEnrollment(identity: string, csr: string): Promise<{ enrollmentId: string }> {
-        const enrollmentId = uuid.v4();
-        FakeAutomatedEnrollment.enrollments.set(enrollmentId, { identity, csr, status: "pending" });
-        return { enrollmentId };
-    }
-
-    public async checkStatus(enrollmentId: string): Promise<EnrollmentResult> {
-        const enrollment = FakeAutomatedEnrollment.enrollments.get(enrollmentId);
-        if (!enrollment) {
-            throw new Error("not found");
-        }
-        return { status: enrollment.status as any, certificate: undefined, error: undefined };
-    }
-
-    public async attachWrappedKey(enrollmentId: string, wrappedKey: any): Promise<void> {
-        const enrollment = FakeAutomatedEnrollment.enrollments.get(enrollmentId);
-        if (enrollment) {
-            enrollment.wrappedKey = wrappedKey;
-        }
-    }
-}
+import { FakeAutomatedEnrollment, keyVaultRound5Suite } from "../keyVaultRound5Suite.js";
 
 describe("Route:KeyVaultSQL Tests - automated sign-enrollment", () => {
     const logger = Logger();
@@ -53,14 +25,16 @@ describe("Route:KeyVaultSQL Tests - automated sign-enrollment", () => {
     const server: Server = new Server({ config, basePath: "./test/server-sql", logger, objectFactory });
     const baseUrl = "/sql/mailboxes";
     let mailboxRepo: Repository<MailboxSQL>;
+    let keyVaultRepo: Repository<KeyVaultSQL>;
+    let escrowScopeRepo: Repository<EscrowScopeSQL>;
     let aclRepo: Repository<AccessControlListSQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
 
-    const createMailbox = async function (): Promise<MailboxSQL> {
+    const createMailbox = async function (ownerUid: string = owner.uid): Promise<MailboxSQL> {
         const obj = new MailboxSQL({
-            ownerUserUid: owner.uid,
+            ownerUserUid: ownerUid,
             primarySmtpAddress: `${uuid.v4()}@example.com`,
             aliasAddresses: [],
             displayName: "Test Mailbox",
@@ -69,7 +43,7 @@ describe("Route:KeyVaultSQL Tests - automated sign-enrollment", () => {
             usedBytes: 0,
         });
         const result: MailboxSQL = await mailboxRepo.save(obj);
-        const records: ACLRecord[] = [{ userOrRoleId: owner.uid, actions: [ACLAction.FULL] }];
+        const records: ACLRecord[] = [{ userOrRoleId: ownerUid, actions: [ACLAction.FULL] }];
         await aclRepo.save({
             uid: result.uid,
             dateCreated: new Date(),
@@ -99,6 +73,8 @@ describe("Route:KeyVaultSQL Tests - automated sign-enrollment", () => {
         conn = connMgr?.connections.get("sql");
         if (isSqlDataSource(conn)) {
             mailboxRepo = conn.getRepository(MailboxSQL);
+            keyVaultRepo = conn.getRepository(KeyVaultSQL);
+            escrowScopeRepo = conn.getRepository(EscrowScopeSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -111,6 +87,8 @@ describe("Route:KeyVaultSQL Tests - automated sign-enrollment", () => {
 
     beforeEach(async () => {
         await mailboxRepo.clear();
+        await keyVaultRepo.clear();
+        await escrowScopeRepo.clear();
         await aclRepo.clear();
         FakeAutomatedEnrollment.enrollments.clear();
     });
@@ -138,5 +116,29 @@ describe("Route:KeyVaultSQL Tests - automated sign-enrollment", () => {
 
         expect(statusResult.status).toBe(200);
         expect(statusResult.body.status).toBe("pending");
+    });
+
+    keyVaultRound5Suite({
+        app: () => server.getApplication(),
+        baseUrl,
+        tokenFor: (user) => JWTUtils.createTokenSync(config.get("auth"), user),
+        createMailbox: (ownerUid) => createMailbox(ownerUid),
+        createEscrowScope: async () =>
+            await escrowScopeRepo.save(
+                new EscrowScopeSQL({
+                    name: "legal",
+                    publicKey: { publicKey: "cert", type: "x509", fingerprint: "fp1", notBefore: 0, notAfter: 1 },
+                    holderUserUids: [uuid.v4()],
+                    requiredHolders: 1,
+                }),
+            ),
+        deleteEscrowScope: async (uid) => {
+            await escrowScopeRepo.delete({ uid });
+        },
+        setEscrowScope: async (mailboxUid, escrowScopeId) => {
+            await mailboxRepo.update({ uid: mailboxUid }, { escrowScopeId: escrowScopeId as any });
+        },
+        findKeyVault: async (mailboxUid) => (await keyVaultRepo.findOne({ where: { mailboxUid } })) ?? undefined,
+        generateCsr: (identity) => generateTestCsr(identity),
     });
 });

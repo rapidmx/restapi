@@ -178,4 +178,64 @@ describe("BaseKeyVaultRoute Tests (findOrCreateKeyVault() TOCTOU race and MAX_*_
         expect(vault.version).toBe(3);
         expect(vault.uid).toBe("kv-1");
     });
+    it("Enrollment-id endpoints 404 on an enrollment service that can't describe (or cancel) its enrollments - fail closed (round 5).", async () => {
+        const route = objectFactory.newInstance<TestKeyVaultRoute>(TestKeyVaultRoute, { initialize: false });
+        const user: any = { uid: "user-1" };
+        const mailbox = { uid: "mailbox-1", ownerUserUid: "user-1", primarySmtpAddress: "a@example.com" };
+        (route as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue(mailbox) };
+        (route as any).keyVaultRepo = {};
+        (route as any).escrowScopeRepo = {};
+        const checkStatus = vi.fn().mockResolvedValue({ status: "pending" });
+        (route as any).signingCertificateEnrollment = { name: "third-party", checkStatus };
+
+        const status: any = await route.checkSignEnrollmentStatus("mailbox-1", "enrollment-1", user).catch((err) => err);
+        expect(status?.status).toBe(404);
+        expect(checkStatus).not.toHaveBeenCalled();
+
+        // Describable, but not cancellable.
+        (route as any).signingCertificateEnrollment = {
+            name: "third-party",
+            checkStatus,
+            describeEnrollment: vi.fn().mockResolvedValue({ identity: "A@example.com" }),
+        };
+        await expect(route.checkSignEnrollmentStatus("mailbox-1", "enrollment-1", user)).resolves.toEqual({ status: "pending" });
+        const cancelled: any = await route.cancelSignEnrollment("mailbox-1", "enrollment-1", user).catch((err) => err);
+        expect(cancelled?.status).toBe(404);
+    });
+    it("enrollKey() treats a legacy vault's null wrap lists as empty when deciding whether bootstrap masterKeyWraps are still accepted (round 5).", async () => {
+        const x509 = await import("@peculiar/x509");
+        x509.cryptoProvider.set(crypto);
+        const keys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+        const certificate = (
+            await x509.X509CertificateGenerator.createSelfSigned({
+                name: "CN=a@example.com",
+                notBefore: new Date(),
+                notAfter: new Date(Date.now() + 86_400_000),
+                keys,
+                signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+                extensions: [new x509.SubjectAlternativeNameExtension([{ type: "email", value: "a@example.com" }])],
+            })
+        ).toString("pem");
+        const route = objectFactory.newInstance<TestKeyVaultRoute>(TestKeyVaultRoute, { initialize: false });
+        const user: any = { uid: "user-1" };
+        const mailbox = { uid: "mailbox-1", ownerUserUid: "user-1", primarySmtpAddress: "a@example.com", keys: [] };
+        const find = vi.fn();
+        (route as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue(mailbox) };
+        (route as any).keyVaultRepo = { find };
+        (route as any).escrowScopeRepo = {};
+        const persistEnrollment = vi.fn().mockResolvedValue({ keyVault: { uid: "kv-1", wrappedKeys: [], masterKeyWraps: [] } });
+        (route as any).persistEnrollment = persistEnrollment;
+        // `recordAuditLog()` builds its event from the whole config.
+        (route as any).config = config;
+        const body: any = { useType: "sign", certificate, wrappedKey: { ciphertext: "c", nonce: "n", algorithm: "aes-gcm" }, masterKeyWraps: [passwordWrap] };
+
+        find.mockResolvedValueOnce([{ uid: "kv-1", masterKeyWraps: null, wrappedKeys: null }]);
+        await route.enrollKey("mailbox-1", body, user);
+        expect(persistEnrollment).toHaveBeenCalledTimes(1);
+
+        find.mockResolvedValueOnce([{ uid: "kv-1", masterKeyWraps: null, wrappedKeys: [{ fingerprint: "x" }] }]);
+        const refused: any = await route.enrollKey("mailbox-1", body, user).catch((err) => err);
+        expect(refused?.status).toBe(409);
+        expect(persistEnrollment).toHaveBeenCalledTimes(1);
+    });
 });

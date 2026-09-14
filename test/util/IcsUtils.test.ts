@@ -1145,6 +1145,17 @@ describe("buildEventIcs() / parseIcsEvent() Tests", () => {
             expect(result.occurrences).toHaveLength(500);
         });
 
+        it("Reports truncated=false for exactly MAX_OCCURRENCES occurrences, and true only once another one exists.", () => {
+            const windowStart = new Date("2026-01-01T00:00:00.000Z");
+            const rule = { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] };
+            const exact = expandOccurrencesDetailed({ startDate, endDate, recurrenceRule: rule }, windowStart, new Date(windowStart.getTime() + 500 * 24 * 60 * 60 * 1000));
+            expect(exact.truncated).toBe(false);
+            expect(exact.occurrences).toHaveLength(500);
+            const oneMore = expandOccurrencesDetailed({ startDate, endDate, recurrenceRule: rule }, windowStart, new Date(windowStart.getTime() + 501 * 24 * 60 * 60 * 1000));
+            expect(oneMore.truncated).toBe(true);
+            expect(oneMore.occurrences).toHaveLength(500);
+        });
+
         it("Reports truncated=false when the whole window fits under the caps.", () => {
             const windowStart = new Date("2026-01-01T00:00:00.000Z");
             const windowEnd = new Date("2026-03-01T00:00:00.000Z");

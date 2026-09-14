@@ -18,7 +18,8 @@ import {
     RouteDecorators,
 } from "@rapidrest/service-core";
 import { EncryptionCertificateAuthority } from "../pki/EncryptionCertificateAuthority.js";
-import { EnrollmentResult, SigningCertificateEnrollment } from "../pki/SigningCertificateEnrollment.js";
+import { EnrollmentBinding, EnrollmentResult, SigningCertificateEnrollment } from "../pki/SigningCertificateEnrollment.js";
+import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { publicKeyFromCertificatePem } from "../util/CertificateInstallUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
@@ -36,10 +37,11 @@ const EMPTY_KEY_VAULT: PublicKeyVault = { wrappedKeys: [], masterKeyWraps: [] };
 
 /** Request body for `enrollKey()`. `wrappedKey`'s `fingerprint`/`useType` are deliberately omitted - the
  * server derives both from the actual issued/validated certificate, never trusting a client-asserted value
- * for either (see `enrollKey()`'s own doc comment). `masterKeyWraps` is only meaningful - and only persisted -
- * the very first time a mailbox enrolls a key at all (bootstrapping its master key); enrolling a second key
- * onto an already-initialized vault ignores it, since adding a master-key wrap independent of key enrollment
- * is `addMasterKeyWrap()`'s (D3's) job, not this one's. */
+ * for either (see `enrollKey()`'s own doc comment). `masterKeyWraps` bootstraps the mailbox's master key, so it is
+ * only accepted the very first time a mailbox enrolls a key at all: sent to a vault that already holds wraps or
+ * wrapped keys it is a `409` (another enrollment - e.g. a second tab setting up at the same time - got there first,
+ * with a different master key). Enrolling an additional key omits it; adding a master-key wrap independent of key
+ * enrollment is `addMasterKeyWrap()`'s (D3's) job. */
 export interface EnrollKeyRequest {
     useType: "sign" | "encrypt";
     /** A PEM-encoded PKCS#10 CSR - required, and only meaningful, when `useType` is `"encrypt"`: the server
@@ -96,8 +98,8 @@ const MAX_MASTER_KEY_WRAPS = 20;
  * owner/delegate path must never be able to add, remove, or fake an escrow wrap itself. `enrollKey()`/
  * `addMasterKeyWrap()` pass `allowEscrow: true` only when `resolveAllowEscrow()` confirms the wrap's own
  * `escrowScopeId` matches the mailbox's actually-assigned `Mailbox.escrowScopeId` and that `EscrowScope`
- * still exists - see that method's own doc comment. `rekey()` always passes `false`; see its own doc
- * comment on why an escrow wrap is preserved verbatim across a rekey instead.
+ * still exists - see that method's own doc comment. `rekey()` applies the same rule to the escrow wraps it replaces
+ * the vault's with (see `assertEscrowCarriedOver()`).
  */
 function validateMasterKeyWrap(wrap: MasterKeyWrap, { allowEscrow }: { allowEscrow: boolean }): void {
     if (!wrap || !MASTER_KEY_WRAP_METHODS.includes(wrap.method)) {
@@ -134,6 +136,22 @@ function validateWrappedPrivateKey(key: Pick<WrappedPrivateKey, "ciphertext" | "
         if (typeof value !== "string" || value.length === 0 || value.length > MAX_WRAP_FIELD_LENGTH) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `${field} must be a non-empty string of at most ${MAX_WRAP_FIELD_LENGTH} characters.`);
         }
+    }
+}
+
+/** Refuses (409) bootstrap `masterKeyWraps` for a vault that is already set up - holding wraps or wrapped keys. They
+ * would be silently ignored while the new key (sealed under the caller's master key) was still appended and published,
+ * leaving the active key under a master key no stored wrap opens: what two tabs setting up keys at once used to do. */
+function assertMasterKeyWrapsAccepted(keyVault: KeyVault | undefined, masterKeyWraps: MasterKeyWrap[] | undefined): void {
+    if (!masterKeyWraps?.length || !keyVault) {
+        return;
+    }
+    if ((keyVault.masterKeyWraps ?? []).length > 0 || (keyVault.wrappedKeys ?? []).length > 0) {
+        throw new ApiError(
+            ApiErrors.IDENTIFIER_EXISTS,
+            409,
+            "This mailbox's key vault is already set up - enroll additional keys without masterKeyWraps, under its existing master key.",
+        );
     }
 }
 
@@ -408,6 +426,9 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
 
         const wrappedKey: WrappedPrivateKey = { ...body.wrappedKey, fingerprint, useType: body.useType };
 
+        // Checked here too (not only in `persistEnrollment()`), so a doomed request doesn't reach the writes.
+        assertMasterKeyWrapsAccepted(await this.findKeyVault(mailbox.uid), body.masterKeyWraps);
+
         const persisted = await this.persistEnrollment(mailbox, publicKey, wrappedKey, body.masterKeyWraps);
 
         await recordAuditLog(
@@ -433,17 +454,19 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         wrappedKey: WrappedPrivateKey,
         initialMasterKeyWraps: MasterKeyWrap[] | undefined,
     ): Promise<{ mailbox: M; keyVault: K }> {
+        // The vault is read (and the bootstrap wraps checked against it) before anything is written; the vault update
+        // below is version-checked, so a concurrent enrollment that lands in between is a 409 too.
+        const keyVault: K = await this.findOrCreateKeyVault(mailbox.uid);
+        assertMasterKeyWrapsAccepted(keyVault, initialMasterKeyWraps);
+
         const updatedMailbox: M = await this.mailboxRepo!.update(
             { uid: mailbox.uid, version: (mailbox as any).version, keys: [...mailbox.keys, publicKey] } as any,
             mailbox,
             { ignoreACL: true },
         );
 
-        const keyVault: K = await this.findOrCreateKeyVault(mailbox.uid);
-        // `initialMasterKeyWraps` only takes effect while the vault has never had any wraps at all - adding a
-        // wrap to an already-initialized vault is `addMasterKeyWrap()`'s (D3's) job, not this one's.
-        const masterKeyWraps: MasterKeyWrap[] =
-            keyVault.masterKeyWraps.length === 0 && initialMasterKeyWraps ? initialMasterKeyWraps : keyVault.masterKeyWraps;
+        // `initialMasterKeyWraps` only ever reaches an empty vault (`assertMasterKeyWrapsAccepted()`).
+        const masterKeyWraps: MasterKeyWrap[] = initialMasterKeyWraps?.length ? initialMasterKeyWraps : keyVault.masterKeyWraps;
         const updatedKeyVault: K = await this.keyVaultRepo!.update(
             {
                 uid: keyVault.uid,
@@ -492,17 +515,25 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         validateWrappedPrivateKey(body.wrappedKey);
 
         const { enrollmentId } = await this.signingCertificateEnrollment!.startEnrollment(mailbox.primarySmtpAddress, body.csr);
-        const attachWrappedKey: ((enrollmentId: string, wrappedKey: unknown) => Promise<void>) | undefined = (
+        const attachWrappedKey: ((enrollmentId: string, wrappedKey: unknown, binding: unknown) => Promise<void>) | undefined = (
             this.signingCertificateEnrollment as any
         ).attachWrappedKey;
         if (typeof attachWrappedKey === "function") {
-            await attachWrappedKey.call(this.signingCertificateEnrollment, enrollmentId, body.wrappedKey);
+            // The wrapped key is sealed under the vault's current master key - recorded so the driver job never installs
+            // it after a rotation (see `KeyVault.masterKeyGeneration`).
+            const keyVault: K | undefined = await this.findKeyVault(mailbox.uid);
+            await attachWrappedKey.call(this.signingCertificateEnrollment, enrollmentId, body.wrappedKey, {
+                mailboxUid: mailbox.uid,
+                masterKeyGeneration: keyVault?.masterKeyGeneration ?? 0,
+            });
         }
 
         return { enrollmentId };
     }
 
-    /** Reports the current status of a previously started automated enrollment - see `startSignEnrollment()`. */
+    /** Reports the current status of a previously started automated enrollment - see `startSignEnrollment()`. Only an
+     * enrollment of the path mailbox (`requireEnrollmentOf()`) - any other id is a `404`, so mailbox access to one
+     * mailbox doesn't read another mailbox's enrollment. */
     @Get("/:id/keyvault/keys/sign-enrollment/:enrollmentId")
     public async checkSignEnrollmentStatus(
         @Param("id") mailboxId: string,
@@ -512,8 +543,86 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
+        await this.requireEnrollmentOf(mailbox, enrollmentId);
 
         return await this.signingCertificateEnrollment!.checkStatus(enrollmentId);
+    }
+
+    /**
+     * Cancels one of the mailbox's pending (or issued but not yet installed) automated signing enrollments: nothing is
+     * installed from it afterwards. Owner-only, like every key-vault write. `rekey()` refuses to run while such an
+     * enrollment exists, so this is how an owner with an enrollment stuck at the CA gets to rotate their keys.
+     */
+    @Delete("/:id/keyvault/keys/sign-enrollment/:enrollmentId")
+    public async cancelSignEnrollment(
+        @Param("id") mailboxId: string,
+        @Param("enrollmentId") enrollmentId: string,
+        @AuthUser user?: JWTUser,
+    ): Promise<EnrollmentResult> {
+        await this.init();
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        this.requireMailboxOwner(mailbox, user);
+        await this.requireEnrollmentOf(mailbox, enrollmentId);
+        if (typeof this.signingCertificateEnrollment!.cancelEnrollment !== "function") {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        await this.signingCertificateEnrollment!.cancelEnrollment(enrollmentId, "Cancelled by the mailbox owner.");
+        return await this.signingCertificateEnrollment!.checkStatus(enrollmentId);
+    }
+
+    /**
+     * Refuses (404) an `enrollmentId` that doesn't belong to `mailbox`: one recorded for another mailbox uid, or - with no
+     * uid recorded - started for another address. Enrollment ids are the only handle on an enrollment, so without this
+     * any caller with access to one mailbox could read (or cancel) every other mailbox's enrollment by id. Fails closed
+     * on an implementation that can't say (`describeEnrollment()` absent).
+     */
+    private async requireEnrollmentOf(mailbox: M, enrollmentId: string): Promise<void> {
+        const describe = this.signingCertificateEnrollment?.describeEnrollment;
+        let binding: EnrollmentBinding | undefined;
+        try {
+            binding = typeof describe === "function" ? await describe.call(this.signingCertificateEnrollment, enrollmentId) : undefined;
+        } catch (err: any) {
+            // An unknown id is a 404 like any other mismatch; "not available" (the Null default) stays what it is.
+            if (typeof err?.status === "number" && err.status >= 500) {
+                throw err;
+            }
+            binding = undefined;
+        }
+        if (!binding || !this.enrollmentBelongsTo(binding, mailbox)) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+    }
+
+    private enrollmentBelongsTo(binding: { identity: string; mailboxUid?: string }, mailbox: M): boolean {
+        return binding.mailboxUid
+            ? binding.mailboxUid === mailbox.uid
+            : normalizeAddress(String(binding.identity)) === normalizeAddress(mailbox.primarySmtpAddress);
+    }
+
+    /**
+     * Refuses (409) while `mailbox` has an automated signing enrollment that is pending, or issued but not yet
+     * installed, holding a wrapped private key. That key is sealed under the vault's CURRENT master key; installed after
+     * a rotation it would become the active signing key under a master key nobody can open any more, and unlocking
+     * with the right password would fail for good.
+     *
+     * Refusing is chosen over cancelling the enrollment on the owner's behalf: an enrollment may be days into a CA's
+     * email challenge, and silently throwing that away (the CA still issues, the certificate is just never installed)
+     * is worse than asking the owner to wait for it or cancel it explicitly (`cancelSignEnrollment()`). The driver job's
+     * own master-key-generation check still covers an enrollment started concurrently with the rotation.
+     */
+    private async assertNoPendingSignEnrollment(mailbox: M): Promise<void> {
+        const list = (this.signingCertificateEnrollment as any)?.listPendingEnrollments;
+        if (typeof list !== "function") {
+            return;
+        }
+        const pending: Array<{ identity: string; mailboxUid?: string; hasWrappedKey?: boolean }> = await list.call(this.signingCertificateEnrollment);
+        if (pending.some((enrollment) => enrollment.hasWrappedKey !== false && this.enrollmentBelongsTo(enrollment, mailbox))) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                "A signing certificate enrollment for this mailbox is still in progress - wait for it to finish, or cancel it, before rotating keys.",
+            );
+        }
     }
 
     /**
@@ -645,6 +754,11 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     }
 
     /**
+     * Refused (409) while the mailbox has an automated signing enrollment in flight (`assertNoPendingSignEnrollment()`),
+     * and when it would drop the mailbox's escrow coverage without a replacement (`assertEscrowCarriedOver()`). Escrow
+     * wraps in the request are accepted for the mailbox's assigned scope only, as in `addMasterKeyWrap()`; old ones are
+     * never kept.
+     *
      * Full, atomic replacement of a mailbox's `wrappedKeys`/`masterKeyWraps` (and published `keys`), following
      * the client's own re-key operation - the only real revocation mechanism for a captured wrap (see
      * `MasterKeyWrap`'s doc comment). Purely client-initiated: this repo has no session/device-revocation
@@ -683,10 +797,9 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `${field} must be an array.`);
             }
         }
-        // Escrow wraps are refused below and preserved from the existing vault instead, so this is "at least one wrap
-        // the owner can unlock with" - with none, the new master key is lost to the owner (the same rule
-        // `removeMasterKeyWrap()` enforces for a single removal).
-        if (body.masterKeyWraps.length === 0) {
+        // At least one wrap the owner can unlock with - with none, the new master key is lost to the owner (the same
+        // rule `removeMasterKeyWrap()` enforces for a single removal).
+        if (!body.masterKeyWraps.some((wrap) => wrap?.method !== "escrow")) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "masterKeyWraps must include at least one non-escrow wrap.");
         }
 
@@ -712,14 +825,17 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `masterKeyWraps cannot exceed ${MAX_MASTER_KEY_WRAPS} entries.`);
         }
         for (const wrap of body.masterKeyWraps ?? []) {
-            validateMasterKeyWrap(wrap, { allowEscrow: false });
+            validateMasterKeyWrap(wrap, { allowEscrow: await this.resolveAllowEscrow(mailbox, wrap) });
         }
+        await this.assertEscrowCarriedOver(mailbox, keyVault, body.masterKeyWraps);
         if ((body.wrappedKeys ?? []).length > MAX_ENROLLED_KEYS) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `wrappedKeys cannot exceed ${MAX_ENROLLED_KEYS} entries.`);
         }
         for (const wrappedKey of body.wrappedKeys ?? []) {
             validateWrappedPrivateKey(wrappedKey);
         }
+
+        await this.assertNoPendingSignEnrollment(mailbox);
 
         const updated: K = await this.persistRekey(mailbox, keyVault, body);
 
@@ -733,6 +849,32 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         return { wrappedKeys: updated.wrappedKeys, masterKeyWraps: updated.masterKeyWraps };
     }
 
+    /**
+     * Keeps `removeMasterKeyWrap()`'s rule - the owner can't take away escrow coverage - across a rotation, which
+     * replaces every wrap: when the mailbox is assigned to an escrow scope that still exists and the vault holds an
+     * escrow wrap for that scope, the rekey must carry a new escrow wrap for it (409 otherwise). Otherwise a "rekey"
+     * that re-submitted the owner's own wraps for the same master key would strip a working escrow wrap. Escrow wraps
+     * for any other scope (a scope the mailbox has since left) are simply dropped. `validateMasterKeyWrap()` has
+     * already refused an escrow wrap in the request for any scope but the assigned one.
+     */
+    private async assertEscrowCarriedOver(mailbox: M, keyVault: K, requested: MasterKeyWrap[]): Promise<void> {
+        const scopeId: string | undefined = mailbox.escrowScopeId || undefined;
+        if (!scopeId || !keyVault.masterKeyWraps.some((wrap) => wrap.method === "escrow" && wrap.escrowScopeId === scopeId)) {
+            return;
+        }
+        if (requested.some((wrap) => wrap.method === "escrow" && wrap.escrowScopeId === scopeId)) {
+            return;
+        }
+        if (!(await this.escrowScopeRepo!.findOne(scopeId, { ignoreACL: true }))) {
+            return;
+        }
+        throw new ApiError(
+            ApiErrors.IDENTIFIER_EXISTS,
+            409,
+            "This mailbox's master key is escrowed - a rekey must include a new escrow wrap for its escrow scope.",
+        );
+    }
+
     @Transactional()
     protected async persistRekey(mailbox: M, keyVault: K, body: RekeyRequest): Promise<K> {
         await this.mailboxRepo!.update(
@@ -740,21 +882,19 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             mailbox,
             { ignoreACL: true },
         );
-        // Any existing escrow wrap is preserved verbatim, never taken from `body` - see
-        // `validateMasterKeyWrap()`'s doc comment: a rekey request can't assert `method: "escrow"` at all, so
-        // naively replacing wholesale with `body.masterKeyWraps` would silently drop escrow coverage on every
-        // rekey. A real re-wrap of the escrow copy for a *new* MK is server-side future work (the spec notes
-        // it "operates on MK's ciphertext under a public key" and needs no client cooperation) - until that
-        // exists, preserving the existing wrap as-is is the safe interim behavior; it will fail to decrypt a
-        // rotated MK, which is a correctness gap for the escrow holder to resolve out of band, not a security
-        // one (nothing here can let a rekey silently disable escrow coverage the deployment configured).
-        const preservedEscrowWraps: MasterKeyWrap[] = keyVault.masterKeyWraps.filter((w) => w.method === "escrow");
+        // Every old wrap is replaced, escrow wraps included: they wrap the old master key, so kept they would open
+        // nothing, pile up against `MAX_MASTER_KEY_WRAPS` (the owner can't remove them) and keep key discovery
+        // reporting escrow coverage that no longer exists. `assertEscrowCarriedOver()` has already required a
+        // replacement escrow wrap wherever dropping the old one would take away coverage the deployment assigned.
+        // `masterKeyGeneration` moves on, so an enrollment holding a key sealed under the old master key is never
+        // installed (`AcmeEnrollmentDriverJob`).
         return await this.keyVaultRepo!.update(
             {
                 uid: keyVault.uid,
                 version: (keyVault as any).version,
                 wrappedKeys: body.wrappedKeys,
-                masterKeyWraps: [...preservedEscrowWraps, ...body.masterKeyWraps],
+                masterKeyWraps: body.masterKeyWraps,
+                masterKeyGeneration: (keyVault.masterKeyGeneration ?? 0) + 1,
             } as any,
             keyVault,
             { ignoreACL: true },

@@ -1231,3 +1231,216 @@ tests, all passing): Message/MailAuthzRound3/Round4/Mailbox/Folder/Attachment/La
 (+Domains)/TransportRule/CalendarShareLink/Task/IngestQueue/Quarantine/MailFilterRule/Contact/MailboxAutoProvision
 (+Static)/SecurityControls/MailboxAccess/CalendarEvent/Note/ContactList/TaskList/MailSignature/BookingType mongo+sql, the
 Base* unit tests, MailPushRoute, BaseAdminWriteGuards. tsc and eslint clean on the touched files.
+
+## 2026-09-14 — Review fixes, round 5 (part B): mailbox, attachments, key vault/enrollment, booking, util exports
+
+Part A (same day) owns BaseMessageRoute/BaseMailIngestRoute/ScanQueueJob/ScheduledSendJob/ErasureExecutionJob and the
+DKIM/MIME/ICS utils; nothing here touches those.
+
+1. HIGH, confirmed: `validateAddressChange()` now applies `ownsAddress()` (auth-server usernames x verified domains) to a
+   non-trusted primary rename, like alias adds - on PUT, bulk PUT (no `req`: fails closed unless static aliases) and
+   `:primarySmtpAddress`. Order 400 (plain/domain) -> 403 (ownership) -> 409 (collision). Existing MailboxRoute tests that
+   renamed as the owner now rename as admin; a self-service rename onto the owner's own username is in
+   `mailboxSelfServiceCreateSuite.ts`.
+2. MEDIUM, confirmed: owner ACL moves happen BEFORE the owner is written (`withOwnerAclMoved()`), so a failure is
+   repaired by retrying (stored owner is still the old one, the move is idempotent). If the write fails, each mailbox
+   whose stored owner isn't the new one gets the two members' previous records back (a partial bulk keeps committed
+   moves). "Remove owner-granted records of non-owners" wasn't possible: `ACLRecord` has only `userOrRoleId`/`actions`
+   and a `manager` delegate is also a `FULL` record, so owner grants are indistinguishable.
+3. HIGH, confirmed: `BaseAttachmentRoute` resolves the owning message and checks/list by its CURRENT folder: `find`/
+   `count` by `messageUid` (LIST/COUNT on the message's folder, query by `messageUid`, `folderUid` ignored),
+   `findById`/`exists`/`download`, and `update`/`delete` (permission on the current folder first, then `realign()`
+   re-stamps the stored folderUid/mailboxUid, substituting the bumped version when the client's matched). `truncate`
+   re-stamps the scope folder's stale rows first. Folder-only list/count return only attachments whose message is in
+   that folder now (filtered in memory; count pages). Client `folderUid`/`mailboxUid` on update are dropped. Attachments
+   aren't soft-deleted, so `deleted` filters are dropped. Responses show the current folderUid/mailboxUid. Not done:
+   re-stamping on message move itself (that's BaseMessageRoute/ScheduledSendJob - part A's).
+4. HIGH, confirmed: new server-managed `KeyVault.masterKeyGeneration` (Mongo+SQL, nullable). `rekey()` bumps it and
+   returns 409 while a signing enrollment for the mailbox (by recorded mailboxUid, else identity) is pending or issued
+   but uninstalled and holds a wrapped key. Chose 409 over auto-cancel: an ACME email challenge may be days in, and
+   silently discarding it is worse than asking the owner to wait or cancel. New owner-only
+   `DELETE /:id/keyvault/keys/sign-enrollment/:enrollmentId` cancels. `startSignEnrollment()` passes
+   `{ mailboxUid, masterKeyGeneration }` to `attachWrappedKey()`; `AcmeEnrollmentDriverJob` refuses (and cancels) when the
+   vault generation differs (legacy unrecorded = 0) or the identity now belongs to another mailbox.
+   `SigningCertificateEnrollment` gains optional `describeEnrollment()`/`cancelEnrollment()` (Rfc8823 + Manual implement
+   both; Null's describe throws its usual 500); Rfc8823 `listPendingEnrollments()` adds `mailboxUid`/`hasWrappedKey`,
+   `getIssuedMaterial()` adds `mailboxUid`/`masterKeyGeneration`.
+   Refinement B (escrow wraps on rekey): old escrow wraps are no longer kept (they can't open the new MK, piled up
+   against the 20-wrap cap, and made discovery report escrow falsely). To keep the owner-can't-remove-escrow rule, rekey
+   accepts an escrow wrap only for the mailbox's assigned, existing scope (`resolveAllowEscrow()`), and 409s when the
+   mailbox is escrowed (assigned scope exists and the vault has a wrap for it) but the request carries no replacement.
+   Wraps for scopes the mailbox left, or deleted scopes, are dropped. "At least one non-escrow wrap" is still required.
+5. HIGH, confirmed: `enrollKey()` 409s when `masterKeyWraps` is non-empty and the vault already has wraps or wrapped
+   keys (checked before writes and again in `persistEnrollment()`, which now reads the vault before the mailbox write).
+   Enrolling without wraps still works.
+6. MEDIUM, confirmed (enrollment ids are the only handle; any READ on any mailbox could read any id's status):
+   `checkSignEnrollmentStatus()` and cancel require `describeEnrollment()` to bind the id to the path mailbox (recorded
+   mailboxUid, else identity == primary address); otherwise 404. Fails closed (404) on an implementation without it.
+7. MEDIUM, confirmed: `displayName` with `@`, CR or LF (or non-string) is 400 on create (incl. auto-provision path),
+   update, bulk and `:displayName`; on updates only when it actually changes, so a stored legacy name round-trips.
+8. LOW, confirmed: `rateLimitKeyForIp()` (ClientIpUtils) keys IPv6 by `/64`; booking slots/book limiter uses it.
+9. `asEntity`, LegalHoldUtils (`findActiveHoldsFor`, `assertNotOnLegalHold`, `loadLegalHoldIndex`, `LegalHoldIndex`)
+   and `findPagesByUid` are exported from `util/index.ts` (package root). No behaviour change.
+
+Contract changes
+- react-shared attachments: `?messageUid=<id>` is the supported list (`folderUid` may still be sent; it's ignored).
+  Returned attachments carry the message's current folderUid.
+- react-shared key vault: `enrollKey` with masterKeyWraps on a set-up vault is 409 (treat as "another tab set up keys":
+  reload the vault, then unlock). Rekey is 409 while a sign enrollment is in flight - offer cancel via
+  `DELETE .../sign-enrollment/:enrollmentId`. Rekey of an escrowed mailbox must include the new escrow wrap in
+  `masterKeyWraps` (not re-add after). `unlockWithPassword` should skip (not fail on) wrapped keys it can't open, so a
+  key installed before this fix doesn't lock the user out.
+- Status checks for another mailbox's enrollment id are 404.
+- Mailbox displayName with `@`/newline is 400 (web-client/server compose need not change; admin UI should validate).
+- Owner primary renames need to be onto the owner's own username; admin console renames are unaffected.
+- A third-party `SigningCertificateEnrollment` must implement `describeEnrollment()` for the status endpoint to work.
+
+Tests: `test/routes/routesKeysRound5Suite.ts` (+ `{mongo,sql}/RoutesKeysRound5.test.ts`, 9 each),
+`test/routes/keyVaultRound5Suite.ts` (run from `{mongo,sql}/KeyVaultRoute.SignEnrollmentAutomated.test.ts`, which now
+share its `FakeAutomatedEnrollment`); additions in MailboxRoute, mailboxSelfServiceCreateSuite, KeyVaultRoute (second
+enrollment 409; escrow wrap accepted for assigned scope), BaseKeyVaultRoute, BaseAttachmentRoute (paging),
+AcmeEnrollmentDriverJob{Mongo,SQL}, Rfc8823/Manual/Null enrollment, bookingSecuritySuite, ClientIpUtils, EntityUtils.
+Targeted runs under the lock all pass; tsc and eslint clean on touched files.
+
+## 2026-09-14 — Review fixes, round 5 (part A): mail flow (send claims, erasure, relays, receipts, DKIM, booking)
+
+Uncommitted. Concurrent with part B (BaseMailboxRoute, BaseAttachmentRoute, BaseKeyVaultRoute, BaseBookingRoute, util
+exports). All nine findings re-checked against the code and confirmed; all fixed. Plus the coordinator's add-on
+(recipients required to send).
+
+1. HIGH, send in flight could be cancelled then re-sent (double send). New `Message.scheduledSendLeaseExpiresAt`
+   (types + MessageMongo/MessageSQL, nullable; server-managed; a date field) is the in-flight marker:
+   - Both claims write it: `BaseMessageRoute.send()` (with the Outbox move; `scheduledSendTime` stays null) and
+     `ScheduledSendJob` (same instant as its `scheduledSendTime` lease). Lease length for both is
+     `mail:jobs:scheduled_send:lease_ms` (900000; the route now reads it too).
+   - `BaseMessageRoute.prepareUpdate()` refuses (409 "This message is being sent right now.") any folder move of a
+     message whose lease is in the future - for every caller, trusted included. Moving out of Outbox (lapsed lease)
+     also clears the lease. `releaseClaim()`, `refuse()`, `recordFailedAttempt()`, the scheduled branch of `send()` and
+     both filings clear it.
+   - Filing (route `fileSentMessage()`, job filing) re-reads and proceeds only while the row is still in the claimed
+     Outbox and carries the claim's lease (compared against the value the claim's `update()` read back, so DB date
+     precision can't break it); otherwise it writes nothing. The job's `recordFailedAttempt()` likewise does nothing
+     once the claim is gone. An already-relayed message outside Outbox is now refused by the job ("not in Outbox")
+     instead of being filed.
+2. HIGH, erasure dropped inbound mail indefinitely. `ScanQueueJob.isMailboxBeingErased()` -> `erasureDisposition()`:
+   - Requests with `dateCreated` before the mailbox row's `dateCreated` are ignored (earlier mailbox at the same
+     address).
+   - drop: `in_progress` with a live claim (`dateModified` within `mail:jobs:erasure_execution:claim_lease_seconds`,
+     900, read by ScanQueueJob too), or `completed` with the mailbox row gone.
+   - defer: `approved` (queued, or handed back by a hold/unloaded plugin) or a stale `in_progress` - `deferEntry()`
+     sets FAILED + `nextAttemptAt` now + `mail:jobs:scan_queue:erasure_defer_seconds` (300) and undoes the claim's
+     `attempts` increment, until the entry is `mail:jobs:scan_queue:erasure_defer_max_seconds` (3600) old; then deliver.
+   - deliver otherwise (incl. `completed` whose mailbox row survived).
+   ErasureExecutionJob: no functional change needed (the drop decision lived in ScanQueueJob); the
+   `ERASURE_IN_PROGRESS` doc comment now states the new rule.
+3. HIGH, MySQL endless re-send on a long Message-ID. `boundIndexedValue()` on every patch write of
+   messageId/conversationId (job filing + `recordFailedAttempt` extras, route `fileSentMessage()`/`markRelayed()`).
+   `scheduledSendRelayedAt` is now persisted by its own minimal version-checked write (`recordRelayed()`, re-read and
+   retried x3 on conflict) inside the tracking transport the moment it accepts, in both the job and the route.
+   Grep of src for other patch writes of bounded fields: client PUTs of Message `messageId`/`conversationId`
+   (`BaseMessageRoute.prepareUpdate()`, every caller) and CalendarEvent `icalUid` (new
+   `BaseCalendarEventRoute.prepareUpdate()`) were unbounded - fixed. Everything else writes these via constructors
+   (create) or lookups already bounded. `markRelayed()` keeps an existing relayedAt, clears the lease, and only makes
+   the message due while it's still in the claimed Outbox.
+4. MEDIUM, `@` display-name bypass (`From :`, bare CR). MimeHeaderUtils now owns it: `extractOriginatorHeaders(raw)`
+   (the shared lexer), `hasAddressLikeDisplayName(value)` (quoted strings, comments, display and group names; RFC 2047
+   Q/B decoded as UTF-8; raw 8-bit UTF-8; fullwidth/small commercial at look-alikes), and
+   `checkOriginatorHeaders(raw, isAllowed, { rejectAddressLikeDisplayNames: true })`. BaseMessageRoute's local copy
+   is gone; `ScheduledSendJob` applies the option at send time (refusal "...display name or comment contains an
+   address.").
+5. MEDIUM, second delivery receipt / lost auto-reply. `completeDeliveryReceipt()` claims first
+   (`claimDeliveryReceipt()`: version-checked write of `deliveryReceiptSentAt` or `deliveryReceiptPending`, re-read and
+   retried x3 on 409, skipped once handled), then sends; a failed send releases it (`releaseDeliveryReceiptClaim()`,
+   only while the row still carries that claim). The automatic reply is tracked per entry by a marker blob
+   `ingest-markers/<entry>/auto-replied` (`maybeSendAutoReplyOnce()`, like the forward marker; `markDelivered()` removes
+   both), not by "this attempt filed". `deliverMessage()` now returns void.
+6. MEDIUM, duplicate trusted Authentication-Results. `DkimOversignUtils.topmostTrustedAuthenticationResults(values, id)`
+   returns only the topmost value stamped by the trusted authserv-id (other ids above it skipped; an unreadable
+   authserv-id fails closed). `verifiedDkimSignatures()` uses only that, and the header.b-less count must now equal the
+   signature count exactly. ScanQueueJob's every AR read goes through it (`authenticationResults()`), as does
+   `verifiedFromAddress()`.
+7. HIGH, distribution-list relay laundering. New `MimeHeaderUtils.prepareRelayCopy(raw, { trustedAuthservId,
+   rewriteFrom, replyToOriginalFrom? })` + `verifiedFromAddress(raw, id)` + `singleFromAddress(raw)` +
+   `containsCalendarContent(raw)` + `RELAY_STRIPPED_HEADERS`:
+   - always strips Authentication-Results, RapidMX-Key, X-RapidMX-Recall-Of, Disposition-Notification-To (bare CR
+     treated as a line break);
+   - keeps From only when it's the single From with aligned passing DKIM (topmost trusted AR); otherwise From becomes
+     `"<name>" <rewrite address>`, Sender and any existing X-Original-From dropped, `X-Original-From: <original>` added
+     (and `Reply-To: <original>` for forwards without a Reply-To);
+   - returns `undefined` (don't relay) for unauthenticated calendar content (text/calendar, application/ics, .ics names
+     incl. RFC 2231/2047, BEGIN:VCALENDAR).
+   `BaseMailIngestRoute`: external members get `prepareRelayCopy(listRaw, { rewriteFrom: list address/name })` (skipped
+   and logged when undefined; `queued` then reflects internal members only); internal members keep `listRaw` (their
+   ScanQueueJob checks use the ingress AR). `restrictSenders` (top-level and nested) now requires
+   `verifiedFromAddress()` to be a member - the envelope sender no longer counts. Unsubscribe verification uses
+   `verifiedFromAddress()` too.
+8. HIGH, forward-rule laundering. `ScanQueueJob.forwardByRule()` sends `prepareRelayCopy(raw, { rewriteFrom: mailbox
+   address/displayName, replyToOriginalFrom: true })` (plus the loop header); also skips when the scan pipeline found an
+   `icsPart` and the From isn't verified.
+9. LOW, booking declines too eagerly. `IcsUtils` flags `truncated` only when an occurrence past `MAX_OCCURRENCES`
+   exists (exactly 500 is complete). `decideResourceBooking()` expands the request in 60-day windows (deduped; cap 5000
+   occurrences - practically unreachable, v8-ignored), and `bookingConflicts()` expands each existing booking only over
+   the span of a group of requested occurrences, halving the group on truncation; only a single requested
+   occurrence whose span still truncates declines.
+
+Add-on (coordinator): `send()` returns 400 "A message needs at least one To, Cc or Bcc recipient to be sent." when no
+recipient has a non-blank address - before the scheduled branch and the claim, so it stays in Drafts. `ScheduledSendJob`
+refuses such a message ("The message has no To, Cc or Bcc recipients."), no relay, no retry.
+
+Contract changes
+- web-client/react-shared: moving a message out of Outbox (e.g. `cancelScheduledSend()`) is 409 while its send is in
+  flight (up to lease_ms); send of a message with no recipients is 400; restricted distribution lists need
+  DKIM-aligned senders; external list members and forward targets see From rewritten for unauthenticated senders.
+- activesync/mapi: send paths should use `checkOriginatorHeaders(raw, isAllowed, { rejectAddressLikeDisplayNames: true })`
+  (or `hasAddressLikeDisplayName()` on `extractOriginatorHeaders()` values), require recipients, and any path that moves
+  messages out of Outbox should respect `scheduledSendLeaseExpiresAt`. If they write messageId/conversationId/icalUid
+  with `RepoUtils.update()`, bound them with `boundIndexedValue()`.
+- server: new config keys `mail:jobs:scan_queue:erasure_defer_seconds` (300), `mail:jobs:scan_queue:erasure_defer_max_seconds`
+  (3600); ScanQueueJob and BaseMessageRoute also read the existing `mail:jobs:erasure_execution:claim_lease_seconds` and
+  `mail:jobs:scheduled_send:lease_ms`. New nullable SQL column `scheduledSendLeaseExpiresAt` on the message table
+  (synchronize).
+
+Tests (under `.vitest-lock`, `--coverage.enabled=false`, targeted): MimeHeaderUtils, DkimOversignUtils, IcsUtils unit;
+ScheduledSendJob mongo/sql (display name, in-flight/moved-mid-relay, bounded long Message-ID with a simulated
+varchar(255), relayed marker surviving filing+bookkeeping failure and a version conflict, no recipients);
+MailAuthzRound4 mongo/sql (new "round 5 (part A)" block: in-flight 409 for owner/admin + lapsed lease, cancel during an
+immediate send, filing failure left relayed/due, bounded ids from send and PUT, `From :`/bare CR/look-alike, no
+recipients); CalendarEventRoute mongo/sql (bounded icalUid PUT); MailIngestRoute mongo/sql (restrictSenders DKIM, From
+rewrite + header strip, verified From kept, calendar not relayed); ScanQueueJob mongo/sql (erasure defer/drop/stale/
+predating/completed, receipt claim vs mark-read, claim retry, topmost AR, auto-reply on retry once, forward rewrite,
+verified forward + calendar skip, booking windows). Replaced: J15's approved-drop test (now in_progress), J7's
+"requested series too long" and round-4's "existing booking has too many occurrences" (now accepted; covered by the
+new single-long-occurrence decline). Also ran MessageRoute, MailAuthzRound3, BaseMessageRoute, ErasureExecutionJob,
+CalendarReminder, MeetingScheduling, Booking, SecurityControls, TransportRule, DistributionList, models and related util
+suites - all passing. `tsc` and eslint clean on the touched files.
+
+## 2026-09-14 — Round 5 follow-up: no moving sent/received mail into Drafts; coverage gate restored
+
+Finding: server's `BaseMailComposeRoute.assemble()` (and its sibling at ~line 633) rewrites body/subject/recipients of
+any message in a Drafts folder, and restapi still let a client move ANY message into Drafts. A Sent Items copy has no
+`scanResultUid`, so it's indistinguishable from a draft: a user (or a held custodian) could move sent/received mail to
+Drafts, re-assemble it and move it back, forging history. activesync's `MessageMoveRules` already refuses this.
+
+Fix (`BaseMessageRoute.prepareScheduledSendUpdate()`, so update, bulk update and `PUT /:id/folderUid` all get it): a
+non-trusted update that changes `folderUid` into a Drafts folder is refused 403 unless the message is currently in
+Drafts (draft between Drafts folders) or Outbox (the scheduled-send cancel path, which still clears the send state; the
+in-flight 409 still runs first for every caller). Trusted callers are exempt, mirroring the Outbox rules (which return
+before this check for trusted users). Create: nothing to add - a non-trusted create into Drafts can already only set
+draft fields (every delivery marker - `scanResultUid`, receipt state, `scheduledSendRelayedAt`, blob keys - is
+server-managed and stripped); normal draft creation is unchanged.
+Tests: `mailAuthzRound4Suite.ts` "round 5 (part B): moves into Drafts" (mongo + sql): Inbox/Sent Items -> Drafts 403 on
+all three paths under a legal hold with the row unchanged; Drafts -> Drafts, Outbox -> Drafts (single and bulk) 200;
+admin exempt; in-flight still 409.
+
+Not fixed, flagged: (1) a `MailFilterRule` MOVE_TO_FOLDER can target a Drafts folder, so `ScanQueueJob` can file
+inbound mail straight into Drafts where compose can rewrite it - the compose route (server) should probably also refuse
+messages with a `scanResultUid`, as activesync does; (2) non-trusted moves OUT of Drafts into Sent Items, and creates
+directly into Sent Items, are still allowed, so fabricating (not rewriting) sent history remains possible.
+
+Coverage gate: new tests for the previously uncovered lines - BaseMessageRoute `recordRelayed()` retry after a version
+bump mid-relay; ScheduledSendJob `recordRelayed()` stopping when a concurrent writer already stamped the marker;
+ScanQueueJob delivery-receipt claim losing to a concurrent claim, giving up after 3 conflicts (entry FAILED, retry sends
+once), release leaving a changed claim alone, release failures logged; booking conflict found in the first half of a
+split expansion; MimeHeaderUtils quoted-pairs in display names/comments; DkimOversignUtils non-string AR values.
+Removed dead code: `BaseAttachmentRoute.resolveMailboxUidFor()` and its `folderClass` (update() strips client
+folderUid/mailboxUid and create() is refused, so `BaseScopedChildRoute.enforceMailboxUid()` never runs for attachments).

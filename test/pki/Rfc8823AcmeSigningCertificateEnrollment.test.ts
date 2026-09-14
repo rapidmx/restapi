@@ -646,6 +646,69 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
         it("getIssuedMaterial() throws 404 for an unknown enrollment id.", async () => {
             await expect(enrollment.getIssuedMaterial("does-not-exist")).rejects.toThrow(/No enrollment found/);
         });
+
+        it("attachWrappedKey()'s binding is reported by describeEnrollment(), listPendingEnrollments() and getIssuedMaterial() (round 5).", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("bound@example.com", await generateCsr("bound@example.com"));
+            const unbound = await enrollment.startEnrollment("unbound@example.com", await generateCsr("unbound@example.com"));
+            await expect(enrollment.describeEnrollment(unbound.enrollmentId)).resolves.toEqual({ identity: "unbound@example.com", mailboxUid: undefined });
+
+            await enrollment.attachWrappedKey(enrollmentId, wrappedKey, { mailboxUid: "mailbox-1", masterKeyGeneration: 3 });
+            await expect(enrollment.describeEnrollment(enrollmentId)).resolves.toEqual({ identity: "bound@example.com", mailboxUid: "mailbox-1" });
+            const listed = await enrollment.listPendingEnrollments();
+            expect(listed.find((e) => e.enrollmentId === enrollmentId)).toEqual(
+                expect.objectContaining({ mailboxUid: "mailbox-1", hasWrappedKey: true, status: "pending" }),
+            );
+            expect(listed.find((e) => e.enrollmentId === unbound.enrollmentId)?.hasWrappedKey).toBe(false);
+
+            await enrollment.recordChallengeToken(enrollmentId, "t6", "r@acme.test", "<i6@acme.test>", "ACME: t6");
+            await enrollment.advanceEnrollment(enrollmentId);
+            FakeAcmeClient.orderStatus = "valid";
+            await enrollment.advanceEnrollment(enrollmentId);
+            FakeAcmeClient.orderStatus = "pending";
+            await expect(enrollment.getIssuedMaterial(enrollmentId)).resolves.toEqual({
+                certificate: FakeAcmeClient.certificatePem,
+                wrappedKey,
+                mailboxUid: "mailbox-1",
+                masterKeyGeneration: 3,
+            });
+            await expect(enrollment.describeEnrollment("does-not-exist")).rejects.toThrow(/No enrollment found/);
+        });
+
+        it("cancelEnrollment() fails a pending or issued-but-uninstalled enrollment, leaving installed and already-failed ones alone (round 5).", async () => {
+            const pending = await enrollment.startEnrollment("cancel-pending@example.com", await generateCsr("cancel-pending@example.com"));
+            await enrollment.cancelEnrollment(pending.enrollmentId, "Cancelled by the mailbox owner.");
+            await expect(enrollment.checkStatus(pending.enrollmentId)).resolves.toEqual({
+                status: "failed",
+                certificate: undefined,
+                error: "Cancelled by the mailbox owner.",
+            });
+            // Already failed: the first reason stays.
+            await enrollment.cancelEnrollment(pending.enrollmentId, "again");
+            expect((await enrollment.checkStatus(pending.enrollmentId)).error).toBe("Cancelled by the mailbox owner.");
+
+            const issue = async (identity: string, token: string): Promise<string> => {
+                const { enrollmentId } = await enrollment.startEnrollment(identity, await generateCsr(identity));
+                await enrollment.attachWrappedKey(enrollmentId, wrappedKey);
+                await enrollment.recordChallengeToken(enrollmentId, token, "r@acme.test", `<${token}@acme.test>`, `ACME: ${token}`);
+                await enrollment.advanceEnrollment(enrollmentId);
+                FakeAcmeClient.orderStatus = "valid";
+                await enrollment.advanceEnrollment(enrollmentId);
+                FakeAcmeClient.orderStatus = "pending";
+                return enrollmentId;
+            };
+            const issued = await issue("cancel-issued@example.com", "t7");
+            await enrollment.cancelEnrollment(issued, "superseded");
+            expect((await enrollment.checkStatus(issued)).status).toBe("failed");
+            await expect(enrollment.getIssuedMaterial(issued)).resolves.toBeUndefined();
+            expect((await enrollment.listPendingEnrollments()).map((e) => e.enrollmentId)).not.toContain(issued);
+
+            const installed = await issue("cancel-installed@example.com", "t8");
+            await enrollment.markInstalled(installed);
+            await enrollment.cancelEnrollment(installed, "too late");
+            expect((await enrollment.checkStatus(installed)).status).toBe("issued");
+
+            await expect(enrollment.cancelEnrollment("does-not-exist", "x")).rejects.toThrow(/No enrollment found/);
+        });
     });
 
     describe("advanceEnrollment()", () => {

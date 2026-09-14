@@ -231,6 +231,32 @@ export function bookingSecuritySuite(ctx: BookingSecuritySuiteContext): void {
             }
         });
 
+        it("counts IPv6 clients by their /64, so rotating through addresses in one subscriber prefix shares one counter (round 5)", async () => {
+            const rateLimiter: any = ctx.rateLimiter();
+            const original = rateLimiter.config;
+            rateLimiter.config = { enabled: true, maxAttempts: 1, windowSeconds: 300, ip: { enabled: false } };
+            let address: string = "2001:db8:1:2::1";
+            const spy = vi.spyOn(BaseBookingRoute.prototype as any, "clientAddress").mockImplementation(() => address);
+            try {
+                const bookingType = await ctx.createBookingType();
+                const slots = () => request(ctx.app()).get(`${ctx.baseUrl}/types/${bookingType.slug}/slots?from=${WINDOW_FROM}&to=${WINDOW_TO}`);
+
+                expect((await slots()).status).toBe(200);
+                address = "2001:db8:1:2:ffff:abcd:1234:5678";
+                expect((await slots()).status).toBe(429);
+                // Another /64 is another client.
+                address = "2001:db8:1:3::1";
+                expect((await slots()).status).toBe(200);
+                // No resolvable address shares one "unknown" counter.
+                address = undefined as unknown as string;
+                expect((await slots()).status).toBe(200);
+                expect((await slots()).status).toBe(429);
+            } finally {
+                spy.mockRestore();
+                rateLimiter.config = original;
+            }
+        });
+
         it("caps one slots response at 500 slots (earliest first) and offers each start once even with duplicated windows", async () => {
             const window = { startMinute: 0, endMinute: 1440 };
             const bookingType = await ctx.createBookingType({

@@ -136,6 +136,12 @@ export interface KeyVault extends BaseEntity {
     /** Server-managed: fingerprint of the signing certificate `AcmeEnrollmentDriverJob` last recorded a
      * `SIGNING_CERT_EXPIRING` audit entry for - so that entry is written once per certificate, not every run. */
     expiryAuditedFingerprint?: string;
+
+    /** Server-managed: how many times this vault's master key has been rotated (`BaseKeyVaultRoute.rekey()` adds one;
+     * absent means never). A signing enrollment records it when it takes the client's wrapped private key, and
+     * `AcmeEnrollmentDriverJob` refuses to install that key once it no longer matches - the key is sealed under a
+     * master key the vault no longer has. */
+    masterKeyGeneration?: number;
 }
 
 /** A scope's own public key, used only so a client can wrap a mailbox's master key against it - the server
@@ -986,9 +992,15 @@ export interface Message extends RecoverableBaseEntity {
      * `scheduledSendTime`, so the message leaves the due queue unsent. Cleared on a successful send. */
     scheduledSendError?: string;
 
-    /** Set by `ScheduledSendJob` once the transport accepted this message but filing it into Sent Items failed.
-     * A later run then only finishes filing - it never relays a message carrying this marker again. */
+    /** Set by `ScheduledSendJob`/`BaseMessageRoute.send()` as soon as the transport accepted this message, and cleared
+     * once it is filed into Sent Items. A later run only finishes filing - it never relays a message carrying it. */
     scheduledSendRelayedAt?: Date;
+
+    /** The in-flight marker of a send: set (to the claim's lease expiry) by `BaseMessageRoute.send()` and
+     * `ScheduledSendJob` when they claim a message for relay, cleared when it is filed or handed back. While it lies
+     * in the future the message can't be moved out of Outbox, and filing only proceeds while the message is still in
+     * Outbox carrying the exact value its claim wrote. */
+    scheduledSendLeaseExpiresAt?: Date;
 
     /** Set by `BaseMessageRoute.recall()` the moment a recall is requested — purely informational (lets a
      * client show "recall requested" immediately). The eventual outcome (each recipient's own `ScanQueueJob`

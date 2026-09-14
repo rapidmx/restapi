@@ -9,7 +9,7 @@ import * as x509 from "@peculiar/x509";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { readFileIfExists, updateJsonFile } from "./FileStoreUtils.js";
-import { EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
+import { EnrollmentBinding, EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
 const { Config, Logger } = ObjectDecorators;
 
 x509.cryptoProvider.set(crypto);
@@ -98,6 +98,23 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
         const store: Record<string, PendingEnrollment> = await this.loadStore();
         const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
         return { status: enrollment.status, certificate: enrollment.certificate, error: enrollment.error };
+    }
+
+    /** See `SigningCertificateEnrollment.describeEnrollment()` - this store keeps only the identity. */
+    public async describeEnrollment(enrollmentId: string): Promise<EnrollmentBinding> {
+        const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
+        return { identity: enrollment.identity };
+    }
+
+    /** See `SigningCertificateEnrollment.cancelEnrollment()` - only a still-pending enrollment changes. */
+    public async cancelEnrollment(enrollmentId: string, reason: string): Promise<void> {
+        await this.updateStore(async (store) => {
+            const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+            if (enrollment.status === "pending") {
+                enrollment.status = "failed";
+                enrollment.error = reason;
+            }
+        });
     }
 
     /**

@@ -18,7 +18,7 @@ import {
 } from "@rapidrest/service-core";
 import type { MailTransport } from "../transport/MailTransport.js";
 import { generateCandidateSlots, normalizeSlug, subtractBusy } from "../util/BookingUtils.js";
-import { resolveClientIp } from "../util/ClientIpUtils.js";
+import { rateLimitKeyForIp, resolveClientIp } from "../util/ClientIpUtils.js";
 import { coerceCalendarEventDates } from "../util/DateCoercionUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
@@ -700,7 +700,9 @@ export abstract class BaseBookingRoute<
      * still applies on top (`req` is passed through), bounding one source across every booking type.
      */
     private async checkBookingRateLimit(counter: "booking" | "booking-slots", slug: string, req: HttpRequest | undefined): Promise<void> {
-        const address: string = (req ? this.clientAddress(req) : undefined) ?? "unknown";
+        // An IPv6 client is counted by its /64 - see `rateLimitKeyForIp()`.
+        const resolved: string | undefined = req ? this.clientAddress(req) : undefined;
+        const address: string = resolved ? rateLimitKeyForIp(resolved) : "unknown";
         await this.rateLimiter?.checkAndIncrement(`${counter}|${address}|${slug}`, undefined, req);
     }
 

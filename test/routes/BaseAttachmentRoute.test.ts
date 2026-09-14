@@ -58,4 +58,24 @@ describe("BaseAttachmentRoute Tests (repoUtils/blobStore guard clauses only)", (
             /internal error/i,
         );
     });
+    it("count() and truncate() page through a folder-scoped scan until a short page (round 5).", async () => {
+        const route = objectFactory.newInstance<TestAttachmentRoute>(TestAttachmentRoute, { initialize: false });
+        (route as any).folderScanPageSize = 1;
+        const a1 = { uid: "a1", messageUid: "m1", folderUid: "f1", mailboxUid: "mb" };
+        const a2 = { uid: "a2", messageUid: "m1", folderUid: "f1", mailboxUid: "mb" };
+        const find = vi.fn().mockResolvedValueOnce([a1]).mockResolvedValueOnce([a2]).mockResolvedValue([]);
+        (route as any).repoUtils = { find, truncate: vi.fn() };
+        (route as any).aclUtils = { hasPermission: vi.fn().mockResolvedValue(true) };
+        (route as any).messageRepo = { findOne: vi.fn().mockResolvedValue({ uid: "m1", folderUid: "f1", mailboxUid: "mb" }) };
+        const res: any = { status: vi.fn().mockReturnThis(), setHeader: vi.fn().mockReturnThis() };
+
+        await route.count({}, { folderUid: "f1" }, res, { uid: "user-1" } as any);
+        expect(res.setHeader).toHaveBeenCalledWith("content-length", 2);
+        expect(find).toHaveBeenCalledTimes(3);
+
+        find.mockReset().mockResolvedValueOnce([a1]).mockResolvedValueOnce([a2]).mockResolvedValue([]);
+        await route.truncate({}, { folderUid: "f1" }, { uid: "user-1" } as any);
+        // Two full pages and a short one for the re-stamp scan, then the inherited truncate's own scan.
+        expect(find.mock.calls.filter(([criteria]) => criteria.folderUid === "eq(f1)" && criteria.sort === undefined).length).toBeGreaterThanOrEqual(3);
+    });
 });

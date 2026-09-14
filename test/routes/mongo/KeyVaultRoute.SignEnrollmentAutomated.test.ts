@@ -11,40 +11,15 @@ import { ACLRecord, MongoConnection, MongoRepository, Server, ObjectFactory, Con
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { MongoMemoryServer } from "mongodb-memory-server";
+import { EscrowScopeMongo } from "../../../src/models/mongo/EscrowScopeMongo.js";
+import { KeyVaultMongo } from "../../../src/models/mongo/KeyVaultMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
-import { EnrollmentResult, SigningCertificateEnrollment } from "../../../src/pki/SigningCertificateEnrollment.js";
 import { generateTestCsr, registerTestDoubles } from "../../testDoubles.js";
+import { FakeAutomatedEnrollment, keyVaultRound5Suite } from "../keyVaultRound5Suite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
 });
-
-/** See test/routes/sql/KeyVaultRoute.SignEnrollmentAutomated.test.ts's identical fake. */
-class FakeAutomatedEnrollment implements SigningCertificateEnrollment {
-    public readonly name = "fake-automated";
-    public static enrollments = new Map<string, { identity: string; csr: string; wrappedKey?: any; status: string }>();
-
-    public async startEnrollment(identity: string, csr: string): Promise<{ enrollmentId: string }> {
-        const enrollmentId = uuid.v4();
-        FakeAutomatedEnrollment.enrollments.set(enrollmentId, { identity, csr, status: "pending" });
-        return { enrollmentId };
-    }
-
-    public async checkStatus(enrollmentId: string): Promise<EnrollmentResult> {
-        const enrollment = FakeAutomatedEnrollment.enrollments.get(enrollmentId);
-        if (!enrollment) {
-            throw new Error("not found");
-        }
-        return { status: enrollment.status as any, certificate: undefined, error: undefined };
-    }
-
-    public async attachWrappedKey(enrollmentId: string, wrappedKey: any): Promise<void> {
-        const enrollment = FakeAutomatedEnrollment.enrollments.get(enrollmentId);
-        if (enrollment) {
-            enrollment.wrappedKey = wrappedKey;
-        }
-    }
-}
 
 describe("Route:KeyVaultMongo Tests - automated sign-enrollment", () => {
     const logger = Logger();
@@ -52,14 +27,16 @@ describe("Route:KeyVaultMongo Tests - automated sign-enrollment", () => {
     const server: Server = new Server({ config, basePath: "./test/server-mongo", logger, objectFactory });
     const baseUrl = "/mongo/mailboxes";
     let mailboxRepo: MongoRepository<MailboxMongo>;
+    let keyVaultRepo: MongoRepository<KeyVaultMongo>;
+    let escrowScopeRepo: MongoRepository<EscrowScopeMongo>;
     let aclRepo: MongoRepository<any>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
 
-    const createMailbox = async function (): Promise<MailboxMongo> {
+    const createMailbox = async function (ownerUid: string = owner.uid): Promise<MailboxMongo> {
         const obj = new MailboxMongo({
-            ownerUserUid: owner.uid,
+            ownerUserUid: ownerUid,
             primarySmtpAddress: `${uuid.v4()}@example.com`,
             aliasAddresses: [],
             displayName: "Test Mailbox",
@@ -68,7 +45,7 @@ describe("Route:KeyVaultMongo Tests - automated sign-enrollment", () => {
             usedBytes: 0,
         });
         const result: MailboxMongo = await mailboxRepo.save(obj);
-        const records: ACLRecord[] = [{ userOrRoleId: owner.uid, actions: [ACLAction.FULL] }];
+        const records: ACLRecord[] = [{ userOrRoleId: ownerUid, actions: [ACLAction.FULL] }];
         await aclRepo.save({
             uid: result.uid,
             dateCreated: new Date(),
@@ -94,6 +71,8 @@ describe("Route:KeyVaultMongo Tests - automated sign-enrollment", () => {
         conn = connMgr?.connections.get("mongo");
         if (conn instanceof MongoConnection) {
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
+            keyVaultRepo = conn.getMongoRepository("KeyVaultMongo");
+            escrowScopeRepo = conn.getMongoRepository("EscrowScopeMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -106,7 +85,7 @@ describe("Route:KeyVaultMongo Tests - automated sign-enrollment", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, aclRepo]) {
+        for (const repo of [mailboxRepo, keyVaultRepo, escrowScopeRepo, aclRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -141,5 +120,29 @@ describe("Route:KeyVaultMongo Tests - automated sign-enrollment", () => {
 
         expect(statusResult.status).toBe(200);
         expect(statusResult.body.status).toBe("pending");
+    });
+
+    keyVaultRound5Suite({
+        app: () => server.getApplication(),
+        baseUrl,
+        tokenFor: (user) => JWTUtils.createTokenSync(config.get("auth"), user),
+        createMailbox: (ownerUid) => createMailbox(ownerUid),
+        createEscrowScope: async () =>
+            await escrowScopeRepo.save(
+                new EscrowScopeMongo({
+                    name: "legal",
+                    publicKey: { publicKey: "cert", type: "x509", fingerprint: "fp1", notBefore: 0, notAfter: 1 },
+                    holderUserUids: [uuid.v4()],
+                    requiredHolders: 1,
+                }),
+            ),
+        deleteEscrowScope: async (uid) => {
+            await escrowScopeRepo.deleteOne({ uid });
+        },
+        setEscrowScope: async (mailboxUid, escrowScopeId) => {
+            await mailboxRepo.updateOne({ uid: mailboxUid } as any, escrowScopeId ? { $set: { escrowScopeId } } : { $unset: { escrowScopeId: "" } });
+        },
+        findKeyVault: async (mailboxUid) => (await keyVaultRepo.findOne({ mailboxUid } as any)) ?? undefined,
+        generateCsr: (identity) => generateTestCsr(identity),
     });
 });

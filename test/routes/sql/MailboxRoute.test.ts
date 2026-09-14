@@ -310,7 +310,7 @@ describe("Route:MailboxSQL Tests", () => {
         const newAddress = `${uuid.v4()}@example.com`;
         const addressUpdate = await request(server.getApplication())
             .put(`${baseUrl}/${obj.uid}`)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send({ uid: obj.uid, version: unrelatedUpdate.body.version, primarySmtpAddress: newAddress });
 
         expect(addressUpdate.status).toBe(200);
@@ -373,7 +373,7 @@ describe("Route:MailboxSQL Tests", () => {
 
         const result = await request(server.getApplication())
             .put(`${baseUrl}/${obj.uid}/primarySmtpAddress`)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send(newAddress);
 
         expect(result.status).toBe(200);
@@ -396,7 +396,7 @@ describe("Route:MailboxSQL Tests", () => {
         const obj = await createMailboxSQL();
         const result = await request(server.getApplication())
             .put(`${baseUrl}/${obj.uid}/primarySmtpAddress`)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send(address);
 
         expect(result.status).toBe(409);
@@ -411,7 +411,7 @@ describe("Route:MailboxSQL Tests", () => {
 
         const result = await request(server.getApplication())
             .put(`${baseUrl}/${obj.uid}`)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: other.primarySmtpAddress });
 
         expect(result.status).toBe(409);
@@ -423,7 +423,7 @@ describe("Route:MailboxSQL Tests", () => {
 
         const result = await request(server.getApplication())
             .put(`${baseUrl}/${obj.uid}`)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: `${uuid.v4()}@not-verified.com` });
 
         expect(result.status).toBe(400);
@@ -436,11 +436,39 @@ describe("Route:MailboxSQL Tests", () => {
 
         const result = await request(server.getApplication())
             .put(`${baseUrl}/${obj.uid}`)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: newAddress });
 
         expect(result.status).toBe(200);
         expect(result.body.primarySmtpAddress).toBe(newAddress);
+    });
+
+    it("Refuses (403) a non-trusted owner renaming primarySmtpAddress to an address that isn't one of their own usernames - by PUT, property PUT or bulk PUT - leaving it unchanged. (Renames onto the owner's own username: see mailboxSelfServiceCreateSuite.ts.)", async () => {
+        const obj = await createMailboxSQL();
+        const newAddress = `ceo-${uuid.v4()}@example.com`;
+
+        const put = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: newAddress });
+        expect(put.status).toBe(403);
+        expect(put.body.message).toBe("You can only change your mailbox's address to one of your own usernames on this server's domains.");
+
+        const property = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}/primarySmtpAddress`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send(newAddress);
+        expect(property.status).toBe(403);
+
+        // `CRUDRoute`'s bulk validator reports any element's failure as a 400.
+        const bulk = await request(server.getApplication())
+            .put(baseUrl)
+            .set("Authorization", "jwt " + ownerToken)
+            .send([{ uid: obj.uid, version: obj.version, primarySmtpAddress: newAddress }]);
+        expect(bulk.status).toBe(400);
+
+        const unchanged = await repo.findOne({ where: { uid: obj.uid } });
+        expect(unchanged?.primarySmtpAddress).toBe(obj.primarySmtpAddress);
     });
 
     it("Allows a PUT that resends the mailbox's own current, unchanged primarySmtpAddress (200) - re-validating only on a genuine change.", async () => {
@@ -461,7 +489,7 @@ describe("Route:MailboxSQL Tests", () => {
 
         const result = await request(server.getApplication())
             .put(baseUrl)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send([{ uid: obj.uid, version: obj.version, primarySmtpAddress: newAddress }]);
 
         expect(result.status).toBe(200);

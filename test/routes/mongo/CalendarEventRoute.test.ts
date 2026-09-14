@@ -263,6 +263,20 @@ describe("Route:CalendarEventMongo Tests", () => {
         expect(result.body.uid).toBe(event.uid);
     });
 
+    it("Stores an over-long icalUid from an update bounded, as the model constructor does on create.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const event = await createCalendarEvent(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${event.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: event.uid, version: event.version, icalUid: "u".repeat(400) });
+
+        expect(result.status).toBe(200);
+        expect(result.body.icalUid).toMatch(/^sha256:[0-9a-f]{64}$/);
+    });
+
     it("A different user cannot read a calendar event by id (404, not 403 — avoids existence leakage).", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid);

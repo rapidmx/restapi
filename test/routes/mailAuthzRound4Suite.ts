@@ -642,4 +642,276 @@ export function mailAuthzRound4Suite(ctx: MailAuthzRound4SuiteContext): void {
             expect((await auth(request(ctx.app()).put(url(`/transport-rules/${list.uid}/name`)), admin).send("Renamed" as any)).status).not.toBe(400);
         });
     });
+
+    describe("round 5 (part A): in-flight sends, bounded ids, display names", () => {
+        afterEach(() => {
+            vi.restoreAllMocks();
+        });
+
+        it("a message whose send is in flight can't be moved out of Outbox, by the owner or an admin, until its lease lapses", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const outbox = await createFolder(mailbox.uid, FolderType.OUTBOX);
+            const inFlight = await createMessage(mailbox, outbox.uid, {
+                scheduledSendTime: new Date(Date.now() + 600_000),
+                scheduledSendLeaseExpiresAt: new Date(Date.now() + 600_000),
+            });
+            for (const user of [owner, admin]) {
+                const move = await auth(request(ctx.app()).put(url(`/messages/${inFlight.uid}`)), user).send({
+                    uid: inFlight.uid,
+                    version: inFlight.version,
+                    scheduledSendTime: null,
+                    folderUid: drafts.uid,
+                });
+                expect({ user: user.uid, status: move.status }).toEqual({ user: user.uid, status: 409 });
+            }
+            // A client can't clear the marker itself.
+            const clear = await auth(request(ctx.app()).put(url(`/messages/${inFlight.uid}`)), owner).send({
+                uid: inFlight.uid,
+                version: inFlight.version,
+                scheduledSendLeaseExpiresAt: null,
+            });
+            expect(clear.status).toBe(200);
+            expect((await ctx.findOne("Message", inFlight.uid))?.scheduledSendLeaseExpiresAt).toBeTruthy();
+
+            await ctx.update("Message", inFlight.uid, { scheduledSendLeaseExpiresAt: new Date(Date.now() - 1000) });
+            const lapsed = await ctx.findOne("Message", inFlight.uid);
+            const move = await auth(request(ctx.app()).put(url(`/messages/${inFlight.uid}`)), owner).send({
+                uid: inFlight.uid,
+                version: lapsed.version,
+                scheduledSendTime: null,
+                folderUid: drafts.uid,
+            });
+            expect(move.status).toBe(200);
+            const moved = await ctx.findOne("Message", inFlight.uid);
+            expect(moved.folderUid).toBe(drafts.uid);
+            expect(moved.scheduledSendLeaseExpiresAt ?? null).toBeNull();
+        });
+
+        it("an immediate send holds its claim while relaying, so the message can't be cancelled and sent twice", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const draft = await sendableDraft(mailbox, drafts);
+            const transport = ctx.transport();
+            const realSend = transport.send.bind(transport);
+            let cancelStatus: number | undefined;
+            let midFlight: any;
+            vi.spyOn(transport, "send").mockImplementationOnce(async (outbound: any) => {
+                midFlight = await ctx.findOne("Message", draft.uid);
+                const cancel = await auth(request(ctx.app()).put(url(`/messages/${draft.uid}`)), owner).send({
+                    uid: draft.uid,
+                    version: midFlight.version,
+                    scheduledSendTime: null,
+                    folderUid: drafts.uid,
+                });
+                cancelStatus = cancel.status;
+                return realSend(outbound);
+            });
+
+            const sent = await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner);
+
+            expect(sent.status).toBe(200);
+            expect(cancelStatus).toBe(409);
+            expect(midFlight.scheduledSendLeaseExpiresAt).toBeTruthy();
+            expect(transport.sent).toHaveLength(1);
+            const stored = await ctx.findOne("Message", draft.uid);
+            expect(stored.folderUid).not.toBe(drafts.uid);
+            expect(stored.scheduledSendLeaseExpiresAt ?? null).toBeNull();
+            expect(stored.scheduledSendRelayedAt ?? null).toBeNull();
+            expect((await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner)).status).toBe(409);
+            expect(transport.sent).toHaveLength(1);
+        });
+
+        it("the relay marker is retried on a re-read when an unrelated write bumped the version during the relay", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const draft = await sendableDraft(mailbox, drafts);
+            const transport = ctx.transport();
+            const realSend = transport.send.bind(transport);
+            vi.spyOn(transport, "send").mockImplementationOnce(async (outbound: any) => {
+                const midFlight = await ctx.findOne("Message", draft.uid);
+                await ctx.update("Message", draft.uid, { version: midFlight.version + 1 });
+                return realSend(outbound);
+            });
+            const sent = await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner);
+
+            expect(sent.status).toBe(200);
+            expect(transport.sent).toHaveLength(1);
+            const stored = await ctx.findOne("Message", draft.uid);
+            expect(stored.folderUid).not.toBe(drafts.uid);
+            expect(stored.scheduledSendLeaseExpiresAt ?? null).toBeNull();
+            expect(stored.scheduledSendRelayedAt ?? null).toBeNull();
+            expect((await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner)).status).toBe(409);
+        });
+
+        it("a relay whose filing fails is left relayed, due for the job, and without its in-flight lease", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await ctx
+                .blobStore()
+                .put(bodyBlobKey, Buffer.from(`From: ${mailbox.primarySmtpAddress}\r\nTo: recipient@example.net\r\nContent-Type: text/html\r\n\r\n<p>hello</p>`));
+            const draft = await createMessage(mailbox, drafts.uid, { bodyBlobKey });
+            const store: any = ctx.blobStore();
+            const realPut = store.put.bind(store);
+            vi.spyOn(store, "put").mockImplementation(async (key: string, ...rest: any[]) => {
+                if (key.startsWith("sanitized/")) {
+                    throw new Error("simulated post-relay blob failure");
+                }
+                return realPut(key, ...rest);
+            });
+
+            const sent = await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner);
+
+            expect(sent.status).toBeGreaterThanOrEqual(500);
+            expect(ctx.transport().sent).toHaveLength(1);
+            const stored = await ctx.findOne("Message", draft.uid);
+            expect(stored.scheduledSendRelayedAt).toBeTruthy();
+            expect(stored.scheduledSendTime).toBeTruthy();
+            expect(stored.scheduledSendLeaseExpiresAt ?? null).toBeNull();
+            expect(stored.folderUid).not.toBe(drafts.uid);
+            expect((await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner)).status).toBe(409);
+        });
+
+        it("over-long Message-ID and conversation ids are stored bounded, from a send or a client update", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const longId = `${"x".repeat(300)}@example.com`;
+            const draft = await sendableDraft(mailbox, drafts, `Message-ID: <${longId}>\r\nFrom: ${mailbox.primarySmtpAddress}`);
+            const sent = await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner);
+            expect(sent.status).toBe(200);
+            const stored = await ctx.findOne("Message", draft.uid);
+            expect(stored.messageId).toMatch(/^sha256:[0-9a-f]{64}$/);
+            expect(stored.conversationId).toBe(stored.messageId);
+
+            const other = await createMessage(mailbox, drafts.uid);
+            const edited = await auth(request(ctx.app()).put(url(`/messages/${other.uid}`)), owner).send({
+                uid: other.uid,
+                version: other.version,
+                messageId: longId,
+                conversationId: longId,
+            });
+            expect(edited.status).toBe(200);
+            const editedRow = await ctx.findOne("Message", other.uid);
+            expect(editedRow.messageId).toBe(stored.messageId);
+            expect(editedRow.conversationId).toBe(stored.messageId);
+        });
+
+        it("the address-in-display-name rule also catches `From :`, bare CR line breaks and look-alike at signs", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const own: string = mailbox.primarySmtpAddress;
+            for (const headers of [
+                `From : "ceo@example.com" <${own}>`,
+                `X-Filler: 1\rFrom : "ceo@example.com" <${own}>`,
+                `From: "ceo＠example.com" <${own}>`,
+                `From: ${own}\r\nSender : "boss@example.com" <${own}>`,
+            ]) {
+                const draft = await sendableDraft(mailbox, drafts, headers);
+                const status = (await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner)).status;
+                expect({ headers, status }).toEqual({ headers, status: 403 });
+            }
+            expect(ctx.transport().sent).toHaveLength(0);
+        });
+
+        it("a message with no To, Cc or Bcc recipient is neither sent nor scheduled (400), and stays in Drafts", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const future = new Date(Date.now() + 3_600_000).toISOString();
+            for (const recipients of [[], [{ address: "  ", type: RecipientType.CC }]]) {
+                const draft = await sendableDraft(mailbox, drafts, undefined, { recipients });
+                const now = await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner);
+                expect(now.status).toBe(400);
+                const later = await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner).send({ scheduledSendTime: future });
+                expect(later.status).toBe(400);
+                const stored = await ctx.findOne("Message", draft.uid);
+                expect(stored.folderUid).toBe(drafts.uid);
+                expect(stored.scheduledSendTime ?? null).toBeNull();
+            }
+            const bccOnly = await sendableDraft(mailbox, drafts, undefined, { recipients: [{ address: "hidden@example.net", type: RecipientType.BCC }] });
+            expect((await auth(request(ctx.app()).post(url(`/messages/${bccOnly.uid}/send`)), owner)).status).toBe(200);
+            expect(ctx.transport().sent).toHaveLength(1);
+        });
+    });
+
+    describe("round 5 (part B): moves into Drafts", () => {
+        it("a sent or received message can't be moved into Drafts, by update, bulk update or :property", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid);
+            const sentItems = await createFolder(mailbox.uid, FolderType.SENT_ITEMS);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const received = await createMessage(mailbox, inbox.uid, { scanResultUid: uuid.v4() });
+            const sent = await createMessage(mailbox, sentItems.uid);
+            // Also under a legal hold: nothing about the hold makes the move possible.
+            await ctx.save("Matter", {
+                name: "Hold",
+                escrowScopeId: uuid.v4(),
+                custodianMailboxUids: [mailbox.uid],
+                dateRangeStart: new Date("2000-01-01"),
+                dateRangeEnd: new Date("2100-01-01"),
+            });
+
+            for (const message of [received, sent]) {
+                const single = await auth(request(ctx.app()).put(url(`/messages/${message.uid}`)), owner).send({
+                    uid: message.uid,
+                    version: message.version,
+                    folderUid: drafts.uid,
+                    subject: "Rewritten",
+                });
+                expect(single.status).toBe(403);
+                const bulk = await auth(request(ctx.app()).put(url("/messages")), owner).send([
+                    { uid: message.uid, version: message.version, folderUid: drafts.uid },
+                ]);
+                expect(bulk.status).toBe(403);
+                const property = await auth(request(ctx.app()).put(url(`/messages/${message.uid}/folderUid`)), owner).send(drafts.uid);
+                expect(property.status).toBe(403);
+
+                const stored = await ctx.findOne("Message", message.uid);
+                expect(stored.folderUid).toBe(message.folderUid);
+                expect(stored.subject).toBe("Subject");
+            }
+
+            // Moves between other folders are unaffected.
+            const toSent = await auth(request(ctx.app()).put(url(`/messages/${received.uid}/folderUid`)), owner).send(sentItems.uid);
+            expect(toSent.status).toBe(200);
+        });
+
+        it("drafts can still move between Drafts folders, a scheduled send can still be cancelled back to Drafts, and trusted callers are exempt", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const otherDrafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const outbox = await createFolder(mailbox.uid, FolderType.OUTBOX);
+
+            // A new draft is created into Drafts as before.
+            const created = await auth(request(ctx.app()).post(url("/messages")), owner).send(
+                draftBody({ folderUid: drafts.uid, mailboxUid: mailbox.uid, from: { address: mailbox.primarySmtpAddress, type: "to" } }),
+            );
+            expect(created.status).toBe(200);
+            const between = await auth(request(ctx.app()).put(url(`/messages/${created.body.uid}/folderUid`)), owner).send(otherDrafts.uid);
+            expect(between.status).toBe(200);
+            expect(between.body.folderUid).toBe(otherDrafts.uid);
+
+            // Outbox -> Drafts cancels a scheduled send, via update and via bulk update.
+            for (const viaBulk of [false, true]) {
+                const scheduled = await createMessage(mailbox, outbox.uid, { scheduledSendTime: new Date(Date.now() + 3_600_000) });
+                const body = { uid: scheduled.uid, version: scheduled.version, folderUid: drafts.uid };
+                const cancel = viaBulk
+                    ? await auth(request(ctx.app()).put(url("/messages")), owner).send([body])
+                    : await auth(request(ctx.app()).put(url(`/messages/${scheduled.uid}`)), owner).send(body);
+                expect({ viaBulk, status: cancel.status }).toEqual({ viaBulk, status: 200 });
+                const stored = await ctx.findOne("Message", scheduled.uid);
+                expect(stored.folderUid).toBe(drafts.uid);
+                expect(stored.scheduledSendTime ?? null).toBeNull();
+            }
+
+            // Like the Outbox rules, the Drafts rule is a non-trusted caller's; the in-flight 409 still applies to everyone.
+            const received = await createMessage(mailbox, inbox.uid);
+            const trusted = await auth(request(ctx.app()).put(url(`/messages/${received.uid}/folderUid`)), admin).send(drafts.uid);
+            expect(trusted.status).toBe(200);
+            const inFlight = await createMessage(mailbox, outbox.uid, { scheduledSendLeaseExpiresAt: new Date(Date.now() + 600_000) });
+            const blocked = await auth(request(ctx.app()).put(url(`/messages/${inFlight.uid}/folderUid`)), owner).send(drafts.uid);
+            expect(blocked.status).toBe(409);
+        });
+    });
 }

@@ -23,9 +23,11 @@ import { AuthenticationResultEntry, parseAuthenticationResults } from "./Authent
  * - When the entry carries RFC 6008's `header.b` (a prefix of the signature's `b=` value), it identifies exactly one
  * signature; a prefix matching more than one signature is ambiguous and matches none.
  * - When it doesn't (many MTAs only stamp `header.d`), a signature for domain `d` counts as verified only when the
- * trusted hop reported at least as many passing entries without `header.b` for `d` as the message carries
+ * trusted hop reported exactly as many passing entries without `header.b` for `d` as the message carries
  * `DKIM-Signature` headers for `d` - i.e. every signature for that domain passed, so an extra, forged signature
- * claiming the same `d=` (which would fail verification) can't be the one providing the oversigning.
+ * claiming the same `d=` (which would fail verification) can't be the one providing the oversigning. Only the
+ * topmost trusted `Authentication-Results` instance counts (`topmostTrustedAuthenticationResults()`), so a second,
+ * older trusted instance (a re-ingested copy) can't double the pass count.
  *
  * Alignment is deliberately **strict** (exact, case-insensitive domain equality), matching
  * `AuthenticationResultsUtils.hasAlignedPassingDkim()` - see its `domainsAlign()` for why relaxed
@@ -137,9 +139,48 @@ export function oversignsHeader(signature: ParsedDkimSignature, headerName: stri
     return signature.signedHeaders.filter((name) => name === wanted).length > occurrences;
 }
 
+/** Method name `authservIdOf()` appends to a header value to learn its authserv-id even when it reports no results. */
+const AUTHSERV_PROBE_METHOD = "x-rapidmx-authserv-probe";
+
+/** The authserv-id of one `Authentication-Results` value (lowercased), or `undefined` if it can't be read - e.g. an
+ * unterminated comment or quoted string that would swallow anything after it. */
+function authservIdOf(value: string): string | undefined {
+    return parseAuthenticationResults(`${value};${AUTHSERV_PROBE_METHOD}=none`).find((entry) => entry.method === AUTHSERV_PROBE_METHOD)?.authservId;
+}
+
+/**
+ * Only the topmost `Authentication-Results` value stamped by `trustedAuthservId` - the one this deployment's MTA
+ * added when it accepted the message - out of `values` (in header order, topmost first, as `extractHeaders()`
+ * returns them). Values above it from other authserv-ids (a later internal hop) are skipped. Older trusted instances
+ * below it are ignored: they were stamped for an earlier delivery of the same bytes (e.g. a message re-ingested
+ * through a forward) and describe signatures as they verified then, so counting them too would let a pass be
+ * counted twice. A value whose authserv-id can't be read ends the search with nothing trusted (fails closed).
+ * Returns at most one value; none for an unconfigured `trustedAuthservId`.
+ */
+export function topmostTrustedAuthenticationResults(values: string | string[] | undefined, trustedAuthservId: string): string[] {
+    if (!trustedAuthservId || !values) {
+        return [];
+    }
+    const trusted: string = trustedAuthservId.toLowerCase();
+    for (const value of Array.isArray(values) ? values : [values]) {
+        if (typeof value !== "string") {
+            continue;
+        }
+        const id: string | undefined = authservIdOf(value);
+        if (id === undefined) {
+            return [];
+        }
+        if (id === trusted) {
+            return [value];
+        }
+    }
+    return [];
+}
+
 /**
  * The subset of `signatures` a trusted `Authentication-Results` `dkim=pass` entry vouches for - see this module's
- * doc comment for how an entry is tied to a signature with and without `header.b`.
+ * doc comment for how an entry is tied to a signature with and without `header.b`. Only the topmost trusted
+ * `Authentication-Results` instance is consulted (`topmostTrustedAuthenticationResults()`).
  */
 export function verifiedDkimSignatures(
     signatures: ParsedDkimSignature[],
@@ -150,7 +191,7 @@ export function verifiedDkimSignatures(
         return [];
     }
     const trusted: string = trustedAuthservId.toLowerCase();
-    const passing: AuthenticationResultEntry[] = parseAuthenticationResults(authenticationResults).filter(
+    const passing: AuthenticationResultEntry[] = parseAuthenticationResults(topmostTrustedAuthenticationResults(authenticationResults, trustedAuthservId)).filter(
         (entry) => entry.authservId === trusted && entry.method === "dkim" && entry.result === "pass" && !!entry.properties["header.d"],
     );
     const entryDomain = (entry: AuthenticationResultEntry): string => entry.properties["header.d"].toLowerCase().replace(/\.$/, "");
@@ -171,7 +212,9 @@ export function verifiedDkimSignatures(
     for (const domain of domains) {
         const forDomain = signatures.filter((sig) => sig.domain === domain);
         const unidentifiedPasses: number = passing.filter((entry) => !entry.properties["header.b"] && entryDomain(entry) === domain).length;
-        if (unidentifiedPasses > 0 && unidentifiedPasses >= forDomain.length) {
+        // Exactly one pass per signature: more passes than signatures means the results don't describe these
+        // signatures one-to-one, so nothing can be concluded from them.
+        if (unidentifiedPasses > 0 && unidentifiedPasses === forDomain.length) {
             forDomain.forEach((sig) => verified.add(sig));
         }
     }

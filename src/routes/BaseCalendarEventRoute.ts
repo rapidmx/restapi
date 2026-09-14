@@ -14,6 +14,7 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
+import { boundIndexedValue } from "../util/ConversationUtils.js";
 import { coerceCalendarEventDates } from "../util/DateCoercionUtils.js";
 import { getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { buildEventIcs } from "../util/IcsUtils.js";
@@ -71,6 +72,15 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
 
     @Inject("MailTransport")
     private mailTransport?: any;
+
+    /** `icalUid` is bounded (`boundIndexedValue()`) for every caller: an update is written as a patch without the model
+     * constructor that normally bounds it, and an over-long value would fail the write on MySQL/MariaDB `varchar(255)`. */
+    protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
+        await super.prepareUpdate(obj, existing, user);
+        if (typeof obj.icalUid === "string") {
+            obj.icalUid = boundIndexedValue(obj.icalUid);
+        }
+    }
 
     private async getMailboxRepo(): Promise<RepoUtils<any>> {
         if (!this.mailboxRepo) {

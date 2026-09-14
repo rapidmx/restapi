@@ -20,11 +20,22 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 interface AcmeDrivenEnrollment {
     listPendingEnrollments?(): Promise<Array<{ enrollmentId: string; identity: string; status: "pending" | "issued" | "failed" }>>;
     advanceEnrollment?(enrollmentId: string): Promise<void>;
-    getIssuedMaterial?(
-        enrollmentId: string,
-    ): Promise<{ certificate: string; wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType"> } | undefined>;
+    getIssuedMaterial?(enrollmentId: string): Promise<IssuedMaterial | undefined>;
     markInstalled?(enrollmentId: string): Promise<void>;
+    cancelEnrollment?(enrollmentId: string, reason: string): Promise<void>;
 }
+
+/** An issued enrollment's certificate and the client's wrapped private key, plus - when recorded at
+ * `BaseKeyVaultRoute.startSignEnrollment()` - the mailbox that started it and its vault's master-key generation then. */
+interface IssuedMaterial {
+    certificate: string;
+    wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">;
+    mailboxUid?: string;
+    masterKeyGeneration?: number;
+}
+
+/** What `installCertificate()` did: installed (or found installed), nothing yet (retry later), or refused for good. */
+type InstallOutcome = { status: "installed" } | { status: "retry" } | { status: "refused"; reason: string };
 
 /**
  * Drives every outstanding RFC 8823 enrollment forward, one `advanceEnrollment()` step per tick, and -
@@ -120,8 +131,12 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
                     await this.signingCertificateEnrollment.advanceEnrollment(enrollmentId);
                 }
                 const material = await this.signingCertificateEnrollment.getIssuedMaterial(enrollmentId);
-                if (material && (await this.installCertificate(identity, material))) {
+                const outcome: InstallOutcome | undefined = material ? await this.installCertificate(identity, material) : undefined;
+                if (outcome?.status === "installed") {
                     await this.signingCertificateEnrollment.markInstalled(enrollmentId);
+                } else if (outcome?.status === "refused") {
+                    this.logger?.warn(`AcmeEnrollmentDriverJob: not installing enrollment '${enrollmentId}' for '${identity}': ${outcome.reason}`);
+                    await this.signingCertificateEnrollment.cancelEnrollment?.(enrollmentId, outcome.reason);
                 }
             } catch (err: any) {
                 this.logger?.error(`AcmeEnrollmentDriverJob: failed to advance enrollment '${enrollmentId}' for '${identity}': ${err.message}`);
@@ -171,19 +186,26 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
      * and only the missing half(s) written; the enrollment counts as already installed only when BOTH are
      * present.
      *
-     * Returns `true` once this identity's `KeyVault`/`Mailbox.keys` genuinely reflect the certificate
+     * Returns `installed` once this identity's `KeyVault`/`Mailbox.keys` genuinely reflect the certificate
      * (including when it turns out to already be installed - the idempotent retry case) - only then does
-     * the caller call `markInstalled()`. Returns `false` when nothing could be done yet (no mailbox found
+     * the caller call `markInstalled()`. Returns `retry` when nothing could be done yet (no mailbox found
      * for `identity`), so the caller leaves the enrollment exactly as-is for a later tick to retry.
+     *
+     * Returns `refused` - and the caller cancels the enrollment - when the wrapped key must never be installed: the
+     * mailbox holding `identity` now isn't the one that started the enrollment, or the vault's master key has been
+     * rotated since (`KeyVault.masterKeyGeneration` no longer matches the generation recorded with the key). The key is
+     * sealed under the old master key; installed, it would become the active signing key and unlocking the vault with
+     * the correct password would fail. Checked against the vault row the (version-checked) update is based on, so a
+     * rotation landing in between makes that update fail instead.
      */
-    private async installCertificate(
-        identity: string,
-        material: { certificate: string; wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType"> },
-    ): Promise<boolean> {
+    private async installCertificate(identity: string, material: IssuedMaterial): Promise<InstallOutcome> {
         const [found] = await this.mailboxRepo!.find({ primarySmtpAddress: identity, limit: 1 } as any, { ignoreACL: true, limit: 1 });
         if (!found) {
             this.logger?.warn(`AcmeEnrollmentDriverJob: no mailbox found for '${identity}' - cannot install its issued certificate.`);
-            return false;
+            return { status: "retry" };
+        }
+        if (material.mailboxUid !== undefined && material.mailboxUid !== found.uid) {
+            return { status: "refused", reason: "The address this certificate was enrolled for now belongs to a different mailbox." };
         }
 
         const { publicKey, fingerprint } = publicKeyFromCertificatePem(material.certificate, "sign", found.primarySmtpAddress);
@@ -192,7 +214,7 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
         const vaultHasKey: boolean = (existingKeyVault?.wrappedKeys ?? []).some((k) => k.fingerprint === fingerprint);
         const mailboxHasKey: boolean = (found.keys ?? []).some((k) => k.fingerprint === fingerprint);
         if (vaultHasKey && mailboxHasKey) {
-            return true;
+            return { status: "installed" };
         }
 
         let keyVaultUid: string = existingKeyVault?.uid ?? "";
@@ -202,8 +224,14 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
             // backend, for which `RepoUtils.update()` silently skips its optimistic-lock/version bump (see
             // `MailboxQuotaRecalcJob.recalcMailbox()`'s identical note).
             const current: K | undefined = existingKeyVault
-                ? ((await this.keyVaultRepo!.findOne(existingKeyVault.uid, { ignoreACL: true })) ?? existingKeyVault)
+                ? ((await this.keyVaultRepo!.findOne(existingKeyVault.uid, { ignoreACL: true, skipCache: true })) ?? existingKeyVault)
                 : undefined;
+            if ((current?.masterKeyGeneration ?? 0) !== (material.masterKeyGeneration ?? 0)) {
+                return {
+                    status: "refused",
+                    reason: "The mailbox's keys were rotated after this enrollment started, so its private key can no longer be unlocked. Enroll again.",
+                };
+            }
             const keyVault: K = current
                 ? await this.keyVaultRepo!.update(
                       { uid: current.uid, version: (current as any).version, wrappedKeys: [...(current.wrappedKeys ?? []), wrappedKey] } as any,
@@ -237,7 +265,7 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
                 details: { useType: "sign", fingerprint, automated: true },
             },
         );
-        return true;
+        return { status: "installed" };
     }
 
     /**
