@@ -124,6 +124,55 @@ describe("Route:BookingTypeMongo Tests", () => {
         expect(result.body.slug).toBe("30-minute-intro-call");
     });
 
+    describe("Shared (ownerless) mailbox", () => {
+        /** A shared mailbox with no owner, whose only ACL grant is `actions` for `otherUser` - the shape
+         * `BaseMailboxAccessRoute`'s viewer/manager roles write. */
+        const createSharedMailbox = async function (actions: string[]): Promise<MailboxMongo> {
+            const result: MailboxMongo = await mailboxRepo.save(
+                new MailboxMongo({
+                    primarySmtpAddress: `support-${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Support",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                }),
+            );
+            await aclRepo.save({
+                uid: result.uid,
+                dateCreated: new Date(),
+                dateModified: new Date(),
+                version: 0,
+                records: [{ userOrRoleId: otherUser.uid, actions }],
+                parentUid: "Mailbox",
+            });
+            return result;
+        };
+
+        it("A 'manager' delegate can create a booking type for a shared mailbox.", async () => {
+            const mailbox = await createSharedMailbox([ACLAction.FULL]);
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + otherUserToken)
+                .send(body(mailbox.uid));
+
+            expect(result.status).toBe(200);
+            expect(result.body.mailboxUid).toBe(mailbox.uid);
+        });
+
+        it("A 'viewer' delegate cannot create a booking type for a shared mailbox (403).", async () => {
+            const mailbox = await createSharedMailbox([ACLAction.READ, ACLAction.LIST, ACLAction.COUNT, ACLAction.EXISTS]);
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + otherUserToken)
+                .send(body(mailbox.uid));
+
+            expect(result.status).toBe(403);
+        });
+    });
+
     it("A user with no access to the mailbox cannot create a booking type (403).", async () => {
         const mailbox = await createMailbox(owner.uid);
 
