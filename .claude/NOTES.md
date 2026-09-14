@@ -524,3 +524,17 @@ gap, and this repo's own lint gate - all three found and validated by an adversa
   `RELEASE_NOTES.md` - that file is JP's own manually-curated, release-level summary (distinct from the
   `@rapidrest/cli`-generated `CHANGELOG.md`, which *does* come from this commit's own message), and none
   of these three fixes are new user-facing features worth a release-notes bullet of their own.
+
+## 2026-09-13 — Plugin contract (src/plugins) and DeviceSyncState moved out
+
+- Plugins are npm packages with a `rapidmx.plugin` manifest (`parsePluginManifest`, `PLUGIN_API_VERSION = 1`); the server
+  host (server repo `src/plugins/`) installs and loads them. `BasePluginRoute` only records the desired set, validates
+  settings against the manifest, and publishes `plugins.changed` on the `plugins` Redis channel.
+- Plugin rows are soft-removed (`removed: true`), not deleted, so the server's `system:plugins:defaults` seeding never
+  re-adds a plugin an admin removed. `Plugin.packageVersion` is the npm version; `version` is the optimistic lock.
+- `PluginRegistry` is deliberately static module state, not a DI token: plugins must share the host's single copy of
+  this library (the host enforces it), and code running without a host gets a correct empty answer.
+- `DeviceSyncState`/`EasDeviceStateCleanupJob` now live in `@rapidmx/activesync`. `ErasureExecutionJob` purges any
+  registered model decorated `@MailboxScopedData()` in its own datastore instead - a plugin model without that decorator
+  would survive a data-subject erasure.
+- Config keys are `system:plugins:registry`/`registry_token`/`allowed_packages` (default allow-list `@rapidmx/*`).
