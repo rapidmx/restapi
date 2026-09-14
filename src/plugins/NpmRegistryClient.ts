@@ -175,18 +175,34 @@ export class NpmRegistryClient {
         return packument;
     }
 
-    /** GETs `path` from the registry as JSON. Resolves `undefined` for a 404. */
+    /**
+     * GETs `path` from the registry as JSON. Resolves `undefined` for a 404.
+     *
+     * Credentials in the registry URL (`https://user:pass@host`) are sent as a Basic `Authorization` header (unless a
+     * token is configured) rather than left in the URL, and no error message repeats the URL or the underlying
+     * network error's text, either of which could carry them into an API response.
+     */
     private async request(path: string): Promise<any | undefined> {
-        const url: string = `${this.registryUrl.replace(/\/+$/, "")}${path}`;
+        let url: URL;
         const headers: Record<string, string> = { Accept: "application/json" };
-        if (this.authToken) {
-            headers.Authorization = `Bearer ${this.authToken}`;
+        try {
+            url = new URL(`${this.registryUrl.replace(/\/+$/, "")}${path}`);
+            if (this.authToken) {
+                headers.Authorization = `Bearer ${this.authToken}`;
+            } else if (url.username || url.password) {
+                const credentials: string = `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`;
+                headers.Authorization = `Basic ${Buffer.from(credentials).toString("base64")}`;
+            }
+            url.username = "";
+            url.password = "";
+        } catch {
+            throw new RegistryRequestError("The plugin registry URL is invalid.");
         }
         const timeoutMs: number = this.options.timeoutMs ?? DEFAULT_REGISTRY_TIMEOUT_MS;
         let response: Response;
         let text: string;
         try {
-            response = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+            response = await fetch(url.href, { headers, signal: AbortSignal.timeout(timeoutMs) });
             if (response.status === 404) {
                 return undefined;
             }
@@ -201,7 +217,10 @@ export class NpmRegistryClient {
             if (err?.name === "TimeoutError") {
                 throw new RegistryRequestError(`The plugin registry didn't respond within ${timeoutMs} ms.`);
             }
-            throw new RegistryRequestError(`Could not reach the plugin registry: ${err.message}`);
+            // Only a system error code (e.g. `ECONNREFUSED`) is repeated - a message can name the URL.
+            const code: unknown = err?.cause?.code ?? err?.code;
+            const detail: string = typeof code === "string" && /^[A-Z0-9_]+$/.test(code) ? ` (${code})` : "";
+            throw new RegistryRequestError(`Could not reach the plugin registry${detail}.`);
         }
         try {
             return JSON.parse(text);

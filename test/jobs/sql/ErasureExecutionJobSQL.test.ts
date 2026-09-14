@@ -499,10 +499,12 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect(updated!.status).toBe("completed");
     });
 
-    it("Leaves the request 'approved' while an installed plugin isn't loaded, completing once it is - its data couldn't be purged.", async () => {
+    it("Leaves the request 'approved' while an installed plugin with mailbox data isn't loaded, completing once it is.", async () => {
         const mailbox = await createMailbox();
-        const plugin = { packageVersion: "1.0.0", enabled: false, settings: {}, manifest: { apiVersion: 1, displayName: "X", settings: [] } };
+        const plugin = { packageVersion: "1.0.0", enabled: false, settings: {}, manifest: { apiVersion: 1, displayName: "X", settings: [], mailboxScopedData: true } };
         await pluginRepo.save(new PluginSQL({ ...plugin, name: "@rapidmx/activesync-plugin", removed: false }));
+        // Neither a disabled plugin without mailbox data nor a removed one holds the erasure.
+        await pluginRepo.save(new PluginSQL({ ...plugin, name: "@rapidmx/branding-plugin", removed: false, manifest: { ...plugin.manifest, mailboxScopedData: undefined } }));
         await pluginRepo.save(new PluginSQL({ ...plugin, name: "@rapidmx/gone-plugin", removed: true }));
         const request = await createRequest({ mailboxUid: mailbox.uid });
         const logger = (job as any).logger;
@@ -516,6 +518,8 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
             PluginRegistry.setLoaded([{ name: "@rapidmx/activesync-plugin", version: "1.0.0" }]);
             await job.run();
             expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("completed");
+            // The removed plugin's data can't be reached, so the erasure records that it was left behind.
+            expect(error).toHaveBeenCalledWith(expect.stringMatching(/without erasing mailbox .* removed plugins \(@rapidmx\/gone-plugin\)/));
         } finally {
             PluginRegistry.setLoaded([]);
         }

@@ -114,12 +114,17 @@ describe("NpmRegistryClient", () => {
     });
 
     it("fetches again after a failed request rather than remembering the failure", async () => {
-        const fetchMock = vi.fn().mockRejectedValueOnce(new Error("ECONNRESET")).mockImplementation(async () => json(packument));
+        const fetchMock = vi
+            .fn()
+            .mockRejectedValueOnce(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }))
+            .mockRejectedValueOnce(Object.assign(new Error("odd"), { code: "not a code: https://x" }))
+            .mockImplementation(async () => json(packument));
         vi.stubGlobal("fetch", fetchMock);
         const client = new NpmRegistryClient();
-        await expect(client.getPackage("@rapidmx/activesync")).rejects.toThrow(/ECONNRESET/);
+        await expect(client.getPackage("@rapidmx/activesync")).rejects.toThrow("Could not reach the plugin registry (ECONNRESET).");
+        await expect(client.getPackage("@rapidmx/activesync")).rejects.toThrow(/^Could not reach the plugin registry\.$/);
         expect((await client.getPackage("@rapidmx/activesync"))!.latest).toBe("1.1.0");
-        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(fetchMock).toHaveBeenCalledTimes(3);
     });
 
     it("resolves a version from a packument with no tags or versions as missing", async () => {
@@ -139,11 +144,32 @@ describe("NpmRegistryClient", () => {
         expect(httpError).toBeInstanceOf(RegistryRequestError);
         expect(httpError.status).toBe(503);
 
-        mockFetch(new Error("ECONNREFUSED"));
+        mockFetch(Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } }));
         const networkError = await new NpmRegistryClient().getVersion("x").catch((err) => err);
         expect(networkError).toBeInstanceOf(RegistryRequestError);
-        expect(networkError.message).toMatch(/ECONNREFUSED/);
+        expect(networkError.message).toBe("Could not reach the plugin registry (ECONNREFUSED).");
         expect(networkError.status).toBeUndefined();
+    });
+
+    it("sends credentials in the registry URL as a Basic header, never in the URL or an error message", async () => {
+        const fetchMock = mockFetch(() => json({ name: "x" }));
+        await new NpmRegistryClient("https://us%40er:p%3Ass@npm.example.com/").getPackage("x");
+        expect(fetchMock).toHaveBeenCalledWith("https://npm.example.com/x", {
+            headers: { Accept: "application/json", Authorization: `Basic ${Buffer.from("us@er:p:ss").toString("base64")}` },
+            signal: expect.any(AbortSignal),
+        });
+        // A configured token wins over URL credentials, which are still stripped.
+        await new NpmRegistryClient("https://user:secret@npm.example.com", "tok").getVersion("x", "1.0.0");
+        expect(fetchMock).toHaveBeenLastCalledWith("https://npm.example.com/x", expect.objectContaining({ headers: { Accept: "application/json", Authorization: "Bearer tok" } }));
+
+        mockFetch(new TypeError("request to https://user:secret@npm.example.com/x failed"));
+        const err = await new NpmRegistryClient("https://user:secret@npm.example.com").getPackage("x").catch((e) => e);
+        expect(err.message).toBe("Could not reach the plugin registry.");
+        for (const invalid of ["not a url", "https://us%zz:x@npm.example.com"]) {
+            const bad = await new NpmRegistryClient(invalid).getPackage("x").catch((e) => e);
+            expect(bad).toBeInstanceOf(RegistryRequestError);
+            expect(bad.message).toBe("The plugin registry URL is invalid.");
+        }
     });
 
     it("gives up on a registry that doesn't answer in time", async () => {

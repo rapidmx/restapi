@@ -5,6 +5,7 @@
 import { PluginManifest } from "../../src/models/types.js";
 import {
     findDependents,
+    findUnmetRequirements,
     orderByDependencies,
     PlannerInstalledPlugin,
     PlannerPackageVersion,
@@ -121,9 +122,71 @@ describe("planPluginChange", () => {
         expect(versions).not.toHaveBeenCalled();
     });
 
-    it("treats an invalid installed version as out of range", async () => {
+    it("treats an invalid or unnormalized installed version as out of range", async () => {
         const plan = await planPluginChange([row(EAS, "not-semver", true)], { name: "x", version: "1.0.0", manifest: manifest("X", { [EAS]: "*" }) }, REGISTRY);
         expect(plan.conflicts).toEqual([`X requires ${EAS} *, but not-semver is installed.`]);
+        const prefixed = await planPluginChange([row(EAS, "v1.0.0", true)], { name: "x", version: "1.0.0", manifest: manifest("X", { [EAS]: "*" }) }, REGISTRY);
+        expect(prefixed.conflicts).toEqual([`X requires ${EAS} *, but v1.0.0 is installed.`]);
+    });
+
+    it("never installs an unnormalized published version", async () => {
+        const reg = registry({ [EAS]: { "1.0.0": manifest("EAS"), "v1.5.0": manifest("EAS") } });
+        const plan = await planPluginChange([], { name: "x", version: "1.0.0", manifest: manifest("X", { [EAS]: "^1.0.0" }) }, reg);
+        expect(plan.install.map((i) => i.version)).toEqual(["1.0.0"]);
+    });
+
+    it("refuses to enable an installed requirement that isn't allowed", async () => {
+        const plan = await planPluginChange([row(EAS, "1.0.0", false)], { name: "x", version: "1.0.0", manifest: manifest("X", { [EAS]: "1" }) }, REGISTRY, {
+            allowed: (name) => name !== EAS,
+        });
+        expect(plan).toEqual({ install: [], enable: [], conflicts: [`X requires ${EAS}, which isn't an allowed plugin package on this server.`] });
+    });
+
+    it("refuses to install or enable a requirement whose required settings have no default or saved value", async () => {
+        const needsKey = (displayName: string): PluginManifest => ({
+            apiVersion: 1,
+            displayName,
+            settings: [
+                { key: "k", label: "API key", type: "string", required: true },
+                { key: "r", label: "Region", type: "string", required: true },
+                { key: "d", label: "Defaulted", type: "string", required: true, default: "x" },
+            ],
+        });
+        const reg = registry({ [EAS]: { "1.0.0": needsKey("EAS") } });
+        const install = await planPluginChange([], { name: "x", version: "1.0.0", manifest: manifest("X", { [EAS]: "1" }) }, reg);
+        expect(install).toEqual({ install: [], enable: [], conflicts: ["EAS requires settings: API key, Region."] });
+
+        const disabled = { ...row(EAS, "1.0.0", false, needsKey("EAS")), settings: { k: "saved" } };
+        const enable = await planPluginChange([disabled], { name: "x", version: "1.0.0", manifest: manifest("X", { [EAS]: "1" }) }, reg);
+        expect(enable.conflicts).toEqual(["EAS requires settings: Region."]);
+        const configured = await planPluginChange([{ ...disabled, settings: { k: "saved", r: "eu" } }], { name: "x", version: "1.0.0", manifest: manifest("X", { [EAS]: "1" }) }, reg);
+        expect(configured).toEqual({ install: [], enable: [EAS], conflicts: [] });
+    });
+});
+
+describe("findUnmetRequirements", () => {
+    it("reports enabled plugins whose requirements are disabled, removed, missing or out of range", () => {
+        const installed = [
+            row(EAS, "2.0.0", true, manifest("EAS")),
+            row(MAPI, "1.0.0", true, manifest("MAPI", { [EAS]: "^1.0.0" })),
+            row(AUTODISCOVER, "1.0.0", true, manifest("Autodiscover", { off: "*", gone: "*", ghost: "*" })),
+            row("off", "1.0.0", false),
+            { ...row("gone", "1.0.0", true), removed: true },
+            row("disabled-dependent", "1.0.0", false, manifest("Disabled", { ghost: "*" })),
+        ];
+        expect(findUnmetRequirements(installed)).toEqual([
+            "MAPI requires EAS ^1.0.0, but 2.0.0 is installed.",
+            "Autodiscover requires off *, which isn't enabled.",
+            "Autodiscover requires gone *, which isn't enabled.",
+            "Autodiscover requires ghost *, which isn't enabled.",
+        ]);
+        expect(findUnmetRequirements(installed, [EAS])).toEqual(["MAPI requires EAS ^1.0.0, but 2.0.0 is installed."]);
+        expect(findUnmetRequirements(installed, ["off"])).toEqual(["Autodiscover requires off *, which isn't enabled."]);
+        // A required row without a stored manifest is named by its package.
+        expect(findUnmetRequirements([row("bare", "2.0.0", true), row("x", "1.0.0", true, manifest("X", { bare: "^1.0.0" }))])).toEqual([
+            "X requires bare ^1.0.0, but 2.0.0 is installed.",
+        ]);
+        expect(findUnmetRequirements([row("plain", "1.0.0", true, { apiVersion: 1, displayName: "Plain" })], ["plain"])).toEqual([]);
     });
 });
 

@@ -21,6 +21,7 @@ import {
 import { AuditAction, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { normalizeUserUid } from "../util/UserUidUtils.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Auth, Delete, Get, Param, Put, Query, RateLimit, Request, User: AuthUser } = RouteDecorators;
 
@@ -48,16 +49,29 @@ const MAILBOX_ACCESS_ROLE_ACTIONS: Record<Exclude<MailboxAccessRole, "custom">, 
     manager: [ACLAction.FULL],
 };
 
-/** A user uid as this platform issues them (a UUID). A grant is only ever made to one user - never to a role name,
- * `anonymous`, or the `.*`/`*` wildcards the ACL system also understands, any of which would hand this mailbox to
- * far more than the one person the caller picked. */
-const USER_UID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** What the caller may do with a mailbox, as `GET /:id/access/me` reports it. `canManage` is what managing its members
+ * (`GET`/`PUT`/`DELETE /:id/access...`) requires. */
+export interface MailboxMyAccess {
+    canRead: boolean;
+    canCreate: boolean;
+    canUpdate: boolean;
+    canDelete: boolean;
+    canManage: boolean;
+}
+
+/** The action managing a mailbox's members requires - see this class's doc comment. */
+const MANAGE_ACTION: string = ACLAction.UPDATE;
 
 /** One plain address: a single `@`, no whitespace, and nothing the search query syntax could read as an operator. */
 const PLAIN_ADDRESS_PATTERN = /^[^\s()@,]+@[^\s()@,]+$/;
 
 /** The longest address worth looking up (RFC 5321's path limit). */
 const MAX_ADDRESS_LENGTH = 320;
+
+/** How many `lookup-by-email` requests one caller may make per `LOOKUP_WINDOW_SECONDS` - enough to add members by
+ * hand, far too few to walk the directory. */
+export const LOOKUP_MAX_ATTEMPTS = 30;
+export const LOOKUP_WINDOW_SECONDS = 60;
 
 /** Maps an arbitrary `ACLRecord.actions` array back onto this route's vocabulary for display - `"manager"` for
  * anything carrying the `FULL` wildcard, `"viewer"` for exactly the viewer action set, and `"custom"` for anything
@@ -69,6 +83,12 @@ function roleFromActions(actions: string[]): MailboxAccessRole {
     }
     const viewer: string[] = MAILBOX_ACCESS_ROLE_ACTIONS.viewer;
     return actions.length === viewer.length && viewer.every((action) => actions.includes(action)) ? "viewer" : "custom";
+}
+
+/** Whether an ACL record id names `memberId`: the same string, or the same user uid in another case. */
+function sameMember(recordId: string, memberId: string): boolean {
+    const uid: string | undefined = normalizeUserUid(recordId);
+    return recordId === memberId || (uid !== undefined && uid === normalizeUserUid(memberId));
 }
 
 /**
@@ -151,30 +171,56 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         return mailbox;
     }
 
-    private async requirePermission(mailbox: M, user: JWTUser | undefined, action: string): Promise<void> {
-        if (!(await this.aclUtils!.hasPermission(user, mailbox.uid, action))) {
+    /** Checks `action` against `acl` - the same uncached ACL (parents included) a change then saves, so a permission
+     * revoked a moment ago can't still authorize the change through a cached copy. */
+    private async requirePermission(acl: AccessControlList, user: JWTUser | undefined, action: string): Promise<void> {
+        if (!(await this.aclUtils!.hasPermission(user, acl, action))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
     }
 
-    private async requireManagePermission(mailboxId: string, user?: JWTUser): Promise<M> {
+    /** The mailbox and its uncached ACL, once the caller is known to be allowed to manage its members. */
+    private async requireManagePermission(mailboxId: string, user?: JWTUser): Promise<{ mailbox: M; acl: AccessControlList }> {
         const mailbox: M = await this.requireMailbox(mailboxId);
-        await this.requirePermission(mailbox, user, ACLAction.UPDATE);
-        return mailbox;
+        const acl: AccessControlList = await this.requireAcl(mailbox.uid);
+        await this.requirePermission(acl, user, MANAGE_ACTION);
+        return { mailbox, acl };
     }
 
     /** Refuses a change to the owner's implicit access, or to the caller's own record unless they're trusted. */
     private assertManageableMember(mailbox: M, userOrRoleId: string, user?: JWTUser): void {
-        if (userOrRoleId === mailbox.ownerUserUid) {
+        if (mailbox.ownerUserUid && sameMember(mailbox.ownerUserUid, userOrRoleId)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The mailbox owner's access cannot be managed here.");
         }
-        if (userOrRoleId === user?.uid && !UserUtils.hasRoles(user, this.trustedRoles)) {
+        if (user?.uid && sameMember(user.uid, userOrRoleId) && !UserUtils.hasRoles(user, this.trustedRoles)) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "You can't change your own access to this mailbox.");
         }
     }
 
-    /** Reads the mailbox's ACL straight from the database - a cached copy could be missing a recent revocation,
-     * which this read-modify-write would then put back. */
+    /**
+     * Whether a record other than `memberId`'s own record on this mailbox grants `FULL` and may apply to that user: a
+     * record for the same uid on a parent ACL, a `.*`/`*` wildcard, or a role (the member's roles aren't known here, so
+     * any role might be one of theirs). Trusted roles are left out - they have full access regardless of records.
+     * Adding, changing or removing the member's own record decides whether that other grant applies (the most specific
+     * record wins), so doing so takes full access, the same as for a record that grants `FULL` itself.
+     */
+    private hasFullAccessElsewhere(acl: AccessControlList, memberId: string): boolean {
+        const mayApply = (id: string): boolean =>
+            id === ".*" || id === "*" || (id !== "anonymous" && normalizeUserUid(id) === undefined && !this.trustedRoles.includes(id));
+        for (let level: AccessControlList | undefined = acl, depth = 0; level; level = level.parent, depth++) {
+            const found: boolean = level.records.some(
+                (record) =>
+                    record.actions.includes(ACLAction.FULL) && (sameMember(record.userOrRoleId, memberId) ? depth > 0 : mayApply(record.userOrRoleId)),
+            );
+            if (found) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Reads the mailbox's ACL (and its parents) straight from the database - a cached copy could be missing a recent
+     * revocation, which this read-modify-write would then put back. */
     private async requireAcl(mailboxUid: string): Promise<AccessControlList> {
         const acl: AccessControlList | undefined = await this.aclUtils!.findACL(mailboxUid, [], { skipCache: true });
         if (!acl) {
@@ -219,8 +265,7 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
      * the owner's own access is implicit, not "a member" someone else granted, and records granting nothing. */
     @Get("/:id/access")
     public async listMembers(@Param("id") mailboxId: string, @AuthUser user?: JWTUser): Promise<MailboxAccessMember[]> {
-        const mailbox: M = await this.requireManagePermission(mailboxId, user);
-        const acl: AccessControlList = await this.requireAcl(mailbox.uid);
+        const { mailbox, acl } = await this.requireManagePermission(mailboxId, user);
         return acl.records
             .filter((record) => record.userOrRoleId !== mailbox.ownerUserUid && record.actions.length > 0)
             .map((record) => ({ userOrRoleId: record.userOrRoleId, role: roleFromActions(record.actions), actions: record.actions }));
@@ -237,32 +282,33 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         @AuthUser user?: JWTUser,
         @Request req?: HttpRequest,
     ): Promise<Omit<MailboxAccessMember, "actions">> {
-        const mailbox: M = await this.requireManagePermission(mailboxId, user);
+        const { mailbox, acl } = await this.requireManagePermission(mailboxId, user);
         this.assertManageableMember(mailbox, userOrRoleId, user);
-        if (!USER_UID_PATTERN.test(userOrRoleId) || this.trustedRoles.includes(userOrRoleId)) {
+        // Stored lowercase, so the owner and self checks above and the ACL's own exact matching agree on who it is.
+        const memberId: string | undefined = normalizeUserUid(userOrRoleId);
+        if (memberId === undefined || this.trustedRoles.includes(memberId)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Access can only be granted to a user.");
         }
         const role: MailboxAccessRole = body?.role;
         if (role !== "viewer" && role !== "manager") {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'role' must be 'viewer' or 'manager'.");
         }
-        const acl: AccessControlList = await this.requireAcl(mailbox.uid);
-        const previous: ACLRecord | undefined = acl.records.find((record) => record.userOrRoleId === userOrRoleId);
-        if (role === "manager" || previous?.actions.includes(ACLAction.FULL)) {
-            // Granting or taking away full access takes full access.
-            await this.requirePermission(mailbox, user, ACLAction.FULL);
+        const previous: ACLRecord | undefined = acl.records.find((record) => sameMember(record.userOrRoleId, memberId));
+        if (role === "manager" || previous?.actions.includes(ACLAction.FULL) || this.hasFullAccessElsewhere(acl, memberId)) {
+            // Granting, taking away or overriding full access takes full access.
+            await this.requirePermission(acl, user, ACLAction.FULL);
         }
         acl.records = [
-            ...acl.records.filter((record) => record.userOrRoleId !== userOrRoleId),
-            { userOrRoleId, actions: MAILBOX_ACCESS_ROLE_ACTIONS[role] },
+            ...acl.records.filter((record) => !sameMember(record.userOrRoleId, memberId)),
+            { userOrRoleId: memberId, actions: MAILBOX_ACCESS_ROLE_ACTIONS[role] },
         ];
         await this.saveAcl(acl);
         await this.audit(req, user, AuditAction.MAILBOX_ACCESS_GRANT, mailbox, {
-            userOrRoleId,
+            userOrRoleId: memberId,
             ...(previous ? { previousRole: roleFromActions(previous.actions) } : {}),
             role,
         });
-        return { userOrRoleId, role };
+        return { userOrRoleId: memberId, role };
     }
 
     /** Revokes a delegate's access to this mailbox - idempotent (a no-op, not a 404, if the given
@@ -276,19 +322,45 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         @AuthUser user?: JWTUser,
         @Request req?: HttpRequest,
     ): Promise<void> {
-        const mailbox: M = await this.requireManagePermission(mailboxId, user);
+        const { mailbox, acl } = await this.requireManagePermission(mailboxId, user);
         this.assertManageableMember(mailbox, userOrRoleId, user);
-        const acl: AccessControlList = await this.requireAcl(mailbox.uid);
-        const previous: ACLRecord | undefined = acl.records.find((record) => record.userOrRoleId === userOrRoleId);
+        const previous: ACLRecord | undefined = acl.records.find((record) => sameMember(record.userOrRoleId, userOrRoleId));
         if (!previous) {
             return;
         }
-        if (previous.actions.includes(ACLAction.FULL)) {
-            await this.requirePermission(mailbox, user, ACLAction.FULL);
+        if (previous.actions.includes(ACLAction.FULL) || this.hasFullAccessElsewhere(acl, previous.userOrRoleId)) {
+            // Removing a record that narrows a full-access grant from elsewhere hands that full access back.
+            await this.requirePermission(acl, user, ACLAction.FULL);
         }
-        acl.records = acl.records.filter((record) => record.userOrRoleId !== userOrRoleId);
+        acl.records = acl.records.filter((record) => record !== previous);
         await this.saveAcl(acl);
-        await this.audit(req, user, AuditAction.MAILBOX_ACCESS_REVOKE, mailbox, { userOrRoleId, previousRole: roleFromActions(previous.actions) });
+        await this.audit(req, user, AuditAction.MAILBOX_ACCESS_REVOKE, mailbox, {
+            userOrRoleId: previous.userOrRoleId,
+            previousRole: roleFromActions(previous.actions),
+        });
+    }
+
+    /**
+     * What the caller may do with this mailbox, evaluated from their effective access: ownership, delegate records,
+     * role and wildcard records, parent ACLs, and trusted roles (which may do everything). A caller with no access gets
+     * every flag `false` rather than a `403`, so a client can use one call to decide what to offer. Registered as a
+     * static segment, so `me` never reaches `/:id/access/:userOrRoleId` (which has no `GET` anyway).
+     */
+    @Auth(["jwt"])
+    @Get("/:id/access/me")
+    public async myAccess(@Param("id") mailboxId: string, @AuthUser user?: JWTUser): Promise<MailboxMyAccess> {
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        // A plain (possibly cached) read, like every other permission check - this changes nothing.
+        const acl: AccessControlList | string = (await this.aclUtils!.findACL(mailbox.uid)) ?? mailbox.uid;
+        const can = (action: string): Promise<boolean> => this.aclUtils!.hasPermission(user, acl, action);
+        const [canRead, canCreate, canUpdate, canDelete, canManage] = await Promise.all([
+            can(ACLAction.READ),
+            can(ACLAction.CREATE),
+            can(ACLAction.UPDATE),
+            can(ACLAction.DELETE),
+            can(MANAGE_ACTION),
+        ]);
+        return { canRead, canCreate, canUpdate, canDelete, canManage };
     }
 
     /**
@@ -313,7 +385,8 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
      * static segment before a parameter regardless of registration order, so `lookup-by-email` never reaches `/:id`.
      */
     @Auth(["jwt"])
-    @RateLimit({ perUser: true })
+    // An explicit limit, so a deployment's (much higher) default for signed-in callers doesn't apply to a directory lookup.
+    @RateLimit({ perUser: true, maxAttempts: LOOKUP_MAX_ATTEMPTS, windowSeconds: LOOKUP_WINDOW_SECONDS })
     @Get("/lookup-by-email")
     public async lookupOwnerByEmail(@Query("email") email: unknown): Promise<{ userUid: string; displayName: string } | null> {
         if (typeof email !== "string" || !email) {
@@ -324,9 +397,15 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The 'email' query parameter must be a single email address.");
         }
         await this.init();
-        const primaryMatches: M[] = await this.mailboxRepo!.find({ primarySmtpAddress: `eq(${address})`, limit: 1 }, { ignoreACL: true, limit: 1 });
+        // A mailbox's uid is its lowercased address when it was created, which matches regardless of the case its
+        // address was stored in. It's only used while the mailbox still has that address - `uid` stays put when the
+        // address changes - otherwise the stored addresses are queried.
+        const byUid: M | undefined = await this.mailboxRepo!.findOne(address, { ignoreACL: true });
+        const hasAddress = (candidate: M): boolean =>
+            normalizeAddress(candidate.primarySmtpAddress) === address || candidate.aliasAddresses.some((alias) => normalizeAddress(alias) === address);
         const mailbox: M | undefined =
-            primaryMatches[0] ??
+            (byUid && hasAddress(byUid) ? byUid : undefined) ??
+            (await this.mailboxRepo!.find({ primarySmtpAddress: `eq(${address})`, limit: 1 }, { ignoreACL: true, limit: 1 }))[0] ??
             (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(address), limit: 1 }, { ignoreACL: true, limit: 1 }))[0];
         if (!mailbox || !mailbox.ownerUserUid) {
             return null;

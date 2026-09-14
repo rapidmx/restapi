@@ -646,3 +646,91 @@ Mailbox access / policy / setup
 - Verification: `yarn lint` and `tsc` clean; full `yarn vitest run --coverage` 218 files / 3648 tests passing, 100%
   statements/functions/lines, 96.7% branches (every changed file fully covered; the remaining branch gaps are the
   pre-existing ones, e.g. `ErasureExecutionJob.findAllPages`, `BaseMailboxPolicyRoute.toPublic`). `dist/` rebuilt.
+
+## 2026-09-14 — Review fixes, round 2: plugin system, mailbox access/policy, retention policy
+
+Every finding was confirmed in code first; none skipped. Not committed, no version bump or release notes.
+
+Contracts other repos already build on
+- `GET /mail/mailboxes/:id/access/me` (`BaseMailboxAccessRoute.myAccess`, `@Auth(["jwt"])`): 200
+  `{ canRead, canCreate, canUpdate, canDelete, canManage }` from `ACLUtils.hasPermission` (owner/delegate/role/
+  wildcard/parent records, trusted roles all true); `canManage` = `ACLAction.UPDATE` (`MANAGE_ACTION`, what
+  list/set/remove member require). 404 missing mailbox, 401 anonymous, **200 all-false** for no access (not 403). It's a
+  deeper static path than `/:id/access/:userOrRoleId`, which has no `GET`; `PUT .../access/me` is a 400 (not a uid).
+- `expectedPlan.version` (optional string; non-string 400): compared with the resolved target version (`POST`: the
+  looked-up version; `PUT`: new `packageVersion` or the installed one) -> 409 with the usual "changed since it was
+  previewed" message.
+- `GET /plan?name=X` for an installed plugin with `packageVersion` omitted/empty/equal to the installed one plans from
+  the stored manifest (no registry read for X itself) - identical to what `PUT {enabled:true}` plans. `PUT` ignores
+  `expectedPlan` (shape still validated) when no plan is computed (plugin stays/becomes disabled, settings-only).
+- `PUT /retention-policy`: `null` for `messageRetentionDays`/`auditLogRetentionDays` clears it (stored `null`, omitted
+  from responses; `RetentionEnforcementJob` already skipped falsy values). Non-null values validated as before; the
+  audit floor only applies to a number.
+
+Plugins
+- `PluginDependencies`: enabling an installed disabled dependency checks `options.allowed`; a dependency to install or
+  enable whose manifest has a required setting with no default (and, for installed rows, no saved value - planner rows
+  now carry `settings`) is a conflict "<displayName> requires settings: A, B."; installed/published versions must be
+  `isExactVersion` (semver-valid and `semver.clean(v) === v`, so `v1.0.0`, ` 1.0.0`, `1.0.0+build` are refused - also in
+  the route's `lookupVersion`). New `findUnmetRequirements(installed, involving?)`.
+- Concurrency: `applyChange(before, involving, change)` re-reads the rows after writing and, for requirements touching
+  the changed names, refuses (409 "Another plugin change made at the same time conflicts with this one: ...") and
+  rolls back when a requirement is newly unmet (problems already present in the `before` snapshot are ignored, so an
+  unrelated pre-broken row doesn't block edits). `PUT`'s own row update and `DELETE` now record undo steps too.
+  Tested with the registry hooks (add vs concurrent disable; version change vs concurrently enabled dependent) and a
+  spy on `audit` for `DELETE`.
+- Undo of a row the change created hard-deletes it (`RepoUtils.delete`, version-guarded; `Plugin` isn't recoverable so
+  that's a purge) instead of soft-removing, which the server's defaults seeding treats as an admin removal.
+- `PUT {packageVersion: "" | " " | null | non-string}` -> 400. Repeated `?namespace=`/`?packageVersion=` -> 400.
+- `/search` `updateAvailable` requires `allowed` (same as `/updates`).
+- A namespace `{name, token}` without its own registry uses its token on the default registry; one with its own
+  registry never gets the global token.
+- `NpmRegistryClient`: userinfo in the registry URL becomes a Basic header (a configured token wins) and is stripped
+  from the fetched URL; network errors report only a system code (`Could not reach the plugin registry (ECONNREFUSED).`),
+  never `err.message`; an unparsable URL / bad percent-encoding is a `RegistryRequestError`.
+- `announce()` catches and logs, so a publish/read failure can't replace a change's outcome.
+- `computePluginStateHash` includes `integrity` (`?? null`, so SQL null and Mongo absent agree). The server hashes DB
+  rows with this function on both sides, so after upgrading every copy computes a new hash once -> one rolling restart.
+- Manifest `mailboxScopedData?: boolean` (validated in `parsePluginManifest`, kept only when declared).
+  `ErasureExecutionJob` now holds an erasure only for a non-removed plugin whose stored manifest declares it and that
+  isn't loaded; removed plugins declaring it don't hold, the completion logs at error level that their data wasn't
+  erased (DataSubjectErasureRequest has no notes/result field; `reason` is the deny reason - no schema change). A hold
+  is also only logged, for the same reason. Plugins that don't declare it (e.g. old manifests) never hold - the
+  activesync plugin needs `"mailboxScopedData": true`, react-shared's `PluginManifest` type needs the field.
+
+Mailbox access / policy
+- SQL `type: "double"` is not a Postgres type (`PostgresDriver.normalizeType` has no mapping, `supportedDataTypes`
+  lacks it -> `DataTypeNotSupportedError` at startup) - the round-1 Mailbox/MailboxPolicy columns and the older
+  `ContactSQL` ones. Now `"double precision"`: in the supportedDataTypes of Postgres (as-is), MySQL (normalized to
+  `double`, so existing MySQL `double` columns don't change) and SQLite (verified the test DB rebuilt with it).
+  Upgrade path (read `RdbmsSchemaBuilder.updateExistColumns` + each query runner's `changeColumn`): any type change on
+  Postgres/MySQL is `dropColumn` + `addColumn` ("To avoid data conversion, we just recreate column") -> data loss, and
+  Postgres `ADD COLUMN ... NOT NULL` fails on a non-empty mailbox table; SQLite recreates the table copying data. No
+  type avoids that (integer -> anything is a type change), and `default: 0` would only turn the Postgres failure into
+  silent quota loss, so the fix documents a manual `ALTER ... TYPE double precision` / `MODIFY ... DOUBLE` before
+  upgrading (README "Upgrading").
+- `validateUpdate` -> `validateTrustedOnlyFields`: non-trusted callers get 403 changing `ownerUserUid`, `quotaBytes`,
+  `usedBytes` (only real changes; owner compared case-insensitively, null/"" = none). Trusted owner uids must be
+  UUID-shaped (stored lowercase) or the caller's own uid (so a dev admin `dev-user` can still assign itself); an
+  existing non-UUID owner round-trips. `updateProperty` now saves the value `validateUpdate` normalized.
+- Non-trusted `POST /mailboxes` (`assertSelfServiceCreate`): policy read fail-closed; 403 unless policy
+  `autoProvisionEnabled`, verified domains and an alias source exist; every address (primary + aliases) must be
+  `<own auth-server name alias>@<verified domain>` (403); `quotaBytes` forced to the policy's self-service quota,
+  `usedBytes` 0. `autoProvision()` calls the shared `createMailboxes()` directly (no second policy/alias fetch). Not
+  added: a one-mailbox-per-user limit on direct create (autoProvision's `existing` shortcut) - not in the finding.
+  Web-client: only the admin console/setup wizard create mailboxes (trusted), so no client impact.
+- Addresses are lowercased on create/update (`normalizeAddressFields`) - ingest, ScanQueueJob, calendar and uid logic
+  already compared lowercase. `lookup-by-email` tries `findOne(<lowercased address>)` (uid) first, used only if that
+  mailbox still has the address (uid survives renames), then the `eq()` queries.
+- `setMember`/`removeMember`/`listMembers` check permission against the uncached ACL (with uncached parents) they read
+  and save. Strict full-access rule: FULL is also required when any record other than the member's own on this mailbox
+  grants FULL and may apply to them - their uid on a parent ACL, `.*`/`*`, or any non-UUID role name (their roles are
+  unknown) except trusted roles and `anonymous` - since adding/changing their exact record overrides that grant and
+  removing it restores it.
+- `USER_UID_PATTERN` moved to `util/UserUidUtils.ts` (lowercase only) with `normalizeUserUid()`; member ids are stored
+  lowercase and matched against owner/self/existing records case-insensitively for UUIDs.
+- `lookup-by-email`: `@RateLimit({ perUser: true, maxAttempts: 30, windowSeconds: 60 })`. The server's
+  `TieredRateLimiter` spreads route config last, so it beats the authenticated tier; tested (31st request 429).
+- Tests: shared suites `test/routes/mailboxSelfServiceCreateSuite.ts` (run by both MailboxAutoProvision files) and
+  `test/routes/retentionPolicyClearSuite.ts`; additions in `mailboxAccessSecuritySuite.ts` and `pluginRouteSuite.ts`
+  (context gains `updatePlugin`). MailboxRoute tests that created mailboxes as a non-trusted caller now do it as admin.

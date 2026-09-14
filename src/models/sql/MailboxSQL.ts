@@ -66,13 +66,14 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     @Description("The IANA timezone identifier (e.g. `America/Los_Angeles`) used to render dates/times for this mailbox.")
     public timezone: string = "";
 
-    // `type: "double"` for both byte counts, for the same reason as `ContactSQL.keysFirstSeen`: an untyped `number`
-    // column is a 32-bit integer on Postgres/MySQL (max ~2.1 GB), below the 5 GB default quota.
-    @Column({ type: "double" })
+    // `type: "double precision"` for both byte counts, for the same reason as `ContactSQL.keysFirstSeen`: an untyped
+    // `number` column is a 32-bit integer on Postgres/MySQL (max ~2.1 GB), below the 5 GB default quota. An existing
+    // Postgres/MySQL column needs a manual `ALTER` before upgrading - see the README's "Upgrading" section.
+    @Column({ type: "double precision" })
     @Description("The maximum total size, in bytes, of all messages/attachments this mailbox may store.")
     public quotaBytes: number = 0;
 
-    @Column({ type: "double" })
+    @Column({ type: "double precision" })
     @Description("The current total size, in bytes, of all messages/attachments stored in this mailbox.")
     public usedBytes: number = 0;
 

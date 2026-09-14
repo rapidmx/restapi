@@ -85,7 +85,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     protected abstract mailboxImportRequestClass: any;
 
     /** Supplied by the Mongo/SQL concrete subclasses so this job can tell which installed plugins aren't loaded in
-     * this process - see `unloadedPluginNames()`. */
+     * this process - see `unloadedMailboxDataPlugins()`. */
     protected abstract pluginClass: any;
 
     /** Supplied by the Mongo/SQL concrete subclasses so this job's own hold re-check can resolve without
@@ -256,28 +256,41 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             }
         }
 
-        // A plugin that's installed but not loaded here (disabled, failed to load, safe mode) registered no
-        // `@MailboxScopedData()` models, so its rows for this mailbox were never seen above. Completing now would
-        // report an erasure that left them behind. Instead `status` stays `"approved"` - the same retry shape as the
-        // hold check above - and a later run, once the plugin is loaded again (or removed), purges them and completes.
-        const unloaded: string[] = await this.unloadedPluginNames();
+        // A plugin whose manifest declares `mailboxScopedData` but isn't loaded here (disabled, failed to load, safe
+        // mode) registered no `@MailboxScopedData()` models, so its rows for this mailbox were never seen above.
+        // Completing now would report an erasure that left them behind. Instead `status` stays `"approved"` - the same
+        // retry shape as the hold check above - and a later run, once the plugin is loaded again, purges them and
+        // completes. The request has no field for the reason, so it's logged. A plugin that doesn't declare mailbox data
+        // never holds an erasure.
+        const { unloaded, removed } = await this.unloadedMailboxDataPlugins();
         if (unloaded.length > 0) {
             this.logger?.error(
-                `ErasureExecutionJob: erasure request ${request.uid} can't complete while installed plugins aren't loaded (${unloaded.join(", ")}) - their data for mailbox ${request.mailboxUid} can't be purged. Load or remove them; the request is retried on a later run.`,
+                `ErasureExecutionJob: erasure request ${request.uid} is waiting for plugins that store mailbox data but aren't loaded (${unloaded.join(", ")}) - their data for mailbox ${request.mailboxUid} can't be purged until they are. Enable them or fix their loading; the request is retried on a later run.`,
             );
             return;
+        }
+        if (removed.length > 0) {
+            // A removed plugin will never be loaded again to purge its rows, so holding would block the erasure forever.
+            // It completes, but what it couldn't reach is recorded (the request has no field for it).
+            this.logger?.error(
+                `ErasureExecutionJob: erasure request ${request.uid} completed without erasing mailbox ${request.mailboxUid}'s data stored by removed plugins (${removed.join(", ")}). Remove that data manually.`,
+            );
         }
 
         await this.markCompleted(request, purgedCount);
     }
 
-    /** The installed (not removed) plugins that aren't loaded in this process, per `PluginRegistry`. */
-    private async unloadedPluginNames(): Promise<string[]> {
+    /** The plugins declaring `mailboxScopedData` in their stored manifest that aren't loaded in this process, per
+     * `PluginRegistry`: installed ones (`unloaded`) and removed ones (`removed`). */
+    private async unloadedMailboxDataPlugins(): Promise<{ unloaded: string[]; removed: string[] }> {
         const rows: Plugin[] = await this.findAllPages(await this.getRepo(this.pluginClass), {});
-        return rows
-            .filter((row) => !row.removed && !PluginRegistry.isActive(row.name))
-            .map((row) => row.name)
-            .sort();
+        const candidates: Plugin[] = rows.filter((row) => row.manifest.mailboxScopedData === true && !PluginRegistry.isActive(row.name));
+        const names = (removed: boolean): string[] =>
+            candidates
+                .filter((row) => !!row.removed === removed)
+                .map((row) => row.name)
+                .sort();
+        return { unloaded: names(false), removed: names(true) };
     }
 
     /** Purges every `mailboxUid`-matching row of one entity type, best-effort per row (a single row's

@@ -53,5 +53,8 @@ describe("Route:PluginSQL Tests", () => {
         bumpVersion: async (uid) => {
             await pluginRepo.increment({ uid }, "version", 1);
         },
+        updatePlugin: async (uid, fields) => {
+            await pluginRepo.update({ uid }, fields);
+        },
     });
 });

@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import semver from "semver";
 import { PluginManifest } from "../models/types.js";
+import { isExactVersion, missingRequiredSettings } from "./PluginUtils.js";
 
 /** An installed plugin as the dependency planner sees it - a `Plugin` row satisfies this. */
 export interface PlannerInstalledPlugin {
@@ -12,6 +13,7 @@ export interface PlannerInstalledPlugin {
     enabled: boolean;
     removed?: boolean;
     manifest?: PluginManifest;
+    settings?: Record<string, unknown>;
 }
 
 /** One published version of a package, with its parsed manifest or the reason it isn't a loadable plugin. */
@@ -74,7 +76,13 @@ function requiredRange(manifest: PluginManifest | undefined, name: string): stri
 }
 
 function satisfies(version: string, range: string): boolean {
-    return semver.valid(version) !== null && semver.satisfies(version, range);
+    return isExactVersion(version) && semver.satisfies(version, range);
+}
+
+/** A conflict naming the settings a dependency needs before it can be installed or enabled, if it needs any. */
+function missingSettingsConflict(label: string, manifest: PluginManifest | undefined, values?: Record<string, unknown>): string | undefined {
+    const missing: string[] = missingRequiredSettings(manifest, values).map((setting) => setting.label);
+    return missing.length > 0 ? `${label} requires settings: ${missing.join(", ")}.` : undefined;
 }
 
 /**
@@ -83,7 +91,8 @@ function satisfies(version: string, range: string): boolean {
  * - installed, enabled and in range: nothing to do;
  * - installed, disabled and in range: it gets enabled;
  * - not installed: it gets installed at the highest published version in range;
- * - installed out of range, missing from the registry, or with no version in range: a conflict.
+ * - installed out of range, missing from the registry, or with no version in range: a conflict;
+ * - to be installed or enabled, but not allowed or missing a required setting with no default or saved value: a conflict.
  *
  * Installed plugins are never upgraded or downgraded to make room. Changing a plugin's version is also a conflict when
  * the new version falls outside the range an enabled plugin requires of it.
@@ -125,6 +134,16 @@ export async function planPluginChange(
                 if (!satisfies(row.packageVersion, range)) {
                     plan.conflicts.push(`${requirer} requires ${label(dependency)} ${range}, but ${row.packageVersion} is installed.`);
                 } else if (!row.enabled) {
+                    // Enabling is as much a change as installing, so a narrowed allow-list stops it too.
+                    if (options.allowed && !options.allowed(dependency)) {
+                        plan.conflicts.push(`${requirer} requires ${dependency}, which isn't an allowed plugin package on this server.`);
+                        continue;
+                    }
+                    const settingsConflict: string | undefined = missingSettingsConflict(label(dependency), row.manifest, row.settings);
+                    if (settingsConflict) {
+                        plan.conflicts.push(settingsConflict);
+                        continue;
+                    }
                     planned.set(dependency, row.packageVersion);
                     await visit(dependency, row.manifest ?? ({} as PluginManifest), [...path, dependency]);
                     plan.enable.push(dependency);
@@ -140,7 +159,7 @@ export async function planPluginChange(
                 plan.conflicts.push(`${requirer} requires ${dependency}, which isn't in the plugin registry.`);
                 continue;
             }
-            const best: string | null = semver.maxSatisfying(versions, range);
+            const best: string | null = semver.maxSatisfying(versions.filter(isExactVersion), range);
             const found: PlannerPackageVersion | undefined = best ? await registry.version(dependency, best) : undefined;
             if (!found) {
                 plan.conflicts.push(`${requirer} requires ${dependency} ${range}, but no published version satisfies it.`);
@@ -150,6 +169,11 @@ export async function planPluginChange(
                 plan.conflicts.push(`${requirer} requires ${dependency}, which can't be installed: ${found.manifest}`);
                 continue;
             }
+            const settingsConflict: string | undefined = missingSettingsConflict(found.manifest.displayName, found.manifest);
+            if (settingsConflict) {
+                plan.conflicts.push(settingsConflict);
+                continue;
+            }
             planned.set(dependency, found.version);
             await visit(dependency, found.manifest, [...path, dependency]);
             plan.install.push({ name: dependency, version: found.version, integrity: found.integrity, manifest: found.manifest });
@@ -157,6 +181,32 @@ export async function planPluginChange(
     };
     await visit(change.name, change.manifest, [change.name]);
     return plan;
+}
+
+/**
+ * Every requirement of an enabled plugin that the enabled plugins don't meet - its requirement is disabled, removed,
+ * missing or out of range. With `involving`, only requirements where the requiring or the required plugin is one of
+ * those names are reported, so an unrelated, already-broken pair doesn't block every change.
+ */
+export function findUnmetRequirements(installed: PlannerInstalledPlugin[], involving?: Iterable<string>): string[] {
+    const names: Set<string> | undefined = involving ? new Set(involving) : undefined;
+    const enabled: Map<string, PlannerInstalledPlugin> = new Map(installed.filter((row) => row.enabled && !row.removed).map((row) => [row.name, row]));
+    const label = (row: PlannerInstalledPlugin): string => row.manifest?.displayName ?? row.name;
+    const problems: string[] = [];
+    for (const row of enabled.values()) {
+        for (const [dependency, range] of requiresOf(row.manifest)) {
+            if (names && !names.has(row.name) && !names.has(dependency)) {
+                continue;
+            }
+            const required: PlannerInstalledPlugin | undefined = enabled.get(dependency);
+            if (!required) {
+                problems.push(`${label(row)} requires ${dependency} ${range}, which isn't enabled.`);
+            } else if (!satisfies(required.packageVersion, range)) {
+                problems.push(`${label(row)} requires ${label(required)} ${range}, but ${required.packageVersion} is installed.`);
+            }
+        }
+    }
+    return problems;
 }
 
 /** The enabled plugins that require `name`. */

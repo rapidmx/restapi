@@ -8,7 +8,9 @@ import {
     computePluginStateHash,
     defaultPluginSettings,
     findPluginNamespace,
+    isExactVersion,
     isNewerVersion,
+    missingRequiredSettings,
     isValidPackageName,
     normalizeAllowedPackages,
     normalizePluginNamespaces,
@@ -54,6 +56,15 @@ describe("parsePluginManifest", () => {
         expect(parsePluginManifest({ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: {} } } })).not.toHaveProperty("requires");
     });
 
+    it("keeps mailboxScopedData when declared", () => {
+        for (const mailboxScopedData of [true, false]) {
+            expect(parsePluginManifest({ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", mailboxScopedData } } })).toEqual(
+                expect.objectContaining({ mailboxScopedData }),
+            );
+        }
+        expect(parsePluginManifest({ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X" } } })).not.toHaveProperty("mailboxScopedData");
+    });
+
     it.each([
         [undefined, /not a RapidMX plugin/],
         [{ rapidmx: { plugin: "nope" } }, /not a RapidMX plugin/],
@@ -78,6 +89,7 @@ describe("parsePluginManifest", () => {
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "number", default: 50, max: 10 }] } } }, /invalid default: 'L' must be at most 10/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "boolean", default: "true" }] } } }, /invalid default/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "select", options: [{ value: "a", label: "A" }], default: "b" }] } } }, /invalid default: 'L' must be one of: a/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", mailboxScopedData: "yes" } } }, /mailboxScopedData must be true or false/],
     ])("rejects %j", (pkg, message) => {
         expect(parsePluginManifest(pkg)).toMatch(message);
     });
@@ -196,6 +208,45 @@ describe("computePluginStateHash", () => {
         expect(computePluginStateHash([{ ...a, settings: { x: 3, y: 2 } }, b])).not.toBe(base);
         expect(computePluginStateHash([{ ...b, settings: undefined as any }])).toBe(computePluginStateHash([b]));
         expect(computePluginStateHash([])).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it("changes with the recorded integrity, treating an unset one (undefined or SQL's null) alike", () => {
+        const a = { name: "a", packageVersion: "1.0.0", enabled: true, settings: {} };
+        const base = computePluginStateHash([a]);
+        expect(computePluginStateHash([{ ...a, integrity: null }])).toBe(base);
+        expect(computePluginStateHash([{ ...a, integrity: "sha512-x" }])).not.toBe(base);
+        expect(computePluginStateHash([{ ...a, integrity: "sha512-x" }])).not.toBe(computePluginStateHash([{ ...a, integrity: "sha512-y" }]));
+    });
+});
+
+describe("isExactVersion", () => {
+    it("accepts only a normalized semver version", () => {
+        for (const version of ["1.0.0", "2.3.4-beta.1"]) {
+            expect(isExactVersion(version)).toBe(true);
+        }
+        for (const version of ["v1.0.0", " 1.0.0", "1.0.0+build", "=1.0.0", "latest", "github:x/y", 1, undefined]) {
+            expect(isExactVersion(version)).toBe(false);
+        }
+    });
+});
+
+describe("missingRequiredSettings", () => {
+    it("lists required settings with neither a default nor a saved value", () => {
+        const strict: PluginManifest = {
+            apiVersion: 1,
+            displayName: "X",
+            settings: [
+                { key: "a", label: "A", type: "string", required: true },
+                { key: "b", label: "B", type: "string", required: true, default: "x" },
+                { key: "c", label: "C", type: "string" },
+                { key: "d", label: "D", type: "number", required: true },
+            ],
+        };
+        expect(missingRequiredSettings(strict).map((setting) => setting.key)).toEqual(["a", "d"]);
+        expect(missingRequiredSettings(strict, { a: "", d: 0 }).map((setting) => setting.key)).toEqual(["a"]);
+        expect(missingRequiredSettings(strict, { a: "v", d: null } as any).map((setting) => setting.key)).toEqual(["d"]);
+        expect(missingRequiredSettings(undefined)).toEqual([]);
+        expect(missingRequiredSettings({ apiVersion: 1, displayName: "X" })).toEqual([]);
     });
 });
 

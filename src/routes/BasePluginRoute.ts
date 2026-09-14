@@ -5,7 +5,6 @@
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { createClient } from "redis";
-import semver from "semver";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { AuditAction, Plugin, PluginManifest } from "../models/types.js";
 import {
@@ -16,12 +15,21 @@ import {
     RegistryRequestError,
     RegistrySearchResult,
 } from "../plugins/NpmRegistryClient.js";
-import { findDependents, PluginChangePlan, planPluginChange, PlannerRegistry, PlannedPluginInstall } from "../plugins/PluginDependencies.js";
+import {
+    findDependents,
+    findUnmetRequirements,
+    PluginChangePlan,
+    planPluginChange,
+    PlannerRegistry,
+    PlannedPluginChange,
+    PlannedPluginInstall,
+} from "../plugins/PluginDependencies.js";
 import {
     computePluginStateHash,
     DEFAULT_ALLOWED_PLUGIN_PACKAGES,
     DEFAULT_PLUGIN_NAMESPACES,
     findPluginNamespace,
+    isExactVersion,
     isNewerVersion,
     isValidPackageName,
     normalizeAllowedPackages,
@@ -43,6 +51,8 @@ const { Delete, Get, Param, Post, Put, Query, Request, RequiresTrustedRole, User
 export interface PluginExpectedPlan {
     install: { name: string; version: string }[];
     enable: string[];
+    /** The version of the plugin being changed that the preview showed (`GET /plan`'s `plugin.version`). */
+    version?: string;
 }
 
 /** The body of `POST /` - `packageVersion` defaults to the registry's `latest`. */
@@ -224,9 +234,11 @@ export abstract class BasePluginRoute<T extends Plugin> {
         const namespace: PluginNamespace | undefined = packageOrNamespace
             ? this.namespaces.find((ns) => ns.name === packageOrNamespace) ?? findPluginNamespace(packageOrNamespace, this.namespaces)
             : undefined;
+        // A namespace on its own registry never gets the default registry's token; one on the default registry uses its
+        // own token when it has one.
         return namespace?.registry
             ? new NpmRegistryClient(namespace.registry, namespace.token)
-            : new NpmRegistryClient(this.registryUrl, this.registryToken || undefined);
+            : new NpmRegistryClient(this.registryUrl, namespace?.token ?? (this.registryToken || undefined));
     }
 
     private registrySession(): RegistrySession {
@@ -307,13 +319,22 @@ export abstract class BasePluginRoute<T extends Plugin> {
         }
     }
 
+    /** A `packageVersion` query parameter: `undefined` when it's absent or empty, a `400` when it's repeated. */
+    private queryVersion(packageVersion: unknown): string | undefined {
+        if (packageVersion !== undefined && typeof packageVersion !== "string") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'packageVersion' must be a single version.");
+        }
+        return packageVersion || undefined;
+    }
+
     /** Resolves a package version from the registry, turning its failure modes into API errors. */
     private async lookupVersion(
         session: RegistrySession,
         name: string,
-        packageVersion?: string,
+        requestedVersion?: unknown,
     ): Promise<RegistryPackageVersion & { manifest: PluginManifest }> {
-        const requested: string = packageVersion || "latest";
+        const packageVersion: string | undefined = this.queryVersion(requestedVersion);
+        const requested: string = packageVersion ?? "latest";
         const found: RegistryPackageVersion | undefined = await this.registryCall(() => session.getVersion(name, requested));
         if (!found) {
             throw new ApiError(
@@ -322,8 +343,9 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 packageVersion ? `'${name}@${packageVersion}' was not found in the plugin registry.` : `'${name}' was not found in the plugin registry.`,
             );
         }
-        if (semver.valid(found.version) === null) {
-            // A dist-tag can point at something other than a published version, such as a git or file reference.
+        if (!isExactVersion(found.version)) {
+            // A dist-tag can point at something other than a published version, such as a git or file reference, and a
+            // version such as `v1.0.0` would be installed as a different string than the one recorded.
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${name}@${requested}' resolves to '${found.version}', which isn't a published version.`);
         }
         if (typeof found.manifest === "string") {
@@ -342,21 +364,42 @@ export abstract class BasePluginRoute<T extends Plugin> {
         return existing;
     }
 
+    /** Tells every server copy about the current plugin set. A failure is logged rather than thrown, so it can't replace
+     * the outcome of the change being announced - each copy's own periodic check still picks the change up. */
     private async announce(): Promise<void> {
-        const all: T[] = await this.pluginRepo!.find({} as any, { ignoreACL: true });
-        await this.publishChange(computePluginStateHash(all));
+        try {
+            const all: T[] = await this.pluginRepo!.find({} as any, { ignoreACL: true });
+            await this.publishChange(computePluginStateHash(all));
+        } catch (err: any) {
+            this.logger?.error(`Could not announce a plugin change: ${err.message}`);
+        }
     }
 
     /**
      * Runs a change that may write several rows. When it fails part way, what it wrote (recorded in `undo`) is undone,
      * best-effort and newest first, before the error is passed on. Every server copy is told about the result whenever
      * anything was written, so a copy never keeps running a half-applied change that its undo couldn't reverse.
+     *
+     * Checks run before writing (dependents, requirements) read a snapshot that a concurrent change can invalidate - one
+     * request disabling a plugin while another enables a plugin that requires it. So once written, the requirements
+     * touching `involving` are checked again against a fresh read, and a change that left an enabled plugin without a
+     * requirement is undone with a `409`. A requirement that was already unmet in `before` (the snapshot the change was
+     * checked against) isn't this change's doing, so it doesn't refuse it.
      */
-    private async applyChange<R>(change: (undo: PluginUndo[]) => Promise<R>): Promise<R> {
+    private async applyChange<R>(before: T[], involving: string[], change: (undo: PluginUndo[]) => Promise<R>): Promise<R> {
         const undo: PluginUndo[] = [];
         let succeeded = false;
         try {
             const result: R = await change(undo);
+            const existing: Set<string> = new Set(findUnmetRequirements(before, involving));
+            const problems: string[] = findUnmetRequirements(await this.installedPlugins(), involving).filter((problem) => !existing.has(problem));
+            if (problems.length > 0) {
+                throw new ApiError(
+                    ApiErrors.IDENTIFIER_EXISTS,
+                    409,
+                    `Another plugin change made at the same time conflicts with this one: ${problems.join(" ")} Nothing was changed. Review the plugins and try again.`,
+                );
+            }
             succeeded = true;
             return result;
         } catch (err) {
@@ -398,21 +441,37 @@ export abstract class BasePluginRoute<T extends Plugin> {
         return plan;
     }
 
-    /**
-     * Refuses, with a `409` and without changing anything, a change whose plan is no longer the one the administrator
-     * confirmed - the registry can change between the preview and the change. No `expected` plan means no check.
-     */
-    private assertExpectedPlan(expected: unknown, plan: Pick<PluginChangePlan, "install" | "enable">): void {
+    /** Validates an `expectedPlan` body field, returning `undefined` when none was given. */
+    private parseExpectedPlan(expected: unknown): PluginExpectedPlan | undefined {
         if (expected === undefined) {
-            return;
+            return undefined;
         }
         const given: any = expected;
         if (!given || typeof given !== "object" || !Array.isArray(given.install) || !Array.isArray(given.enable)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'expectedPlan' must list the plugins the change installs and enables.");
         }
+        if (given.version !== undefined && typeof given.version !== "string") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'expectedPlan.version' must be the previewed version.");
+        }
+        return given;
+    }
+
+    /**
+     * Refuses, with a `409` and without changing anything, a change whose plan is no longer the one the administrator
+     * confirmed - the registry can change between the preview and the change (including what `latest` points at, which
+     * `version` catches). No `expected` plan means no check.
+     */
+    private assertExpectedPlan(expected: PluginExpectedPlan | undefined, plan: Pick<PluginChangePlan, "install" | "enable">, version: string): void {
+        if (expected === undefined) {
+            return;
+        }
         const sameSet = (a: unknown[], b: unknown[]): boolean => JSON.stringify(a.map(String).sort()) === JSON.stringify(b.map(String).sort());
         const installKey = (install: any): string => JSON.stringify([install?.name, install?.version]);
-        if (!sameSet(given.install.map(installKey), plan.install.map(installKey)) || !sameSet(given.enable, plan.enable)) {
+        if (
+            (expected.version !== undefined && expected.version !== version) ||
+            !sameSet(expected.install.map(installKey), plan.install.map(installKey)) ||
+            !sameSet(expected.enable, plan.enable)
+        ) {
             throw new ApiError(
                 ApiErrors.IDENTIFIER_EXISTS,
                 409,
@@ -481,9 +540,16 @@ export abstract class BasePluginRoute<T extends Plugin> {
         }
         const created: T = await this.pluginRepo!.create(new this.pluginClass(fields), options);
         undo.push(async () => {
-            await this.pluginRepo!.update({ uid: created.uid, version: created.version, enabled: false, removed: true } as any, created, options);
+            // Deleted outright: a removed row would read as an administrator's removal, which stops the server's
+            // default plugin list from ever adding the package.
+            await this.pluginRepo!.delete(created.uid, { ignoreACL: true, version: created.version });
         });
         return created;
+    }
+
+    /** The plugins a change to `name` writes: `name` and whatever its plan installs and enables. */
+    private changedNames(name: string, plan?: PluginChangePlan): string[] {
+        return [name, ...(plan?.install.map((install) => install.name) ?? []), ...(plan?.enable ?? [])];
     }
 
     /** Installs and enables what a plan needs, dependencies first, and returns the rows it changed. */
@@ -539,12 +605,13 @@ export abstract class BasePluginRoute<T extends Plugin> {
      * A registry result without a name and version is left out. */
     @RequiresTrustedRole()
     @Get("/search")
-    public async search(@Query("namespace") namespace?: string): Promise<PluginSearchResult[]> {
+    public async search(@Query("namespace") namespace?: unknown): Promise<PluginSearchResult[]> {
         let scopes: string[];
-        if (namespace === undefined || namespace.trim() === "") {
+        if (namespace === undefined || (typeof namespace === "string" && namespace.trim() === "")) {
             scopes = this.namespaces.map((ns) => ns.name);
         } else {
-            const [requested] = normalizePluginNamespaces([namespace]);
+            // A repeated `?namespace=` arrives as a list, which is refused like any other invalid scope.
+            const [requested] = typeof namespace === "string" ? normalizePluginNamespaces([namespace]) : [];
             if (!requested) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'namespace' must be an npm scope, for example @rapidmx.");
             }
@@ -560,12 +627,14 @@ export abstract class BasePluginRoute<T extends Plugin> {
         const installed: Map<string, T> = new Map((await this.installedPlugins()).map((plugin) => [plugin.name, plugin]));
         return found.map((result) => {
             const plugin: T | undefined = installed.get(result.name);
+            const allowed: boolean = matchesAllowedPackage(result.name, this.allowedPackages);
             return {
                 ...result,
-                allowed: matchesAllowedPackage(result.name, this.allowedPackages),
+                allowed,
                 installedUid: plugin?.uid,
                 installedVersion: plugin?.packageVersion,
-                updateAvailable: !!plugin && isNewerVersion(result.version, plugin.packageVersion),
+                // As in `GET /updates`: upgrading a plugin outside the allow-list would be refused.
+                updateAvailable: allowed && !!plugin && isNewerVersion(result.version, plugin.packageVersion),
             };
         });
     }
@@ -605,26 +674,37 @@ export abstract class BasePluginRoute<T extends Plugin> {
         return { package: pkg, selected };
     }
 
-    /** What adding `name` (or changing it, when installed) at `packageVersion` - default the registry's `latest` - would
-     * also install and enable, and any conflicts that would refuse it. Nothing is changed. */
+    /**
+     * What adding `name` (or changing it, when installed) at `packageVersion` - default the registry's `latest` - would
+     * also install and enable, and any conflicts that would refuse it. Nothing is changed.
+     *
+     * For an installed plugin with `packageVersion` omitted or equal to its installed version, this is the plan for
+     * enabling it: its stored manifest is used and the registry isn't asked about the plugin itself, exactly as
+     * `PUT /:id` plans `{ enabled: true }`.
+     */
     @RequiresTrustedRole()
     @Get("/plan")
-    public async plan(@Query("name") name?: string, @Query("packageVersion") packageVersion?: string): Promise<PluginPlanResponse> {
+    public async plan(@Query("name") name?: unknown, @Query("packageVersion") packageVersion?: unknown): Promise<PluginPlanResponse> {
         const trimmed: string = typeof name === "string" ? name.trim() : "";
         if (!trimmed) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'name' is required.");
         }
         this.assertAllowed(trimmed);
+        const requested: string | undefined = this.queryVersion(packageVersion);
         const session: RegistrySession = this.registrySession();
-        const found = await this.lookupVersion(session, trimmed, packageVersion);
         const installed: T[] = await this.installedPlugins();
-        const plan: PluginChangePlan = await planPluginChange(
-            installed,
-            { name: trimmed, version: found.version, manifest: found.manifest },
-            this.plannerRegistry(session),
-            { allowed: (dependency) => matchesAllowedPackage(dependency, this.allowedPackages) },
-        );
-        return { plugin: { name: trimmed, version: found.version, manifest: found.manifest }, ...plan };
+        const current: T | undefined = installed.find((row) => row.name === trimmed);
+        let target: PlannedPluginChange;
+        if (current && (requested === undefined || requested === current.packageVersion)) {
+            target = { name: trimmed, version: current.packageVersion, manifest: current.manifest };
+        } else {
+            const found = await this.lookupVersion(session, trimmed, requested);
+            target = { name: trimmed, version: found.version, manifest: found.manifest };
+        }
+        const plan: PluginChangePlan = await planPluginChange(installed, target, this.plannerRegistry(session), {
+            allowed: (dependency) => matchesAllowedPackage(dependency, this.allowedPackages),
+        });
+        return { plugin: target, ...plan };
     }
 
     /** Adds a plugin, installing and enabling the plugins it requires first. Refused with a `409` when a requirement
@@ -643,10 +723,11 @@ export abstract class BasePluginRoute<T extends Plugin> {
         }
         const session: RegistrySession = this.registrySession();
         const found = await this.lookupVersion(session, name, obj?.packageVersion);
+        const expectedPlan: PluginExpectedPlan | undefined = this.parseExpectedPlan(obj?.expectedPlan);
         const plan: PluginChangePlan = await this.planOrRefuse(session, installed, name, found.version, found.manifest);
-        this.assertExpectedPlan(obj?.expectedPlan, plan);
+        this.assertExpectedPlan(expectedPlan, plan, found.version);
 
-        return this.applyChange(async (undo) => {
+        return this.applyChange(installed, this.changedNames(name, plan), async (undo) => {
             const dependencies: T[] = await this.applyPlan(plan, installed, req, user, undo);
             const created: T = await this.installRow({ name, version: found.version, integrity: found.integrity, manifest: found.manifest }, user, undo);
             await this.audit(req, user, AuditAction.PLUGIN_INSTALL, created, { packageVersion: found.version });
@@ -669,6 +750,11 @@ export abstract class BasePluginRoute<T extends Plugin> {
         let dependencyPlan: PluginChangePlan | undefined;
         const session: RegistrySession = this.registrySession();
 
+        if (obj?.packageVersion !== undefined && (typeof obj.packageVersion !== "string" || obj.packageVersion.trim() === "")) {
+            // An empty version would otherwise read as a change to the registry's `latest`.
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'packageVersion' must be a version.");
+        }
+        const expectedPlan: PluginExpectedPlan | undefined = this.parseExpectedPlan(obj?.expectedPlan);
         const changingVersion: boolean = obj?.packageVersion !== undefined && obj.packageVersion !== existing.packageVersion;
         if (changingVersion || (obj?.enabled === true && !existing.enabled)) {
             // An allow-list narrowed since the plugin was added also stops it being re-enabled or moved to another version.
@@ -709,20 +795,33 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, err.message);
             }
         }
-        this.assertExpectedPlan(obj?.expectedPlan, dependencyPlan ?? { install: [], enable: [] });
+        if (dependencyPlan) {
+            // A change that plans nothing (the plugin stays or becomes disabled) has no preview to compare against.
+            this.assertExpectedPlan(expectedPlan, dependencyPlan, patch.packageVersion ?? existing.packageVersion);
+        }
 
         if (dependencyPlan && obj?.version !== undefined && obj.version !== existing.version) {
             // Checked before any dependency is touched, so a stale edit changes nothing.
             throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, ApiErrorMessages.INVALID_OBJECT_VERSION);
         }
-        return this.applyChange(async (undo) => {
+        return this.applyChange(installed, this.changedNames(existing.name, dependencyPlan), async (undo) => {
             if (dependencyPlan) {
                 await this.applyPlan(dependencyPlan, installed, req, user, undo);
             }
+            const options = { user, ignoreACL: true };
             const updated: T = await this.pluginRepo!.update({ uid: existing.uid, version: obj?.version ?? existing.version, ...patch } as any, existing, {
-                user,
+                ...options,
                 version: obj?.version,
-                ignoreACL: true,
+            });
+            const previous: Partial<Plugin> = {
+                packageVersion: existing.packageVersion,
+                integrity: existing.integrity ?? (null as any),
+                enabled: existing.enabled,
+                settings: existing.settings,
+                manifest: existing.manifest,
+            };
+            undo.push(async () => {
+                await this.pluginRepo!.update({ uid: updated.uid, version: updated.version, ...previous } as any, updated, options);
             });
             await this.audit(req, user, AuditAction.PLUGIN_UPDATE, updated, {
                 packageVersion: updated.packageVersion,
@@ -737,12 +836,15 @@ export abstract class BasePluginRoute<T extends Plugin> {
     @Delete("/:id")
     public async remove(@Param("id") id: string, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<void> {
         const existing: T = await this.findInstalled(id);
-        this.assertNoDependents(await this.installedPlugins(), existing, "uninstalled");
-        await this.pluginRepo!.update({ uid: existing.uid, version: existing.version, enabled: false, removed: true } as any, existing, {
-            user,
-            ignoreACL: true,
+        const installed: T[] = await this.installedPlugins();
+        this.assertNoDependents(installed, existing, "uninstalled");
+        await this.applyChange(installed, [existing.name], async (undo) => {
+            const options = { user, ignoreACL: true };
+            const removed: T = await this.pluginRepo!.update({ uid: existing.uid, version: existing.version, enabled: false, removed: true } as any, existing, options);
+            undo.push(async () => {
+                await this.pluginRepo!.update({ uid: removed.uid, version: removed.version, enabled: existing.enabled, removed: false } as any, removed, options);
+            });
+            await this.audit(req, user, AuditAction.PLUGIN_REMOVE, existing, { packageVersion: existing.packageVersion });
         });
-        await this.audit(req, user, AuditAction.PLUGIN_REMOVE, existing, { packageVersion: existing.packageVersion });
-        await this.announce();
     }
 }

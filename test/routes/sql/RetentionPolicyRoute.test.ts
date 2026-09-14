@@ -12,6 +12,7 @@ import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { RetentionPolicySQL } from "../../../src/models/sql/RetentionPolicySQL.js";
 import { AuditAction, MIN_AUDIT_LOG_RETENTION_DAYS } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { retentionPolicyClearSuite } from "../retentionPolicyClearSuite.js";
 
 describe("Route:RetentionPolicySQL Tests", () => {
     const logger = Logger();
@@ -48,6 +49,13 @@ describe("Route:RetentionPolicySQL Tests", () => {
     beforeEach(async () => {
         await policyRepo.clear();
         await auditLogRepo.clear();
+    });
+
+    retentionPolicyClearSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        adminToken: () => adminToken,
+        storedPolicy: async () => (await policyRepo.find())[0],
     });
 
     describe("GET /retention-policy (authenticated, any user)", () => {

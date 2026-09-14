@@ -231,13 +231,32 @@ export function parsePluginManifest(pkg: any): PluginManifest | string {
             return `This plugin's manifest requires ${name} with an invalid version range.`;
         }
     }
+    if (manifest.mailboxScopedData !== undefined && typeof manifest.mailboxScopedData !== "boolean") {
+        return "This plugin's manifest mailboxScopedData must be true or false.";
+    }
     return {
         apiVersion: manifest.apiVersion,
         displayName: manifest.displayName,
         description: typeof manifest.description === "string" ? manifest.description : undefined,
         settings: settings as PluginSettingDefinition[],
         ...(Object.keys(requires).length > 0 ? { requires: requires as Record<string, string> } : {}),
+        ...(manifest.mailboxScopedData !== undefined ? { mailboxScopedData: manifest.mailboxScopedData } : {}),
     };
+}
+
+/** Whether `version` is an exact, already-normalized semver version. `semver.valid()` alone also accepts forms such as
+ * `v1.0.0` or ` 1.0.0`, which npm would install as a different string than the one stored. */
+export function isExactVersion(version: unknown): version is string {
+    return typeof version === "string" && semver.valid(version) !== null && semver.clean(version) === version;
+}
+
+/** The settings `manifest` requires that have neither a default nor a value in `values` - a plugin can't run without
+ * them. */
+export function missingRequiredSettings(manifest: PluginManifest | undefined, values: Record<string, unknown> = {}): PluginSettingDefinition[] {
+    return (manifest?.settings ?? []).filter((setting) => {
+        const value: unknown = Object.prototype.hasOwnProperty.call(values, setting.key) ? values[setting.key] : undefined;
+        return setting.required && setting.default === undefined && (value === undefined || value === null || value === "");
+    });
 }
 
 function checkSettingDefinition(setting: any): string | undefined {
@@ -358,16 +377,18 @@ function checkSettingValue(definition: PluginSettingDefinition, value: unknown):
 }
 
 /**
- * A stable fingerprint of what a server copy should have loaded: every enabled plugin's name, version and
- * settings, independent of row order and key order. Two copies with the same hash loaded the same plugins
- * with the same settings, so a change message whose hash matches a copy's own is a no-op for it.
+ * A stable fingerprint of what a server copy should have loaded: every enabled plugin's name, version, recorded
+ * integrity and settings, independent of row order and key order. Two copies with the same hash loaded the same
+ * plugins with the same settings, so a change message whose hash matches a copy's own is a no-op for it. An unset
+ * integrity (`undefined`, or `null` as SQL reads it back) hashes the same.
  */
-export function computePluginStateHash(plugins: Pick<Plugin, "name" | "packageVersion" | "enabled" | "settings">[]): string {
+export function computePluginStateHash(plugins: (Pick<Plugin, "name" | "packageVersion" | "enabled" | "settings"> & { integrity?: string | null })[]): string {
     const normalized = plugins
         .filter((plugin) => plugin.enabled)
         .map((plugin) => [
             plugin.name,
             plugin.packageVersion,
+            plugin.integrity ?? null,
             Object.keys(plugin.settings ?? {})
                 .sort()
                 .map((key) => [key, plugin.settings[key]]),

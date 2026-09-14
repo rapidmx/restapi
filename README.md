@@ -64,6 +64,35 @@ until a specific code path is hit:
   message that didn't originally carry one. This is a DKIM-signer configuration concern (outside this
   library's own code, which only attaches the headers) — configure your outbound MTA/DKIM signer accordingly.
 
+## Upgrading
+
+### SQL: 64-bit byte counts and timestamps (Postgres and MySQL/MariaDB)
+
+`mailbox_sql.quotaBytes`/`usedBytes`, `mailbox_policy_sql.defaultQuotaBytes`/`autoProvisionQuotaBytes` and
+`contact_sql.keysFirstSeen`/`lastMessageSeen` are `double precision` columns (a 32-bit `integer` can't hold a 5 GB
+quota or an epoch-millisecond timestamp). With `synchronize: true`, TypeORM applies a column **type** change on
+Postgres and MySQL by dropping the column and adding it again — every stored quota, used-byte count and key timestamp
+is lost, and on Postgres adding the `NOT NULL` mailbox columns to a non-empty table fails at startup. SQLite rebuilds
+the table with its data, so it needs nothing.
+
+Before starting a version with these column types on an existing Postgres or MySQL database whose columns are still
+integers, change them in place (TypeORM then finds nothing to change):
+
+```sql
+-- Postgres
+ALTER TABLE mailbox_sql ALTER COLUMN "quotaBytes" TYPE double precision, ALTER COLUMN "usedBytes" TYPE double precision;
+ALTER TABLE mailbox_policy_sql ALTER COLUMN "defaultQuotaBytes" TYPE double precision, ALTER COLUMN "autoProvisionQuotaBytes" TYPE double precision;
+ALTER TABLE contact_sql ALTER COLUMN "keysFirstSeen" TYPE double precision, ALTER COLUMN "lastMessageSeen" TYPE double precision;
+
+-- MySQL / MariaDB
+ALTER TABLE mailbox_sql MODIFY `quotaBytes` DOUBLE NOT NULL, MODIFY `usedBytes` DOUBLE NOT NULL;
+ALTER TABLE mailbox_policy_sql MODIFY `defaultQuotaBytes` DOUBLE NULL, MODIFY `autoProvisionQuotaBytes` DOUBLE NULL;
+ALTER TABLE contact_sql MODIFY `keysFirstSeen` DOUBLE NULL, MODIFY `lastMessageSeen` DOUBLE NULL;
+```
+
+Skip any table that doesn't exist yet (it's created with the right types). A MySQL column already created as `double`
+is left alone.
+
 ## Status
 
 This library is under active development. Phase 1 (the core data model, the standard RapidREST CRUD API, mail

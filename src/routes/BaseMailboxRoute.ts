@@ -23,6 +23,7 @@ import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { DEFAULT_MAILBOX_QUOTA_BYTES, findOrSeedMailboxPolicy } from "../util/MailboxPolicyUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
+import { normalizeUserUid } from "../util/UserUidUtils.js";
 const { Auth, Delete, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 const { Config } = ObjectDecorators;
 
@@ -48,6 +49,21 @@ function rejectServerManagedFields(obj: Record<string, unknown>): void {
     }
     if (typeof obj.keyDiscoveryHash === "string" && obj.keyDiscoveryHash.length > 0) {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'keyDiscoveryHash' is managed by the server and cannot be set directly.");
+    }
+}
+
+/** `Mailbox` fields only a trusted caller may change: who owns the mailbox, and how much it may store and is counted as
+ * storing. A delegate with plain update access could otherwise take the mailbox over or lift its quota. */
+const TRUSTED_ONLY_FIELDS = ["ownerUserUid", "quotaBytes", "usedBytes"] as const;
+
+/** Lowercases a patch's addresses in place, as `create()` does - mail delivery and every address comparison in this
+ * codebase already work on lowercased addresses, and `uid` is the lowercased address too. */
+function normalizeAddressFields(obj: Record<string, unknown>): void {
+    if (typeof obj.primarySmtpAddress === "string") {
+        obj.primarySmtpAddress = normalizeAddress(obj.primarySmtpAddress);
+    }
+    if (Array.isArray(obj.aliasAddresses)) {
+        obj.aliasAddresses = obj.aliasAddresses.map((alias) => (typeof alias === "string" ? normalizeAddress(alias) : alias));
     }
 }
 
@@ -300,6 +316,75 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 }
                 (o as any).ownerUserUid = user.uid;
             }
+            await this.assertSelfServiceCreate(objs, req);
+        } else {
+            for (const o of objs) {
+                if ((o as any).ownerUserUid === null || (o as any).ownerUserUid === "") {
+                    // No owner: a shared mailbox.
+                    delete (o as any).ownerUserUid;
+                } else if (o.ownerUserUid !== undefined) {
+                    (o as any).ownerUserUid = this.parseOwnerUserUid(o.ownerUserUid, user);
+                }
+            }
+        }
+        return this.createMailboxes(obj, objs, req, user, isTrusted);
+    }
+
+    /**
+     * The owner a trusted caller assigns: a user uid (UUID-shaped, stored lowercase), or the caller's own uid whatever
+     * its shape. Anything else - a role name, `anonymous`, a wildcard, a typo - would leave the mailbox owned by nobody
+     * who can sign in, or by far more than one person wherever the owner is matched against ACL records.
+     */
+    private parseOwnerUserUid(value: unknown, user: JWTUser | undefined): string {
+        const uid: string | undefined = normalizeUserUid(value) ?? (value === user?.uid ? (value as string) : undefined);
+        if (uid === undefined) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'ownerUserUid' must be a user uid.");
+        }
+        return uid;
+    }
+
+    /**
+     * Holds a non-trusted caller's `POST /` to the same rules as `autoProvision()`, which it could otherwise sidestep:
+     * the mailbox policy must allow self-service mailboxes (and is read fail-closed), every address - primary and
+     * aliases - must be one of the caller's own auth-server name aliases on a verified domain, and the quota is the
+     * policy's self-service quota with nothing yet used, whatever the request says.
+     */
+    private async assertSelfServiceCreate(objs: T[], req: HttpRequest): Promise<void> {
+        const policy = await findOrSeedMailboxPolicy(this._objectFactory!, this.mailboxPolicyClass, {
+            defaultQuotaBytes: this.defaultQuotaBytes,
+            autoProvisionEnabled: this.autoProvisionEnabled,
+            autoProvisionQuotaBytes: this.autoProvisionQuotaBytes,
+        }, this.logger, true);
+        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        const hasAliasSource: boolean = this.staticAliases.length > 0 || !!this.authServerUrl;
+        if (!policy.autoProvisionEnabled || domains.length === 0 || !hasAliasSource) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Creating your own mailbox is not enabled on this server.");
+        }
+        const aliases: string[] = (await this.fetchNameAliases(req)).map((alias) => alias.toLowerCase());
+        const ownAddress = (address: unknown): boolean => {
+            const [local, domain, ...rest] = typeof address === "string" ? normalizeAddress(address).split("@") : [];
+            return rest.length === 0 && aliases.includes(local) && domains.includes(domain);
+        };
+        for (const o of objs) {
+            const addresses: unknown[] = [o.primarySmtpAddress, ...(Array.isArray(o.aliasAddresses) ? o.aliasAddresses : [])];
+            // A missing primary address is left to the check below, which answers it with a 400.
+            if (addresses.some((address, i) => (i > 0 || address) && !ownAddress(address))) {
+                throw new ApiError(
+                    ApiErrors.AUTH_PERMISSION_FAILURE,
+                    403,
+                    "You can only create a mailbox at one of your own usernames on this server's domains.",
+                );
+            }
+            (o as any).quotaBytes = policy.autoProvisionQuotaBytes;
+            (o as any).usedBytes = 0;
+        }
+    }
+
+    /** Creates already-authorized mailboxes: the domain and address checks every caller gets, then the rows and their
+     * well-known folders. */
+    private async createMailboxes(obj: T | T[], objs: T[], req: HttpRequest, user: JWTUser, isTrusted: boolean): Promise<T | T[]> {
+        for (const o of objs) {
+            normalizeAddressFields(o as Record<string, unknown>);
         }
         // Applies to every caller, trusted or not — this server's verified `Domain`s (once at least one
         // exists) are the one source of truth for which domains it accepts mail on at all, not just a
@@ -418,20 +503,55 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * for how that path is handled instead.
      */
     protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser): Promise<void> {
-        await this.validateEscrowScopeAssignment(id, obj, UserUtils.hasRoles(user, this.trustedRoles));
+        const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
+        await this.validateEscrowScopeAssignment(id, obj, isTrusted);
         rejectServerManagedFields(obj);
+        await this.validateTrustedOnlyFields(id, obj, user, isTrusted);
+        normalizeAddressFields(obj);
         if (obj.primarySmtpAddress !== undefined) {
             // Only re-validate when the address is genuinely changing, not merely present in the patch (a
             // client round-tripping the full object back unchanged must not start failing because e.g. a
             // domain was un-verified after the fact - the same "only act on a real change" guard
             // `BaseDomainRoute.update()` applies to its own uid-derived `name` field).
             const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
-            if (existing && existing.primarySmtpAddress !== obj.primarySmtpAddress) {
+            if (existing && normalizeAddress(existing.primarySmtpAddress) !== obj.primarySmtpAddress) {
                 await this.validateAddressChange(id, obj.primarySmtpAddress);
             }
             (obj as any).keyDiscoveryHash = computeKeyDiscoveryHash(obj.primarySmtpAddress.split("@")[0]);
         }
         return super.validateUpdate(id, obj, user);
+    }
+
+    /**
+     * Refuses a non-trusted caller's change to `TRUSTED_ONLY_FIELDS`, and checks a trusted caller's new `ownerUserUid`
+     * (see `parseOwnerUserUid()`). Like the escrow scope check, only a real change counts, so a full-object `PUT`
+     * round-tripping the current values - including an owner uid stored before this check existed - still works.
+     */
+    private async validateTrustedOnlyFields(id: string, obj: Record<string, any>, user: JWTUser | undefined, isTrusted: boolean): Promise<void> {
+        const touched = TRUSTED_ONLY_FIELDS.filter((field) => obj[field] !== undefined);
+        if (touched.length === 0) {
+            return;
+        }
+        const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+        for (const field of touched) {
+            let changed: boolean;
+            if (field === "ownerUserUid") {
+                // `null` (SQL's unset) and `""` both mean no owner.
+                const next: unknown = obj.ownerUserUid || undefined;
+                const current: string | undefined = existing?.ownerUserUid || undefined;
+                changed = typeof next === "string" && typeof current === "string" ? next.toLowerCase() !== current.toLowerCase() : next !== current;
+                if (!changed) {
+                    obj.ownerUserUid = existing?.ownerUserUid;
+                } else if (isTrusted && next !== undefined) {
+                    obj.ownerUserUid = this.parseOwnerUserUid(next, user);
+                }
+            } else {
+                changed = obj[field] !== (existing as any)?.[field];
+            }
+            if (changed && !isTrusted) {
+                throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, `'${field}' can only be changed by a trusted administrator.`);
+            }
+        }
     }
 
     /**
@@ -496,12 +616,16 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             if (!current) {
                 throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
             }
+            if (typeof obj !== "string") {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'primarySmtpAddress' must be an address.");
+            }
+            obj = normalizeAddress(obj);
             // This redirects straight to `this.update()` below rather than going through the framework's own
             // HTTP dispatch (there is none here - this is a plain in-process call), so the `@Validate
             // ("validateUpdate")` pipeline middleware that would normally run `validateUpdate()` for a real
             // PUT never fires for this path. `validateAddressChange()` must therefore be called explicitly
             // here too, the same "only on a genuine change" guard `validateUpdate()` itself applies.
-            if (current.primarySmtpAddress !== obj) {
+            if (normalizeAddress(current.primarySmtpAddress) !== obj) {
                 await this.validateAddressChange(id, obj);
             }
             return this.update(
@@ -516,7 +640,11 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 user,
             );
         }
-        return super.updateProperty(id, propertyName, obj, user);
+        // As `CRUDRoute.updateProperty()`, except that what's saved is the value `validateUpdate()` left in the patch -
+        // a normalized alias list or owner uid, not the raw one.
+        const patch: Record<string, any> = { [propertyName]: obj };
+        await this.validateUpdate(id, patch as UpdateObject<T>, user);
+        return await this.doUpdateProperty(id, propertyName, patch[propertyName], { user });
     }
 
     /**
@@ -589,17 +717,15 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
 
-        const mailbox = (await this.create(
-            {
-                primarySmtpAddress: `${body.alias}@${body.domain}`,
-                displayName: body.alias,
-                ownerUserUid: user.uid,
-                timezone: "UTC",
-                quotaBytes: policy.autoProvisionQuotaBytes,
-            } as T,
-            req,
-            user,
-        )) as T;
+        // Everything `create()` would check for a self-service caller was checked above, against the same policy read.
+        const requested = {
+            primarySmtpAddress: `${body.alias}@${body.domain}`,
+            displayName: body.alias,
+            ownerUserUid: user.uid,
+            timezone: "UTC",
+            quotaBytes: policy.autoProvisionQuotaBytes,
+        } as T;
+        const mailbox = (await this.createMailboxes(requested, [requested], req, user, UserUtils.hasRoles(user, this.trustedRoles))) as T;
         return { status: "created", mailbox };
     }
 

@@ -12,6 +12,7 @@ import { RetentionPolicyMongo } from "../../../src/models/mongo/RetentionPolicyM
 import { AuditAction, MIN_AUDIT_LOG_RETENTION_DAYS } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { retentionPolicyClearSuite } from "../retentionPolicyClearSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
@@ -54,6 +55,13 @@ describe("Route:RetentionPolicyMongo Tests", () => {
     beforeEach(async () => {
         await policyRepo.clear();
         await auditLogRepo.clear();
+    });
+
+    retentionPolicyClearSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        adminToken: () => adminToken,
+        storedPolicy: async () => (await policyRepo.find().toArray())[0],
     });
 
     describe("GET /retention-policy (authenticated, any user)", () => {

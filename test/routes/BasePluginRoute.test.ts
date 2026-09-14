@@ -99,6 +99,19 @@ describe("BasePluginRoute namespaces", () => {
         const rapidmx: any = route.createRegistryClient("@rapidmx/mapi-plugin");
         expect([rapidmx.registryUrl, rapidmx.authToken]).toEqual(["https://registry.default.test", undefined]);
         expect(route.allowedPackages).toEqual(["left-pad", "@rapidmx/*", "@acme/*"]);
+
+        // A namespace with a token but no registry of its own uses that token on the default registry; one with its own
+        // registry and no token never gets the default registry's token.
+        const tokens = await newRoute({
+            registryUrl: "https://registry.default.test",
+            registryToken: "global",
+            namespacesConfig: ["@rapidmx", { name: "@tok", token: "ns-token" }, { name: "@own", registry: "https://npm.own.test" }],
+        });
+        const tok: any = tokens.createRegistryClient("@tok/x-plugin");
+        expect([tok.registryUrl, tok.authToken]).toEqual(["https://registry.default.test", "ns-token"]);
+        expect(tokens.createRegistryClient("@rapidmx/x-plugin").authToken).toBe("global");
+        const own: any = tokens.createRegistryClient("@own/x-plugin");
+        expect([own.registryUrl, own.authToken]).toEqual(["https://npm.own.test", undefined]);
         expect(route.listNamespaces()).toEqual([{ name: "@rapidmx", registry: undefined }, { name: "@acme", registry: "https://npm.acme.test" }]);
     });
 
@@ -127,5 +140,12 @@ describe("BasePluginRoute rollback", () => {
         ]);
         expect(order).toEqual(["second", "first"]);
         expect(logger.error).toHaveBeenCalledWith("Could not undo part of a failed plugin change: row gone");
+    });
+
+    it("logs, rather than throws, a failure to announce a change, so it can't replace the change's outcome", async () => {
+        const logger = { error: vi.fn() };
+        const route = await newRoute({ logger, pluginRepo: { find: vi.fn().mockRejectedValue(new Error("db down")) } });
+        await expect(route.announce()).resolves.toBeUndefined();
+        expect(logger.error).toHaveBeenCalledWith("Could not announce a plugin change: db down");
     });
 });

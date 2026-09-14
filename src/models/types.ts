@@ -2321,6 +2321,9 @@ export interface PluginManifest {
     /** Other plugins this one needs, as package name to npm version range. They are installed and enabled along with
      * it and loaded before it, and can't be disabled or uninstalled while it's enabled. */
     requires?: Record<string, string>;
+    /** `true` when the plugin stores data belonging to a mailbox (models marked `@MailboxScopedData()`). A data-subject
+     * erasure waits while such a plugin is installed but not loaded, since its rows can't be purged without its models. */
+    mailboxScopedData?: boolean;
 }
 
 /**

@@ -156,6 +156,15 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
         expect(found).toBeTruthy();
     });
 
+    it("Does nothing when both fields were cleared to null (no automatic purge).", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", messageRetentionDays: null as any, auditLogRetentionDays: null as any }));
+        const message = await createMessage({ sentDate: new Date(Date.now() - 3650 * DAY_MS) });
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        expect(await messageRepo.findOne({ uid: message.uid } as any)).toBeTruthy();
+    });
+
     it("Does nothing when the repos are not yet initialized.", async () => {
         const original = (job as any).messageRepo;
         (job as any).messageRepo = undefined;

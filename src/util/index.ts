@@ -34,3 +34,4 @@ export * from "./MimeHeaderUtils.js";
 export * from "./OofUtils.js";
 export * from "./RecoverableRepoUtils.js";
 export * from "./TransportRuleUtils.js";
+export * from "./UserUidUtils.js";

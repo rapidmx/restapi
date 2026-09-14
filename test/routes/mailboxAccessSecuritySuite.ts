@@ -56,6 +56,158 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
             const repeated = await as(ctx.ownerToken, request(ctx.app()).get(`${ctx.baseUrl}/lookup-by-email?email=a@example.com&email=b@example.com`));
             expect(repeated.status).toBe(400);
         });
+
+        it("finds a mailbox whose address is stored in mixed case, but not by an address it no longer has", async () => {
+            const local: string = `Mixed.Case.${uuid.v4()}`;
+            const mixed = await ctx.createMailbox([], { uid: `${local}@example.com`.toLowerCase(), primarySmtpAddress: `${local}@Example.com` });
+            const lookup = (email: string) => as(ctx.ownerToken, request(ctx.app()).get(`${ctx.baseUrl}/lookup-by-email?email=${encodeURIComponent(email)}`));
+            const found = await lookup(`${local}@example.com`.toLowerCase());
+            expect(found.status).toBe(200);
+            expect(found.body).toEqual({ userUid: ctx.ownerUid, displayName: "Test Mailbox" });
+            expect(mixed.uid).toBe(`${local}@example.com`.toLowerCase());
+
+            // Renamed: the uid keeps the old address, which must no longer resolve; the new address still does.
+            const renamed = await ctx.createMailbox([], { uid: `old-${local}@example.com`.toLowerCase(), primarySmtpAddress: `new-${local}@example.com`.toLowerCase(), displayName: "Renamed" });
+            expect((await lookup(renamed.uid)).body).toBeNull();
+            expect((await lookup(`new-${local}@example.com`)).body).toEqual({ userUid: ctx.ownerUid, displayName: "Renamed" });
+            // An alias still resolves through a uid match.
+            const aliased = await ctx.createMailbox([], { uid: `alias-${local}@example.com`.toLowerCase(), primarySmtpAddress: `other-${local}@example.com`.toLowerCase(), aliasAddresses: [`Alias-${local}@example.com`], displayName: "Aliased" });
+            expect((await lookup(aliased.uid)).body).toEqual({ userUid: ctx.ownerUid, displayName: "Aliased" });
+        });
+
+        it("limits each caller to 30 lookups a minute, whatever the deployment's default for signed-in callers", async () => {
+            const caller: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
+            const token: string = JWTUtils.createTokenSync(ctx.config.get("auth"), caller);
+            const statuses: number[] = [];
+            for (let i = 0; i < 31; i++) {
+                statuses.push((await as(token, request(ctx.app()).get(`${ctx.baseUrl}/lookup-by-email?email=nobody@example.com`))).status);
+            }
+            expect(statuses.slice(0, 30).every((status) => status === 200)).toBe(true);
+            expect(statuses[30]).toBe(429);
+        });
+    });
+
+    describe("fields only a trusted caller may change", () => {
+        const updateOnly = [ACLAction.READ, ACLAction.UPDATE];
+        const mailboxUrl = (uid: string, property: string = "") => `${ctx.baseUrl}/${uid}${property ? `/${property}` : ""}`;
+        /** A full-object style `PUT`, carrying the mailbox's current optimistic-lock version. */
+        const putMailbox = async (token: string, uid: string, body: Record<string, unknown>) => {
+            const { version } = (await as(adminToken, request(ctx.app()).get(mailboxUrl(uid)))).body;
+            return await as(token, request(ctx.app()).put(mailboxUrl(uid))).send({ uid, version, ...body });
+        };
+
+        it("refuses a delegate with update access changing the owner, quota or used bytes, by PUT or property PUT", async () => {
+            const mailbox: any = await ctx.createMailbox([{ userOrRoleId: delegate.uid, actions: updateOnly }]);
+            for (const body of [{ ownerUserUid: delegate.uid }, { ownerUserUid: null }, { quotaBytes: 1e15 }, { usedBytes: 0.5 }]) {
+                const result = await putMailbox(delegateToken, mailbox.uid, body);
+                expect(result.status).toBe(403);
+                expect(result.body.message).toMatch(/can only be changed by a trusted administrator/);
+            }
+            expect((await as(delegateToken, request(ctx.app()).put(mailboxUrl(mailbox.uid, "ownerUserUid"))).send(JSON.stringify(delegate.uid)).set("Content-Type", "application/json")).status).toBe(403);
+
+            // Round-tripping the current values is fine (including the owner uid in another case), as is anything else.
+            const roundTrip = await putMailbox(delegateToken, mailbox.uid, {
+                ownerUserUid: ctx.ownerUid.toUpperCase(),
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+                displayName: "Renamed",
+            });
+            expect(roundTrip.status).toBe(200);
+            expect(roundTrip.body).toEqual(expect.objectContaining({ ownerUserUid: ctx.ownerUid, quotaBytes: 1_000_000_000, displayName: "Renamed" }));
+        });
+
+        it("lets a trusted caller change them, requiring a user uid for the owner and storing it lowercase", async () => {
+            const mailbox: any = await ctx.createMailbox();
+            const newOwner: string = uuid.v4();
+            const changed = await putMailbox(adminToken, mailbox.uid, { ownerUserUid: newOwner.toUpperCase(), quotaBytes: 2e10 });
+            expect(changed.status).toBe(200);
+            expect(changed.body).toEqual(expect.objectContaining({ ownerUserUid: newOwner, quotaBytes: 2e10 }));
+            for (const ownerUserUid of ["dev-user", "anonymous", 5]) {
+                const result = await putMailbox(adminToken, mailbox.uid, { ownerUserUid });
+                expect(result.status).toBe(400);
+            }
+            const shared = await putMailbox(adminToken, mailbox.uid, { ownerUserUid: null });
+            expect(shared.status).toBe(200);
+            expect(shared.body.ownerUserUid ?? undefined).toBeUndefined();
+
+            // An owner uid stored before this check existed still round-trips.
+            const legacy: any = await ctx.createMailbox([], { ownerUserUid: "dev-user" });
+            expect((await putMailbox(adminToken, legacy.uid, { ownerUserUid: "dev-user", displayName: "Kept" })).status).toBe(200);
+        });
+
+        it("stores changed addresses lowercase, by PUT or property PUT", async () => {
+            const mailbox: any = await ctx.createMailbox();
+            const aliases = await putMailbox(ctx.ownerToken, mailbox.uid, { aliasAddresses: ["Alias.One@Example.com", 3] });
+            expect(aliases.status).toBe(200);
+            expect(aliases.body.aliasAddresses).toEqual(["alias.one@example.com", 3]);
+            const property = await as(ctx.ownerToken, request(ctx.app()).put(mailboxUrl(mailbox.uid, "aliasAddresses"))).send(["Alias.Two@Example.com"]);
+            expect(property.status).toBe(200);
+            expect(property.body.aliasAddresses).toEqual(["alias.two@example.com"]);
+            const renamed = await as(ctx.ownerToken, request(ctx.app()).put(mailboxUrl(mailbox.uid, "primarySmtpAddress"))).send(`New.${mailbox.primarySmtpAddress.toUpperCase()}`);
+            expect(renamed.status).toBe(200);
+            expect(renamed.body.primarySmtpAddress).toBe(`new.${mailbox.primarySmtpAddress}`);
+            // Resending the current address in another case isn't a change.
+            const same = await as(ctx.ownerToken, request(ctx.app()).put(mailboxUrl(mailbox.uid, "primarySmtpAddress"))).send(`NEW.${mailbox.primarySmtpAddress}`);
+            expect(same.status).toBe(200);
+            const notAddress = await as(ctx.ownerToken, request(ctx.app()).put(mailboxUrl(mailbox.uid, "primarySmtpAddress"))).send([1]);
+            expect(notAddress.status).toBe(400);
+        });
+
+        it("still answers 404 for a trusted-only field change on a mailbox that doesn't exist", async () => {
+            const missing = `${uuid.v4()}@example.com`;
+            const result = await as(adminToken, request(ctx.app()).put(mailboxUrl(missing))).send({ uid: missing, version: 0, ownerUserUid: uuid.v4(), quotaBytes: 1 });
+            expect(result.status).toBe(404);
+        });
+    });
+
+    describe("GET /:id/access/me", () => {
+        const me = (mailboxUid: string) => `${ctx.baseUrl}/${mailboxUid}/access/me`;
+        const none = { canRead: false, canCreate: false, canUpdate: false, canDelete: false, canManage: false };
+        const all = { canRead: true, canCreate: true, canUpdate: true, canDelete: true, canManage: true };
+
+        it("reports the caller's effective access from owner, delegate, role, wildcard and trusted-role records", async () => {
+            const roleUser: any = { uid: uuid.v4(), roles: ["support"], elevated: Date.now() };
+            const stranger: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
+            const mailbox = await ctx.createMailbox([
+                { userOrRoleId: delegate.uid, actions: [ACLAction.READ, ACLAction.UPDATE] },
+                { userOrRoleId: "support", actions: [ACLAction.FULL] },
+            ]);
+            const get = async (token: string, uid: string = mailbox.uid) => await as(token, request(ctx.app()).get(me(uid)));
+            const token = (user: any) => JWTUtils.createTokenSync(ctx.config.get("auth"), user);
+
+            expect((await get(ctx.ownerToken)).body).toEqual(all);
+            expect((await get(adminToken)).body).toEqual(all);
+            expect((await get(token(roleUser))).body).toEqual(all);
+            expect((await get(delegateToken)).body).toEqual({ canRead: true, canCreate: false, canUpdate: true, canDelete: false, canManage: true });
+            const denied = await get(token(stranger));
+            expect(denied.status).toBe(200);
+            expect(denied.body).toEqual(none);
+
+            const open = await ctx.createMailbox([{ userOrRoleId: ".*", actions: [ACLAction.READ] }]);
+            expect((await get(token(stranger), open.uid)).body).toEqual({ ...none, canRead: true });
+        });
+
+        it("returns 404 for a missing mailbox and 401 without a signed-in caller", async () => {
+            expect((await as(ctx.ownerToken, request(ctx.app()).get(me(`${uuid.v4()}@example.com`)))).status).toBe(404);
+            const mailbox = await ctx.createMailbox();
+            expect((await request(ctx.app()).get(me(mailbox.uid))).status).toBe(401);
+        });
+
+        it("reports no access when the mailbox has no ACL", async () => {
+            const mailbox = await ctx.createMailbox();
+            vi.spyOn(ACLUtils.prototype, "findACL").mockResolvedValue(undefined);
+            expect((await as(delegateToken, request(ctx.app()).get(me(mailbox.uid)))).body).toEqual(none);
+        });
+
+        it("never treats 'me' as a member id", async () => {
+            const mailbox = await ctx.createMailbox();
+            const put = await as(ctx.ownerToken, request(ctx.app()).put(access(mailbox.uid, "me"))).send({ role: "viewer" });
+            expect(put.status).toBe(400);
+            expect(put.body.message).toBe("Access can only be granted to a user.");
+            expect((await as(ctx.ownerToken, request(ctx.app()).delete(access(mailbox.uid, "me")))).status).toBe(204);
+            expect((await as(ctx.ownerToken, request(ctx.app()).get(access(mailbox.uid)))).body).toEqual([]);
+            expect((await as(ctx.ownerToken, request(ctx.app()).get(me(mailbox.uid)))).body).toEqual(all);
+        });
     });
 
     describe("who can be granted access", () => {
@@ -66,6 +218,24 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
                 expect(result.status).toBe(400);
                 expect(result.body.message).toBe("Access can only be granted to a user.");
             }
+        });
+
+        it("stores a user uid lowercase, and matches the owner, the caller and existing records whatever their case", async () => {
+            const mailbox = await ctx.createMailbox([{ userOrRoleId: delegate.uid, actions: [ACLAction.READ, ACLAction.UPDATE] }]);
+            const upper: string = target.toUpperCase();
+            const granted = await as(ctx.ownerToken, request(ctx.app()).put(access(mailbox.uid, upper))).send({ role: "viewer" });
+            expect(granted.status).toBe(200);
+            expect(granted.body).toEqual({ userOrRoleId: target, role: "viewer" });
+            expect((await as(ctx.ownerToken, request(ctx.app()).put(access(mailbox.uid, target))).send({ role: "manager" })).status).toBe(200);
+            const members = await as(ctx.ownerToken, request(ctx.app()).get(access(mailbox.uid)));
+            expect(members.body.filter((member: any) => member.userOrRoleId.toLowerCase() === target)).toEqual([
+                { userOrRoleId: target, role: "manager", actions: [ACLAction.FULL] },
+            ]);
+
+            expect((await as(ctx.ownerToken, request(ctx.app()).put(access(mailbox.uid, ctx.ownerUid.toUpperCase()))).send({ role: "viewer" })).status).toBe(400);
+            expect((await as(delegateToken, request(ctx.app()).put(access(mailbox.uid, delegate.uid.toUpperCase()))).send({ role: "viewer" })).status).toBe(403);
+            expect((await as(ctx.ownerToken, request(ctx.app()).delete(access(mailbox.uid, upper)))).status).toBe(204);
+            expect((await as(ctx.ownerToken, request(ctx.app()).get(access(mailbox.uid)))).body.map((member: any) => member.userOrRoleId)).toEqual([delegate.uid]);
         });
 
         it("refuses to set 'custom', which is display-only", async () => {
@@ -92,6 +262,50 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
             expect((await as(delegateToken, request(ctx.app()).delete(access(mailbox.uid, manager)))).status).toBe(403);
 
             expect((await as(ctx.ownerToken, request(ctx.app()).put(access(mailbox.uid, target))).send({ role: "manager" })).status).toBe(200);
+        });
+
+        it("takes full access to add, change or remove a record for someone a role or wildcard record may give full access", async () => {
+            for (const grant of ["support", ".*"]) {
+                const viewerTarget: string = uuid.v4();
+                const mailbox = await ctx.createMailbox([
+                    { userOrRoleId: delegate.uid, actions: updateOnly },
+                    { userOrRoleId: grant, actions: [ACLAction.FULL] },
+                    { userOrRoleId: viewerTarget, actions: [ACLAction.READ] },
+                ]);
+                // A record of the target's own would override (narrow) that grant, and removing one would restore it.
+                expect((await as(delegateToken, request(ctx.app()).put(access(mailbox.uid, target))).send({ role: "viewer" })).status).toBe(403);
+                expect((await as(delegateToken, request(ctx.app()).delete(access(mailbox.uid, viewerTarget)))).status).toBe(403);
+                expect((await as(ctx.ownerToken, request(ctx.app()).put(access(mailbox.uid, target))).send({ role: "viewer" })).status).toBe(200);
+                expect((await as(ctx.ownerToken, request(ctx.app()).delete(access(mailbox.uid, viewerTarget)))).status).toBe(204);
+            }
+            // A role record that doesn't grant full access, or one for a trusted role, changes nothing.
+            const mailbox = await ctx.createMailbox([
+                { userOrRoleId: delegate.uid, actions: updateOnly },
+                { userOrRoleId: "support", actions: [ACLAction.READ] },
+                { userOrRoleId: "admin", actions: [ACLAction.FULL] },
+            ]);
+            expect((await as(delegateToken, request(ctx.app()).put(access(mailbox.uid, target))).send({ role: "viewer" })).status).toBe(200);
+        });
+
+        it("takes full access to add a record for someone a parent ACL gives full access", async () => {
+            const mailbox = await ctx.createMailbox([{ userOrRoleId: delegate.uid, actions: updateOnly }]);
+            const findACL = ACLUtils.prototype.findACL;
+            vi.spyOn(ACLUtils.prototype, "findACL").mockImplementation(async function (this: any, ...args: any[]) {
+                const acl: any = await (findACL as any).apply(this, args);
+                if (acl?.uid === mailbox.uid) {
+                    acl.parent = { uid: "parent", records: [{ userOrRoleId: target, actions: [ACLAction.FULL] }], parent: acl.parent };
+                }
+                return acl;
+            });
+            expect((await as(delegateToken, request(ctx.app()).put(access(mailbox.uid, target))).send({ role: "viewer" })).status).toBe(403);
+        });
+
+        it("checks permission against the same uncached ACL it saves", async () => {
+            const mailbox = await ctx.createMailbox([{ userOrRoleId: delegate.uid, actions: updateOnly }]);
+            const hasPermission = vi.spyOn(ACLUtils.prototype, "hasPermission");
+            expect((await as(delegateToken, request(ctx.app()).put(access(mailbox.uid, target))).send({ role: "viewer" })).status).toBe(200);
+            expect(hasPermission).toHaveBeenCalledWith(expect.objectContaining({ uid: delegate.uid }), expect.objectContaining({ uid: mailbox.uid }), ACLAction.UPDATE);
+            expect(hasPermission).not.toHaveBeenCalledWith(expect.anything(), mailbox.uid, expect.anything());
         });
 
         it("refuses a caller changing their own record, unless they're trusted", async () => {

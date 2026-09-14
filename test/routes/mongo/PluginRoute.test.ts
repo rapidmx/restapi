@@ -59,5 +59,8 @@ describe("Route:PluginMongo Tests", () => {
         bumpVersion: async (uid) => {
             await pluginRepo.updateOne({ uid }, { $inc: { version: 1 } });
         },
+        updatePlugin: async (uid, fields) => {
+            await pluginRepo.updateOne({ uid }, { $set: fields });
+        },
     });
 });

@@ -19,7 +19,9 @@ import { Repository } from "typeorm";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MailboxPolicySQL } from "../../../src/models/sql/MailboxPolicySQL.js";
+import { MAILBOX_POLICY_UID } from "../../../src/util/MailboxPolicyUtils.js";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { mailboxSelfServiceCreateSuite } from "../mailboxSelfServiceCreateSuite.js";
 
 describe("Route:MailboxSQL auto-provision/domain Tests", () => {
     const logger = Logger();
@@ -224,19 +226,6 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
         expect(result.body).toEqual(["example.com", "example.org"]);
     });
 
-    it("create() rejects a manually-specified mailbox address whose domain isn't in the configured list, for a non-trusted caller.", async () => {
-        const result = await withAuth(request(server.getApplication()).post(baseUrl), userToken).send({
-            primarySmtpAddress: `${uuid.v4()}@not-configured.com`,
-            aliasAddresses: [],
-            displayName: "Off-domain",
-            timezone: "UTC",
-            quotaBytes: 1_000_000_000,
-            usedBytes: 0,
-        });
-
-        expect(result.status).toBe(400);
-    });
-
     it("create() rejects an off-domain address even for a trusted (admin) caller — the domain list applies to everyone.", async () => {
         const result = await withAuth(request(server.getApplication()).post(baseUrl), adminToken).send({
             primarySmtpAddress: `${uuid.v4()}@not-configured.com`,
@@ -250,17 +239,18 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
         expect(result.status).toBe(400);
     });
 
-    it("create() allows a manually-specified address on one of the configured domains.", async () => {
-        const result = await withAuth(request(server.getApplication()).post(baseUrl), userToken).send({
-            primarySmtpAddress: `${uuid.v4()}@example.com`,
-            aliasAddresses: [],
-            displayName: "On-domain",
-            timezone: "UTC",
-            quotaBytes: 1_000_000_000,
-            usedBytes: 0,
-        });
-
-        expect(result.status).toBeGreaterThanOrEqual(200);
-        expect(result.status).toBeLessThan(300);
+    mailboxSelfServiceCreateSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        userUid: user.uid,
+        userToken,
+        adminToken,
+        withAuth,
+        mockAliases: (aliases) => mockFetch.mockResolvedValue(aliasResponse(aliases)),
+        disableSelfService: async () => {
+            await policyRepo.save(new MailboxPolicySQL({ uid: MAILBOX_POLICY_UID, autoProvisionEnabled: false } as any));
+        },
+        mailboxes: () => repo.find(),
+        tokenFor: (subject) => JWTUtils.createTokenSync(config.get("auth"), subject),
     });
 });

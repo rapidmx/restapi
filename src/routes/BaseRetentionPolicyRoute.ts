@@ -19,6 +19,10 @@ const RETENTION_POLICY_UID = "retention-policy";
  * by accident. */
 export type PublicRetentionPolicy = Pick<RetentionPolicy, "messageRetentionDays" | "auditLogRetentionDays">;
 
+/** The body of `PUT /retention-policy`: a field left out is left alone, and `null` clears it back to "no automatic
+ * purge". */
+export type RetentionPolicyUpdate = { [K in keyof PublicRetentionPolicy]?: PublicRetentionPolicy[K] | null };
+
 /** All-`undefined` defaults `GET /retention-policy` returns when nothing has been configured yet - never
  * a `404`, matching `BaseEncryptionPolicyRoute.ts`'s identical reasoning. `undefined` means "no automatic
  * purge configured" for both fields - see `RetentionPolicy`'s own doc comment in `models/types.ts`. */
@@ -103,11 +107,10 @@ export abstract class BaseRetentionPolicyRoute<T extends RetentionPolicy> {
 
     /** Only ever copies a field into the returned patch if the caller actually supplied it, so an
      * unrelated field this route doesn't recognize can never ride along into `repoUtils.update()` - same
-     * as `BaseEncryptionPolicyRoute.extractPatch()`. Clearing a previously-configured value back to "no
-     * automatic purge" isn't supported by this endpoint (a fast-follow if a real need for it shows up) -
-     * matches that same sibling route's own scope. */
-    private extractPatch(obj: Partial<PublicRetentionPolicy> | undefined): Partial<PublicRetentionPolicy> {
-        const patch: Partial<PublicRetentionPolicy> = {};
+     * as `BaseEncryptionPolicyRoute.extractPatch()`. A `null` is copied too: it clears a previously-configured
+     * value back to "no automatic purge" (stored as `null`, which `RetentionEnforcementJob` treats as unset). */
+    private extractPatch(obj: RetentionPolicyUpdate | undefined): RetentionPolicyUpdate {
+        const patch: RetentionPolicyUpdate = {};
         for (const field of ["messageRetentionDays", "auditLogRetentionDays"] as const) {
             const value = obj?.[field];
             if (value !== undefined) {
@@ -120,17 +123,18 @@ export abstract class BaseRetentionPolicyRoute<T extends RetentionPolicy> {
     /** Runs as `@Validate` middleware, strictly before `update()` is ever invoked - guarantees a rejected
      * (400) request never has the side effect of materializing the singleton row on what would otherwise
      * be its first write, same guarantee `BaseEncryptionPolicyRoute.validateUpdate()` preserves. */
-    protected validateUpdate(obj: Partial<PublicRetentionPolicy> | undefined): void {
+    protected validateUpdate(obj: RetentionPolicyUpdate | undefined): void {
         for (const field of ["messageRetentionDays", "auditLogRetentionDays"] as const) {
             const value = obj?.[field];
-            if (value === undefined) {
+            if (value === undefined || value === null) {
                 continue;
             }
             if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
-                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${field}' must be a positive integer number of days.`);
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${field}' must be a positive integer number of days, or null for no automatic purge.`);
             }
         }
-        if (obj?.auditLogRetentionDays !== undefined && obj.auditLogRetentionDays < MIN_AUDIT_LOG_RETENTION_DAYS) {
+        // Clearing the audit log period (`null`) keeps entries forever, so the floor only applies to a number.
+        if (typeof obj?.auditLogRetentionDays === "number" && obj.auditLogRetentionDays < MIN_AUDIT_LOG_RETENTION_DAYS) {
             throw new ApiError(
                 ApiErrors.INVALID_REQUEST,
                 400,
@@ -152,8 +156,8 @@ export abstract class BaseRetentionPolicyRoute<T extends RetentionPolicy> {
     @RequiresTrustedRole()
     @Put()
     @Validate("validateUpdate")
-    public async update(obj: Partial<PublicRetentionPolicy> | undefined, @AuthUser user?: JWTUser): Promise<PublicRetentionPolicy> {
-        const patch: Partial<PublicRetentionPolicy> = this.extractPatch(obj);
+    public async update(obj: RetentionPolicyUpdate | undefined, @AuthUser user?: JWTUser): Promise<PublicRetentionPolicy> {
+        const patch: RetentionPolicyUpdate = this.extractPatch(obj);
 
         await this.init();
         const existing: T = await this.findOrCreate();

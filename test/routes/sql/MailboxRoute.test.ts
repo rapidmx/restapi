@@ -164,7 +164,7 @@ describe("Route:MailboxSQL Tests", () => {
         expect(result.body).toEqual([]);
     });
 
-    it("Can create a mailbox as any authenticated user, and it is automatically owned by the creator.", async () => {
+    it("A trusted caller can create a mailbox owned by a user. (Self-service creation: see mailboxSelfServiceCreateSuite.ts.)", async () => {
         const obj: MailboxSQL = new MailboxSQL({
             ownerUserUid: owner.uid,
             primarySmtpAddress: `${uuid.v4()}@example.com`,
@@ -177,7 +177,7 @@ describe("Route:MailboxSQL Tests", () => {
 
         const result = await request(server.getApplication())
             .post(baseUrl)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send(obj);
 
         expect(result.status).toBeGreaterThanOrEqual(200);
@@ -643,7 +643,7 @@ describe("Route:MailboxSQL Tests", () => {
         expect(result.headers["content-length"]).toBe("2");
     });
 
-    it("A non-trusted caller's ownerUserUid is always forced to their own uid, even if the request body claims another.", async () => {
+    it("A non-trusted caller can't create a mailbox directly while self-service mailboxes aren't set up (403) - no verified domains here.", async () => {
         const obj: MailboxSQL = new MailboxSQL({
             ownerUserUid: otherUser.uid,
             primarySmtpAddress: `${uuid.v4()}@example.com`,
@@ -659,9 +659,8 @@ describe("Route:MailboxSQL Tests", () => {
             .set("Authorization", "jwt " + ownerToken)
             .send(obj);
 
-        expect(result.status).toBeGreaterThanOrEqual(200);
-        expect(result.status).toBeLessThan(300);
-        expect(result.body.ownerUserUid).toBe(owner.uid);
+        expect(result.status).toBe(403);
+        expect(await repo.find()).toEqual([]);
     });
 
     it("A trusted (admin) caller can create a true ownerless shared mailbox by omitting ownerUserUid.", async () => {
@@ -688,7 +687,7 @@ describe("Route:MailboxSQL Tests", () => {
         expect(acl?.records ?? []).toEqual([]);
     });
 
-    it("Writes an AuditLogEntry when a trusted caller creates a mailbox, but not for self-service creation.", async () => {
+    it("Writes an AuditLogEntry when a trusted caller creates a mailbox (self-service creation isn't audited - see mailboxSelfServiceCreateSuite.ts).", async () => {
         const sharedResult = await request(server.getApplication())
             .post(baseUrl)
             .set("Authorization", "jwt " + adminToken)
@@ -709,24 +708,6 @@ describe("Route:MailboxSQL Tests", () => {
         expect(sharedEntries[0].targetType).toBe("Mailbox");
         expect(sharedEntries[0].mailboxUid).toBe(sharedResult.body.uid);
         expect(sharedEntries[0].actorUserUid).toBe(admin.uid);
-
-        const selfServiceResult = await request(server.getApplication())
-            .post(baseUrl)
-            .set("Authorization", "jwt " + ownerToken)
-            .send({
-                ownerUserUid: owner.uid,
-                primarySmtpAddress: `${uuid.v4()}@example.com`,
-                aliasAddresses: [],
-                displayName: "Self Service Mailbox",
-                timezone: "UTC",
-                quotaBytes: 1_000_000_000,
-                usedBytes: 0,
-            });
-        expect(selfServiceResult.status).toBeGreaterThanOrEqual(200);
-        expect(selfServiceResult.status).toBeLessThan(300);
-
-        const selfServiceEntries = await auditLogRepo.find({ where: { targetUid: selfServiceResult.body.uid } });
-        expect(selfServiceEntries.length).toBe(0);
     });
 
     it("Rejects a non-trusted caller creating a resource mailbox (403).", async () => {
@@ -789,7 +770,7 @@ describe("Route:MailboxSQL Tests", () => {
 
         const result = await request(server.getApplication())
             .post(baseUrl)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send(obj);
 
         expect(result.status).toBeGreaterThanOrEqual(200);
@@ -797,7 +778,7 @@ describe("Route:MailboxSQL Tests", () => {
 
         const folders = await request(server.getApplication())
             .get(`/sql/folders?mailboxUid=${result.body.uid}`)
-            .set("Authorization", "jwt " + ownerToken);
+            .set("Authorization", "jwt " + adminToken);
 
         expect(folders.status).toBe(200);
         const types = folders.body.map((f: any) => f.type).sort();
@@ -992,7 +973,7 @@ describe("Route:MailboxSQL Tests", () => {
 
         const result = await request(server.getApplication())
             .post(baseUrl)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send(obj);
 
         expect(result.status).toBe(409);
@@ -1001,7 +982,7 @@ describe("Route:MailboxSQL Tests", () => {
     it("Rejects creating a mailbox with no primarySmtpAddress (400).", async () => {
         const result = await request(server.getApplication())
             .post(baseUrl)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send({ ownerUserUid: owner.uid, displayName: "No Address", timezone: "UTC", quotaBytes: 1, usedBytes: 0 });
 
         expect(result.status).toBe(400);
@@ -1032,18 +1013,18 @@ describe("Route:MailboxSQL Tests", () => {
 
         const result = await request(server.getApplication())
             .post(baseUrl)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send(objs);
 
         expect(result.status).toBe(409);
     });
 
-    it("A created mailbox's uid is the normalized primary SMTP address.", async () => {
+    it("A created mailbox's uid and stored addresses are the normalized (lowercased) addresses.", async () => {
         const address = `Mixed.Case.${uuid.v4()}@Example.com`;
         const obj: MailboxSQL = new MailboxSQL({
             ownerUserUid: owner.uid,
             primarySmtpAddress: address,
-            aliasAddresses: [],
+            aliasAddresses: ["Alias.Case@Example.com"],
             displayName: "Case Test",
             timezone: "UTC",
             quotaBytes: 1_000_000_000,
@@ -1052,11 +1033,13 @@ describe("Route:MailboxSQL Tests", () => {
 
         const result = await request(server.getApplication())
             .post(baseUrl)
-            .set("Authorization", "jwt " + ownerToken)
+            .set("Authorization", "jwt " + adminToken)
             .send(obj);
 
         expect(result.status).toBeGreaterThanOrEqual(200);
         expect(result.status).toBeLessThan(300);
         expect(result.body.uid).toBe(address.toLowerCase());
+        expect(result.body.primarySmtpAddress).toBe(address.toLowerCase());
+        expect(result.body.aliasAddresses).toEqual(["alias.case@example.com"]);
     });
 });
