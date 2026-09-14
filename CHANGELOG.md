@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-14
+
+### Added
+- Added mailbox access management + email-lookup routes for shared mailboxes
+- Added a plugin contract: the rapidmx.plugin manifest, PLUGIN_API_VERSION, settings validation, the package allow-list matcher and a state hash every server copy compares against
+- Added a Plugin model (Mongo/SQL) recording each plugin's package version, integrity hash, enabled flag, settings and manifest snapshot, kept as a removed row rather than deleted so default plugins never re-add one an administrator removed
+- Added BasePluginRoute (trusted-role only) to preview a package from the npm registry, add, upgrade, configure, enable, disable and remove plugins, and read each server copy's reported status, announcing every change on the plugins Redis channel
+- Added NpmRegistryClient for reading package versions and manifests from a configurable, optionally authenticated registry
+- Added PluginRegistry, the loaded-plugin list a host sets and plugins read, and the @MailboxScopedData() decorator
+- Added tests for the mailbox access route's unknown-mailbox, missing-ACL and missing-email paths and its SQL alias query
+- Added notes on the plugin contract, soft-removed plugin rows, PluginRegistry's design and the erasure hook
+- Added a MailboxPolicy singleton at system/mailbox-policy for the default mailbox quota and self-service mailbox creation, seeded from the mail:default_quota_bytes and mail:auto_provision:* config on first use and falling back to that config for unset fields or a failed read
+- Added a SetupState singleton at system/setup that tracks the first-run setup wizard: whether setup is required (never started on a server with domains, or started and not finished), the current step, completion and reopening
+- Added findOrCreateSingleton() for create-or-fetch of singleton settings rows
+
+### Changed
+- BaseMailboxAccessRoute (mongo/sql) is a thin, purpose-built wrapper around a
+- mailbox's own AccessControlList - list/grant/revoke a delegate's access via a
+- simple viewer/manager vocabulary, gated at plain ACLAction.UPDATE rather than
+- the literal FULL the generic BaseACLRoute requires, so a non-owner delegate
+- can manage membership too. A single grant here already cascades to every
+- folder and record under the mailbox (confirmed via research: parentUid
+- chaining already wires every well-known folder's ACL to its mailbox, and
+- CalendarEvent/Contact/Task/Message have no independent ACL of their own).
+- Also adds GET /mail/mailboxes/lookup-by-email, resolving an email to the
+- person who owns the Mailbox at that address (primarySmtpAddress or an alias)
+- - there is no separate user/identity directory anywhere in this platform, so
+- this is the only way to turn "someone's email" into a uid for a share-access
+- UI. Deliberately excludes shared/ownerless mailboxes from matching.
+- First piece of a larger shared-mailbox feature (booking pages already work
+- for shared mailboxes with no changes needed; multi-mailbox Mail/Calendar UI
+- is a separate follow-up pass).
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Test that a shared mailbox's delegate can create a booking link
+- Covers the shared-mailbox booking page case end to end at the route level:
+- a manager-role delegate on an ownerless mailbox can create a booking type
+- for it, and a viewer-role delegate gets 403. No route change was needed -
+- BookingType is already permission-checked against the mailbox's ACL.
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Move DeviceSyncState and EasDeviceStateCleanupJob out of this library and into the ActiveSync plugin
+- Change ErasureExecutionJob to purge every loaded @MailboxScopedData() model in its datastore instead of DeviceSyncState specifically, so plugin data is still erased with its mailbox
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Rename the plugin config keys from plugins:* to system:plugins:*, grouping deployment-wide settings under system
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Change autoProvision() to read the mailbox policy instead of the auto-provision config directly
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Updated the release notes for the plugin contract, shared mailbox access, mailbox policy and setup state changes
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+### Fixed
+- Fixed test isolation for suites that rely on auto-provisioning config now that the policy row it seeds persists across test files
+
 ## [0.8.0] - 2026-09-13
 
 ### Added
@@ -686,7 +739,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/RapidMX/restapi/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/RapidMX/restapi/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/RapidMX/restapi/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/RapidMX/restapi/compare/v0.4.0...v0.6.0
