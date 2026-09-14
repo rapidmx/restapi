@@ -9,6 +9,9 @@ import { BlobReferenceSource, deleteBlobsIfUnreferenced, messageBlobReferenceSou
 import { LegalHoldIndex, loadLegalHoldIndex } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
+import { findPagesByUid } from "../util/MailboxContentUtils.js";
+import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
+import type { SearchProvider } from "../search/SearchProvider.js";
 import { Attachment, AuditAction, AuditLogEntry, Message, RetentionPolicy } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
@@ -42,8 +45,12 @@ const RETENTION_POLICY_UID = "retention-policy";
  * deployment's own compliance policy asserts is gone after N days would in fact remain fully stored and
  * independently downloadable via `BaseAttachmentRoute` indefinitely.
  *
+ * Soft-deleted messages (e.g. in Deleted Items) are purged too, and a purged message's search index document is
+ * removed. If any of a message's attachments (or any of its blobs) fails to purge, the message itself is kept and
+ * retried on the next run.
+ *
  * Message content blobs are shared between recipient mailboxes (and mail-filter copies), so a blob is only
- * deleted once no remaining row references it - see `util/BlobReferenceUtils.ts`. Each run reads expired rows
+ * deleted once no other row references it - see `util/BlobReferenceUtils.ts`. Each run reads expired rows
  * oldest first in a stable order and pages past rows it skipped (held, or failed to purge), so a stuck row
  * never blocks the rows behind it; mailboxes under any open hold are left out of the message query altogether
  * (holds are loaded once per page via `loadLegalHoldIndex()`, not re-read per record).
@@ -78,6 +85,10 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
+
+    /** Optional: when search isn't configured, index removal is a no-op. */
+    @Inject("SearchProvider")
+    private searchProvider?: SearchProvider;
 
     @Config("mail:jobs:retention_enforcement:schedule", "0 0 4 * * *")
     private scheduleExpr: string = "0 0 4 * * *";
@@ -151,48 +162,67 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
             ingestQueueEntryClass: this.ingestQueueEntryClass,
         });
 
-        const purgedCount: number = await this.purgeSortedBatches<M>(
-            this.messageRepo!,
-            "sentDate",
-            cutoff,
-            // A mailbox under any open hold is left out of the query altogether, so a held custodian's (possibly
-            // huge) expired mail never fills the batch ahead of purgeable mail. That is deliberately conservative:
-            // its expired mail outside the hold's date range also waits until the hold closes.
-            (holds) => (holds.heldMailboxUids.size > 0 ? { mailboxUid: `nin(${[...holds.heldMailboxUids].join(",")})` } : {}),
-            (holds, message) => holds.isHeld(message.mailboxUid, message.sentDate),
-            async (message) => {
-                // Every `Attachment` referencing this message first - `Message` deletion has no database-level
-                // cascade onto them (see this class's own doc comment). Best-effort per attachment - one failing
-                // here shouldn't block the parent message's own purge below.
-                const attachments: AT[] = await this.attachmentRepo!.find({ messageUid: message.uid, limit: 1000 } as any, {
-                    ignoreACL: true,
-                    limit: 1000,
-                });
+        const purgeMessage = async (message: M): Promise<void> => {
+            // Every `Attachment` referencing this message first - `Message` deletion has no database-level cascade
+            // onto them (see this class's own doc comment). Any attachment failure propagates and stops this message's
+            // purge: the message stays, so the next run finds it - and the attachments it still has - again, rather
+            // than an attachment row (and its blobs) outliving a parent nothing will ever revisit.
+            //
+            // Each row's content goes BEFORE the row itself, and only if no OTHER row still references it (the row
+            // being purged is excluded from the reference check): inbound mail and filter-rule copies share blobs
+            // across every recipient mailbox (see `util/BlobReferenceUtils.ts`), including mailboxes this policy
+            // isn't purging yet or that are held. Deleting content first means a blob-store failure leaves the row -
+            // and so its blob keys - in place for the next run to retry, instead of an orphaned blob.
+            for await (const attachments of findPagesByUid<AT>(this.attachmentRepo!, { messageUid: message.uid })) {
                 for (const attachment of attachments) {
-                    try {
-                        await this.attachmentRepo!.delete(attachment.uid, { ignoreACL: true, purge: true });
-                        await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, [
-                            (attachment as any).blobKey,
-                            (attachment as any).extractedTextBlobKey,
-                        ]);
-                    } catch (err: any) {
-                        this.logger?.warn(
-                            `RetentionEnforcementJob: failed to purge attachment ${attachment.uid} for expired message ${message.uid}: ${err.message}`,
-                        );
-                    }
+                    await deleteBlobsIfUnreferenced(
+                        this._objectFactory!,
+                        this.blobStore!,
+                        blobSources,
+                        [(attachment as any).blobKey, (attachment as any).extractedTextBlobKey],
+                        { entityClass: this.attachmentClass, uid: attachment.uid },
+                    );
+                    await this.attachmentRepo!.delete(attachment.uid, { ignoreACL: true, purge: true });
                 }
+            }
 
-                // The row goes first, then its content only if no other row still references it: inbound mail
-                // and filter-rule copies share one raw blob across every recipient mailbox (see
-                // `util/BlobReferenceUtils.ts`), including mailboxes this policy isn't purging yet or that are held.
-                await this.messageRepo!.delete(message.uid, { ignoreACL: true, purge: true });
-                await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, [
-                    (message as any).bodyBlobKey,
-                    (message as any).sanitizedHtmlBlobKey,
-                ]);
-            },
-            (message, err) => this.logger?.warn(`RetentionEnforcementJob: failed to purge expired message ${message.uid}: ${err.message}`),
-        );
+            await deleteBlobsIfUnreferenced(
+                this._objectFactory!,
+                this.blobStore!,
+                blobSources,
+                [(message as any).bodyBlobKey, (message as any).sanitizedHtmlBlobKey],
+                { entityClass: this.messageClass, uid: message.uid },
+            );
+            await this.messageRepo!.delete(message.uid, { ignoreACL: true, purge: true });
+            // The search document (subject/body/attachment text) must not outlive the purged message.
+            await removeFromSearchIndex(this.searchProvider, "message", message.uid, this.logger);
+        };
+
+        // A mailbox under any open hold is left out of the query altogether, so a held custodian's (possibly huge)
+        // expired mail never fills the batch ahead of purgeable mail. That is deliberately conservative: its expired
+        // mail outside the hold's date range also waits until the hold closes.
+        const excludeHeld = (holds: LegalHoldIndex): Record<string, any> =>
+            holds.heldMailboxUids.size > 0 ? { mailboxUid: `nin(${[...holds.heldMailboxUids].join(",")})` } : {};
+
+        // Live messages, then soft-deleted ones (e.g. in Deleted Items): `find()` excludes soft-deleted rows unless
+        // `deleted: true` is asked for explicitly, and a retention policy that ages content out must purge a
+        // recoverable copy just the same. Both share this run's `batchSize` budget.
+        let purgedCount = 0;
+        for (const deletedCriteria of [{}, { deleted: true }]) {
+            purgedCount += await this.purgeSortedBatches<M>(
+                this.messageRepo!,
+                "sentDate",
+                cutoff,
+                (holds) => ({ ...excludeHeld(holds), ...deletedCriteria }),
+                (holds, message) => holds.isHeld(message.mailboxUid, message.sentDate),
+                purgeMessage,
+                (message, err) => this.logger?.warn(`RetentionEnforcementJob: failed to purge expired message ${message.uid}: ${err.message}`),
+                this.batchSize - purgedCount,
+            );
+            if (purgedCount >= this.batchSize) {
+                break;
+            }
+        }
 
         if (purgedCount > 0) {
             await this.recordPurge("Message", purgedCount, maxAgeDays);
@@ -240,6 +270,7 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
         isHeld: (holds: LegalHoldIndex, row: T) => boolean,
         purge: (row: T) => Promise<void>,
         onError: (row: T, err: any) => void,
+        budget: number = this.batchSize,
     ): Promise<number> {
         const pageSize: number = Math.max(1, Math.min(this.batchSize, 1000));
         // Bounds a run that finds nothing but skipped rows, so a large held backlog can't make one run unbounded.
@@ -247,7 +278,7 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
         let purged = 0;
         let skipped = 0;
         let examined = 0;
-        while (purged < this.batchSize && examined < maxExamined) {
+        while (purged < budget && examined < maxExamined) {
             const holds: LegalHoldIndex = await loadLegalHoldIndex(this._objectFactory!, this.matterClass);
             const page: number = Math.floor(skipped / pageSize);
             const rows: T[] = await repo.find(
@@ -266,7 +297,7 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
                 break;
             }
             for (const row of fresh) {
-                if (purged >= this.batchSize) {
+                if (purged >= budget) {
                     break;
                 }
                 examined++;

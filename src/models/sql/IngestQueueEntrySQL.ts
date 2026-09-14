@@ -40,7 +40,9 @@ export class IngestQueueEntrySQL extends BaseEntity implements IngestQueueEntry 
     @Description("The resolved `Mailbox` this message is addressed to.")
     public mailboxUid: string = "";
 
-    @Column()
+    // `text`: the MTA passes MAIL FROM through unchecked, and a plain string column is `varchar(255)` on MySQL, which
+    // rejects a longer value and loses the message. Not indexed.
+    @Column({ type: "text" })
     @Description("The SMTP envelope sender (`MAIL FROM`) address.")
     public envelopeFrom: string = "";
 

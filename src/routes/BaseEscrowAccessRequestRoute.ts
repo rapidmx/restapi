@@ -17,7 +17,13 @@ import {
 } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
-import { evaluateEscrowApprovals, findHeldScopeIds, requireEscrowHolder, resolveEscrowApprovalTtlHours } from "../util/EscrowUtils.js";
+import {
+    evaluateEscrowApprovals,
+    exactInFilter,
+    findHeldScopeIds,
+    requireEscrowHolder,
+    resolveEscrowApprovalTtlHours,
+} from "../util/EscrowUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import {
     AuditAction,
@@ -393,15 +399,17 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
     public async find(@Query() query: any, @AuthUser user?: JWTUser): Promise<R[]> {
         await this.init();
         const { limit, page } = parseListPaging(query);
-        const heldScopeIds: string[] = await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user);
-        if (heldScopeIds.length === 0) {
+        const heldScopes: string | undefined = exactInFilter(await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user));
+        if (!heldScopes) {
             return [];
         }
-        let matterIds: string[] = await this.findAllMatterIds(heldScopeIds);
+        let matterIds: string[] = await this.findAllMatterIds(heldScopes);
         if (query?.matterId !== undefined) {
             matterIds = matterIds.filter((uid) => uid === query.matterId);
         }
-        if (matterIds.length === 0) {
+        // `exactInFilter()`: a matter uid holding `,` would otherwise widen the `in(...)` below to other matters.
+        const matterFilter: string | undefined = exactInFilter(matterIds);
+        if (!matterFilter) {
             return [];
         }
         const filter: Record<string, any> = {};
@@ -411,17 +419,18 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
             }
         }
         return await this.requestRepo!.find(
-            { ...filter, matterId: `in(${matterIds.join(",")})`, sort: "-dateCreated", limit, page } as any,
+            { ...filter, matterId: matterFilter, sort: "-dateCreated", limit, page } as any,
             { limit, page, ignoreACL: true },
         );
     }
 
-    /** The uid of every matter under `scopeIds` - every page, since a single `find()` stops at 100 rows. */
-    private async findAllMatterIds(scopeIds: string[]): Promise<string[]> {
+    /** The uid of every matter under `scopeFilter` (an `exactInFilter()` operand) - every page, since a single
+     * `find()` stops at 100 rows. */
+    private async findAllMatterIds(scopeFilter: string): Promise<string[]> {
         const matterIds: string[] = [];
         for (let page = 0; ; page++) {
             const batch: M[] = await this.matterRepo!.find(
-                { escrowScopeId: `in(${scopeIds.join(",")})`, sort: "uid", limit: MATTER_PAGE_SIZE, page } as any,
+                { escrowScopeId: scopeFilter, sort: "uid", limit: MATTER_PAGE_SIZE, page } as any,
                 { ignoreACL: true, limit: MATTER_PAGE_SIZE, page },
             );
             matterIds.push(...batch.map((m) => m.uid));

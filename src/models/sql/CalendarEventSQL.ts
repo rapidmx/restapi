@@ -20,6 +20,7 @@ import {
     RecipientType,
     RecurrenceRule,
 } from "../types.js";
+import { boundIndexedValue } from "../../util/ConversationUtils.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Nullable } = ObjectDecorators;
@@ -37,6 +38,8 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Index("calevent_folder", ["folderUid"])
 @Index("calevent_ical_uid", ["icalUid"])
 @Index("calevent_mailbox", ["mailboxUid"])
+@Index("calevent_folder_modified", ["folderUid", "dateModified", "uid"])
+@Index("calevent_mailbox_modified", ["mailboxUid", "dateModified", "uid"])
 @Index("calevent_start_date", ["startDate"])
 @Index("calevent_status", ["status"])
 @Index("calevent_cancel_notice_sent_at", ["cancelNoticeSentAt"])
@@ -80,7 +83,9 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
     @Description("`true` if the event spans the entire day rather than a specific time range.")
     public allDay: boolean = false;
 
-    @Column()
+    // `text`: taken from inbound iTIP/ICS data (TZID) and unindexed - a plain string column is `varchar(255)` on MySQL,
+    // which rejects a longer value and fails the import.
+    @Column({ type: "text" })
     @Description("The IANA timezone identifier the event's start/end times were authored in.")
     public timezone: string = "";
 
@@ -123,7 +128,8 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
 
     @Column()
     @Description(
-        "A stable identifier (RFC 5545 `UID`) for this event, shared across all clients/protocols and iTIP messages.",
+        "A stable identifier (RFC 5545 `UID`) for this event, shared across all clients/protocols and iTIP messages. " +
+            "A value longer than 255 characters is stored as `sha256:<hex>` of the original.",
     )
     public icalUid: string = "";
 
@@ -194,7 +200,7 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
                 "reminderMinutesBeforeStart" in other
                     ? other.reminderMinutesBeforeStart
                     : this.reminderMinutesBeforeStart;
-            this.icalUid = other.icalUid !== undefined ? other.icalUid : this.icalUid;
+            this.icalUid = other.icalUid !== undefined ? boundIndexedValue(other.icalUid) : this.icalUid;
             this.sequence = other.sequence !== undefined ? other.sequence : this.sequence;
             this.autoReplyEnabled = "autoReplyEnabled" in other ? other.autoReplyEnabled : this.autoReplyEnabled;
             this.autoReplyMessage = "autoReplyMessage" in other ? other.autoReplyMessage : this.autoReplyMessage;

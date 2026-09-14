@@ -15,6 +15,7 @@ import {
 } from "@rapidrest/service-core";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 import { getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { AuditAction, DistributionList, Mailbox } from "../models/types.js";
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
@@ -109,6 +110,8 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
 
         const seenUids: Set<string> = new Set();
         for (const o of objs) {
+            // `_id` would replace another document on Mongo - see `util/RequestBodyUtils.ts`.
+            stripClientCreateFields(o);
             await this.assignUidAndCheckCollision(o, domains);
             if (seenUids.has((o as any).uid)) {
                 throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "Duplicate address within the same request.");
@@ -174,6 +177,18 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         }
     }
 
+    /** Runs for the inherited `updateBulk()` (per element) and `updateProperty()` - refuses path keys there too. */
+    protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser): Promise<void> {
+        assertNoPathKeys(obj);
+        stripClientId(obj);
+        return super.validateUpdate(id, obj, user);
+    }
+
+    public async updateProperty(id: string, propertyName: string, obj: any, user?: JWTUser): Promise<T> {
+        assertPlainPropertyName(propertyName);
+        return super.updateProperty(id, propertyName, obj, user);
+    }
+
     @RequiresTrustedRole()
     public async update(
         @Param("id") id: string,
@@ -181,6 +196,8 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
+        assertNoPathKeys(obj);
+        stripClientId(obj);
         const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);

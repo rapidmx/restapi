@@ -5,9 +5,11 @@
 import { simpleParser, ParsedMail } from "mailparser";
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { SearchDocument, SearchProvider } from "../search/SearchProvider.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
+import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
 import { isEncryptedBody } from "../util/SmimeUtils.js";
 import { Attachment, Message, RecipientType } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
@@ -132,9 +134,16 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
         // whose `buildDocument()` throws (e.g. a transient blob-store failure) or that the provider rejects must
         // be picked up again by a later run (up to `maxAttempts`), not silently marked "already indexed".
         const built: M[] = [];
+        // Per built message, the attachment uids whose extracted text went into its document (only for a message
+        // whose attachments were actually read) - re-checked after stamping, see `recheckAttachmentText()`.
+        const indexedAttachmentUids: Map<string, Set<string>> = new Map();
         for (const message of pending) {
             try {
-                docs.push(await this.buildDocument(message));
+                const seen: Set<string> = new Set();
+                docs.push(await this.buildDocument(message, seen));
+                if (message.hasAttachments) {
+                    indexedAttachmentUids.set(message.uid, seen);
+                }
                 built.push(message);
             } catch (err: any) {
                 await this.recordFailure(message, `failed to build search document: ${err?.message}`);
@@ -176,13 +185,78 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
                 update.searchIndexNextAttemptAt = null;
                 update.searchIndexError = null;
             }
+            let stamped: M;
             try {
-                await this.messageRepo.update(update, message, { ignoreACL: true, skipPush: true });
+                // `asEntity()`: Mongo `find()` returns plain documents, for which `update()` skips its optimistic
+                // lock entirely - a concurrent edit (e.g. a flag change) could otherwise be clobbered, or a stale
+                // stamp could land over a newer content change that cleared `searchIndexedAt`.
+                stamped = await this.messageRepo.update(update, asEntity(this.messageRepo, message), { ignoreACL: true, skipPush: true });
             } catch (err: any) {
                 // e.g. a concurrent edit bumped the version - the message is simply re-indexed on a later run.
                 this.logger?.warn(`SearchIndexJob: failed to stamp searchIndexedAt on message ${message.uid}: ${err?.message}`);
+                await this.removeIfGone(message.uid);
+                continue;
+            }
+            const seen: Set<string> | undefined = indexedAttachmentUids.get(message.uid);
+            if (seen) {
+                await this.recheckAttachmentText(stamped ?? message, seen);
             }
         }
+    }
+
+    /**
+     * Closes the race with `AttachmentExtractionJob`: an attachment whose text was extracted AFTER this run read the
+     * message's attachments, but whose extraction job checked the message BEFORE this run stamped it, would otherwise
+     * leave the message stamped "indexed" without that text forever. Re-reads the message's extracted attachments
+     * after the stamp is committed; if any wasn't in the indexed document, the stamp is cleared again (version-checked
+     * against the stamp just written, retried against a fresh read on a conflict) so the next run re-indexes it.
+     * `AttachmentExtractionJob.invalidateSearchIndex()` re-reads the message after committing the attachment, so
+     * whichever write lands last sees the other.
+     */
+    private async recheckAttachmentText(stamped: M, seen: Set<string>): Promise<void> {
+        try {
+            const attachments: A[] = await this.attachmentRepo!.find(
+                { messageUid: stamped.uid, extractedTextBlobKey: "ne(null)", limit: MAX_ATTACHMENTS_PER_MESSAGE } as any,
+                { ignoreACL: true, limit: MAX_ATTACHMENTS_PER_MESSAGE, skipCache: true },
+            );
+            if (attachments.every((attachment) => seen.has(attachment.uid))) {
+                return;
+            }
+            let current: M | undefined = stamped;
+            for (let attempt = 0; current?.searchIndexedAt && attempt < 3; attempt++) {
+                try {
+                    await this.messageRepo!.update(
+                        { uid: current.uid, version: (current as any).version, searchIndexedAt: null } as any,
+                        asEntity(this.messageRepo!, current),
+                        { ignoreACL: true, skipPush: true },
+                    );
+                    return;
+                } catch {
+                    current = await this.messageRepo!.findOne(stamped.uid, { ignoreACL: true, includeDeleted: true, skipCache: true });
+                }
+            }
+        } catch (err: any) {
+            this.logger?.warn(`SearchIndexJob: failed to re-check attachment text for message ${stamped.uid}: ${err?.message}`);
+        }
+    }
+
+    /**
+     * Called when stamping `searchIndexedAt` fails (typically a version conflict): if the message was soft-deleted or
+     * purged while this run was building/indexing its document, the document just written would otherwise resurrect
+     * it in search - the delete path's own index removal may already have run before this run's `bulkIndex()`. A
+     * still-live message is left alone: it stays unstamped and is simply re-indexed on a later run.
+     */
+    private async removeIfGone(uid: string): Promise<void> {
+        try {
+            const current: M | undefined = await this.messageRepo!.findOne(uid, { ignoreACL: true, includeDeleted: true, skipCache: true });
+            if (current && (current as any).deleted !== true) {
+                return;
+            }
+        } catch (err: any) {
+            this.logger?.warn(`SearchIndexJob: failed to re-check message ${uid} after a failed stamp: ${err?.message}`);
+            return;
+        }
+        await removeFromSearchIndex(this.searchProvider, "message", uid, this.logger);
     }
 
     /**
@@ -208,7 +282,7 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
                     searchIndexNextAttemptAt: exhausted ? null : new Date(Date.now() + delayMs),
                     searchIndexError: reason.slice(0, MAX_ERROR_LENGTH),
                 } as any,
-                message,
+                asEntity(this.messageRepo!, message),
                 { ignoreACL: true, skipPush: true },
             );
         } catch (err: any) {
@@ -216,7 +290,7 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
         }
     }
 
-    private async buildDocument(message: M): Promise<SearchDocument> {
+    private async buildDocument(message: M, indexedAttachmentUids?: Set<string>): Promise<SearchDocument> {
         const raw: Buffer = await this.blobStore!.get(message.bodyBlobKey);
         const parsed: ParsedMail = await simpleParser(raw);
         // An S/MIME-encrypted body is ciphertext to this server - indexing it (or any attachment text
@@ -242,6 +316,7 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
                 if (attachment.extractedTextBlobKey) {
                     const text: Buffer = await this.blobStore!.get(attachment.extractedTextBlobKey);
                     attachmentText.push(text.toString("utf-8"));
+                    indexedAttachmentUids?.add(attachment.uid);
                 }
             }
         }

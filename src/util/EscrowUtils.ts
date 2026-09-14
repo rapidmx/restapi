@@ -71,6 +71,25 @@ export async function findHeldScopeIds(
     return scopes.filter((s) => s.holderUserUids.includes(user.uid)).map((s) => s.uid);
 }
 
+/**
+ * `true` when `value` can be put inside a query-DSL operand (`eq(...)`, `in(...)`) and still match only itself:
+ * `in()` splits on commas, parentheses are operator syntax, and `me`/`null` are substituted (the caller's own uid,
+ * SQL `NULL`). Server-generated uids always pass; a legacy client-chosen uid like `"a,victim"` doesn't.
+ */
+export function isQuerySafeUid(value: unknown): value is string {
+    return typeof value === "string" && value.length > 0 && !/[,()]/.test(value) && value !== "me" && value !== "null";
+}
+
+/**
+ * An `in(...)` operand matching exactly `values`, leaving out any value `isQuerySafeUid()` rejects (so an injected
+ * `"a,victim"` can never widen the match to `victim`). `undefined` when nothing usable is left - the caller's
+ * result is then empty.
+ */
+export function exactInFilter(values: readonly string[]): string | undefined {
+    const safe: string[] = [...new Set(values.filter(isQuerySafeUid))];
+    return safe.length > 0 ? `in(${safe.join(",")})` : undefined;
+}
+
 /** How long an `EscrowAccessRequest` stays usable after reaching its approval threshold when
  * `mail:escrow:approval_ttl_hours` isn't configured. */
 export const DEFAULT_ESCROW_APPROVAL_TTL_HOURS = 72;

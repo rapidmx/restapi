@@ -190,6 +190,25 @@ describe("DomainVerificationJobSQL Tests (real DB + DI)", () => {
         expect(goodFound!.verified).toBe(true);
     });
 
+    it("Does not overwrite a concurrent admin edit made while DNS was being checked (version-checked update) - the domain is simply re-checked next run.", async () => {
+        const domain = await createDomain({ name: "raced.com" });
+        dnsResolver.records.set("raced.com", [[buildVerificationTxtValue(domain.verificationToken)]]);
+        const repoUtils = (job as any).domainRepo;
+        const [stale] = await repoUtils.find({ uid: domain.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+        await domainRepo.update({ uid: domain.uid }, { version: domain.version + 1, dkimSelector: "edited" });
+        vi.spyOn(repoUtils, "find").mockResolvedValueOnce([stale]);
+        const warnSpy = vi.spyOn((job as any).logger, "warn");
+
+        await job.run();
+
+        const found = await domainRepo.findOne({ where: { uid: domain.uid } });
+        expect(found!.version).toBe(domain.version + 1);
+        expect(found!.dkimSelector).toBe("edited");
+        expect(found!.verified).toBe(false);
+        expect(found!.lastCheckedAt ?? null).toBeNull();
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("raced.com"));
+    });
+
     it("Bounds how many domains are checked per run to the configured batch size.", async () => {
         (job as any).batchSize = 2;
         const domains = await Promise.all([createDomain(), createDomain(), createDomain()]);

@@ -34,14 +34,26 @@ export class LocalFsBlobStore implements BlobStore {
         return path.join(this.root, hash.slice(0, 2), hash.slice(2, 4), safeKey);
     }
 
+    /**
+     * Writes to a uniquely-named temp file in the target's own directory, then `rename()`s it into place, so a
+     * reader never observes a partially-written blob (a crash or a failing input stream mid-write leaves the
+     * previous content, or no file, rather than a truncated one). The temp file is removed on any error.
+     */
     public async put(key: string, data: Buffer | NodeJS.ReadableStream, _options?: BlobPutOptions): Promise<void> {
         const filePath: string = this.resolvePath(key);
         await fs.mkdir(path.dirname(filePath), { recursive: true });
 
-        if (Buffer.isBuffer(data)) {
-            await fs.writeFile(filePath, data);
-        } else {
-            await pipeline(data, createWriteStream(filePath));
+        const tempPath: string = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+        try {
+            if (Buffer.isBuffer(data)) {
+                await fs.writeFile(tempPath, data, { flag: "wx" });
+            } else {
+                await pipeline(data, createWriteStream(tempPath, { flags: "wx" }));
+            }
+            await fs.rename(tempPath, filePath);
+        } catch (err) {
+            await fs.rm(tempPath, { force: true });
+            throw err;
         }
     }
 

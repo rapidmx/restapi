@@ -703,6 +703,9 @@ describe("Route:BookingMongo Tests (anonymous)", () => {
         createFolder: async (data: any) =>
             await folderRepo.save(new FolderMongo({ unreadCount: 0, totalCount: 0, syncKeyVersion: 0, ...data })),
         findEvents: async () => await calendarEventRepo.find({}).toArray(),
+        updateEvent: async (uid: string, patch: any) => {
+            await calendarEventRepo.updateOne({ uid }, { $set: patch });
+        },
         findBookings: async () => await bookingRepo.find({}).toArray(),
         rateLimiter: () => objectFactory.getInstance(RateLimiter),
     });

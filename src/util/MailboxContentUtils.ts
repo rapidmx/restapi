@@ -25,6 +25,48 @@ async function getRepo(objectFactory: ObjectFactory, entityClass: any): Promise<
 }
 
 /**
+ * Reads every row of `repo` matching `criteria`, one page at a time, using keyset paging on `uid`: each page is
+ * `uid > <last uid of the previous page>` sorted by `uid` ascending. Offset paging without a sort (`page=N`) has no
+ * stable order on either backend, so rows can be skipped or repeated between pages, and offset paging over a result
+ * set the caller is deleting from shifts every later page. Keyset paging stays correct in both cases: a row deleted
+ * behind the cursor doesn't move the cursor, and the order is identical on Mongo and SQL.
+ *
+ * `criteria` must not constrain `uid` itself. Queries are ACL-free and uncached (`skipCache`), and `limit` is passed
+ * both in the query object and in `options` (the SQL backend reads only the former, Mongo only the latter). A row
+ * inserted concurrently with a `uid` below the cursor isn't seen by this pass - callers that need to catch those
+ * (e.g. a purge racing with delivery) run another pass.
+ *
+ * @param repo The repository to read.
+ * @param criteria The search criteria (without `uid`, `sort`, `limit` or `page`).
+ * @param pageSize Rows per page, clamped to 1..1000 (the framework's own maximum).
+ */
+export async function* findPagesByUid<T extends { uid: string } = any>(
+    repo: RepoUtils<any>,
+    criteria: Record<string, any>,
+    pageSize: number = 500,
+): AsyncGenerator<T[]> {
+    const limit: number = Math.max(1, Math.min(Math.floor(pageSize) || 1, 1000));
+    let after: string | undefined;
+    for (;;) {
+        const query: Record<string, any> = { ...criteria, sort: { uid: "ASC" }, limit };
+        if (after !== undefined) {
+            query.uid = `gt(${after})`;
+        }
+        const batch: T[] = await repo.find(query as any, { ignoreACL: true, limit, skipCache: true });
+        if (batch.length === 0) {
+            return;
+        }
+        yield batch;
+        const last: string = batch[batch.length - 1].uid;
+        // Defensive: a cursor that doesn't advance (a backend ignoring the `gt(...)` filter) would loop forever.
+        if (batch.length < limit || (after !== undefined && !(last > after))) {
+            return;
+        }
+        after = last;
+    }
+}
+
+/**
  * Aggregates one mailbox's full content - `Mailbox` itself plus every `Message`/`Contact`/`ContactList`/
  * `CalendarEvent`/`Task`/`Note`/`Attachment` row it owns - into newline-delimited JSON lines, one object
  * per line, each tagged with an `entityType` field. Originally `DataExportJob`'s own private
@@ -70,20 +112,16 @@ export async function collectMailboxContentLines(
         if (entityType === "message" && messageDateRange) {
             criteria.sentDate = `range(${messageDateRange.start.toISOString()},${messageDateRange.end.toISOString()})`;
         }
-        // Paged (a bare, unpaginated `find()` silently truncates at 100 rows - see `MailboxQuotaRecalcJob.
-        // findAllPages()`), with the row budget checked as each page arrives rather than after every page has
+        // Paged (a bare, unpaginated `find()` silently truncates at 100 rows) by stable keyset on `uid` - see
+        // `findPagesByUid()` - with the row budget checked as each page arrives rather than after every page has
         // been loaded - an export/eDiscovery collection must be complete, not a sample, but also must not load
         // an unbounded table into memory just to discover it's too big.
-        for (let page = 0; ; page++) {
-            const batch: any[] = await repo.find({ ...criteria, limit: pageSize, page } as any, { ignoreACL: true, limit: pageSize, page });
+        for await (const batch of findPagesByUid(repo, criteria, pageSize)) {
             if (lines.length + batch.length > maxRows) {
                 throw new Error(`Mailbox ${mailboxUid}'s content exceeds the maximum of ${maxRows} exportable rows.`);
             }
             for (const row of batch) {
                 lines.push(JSON.stringify({ entityType, ...row }));
-            }
-            if (batch.length < pageSize) {
-                break;
             }
         }
     }

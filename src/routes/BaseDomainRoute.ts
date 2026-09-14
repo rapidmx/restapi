@@ -20,6 +20,7 @@ import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { checkDnsSetup, type DnsRecordCheck } from "../util/DnsSetupUtils.js";
 import { checkDomainVerification } from "../util/DomainVerificationUtils.js";
 import { isReservedDomainName } from "../util/DomainUtils.js";
+import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
 import { AuditAction, Domain } from "../models/types.js";
 const { Get, Param, Post, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 const { Config, Inject } = ObjectDecorators;
@@ -132,6 +133,8 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
 
         const seenUids: Set<string> = new Set();
         for (const o of objs) {
+            // `_id` (an upsert over another row on Mongo), bookkeeping fields and dotted/`$` keys are never the client's.
+            stripClientCreateFields(o);
             await this.assignUidAndCheckCollision(o);
             if (seenUids.has((o as any).uid)) {
                 throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "Duplicate domain within the same request.");
@@ -162,6 +165,11 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
+        if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        // A dotted/`$` key (`dkim.selector`, `dmarcPolicy.p`) is a Mongo update path past the stripping and checks below.
+        assertNoPathKeys(obj);
         const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -204,6 +212,7 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         if (!Array.isArray(objs)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
+        assertNoPathKeys(objs);
         const updated: T[] = [];
         for (const obj of objs) {
             updated.push(await this.update((obj as any)?.uid, obj, req, user));
@@ -221,6 +230,7 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         obj: any,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
+        assertPlainPropertyName(propertyName);
         if (SERVER_MANAGED_DOMAIN_FIELDS.includes(propertyName)) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, `'${propertyName}' cannot be set through this API.`);
         }

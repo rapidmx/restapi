@@ -18,11 +18,15 @@ function makeFixture(rowsPerEntity: Record<string, number>) {
             const entity: string = opts.name.replace(/Class$/, "");
             const total: number = rowsPerEntity[entity] ?? 0;
             return {
+                // Keyset paging: rows are uids `<entity>-000000`.. sorted ascending; `uid: gt(x)` resumes after `x`.
                 find: async (criteria: any, options: any) => {
                     calls.push({ entity, criteria, options });
-                    const start: number = options.page * options.limit;
-                    const count: number = Math.max(0, Math.min(options.limit, total - start));
-                    return Array.from({ length: count }, (_, i) => ({ uid: `${entity}-${start + i}` }));
+                    const all: string[] = Array.from({ length: total }, (_, i) => `${entity}-${String(i).padStart(6, "0")}`);
+                    const after: string | undefined = criteria.uid?.match(/^gt\((.*)\)$/)?.[1];
+                    return all
+                        .filter((uid) => after === undefined || uid > after)
+                        .slice(0, criteria.limit)
+                        .map((uid) => ({ uid }));
                 },
             };
         },
@@ -45,6 +49,19 @@ describe("MailboxContentUtils Tests", () => {
         );
         // Mailbox line + page 0 (10) fits; page 1 would make 21 > 20 - so exactly two pages were ever read.
         expect(calls.filter((c) => c.entity === "message").length).toBe(2);
+    });
+
+    it("Pages by stable uid keyset (sorted, uid > last uid of the previous page), never by unsorted offset.", async () => {
+        const { calls, classes, objectFactory } = makeFixture({ contact: 5 });
+        await collectMailboxContentLines(objectFactory, classes, "mb", { uid: "mb" } as any, undefined, 1_000, 2);
+        const contactCalls = calls.filter((c) => c.entity === "contact");
+        expect(contactCalls.map((c) => c.criteria.uid)).toEqual([undefined, "gt(contact-000001)", "gt(contact-000003)"]);
+        for (const call of contactCalls) {
+            expect(call.criteria.sort).toEqual({ uid: "ASC" });
+            expect(call.criteria.page).toBeUndefined();
+            expect(call.options.page).toBeUndefined();
+            expect(call.criteria.mailboxUid).toBe("mb");
+        }
     });
 
     it("Pushes both date-range bounds into the Message query as one range(...) criterion, and applies it to messages only.", async () => {

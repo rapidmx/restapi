@@ -444,4 +444,164 @@ export function escrowControlsSuite(ctx: SecurityControlsSuiteContext): void {
             }
         });
     });
+
+    describe("round 4", () => {
+        const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+        it("never takes a client uid (or _id/version) for a new escrow scope or matter", async () => {
+            const admin = newUser(["admin"]);
+            const holder = newUser();
+            const scopeResult = await as(admin).post("/escrow-scopes", {
+                uid: "chosen,scope",
+                _id: "0123456789abcdef01234567",
+                version: 7,
+                name: "legal",
+                publicKey: publicKey(),
+                holderUserUids: [holder.uid],
+                requiredHolders: 1,
+                notifySubjectOnAccess: false,
+            });
+            expect(scopeResult.status).toBe(200);
+            expect(scopeResult.body.uid).toMatch(UUID);
+            expect(scopeResult.body.version).toBe(0);
+
+            const matterResult = await as(holder).post("/matters", {
+                uid: "chosen,matter",
+                name: "Investigation",
+                escrowScopeId: scopeResult.body.uid,
+                custodianMailboxUids: [uuid.v4()],
+            });
+            expect(matterResult.status).toBe(200);
+            expect(matterResult.body.uid).toMatch(UUID);
+            expect(await ctx.store().find("Matter", { uid: "chosen,matter" })).toHaveLength(0);
+        });
+
+        it("never widens a holder's lists or a matter truncate through a (legacy) uid containing a comma", async () => {
+            const victim = newUser();
+            const attacker = newUser();
+            const victimScope = await createScope({ holderUserUids: [victim.uid] });
+            const victimMailbox = await createMailbox({ escrowScopeId: victimScope.uid });
+            const victimMatter = await createMatter(victimScope.uid, [victimMailbox.uid]);
+            const victimRequest = await createRequest(victimMatter, victimMailbox, [{ holderUserUid: victim.uid, approvedAt: new Date() }]);
+            await ctx.store().save("MatterExportRequest", { matterId: victimMatter.uid, requestedByUserUid: victim.uid, status: "pending" });
+
+            // Rows written before uids were server-minted: a scope and a matter whose uids smuggle the victim's in.
+            const legacyScope = await createScope({ uid: `x,${victimScope.uid}`, holderUserUids: [attacker.uid] });
+            expect(legacyScope.uid).toContain(",");
+            const attackerScope = await createScope({ holderUserUids: [attacker.uid] });
+            await createMatter(attackerScope.uid, [uuid.v4()], { uid: `y,${victimMatter.uid}` });
+
+            const matters = await as(attacker).get("/matters");
+            expect(matters.status).toBe(200);
+            expect(matters.body.map((m: any) => m.uid)).not.toContain(victimMatter.uid);
+            expect((await as(attacker).get("/escrow-access-requests")).body.map((r: any) => r.uid)).not.toContain(victimRequest.uid);
+            expect((await as(attacker).get("/matter-export-requests")).body).toEqual([]);
+
+            expect((await as(attacker).delete("/matters")).status).toBeLessThan(300);
+            expect(await ctx.store().find("Matter", { uid: victimMatter.uid })).toHaveLength(1);
+            expect(await ctx.store().find("Matter", { uid: `y,${victimMatter.uid}` })).toHaveLength(0);
+        });
+
+        it("treats a round-tripped public key (ISO dates, revokedAt: null, other key order) as unchanged, but a different key as a change", async () => {
+            const { scope } = await approvedSetup(1);
+            const admin = newUser(["admin"]);
+            const stored = (await ctx.store().find("EscrowScope", { uid: scope.uid }))[0];
+            const roundTripped = {
+                revokedAt: null,
+                notAfter: new Date(stored.publicKey.notAfter).toISOString(),
+                notBefore: new Date(stored.publicKey.notBefore).toISOString(),
+                fingerprint: stored.publicKey.fingerprint.toUpperCase(),
+                type: stored.publicKey.type,
+                publicKey: stored.publicKey.publicKey,
+            };
+
+            const renamed = await as(admin).put(`/escrow-scopes/${scope.uid}`, { uid: scope.uid, version: stored.version, name: "renamed", publicKey: roundTripped });
+            expect(renamed.status).toBe(200);
+            const after = (await ctx.store().find("EscrowScope", { uid: scope.uid }))[0];
+            expect(after.name).toBe("renamed");
+            // The stored key is kept as it was, not replaced by the reformatted copy.
+            expect(after.publicKey.notBefore).toBe(stored.publicKey.notBefore);
+
+            // Same fingerprint but different key material, or a different validity window: real changes, refused while
+            // the approval is live.
+            for (const changed of [{ publicKey: "other-cert" }, { notAfter: stored.publicKey.notAfter + 5000 }]) {
+                const result = await as(admin).put(`/escrow-scopes/${scope.uid}`, {
+                    uid: scope.uid,
+                    version: after.version,
+                    publicKey: { ...stored.publicKey, ...changed },
+                });
+                expect(result.status).toBe(409);
+            }
+        });
+
+        it("refuses downloading an export of a closed matter (409)", async () => {
+            const holder = newUser();
+            const scope = await createScope({ holderUserUids: [holder.uid] });
+            const matter = await createMatter(scope.uid, [uuid.v4()], { closedAt: new Date() });
+            const exportRequest = await ctx.store().save("MatterExportRequest", {
+                matterId: matter.uid,
+                requestedByUserUid: holder.uid,
+                status: "ready",
+                blobKey: `matter-export/${uuid.v4()}`,
+            });
+
+            const result = await as(holder).get(`/matter-export-requests/${exportRequest.uid}/download`);
+
+            expect(result.status).toBe(409);
+        });
+
+        it("refuses dotted or $ keys on matter, escrow scope and domain updates (400), changing nothing", async () => {
+            const admin = newUser(["admin"]);
+            const holder = newUser();
+            const scope = await createScope({ holderUserUids: [holder.uid, uuid.v4()], requiredHolders: 2 });
+            const matter = await createMatter(scope.uid, [uuid.v4()]);
+            const domainName = `${uuid.v4()}.example.org`;
+            const domain = await ctx.store().save("Domain", { uid: domainName, name: domainName, enabled: true, verified: false, verificationToken: "t" });
+
+            for (const body of [{ "custodianMailboxUids.0": "someone-else" }, { $set: { closedAt: new Date() } }]) {
+                expect((await as(holder).put(`/matters/${matter.uid}`, { uid: matter.uid, version: matter.version, ...body })).status).toBe(400);
+            }
+            expect((await as(holder).put("/matters", [{ uid: matter.uid, version: matter.version, "name.x": "y" }])).status).toBe(400);
+            expect((await as(holder).put(`/matters/${matter.uid}/custodianMailboxUids.0`).send(["x"])).status).toBe(400);
+            expect((await ctx.store().find("Matter", { uid: matter.uid }))[0].custodianMailboxUids).toEqual(matter.custodianMailboxUids);
+
+            expect((await as(admin).put(`/escrow-scopes/${scope.uid}`, { uid: scope.uid, version: scope.version, "holderUserUids.0": admin.uid })).status).toBe(400);
+            expect((await as(admin).put("/escrow-scopes", [{ uid: scope.uid, version: scope.version, "requiredHolders.x": 1 }])).status).toBe(400);
+            expect((await as(admin).put(`/escrow-scopes/${scope.uid}/holderUserUids.0`).send([admin.uid])).status).toBe(400);
+            expect((await ctx.store().find("EscrowScope", { uid: scope.uid }))[0].holderUserUids).toEqual(scope.holderUserUids);
+
+            expect((await as(admin).put(`/domains/${domain.uid}`, { uid: domain.uid, version: domain.version, "verified.x": true })).status).toBe(400);
+            expect((await as(admin).put("/domains", [{ uid: domain.uid, version: domain.version, $inc: { version: 1 } }])).status).toBe(400);
+            expect((await as(admin).put(`/domains/${domain.uid}/dkim.selector`).send("x")).status).toBe(400);
+            expect((await ctx.store().find("Domain", { uid: domain.uid }))[0].verified).toBe(false);
+        });
+
+        it("refuses malformed body shapes on matter, escrow scope and domain writes (400), changing nothing", async () => {
+            const admin = newUser(["admin"]);
+            const holder = newUser();
+            const scope = await createScope({ holderUserUids: [holder.uid, uuid.v4()], requiredHolders: 2 });
+            const matter = await createMatter(scope.uid, [uuid.v4()]);
+            const domainName = `${uuid.v4()}.example.org`;
+            const domain = await ctx.store().save("Domain", { uid: domainName, name: domainName, enabled: true, verified: false, verificationToken: "t" });
+            const scopesBefore: number = (await ctx.store().find("EscrowScope", {})).length;
+            const mattersBefore: number = (await ctx.store().find("Matter", {})).length;
+
+            // A nested array / an empty array body passes the generic per-element validation (it has no elements to
+            // validate), so the route's own shape checks are what refuse it.
+            expect((await as(admin).post("/escrow-scopes", [[]])).status).toBe(400);
+            expect((await as(admin).put(`/escrow-scopes/${scope.uid}`, [])).status).toBe(400);
+            expect((await as(holder).post("/matters", [[]])).status).toBe(400);
+            expect((await as(holder).put(`/matters/${matter.uid}`, [])).status).toBe(400);
+            expect((await as(admin).put(`/domains/${domain.uid}`, [])).status).toBe(400);
+
+            expect((await ctx.store().find("EscrowScope", {})).length).toBe(scopesBefore);
+            expect((await ctx.store().find("Matter", {})).length).toBe(mattersBefore);
+            const [storedScope] = await ctx.store().find("EscrowScope", { uid: scope.uid });
+            expect(storedScope.version).toBe(scope.version);
+            const [storedMatter] = await ctx.store().find("Matter", { uid: matter.uid });
+            expect(storedMatter.version).toBe(matter.version);
+            const [storedDomain] = await ctx.store().find("Domain", { uid: domain.uid });
+            expect(storedDomain.version).toBe(domain.version);
+        });
+    });
 }

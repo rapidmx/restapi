@@ -337,3 +337,85 @@ describe("normalizeSlug() Tests", () => {
         expect(normalizeSlug("!!!")).toBe("");
     });
 });
+
+describe("BookingUtils round-4 limits", () => {
+    it("validateAvailability() requires whole-minute durations and intervals from 5 minutes to a day.", () => {
+        for (const durationMinutes of [4, 0.5, 5.5, 1441, Number.NaN, "30" as any]) {
+            expect(validateAvailability({ durationMinutes })).toMatch(/durationMinutes/);
+        }
+        for (const slotIntervalMinutes of [4, 0.0001, 1441, "15" as any]) {
+            expect(validateAvailability({ slotIntervalMinutes })).toMatch(/slotIntervalMinutes/);
+        }
+        expect(validateAvailability({ durationMinutes: 5, slotIntervalMinutes: 1440 })).toBeUndefined();
+    });
+
+    it("validateAvailability() bounds bookingWindowDays, minimumNoticeMinutes, buffers and maxPerDay.", () => {
+        expect(validateAvailability({ bookingWindowDays: 0 })).toMatch(/bookingWindowDays/);
+        expect(validateAvailability({ bookingWindowDays: 366 })).toMatch(/bookingWindowDays/);
+        expect(validateAvailability({ bookingWindowDays: 1.5 })).toMatch(/bookingWindowDays/);
+        expect(validateAvailability({ bookingWindowDays: 365 })).toBeUndefined();
+        expect(validateAvailability({ minimumNoticeMinutes: -1 })).toMatch(/minimumNoticeMinutes/);
+        expect(validateAvailability({ minimumNoticeMinutes: 365 * 1440 + 1 })).toMatch(/minimumNoticeMinutes/);
+        expect(validateAvailability({ minimumNoticeMinutes: 365 * 1440 })).toBeUndefined();
+        expect(validateAvailability({ bufferBeforeMinutes: -5 })).toMatch(/bufferBeforeMinutes/);
+        expect(validateAvailability({ bufferAfterMinutes: 1441 })).toMatch(/bufferAfterMinutes/);
+        expect(validateAvailability({ maxPerDay: 0 })).toMatch(/maxPerDay/);
+        expect(validateAvailability({ maxPerDay: null as any })).toBeUndefined();
+        expect(validateAvailability({ maxPerDay: 3 })).toBeUndefined();
+    });
+
+    it("validateAvailability() caps window and override counts, and refuses repeated override dates and fractional minutes.", () => {
+        const window = { dayOfWeek: 1, startMinute: 540, endMinute: 600 };
+        expect(validateAvailability({ availability: Array(51).fill(window) })).toMatch(/at most 50 windows/);
+        expect(validateAvailability({ availability: Array(50).fill(window) })).toBeUndefined();
+        expect(validateAvailability({ availability: "x" as any })).toMatch(/availability/);
+        expect(validateAvailability({ dateOverrides: "x" as any })).toMatch(/dateOverrides/);
+        expect(
+            validateAvailability({
+                dateOverrides: Array.from({ length: 367 }, (_, i) => ({ date: new Date(Date.UTC(2026, 0, 1 + i)).toISOString().slice(0, 10), windows: [] })),
+            }),
+        ).toMatch(/at most 366 dates/);
+        expect(validateAvailability({ dateOverrides: [{ date: "2026-06-01", windows: Array(51).fill(window) }] })).toMatch(/at most 50 windows/);
+        expect(
+            validateAvailability({
+                dateOverrides: [
+                    { date: "2026-06-01", windows: [] },
+                    { date: "2026-06-01", windows: [window] },
+                ],
+            }),
+        ).toMatch(/more than once/);
+        expect(validateAvailability({ availability: [{ dayOfWeek: 1, startMinute: 540.5, endMinute: 600 }] })).toMatch(/whole minutes/);
+    });
+
+    it("generateCandidateSlots() offers nothing for a stored zero, fractional-below-one or non-numeric step instead of looping.", () => {
+        const from = new Date("2026-06-01T00:00:00.000Z");
+        const to = new Date("2026-06-02T00:00:00.000Z");
+        const now = new Date("2026-05-25T00:00:00.000Z");
+        expect(generateCandidateSlots(makeBookingType({ slotIntervalMinutes: 0.0001 }), from, to, now)).toEqual([]);
+        expect(generateCandidateSlots(makeBookingType({ durationMinutes: 0, slotIntervalMinutes: 15 }), from, to, now)).toEqual([]);
+        expect(generateCandidateSlots(makeBookingType({ slotIntervalMinutes: "abc" as any }), from, to, now)).toEqual([]);
+    });
+
+    it("generateCandidateSlots() de-duplicates starts from overlapping windows and stops collecting after the day it reaches 5000 slots.", () => {
+        const now = new Date("2026-05-25T00:00:00.000Z");
+        const overlapping = makeBookingType({
+            availability: [
+                { dayOfWeek: 1, startMinute: 540, endMinute: 660 },
+                { dayOfWeek: 1, startMinute: 600, endMinute: 720 },
+            ],
+        });
+        expect(
+            isoStarts(generateCandidateSlots(overlapping, new Date("2026-06-01T00:00:00.000Z"), new Date("2026-06-02T00:00:00.000Z"), now)),
+        ).toEqual(["2026-06-01T13:00:00.000Z", "2026-06-01T14:00:00.000Z", "2026-06-01T15:00:00.000Z"]);
+
+        // 1-minute steps (a legacy row) over whole days: 1440 a day, so the cap is crossed on the 4th day.
+        const dense = makeBookingType({
+            durationMinutes: 1,
+            bookingWindowDays: 365,
+            availability: [0, 1, 2, 3, 4, 5, 6].map((dayOfWeek) => ({ dayOfWeek, startMinute: 0, endMinute: 1440 })),
+        });
+        const slots = generateCandidateSlots(dense, new Date("2026-06-01T04:00:00.000Z"), new Date("2026-07-01T04:00:00.000Z"), now);
+        expect(slots).toHaveLength(4 * 1440);
+        expect(slots[slots.length - 1].start.toISOString()).toBe("2026-06-05T03:59:00.000Z");
+    });
+});

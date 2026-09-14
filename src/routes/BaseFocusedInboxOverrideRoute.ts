@@ -5,6 +5,7 @@
 import { ApiError, type JWTUser } from "@rapidrest/core";
 import { ApiErrors, HttpRequest, RouteDecorators } from "@rapidrest/service-core";
 import { normalizeAddress } from "../util/AddressUtils.js";
+import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import { FocusedInboxOverride } from "../models/types.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 const { Post, Request, User: AuthUser } = RouteDecorators;
@@ -57,7 +58,22 @@ export abstract class BaseFocusedInboxOverrideRoute<T extends FocusedInboxOverri
             // `update()` re-checks the caller's permission on the existing override's mailbox.
             return await this.update(existing.uid, { uid: existing.uid, version: existing.version, classifyAs: obj.classifyAs } as any, req, user);
         }
-        return await super.create(obj, req, user);
+        const classifyAs: unknown = obj.classifyAs;
+        try {
+            return await super.create(obj, req, user);
+        } catch (err: any) {
+            // A concurrent create for the same (mailbox, sender) won the unique index: apply this one to that row. (The
+            // create above already checked permission on `obj.mailboxUid` and normalized the sender.)
+            /* v8 ignore start -- only a concurrent create of the same override reaches here */
+            if (isDuplicateKeyError(err)) {
+                const winner: T | undefined = await this.findForSender(obj.mailboxUid, obj.senderAddress);
+                if (winner) {
+                    return await this.update(winner.uid, { uid: winner.uid, version: winner.version, classifyAs } as any, req, user);
+                }
+            }
+            /* v8 ignore stop */
+            throw err;
+        }
     }
 
     protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {

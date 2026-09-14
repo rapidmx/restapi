@@ -16,6 +16,8 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import type { CalendarShareLink } from "../models/types.js";
+import { coerceDateFields } from "../util/DateCoercionUtils.js";
+import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 const { Delete, Get, Head, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /**
@@ -90,7 +92,11 @@ function stripUnsafeQueryKeys(query: any): Record<string, any> {
  * Writes: `create()` always has the server mint `uid` (a client-chosen uid could name an existing
  * `AccessControlList` - which `RepoUtils.create()` reuses, adding the creator with full rights - or carry the `,()`
  * characters the search-query parser treats as syntax); `serverManagedFields` are dropped from a non-trusted caller's
- * create/update body; `trustedOnlyWrites` restricts every write to trusted callers.
+ * create/update body; `trustedOnlyWrites` restricts every write to trusted callers. A create never takes `_id`,
+ * `version`, `dateCreated`, `dateModified` or a dotted/`$` key from the client; an update body or `:property` with a
+ * dotted/`$` key is 400 (`util/RequestBodyUtils.ts`); `dateFields` are coerced to `Date`s; moving a record to another
+ * mailbox runs `checkLegalHold()`; `?deleted=true` only shows soft-deleted records to callers with DELETE and UPDATE
+ * on the scope.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -110,6 +116,10 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
     /** Fields only server-side code sets. Dropped from a non-trusted caller's create/update body, so a full object
      * round-tripped back keeps the stored values. */
     protected readonly serverManagedFields: readonly string[] = [];
+
+    /** Top-level `Date` fields of `T`, coerced to real `Date`s (400 if unparseable) on every create and update - the
+     * Mongo backend otherwise stores a JSON body's ISO string as-is. See `util/DateCoercionUtils.ts`. */
+    protected readonly dateFields: readonly string[] = [];
 
     private shareLinkRepo?: RepoUtils<CalendarShareLink>;
 
@@ -189,6 +199,30 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * never parsed as an operator. */
     private scopedFilter(params: any, query: any, scopeUid: string): any {
         return { ...stripUnsafeQueryKeys(query), ...params, [this.scopeProperty]: `eq(${scopeUid})` };
+    }
+
+    /** Whether `user` may see soft-deleted records in `scopeUid`: DELETE and UPDATE there, the two actions a restore
+     * needs - the same rule `RepoUtils` applies to `?deleted=true` when it checks ACLs itself. A share-link identity or
+     * a read-only delegate doesn't qualify. */
+    private async canViewDeleted(user: JWTUser | undefined, scopeUid: string): Promise<boolean> {
+        return (
+            (await this.aclUtils!.hasPermission(user, scopeUid, ACLAction.DELETE)) &&
+            (await this.aclUtils!.hasPermission(user, scopeUid, ACLAction.UPDATE))
+        );
+    }
+
+    /** `scopedFilter()`, minus a client `deleted` filter unless `user` may view deleted records (`canViewDeleted()`). */
+    private async listFilter(params: any, query: any, scopeUid: string, user: JWTUser | undefined): Promise<any> {
+        const filter: any = this.scopedFilter(params, query, scopeUid);
+        if ("deleted" in filter && !(await this.canViewDeleted(user, scopeUid))) {
+            delete filter.deleted;
+        }
+        return filter;
+    }
+
+    /** Whether a `?deleted=true` single-record read may return a soft-deleted `existing` to `user`. */
+    private async deletedVisible(existing: T, scopeUid: string, user: JWTUser | undefined): Promise<boolean> {
+        return (existing as any).deleted !== true || (await this.canViewDeleted(user, scopeUid));
     }
 
     private async requirePermission(scopeUid: string | undefined, user: JWTUser | undefined, action: string): Promise<void> {
@@ -281,11 +315,12 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!scopeUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        if (!(await this.aclUtils!.hasPermission(await this.resolveEffectiveUser(user, query, scopeUid), scopeUid, ACLAction.COUNT))) {
+        const effectiveUser: JWTUser | undefined = await this.resolveEffectiveUser(user, query, scopeUid);
+        if (!(await this.aclUtils!.hasPermission(effectiveUser, scopeUid, ACLAction.COUNT))) {
             return res.status(200).setHeader("content-length", 0);
         }
         const result: number = await this.repoUtils.count(
-            this.scopedFilter(params, query, scopeUid),
+            await this.listFilter(params, query, scopeUid, effectiveUser),
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
         return res.status(200).setHeader("content-length", result);
@@ -295,11 +330,17 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         this.requireTrustedWrite(user);
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
+        if (objs.some((single) => !single || typeof single !== "object" || Array.isArray(single))) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
         for (const single of objs) {
             await this.requirePermission(this.scopeUidOf(single), user, ACLAction.CREATE);
             await this.enforceMailboxUid(single, this.scopeUidOf(single));
-            // Always a server-minted uid - see this class's doc comment.
+            // Always a server-minted uid - see this class's doc comment. `_id` (which would replace another document
+            // on Mongo), `version`/`dateCreated`/`dateModified` and path keys are never the client's either.
             delete (single as any).uid;
+            stripClientCreateFields(single);
+            coerceDateFields(single, this.dateFields);
             await this.prepareCreate(single, user);
         }
         if (Array.isArray(obj)) {
@@ -355,8 +396,10 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             ignoreACL: true,
         });
         const scopeUid: string | undefined = existing ? this.scopeUidOf(existing) : undefined;
+        const effectiveUser: JWTUser | undefined = scopeUid ? await this.resolveEffectiveUser(user, query, scopeUid) : undefined;
         const permitted: boolean = scopeUid
-            ? await this.aclUtils!.hasPermission(await this.resolveEffectiveUser(user, query, scopeUid), scopeUid, ACLAction.EXISTS)
+            ? (await this.aclUtils!.hasPermission(effectiveUser, scopeUid, ACLAction.EXISTS)) &&
+              (await this.deletedVisible(existing!, scopeUid, effectiveUser))
             : false;
         return permitted
             ? res.status(200).setHeader("content-length", 1)
@@ -372,11 +415,12 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!scopeUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        if (!(await this.aclUtils!.hasPermission(await this.resolveEffectiveUser(user, query, scopeUid), scopeUid, ACLAction.LIST))) {
+        const effectiveUser: JWTUser | undefined = await this.resolveEffectiveUser(user, query, scopeUid);
+        if (!(await this.aclUtils!.hasPermission(effectiveUser, scopeUid, ACLAction.LIST))) {
             return [];
         }
         return await this.repoUtils.find(
-            this.scopedFilter(params, query, scopeUid),
+            await this.listFilter(params, query, scopeUid, effectiveUser),
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
     }
@@ -392,7 +436,12 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             ignoreACL: true,
         });
         const scopeUid: string | undefined = existing ? this.scopeUidOf(existing) : undefined;
-        if (!scopeUid || !(await this.aclUtils!.hasPermission(await this.resolveEffectiveUser(user, query, scopeUid), scopeUid, ACLAction.READ))) {
+        const effectiveUser: JWTUser | undefined = scopeUid ? await this.resolveEffectiveUser(user, query, scopeUid) : undefined;
+        if (
+            !scopeUid ||
+            !(await this.aclUtils!.hasPermission(effectiveUser, scopeUid, ACLAction.READ)) ||
+            !(await this.deletedVisible(existing!, scopeUid, effectiveUser))
+        ) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
         return existing!;
@@ -431,7 +480,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         // under `purge: true`) - see `checkLegalHold()`'s own doc comment. Every matched record must be
         // checked, the same protection a caller can't route around by simply preferring this bulk endpoint
         // over the equivalent one-at-a-time `delete(..., { purge: true })` calls.
-        const matched: T[] = await this.findAllForTruncate(this.scopedFilter(params, query, scopeUid!), user);
+        const matched: T[] = await this.findAllForTruncate(await this.listFilter(params, query, scopeUid!, user), user);
         if (matched.length === 0) {
             return;
         }
@@ -465,6 +514,13 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         this.requireTrustedWrite(user);
+        if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        // A dotted or `$` key is a Mongo update path (`receiptStatus.0`, `actions.2.labelUid`) that skips every check
+        // below on the top-level field - see `util/RequestBodyUtils.ts`.
+        assertNoPathKeys(obj);
+        stripClientId(obj);
         const existing: T | undefined = await this.repoUtils.findOne(id, { skipCache: true, ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -499,6 +555,14 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             await this.enforceMailboxUid(obj, newScopeUid !== undefined ? newScopeUid : this.scopeUidOf(existing));
         }
 
+        // Moving a record to another mailbox takes it out of its mailbox's legal hold (holds, erasure and retention all
+        // select by `mailboxUid`), so it's refused for a held record, like a purge.
+        const movedToMailboxUid: unknown = (obj as any).mailboxUid;
+        if (movedToMailboxUid !== undefined && movedToMailboxUid !== (existing as any).mailboxUid) {
+            await this.checkLegalHold(existing);
+        }
+
+        coerceDateFields(obj, this.dateFields);
         await this.prepareUpdate(obj, existing, user);
         await this.validate(obj, { user });
         const updated: T = await this.repoUtils.update(obj, existing, { user, ignoreACL: true });
@@ -519,6 +583,8 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
     @Put()
     public async updateBulk(obj: UpdateObject<T>[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
         this.requireTrustedWrite(user);
+        // (A non-array body never gets here: `CRUDRoute`s bulk validator already refused it.)
+        assertNoPathKeys(obj);
         const results: T[] = [];
         for (const single of obj) {
             results.push(await this.update(single.uid, single, req, user));
@@ -537,6 +603,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         this.requireTrustedWrite(user);
+        assertPlainPropertyName(propertyName);
         const existing: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);

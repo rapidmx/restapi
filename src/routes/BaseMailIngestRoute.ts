@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
+import addressparser from "nodemailer/lib/addressparser/index.js";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import {
     ApiErrorMessages,
@@ -22,7 +23,9 @@ import { DistributionList, IngestQueueEntry, IngestStatus, Mailbox, QuarantineRe
 import { normalizeAddress, stripPlusTag } from "../util/AddressUtils.js";
 import { rewriteHeadersForList } from "../util/DistributionListUtils.js";
 import { getVerifiedDomainNames } from "../util/DomainUtils.js";
-import { extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
+import { extractHeader, extractHeaders, prependHeaders } from "../util/MimeHeaderUtils.js";
+import { hasAlignedPassingDkim } from "../util/AuthenticationResultsUtils.js";
+import { asEntity } from "../util/EntityUtils.js";
 import { buildTransportRuleContext, evaluateTransportRules } from "../util/TransportRuleUtils.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Description, Summary } = DocDecorators;
@@ -96,6 +99,11 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
     /** Gmail-style `user+tag@domain.com` plus-addressing - see `findMailboxByAddress()`. Mailbox-scoped only
      * (not `DistributionList`) and delivery-routing only (not authentication/login) - deliberate scope
      * boundaries, not oversights. */
+    /** The `authserv-id` of the MTA's own `Authentication-Results` header - see this class's doc comment. An unsubscribe
+     * is only honored with aligned, passing DKIM reported under it; unset (`""`), no unsubscribe is honored. */
+    @Config("mail:security:trusted_authserv_id", "")
+    private trustedAuthservId: string = "";
+
     @Config("mail:plus_addressing:enabled", true)
     private plusAddressingEnabled: boolean = true;
 
@@ -325,16 +333,50 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
      * library. Best-effort: a failure to send the confirmation is logged, not propagated (the unsubscribe
      * itself has already been persisted by that point).
      */
+    /**
+     * Whether `raw` provably comes from `member`: its one `From` header is exactly `member`, and the trusted MTA
+     * (`mail:security:trusted_authserv_id`) reported a passing DKIM signature aligned with the member's domain.
+     */
+    private isVerifiedMemberMessage(raw: Buffer, member: string): boolean {
+        const parsed = extractHeaders(raw, "From").flatMap((value) => addressparser(value, { flatten: true }));
+        if (parsed.length !== 1 || normalizeAddress(String(parsed[0].address)) !== member) {
+            return false;
+        }
+        const domain: string = member.slice(member.lastIndexOf("@") + 1);
+        return hasAlignedPassingDkim(extractHeaders(raw, "Authentication-Results"), domain, this.trustedAuthservId);
+    }
+
     private async handleUnsubscribe(list: DistributionList, envelopeFrom: string): Promise<void> {
         const normalizedFrom: string = normalizeAddress(envelopeFrom);
-        const remaining: string[] = (list.memberAddresses ?? []).filter((m) => normalizeAddress(m) !== normalizedFrom);
 
         try {
-            await this.distributionListRepo!.update(
-                { uid: list.uid, version: list.version, memberAddresses: remaining },
-                list,
-                { ignoreACL: true },
-            );
+            // `list` is a `find()` row - a plain document on Mongo, which `update()` writes back unversioned (`asEntity()`),
+            // so a concurrent membership change could be silently undone. A conflict re-reads the list and retries.
+            let current: DistributionList | undefined = list;
+            for (let attempt = 1; current; attempt++) {
+                // `deliver()` only unsubscribes a member it found in this list, so there is a member list.
+                const members: string[] = current.memberAddresses;
+                const remaining: string[] = members.filter((m) => normalizeAddress(m) !== normalizedFrom);
+                /* v8 ignore next 3 -- only when a concurrent unsubscribe already removed the member */
+                if (remaining.length === members.length) {
+                    break;
+                }
+                try {
+                    await this.distributionListRepo!.update(
+                        { uid: current.uid, version: current.version, memberAddresses: remaining },
+                        asEntity(this.distributionListRepo!, current),
+                        { ignoreACL: true },
+                    );
+                    break;
+                    /* v8 ignore start -- only a concurrent change to the same list reaches here */
+                } catch (err: any) {
+                    if (attempt >= 3 || err?.status !== 409) {
+                        throw err;
+                    }
+                    current = await this.distributionListRepo!.findOne(list.uid, { ignoreACL: true, skipCache: true });
+                }
+                /* v8 ignore stop */
+            }
         } catch (err: any) {
             this.logger?.warn(
                 `MailIngestRoute: failed to remove unsubscribing member '${envelopeFrom}' from '${list.primarySmtpAddress}': ${err.message}`,
@@ -573,9 +615,16 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
 
             // A current member emailing the list itself with `Subject: unsubscribe` is removed from
             // `memberAddresses` instead of the message being fanned out - checked before `restrictSenders` so
-            // unsubscribing works regardless of that flag.
+            // unsubscribing works regardless of that flag. The envelope sender is forgeable, so the removal needs proof
+            // the member sent it (`isVerifiedMemberMessage()`); an unverifiable request is dropped, not fanned out.
             if (isMember && extractHeader(raw, "Subject")?.trim().toLowerCase() === "unsubscribe") {
-                await this.handleUnsubscribe(list, envelopeFrom);
+                if (this.isVerifiedMemberMessage(raw, envelopeFromNormalized)) {
+                    await this.handleUnsubscribe(list, envelopeFrom);
+                } else {
+                    this.logger?.warn(
+                        `MailIngestRoute: ignoring unverified unsubscribe for '${envelopeFrom}' from '${list.primarySmtpAddress}'.`,
+                    );
+                }
                 results.push({ rcpt: address, queued: false });
                 continue;
             }

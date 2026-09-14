@@ -386,6 +386,13 @@ describe("discoverAndMergeKeys() Tests", () => {
         expect(result).toBeUndefined();
     });
 
+    it("Rejects an address with multiple @ (or an empty local part) without any DNS lookup or fetch.", async () => {
+        expect(await discoverAndMergeKeys(dnsResolver, "a@evil.example.com@victim.example.com", undefined)).toBeUndefined();
+        expect(await discoverAndMergeKeys(dnsResolver, "@victim.example.com", undefined)).toBeUndefined();
+        expect(dnsResolver.resolveTxt).not.toHaveBeenCalled();
+        expect(mockFetch).not.toHaveBeenCalled();
+    });
+
     it("Returns undefined when the domain publishes no _rapidmx record (not a federated peer).", async () => {
         (dnsResolver.resolveTxt as any).mockRejectedValue(new Error("NXDOMAIN"));
         const result = await discoverAndMergeKeys(dnsResolver, "alice@non-participating-1.example.com", undefined);

@@ -260,7 +260,7 @@ export interface EscrowAccessRequest extends BaseEntity {
     deniedAt?: Date;
 }
 
-export type MatterExportStatus = "pending" | "ready" | "failed";
+export type MatterExportStatus = "pending" | "processing" | "ready" | "failed";
 
 /**
  * A holder-invoked eDiscovery export of a `Matter`'s full custodian set - the same kind of downloadable
@@ -291,6 +291,12 @@ export interface MatterExportRequest extends BaseEntity {
     blobKey?: string;
 
     errorMessage?: string;
+
+    /** How many times `MatterExportJob` has claimed this request into `"processing"`. A request left in
+     * `"processing"` past its lease (`dateModified` older than `mail:jobs:matter_export:lease_minutes`, e.g.
+     * the processing replica died) is reclaimed back to `"pending"` until this reaches
+     * `mail:jobs:matter_export:max_attempts`, then marked `"failed"`. */
+    processingAttempts?: number;
 }
 
 /** The lifecycle event an `EscrowAuditLogEntry` records - the three moments real escrow-wrapped key
@@ -554,7 +560,7 @@ export interface MailboxImportRequest extends BaseEntity {
     processingAttempts?: number;
 }
 
-export type DataSubjectErasureStatus = "pending" | "approved" | "denied" | "completed";
+export type DataSubjectErasureStatus = "pending" | "approved" | "in_progress" | "denied" | "completed";
 
 /**
  * A GDPR Article 17 ("right to erasure") request for one mailbox - mirrors `EscrowAccessRequest`'s

@@ -411,6 +411,22 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
         expect(entries.map((e) => e.mailboxUid)).toEqual([mailboxB.uid]);
     });
 
+    it("Marks a request failed, without claiming it or writing a bundle, when looking up its matter throws.", async () => {
+        const request = await createRequest({ matterId: uuid.v4() });
+        vi.spyOn((job as any).matterRepo, "findOne").mockRejectedValueOnce(new Error("simulated matter lookup failure"));
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const putSpy = vi.spyOn(blobStore, "put");
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.status).toBe("failed");
+        expect(updated!.errorMessage).toBe("simulated matter lookup failure");
+        expect(updated!.processingAttempts ?? 0).toBe(0);
+        expect(putSpy).not.toHaveBeenCalled();
+        expect(await auditLogRepo.find({ action: AuditAction.MATTER_EXPORT_FAILED }).toArray()).toHaveLength(1);
+    });
+
     it("Logs an error when even marking a request failed itself throws.", async () => {
         const request = await createRequest({ matterId: uuid.v4() });
         const repoUtils = (job as any).requestRepo;
@@ -420,6 +436,209 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
 
         const stillPending = await requestRepo.findOne({ uid: request.uid } as any);
         expect(stillPending!.status).toBe("pending");
+    });
+
+    const withJobField = async (field: string, value: any, fn: () => Promise<void>): Promise<void> => {
+        const original = (job as any)[field];
+        (job as any)[field] = value;
+        try {
+            await fn();
+        } finally {
+            (job as any)[field] = original;
+        }
+    };
+
+    it("Claims a request into 'processing' (bumping processingAttempts) and streams the bundle to an attempt-scoped blob key.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId });
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailbox.uid] });
+        const request = await createRequest({ matterId: matter.uid });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const putSpy = vi.spyOn(blobStore, "put");
+
+        await job.run();
+
+        const updated = (await requestRepo.findOne({ uid: request.uid } as any));
+        expect(updated!.status).toBe("ready");
+        expect(updated!.processingAttempts).toBe(1);
+        expect(updated!.blobKey).toBe(`matter-exports/${request.uid}-1.ndjson`);
+        expect(Buffer.isBuffer(putSpy.mock.calls[0][1])).toBe(false);
+        // claim + ready (the lease isn't due for renewal yet)
+        expect(updated!.version).toBe(request.version + 2);
+    });
+
+    it("Only one of two overlapping runs holding the same stale request row wins the claim - the loser builds no bundle and records no attestations.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId });
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailbox.uid] });
+        const request = await createRequest({ matterId: matter.uid });
+        const repoUtils = (job as any).requestRepo;
+        const [stale] = await repoUtils.find({ status: "pending", limit: 5 } as any, { ignoreACL: true, limit: 5 });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const putSpy = vi.spyOn(blobStore, "put");
+
+        await (job as any).processRequest(stale);
+        await expect((job as any).processRequest(stale)).rejects.toThrow();
+
+        expect(putSpy).toHaveBeenCalledTimes(1);
+        const updated = (await requestRepo.findOne({ uid: request.uid } as any));
+        expect(updated!.status).toBe("ready");
+        expect(updated!.processingAttempts).toBe(1);
+        expect((await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_READY }).toArray()).length).toBe(1);
+    });
+
+    it("Reclaims a 'processing' request whose lease expired and processes it again in the same run.", async () => {
+        const matter = await createMatter({ custodianMailboxUids: [] });
+        const request = await createRequest({
+            matterId: matter.uid,
+            status: "processing",
+            processingAttempts: 1,
+            dateModified: new Date(Date.now() - 2 * 60 * 60_000),
+        });
+
+        await job.run();
+
+        const updated = (await requestRepo.findOne({ uid: request.uid } as any));
+        expect(updated!.status).toBe("ready");
+        expect(updated!.processingAttempts).toBe(2);
+        expect(updated!.blobKey).toBe(`matter-exports/${request.uid}-2.ndjson`);
+    });
+
+    it("Leaves a 'processing' request alone while its lease is still fresh.", async () => {
+        const matter = await createMatter({ custodianMailboxUids: [] });
+        const request = await createRequest({ matterId: matter.uid, status: "processing", processingAttempts: 1 });
+
+        await job.run();
+
+        const updated = (await requestRepo.findOne({ uid: request.uid } as any));
+        expect(updated!.status).toBe("processing");
+        expect(updated!.version).toBe(request.version);
+    });
+
+    it("Marks an abandoned request failed instead of reclaiming it once max_attempts is reached.", async () => {
+        const matter = await createMatter({ custodianMailboxUids: [] });
+        const request = await createRequest({
+            matterId: matter.uid,
+            status: "processing",
+            processingAttempts: 3,
+            dateModified: new Date(Date.now() - 2 * 60 * 60_000),
+        });
+
+        await job.run();
+
+        const updated = (await requestRepo.findOne({ uid: request.uid } as any));
+        expect(updated!.status).toBe("failed");
+        expect(updated!.errorMessage).toContain("did not complete after 3 attempt(s)");
+        expect((await auditLogRepo.find({ action: AuditAction.MATTER_EXPORT_FAILED }).toArray()).length).toBe(1);
+    });
+
+    it("Fails an export that exceeds mail:export:max_bytes, leaving no partial blob and no attestations behind.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId, displayName: "x".repeat(500) });
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailbox.uid] });
+        const request = await createRequest({ matterId: matter.uid });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+
+        await withJobField("maxBytes", 100, async () => {
+            await job.run();
+        });
+
+        const updated = (await requestRepo.findOne({ uid: request.uid } as any));
+        expect(updated!.status).toBe("failed");
+        expect(updated!.errorMessage).toBe("Export exceeds the maximum export size of 100 bytes.");
+        expect(await blobStore.exists(`matter-exports/${request.uid}-1.ndjson`)).toBe(false);
+        expect((await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_READY }).toArray()).length).toBe(0);
+    });
+
+    it("Renews its lease after each custodian while streaming, and still completes.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailboxA = await createMailbox({ escrowScopeId });
+        const mailboxB = await createMailbox({ escrowScopeId });
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailboxA.uid, mailboxB.uid] });
+        const request = await createRequest({ matterId: matter.uid });
+
+        await withJobField("leaseMinutes", 0, async () => {
+            await (job as any).processRequest(request);
+        });
+
+        const updated = (await requestRepo.findOne({ uid: request.uid } as any));
+        expect(updated!.status).toBe("ready");
+        // claim + one renewal per custodian + ready
+        expect(updated!.version).toBe(request.version + 4);
+    });
+
+    it("A run that lost its lease mid-export (another replica reclaimed the request) neither marks it ready nor leaves its blob or attestations behind.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId });
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailbox.uid] });
+        const request = await createRequest({ matterId: matter.uid });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const realPut = blobStore.put.bind(blobStore);
+        vi.spyOn(blobStore, "put").mockImplementationOnce(async (key: string, data: any, options?: any) => {
+            await realPut(key, data, options);
+            await requestRepo.updateOne({ uid: request.uid } as any, { $inc: { version: 1 }, $set: { status: "pending" } });
+        });
+
+        await (job as any).processRequest(request);
+
+        const updated = (await requestRepo.findOne({ uid: request.uid } as any));
+        expect(updated!.status).toBe("pending");
+        expect(updated!.blobKey).toBeFalsy();
+        expect(await blobStore.exists(`matter-exports/${request.uid}-1.ndjson`)).toBe(false);
+        expect((await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_READY }).toArray()).length).toBe(0);
+    });
+
+    it("Logs a warning and still processes pending requests when the abandoned-request lookup fails.", async () => {
+        const matter = await createMatter({ custodianMailboxUids: [] });
+        const request = await createRequest({ matterId: matter.uid });
+        const repoUtils = (job as any).requestRepo;
+        const originalFind = repoUtils.find.bind(repoUtils);
+        vi.spyOn(repoUtils, "find").mockImplementation(async (query: any, options: any) => {
+            if (query?.status === "processing") {
+                throw new Error("simulated abandoned lookup failure");
+            }
+            return await originalFind(query, options);
+        });
+        const warnSpy = vi.spyOn((job as any).logger, "warn");
+
+        await job.run();
+
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated abandoned lookup failure"));
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.status).toBe("ready");
+    });
+
+    it("Logs a warning (no throw) when reclaiming an abandoned request fails, leaving it for a later run.", async () => {
+        const matter = await createMatter({ custodianMailboxUids: [] });
+        const request = await createRequest({
+            matterId: matter.uid,
+            status: "processing",
+            processingAttempts: 1,
+            dateModified: new Date(Date.now() - 2 * 60 * 60_000),
+        });
+        vi.spyOn((job as any).requestRepo, "update").mockRejectedValueOnce(new Error("simulated reclaim failure"));
+        const warnSpy = vi.spyOn((job as any).logger, "warn");
+
+        await job.run();
+
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated reclaim failure"));
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.status).toBe("processing");
+    });
+
+    it("Logs a warning and still fails the request when deleting the incomplete export blob itself fails.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId, displayName: "x".repeat(500) });
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailbox.uid] });
+        const request = await createRequest({ matterId: matter.uid });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        vi.spyOn(blobStore, "delete").mockRejectedValue(new Error("simulated blob delete failure"));
+        const warnSpy = vi.spyOn((job as any).logger, "warn");
+
+        await withJobField("maxBytes", 100, async () => {
+            await job.run();
+        });
+
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated blob delete failure"));
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.status).toBe("failed");
     });
 
     it("Does nothing when the repos are not yet initialized.", async () => {

@@ -71,6 +71,44 @@ describe("resolveActiveOof() Tests", () => {
         expect(resolveActiveOof(mailbox)).toEqual({ active: true, message: "I'm out." });
     });
 
+    it("Honors a window whose bounds come back from storage as ISO strings (Mongo), not Date objects.", () => {
+        const day = 24 * 60 * 60 * 1000;
+        const inside = makeMailbox({
+            oofEnabled: true,
+            oofMessage: "I'm out.",
+            oofStartTime: new Date(Date.now() - day).toISOString() as unknown as Date,
+            oofEndTime: new Date(Date.now() + day).toISOString() as unknown as Date,
+        });
+        expect(resolveActiveOof(inside)).toEqual({ active: true, message: "I'm out." });
+
+        const expired = makeMailbox({
+            oofEnabled: true,
+            oofMessage: "I'm out.",
+            oofStartTime: new Date(Date.now() - 2 * day).toISOString() as unknown as Date,
+            oofEndTime: new Date(Date.now() - day).toISOString() as unknown as Date,
+        });
+        expect(resolveActiveOof(expired)).toBeUndefined();
+
+        const notYetStarted = makeMailbox({
+            oofEnabled: true,
+            oofMessage: "I'm out.",
+            oofStartTime: new Date(Date.now() + day).toISOString() as unknown as Date,
+            oofEndTime: new Date(Date.now() + 2 * day).toISOString() as unknown as Date,
+        });
+        expect(resolveActiveOof(notYetStarted)).toBeUndefined();
+    });
+
+    it("Fails closed (no automatic reply) when a window bound is an unparseable date.", () => {
+        const mailbox = makeMailbox({
+            oofEnabled: true,
+            oofMessage: "I'm out.",
+            oofStartTime: "not-a-date" as unknown as Date,
+            oofEndTime: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        });
+        expect(resolveActiveOof(mailbox)).toBeUndefined();
+        expect(resolveActiveOof(makeMailbox({ ...mailbox, oofStartTime: new Date(0), oofEndTime: new Date(NaN) }))).toBeUndefined();
+    });
+
     it("Returns active with the linked calendar event's message when the event is active, mailbox toggle off.", () => {
         const mailbox = makeMailbox({ oofEnabled: false });
         const event = makeEvent({ autoReplyEnabled: true, autoReplyMessage: "On vacation." });

@@ -8,7 +8,7 @@ import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-
 import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline, ScanPipelineResult } from "../scan/ScanPipeline.js";
-import { deriveConversationId } from "../util/ConversationUtils.js";
+import { boundIndexedValue, deriveConversationId } from "../util/ConversationUtils.js";
 import { extractHeader } from "../util/MimeHeaderUtils.js";
 import { parseMbox } from "../util/MboxUtils.js";
 import { extractPstMessages } from "../util/PstImportUtils.js";
@@ -30,12 +30,17 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * quota - stops the whole import (see `MailboxImportJob.processRequest()`). */
 class MailboxQuotaExceededError extends Error {}
 
-/** Tracks the target mailbox's quota across one import run. `quotaBytes <= 0` means unlimited (the model
- * default of `0` is an unprovisioned quota, not a zero-byte mailbox). */
+/** The target mailbox's quota as of this run's last read/charge - used only for the cheap pre-scan check; the
+ * authoritative check is `MailboxImportJob.chargeQuota()` against the freshly read row. `quotaBytes <= 0` means
+ * unlimited (the model default of `0` is an unprovisioned quota, not a zero-byte mailbox). */
 interface ImportQuota {
+    mailboxUid: string;
     quotaBytes: number;
     usedBytes: number;
 }
+
+/** How many times a `Mailbox.usedBytes` charge/refund is retried on an optimistic-lock conflict. */
+const MAX_QUOTA_ATTEMPTS = 5;
 
 /** The lease a running attempt holds on its request row - see `DataExportJob`'s identical scheme. */
 interface ImportLease<MIR> {
@@ -69,10 +74,15 @@ interface ImportLease<MIR> {
  * sense" scope note.
  *
  * **Quota.** The target mailbox's `quotaBytes` is enforced before each message is stored (counting the raw
- * message plus its attachments, the same formula `MailboxQuotaRecalcJob` uses, on top of the mailbox's
- * `usedBytes` at the start of the run); a `quotaBytes` of `0` means unlimited. Once the next message would
- * exceed it, the import stops and the request is marked `"failed"` with a quota error, keeping the
- * `importedCount`/`failedCount` of what was already imported (those messages stay).
+ * message plus its attachments, the same formula `MailboxQuotaRecalcJob` uses); a `quotaBytes` of `0` means
+ * unlimited. Each message's size is charged to the persisted `Mailbox.usedBytes` BEFORE it is stored, by a
+ * version-checked update against a fresh read (retried on conflict - see `chargeQuota()`), so concurrent imports
+ * and other `usedBytes` writers see each other's usage instead of clobbering it, and a crash mid-import doesn't
+ * lose the accounting of what was already imported. A message that then fails to store is refunded. Once the
+ * next message would exceed the quota, the import stops and the request is marked `"failed"` with a quota error,
+ * keeping the `importedCount`/`failedCount` of what was already imported (those messages stay). Residual: a crash
+ * between a charge and the message being stored over-counts that one message until `MailboxQuotaRecalcJob`
+ * recomputes the mailbox.
  *
  * **Lease/reclaim.** Same scheme as `DataExportJob` (see its doc comment): the claim bumps
  * `processingAttempts` and starts a lease on the row's `dateModified`, renewed while importing; a
@@ -276,7 +286,7 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             const source: Buffer = await this.blobStore!.get(processing.sourceBlobKey);
             const rawMessages: Buffer[] = processing.format === "mbox" ? parseMbox(source) : await extractPstMessages(source);
 
-            const quota: ImportQuota = { quotaBytes: mailbox.quotaBytes ?? 0, usedBytes: mailbox.usedBytes ?? 0 };
+            const quota: ImportQuota = { mailboxUid: mailbox.uid, quotaBytes: mailbox.quotaBytes ?? 0, usedBytes: mailbox.usedBytes ?? 0 };
             let importedCount = 0;
             let failedCount = 0;
             let quotaError: string | undefined;
@@ -370,7 +380,9 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
      * attempt, to skip what the earlier (abandoned) attempt already persisted. */
     private async alreadyImported(raw: Buffer, folder: F): Promise<boolean> {
         const header: string | undefined = extractHeader(raw, "Message-ID");
-        const messageId: string = (header ?? "").trim().replace(/^<|>$/g, "");
+        // Bounded the same way `Message` bounds the stored value (an over-long Message-ID is stored as its SHA-256),
+        // or an over-long Message-ID would never match and a retry would duplicate the message.
+        const messageId: string = boundIndexedValue((header ?? "").trim().replace(/^<|>$/g, ""));
         if (!messageId) {
             return false;
         }
@@ -405,7 +417,8 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
      * reuse of `ScanQueueJob.deliverMessage()`. Returns `false` (skipped, not thrown) for an AV-`INFECTED` or
      * AV-`ERROR` verdict - imported historical malware is a real risk, not a hypothetical this repo need only
      * assert against. Throws `MailboxQuotaExceededError` (before storing anything) when this message would
-     * push the mailbox past `quota`; otherwise adds its size to `quota.usedBytes`. */
+     * push the mailbox past its quota; otherwise charges its size to the persisted `Mailbox.usedBytes`
+     * (`chargeQuota()`), refunding it if storing the message then fails. */
     private async persistImportedMessage(raw: Buffer, mailbox: MB, folder: F, quota: ImportQuota): Promise<boolean> {
         // Cheap pre-check on the raw size alone, before paying for a scan.
         this.assertWithinQuota(quota, raw.length);
@@ -430,8 +443,17 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
 
         // Same size formula `MailboxQuotaRecalcJob` uses: the stored raw body plus every attachment row's size.
         const messageBytes: number = raw.length + result.attachments.reduce((sum, a) => sum + a.content.length, 0);
-        this.assertWithinQuota(quota, messageBytes);
+        // Charged (persisted) before anything is stored; refunded if storing then fails.
+        await this.chargeQuota(quota, messageBytes);
+        try {
+            return await this.storeImportedMessage(raw, result, mailbox, folder);
+        } catch (err) {
+            await this.refundQuota(quota, messageBytes);
+            throw err;
+        }
+    }
 
+    private async storeImportedMessage(raw: Buffer, result: ScanPipelineResult, mailbox: MB, folder: F): Promise<boolean> {
         const bodyBlobKey = `imported/${crypto.randomUUID()}`;
         await this.blobStore!.put(bodyBlobKey, raw, { contentType: "message/rfc822" });
 
@@ -441,7 +463,9 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             await this.blobStore!.put(sanitizedHtmlBlobKey, Buffer.from(result.sanitizedHtml, "utf-8"), { contentType: "text/html" });
         }
 
-        const messageId: string = result.messageIdHeader ?? crypto.randomUUID();
+        // Bounded explicitly (the model constructors bound it too - idempotent) so the stored value always matches
+        // `alreadyImported()`'s bounded lookup.
+        const messageId: string = boundIndexedValue(result.messageIdHeader ?? crypto.randomUUID());
         const conversationId: string = deriveConversationId(result.references, result.inReplyTo, messageId);
         // `ScanPipelineResult` doesn't parse/expose the message's own `Date:` header (nothing about live
         // inbound delivery ever needed it - `ScanQueueJob.deliverMessage()` also just stamps `new Date()`,
@@ -503,8 +527,64 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             );
         }
 
-        quota.usedBytes += messageBytes;
         return true;
+    }
+
+    /**
+     * Atomically checks and charges `bytes` against the mailbox's persisted quota: re-reads the mailbox (uncached),
+     * throws `MailboxQuotaExceededError` if `usedBytes + bytes` would exceed its current `quotaBytes`, and otherwise
+     * writes the incremented `usedBytes` with a version-checked update (`asEntity()` - an unversioned Mongo write
+     * would silently overwrite a concurrent charge). A conflict re-reads and retries, up to `MAX_QUOTA_ATTEMPTS`.
+     * Refreshes `quota` from what was read, for the next message's cheap pre-check.
+     */
+    private async chargeQuota(quota: ImportQuota, bytes: number): Promise<void> {
+        let lastError: unknown;
+        for (let attempt = 0; attempt < MAX_QUOTA_ATTEMPTS; attempt++) {
+            const current: MB | undefined = await this.mailboxRepo!.findOne(quota.mailboxUid, { ignoreACL: true, skipCache: true });
+            if (!current) {
+                throw new Error("The target mailbox no longer exists.");
+            }
+            quota.quotaBytes = current.quotaBytes ?? 0;
+            quota.usedBytes = current.usedBytes ?? 0;
+            this.assertWithinQuota(quota, bytes);
+            try {
+                await this.mailboxRepo!.update(
+                    { uid: current.uid, version: (current as any).version, usedBytes: quota.usedBytes + bytes } as any,
+                    asEntity(this.mailboxRepo!, current),
+                    { ignoreACL: true, skipPush: true },
+                );
+                quota.usedBytes += bytes;
+                return;
+            } catch (err) {
+                lastError = err;
+            }
+        }
+        throw lastError;
+    }
+
+    /** Best-effort reversal of `chargeQuota()` for a message that failed to store - same versioned retry loop. A
+     * refund that can't be written is logged; `MailboxQuotaRecalcJob` corrects the over-count later. */
+    private async refundQuota(quota: ImportQuota, bytes: number): Promise<void> {
+        let lastError: any;
+        for (let attempt = 0; attempt < MAX_QUOTA_ATTEMPTS; attempt++) {
+            try {
+                const current: MB | undefined = await this.mailboxRepo!.findOne(quota.mailboxUid, { ignoreACL: true, skipCache: true });
+                if (!current) {
+                    return;
+                }
+                const usedBytes: number = Math.max(0, (current.usedBytes ?? 0) - bytes);
+                await this.mailboxRepo!.update(
+                    { uid: current.uid, version: (current as any).version, usedBytes } as any,
+                    asEntity(this.mailboxRepo!, current),
+                    { ignoreACL: true, skipPush: true },
+                );
+                quota.usedBytes = usedBytes;
+                return;
+            } catch (err) {
+                lastError = err;
+            }
+        }
+        this.logger?.warn(`MailboxImportJob: failed to refund ${bytes} quota bytes to mailbox ${quota.mailboxUid}: ${lastError?.message}`);
     }
 
     private assertWithinQuota(quota: ImportQuota, additionalBytes: number): void {

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
+import addressparser from "nodemailer/lib/addressparser/index.js";
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import {
     ACLAction,
@@ -24,7 +25,10 @@ import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { findActiveHoldsFor } from "../util/LegalHoldUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
-import { extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
+import { coerceDateValue } from "../util/DateCoercionUtils.js";
+import { asEntity } from "../util/EntityUtils.js";
+import { checkOriginatorHeaders, extractHeader, extractHeaders, prependHeaders } from "../util/MimeHeaderUtils.js";
+import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import { buildRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification } from "../util/ReceiptUtils.js";
@@ -86,6 +90,29 @@ const SERVER_MANAGED_MESSAGE_FIELDS = [
     "deliveryReceiptSentAt",
     "deliveryReceiptPending",
     "deliveryReceiptDeclined",
+    // `SearchIndexJob`'s retry state.
+    "searchIndexAttempts",
+    "searchIndexNextAttemptAt",
+    "searchIndexError",
+    // `ScheduledSendJob`'s retry state and relay marker (`scheduledSendTime` itself is handled in `prepareUpdate()`).
+    "scheduledSendAttempts",
+    "scheduledSendError",
+    "scheduledSendRelayedAt",
+    // Derived from the message's `Attachment`s (`BaseAttachmentRoute`, ingest, import).
+    "hasAttachments",
+] as const;
+
+/** Every top-level `Date` field of `Message` - coerced on create/update (see `BaseScopedChildRoute.dateFields`). */
+const MESSAGE_DATE_FIELDS = [
+    "sentDate",
+    "receivedDate",
+    "searchIndexedAt",
+    "searchIndexNextAttemptAt",
+    "scheduledSendTime",
+    "scheduledSendRelayedAt",
+    "recallRequestedAt",
+    "deliveryReceiptSentAt",
+    "readReceiptSentAt",
 ] as const;
 
 /** Parses a stored date that may come back as a `Date` or (Mongo) an ISO string; `undefined` if it isn't one. */
@@ -95,10 +122,30 @@ function toValidDate(value: unknown): Date | undefined {
     return date && !Number.isNaN(date.getTime()) ? date : undefined;
 }
 
-/** The addresses in an RFC 5322 `From` header value: every `<addr>`, or the comma-separated bare addresses. */
-function addressesInFromHeader(value: string): string[] {
-    const bracketed: string[] = [...value.matchAll(/<([^<>\s]+)>/g)].map((match) => match[1]);
-    return bracketed.length > 0 ? bracketed : value.split(",").map((part) => part.trim()).filter((part) => part.length > 0);
+/** Whether any `From`/`Sender` header of `raw` carries a display name (or comment) with an address in it -
+ * `"ceo@example.com" <me@example.com>` shows the recipient an address the sender doesn't own. RFC 2047 encoded words
+ * are decoded first (Q and B), so `=?utf-8?q?ceo=40example.com?=` counts too. */
+function hasAddressLikeDisplayName(raw: Buffer): boolean {
+    for (const name of ["From", "Sender"]) {
+        for (const value of extractHeaders(raw, name)) {
+            for (const entry of addressparser(value, { flatten: true }) as { name?: string }[]) {
+                if (decodeEncodedWords(String(entry.name)).includes("@")) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/** Decodes RFC 2047 encoded words well enough to find an `@` in them. */
+function decodeEncodedWords(text: string): string {
+    return text.replace(/=\?[^?]+\?([bBqQ])\?([^?]*)\?=/g, (_match, encoding: string, data: string) => {
+        if (encoding.toUpperCase() === "B") {
+            return Buffer.from(data, "base64").toString("latin1");
+        }
+        return data.replace(/_/g, " ").replace(/=([0-9A-Fa-f]{2})/g, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+    });
 }
 
 /** Builds one `ConversationSummary` from every `Message` sharing `conversationId`. */
@@ -145,6 +192,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     protected readonly scopeProperty: string = "folderUid";
 
     protected readonly serverManagedFields: readonly string[] = SERVER_MANAGED_MESSAGE_FIELDS;
+
+    protected readonly dateFields: readonly string[] = MESSAGE_DATE_FIELDS;
 
     protected abstract folderClass: any;
 
@@ -230,21 +279,39 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         return this.mailboxRepo;
     }
 
-    /** Both callers pass a folder uid that already passed a permission check, so it's always a real string. */
-    private async isDraftsFolder(folderUid: string): Promise<boolean> {
+    /** Every caller passes a folder uid that already passed a permission check, so it's always a real string. */
+    private async folderTypeOf(folderUid: string): Promise<FolderType | undefined> {
         const folder: any = await (await this.getFolderRepo()).findOne(folderUid, { ignoreACL: true });
-        return folder?.type === FolderType.DRAFTS;
+        return folder?.type;
+    }
+
+    private async isDraftsFolder(folderUid: string): Promise<boolean> {
+        return (await this.folderTypeOf(folderUid)) === FolderType.DRAFTS;
+    }
+
+    /** Refused (403): only `send()` puts a message in Outbox, after checking its sender - `ScheduledSendJob` relays
+     * whatever it finds there. */
+    private static outboxRefusal(): ApiError {
+        return new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Messages are only queued in Outbox by sending them.");
     }
 
     /**
      * Beyond `SERVER_MANAGED_MESSAGE_FIELDS`, a non-trusted caller may only set `sentDate`/`receivedDate` and
      * `dispositionNotificationTo` when creating a draft (target folder is Drafts). Dates on anything else are the
      * server's (`now`, the model default): `checkLegalHold()` scopes a hold by them, so a client-chosen date would take
-     * a message out of a hold's range.
+     * a message out of a hold's range. A non-trusted create never schedules a send or lands in Outbox.
      */
     protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
         await super.prepareCreate(obj, user);
-        if (this.isTrusted(user) || (await this.isDraftsFolder(obj.folderUid))) {
+        if (this.isTrusted(user)) {
+            return;
+        }
+        delete obj.scheduledSendTime;
+        const folderType: FolderType | undefined = await this.folderTypeOf(obj.folderUid);
+        if (folderType === FolderType.OUTBOX) {
+            throw BaseMessageRoute.outboxRefusal();
+        }
+        if (folderType === FolderType.DRAFTS) {
             return;
         }
         delete obj.sentDate;
@@ -268,6 +335,42 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if ("dispositionNotificationTo" in obj && !(await this.isDraftsFolder(existing.folderUid))) {
             delete obj.dispositionNotificationTo;
         }
+        await this.prepareScheduledSendUpdate(obj, existing);
+    }
+
+    /**
+     * `scheduledSendTime` and Outbox membership are the send path's: `send()` checks the sender, then schedules. A
+     * non-trusted update:
+     * - can't set `scheduledSendTime` (400 when it would change it; an unchanged or `null` value is dropped, so a
+     * round-tripped object still saves);
+     * - can't move a message into Outbox (403);
+     * - moving a message out of Outbox cancels its scheduled send (the server clears `scheduledSendTime` and the job's
+     * retry state) - refused (409) once the message was already relayed and only its filing is pending.
+     */
+    private async prepareScheduledSendUpdate(obj: any, existing: T): Promise<void> {
+        if ("scheduledSendTime" in obj) {
+            const requested: Date | undefined = toValidDate(obj.scheduledSendTime);
+            const current: Date | undefined = toValidDate(existing.scheduledSendTime);
+            if (requested && requested.getTime() !== current?.getTime()) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'scheduledSendTime' is set by sending the message (POST /:id/send).");
+            }
+            delete obj.scheduledSendTime;
+        }
+        const targetFolderUid: unknown = obj.folderUid;
+        if (typeof targetFolderUid !== "string" || targetFolderUid === existing.folderUid) {
+            return;
+        }
+        if ((await this.folderTypeOf(targetFolderUid)) === FolderType.OUTBOX) {
+            throw BaseMessageRoute.outboxRefusal();
+        }
+        if ((await this.folderTypeOf(existing.folderUid)) === FolderType.OUTBOX) {
+            if ((existing as any).scheduledSendRelayedAt) {
+                throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "This message has already been sent.");
+            }
+            obj.scheduledSendTime = null;
+            obj.scheduledSendAttempts = null;
+            obj.scheduledSendError = null;
+        }
     }
 
     /**
@@ -276,16 +379,19 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * aliases. `from` is ordinary draft data, and it becomes the envelope sender, so without this any caller with
      * write access to one mailbox could send as any address at all.
      */
+    //
+    // With `raw`, the composed source's originator headers are checked too (`checkOriginatorHeaders()`): exactly one
+    // `From`, at most one `Sender`, every address in them (group members included) the mailbox's own, no address-like
+    // text outside an address, and no address in a display name or comment.
     private assertSenderAllowed(mailbox: Mailbox | undefined, message: T, raw?: Buffer): void {
         const allowed: Set<string> = new Set(
             mailbox ? [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].filter((a) => typeof a === "string").map(normalizeAddress) : [],
         );
-        const addresses: unknown[] = [message.from?.address];
-        const headerFrom: string | undefined = raw ? extractHeader(raw, "From") : undefined;
-        if (headerFrom) {
-            addresses.push(...addressesInFromHeader(headerFrom));
-        }
-        if (addresses.some((address) => typeof address !== "string" || !allowed.has(normalizeAddress(address)))) {
+        const isAllowed = (address: unknown): boolean => typeof address === "string" && allowed.has(normalizeAddress(address));
+        const refused: boolean =
+            !isAllowed(message.from?.address) ||
+            (raw !== undefined && (checkOriginatorHeaders(raw, isAllowed) !== undefined || hasAddressLikeDisplayName(raw)));
+        if (refused) {
             throw new ApiError(
                 ApiErrors.AUTH_PERMISSION_FAILURE,
                 403,
@@ -388,53 +494,89 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         return summaries;
     }
 
+    /**
+     * Sends a draft now, or - with a future `scheduledSendTime` in the body (or already stored on the message by
+     * server-side code) - queues it in Outbox for `ScheduledSendJob`. Either way the sender (`from.address` and the
+     * composed source's `From`/`Sender` headers) is checked first.
+     *
+     * An immediate send is claimed before anything is relayed: a version-checked move into Outbox (with no
+     * `scheduledSendTime`, so the job leaves it alone), which only one of two concurrent sends can win. A message
+     * already in Outbox (scheduled, or claimed by an in-flight send) is refused (409) - move it back to Drafts first.
+     * A failed relay moves it back where it was; a relay that succeeded but couldn't be filed into Sent Items is
+     * stamped `scheduledSendRelayedAt` and made due, so `ScheduledSendJob` only finishes the filing and never relays
+     * it again.
+     */
     @Summary("Send message")
     @Description(
         "Scans and relays a drafted message via the configured MailTransport, then moves it into the " +
-            "mailbox's Sent Items folder.",
+            "mailbox's Sent Items folder. A future scheduledSendTime in the body queues it in Outbox instead.",
     )
     @Returns([Object])
     @Post("/:id/send")
-    public async send(@Param("id") id: string, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T> {
+    public async send(
+        @Param("id") id: string,
+        body: { scheduledSendTime?: string | null } | undefined,
+        @Request req: HttpRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<T> {
         if (!this.repoUtils || !this.blobStore || !this.mailTransport || !this.scanPipeline) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
 
-        const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
+        const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true, skipCache: true });
         if (!message) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
         if (!(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
+        const requestedSendTime: Date | undefined = coerceDateValue((body as any)?.scheduledSendTime, "scheduledSendTime") || undefined;
+
+        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        const currentFolderType: FolderType | undefined = await this.folderTypeOf(message.folderUid);
+        if ((message as any).scheduledSendRelayedAt || currentFolderType === FolderType.SENT_ITEMS) {
+            throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "This message has already been sent.");
+        }
+        if (currentFolderType === FolderType.OUTBOX) {
+            throw new ApiError(
+                ApiErrors.INVALID_OBJECT_VERSION,
+                409,
+                "This message is already queued for sending. Move it back to Drafts to change or resend it.",
+            );
+        }
 
         const sendingMailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, {
             ignoreACL: true,
         });
-        // Checked for a scheduled send too, before it's queued - `ScheduledSendJob` relays with `from.address` as the
-        // envelope sender.
         this.assertSenderAllowed(sendingMailbox, message);
 
-        // "Do not deliver before" (`PR_DEFERRED_SEND_TIME`) - a future `scheduledSendTime`, set via an ordinary
-        // `PUT` on the draft before calling this endpoint, defers relay instead of sending now. The message sits
-        // in the mailbox's Outbox folder until `ScheduledSendJob` relays it and clears this field. Canceling a
-        // scheduled send is just another ordinary `PUT` (clear the field, or move back to Drafts) - no separate
-        // endpoint for that either.
-        if (message.scheduledSendTime && message.scheduledSendTime > new Date()) {
-            const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        // The message's `bodyBlobKey` already holds the fully composed RFC 5322 source (assembled by the
+        // webmail compose UI, or an EAS/MAPI "send" handler, before this endpoint is called) — this route's
+        // job is scanning and relay, not MIME composition. Its originator headers are checked before a scheduled send
+        // is queued too - `ScheduledSendJob` relays these same bytes.
+        let raw: Buffer = await this.blobStore.get(message.bodyBlobKey);
+        this.assertSenderAllowed(sendingMailbox, message, raw);
+
+        // "Do not deliver before" (`PR_DEFERRED_SEND_TIME`) - a future `scheduledSendTime` defers relay instead of
+        // sending now. The message sits in the mailbox's Outbox folder until `ScheduledSendJob` relays it; moving it
+        // back out of Outbox (e.g. to Drafts) cancels it.
+        const scheduledSendTime: Date | undefined = requestedSendTime ?? toValidDate(message.scheduledSendTime);
+        if (scheduledSendTime && scheduledSendTime.getTime() > Date.now()) {
             const outbox: any = await findOrCreateWellKnownFolder(folderRepo, this.folderClass, message.mailboxUid, FolderType.OUTBOX, user);
             return await this.repoUtils.update(
-                { uid: message.uid, version: (message as any).version, folderUid: outbox.uid } as any,
+                {
+                    uid: message.uid,
+                    version: (message as any).version,
+                    folderUid: outbox.uid,
+                    scheduledSendTime,
+                    scheduledSendAttempts: null,
+                    scheduledSendError: null,
+                } as any,
                 message,
                 { user, ignoreACL: true },
             );
         }
 
-        // The message's `bodyBlobKey` already holds the fully composed RFC 5322 source (assembled by the
-        // webmail compose UI, or an EAS/MAPI "send" handler, before this endpoint is called) — this route's
-        // job is scanning and relay, not MIME composition.
-        let raw: Buffer = await this.blobStore.get(message.bodyBlobKey);
-        this.assertSenderAllowed(sendingMailbox, message, raw);
         const envelopeTo: string[] = message.recipients.map((r) => r.address);
 
         // A receipt request is a single message-level header - RFC 3798 has no "only notify me for these
@@ -501,18 +643,53 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             ]);
         }
 
+        // Claim: a version-checked move into Outbox, with no `scheduledSendTime` so `ScheduledSendJob` ignores it. Of two
+        // concurrent sends only one gets past this.
+        const outbox: any = await findOrCreateWellKnownFolder(folderRepo, this.folderClass, message.mailboxUid, FolderType.OUTBOX, user);
+        const claimed: T = await this.repoUtils.update(
+            { uid: message.uid, version: (message as any).version, folderUid: outbox.uid, scheduledSendTime: null } as any,
+            message,
+            { user, ignoreACL: true },
+        );
         const {
             raw: relayedRaw,
             messageId,
             conversationId,
             sanitizedHtmlBlobKey: scannedHtmlBlobKey,
             encrypted,
-        } = await scanAndRelay(raw, message.from.address, envelopeTo, this.scanPipeline, this.mailTransport, this.blobStore);
+        } = await this.relayClaimed(claimed, message.folderUid, raw, envelopeTo);
+        try {
+            return await this.fileSentMessage(message, claimed, user, raw, relayedRaw, attachesReceiptRequest, envelopeTo, {
+                messageId,
+                conversationId,
+                scannedHtmlBlobKey,
+                encrypted,
+            });
+            /* v8 ignore start -- only a blob store/database failure after a successful relay */
+        } catch (err) {
+            await this.markRelayed(message.uid, { messageId, conversationId });
+            throw err;
+        }
+        /* v8 ignore stop */
+    }
+
+    /** Files a message `send()` just relayed into Sent Items. */
+    private async fileSentMessage(
+        message: T,
+        claimed: T,
+        user: JWTUser | undefined,
+        raw: Buffer,
+        relayedRaw: Buffer,
+        attachesReceiptRequest: boolean,
+        envelopeTo: string[],
+        relay: { messageId: string; conversationId: string; scannedHtmlBlobKey?: string; encrypted: boolean },
+    ): Promise<T> {
+        const { messageId, conversationId, scannedHtmlBlobKey, encrypted } = relay;
         if (relayedRaw !== raw) {
             // `scanAndRelay()` injected a `Message-ID` this draft didn't already have - persist the augmented
             // bytes so a later read (and any future `recall()` of this very message) sees the same header it
             // was actually relayed with.
-            await this.blobStore.put(message.bodyBlobKey, relayedRaw, { contentType: "message/rfc822" });
+            await this.blobStore!.put(message.bodyBlobKey, relayedRaw, { contentType: "message/rfc822" });
         }
 
         const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
@@ -547,10 +724,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             }
         }
 
-        return await this.repoUtils.update(
+        // Re-read: the relay can take a while, and an unrelated write (e.g. a flag change) must not fail the filing.
+        const current: T = (await this.repoUtils!.findOne(message.uid, { ignoreACL: true, skipCache: true }))!;
+        return await this.repoUtils!.update(
             {
                 uid: message.uid,
-                version: (message as any).version,
+                version: (current as any).version,
                 folderUid: sentFolder.uid,
                 flags,
                 sanitizedHtmlBlobKey,
@@ -559,10 +738,91 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 receiptStatus,
                 encrypted,
             } as any,
-            message,
+            current,
             { user, ignoreACL: true },
         );
     }
+
+    /**
+     * Relays a message `send()` has claimed. Before the transport accepts it, any failure (building the receipt/key
+     * headers happens before this, scanning in here) moves the message back to `originalFolderUid` - an ordinary
+     * failed send. After the transport accepted it, a failure marks it relayed (`markRelayed()`) instead, so it is
+     * never sent twice.
+     */
+    private async relayClaimed(claimed: T, originalFolderUid: string, raw: Buffer, envelopeTo: string[]) {
+        let accepted: boolean = false;
+        const trackingTransport = {
+            send: async (outbound: any) => {
+                const result: any = await this.mailTransport.send(outbound);
+                if (result.accepted.length > 0) {
+                    accepted = true;
+                }
+                return result;
+            },
+        };
+        try {
+            return await scanAndRelay(raw, claimed.from.address, envelopeTo, this.scanPipeline!, trackingTransport, this.blobStore!);
+        } catch (err) {
+            /* v8 ignore start -- only a blob store failure after the transport accepted the message */
+            if (accepted) {
+                await this.markRelayed(claimed.uid, { messageId: extractHeader(raw, "Message-ID")?.replace(/^<|>$/g, "") });
+                throw err;
+            }
+            /* v8 ignore stop */
+            await this.releaseClaim(claimed, originalFolderUid);
+            throw err;
+        }
+    }
+
+    /** Moves a claimed-but-unsent message back to where it was, unless something moved it meanwhile. Best-effort
+     * (logged). */
+    private async releaseClaim(claimed: T, originalFolderUid: string): Promise<void> {
+        try {
+            const current: T = (await this.repoUtils!.findOne(claimed.uid, { ignoreACL: true, skipCache: true }))!;
+            /* v8 ignore if -- only a concurrent move of the message during its relay */
+            if (current.folderUid !== claimed.folderUid) {
+                return;
+            }
+            await this.repoUtils!.update(
+                { uid: current.uid, version: (current as any).version, folderUid: originalFolderUid } as any,
+                current,
+                { ignoreACL: true },
+            );
+            /* v8 ignore start -- only a concurrent write or database failure */
+        } catch (err: any) {
+            this.logger?.warn(`BaseMessageRoute: failed to release the send claim on message ${claimed.uid}: ${err.message}`);
+        }
+        /* v8 ignore stop */
+    }
+
+    /** Records that a message was relayed but not filed: `scheduledSendRelayedAt` plus a due `scheduledSendTime`, so
+     * `ScheduledSendJob` finishes the filing without relaying again. Best-effort (logged). */
+    /* v8 ignore start -- reached only when filing fails after a successful relay */
+    private async markRelayed(uid: string, fields: Record<string, unknown>): Promise<void> {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                const current: T | undefined = await this.repoUtils!.findOne(uid, { ignoreACL: true, skipCache: true });
+                if (!current) {
+                    return;
+                }
+                await this.repoUtils!.update(
+                    {
+                        uid,
+                        version: (current as any).version,
+                        ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)),
+                        scheduledSendRelayedAt: new Date(),
+                        scheduledSendTime: new Date(),
+                    } as any,
+                    current,
+                    { ignoreACL: true },
+                );
+                return;
+            } catch (err: any) {
+                this.logger?.warn(`BaseMessageRoute: failed to record the relay of message ${uid}: ${err.message}`);
+            }
+        }
+    }
+    /* v8 ignore stop */
 
     /**
      * Attempts to recall a message this mailbox previously sent — Exchange/Outlook's "Recall This Message" —
@@ -765,21 +1025,35 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     ): Promise<void> {
         const normalized: string = normalizeAddress(senderAddress);
         const repo: RepoUtils<FocusedInboxOverride> = await this.getFocusedInboxOverrideRepo();
-        const existing: FocusedInboxOverride[] = await repo.find(
-            { mailboxUid, senderAddress: normalized, limit: 1 } as any,
-            { ignoreACL: true, limit: 1 },
-        );
-        if (existing[0]) {
-            await repo.update(
-                { uid: existing[0].uid, version: (existing[0] as any).version, classifyAs },
-                existing[0],
-                { ignoreACL: true },
+        // `find()` returns plain documents on Mongo, which `update()` doesn't version-check (`asEntity()`). A lost race -
+        // a concurrent update (409) or a concurrent create hitting the (mailbox, sender) unique index - re-reads and
+        // applies this instruction to the row that won.
+        for (let attempt = 1; ; attempt++) {
+            const existing: FocusedInboxOverride[] = await repo.find(
+                { mailboxUid: `eq(${mailboxUid})`, senderAddress: `eq(${normalized})`, limit: 1 } as any,
+                { ignoreACL: true, limit: 1, skipCache: true },
             );
-            return;
+            try {
+                if (existing[0]) {
+                    await repo.update(
+                        { uid: existing[0].uid, version: (existing[0] as any).version, classifyAs },
+                        asEntity(repo, existing[0]),
+                        { ignoreACL: true },
+                    );
+                    return;
+                }
+                await repo.create(new this.focusedInboxOverrideClass({ mailboxUid, senderAddress: normalized, classifyAs }), {
+                    ignoreACL: true,
+                });
+                return;
+                /* v8 ignore start -- only a concurrent classify of the same sender reaches here */
+            } catch (err: any) {
+                if (attempt >= 3 || !(err?.status === 409 || isDuplicateKeyError(err))) {
+                    throw err;
+                }
+            }
+            /* v8 ignore stop */
         }
-        await repo.create(new this.focusedInboxOverrideClass({ mailboxUid, senderAddress: normalized, classifyAs }), {
-            ignoreACL: true,
-        });
     }
 
     /**

@@ -13,7 +13,7 @@ import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
-import { requireEscrowHolder, findHeldScopeIds } from "../util/EscrowUtils.js";
+import { exactInFilter, findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { EscrowAuditAction, Mailbox, Matter, MatterExportRequest } from "../models/types.js";
 const { Inject, Logger } = ObjectDecorators;
@@ -142,15 +142,16 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
     ): Promise<T[]> {
         await this.init();
         const { limit, page } = parseListPaging({ limit: limitParam, page: pageParam });
-        const heldScopeIds: string[] = await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user);
-        if (heldScopeIds.length === 0) {
+        // `exactInFilter()`: a uid holding `,` would otherwise widen these `in(...)` filters to other scopes/matters.
+        const heldScopes: string | undefined = exactInFilter(await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user));
+        if (!heldScopes) {
             return [];
         }
         let matterIds: string[] = [];
         for (let matterPage = 0; ; matterPage++) {
             // Every page - a single `find()` stops at 100 rows, hiding the requests of every later matter.
             const batch: M[] = await this.matterRepo!.find(
-                { escrowScopeId: `in(${heldScopeIds.join(",")})`, sort: "uid", limit: MATTER_PAGE_SIZE, page: matterPage } as any,
+                { escrowScopeId: heldScopes, sort: "uid", limit: MATTER_PAGE_SIZE, page: matterPage } as any,
                 { ignoreACL: true, limit: MATTER_PAGE_SIZE, page: matterPage },
             );
             matterIds.push(...batch.map((m) => m.uid));
@@ -161,10 +162,11 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
         if (matterIdParam !== undefined) {
             matterIds = matterIds.filter((uid) => uid === matterIdParam);
         }
-        if (matterIds.length === 0) {
+        const matterFilter: string | undefined = exactInFilter(matterIds);
+        if (!matterFilter) {
             return [];
         }
-        return await this.requestRepo!.find({ matterId: `in(${matterIds.join(",")})`, sort: "-dateCreated", limit, page } as any, {
+        return await this.requestRepo!.find({ matterId: matterFilter, sort: "-dateCreated", limit, page } as any, {
             ignoreACL: true,
             limit,
             page,
@@ -189,6 +191,11 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
         const request: T = await this.requireRequest(id);
         const matter: M = await this.requireMatter(request.matterId);
         await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        // A closed matter is over - its exports stop being downloadable too, same as `create()` refusing new ones and
+        // `BaseEscrowAccessRequestRoute.material()` refusing key material.
+        if (matter.closedAt) {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This matter is closed.");
+        }
         if (request.status !== "ready" || !request.blobKey) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "This export is not ready for download yet.");
         }

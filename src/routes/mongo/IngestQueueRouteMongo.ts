@@ -20,4 +20,6 @@ export class IngestQueueRouteMongo extends BaseScopedChildRoute<IngestQueueEntry
     protected readonly scopeProperty: string = "mailboxUid";
     /** Entries are produced by ingest; only a trusted caller (ops) may change them. */
     protected readonly trustedOnlyWrites: boolean = true;
+    /** Range-queried by `ScanQueueJob` - stored as real `Date`s (see `BaseScopedChildRoute.dateFields`). */
+    protected readonly dateFields: readonly string[] = ["nextAttemptAt", "scanLeaseExpiresAt"];
 }

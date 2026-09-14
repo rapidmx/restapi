@@ -2,15 +2,24 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { Readable } from "stream";
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
+import { DEFAULT_MAX_EXPORT_BYTES } from "./DataExportJob.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
 import { collectMailboxContentLines, DEFAULT_MAX_MAILBOX_CONTENT_ROWS, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
 import { AuditAction, EscrowAuditAction, Mailbox, Matter, MatterExportRequest } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
+
+/** The lease a running attempt holds on its request row - `held` is the row as of this run's last
+ * version-checked write (the claim or a renewal). Same shape as `DataExportJob`'s own `ExportLease`. */
+interface MatterExportLease<T> {
+    held: T;
+    renewedAt: number;
+}
 
 /**
  * Processes pending `MatterExportRequest` rows (see that entity's own doc comment) - mirrors
@@ -30,6 +39,13 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * through the ordinary `AuditAction.MATTER_EXPORT_FAILED`/`recordAuditLog()` instead, since it isn't a
  * per-mailbox content disclosure event the hash chain is meant to capture - no `mailboxUid` to attribute it
  * to at all in that case, unlike `DataExportJob.markFailed()`'s own always-single-mailboxUid failure.
+ *
+ * **Lease/reclaim/attempts.** Identical to `DataExportJob`'s: a request is claimed by a version-checked
+ * transition to `"processing"` (bumping `processingAttempts`); the row's `dateModified` is the lease, renewed
+ * after each custodian while streaming. An expired `"processing"` row is reclaimed to `"pending"` (or marked
+ * `"failed"` once `processingAttempts` reaches `mail:jobs:matter_export:max_attempts`) at the start of every
+ * `run()`. Bundles are written under attempt-scoped blob keys and streamed into `BlobStore.put()` (see
+ * `generateBundle()` for the per-custodian memory bound), capped at `mail:export:max_bytes`.
  *
  * No legal-hold check - unlike a `purge` (see `util/LegalHoldUtils.ts`), a read-only export doesn't
  * destroy anything a hold is meant to preserve.
@@ -78,9 +94,23 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
     // per custodian mailbox, the same as `DataExportJob`'s identical field, not to the combined bundle across
     // every custodian (a `Matter`'s custodian list is holder/admin-curated, not attacker-controlled, so
     // bounding each mailbox individually is the right compounding boundary here rather than a single
-    // whole-request total).
+    // whole-request total). The combined bundle is instead bounded by `maxBytes` below.
     @Config("mail:jobs:matter_export:max_content_rows", DEFAULT_MAX_MAILBOX_CONTENT_ROWS)
     private maxContentRows: number = DEFAULT_MAX_MAILBOX_CONTENT_ROWS;
+
+    /** How long a request may sit in `"processing"` without its lease being renewed before it is presumed
+     * abandoned (the processing replica died) and reclaimed - see `DataExportJob`'s identical `lease_minutes`. */
+    @Config("mail:jobs:matter_export:lease_minutes", 60)
+    private leaseMinutes: number = 60;
+
+    /** How many claims a request gets before an abandoned `"processing"` row is marked `"failed"` instead of
+     * being reclaimed for another attempt. */
+    @Config("mail:jobs:matter_export:max_attempts", 3)
+    private maxAttempts: number = 3;
+
+    /** Total byte ceiling for one combined export bundle - shared with `DataExportJob` (default 2 GiB). */
+    @Config("mail:export:max_bytes", DEFAULT_MAX_EXPORT_BYTES)
+    private maxBytes: number = DEFAULT_MAX_EXPORT_BYTES;
 
     /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
     @Config()
@@ -122,6 +152,8 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
             return;
         }
 
+        await this.reclaimAbandonedRequests();
+
         const pending: T[] = await this.requestRepo.find(
             { status: "pending", limit: this.batchSize } as any,
             { ignoreACL: true, limit: this.batchSize },
@@ -135,6 +167,62 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
                 await this.markFailed(request, err.message);
             }
         }
+    }
+
+    private get leaseMs(): number {
+        return this.leaseMinutes * 60_000;
+    }
+
+    /** Reclaims `"processing"` rows whose lease (`dateModified`) expired - identical to `DataExportJob.
+     * reclaimAbandonedRequests()`. Every transition is version-checked against the row as just read
+     * (`asEntity()`), so when two replicas race to reclaim the same row exactly one wins; the loser's update
+     * throws and is merely logged. */
+    private async reclaimAbandonedRequests(): Promise<void> {
+        const cutoff: Date = new Date(Date.now() - this.leaseMs);
+        let abandoned: T[];
+        try {
+            abandoned = await this.requestRepo!.find(
+                { status: "processing", dateModified: `lt(${cutoff.toISOString()})`, limit: this.batchSize } as any,
+                { ignoreACL: true, limit: this.batchSize },
+            );
+        } catch (err: any) {
+            this.logger?.warn(`MatterExportJob: failed to look up abandoned export requests: ${err.message}`);
+            return;
+        }
+        for (const request of abandoned) {
+            // A "processing" row has had at least one claim, even if the counter is somehow missing/0.
+            const attempts: number = Math.max(1, request.processingAttempts ?? 0);
+            try {
+                if (attempts >= this.maxAttempts) {
+                    this.logger?.warn(`MatterExportJob: export request ${request.uid} abandoned after ${attempts} attempt(s); marking failed.`);
+                    await this.transitionToFailed(request, `The export did not complete after ${attempts} attempt(s) - processing was interrupted each time.`);
+                } else {
+                    this.logger?.warn(`MatterExportJob: reclaiming abandoned export request ${request.uid} (attempt ${attempts} of ${this.maxAttempts}).`);
+                    await this.requestRepo!.update(
+                        { uid: request.uid, version: (request as any).version, status: "pending" } as any,
+                        asEntity(this.requestRepo!, request),
+                        { ignoreACL: true },
+                    );
+                }
+            } catch (err: any) {
+                this.logger?.warn(`MatterExportJob: failed to reclaim abandoned export request ${request.uid}: ${err.message}`);
+            }
+        }
+    }
+
+    /** Renews this attempt's lease (a version-checked write that bumps `dateModified`) once a quarter of the
+     * lease period has elapsed since the last renewal. Throws - aborting the export - if the row's version
+     * moved underneath it, i.e. the lease was lost to a reclaim. */
+    private async renewLease(lease: MatterExportLease<T>): Promise<void> {
+        if (Date.now() - lease.renewedAt < this.leaseMs / 4) {
+            return;
+        }
+        lease.held = await this.requestRepo!.update(
+            { uid: lease.held.uid, version: (lease.held as any).version, status: "processing" } as any,
+            asEntity(this.requestRepo!, lease.held),
+            { ignoreACL: true },
+        );
+        lease.renewedAt = Date.now();
     }
 
     private get contentEntityClasses(): MailboxContentEntityClasses {
@@ -156,10 +244,22 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
             return;
         }
 
-        const dateRange = { start: matter.dateRangeStart, end: matter.dateRangeEnd };
-        const allLines: string[] = [];
-        // Collected here and only actually recorded (below) once the export bundle as a whole has been
-        // successfully written and the request marked "ready" - see this class's own doc comment. Each
+        // Claimed via a version-checked transition to "processing" BEFORE any content is collected or any blob
+        // written (the same "claim first, work second" discipline as `DataExportJob.processRequest()`): a
+        // losing overlapping run's claim throws here (caught by `run()`) and never builds a bundle. The claim
+        // starts this attempt's lease (`dateModified`) and bumps `processingAttempts`.
+        const attempt: number = (request.processingAttempts ?? 0) + 1;
+        const lease: MatterExportLease<T> = {
+            held: await this.requestRepo!.update(
+                { uid: request.uid, version: (request as any).version, status: "processing", processingAttempts: attempt } as any,
+                asEntity(this.requestRepo!, request),
+                { ignoreACL: true },
+            ),
+            renewedAt: Date.now(),
+        };
+
+        // Filled while streaming and only actually recorded (below) once the export bundle as a whole has
+        // been successfully written and the request marked "ready" - see this class's own doc comment. Each
         // `EscrowAuditLogEntry` is a permanent, hash-chained attestation that a specific mailbox's content
         // was included in a completed, downloadable export; recording it any earlier (e.g. immediately
         // after that one mailbox's own content was collected) would let a LATER custodian's failure - a
@@ -167,53 +267,51 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
         // request "failed" while leaving behind a permanent, unfixable record falsely attesting that an
         // export completed for the mailboxes already processed.
         const includedMailboxUids: string[] = [];
-        for (const mailboxUid of matter.custodianMailboxUids) {
-            const mailbox: MB | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
-            if (!mailbox) {
-                this.logger?.warn(`MatterExportJob: skipping custodian mailbox ${mailboxUid} for request ${request.uid} - it no longer exists.`);
-                continue;
+        // Attempt-scoped, so a stale run from an earlier (reclaimed) attempt can never overwrite this
+        // attempt's bundle, nor this one the next attempt's.
+        const blobKey = `matter-exports/${request.uid}-${attempt}.ndjson`;
+
+        // Every failure from here on must mark against the currently-held lease version, not `request`'s stale
+        // pre-claim one (which `run()`'s outer catch would use, and simply fail a second time).
+        let blobStored = false;
+        try {
+            try {
+                await this.blobStore!.put(blobKey, Readable.from(this.generateBundle(matter, request.uid, lease, includedMailboxUids)), {
+                    contentType: "application/x-ndjson",
+                });
+                blobStored = true;
+            } catch (err: any) {
+                // A stream that errors mid-put can leave a partial blob behind - never referenced, deleted here.
+                await this.deleteBlobQuietly(blobKey);
+                throw err;
             }
-            // `custodianMailboxUids` is holder-set, unvalidated free text (`BaseMatterRoute`'s own
-            // `validateMatter()` only checks it's a non-empty array of non-empty strings) - without this
-            // check, any holder of any `EscrowScope` could list an arbitrary mailbox as a "custodian" on
-            // their own matter and export its full content, bypassing the real "both must agree" binding
-            // `BaseEscrowAccessRequestRoute.create()` already enforces before opening genuine escrow
-            // access (see `Matter.custodianMailboxUids`'s own doc comment).
-            if (mailbox.escrowScopeId !== matter.escrowScopeId) {
-                this.logger?.warn(
-                    `MatterExportJob: skipping custodian mailbox ${mailboxUid} for request ${request.uid} - it is not actually assigned to this matter's escrow scope.`,
-                );
-                continue;
-            }
-            const lines: string[] = await collectMailboxContentLines(
-                this._objectFactory!,
-                this.contentEntityClasses,
-                mailboxUid,
-                mailbox,
-                dateRange,
-                this.maxContentRows,
+
+            // Version-checked against the lease this run still holds (renewed while streaming), deliberately
+            // NOT a re-fetch: if this attempt's lease expired and another replica reclaimed the request, this
+            // update must lose rather than stamp "ready" over the newer attempt.
+            await this.requestRepo!.update(
+                { uid: lease.held.uid, version: (lease.held as any).version, status: "ready", blobKey } as any,
+                asEntity(this.requestRepo!, lease.held),
+                { ignoreACL: true },
             );
-            allLines.push(...lines);
-            includedMailboxUids.push(mailboxUid);
+            blobStored = false;
+        } catch (err: any) {
+            if (blobStored) {
+                // The bundle was stored but the request never reached "ready" - nothing references the blob.
+                await this.deleteBlobQuietly(blobKey);
+            }
+            this.logger?.error(`MatterExportJob: failed to process export request ${request.uid}: ${err.message}`);
+            await this.markFailed(lease.held, err.message);
+            return;
         }
-
-        const blobKey = `matter-exports/${request.uid}.ndjson`;
-        await this.blobStore!.put(blobKey, Buffer.from(allLines.join("\n"), "utf-8"), { contentType: "application/x-ndjson" });
-
-        await this.requestRepo!.update(
-            { uid: request.uid, version: (request as any).version, status: "ready", blobKey } as any,
-            asEntity(this.requestRepo!, request),
-            { ignoreACL: true },
-        );
 
         // Best-effort per mailbox, deliberately NOT allowed to throw out of `processRequest()` - the
         // request is already genuinely `"ready"` (the bundle above is real, stored, and downloadable) by
         // this point, so a failure here (e.g. `recordEscrowAuditEntry()`'s own sequence-contention retries
         // exhausted under a concurrent writer) must not route through `run()`'s `catch`/`markFailed()`:
         // that would try to write a STALE pre-"ready" version, itself fail its own optimistic-lock check,
-        // and get silently swallowed - leaving the request stuck at "ready" forever with no path to retry
-        // the one mailbox whose attestation never got recorded. Logged loudly instead, so the gap is at
-        // least operator-visible rather than a silent, permanent hole in the hash-chained ledger.
+        // and get silently swallowed. Logged loudly instead, so the gap is at least operator-visible rather
+        // than a silent, permanent hole in the hash-chained ledger.
         for (const mailboxUid of includedMailboxUids) {
             try {
                 await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
@@ -231,21 +329,86 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
         }
     }
 
+    /**
+     * Yields the NDJSON bundle one custodian mailbox at a time, fed through `Readable.from()` straight into
+     * `BlobStore.put()` - the combined bundle across every custodian is never held in memory, nor joined into a
+     * second full-size string copy. Memory is bounded to ONE custodian's collected lines at a time
+     * (`collectMailboxContentLines()` returns an array, itself capped at `max_content_rows`); a fully
+     * row-by-row stream would need a generator variant of that shared helper. The lease is renewed after
+     * each custodian, so a long multi-custodian export isn't mistaken for an abandoned one. Throws (erroring
+     * the stream, rejecting the `put()`) on a `mail:export:max_bytes` overrun rather than truncating.
+     */
+    private async *generateBundle(matter: M, requestUid: string, lease: MatterExportLease<T>, includedMailboxUids: string[]): AsyncGenerator<Buffer> {
+        const dateRange = { start: matter.dateRangeStart, end: matter.dateRangeEnd };
+        let bytes = 0;
+        let first = true;
+        for (const mailboxUid of matter.custodianMailboxUids) {
+            const mailbox: MB | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
+            if (!mailbox) {
+                this.logger?.warn(`MatterExportJob: skipping custodian mailbox ${mailboxUid} for request ${requestUid} - it no longer exists.`);
+                continue;
+            }
+            // `custodianMailboxUids` is holder-set, unvalidated free text (`BaseMatterRoute`'s own
+            // `validateMatter()` only checks it's a non-empty array of non-empty strings) - without this
+            // check, any holder of any `EscrowScope` could list an arbitrary mailbox as a "custodian" on
+            // their own matter and export its full content, bypassing the real "both must agree" binding
+            // `BaseEscrowAccessRequestRoute.create()` already enforces before opening genuine escrow
+            // access (see `Matter.custodianMailboxUids`'s own doc comment).
+            if (mailbox.escrowScopeId !== matter.escrowScopeId) {
+                this.logger?.warn(
+                    `MatterExportJob: skipping custodian mailbox ${mailboxUid} for request ${requestUid} - it is not actually assigned to this matter's escrow scope.`,
+                );
+                continue;
+            }
+            const lines: string[] = await collectMailboxContentLines(
+                this._objectFactory!,
+                this.contentEntityClasses,
+                mailboxUid,
+                mailbox,
+                dateRange,
+                this.maxContentRows,
+            );
+            for (let i = 0; i < lines.length; i++) {
+                const chunk: Buffer = Buffer.from(first ? lines[i] : `\n${lines[i]}`, "utf-8");
+                first = false;
+                bytes += chunk.length;
+                if (bytes > this.maxBytes) {
+                    throw new Error(`Export exceeds the maximum export size of ${this.maxBytes} bytes.`);
+                }
+                yield chunk;
+            }
+            includedMailboxUids.push(mailboxUid);
+            await this.renewLease(lease);
+        }
+    }
+
+    private async deleteBlobQuietly(blobKey: string): Promise<void> {
+        try {
+            await this.blobStore!.delete(blobKey);
+        } catch (err: any) {
+            this.logger?.warn(`MatterExportJob: failed to delete incomplete export blob ${blobKey}: ${err.message}`);
+        }
+    }
+
     private async markFailed(request: T, errorMessage: string): Promise<void> {
         try {
-            const updated: T = await this.requestRepo!.update(
-                { uid: request.uid, version: (request as any).version, status: "failed", errorMessage } as any,
-                asEntity(this.requestRepo!, request),
-                { ignoreACL: true },
-            );
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, logger: this.logger },
-                { action: AuditAction.MATTER_EXPORT_FAILED, targetType: "MatterExportRequest", targetUid: updated.uid },
-            );
+            await this.transitionToFailed(request, errorMessage);
         } catch (err: any) {
             this.logger?.error(`MatterExportJob: failed to mark export request ${request.uid} as failed: ${err.message}`);
         }
+    }
+
+    private async transitionToFailed(request: T, errorMessage: string): Promise<void> {
+        const updated: T = await this.requestRepo!.update(
+            { uid: request.uid, version: (request as any).version, status: "failed", errorMessage } as any,
+            asEntity(this.requestRepo!, request),
+            { ignoreACL: true },
+        );
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, logger: this.logger },
+            { action: AuditAction.MATTER_EXPORT_FAILED, targetType: "MatterExportRequest", targetUid: updated.uid },
+        );
     }
 }

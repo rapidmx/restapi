@@ -14,7 +14,7 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { verifyEscrowAuditChain, type EscrowAuditVerificationResult } from "../util/EscrowAuditUtils.js";
-import { findHeldScopeIds } from "../util/EscrowUtils.js";
+import { exactInFilter, findHeldScopeIds, isQuerySafeUid } from "../util/EscrowUtils.js";
 import { EscrowAuditLogEntry, Matter } from "../models/types.js";
 const { Before, Delete, Get, Param, Post, Put, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
@@ -70,8 +70,9 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
         if (UserUtils.hasRoles(user, this.trustedRoles)) {
             return undefined;
         }
-        const heldScopeIds: string[] = await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user);
-        if (heldScopeIds.length === 0) {
+        // `exactInFilter()`/`isQuerySafeUid()`: a uid holding `,` would widen the `in(...)` filters below.
+        const heldScopes: string | undefined = exactInFilter(await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user));
+        if (!heldScopes) {
             return [];
         }
         const matterRepo: RepoUtils<Matter> = await this.getMatterRepo();
@@ -80,10 +81,10 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
         const matterIds: string[] = [];
         for (let page = 0; ; page++) {
             const batch: Matter[] = await matterRepo.find(
-                { escrowScopeId: `in(${heldScopeIds.join(",")})`, sort: "uid", limit: MATTER_PAGE_SIZE, page } as any,
+                { escrowScopeId: heldScopes, sort: "uid", limit: MATTER_PAGE_SIZE, page } as any,
                 { ignoreACL: true, limit: MATTER_PAGE_SIZE, page },
             );
-            matterIds.push(...batch.map((m) => m.uid));
+            matterIds.push(...batch.map((m) => m.uid).filter(isQuerySafeUid));
             if (batch.length < MATTER_PAGE_SIZE) {
                 return matterIds;
             }

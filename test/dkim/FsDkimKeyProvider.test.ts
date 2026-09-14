@@ -61,6 +61,26 @@ describe("FsDkimKeyProvider Tests", () => {
         expect(pemAfterSecond).toBe(pemAfterFirst);
     });
 
+    it("Concurrent first calls for the same domain all return the single key that was persisted (losers re-read the winner's).", async () => {
+        const providers = Array.from({ length: 5 }, () => {
+            const p = new FsDkimKeyProvider();
+            (p as any).keyDir = tmpDir;
+            (p as any).selector = "mail";
+            return p;
+        });
+        const info = vi.fn();
+        providers.forEach((p) => ((p as any).logger = { info }));
+
+        const results: DkimKeyPair[] = await Promise.all(providers.map((p) => p.ensureKeyPair("concurrent.example.com")));
+
+        const pem: string = await fs.readFile(path.join(tmpDir, "concurrent.example.com.mail.key"), "utf-8");
+        const persisted: string = crypto.createPublicKey(pem).export({ type: "spki", format: "der" }).toString("base64");
+        expect(results.map((r) => r.publicKey)).toEqual(Array(5).fill(persisted));
+        // Exactly one caller generated-and-persisted; everyone else lost the exclusive create.
+        expect(info).toHaveBeenCalledTimes(1);
+        expect((await fs.readdir(tmpDir)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    });
+
     it("Rethrows a filesystem error other than ENOENT while reading an existing key.", async () => {
         const filePath: string = path.join(tmpDir, "dir-not-file.mail.key");
         await fs.mkdir(filePath, { recursive: true });

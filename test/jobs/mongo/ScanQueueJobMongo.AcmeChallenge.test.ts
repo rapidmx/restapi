@@ -27,6 +27,7 @@ import { MailFilterRuleMongo } from "../../../src/models/mongo/MailFilterRuleMon
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
 import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
 import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
+import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSubjectErasureRequestMongo.js";
 import { FocusedInboxOverrideMongo } from "../../../src/models/mongo/FocusedInboxOverrideMongo.js";
 import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySuppressionMongo.js";
 import { IngestStatus } from "../../../src/models/types.js";
@@ -164,6 +165,8 @@ describe("ScanQueueJobMongo Tests - RFC 8823 challenge-email correlation", () =>
         models.set("FocusedInboxOverrideMongo", FocusedInboxOverrideMongo);
         models.set("ContactMongo", ContactMongo);
         models.set("DomainMongo", DomainMongo);
+        // Consulted before filing (is the mailbox being erased?) - see ScanQueueJob.isMailboxBeingErased().
+        models.set("DataSubjectErasureRequestMongo", DataSubjectErasureRequestMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("mongo");

@@ -10,7 +10,7 @@
 // through test/routes/{mongo,sql}/KeyVaultRoute.test.ts's full HTTP+DB harness. Every other reachable
 // behavior of this class is exercised there.
 import config from "../config.js";
-import { ObjectFactory } from "@rapidrest/service-core";
+import { BaseEntity, ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { BaseKeyVaultRoute } from "../../src/routes/BaseKeyVaultRoute.js";
 
@@ -116,7 +116,7 @@ describe("BaseKeyVaultRoute Tests (findOrCreateKeyVault() TOCTOU race and MAX_*_
         (route as any).escrowScopeRepo = {};
 
         await expect(
-            route.rekey("mailbox-1", { wrappedKeys: [], masterKeyWraps: Array(21).fill({}) } as any, user),
+            route.rekey("mailbox-1", { keys: [], wrappedKeys: [], masterKeyWraps: Array(21).fill({}) } as any, user),
         ).rejects.toThrow("masterKeyWraps cannot exceed 20 entries.");
     });
 
@@ -130,7 +130,52 @@ describe("BaseKeyVaultRoute Tests (findOrCreateKeyVault() TOCTOU race and MAX_*_
         (route as any).escrowScopeRepo = {};
 
         await expect(
-            route.rekey("mailbox-1", { wrappedKeys: Array(51).fill({}), masterKeyWraps: [] } as any, user),
+            route.rekey("mailbox-1", { keys: [], wrappedKeys: Array(51).fill({}), masterKeyWraps: [passwordWrap] } as any, user),
         ).rejects.toThrow("wrappedKeys cannot exceed 50 entries.");
+    });
+
+    const passwordWrap = { method: "password", ciphertext: "c", nonce: "n", salt: "s", kdf: "argon2id", schemeVersion: 1 };
+
+    it("rekey() requires keys, wrappedKeys and masterKeyWraps arrays, and at least one (non-escrow) master key wrap (400), before writing anything.", async () => {
+        const route = objectFactory.newInstance<TestKeyVaultRoute>(TestKeyVaultRoute, { initialize: false });
+        const user: any = { uid: "user-1" };
+        const mailbox = { uid: "mailbox-1", ownerUserUid: "user-1", keys: [] };
+        const update = vi.fn();
+        (route as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue(mailbox), update };
+        (route as any).keyVaultRepo = { find: vi.fn().mockResolvedValue([{ uid: "kv-1", masterKeyWraps: [], wrappedKeys: [] }]), update };
+        (route as any).escrowScopeRepo = {};
+
+        const valid = { keys: [], wrappedKeys: [], masterKeyWraps: [passwordWrap] };
+        const cases: [any, string][] = [
+            [undefined, "wrappedKeys must be an array."],
+            [{ ...valid, wrappedKeys: undefined }, "wrappedKeys must be an array."],
+            [{ ...valid, masterKeyWraps: "x" }, "masterKeyWraps must be an array."],
+            [{ ...valid, keys: undefined }, "keys must be an array."],
+            [{ ...valid, masterKeyWraps: [] }, "masterKeyWraps must include at least one non-escrow wrap."],
+        ];
+        for (const [body, message] of cases) {
+            const error: any = await route.rekey("mailbox-1", body, user).catch((err) => err);
+            expect(error?.status).toBe(400);
+            expect(error?.message).toBe(message);
+        }
+        expect(update).not.toHaveBeenCalled();
+    });
+
+    it("findKeyVault() returns an entity instance, so vault updates are version-checked on MongoDB (plain documents aren't).", async () => {
+        class VaultEntity extends BaseEntity {
+            constructor(other?: any) {
+                super(other);
+                Object.assign(this, other);
+            }
+        }
+        const route = objectFactory.newInstance<TestKeyVaultRoute>(TestKeyVaultRoute, { initialize: false });
+        const plain = { uid: "kv-1", version: 3, mailboxUid: "mailbox-1", wrappedKeys: [], masterKeyWraps: [] };
+        (route as any).keyVaultRepo = { modelClass: VaultEntity, find: vi.fn().mockResolvedValue([plain]) };
+
+        const vault = await (route as any).findKeyVault("mailbox-1");
+
+        expect(vault).toBeInstanceOf(BaseEntity);
+        expect(vault.version).toBe(3);
+        expect(vault.uid).toBe("kv-1");
     });
 });

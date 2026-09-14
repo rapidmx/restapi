@@ -694,6 +694,9 @@ describe("Route:BookingSQL Tests (anonymous)", () => {
         createFolder: async (data: any) =>
             await folderRepo.save(new FolderSQL({ unreadCount: 0, totalCount: 0, syncKeyVersion: 0, ...data })),
         findEvents: async () => await calendarEventRepo.find(),
+        updateEvent: async (uid: string, patch: any) => {
+            await calendarEventRepo.update({ uid }, patch);
+        },
         findBookings: async () => await bookingRepo.find(),
         rateLimiter: () => objectFactory.getInstance(RateLimiter),
     });

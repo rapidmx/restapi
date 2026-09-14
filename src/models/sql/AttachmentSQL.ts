@@ -50,11 +50,14 @@ export class AttachmentSQL extends BaseEntity implements Attachment {
     @Description("The unique identifier of the `Mailbox` this attachment belongs to.")
     public mailboxUid: string = "";
 
-    @Column()
+    // `text`: taken from the sender's MIME headers and unindexed - a plain string column is `varchar(255)` on MySQL,
+    // which rejects a longer value and fails delivery. Same for `contentId` below.
+    @Column({ type: "text" })
     @Description("The filename of the attachment.")
     public filename: string = "";
 
-    @Column()
+    // `text` for the same reason as `filename` above - the sender's Content-Type, unindexed.
+    @Column({ type: "text" })
     @Description("The MIME type of the attachment.")
     public mimeType: string = "";
 
@@ -66,7 +69,7 @@ export class AttachmentSQL extends BaseEntity implements Attachment {
     @Description("The key under which the attachment's binary content is stored in the `BlobStore`.")
     public blobKey: string = "";
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("The MIME `Content-ID`, present when this attachment is referenced inline by the message's HTML body.")
     @Nullable
     public contentId?: string;

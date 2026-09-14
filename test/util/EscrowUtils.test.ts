@@ -13,7 +13,9 @@
 import {
     DEFAULT_ESCROW_APPROVAL_TTL_HOURS,
     evaluateEscrowApprovals,
+    exactInFilter,
     findHeldScopeIds,
+    isQuerySafeUid,
     requireEscrowHolder,
     resolveEscrowApprovalTtlHours,
 } from "../../src/util/EscrowUtils.js";
@@ -153,5 +155,20 @@ describe("evaluateEscrowApprovals() Tests", () => {
         expect(evaluateEscrowApprovals({ requiredHoldersAtCreation: 0 } as any, {} as any, 72).thresholdMet).toBe(false);
         const single: any = { requiredHoldersAtCreation: 1, approvals: [{ holderUserUid: "a", approvedAt: new Date() }] };
         expect(evaluateEscrowApprovals(single, scope, 72).expired).toBe(false);
+    });
+});
+
+describe("isQuerySafeUid() / exactInFilter() Tests", () => {
+    it("Accepts ordinary uids and rejects anything the query DSL would read as syntax or substitute.", () => {
+        expect(isQuerySafeUid("0f8fad5b-d9cb-469f-a165-70867728950e")).toBe(true);
+        for (const value of ["a,b", "in(x)", "a)", "me", "null", "", undefined, 42]) {
+            expect(isQuerySafeUid(value)).toBe(false);
+        }
+    });
+
+    it("Builds an in() operand of the safe, distinct values only, or undefined when none are left.", () => {
+        expect(exactInFilter(["a", "b", "a", "x,victim", "me"])).toBe("in(a,b)");
+        expect(exactInFilter(["x,victim"])).toBeUndefined();
+        expect(exactInFilter([])).toBeUndefined();
     });
 });

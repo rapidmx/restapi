@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { Event, EventUtils, type JWTUser, type ObjectFactory } from "@rapidrest/core";
-import { HttpRequest, NetUtils, RepoUtils } from "@rapidrest/service-core";
+import { HttpRequest, RepoUtils } from "@rapidrest/service-core";
 import { AuditAction, Mailbox } from "../models/types.js";
+import { resolveClientIp } from "./ClientIpUtils.js";
 
 /**
  * `true` when `user` is reading `mailbox`'s content as someone other than its own owner - an admin
@@ -25,7 +26,7 @@ export function isNonOwnerAccess(mailbox: Mailbox, user: JWTUser | undefined): b
  * rather than duplicated here. */
 export interface AuditLogCallerContext {
     /** The route's own `this.config` (`ModelRoute.config`) - needed both for `EventUtils.record()`'s
-     * `Event` construction and to resolve `trusted_proxies` for `NetUtils.getIPAddress()`. */
+     * `Event` construction and to resolve `trusted_proxies` (exact addresses or CIDR ranges) for `resolveClientIp()`. */
     config: any;
     req?: HttpRequest;
     user?: JWTUser;
@@ -77,7 +78,7 @@ export async function recordAuditLog(
     caller: AuditLogCallerContext,
     params: AuditLogParams,
 ): Promise<void> {
-    const ip = caller.req ? NetUtils.getIPAddress(caller.req, caller.config?.get("trusted_proxies")) : undefined;
+    const ip = caller.req ? resolveClientIp(caller.req, caller.config?.get?.("trusted_proxies")) : undefined;
 
     try {
         const repo = await getAuditLogRepo(objectFactory, auditLogClass);

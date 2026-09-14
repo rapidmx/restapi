@@ -9,7 +9,9 @@ import { PublicKey } from "../models/types.js";
 /** The result of successfully parsing and validating an inbound `RapidMX-Key` header - the header's own
  * `addr` attribute (already confirmed to match the message's `From` address) plus the encryption `PublicKey`
  * it carries. Callers still owe the DKIM-verification gate (`util/AuthenticationResultsUtils.ts`'s
- * `hasAlignedPassingDkim()`) before treating this as trustworthy - this function only handles the header's
+ * `hasAlignedPassingDkim()`) *and* the oversigning gate (`util/DkimOversignUtils.ts`'s
+ * `isHeaderOversignedByAlignedDkim()` - without it, the header can be appended to any genuinely signed message from
+ * the same domain and replayed) before treating this as trustworthy - this function only handles the header's
  * own syntax/semantics, never authentication. */
 export interface ParsedRapidMxKeyHeader {
     addr: string;

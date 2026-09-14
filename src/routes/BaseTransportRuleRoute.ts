@@ -13,6 +13,7 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 import { AuditAction, TransportRule } from "../models/types.js";
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
@@ -44,6 +45,8 @@ export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CR
         // Always a server-minted uid, like every other create route (see `BaseScopedChildRoute`'s doc comment).
         for (const single of Array.isArray(obj) ? obj : [obj]) {
             delete (single as any).uid;
+            // `_id` would replace another document on Mongo - see `util/RequestBodyUtils.ts`.
+            stripClientCreateFields(single);
         }
         const created: T[] = Array.isArray(obj)
             ? await this.doBulkCreate(obj, { req, user, ignoreACL: true })
@@ -61,6 +64,18 @@ export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CR
         return Array.isArray(obj) ? created : created[0];
     }
 
+    /** Runs for the inherited `updateBulk()` (per element) and `updateProperty()` - refuses path keys there too. */
+    protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser): Promise<void> {
+        assertNoPathKeys(obj);
+        stripClientId(obj);
+        return super.validateUpdate(id, obj, user);
+    }
+
+    public async updateProperty(id: string, propertyName: string, obj: any, user?: JWTUser): Promise<T> {
+        assertPlainPropertyName(propertyName);
+        return super.updateProperty(id, propertyName, obj, user);
+    }
+
     @RequiresTrustedRole()
     public async update(
         @Param("id") id: string,
@@ -68,6 +83,8 @@ export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CR
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
+        assertNoPathKeys(obj);
+        stripClientId(obj);
         const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);

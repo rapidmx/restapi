@@ -726,6 +726,172 @@ describe("MailboxImportJobMongo Tests (real DB + DI)", () => {
         expect((await messageRepo.find({ folderUid: folder.uid }).toArray()).length).toBe(1);
     });
 
+    const importTwoMessages = async (): Promise<{ mailbox: any; folder: any; request: any }> => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        await blobStore.put(
+            sourceBlobKey,
+            Buffer.concat([
+                buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01")),
+                buildMboxEntry(makeRawMessage(), "bob@example.com", new Date("2020-01-02")),
+            ]),
+        );
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+        return { mailbox, folder, request };
+    };
+
+    const storedBytes = async (folderUid: string): Promise<number> => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        let total = 0;
+        for (const message of await messageRepo.find({ folderUid: folderUid }).toArray()) {
+            total += await blobStore.size(message.bodyBlobKey);
+        }
+        for (const attachment of await attachmentRepo.find({ folderUid: folderUid }).toArray()) {
+            total += attachment.sizeBytes;
+        }
+        return total;
+    };
+
+    it("Persists each imported message's size to Mailbox.usedBytes (not just in memory).", async () => {
+        const { mailbox, folder } = await importTwoMessages();
+
+        await job.run();
+
+        const updated = (await mailboxRepo.findOne({ uid: mailbox.uid } as any));
+        const expected = await storedBytes(folder.uid);
+        expect(expected).toBeGreaterThan(0);
+        expect(Number(updated!.usedBytes)).toBe(expected);
+        expect(updated!.version).toBe(mailbox.version + 2);
+    });
+
+    it("Does not clobber a concurrent usedBytes change made mid-import (version-checked charge, retried on conflict).", async () => {
+        const { mailbox, folder } = await importTwoMessages();
+        const messageRepoUtils = (job as any).messageRepo;
+        const realCreate = messageRepoUtils.create.bind(messageRepoUtils);
+        vi.spyOn(messageRepoUtils, "create").mockImplementationOnce(async (...args: any[]) => {
+            // e.g. concurrent delivery or another import charging the same mailbox after this run's first charge.
+            await mailboxRepo.updateOne({ uid: mailbox.uid } as any, { $inc: { version: 1, usedBytes: 777 } });
+            return await realCreate(...args);
+        });
+
+        await job.run();
+
+        const updated = (await mailboxRepo.findOne({ uid: mailbox.uid } as any));
+        expect(Number(updated!.usedBytes)).toBe(777 + (await storedBytes(folder.uid)));
+    });
+
+    it("Refunds the quota charge of a message that failed to store.", async () => {
+        const { mailbox, folder, request } = await importTwoMessages();
+        const messageRepoUtils = (job as any).messageRepo;
+        vi.spyOn(messageRepoUtils, "create").mockRejectedValueOnce(new Error("simulated failure"));
+
+        await job.run();
+
+        const updatedRequest = (await requestRepo.findOne({ uid: request.uid } as any));
+        expect(updatedRequest!.importedCount).toBe(1);
+        expect(updatedRequest!.failedCount).toBe(1);
+        const updated = (await mailboxRepo.findOne({ uid: mailbox.uid } as any));
+        expect(Number(updated!.usedBytes)).toBe(await storedBytes(folder.uid));
+    });
+
+    it("On a reclaimed retry, still dedups a message whose Message-ID is over 255 characters (stored bounded as sha256:<hex>).", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const longId = `${"x".repeat(300)}@example.com`;
+        await messageRepo.save(
+            new MessageMongo({
+                mailboxUid: mailbox.uid,
+                folderUid: folder.uid,
+                messageId: longId,
+                subject: "Test message",
+                from: { address: "sender@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date("2020-01-01"),
+                receivedDate: new Date("2020-01-01"),
+                bodyBlobKey: `imported/${uuid.v4()}`,
+                flags: { read: true, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: false,
+            }),
+        );
+        const sourceBlobKey = await putMbox([
+            buildMboxEntry(makeRawMessage({ extraHeader: `Message-ID: <${longId}>` }), "alice@example.com", new Date("2020-01-01")),
+        ]);
+        const request = await createRequest({
+            mailboxUid: mailbox.uid,
+            targetFolderUid: folder.uid,
+            format: "mbox",
+            sourceBlobKey,
+            status: "processing",
+            processingAttempts: 1,
+            dateModified: new Date(Date.now() - 3 * 60 * 60_000),
+        });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.status).toBe("completed");
+        expect(updated!.importedCount).toBe(1);
+        const messages = await messageRepo.find({ folderUid: folder.uid }).toArray();
+        expect(messages.length).toBe(1);
+        expect(messages[0].messageId).toMatch(/^sha256:[0-9a-f]{64}$/);
+    });
+
+    it("Counts a message as failed (storing nothing) when the mailbox disappears before its quota charge.", async () => {
+        const { folder, request } = await importTwoMessages();
+        const mailboxRepoUtils = (job as any).mailboxRepo;
+        const realFindOne = mailboxRepoUtils.findOne.bind(mailboxRepoUtils);
+        vi.spyOn(mailboxRepoUtils, "findOne")
+            .mockImplementationOnce(async (...args: any[]) => await realFindOne(...args))
+            .mockResolvedValue(undefined);
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.importedCount).toBe(0);
+        expect(updated!.failedCount).toBe(2);
+        expect((await messageRepo.find({ folderUid: folder.uid }).toArray()).length).toBe(0);
+    });
+
+    it("Counts a message as failed (storing nothing) when every quota charge attempt conflicts.", async () => {
+        const { mailbox, folder, request } = await importTwoMessages();
+        vi.spyOn((job as any).mailboxRepo, "update").mockRejectedValue(new Error("simulated persistent conflict"));
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.failedCount).toBe(2);
+        expect((await messageRepo.find({ folderUid: folder.uid }).toArray()).length).toBe(0);
+        expect((await mailboxRepo.findOne({ uid: mailbox.uid } as any))!.usedBytes).toBe(0);
+    });
+
+    it("Skips the refund when the mailbox disappeared, and logs (no throw) when every refund attempt conflicts.", async () => {
+        const { request } = await importTwoMessages();
+        const messageRepoUtils = (job as any).messageRepo;
+        vi.spyOn(messageRepoUtils, "create").mockRejectedValue(new Error("simulated failure"));
+        const mailboxRepoUtils = (job as any).mailboxRepo;
+        const realFindOne = mailboxRepoUtils.findOne.bind(mailboxRepoUtils);
+        const realUpdate = mailboxRepoUtils.update.bind(mailboxRepoUtils);
+        vi.spyOn(mailboxRepoUtils, "findOne")
+            .mockImplementationOnce(async (...args: any[]) => await realFindOne(...args)) // processRequest()
+            .mockImplementationOnce(async (...args: any[]) => await realFindOne(...args)) // charge #1
+            .mockResolvedValueOnce(undefined) // refund #1: mailbox gone
+            .mockImplementation(async (...args: any[]) => await realFindOne(...args));
+        vi.spyOn(mailboxRepoUtils, "update")
+            .mockImplementationOnce(async (...args: any[]) => await realUpdate(...args)) // charge #1
+            .mockImplementationOnce(async (...args: any[]) => await realUpdate(...args)) // charge #2
+            .mockRejectedValue(new Error("simulated refund conflict"));
+        const warnSpy = vi.spyOn((job as any).logger, "warn");
+
+        await job.run();
+
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated refund conflict"));
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.failedCount).toBe(2);
+    });
+
     it("Does nothing when the repos are not yet initialized.", async () => {
         const original = (job as any).requestRepo;
         (job as any).requestRepo = undefined;

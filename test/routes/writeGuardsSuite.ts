@@ -164,7 +164,8 @@ export function writeGuardsSuite(ctx: SecurityControlsSuiteContext): void {
             expect((await upload("logo", "image/svg+xml", svg)).status).toBe(400);
             expect((await upload("icon", "image/svg+xml", svg)).status).toBe(400);
             expect((await upload("logo", "text/html", svg)).status).toBe(400);
-            expect((await upload("logo", "image/gif", Buffer.from("GIF89a"))).status).toBe(400);
+            // GIF is a raster format like PNG/JPEG, accepted since round 4 (the web client's branding form offers it).
+            expect((await upload("logo", "image/gif", Buffer.from("GIF89a"))).status).toBe(200);
 
             expect((await upload("logo", "IMAGE/PNG; foo=bar", Buffer.from("png-bytes"))).status).toBe(200);
             expect((await upload("icon", "image/x-icon", Buffer.from("ico-bytes"))).status).toBe(200);

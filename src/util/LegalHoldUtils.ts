@@ -5,6 +5,7 @@
 import { ApiError, type ObjectFactory } from "@rapidrest/core";
 import { ApiErrors, RepoUtils } from "@rapidrest/service-core";
 import { Matter } from "../models/types.js";
+import { findPagesByUid } from "./MailboxContentUtils.js";
 
 /** Caches one `RepoUtils` per concrete `Matter` class (Mongo vs SQL) - mirrors `EscrowUtils.ts`'s
  * identical `getEscrowScopeRepo()` pattern. */
@@ -28,12 +29,9 @@ function getMatterRepo(objectFactory: ObjectFactory, matterClass: any): Promise<
  * not just an incomplete listing. */
 async function findAllMatters(repo: RepoUtils<Matter>, pageSize: number = 500): Promise<Matter[]> {
     const all: Matter[] = [];
-    for (let page = 0; ; page++) {
-        const batch: Matter[] = await repo.find({ limit: pageSize, page } as any, { ignoreACL: true, limit: pageSize, page });
+    // Keyset-paged on `uid` (see `findPagesByUid()`): unsorted offset paging can skip or repeat rows between pages.
+    for await (const batch of findPagesByUid<Matter>(repo, {}, pageSize)) {
         all.push(...batch);
-        if (batch.length < pageSize) {
-            break;
-        }
     }
     return all;
 }

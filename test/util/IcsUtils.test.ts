@@ -2,7 +2,14 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { buildEventIcs, convertLocalToUtc, expandOccurrences, parseIcsEvent, resolveTimeZone } from "../../src/util/IcsUtils.js";
+import {
+    buildEventIcs,
+    convertLocalToUtc,
+    expandOccurrences,
+    expandOccurrencesDetailed,
+    parseIcsEvent,
+    resolveTimeZone,
+} from "../../src/util/IcsUtils.js";
 import {
     Attendee,
     AttendeeResponseStatus,
@@ -827,6 +834,365 @@ describe("buildEventIcs() / parseIcsEvent() Tests", () => {
             }
             expect(resolveTimeZone("America/New_York")).toBe("America/New_York");
             expect(resolveTimeZone("Not/A_Real_Zone_0")).toBeUndefined();
+        });
+    });
+
+    describe("Component (BEGIN/END) tracking", () => {
+        const wrap = (...body: string[]): string => ["BEGIN:VCALENDAR", "VERSION:2.0", "METHOD:REQUEST", ...body, "END:VCALENDAR"].join("\r\n");
+
+        it("Never applies a VTIMEZONE's own DTSTART/RRULE to the event.", () => {
+            const raw = wrap(
+                "BEGIN:VTIMEZONE",
+                "TZID:America/New_York",
+                "BEGIN:STANDARD",
+                "DTSTART:19701101T020000",
+                "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+                "TZOFFSETFROM:-0400",
+                "TZOFFSETTO:-0500",
+                "END:STANDARD",
+                "BEGIN:DAYLIGHT",
+                "DTSTART:19700308T020000",
+                "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+                "END:DAYLIGHT",
+                "END:VTIMEZONE",
+                "BEGIN:VEVENT",
+                "UID:tz-uid",
+                "DTSTART;TZID=America/New_York:20260615T090000",
+                "DTEND;TZID=America/New_York:20260615T100000",
+                "END:VEVENT",
+            );
+            const parsed = parseIcsEvent(raw)!;
+            expect(parsed.recurrenceRule).toBeUndefined();
+            expect(parsed.startDate!.toISOString()).toBe("2026-06-15T13:00:00.000Z");
+            expect(parsed.timezone).toBe("America/New_York");
+        });
+
+        it("Never treats a VALARM's ATTENDEE/SUMMARY lines as the event's own.", () => {
+            const raw = wrap(
+                "BEGIN:VEVENT",
+                "UID:alarm-uid",
+                "SUMMARY:Real title",
+                "DTSTART:20260615T120000Z",
+                "ATTENDEE;PARTSTAT=ACCEPTED:mailto:real@example.com",
+                "BEGIN:VALARM",
+                "ACTION:EMAIL",
+                "SUMMARY:Alarm title",
+                "ATTENDEE:mailto:alarm-recipient@example.com",
+                "END:VALARM",
+                "ATTENDEE:mailto:after-alarm@example.com",
+                "END:VEVENT",
+            );
+            const parsed = parseIcsEvent(raw)!;
+            expect(parsed.summary).toBe("Real title");
+            expect(parsed.attendees.map((a) => a.address)).toEqual(["real@example.com", "after-alarm@example.com"]);
+        });
+
+        it("Uses the first VEVENT without RECURRENCE-ID as the master and returns the others as overrides, never merging them.", () => {
+            const raw = wrap(
+                "BEGIN:VEVENT",
+                "UID:series-uid",
+                "RECURRENCE-ID:20260622T190000Z",
+                "SEQUENCE:2",
+                "SUMMARY:Moved occurrence",
+                "DTSTART:20260622T210000Z",
+                "DTEND:20260622T220000Z",
+                "ATTENDEE:mailto:override-only@example.com",
+                "END:VEVENT",
+                "BEGIN:VEVENT",
+                "UID:series-uid",
+                "SEQUENCE:1",
+                "SUMMARY:Weekly",
+                "DTSTAMP:20260601T101500Z",
+                "DTSTART:20260615T190000Z",
+                "DTEND:20260615T200000Z",
+                "RRULE:FREQ=WEEKLY;COUNT=4",
+                "EXDATE:20260629T190000Z",
+                "ATTENDEE:mailto:master@example.com",
+                "END:VEVENT",
+                "BEGIN:VEVENT",
+                "UID:some-other-uid",
+                "RECURRENCE-ID:20260622T190000Z",
+                "DTSTART:20260622T190000Z",
+                "END:VEVENT",
+            );
+            const parsed = parseIcsEvent(raw)!;
+            expect(parsed.uid).toBe("series-uid");
+            expect(parsed.summary).toBe("Weekly");
+            expect(parsed.sequence).toBe(1);
+            expect(parsed.recurrenceId).toBeUndefined();
+            expect(parsed.startDate!.toISOString()).toBe("2026-06-15T19:00:00.000Z");
+            expect(parsed.recurrenceRule!.count).toBe(4);
+            expect(parsed.recurrenceRule!.exceptions).toEqual([new Date("2026-06-29T19:00:00.000Z")]);
+            expect(parsed.attendees.map((a) => a.address)).toEqual(["master@example.com"]);
+            expect(parsed.dtstamp!.toISOString()).toBe("2026-06-01T10:15:00.000Z");
+
+            expect(parsed.overrides).toHaveLength(1);
+            const override = parsed.overrides![0];
+            expect(override.recurrenceId!.toISOString()).toBe("2026-06-22T19:00:00.000Z");
+            expect(override.summary).toBe("Moved occurrence");
+            expect(override.sequence).toBe(2);
+            expect(override.recurrenceRule).toBeUndefined();
+            expect(override.attendees.map((a) => a.address)).toEqual(["override-only@example.com"]);
+        });
+
+        it("Falls back to the first VEVENT when every VEVENT has a RECURRENCE-ID (a single-occurrence message).", () => {
+            const raw = wrap(
+                "BEGIN:VEVENT",
+                "UID:occ-uid",
+                "RECURRENCE-ID:20260622T190000Z",
+                "SUMMARY:First",
+                "END:VEVENT",
+                "BEGIN:VEVENT",
+                "UID:occ-uid",
+                "RECURRENCE-ID:20260629T190000Z",
+                "SUMMARY:Second",
+                "END:VEVENT",
+            );
+            const parsed = parseIcsEvent(raw)!;
+            expect(parsed.summary).toBe("First");
+            expect(parsed.recurrenceId!.toISOString()).toBe("2026-06-22T19:00:00.000Z");
+            expect(parsed.overrides!.map((o) => o.summary)).toEqual(["Second"]);
+        });
+
+        it("Omits overrides and dtstamp for a plain single-VEVENT message without DTSTAMP.", () => {
+            const parsed = parseIcsEvent(wrap("BEGIN:VEVENT", "UID:plain", "DTSTART:20260615T120000Z", "END:VEVENT"))!;
+            expect(parsed.overrides).toBeUndefined();
+            expect(parsed.dtstamp).toBeUndefined();
+        });
+
+        it("Parses DTSTAMP from a generated payload.", () => {
+            const before = Date.now() - 1000;
+            const parsed = parseIcsEvent(buildEventIcs(makeEvent(), "REQUEST"))!;
+            expect(parsed.dtstamp!.getTime()).toBeGreaterThanOrEqual(before);
+        });
+
+        it("Skips unrecognized properties and malformed (non content-line) lines inside a VEVENT.", () => {
+            const parsed = parseIcsEvent(
+                wrap("BEGIN:VEVENT", "UID:x-uid", "X-MICROSOFT-CDO-BUSYSTATUS:BUSY", "this line has no colon", "SUMMARY:Kept", "END:VEVENT"),
+            )!;
+            expect(parsed.uid).toBe("x-uid");
+            expect(parsed.summary).toBe("Kept");
+        });
+
+        it("Tolerates a bare VEVENT with no VCALENDAR wrapper, and a stray END with no matching BEGIN.", () => {
+            const raw = ["METHOD:REQUEST", "BEGIN:VEVENT", "UID:bare", "END:VALARM", "SUMMARY:Still in the event", "END:VEVENT"].join("\n");
+            const parsed = parseIcsEvent(raw)!;
+            expect(parsed.method).toBe("REQUEST");
+            expect(parsed.uid).toBe("bare");
+            expect(parsed.summary).toBe("Still in the event");
+        });
+
+        it("Ignores a VEVENT nested inside some other component.", () => {
+            const nestedInTodo = wrap("BEGIN:VTODO", "BEGIN:VEVENT", "UID:nested", "END:VEVENT", "END:VTODO");
+            expect(parseIcsEvent(nestedInTodo)).toBeUndefined();
+            const deeplyNested = wrap("BEGIN:VEVENT", "UID:outer", "BEGIN:VALARM", "BEGIN:VEVENT", "UID:inner", "SUMMARY:Inner", "END:VEVENT", "END:VALARM", "END:VEVENT");
+            const parsed = parseIcsEvent(deeplyNested)!;
+            expect(parsed.uid).toBe("outer");
+            expect(parsed.summary).toBeUndefined();
+            expect(parsed.overrides).toBeUndefined();
+        });
+
+        it("Ignores a METHOD line nested inside a VEVENT.", () => {
+            const raw = ["BEGIN:VCALENDAR", "METHOD:REQUEST", "BEGIN:VEVENT", "UID:m", "METHOD:CANCEL", "END:VEVENT", "END:VCALENDAR"].join("\r\n");
+            expect(parseIcsEvent(raw)!.method).toBe("REQUEST");
+        });
+
+        it("Returns undefined when there is no VEVENT at all, even if a UID appears elsewhere.", () => {
+            expect(parseIcsEvent(wrap("BEGIN:VTODO", "UID:todo-uid", "END:VTODO"))).toBeUndefined();
+        });
+    });
+
+    describe("Generated-output injection hardening", () => {
+        const contentLines = (ics: string): string[] => ics.split("\r\n");
+
+        it("A CR/LF in a TEXT value can't start a new content line.", () => {
+            const event = makeEvent({ title: "Hi\r\nATTENDEE:mailto:evil@evil.com\rORGANIZER:mailto:evil@evil.com", location: "A\nB" });
+            const ics = buildEventIcs(event, "REQUEST");
+            expect(ics.replace(/\r\n/g, "")).not.toMatch(/[\r\n]/);
+            expect(contentLines(ics).some((line) => line.startsWith("ATTENDEE:mailto:evil"))).toBe(false);
+            expect(contentLines(ics).some((line) => line.startsWith("ORGANIZER:mailto:evil"))).toBe(false);
+
+            const parsed = parseIcsEvent(ics)!;
+            expect(parsed.summary).toBe("Hi\nATTENDEE:mailto:evil@evil.com\nORGANIZER:mailto:evil@evil.com");
+            expect(parsed.location).toBe("A\nB");
+            expect(parsed.attendees.map((a) => a.address)).toEqual(["attendee@example.com"]);
+            expect(parsed.organizer!.address).toBe("organizer@example.com");
+        });
+
+        it("A display name can't inject parameters or properties via quotes, ';', ':' or CR/LF.", () => {
+            const event = makeEvent({
+                organizer: { address: "organizer@example.com", displayName: 'Org";SENT-BY="mailto:evil@evil.com', type: RecipientType.TO },
+                attendees: [
+                    makeAttendee({
+                        displayName: 'Evil";PARTSTAT=ACCEPTED:mailto:x@x.com\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:evil@evil.com',
+                    }),
+                ],
+            });
+            const ics = buildEventIcs(event, "REQUEST");
+            expect(ics.replace(/\r\n/g, "")).not.toMatch(/[\r\n]/);
+
+            const parsed = parseIcsEvent(ics)!;
+            expect(parsed.attendees).toHaveLength(1);
+            expect(parsed.attendees[0].address).toBe("attendee@example.com");
+            expect(parsed.attendees[0].partstat).toBe(AttendeeResponseStatus.NEEDS_ACTION);
+            expect(parsed.attendees[0].displayName).toBe("Evil;PARTSTAT=ACCEPTED:mailto:x@x.comATTENDEE;PARTSTAT=ACCEPTED:mailto:evil@evil.com");
+            expect(parsed.organizer).toEqual({ address: "organizer@example.com", displayName: "Org;SENT-BY=mailto:evil@evil.com" });
+        });
+
+        it("Round-trips a display name containing a comma exactly (quoted, not backslash-escaped).", () => {
+            const event = makeEvent({ attendees: [makeAttendee({ displayName: "Doe, John" })] });
+            const ics = buildEventIcs(event, "REQUEST");
+            expect(ics).toContain('CN="Doe, John"');
+            expect(parseIcsEvent(ics)!.attendees[0].displayName).toBe("Doe, John");
+        });
+
+        it("Strips CR/LF from an address or UID interpolated into a content line.", () => {
+            const event = makeEvent({ icalUid: "uid-1\r\nATTENDEE:mailto:evil@evil.com", attendees: [makeAttendee({ address: "a@example.com\r\nX-EVIL:1" })] });
+            const ics = buildEventIcs(event, "REQUEST");
+            expect(ics.replace(/\r\n/g, "")).not.toMatch(/[\r\n]/);
+            expect(contentLines(ics).some((line) => line.startsWith("X-EVIL") || line.startsWith("ATTENDEE:mailto:evil"))).toBe(false);
+        });
+    });
+
+    describe("DATE-form UNTIL", () => {
+        it("Is the end of that local day in the event's TZID, so an occurrence later that day is included.", () => {
+            const raw = [
+                "BEGIN:VCALENDAR",
+                "METHOD:REQUEST",
+                "BEGIN:VEVENT",
+                "UID:until-uid",
+                "RRULE:FREQ=DAILY;UNTIL=20261231",
+                "DTSTART;TZID=America/Los_Angeles:20261230T170000",
+                "DTEND;TZID=America/Los_Angeles:20261230T180000",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            ].join("\r\n");
+            const parsed = parseIcsEvent(raw)!;
+            expect(parsed.recurrenceRule!.until!.toISOString()).toBe("2027-01-01T07:59:59.999Z");
+
+            const occurrences = expandOccurrences(
+                { startDate: parsed.startDate!, endDate: parsed.endDate!, recurrenceRule: parsed.recurrenceRule, timezone: parsed.timezone },
+                new Date("2026-12-01T00:00:00.000Z"),
+                new Date("2027-02-01T00:00:00.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-12-31T01:00:00.000Z", "2027-01-01T01:00:00.000Z"]);
+        });
+
+        it("Is the end of that UTC day for a UTC DTSTART.", () => {
+            const raw = [
+                "BEGIN:VCALENDAR",
+                "METHOD:REQUEST",
+                "BEGIN:VEVENT",
+                "UID:until-utc",
+                "DTSTART:20261230T170000Z",
+                "DTEND:20261230T180000Z",
+                "RRULE:FREQ=DAILY;UNTIL=20261231",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            ].join("\r\n");
+            const parsed = parseIcsEvent(raw)!;
+            expect(parsed.recurrenceRule!.until!.toISOString()).toBe("2026-12-31T23:59:59.999Z");
+            const occurrences = expandOccurrences(
+                { startDate: parsed.startDate!, endDate: parsed.endDate!, recurrenceRule: parsed.recurrenceRule },
+                new Date("2026-12-01T00:00:00.000Z"),
+                new Date("2027-02-01T00:00:00.000Z"),
+            );
+            expect(occurrences).toHaveLength(2);
+        });
+
+        it("Falls back to the end of the UTC day when the event's TZID is unrecognizable.", () => {
+            const raw = [
+                "BEGIN:VCALENDAR",
+                "METHOD:REQUEST",
+                "BEGIN:VEVENT",
+                "UID:until-junk-tz",
+                "DTSTART;TZID=Not A Real Zone:20261230T170000",
+                "RRULE:FREQ=DAILY;UNTIL=20261231",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            ].join("\r\n");
+            expect(parseIcsEvent(raw)!.recurrenceRule!.until!.toISOString()).toBe("2026-12-31T23:59:59.999Z");
+        });
+
+        it("Still reads a Z-suffixed DATE-TIME UNTIL as an exact UTC instant.", () => {
+            const raw = [
+                "BEGIN:VCALENDAR",
+                "METHOD:REQUEST",
+                "BEGIN:VEVENT",
+                "UID:until-exact",
+                "DTSTART;TZID=America/Los_Angeles:20261230T170000",
+                "RRULE:FREQ=DAILY;UNTIL=20261231T010000Z",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            ].join("\r\n");
+            expect(parseIcsEvent(raw)!.recurrenceRule!.until!.toISOString()).toBe("2026-12-31T01:00:00.000Z");
+        });
+    });
+
+    describe("expandOccurrencesDetailed() truncation", () => {
+        const startDate = new Date("2026-01-01T09:00:00.000Z");
+        const endDate = new Date("2026-01-01T10:00:00.000Z");
+
+        it("Reports truncated=true when MAX_OCCURRENCES (500) is hit.", () => {
+            const windowStart = new Date("2026-01-01T00:00:00.000Z");
+            const windowEnd = new Date(windowStart.getTime() + 731 * 24 * 60 * 60 * 1000);
+            const result = expandOccurrencesDetailed(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] } },
+                windowStart,
+                windowEnd,
+            );
+            expect(result.truncated).toBe(true);
+            expect(result.occurrences).toHaveLength(500);
+        });
+
+        it("Reports truncated=false when the whole window fits under the caps.", () => {
+            const windowStart = new Date("2026-01-01T00:00:00.000Z");
+            const windowEnd = new Date("2026-03-01T00:00:00.000Z");
+            const daily = expandOccurrencesDetailed(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] } },
+                windowStart,
+                windowEnd,
+            );
+            expect(daily.truncated).toBe(false);
+            expect(daily.occurrences).toHaveLength(59);
+
+            const counted = expandOccurrencesDetailed(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, count: 3, exceptions: [] } },
+                windowStart,
+                new Date(windowStart.getTime() + 731 * 24 * 60 * 60 * 1000),
+            );
+            expect(counted.truncated).toBe(false);
+            expect(counted.occurrences).toHaveLength(3);
+
+            const single = expandOccurrencesDetailed({ startDate, endDate }, windowStart, windowEnd);
+            expect(single).toEqual({ occurrences: [{ start: startDate, end: endDate }], truncated: false });
+        });
+
+        it("Reports truncated=true when MAX_PERIODS is hit by a rule that can never match over a huge window.", () => {
+            // February never has a 31st, so every one of the 50,000 walked days is a non-match.
+            const result = expandOccurrencesDetailed(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, byMonth: [2], byMonthDay: [31], exceptions: [] } },
+                new Date("2026-01-01T00:00:00.000Z"),
+                new Date("2250-01-01T00:00:00.000Z"),
+            );
+            expect(result.occurrences).toEqual([]);
+            expect(result.truncated).toBe(true);
+        });
+
+        it("Reports truncated=false when COUNT runs out before the window even starts.", () => {
+            const result = expandOccurrencesDetailed(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, count: 3, exceptions: [] } },
+                new Date("2027-01-01T00:00:00.000Z"),
+                new Date("2027-02-01T00:00:00.000Z"),
+            );
+            expect(result).toEqual({ occurrences: [], truncated: false });
+        });
+
+        it("expandOccurrences() returns the same occurrences as expandOccurrencesDetailed().", () => {
+            const event = { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] } };
+            const windowStart = new Date("2026-01-01T00:00:00.000Z");
+            const windowEnd = new Date("2026-06-01T00:00:00.000Z");
+            expect(expandOccurrences(event, windowStart, windowEnd)).toEqual(expandOccurrencesDetailed(event, windowStart, windowEnd).occurrences);
         });
     });
 });

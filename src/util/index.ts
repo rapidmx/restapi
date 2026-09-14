@@ -15,7 +15,9 @@
 export * from "./AddressUtils.js";
 export * from "./AuditLogUtils.js";
 export * from "./AutoReplyUtils.js";
+export * from "./BlobReferenceUtils.js";
 export * from "./BookingUtils.js";
+export * from "./ClientIpUtils.js";
 export * from "./ConversationUtils.js";
 export * from "./DistributionListUtils.js";
 export * from "./DnsSetupUtils.js";
@@ -33,5 +35,7 @@ export * from "./MailboxScopeUtils.js";
 export * from "./MimeHeaderUtils.js";
 export * from "./OofUtils.js";
 export * from "./RecoverableRepoUtils.js";
+export * from "./RequestBodyUtils.js";
+export * from "./SearchIndexUtils.js";
 export * from "./TransportRuleUtils.js";
 export * from "./UserUidUtils.js";

@@ -42,6 +42,10 @@ export class OpenSearchProvider implements SearchProvider {
     @Config("mail:search:opensearch:password")
     private password?: string;
 
+    /** Upper bound on one `_bulk` request's serialized body; larger batches are split across requests. */
+    @Config("mail:search:opensearch:max_bulk_bytes", 10 * 1024 * 1024)
+    private maxBulkBytes: number = 10 * 1024 * 1024;
+
     @Logger
     private logger: any;
 
@@ -102,15 +106,57 @@ export class OpenSearchProvider implements SearchProvider {
         if (docs.length === 0) {
             return [];
         }
-        const body: any[] = docs.flatMap((doc) => [
-            { index: { _index: this.index_, _id: this.docId(doc.entityType, doc.entityUid) } },
-            truncateSearchDocumentText(doc),
-        ]);
-        const response = await this.client.bulk({ body });
 
-        // The `_bulk` API responds 200 even when individual items fail, flagging that only via a top-level
-        // `errors: true` plus a per-item `error` - so success must be read per item, in request order, rather
-        // than inferred from the call resolving.
+        // Split into `_bulk` requests of at most `maxBulkBytes` serialized NDJSON (OpenSearch's
+        // `http.max_content_length` defaults to 100MB, and large requests pressure the cluster's heap long before
+        // that) - a single document larger than the cap still goes out, alone, in its own chunk.
+        const chunks: { docs: SearchDocument[]; body: any[] }[] = [];
+        let current: { docs: SearchDocument[]; body: any[] } = { docs: [], body: [] };
+        let currentBytes = 0;
+        for (const doc of docs) {
+            const action: any = { index: { _index: this.index_, _id: this.docId(doc.entityType, doc.entityUid) } };
+            const source: SearchDocument = truncateSearchDocumentText(doc);
+            const bytes: number = Buffer.byteLength(JSON.stringify(action)) + Buffer.byteLength(JSON.stringify(source)) + 2;
+            if (current.docs.length > 0 && currentBytes + bytes > this.maxBulkBytes) {
+                chunks.push(current);
+                current = { docs: [], body: [] };
+                currentBytes = 0;
+            }
+            current.docs.push(doc);
+            current.body.push(action, source);
+            currentBytes += bytes;
+        }
+        chunks.push(current);
+
+        const indexed: string[] = [];
+        for (const chunk of chunks) {
+            let response: any;
+            try {
+                response = await this.client.bulk({ body: chunk.body });
+            } catch (err: any) {
+                if (err?.meta?.statusCode === 413) {
+                    // The cluster's own request-size limit is lower than `max_bulk_bytes` - index this chunk one
+                    // document at a time instead, isolating any single document that is itself too large.
+                    indexed.push(...(await this.indexIndividually(chunk.docs)));
+                    continue;
+                }
+                if (indexed.length === 0) {
+                    // Nothing indexed yet: a whole-batch failure (e.g. cluster unreachable) - reject, per the contract.
+                    throw err;
+                }
+                // Earlier chunks did index: report exactly those, leaving the rest for the caller to retry.
+                this.logger?.warn(`OpenSearchProvider: bulk request failed after ${indexed.length} indexed document(s): ${err?.message ?? err}`);
+                return indexed;
+            }
+            indexed.push(...this.readBulkResponse(chunk.docs, response));
+        }
+        return indexed;
+    }
+
+    /** The `_bulk` API responds 200 even when individual items fail, flagging that only via a top-level
+     * `errors: true` plus a per-item `error` - so success must be read per item, in request order, rather
+     * than inferred from the call resolving. */
+    private readBulkResponse(docs: SearchDocument[], response: any): string[] {
         const result: any = response?.body ?? response;
         if (!result?.errors) {
             return docs.map((doc) => doc.entityUid);
@@ -126,6 +172,19 @@ export class OpenSearchProvider implements SearchProvider {
                 this.logger?.warn(`OpenSearchProvider: failed to index ${doc.entityType} ${doc.entityUid}: ${reason}`);
             }
         });
+        return indexed;
+    }
+
+    private async indexIndividually(docs: SearchDocument[]): Promise<string[]> {
+        const indexed: string[] = [];
+        for (const doc of docs) {
+            try {
+                await this.index(doc);
+                indexed.push(doc.entityUid);
+            } catch (err: any) {
+                this.logger?.warn(`OpenSearchProvider: failed to index ${doc.entityType} ${doc.entityUid}: ${err?.message ?? err}`);
+            }
+        }
         return indexed;
     }
 

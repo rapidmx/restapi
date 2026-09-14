@@ -15,7 +15,8 @@ import {
 } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { coerceDateFields, MATTER_DATE_FIELDS } from "../util/DateCoercionUtils.js";
-import { findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
+import { exactInFilter, findHeldScopeIds, isQuerySafeUid, requireEscrowHolder } from "../util/EscrowUtils.js";
+import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
 import { AuditAction, Matter } from "../models/types.js";
 const { Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
@@ -100,6 +101,14 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
         for (const o of objs) {
+            if (!o || typeof o !== "object" || Array.isArray(o)) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+            }
+            // Always a server-minted uid: a client uid like `"a,victim"` would otherwise ride into the `in(...)`/`eq(...)`
+            // filters later built from matter uids. `_id` (an upsert over another row on Mongo), bookkeeping fields
+            // and dotted/`$` keys are never the client's either - see `util/RequestBodyUtils.ts`.
+            delete (o as any).uid;
+            stripClientCreateFields(o);
             if (!o.escrowScopeId) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "escrowScopeId is required.");
             }
@@ -157,6 +166,11 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
+        if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        // A dotted/`$` key is a Mongo update path (`custodianMailboxUids.0`) past `validateMatter()`'s checks.
+        assertNoPathKeys(obj);
         const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -191,6 +205,11 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
      * partial-success `BulkError` aggregation - this endpoint is a rare, holder-invoked admin action, not
      * a high-volume batch import worth that extra complexity). */
     public async updateBulk(objs: T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
+        if (!Array.isArray(objs)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        // Checked for the whole batch up front, so an invalid entry fails it before any entry is written.
+        assertNoPathKeys(objs);
         const updated: T[] = [];
         for (const obj of objs) {
             updated.push(await this.update((obj as any).uid, obj, req, user));
@@ -208,6 +227,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         obj: any,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
+        assertPlainPropertyName(propertyName);
         const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -252,11 +272,11 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
      * matter that only starts matching after this snapshot is simply left for a later truncate() call to
      * pick up (and check) instead. */
     public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
-        const heldScopeIds: string[] = await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user);
-        if (heldScopeIds.length === 0) {
+        const heldScopes: string | undefined = await this.heldScopeFilter(user);
+        if (!heldScopes) {
             return;
         }
-        const scopedQuery = { ...stripClientQuery(query, ["escrowScopeId"]), ...params, escrowScopeId: `in(${heldScopeIds.join(",")})` };
+        const scopedQuery = { ...stripClientQuery(query, ["escrowScopeId"]), ...params, escrowScopeId: heldScopes };
         const findOptions = { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true };
         const matched: T[] = await this.repoUtils!.find(scopedQuery, findOptions);
         if (matched.length === 0) {
@@ -278,10 +298,15 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             }
         }
 
-        await this.repoUtils!.truncate({ uid: `in(${matched.map((existing) => existing.uid).join(",")})` } as any, {
-            user,
-            ignoreACL: true,
-        });
+        // One exact delete per checked matter rather than one `in(a,b,...)`: the query parser splits `in(...)` on
+        // commas, so a (legacy, client-chosen) uid containing one would widen the delete to matters never checked.
+        for (const existing of matched) {
+            if (isQuerySafeUid(existing.uid)) {
+                await this.repoUtils!.truncate({ uid: `eq(${existing.uid})` } as any, { user, ignoreACL: true });
+            } else {
+                await this.repoUtils!.delete(existing.uid, { user, ignoreACL: true });
+            }
+        }
 
         for (const existing of matched) {
             await recordAuditLog(
@@ -325,13 +350,19 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         );
     }
 
+    /** The `escrowScopeId` filter matching exactly the scopes `user` holds (see `exactInFilter()`), `undefined` for
+     * none. */
+    private async heldScopeFilter(user: JWTUser | undefined): Promise<string | undefined> {
+        return exactInFilter(await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user));
+    }
+
     public async find(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<T[]> {
-        const heldScopeIds: string[] = await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user);
-        if (heldScopeIds.length === 0) {
+        const heldScopes: string | undefined = await this.heldScopeFilter(user);
+        if (!heldScopes) {
             return [];
         }
         return await this.repoUtils!.find(
-            { ...stripClientQuery(query, ["escrowScopeId"]), ...params, escrowScopeId: `in(${heldScopeIds.join(",")})` },
+            { ...stripClientQuery(query, ["escrowScopeId"]), ...params, escrowScopeId: heldScopes },
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
     }
@@ -342,12 +373,12 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         @Response res: HttpResponse,
         @AuthUser user?: JWTUser,
     ): Promise<any> {
-        const heldScopeIds: string[] = await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user);
-        if (heldScopeIds.length === 0) {
+        const heldScopes: string | undefined = await this.heldScopeFilter(user);
+        if (!heldScopes) {
             return res.status(200).setHeader("content-length", 0);
         }
         const result: number = await this.repoUtils!.count(
-            { ...stripClientQuery(query, ["escrowScopeId"]), ...params, escrowScopeId: `in(${heldScopeIds.join(",")})` },
+            { ...stripClientQuery(query, ["escrowScopeId"]), ...params, escrowScopeId: heldScopes },
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
         return res.status(200).setHeader("content-length", result);

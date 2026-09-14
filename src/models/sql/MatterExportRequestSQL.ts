@@ -53,6 +53,14 @@ export class MatterExportRequestSQL extends BaseEntity implements MatterExportRe
     @Nullable
     public errorMessage?: string;
 
+    // Nullable rather than NOT NULL DEFAULT 0: service-core's `ColumnOptions` has no `default`, and a NOT NULL
+    // column without one can't be added to an existing table. New rows still get `0` from the initializer; a
+    // pre-existing row reads as `null`, which `MatterExportJob` treats as `0`.
+    @Column({ type: "int", nullable: true })
+    @Description("How many times MatterExportJob has claimed this request for processing (lease/retry counter).")
+    @Nullable
+    public processingAttempts?: number = 0;
+
     constructor(other?: Partial<MatterExportRequestSQL>) {
         super(other);
 
@@ -62,6 +70,7 @@ export class MatterExportRequestSQL extends BaseEntity implements MatterExportRe
             this.status = other.status !== undefined ? other.status : this.status;
             this.blobKey = "blobKey" in other ? other.blobKey : this.blobKey;
             this.errorMessage = "errorMessage" in other ? other.errorMessage : this.errorMessage;
+            this.processingAttempts = other.processingAttempts !== undefined && other.processingAttempts !== null ? other.processingAttempts : this.processingAttempts;
         }
     }
 }

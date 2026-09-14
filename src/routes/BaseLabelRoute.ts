@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { type JWTUser } from "@rapidrest/core";
 import { HttpRequest, RepoFindOptions, RouteDecorators } from "@rapidrest/service-core";
+import { asEntity } from "../util/EntityUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { Label, Message } from "../models/types.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
@@ -62,22 +63,48 @@ export abstract class BaseLabelRoute<T extends Label, M extends Message> extends
             const options: RepoFindOptions = { limit: MESSAGE_PAGE_SIZE, page, ignoreACL: true };
             const batch: M[] = await repo.find({ mailboxUid, limit: MESSAGE_PAGE_SIZE, page } as any, options);
             for (const message of batch) {
-                const labelUids: string[] = message.labelUids ?? [];
-                if (labelUids.includes(labelUid)) {
-                    await repo.update(
-                        {
-                            uid: message.uid,
-                            version: message.version,
-                            labelUids: labelUids.filter((uid) => uid !== labelUid),
-                        } as Partial<M>,
-                        message,
-                        { ignoreACL: true },
-                    );
+                if ((message.labelUids ?? []).includes(labelUid)) {
+                    await this.removeLabelFrom(repo, message, labelUid);
                 }
             }
             if (batch.length < MESSAGE_PAGE_SIZE) {
                 break;
             }
+        }
+    }
+
+    /**
+     * Removes `labelUid` from one message's `labelUids` under the optimistic lock - `find()` rows are plain documents on
+     * Mongo, which `update()` would otherwise write back unversioned, silently undoing a concurrent edit. On a conflict
+     * the message is re-read and retried.
+     */
+    private async removeLabelFrom(repo: RecoverableRepoUtils<M>, message: M, labelUid: string): Promise<void> {
+        // The caller only passes a message whose `labelUids` includes `labelUid`.
+        let current: M = message;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                await repo.update(
+                    {
+                        uid: current.uid,
+                        version: current.version,
+                        labelUids: current.labelUids!.filter((uid) => uid !== labelUid),
+                    } as Partial<M>,
+                    asEntity(repo, current),
+                    { ignoreACL: true },
+                );
+                return;
+                /* v8 ignore start -- only a concurrent write to the same message reaches here */
+            } catch (err: any) {
+                if (attempt >= 3 || err?.status !== 409) {
+                    throw err;
+                }
+                const reread: M | undefined = await repo.findOne(message.uid, { ignoreACL: true, skipCache: true });
+                if (!reread?.labelUids?.includes(labelUid)) {
+                    return;
+                }
+                current = reread;
+            }
+            /* v8 ignore stop */
         }
     }
 

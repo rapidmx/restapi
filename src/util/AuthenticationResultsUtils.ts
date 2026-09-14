@@ -43,42 +43,147 @@ export function parseAuthenticationResults(headerValues: string | string[] | und
     const entries: AuthenticationResultEntry[] = [];
 
     for (const raw of values) {
-        const segments: string[] = raw
-            .split(";")
-            .map((s) => s.trim())
-            .filter((s) => s.length > 0);
+        if (typeof raw !== "string") {
+            continue;
+        }
+        const segments: string[][] = tokenizeAuthenticationResults(raw);
         if (segments.length === 0) {
             continue;
         }
-        // The first segment is the authserv-id - captured (not skipped) so each entry can be checked against
-        // a configured trusted value below.
-        const authservId: string = segments[0].split(/\s+/)[0].toLowerCase();
-        for (const segment of segments.slice(1)) {
-            if (segment.toLowerCase() === "none") {
+        // The first segment is the authserv-id (optionally followed by a version) - captured (not skipped) so
+        // each entry can be checked against a configured trusted value below.
+        const authservId: string = unquote(segments[0][0]).toLowerCase();
+        for (const tokens of segments.slice(1)) {
+            if (tokens.length === 1 && tokens[0].toLowerCase() === "none") {
                 continue;
             }
-            const tokens: string[] = segment.split(/\s+/);
-            // `segment` is non-empty (filtered above), so splitting on whitespace always yields at least one
-            // element - `tokens.shift()` can never actually be `undefined` here.
-            const methodResult: string = tokens.shift()!;
+            const methodResult: string = tokens[0];
             const eq: number = methodResult.indexOf("=");
             if (eq < 0) {
                 continue;
             }
-            const method: string = methodResult.slice(0, eq).toLowerCase();
-            const result: string = methodResult.slice(eq + 1).toLowerCase();
+            // `method` may carry a `/version` suffix (RFC 8601 §2.2) - it identifies the same method.
+            const method: string = unquote(methodResult.slice(0, eq)).split("/")[0].toLowerCase();
+            const result: string = unquote(methodResult.slice(eq + 1)).toLowerCase();
             const properties: Record<string, string> = {};
-            for (const token of tokens) {
+            for (const token of tokens.slice(1)) {
                 const propEq: number = token.indexOf("=");
                 if (propEq < 0) {
                     continue;
                 }
-                properties[token.slice(0, propEq).toLowerCase()] = token.slice(propEq + 1).replace(/^"|"$/g, "");
+                properties[token.slice(0, propEq).toLowerCase()] = unquote(token.slice(propEq + 1));
             }
             entries.push({ authservId, method, result, properties });
         }
     }
     return entries;
+}
+
+/**
+ * Lexes one raw `Authentication-Results` value into `;`-separated segments of whitespace-separated tokens,
+ * honoring RFC 8601's (RFC 5322) lexical rules so that attacker-influenced text can't be mistaken for structure:
+ * - CFWS comments - `(...)`, which may nest and may contain `\`-escaped characters - are removed entirely (they
+ * act as a token separator), so e.g. `dkim=fail (dkim=pass header.d=example.com)` yields only `dkim=fail`.
+ * - Quoted strings - `"..."`, which may contain `\`-escaped characters - are kept intact as part of their token,
+ * so a `;`, whitespace, or `(` inside one never splits a segment/token or opens a comment.
+ * - Whitespace (or a comment) around `=` is dropped, so `header.d = example.com` still forms one `key=value` token.
+ * An unterminated comment or quoted string simply runs to the end of the value. Empty segments are dropped.
+ * Quoted tokens are returned still quoted - see `unquote()`.
+ */
+function tokenizeAuthenticationResults(raw: string): string[][] {
+    const segments: string[][] = [];
+    let tokens: string[] = [];
+    let token = "";
+
+    const endToken = () => {
+        if (token.length > 0) {
+            tokens.push(token);
+            token = "";
+        }
+    };
+    const endSegment = () => {
+        endToken();
+        if (tokens.length > 0) {
+            segments.push(tokens);
+        }
+        tokens = [];
+    };
+
+    let i = 0;
+    while (i < raw.length) {
+        const ch: string = raw[i];
+        if (ch === "(") {
+            // A comment: skip to its matching close paren, honoring nesting and `\`-escapes.
+            let depth = 0;
+            for (; i < raw.length; i++) {
+                const c: string = raw[i];
+                if (c === "\\") {
+                    i++;
+                } else if (c === "(") {
+                    depth++;
+                } else if (c === ")") {
+                    depth--;
+                    if (depth === 0) {
+                        break;
+                    }
+                }
+            }
+            i++;
+            // A comment separates tokens, except directly after `=` (`key=(comment)value`).
+            if (!token.endsWith("=")) {
+                endToken();
+            }
+            continue;
+        }
+        if (ch === '"') {
+            // A quoted string: copied verbatim (quotes and escapes included) into the current token.
+            let j: number = i + 1;
+            for (; j < raw.length; j++) {
+                if (raw[j] === "\\") {
+                    j++;
+                } else if (raw[j] === '"') {
+                    break;
+                }
+            }
+            token += raw.slice(i, Math.min(j + 1, raw.length));
+            i = j + 1;
+            continue;
+        }
+        if (ch === ";") {
+            endSegment();
+            i++;
+            continue;
+        }
+        if (/\s/.test(ch)) {
+            if (!token.endsWith("=")) {
+                endToken();
+            }
+            i++;
+            continue;
+        }
+        if (ch === "=") {
+            // Re-join `key = value`: a whitespace/comment-separated `key` token directly before this `=`.
+            if (token.length === 0 && tokens.length > 0 && !tokens[tokens.length - 1].includes("=")) {
+                token = tokens.pop()!;
+            }
+            token += "=";
+            i++;
+            continue;
+        }
+        token += ch;
+        i++;
+    }
+    endSegment();
+    return segments;
+}
+
+/** Strips a token's surrounding DQUOTEs (if it is a quoted string) and resolves its `\`-escapes. */
+function unquote(value: string): string {
+    if (value.length > 0 && value.startsWith('"')) {
+        const inner: string = value.endsWith('"') && value.length >= 2 ? value.slice(1, -1) : value.slice(1);
+        return inner.replace(/\\(.)/g, "$1");
+    }
+    return value;
 }
 
 /** Reports whether `dkimDomain` aligns with `fromDomain`. Case-insensitive, and deliberately **strict**

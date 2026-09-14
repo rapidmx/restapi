@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { BaseEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
 import { OofReplySuppression } from "../types.js";
+import { boundIndexedValue } from "../../util/ConversationUtils.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity, Index } = PersistenceDecorators;
@@ -39,7 +40,12 @@ export class OofReplySuppressionSQL extends BaseEntity implements OofReplySuppre
     public mailboxUid: string = "";
 
     @Column()
-    @Description("The sender address a reply was most recently sent to.")
+    // Bounded by `boundIndexedValue()` in the constructor: it's the unchecked SMTP MAIL FROM, and indexed, so a longer
+    // value would fail the insert on MySQL (`varchar(255)`). Look it up with `boundIndexedValue(address)` too.
+    @Description(
+        "The sender address a reply was most recently sent to. A value longer than 255 characters is stored as " +
+            "`sha256:<hex>` of the original.",
+    )
     public senderAddress: string = "";
 
     @Column()
@@ -51,7 +57,7 @@ export class OofReplySuppressionSQL extends BaseEntity implements OofReplySuppre
 
         if (other) {
             this.mailboxUid = other.mailboxUid !== undefined ? other.mailboxUid : this.mailboxUid;
-            this.senderAddress = other.senderAddress !== undefined ? other.senderAddress : this.senderAddress;
+            this.senderAddress = other.senderAddress !== undefined ? boundIndexedValue(other.senderAddress) : this.senderAddress;
             this.lastRepliedAt = other.lastRepliedAt !== undefined ? other.lastRepliedAt : this.lastRepliedAt;
         }
     }

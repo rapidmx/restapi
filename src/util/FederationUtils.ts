@@ -46,11 +46,23 @@ const NOT_PARTICIPATING: Record<string, any> = { participating: false };
  * own `@Config` field (Group E's discovery route) can widen either independently via `options`. */
 const DEFAULT_TTL_SECONDS = 24 * 60 * 60;
 
+/** Default cache lifetime (seconds) after a transient DNS failure (SERVFAIL, timeout, refused, ...) - short, so a
+ * resolver hiccup doesn't mark a real federated peer as non-participating for a day, but non-zero, so a DNS outage
+ * isn't hammered on every send. */
+const DEFAULT_TRANSIENT_FAILURE_TTL_SECONDS = 60;
+
+/** Resolver error codes that authoritatively mean "no such record": NXDOMAIN (`ENOTFOUND`) and an existing name
+ * without TXT records (`ENODATA`) - Node's `dns` module codes, also used by `DnsResolver` implementations. */
+const AUTHORITATIVE_NEGATIVE_CODES: ReadonlySet<string> = new Set(["ENOTFOUND", "ENODATA"]);
+
 export interface ResolveFederationPolicyOptions {
     /** How long (seconds) a resolved policy is cached before being re-resolved. Default 24h. */
     positiveTtlSeconds?: number;
     /** How long (seconds) a confirmed non-participating domain is cached. Default 24h. */
     negativeTtlSeconds?: number;
+    /** How long (seconds) the "not participating" answer is cached after a transient DNS failure (any resolver
+     * error other than NXDOMAIN/ENODATA). Default 60s; `0` disables caching it. */
+    transientFailureTtlSeconds?: number;
 }
 
 /**
@@ -83,7 +95,8 @@ function parsePolicyRecord(value: string): FederationPolicy | undefined {
 
 /**
  * Resolves `domain`'s federation policy via its `_rapidmx.<domain>` TXT record, caching both positive and
- * negative results in `policyCache`. Never throws - a DNS failure, NXDOMAIN, or a record that doesn't parse
+ * negative results in `policyCache` (a transient DNS failure only briefly - see
+ * `ResolveFederationPolicyOptions.transientFailureTtlSeconds`). Never throws - a DNS failure, NXDOMAIN, or a record that doesn't parse
  * as a recognized RapidMX policy are all treated as "not a federated peer", exactly mirroring
  * `checkDomainVerification()`'s own never-throws contract in `util/DomainVerificationUtils.ts`.
  *
@@ -105,6 +118,7 @@ export async function resolveFederationPolicy(
     }
 
     let resolved: FederationPolicy | undefined;
+    let transientFailure = false;
     try {
         const records: string[][] = await dnsResolver.resolveTxt(`_rapidmx.${normalizedDomain}`);
         for (const chunks of records) {
@@ -114,12 +128,18 @@ export async function resolveFederationPolicy(
                 break;
             }
         }
-    } catch {
+    } catch (err: any) {
         resolved = undefined;
+        transientFailure = !AUTHORITATIVE_NEGATIVE_CODES.has(err?.code);
     }
 
     if (resolved) {
         await policyCache.save(cacheKey, resolved, options.positiveTtlSeconds ?? DEFAULT_TTL_SECONDS);
+    } else if (transientFailure) {
+        const ttl: number = options.transientFailureTtlSeconds ?? DEFAULT_TRANSIENT_FAILURE_TTL_SECONDS;
+        if (ttl > 0) {
+            await policyCache.save(cacheKey, NOT_PARTICIPATING, ttl);
+        }
     } else {
         await policyCache.save(cacheKey, NOT_PARTICIPATING, options.negativeTtlSeconds ?? DEFAULT_TTL_SECONDS);
     }

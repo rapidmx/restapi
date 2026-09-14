@@ -2,9 +2,59 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { extractHeader, extractHeaders, prependHeaders } from "../../src/util/MimeHeaderUtils.js";
+import { checkOriginatorHeaders, extractHeader, extractHeaders, prependHeaders } from "../../src/util/MimeHeaderUtils.js";
 
 describe("MimeHeaderUtils Tests", () => {
+    describe("checkOriginatorHeaders()", () => {
+        const allowed = new Set(["me@example.com", "alias@example.com"]);
+        const isAllowed = (address: string): boolean => allowed.has(address.trim().toLowerCase());
+        const check = (headers: string): string | undefined => checkOriginatorHeaders(Buffer.from(`${headers}\r\n\r\nBody from: evil@x.com\r\n`), isAllowed);
+
+        it("Passes a plain From header naming an allowed address, any case.", () => {
+            expect(check("From: Me@EXAMPLE.com\r\nTo: you@example.com")).toBeUndefined();
+        });
+
+        it("Passes quoted display names (even ones containing commas and addresses), comments, encoded words and groups.", () => {
+            expect(check('From: "Doe, J <evil@x.com>" <me@example.com>')).toBeUndefined();
+            expect(check("From: me@example.com (really evil@x.com)")).toBeUndefined();
+            expect(check('From: "Doe \\"evil@x.com\\" J" <me@example.com> (nested (evil@x.com) \\) comment)')).toBeUndefined();
+            expect(check("From: =?utf-8?B?w6nDqQ==?= <alias@example.com>")).toBeUndefined();
+            expect(check("From: team: me@example.com, =?utf-8?Q?A?= <alias@example.com>;")).toBeUndefined();
+            expect(check("From: me@example.com\r\nSender: alias@example.com")).toBeUndefined();
+        });
+
+        it("Refuses a foreign address, alone or alongside an allowed one, or inside a group.", () => {
+            expect(check("From: evil@x.com")).toContain("From header");
+            expect(check("From: me@example.com, evil@x.com")).toContain("From header");
+            expect(check("From: team: me@example.com, evil@x.com;")).toContain("From header");
+        });
+
+        it("Refuses a foreign address a tolerant parser would demote to a display name.", () => {
+            expect(check("From: <me@example.com> <evil@x.com>")).toContain("From header");
+            expect(check("From: me@example.com evil@x.com")).toContain("From header");
+            expect(check("From: evil@x.com <me@example.com>")).toContain("From header");
+        });
+
+        it("Checks folded headers, case-insensitive names, whitespace before the colon, and bare-CR line breaks.", () => {
+            expect(check("From: me@example.com,\r\n\tevil@x.com")).toContain("From header");
+            expect(check("fRoM: evil@x.com")).toContain("From header");
+            expect(check("From : evil@x.com")).toContain("From header");
+            expect(check("From: me@example.com\rSender: evil@x.com")).toContain("Sender header");
+        });
+
+        it("Refuses duplicate From or Sender headers, a missing From, and a From with no address.", () => {
+            expect(check("From: me@example.com\r\nFrom: me@example.com")).toContain("more than one From");
+            expect(check("From: me@example.com\r\nSender: me@example.com\r\nsender: me@example.com")).toContain("more than one Sender");
+            expect(check("To: you@example.com")).toContain("no From header");
+            expect(check("From: undisclosed:;")).toContain("no address");
+            expect(check("From: Just A Name")).toContain("From header");
+        });
+
+        it("Refuses a Sender naming a foreign address.", () => {
+            expect(check("From: me@example.com\r\nSender: evil@x.com")).toContain("Sender header");
+        });
+    });
+
     describe("extractHeader()", () => {
         it("Finds a simple top-level header, case-insensitively.", () => {
             const raw = Buffer.from("From: a@example.com\r\nSubject: Hello\r\n\r\nBody\r\n");

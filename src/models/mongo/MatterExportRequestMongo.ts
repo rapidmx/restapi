@@ -53,6 +53,11 @@ export class MatterExportRequestMongo extends BaseMongoEntity implements MatterE
     @Nullable
     public errorMessage?: string;
 
+    @Column()
+    @Description("How many times MatterExportJob has claimed this request for processing (lease/retry counter).")
+    @Nullable
+    public processingAttempts?: number = 0;
+
     constructor(other?: Partial<MatterExportRequestMongo>) {
         super(other);
 
@@ -62,6 +67,7 @@ export class MatterExportRequestMongo extends BaseMongoEntity implements MatterE
             this.status = other.status !== undefined ? other.status : this.status;
             this.blobKey = "blobKey" in other ? other.blobKey : this.blobKey;
             this.errorMessage = "errorMessage" in other ? other.errorMessage : this.errorMessage;
+            this.processingAttempts = other.processingAttempts !== undefined && other.processingAttempts !== null ? other.processingAttempts : this.processingAttempts;
         }
     }
 }

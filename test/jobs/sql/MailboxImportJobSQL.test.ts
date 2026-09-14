@@ -669,6 +669,120 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
         expect((await messageRepo.find({ where: { folderUid: folder.uid } })).length).toBe(1);
     });
 
+    const importTwoMessages = async (): Promise<{ mailbox: any; folder: any; request: any }> => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        await blobStore.put(
+            sourceBlobKey,
+            Buffer.concat([
+                buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01")),
+                buildMboxEntry(makeRawMessage(), "bob@example.com", new Date("2020-01-02")),
+            ]),
+        );
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+        return { mailbox, folder, request };
+    };
+
+    const storedBytes = async (folderUid: string): Promise<number> => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        let total = 0;
+        for (const message of await messageRepo.find({ where: { folderUid: folderUid } })) {
+            total += await blobStore.size(message.bodyBlobKey);
+        }
+        for (const attachment of await attachmentRepo.find({ where: { folderUid: folderUid } })) {
+            total += attachment.sizeBytes;
+        }
+        return total;
+    };
+
+    it("Persists each imported message's size to Mailbox.usedBytes (not just in memory).", async () => {
+        const { mailbox, folder } = await importTwoMessages();
+
+        await job.run();
+
+        const updated = (await mailboxRepo.findOne({ where: { uid: mailbox.uid } }));
+        const expected = await storedBytes(folder.uid);
+        expect(expected).toBeGreaterThan(0);
+        expect(Number(updated!.usedBytes)).toBe(expected);
+        expect(updated!.version).toBe(mailbox.version + 2);
+    });
+
+    it("Does not clobber a concurrent usedBytes change made mid-import (version-checked charge, retried on conflict).", async () => {
+        const { mailbox, folder } = await importTwoMessages();
+        const messageRepoUtils = (job as any).messageRepo;
+        const realCreate = messageRepoUtils.create.bind(messageRepoUtils);
+        vi.spyOn(messageRepoUtils, "create").mockImplementationOnce(async (...args: any[]) => {
+            // e.g. concurrent delivery or another import charging the same mailbox after this run's first charge.
+            const current = (await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))!;
+            await mailboxRepo.update({ uid: mailbox.uid }, { version: current.version + 1, usedBytes: Number(current.usedBytes) + 777 });
+            return await realCreate(...args);
+        });
+
+        await job.run();
+
+        const updated = (await mailboxRepo.findOne({ where: { uid: mailbox.uid } }));
+        expect(Number(updated!.usedBytes)).toBe(777 + (await storedBytes(folder.uid)));
+    });
+
+    it("Refunds the quota charge of a message that failed to store.", async () => {
+        const { mailbox, folder, request } = await importTwoMessages();
+        const messageRepoUtils = (job as any).messageRepo;
+        vi.spyOn(messageRepoUtils, "create").mockRejectedValueOnce(new Error("simulated failure"));
+
+        await job.run();
+
+        const updatedRequest = (await requestRepo.findOne({ where: { uid: request.uid } }));
+        expect(updatedRequest!.importedCount).toBe(1);
+        expect(updatedRequest!.failedCount).toBe(1);
+        const updated = (await mailboxRepo.findOne({ where: { uid: mailbox.uid } }));
+        expect(Number(updated!.usedBytes)).toBe(await storedBytes(folder.uid));
+    });
+
+    it("On a reclaimed retry, still dedups a message whose Message-ID is over 255 characters (stored bounded as sha256:<hex>).", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const longId = `${"x".repeat(300)}@example.com`;
+        await messageRepo.save(
+            new MessageSQL({
+                mailboxUid: mailbox.uid,
+                folderUid: folder.uid,
+                messageId: longId,
+                subject: "Test message",
+                from: { address: "sender@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date("2020-01-01"),
+                receivedDate: new Date("2020-01-01"),
+                bodyBlobKey: `imported/${uuid.v4()}`,
+                flags: { read: true, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: false,
+            }),
+        );
+        const sourceBlobKey = await putMbox([
+            buildMboxEntry(makeRawMessage({ extraHeader: `Message-ID: <${longId}>` }), "alice@example.com", new Date("2020-01-01")),
+        ]);
+        const request = await createRequest({
+            mailboxUid: mailbox.uid,
+            targetFolderUid: folder.uid,
+            format: "mbox",
+            sourceBlobKey,
+            status: "processing",
+            processingAttempts: 1,
+            dateModified: new Date(Date.now() - 3 * 60 * 60_000),
+        });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("completed");
+        expect(updated!.importedCount).toBe(1);
+        const messages = await messageRepo.find({ where: { folderUid: folder.uid } });
+        expect(messages.length).toBe(1);
+        expect(messages[0].messageId).toMatch(/^sha256:[0-9a-f]{64}$/);
+    });
+
     it("Does nothing when the repos are not yet initialized.", async () => {
         const original = (job as any).requestRepo;
         (job as any).requestRepo = undefined;

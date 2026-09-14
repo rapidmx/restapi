@@ -8,8 +8,11 @@ import * as os from "os";
 import * as path from "path";
 import {
     createFileExclusive,
+    fsyncDirectory,
     lockKeyForPath,
     readFileIfExists,
+    STALE_TEMP_FILE_AGE_MS,
+    sweepStaleTempFiles,
     updateJsonFile,
     withLock,
     writeFileAtomic,
@@ -147,6 +150,49 @@ describe("FileStoreUtils Tests", () => {
 
             expect(results.filter(Boolean)).toHaveLength(1);
             expect(await fs.readFile(filePath, "utf-8")).toBe(`v${results.indexOf(true)}`);
+        });
+    });
+
+    describe("stale temp files / directory fsync", () => {
+        const TEMP_SUFFIX = ".1234.0b8a6c1e-2f3d-4e5f-8a9b-0c1d2e3f4a5b.tmp";
+
+        it("sweepStaleTempFiles() removes only old files matching the temp-name pattern.", async () => {
+            const dir: string = freshDir();
+            await fs.mkdir(path.join(dir, `subdir${TEMP_SUFFIX}`), { recursive: true });
+            const old = new Date(Date.now() - STALE_TEMP_FILE_AGE_MS - 60_000);
+            for (const name of [`store.json${TEMP_SUFFIX}`, "store.json", "notes.tmp"]) {
+                await fs.writeFile(path.join(dir, name), "x");
+                await fs.utimes(path.join(dir, name), old, old);
+            }
+            await fs.writeFile(path.join(dir, `fresh.json${TEMP_SUFFIX}`), "x");
+
+            await expect(sweepStaleTempFiles(dir)).resolves.toBe(1);
+
+            expect((await fs.readdir(dir)).sort()).toEqual([`fresh.json${TEMP_SUFFIX}`, "notes.tmp", "store.json", `subdir${TEMP_SUFFIX}`].sort());
+        });
+
+        it("sweepStaleTempFiles() returns 0 for a missing directory.", async () => {
+            await expect(sweepStaleTempFiles(path.join(freshDir(), "missing"))).resolves.toBe(0);
+        });
+
+        it("The first write into a directory sweeps abandoned temp files there.", async () => {
+            const dir: string = freshDir();
+            await fs.mkdir(dir, { recursive: true });
+            const abandoned: string = path.join(dir, `ca.json${TEMP_SUFFIX}`);
+            await fs.writeFile(abandoned, "torn");
+            const old = new Date(Date.now() - STALE_TEMP_FILE_AGE_MS - 60_000);
+            await fs.utimes(abandoned, old, old);
+
+            await writeFileAtomic(path.join(dir, "ca.json"), "{}", 0o600);
+
+            expect(await fs.readdir(dir)).toEqual(["ca.json"]);
+        });
+
+        it("fsyncDirectory() never throws (existing, missing, or platform-unsupported).", async () => {
+            const dir: string = freshDir();
+            await fs.mkdir(dir, { recursive: true });
+            await expect(fsyncDirectory(dir)).resolves.toBeUndefined();
+            await expect(fsyncDirectory(path.join(dir, "missing"))).resolves.toBeUndefined();
         });
     });
 

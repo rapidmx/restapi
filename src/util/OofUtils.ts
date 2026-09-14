@@ -32,12 +32,23 @@ export function resolveActiveOof(mailbox: Mailbox, activeEvent?: CalendarEvent):
     }
 
     if (mailbox.oofEnabled) {
-        const now = new Date();
-        if (mailbox.oofStartTime && mailbox.oofEndTime && (now < mailbox.oofStartTime || now > mailbox.oofEndTime)) {
-            return undefined;
+        if (mailbox.oofStartTime && mailbox.oofEndTime) {
+            // Compared as epoch milliseconds: the Mongo backend hands these back as ISO strings despite the `Date`
+            // typing, and comparing a `Date` to a string with `<`/`>` is always false. An unparseable bound fails
+            // closed (no automatic reply) rather than silently widening the window to "always on".
+            const now: number = Date.now();
+            const start: number = toEpochMs(mailbox.oofStartTime);
+            const end: number = toEpochMs(mailbox.oofEndTime);
+            if (Number.isNaN(start) || Number.isNaN(end) || now < start || now > end) {
+                return undefined;
+            }
         }
         return { active: true, message: mailbox.oofMessage };
     }
 
     return undefined;
+}
+
+function toEpochMs(value: Date | string | number): number {
+    return new Date(value).getTime();
 }

@@ -9,6 +9,7 @@ import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { Contact, ContactAddressKind, Folder, FolderType, Mailbox } from "../models/types.js";
+import { asEntity } from "../util/EntityUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { discoverAndMergeKeys, KeyringUpdate } from "../util/KeyringUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
@@ -116,9 +117,11 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
 
         const existingMatches: C[] = await this.contactRepo!.find(
             { mailboxUid: mailbox.uid, limit: 1, ...this.contactEmailQuery(addr) },
-            { ignoreACL: true, limit: 1 },
+            { ignoreACL: true, limit: 1, skipCache: true },
         );
-        const existingContact: C | undefined = existingMatches[0];
+        // An entity instance, so the keyring update below is version-checked: MongoDB's `find()` returns a plain
+        // document, which `RepoUtils.update()` would write unconditionally over a concurrent edit of the contact.
+        const existingContact: C | undefined = existingMatches[0] ? asEntity(this.contactRepo!, existingMatches[0]) : undefined;
 
         const update = await discoverAndMergeKeys(this.dnsResolver!, addr, existingContact);
         if (!update) {

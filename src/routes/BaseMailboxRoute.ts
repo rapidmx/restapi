@@ -24,7 +24,12 @@ import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { DEFAULT_MAILBOX_QUOTA_BYTES, findOrSeedMailboxPolicy } from "../util/MailboxPolicyUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { normalizeUserUid } from "../util/UserUidUtils.js";
+import { coerceDateFields } from "../util/DateCoercionUtils.js";
+import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 const { Auth, Delete, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
+
+/** Every top-level `Date` field of `Mailbox` a client writes - coerced on create/update (see `util/DateCoercionUtils.ts`). */
+const MAILBOX_DATE_FIELDS = ["oofStartTime", "oofEndTime"] as const;
 const { Config } = ObjectDecorators;
 
 /** `Mailbox` fields that only server-side code may set - the CA-issued `keys` (`BaseKeyVaultRoute.enrollKey()`/
@@ -381,7 +386,13 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
+        if (objs.some((o) => !o || typeof o !== "object" || Array.isArray(o))) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
         for (const o of objs) {
+            // `_id` would replace another mailbox's document on Mongo - see `util/RequestBodyUtils.ts`.
+            stripClientCreateFields(o);
+            coerceDateFields(o, MAILBOX_DATE_FIELDS);
             rejectServerManagedFields(o as Record<string, unknown>);
             // A brand-new mailbox always starts unscoped - assignment only ever happens afterward via
             // `update()`/`validateEscrowScopeAssignment()`, which also checks the referenced scope actually
@@ -546,6 +557,16 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // lazily provisioned on first actual use — see `findOrCreateWellKnownFolder`'s own doc comment —
         // only these five are load-bearing for the client to render anything at all, so only these five are
         // created eagerly here.
+        // `RepoUtils.create()` grants only a non-trusted creator; a mailbox an administrator creates for someone else
+        // would leave its owner with no access record at all.
+        if (isTrusted) {
+            for (const mailbox of created) {
+                if (mailbox.ownerUserUid) {
+                    await this.syncOwnerAcl(mailbox.uid, undefined, mailbox.ownerUserUid);
+                }
+            }
+        }
+
         const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
         for (const mailbox of created) {
             await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.INBOX, user);
@@ -601,6 +622,10 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     // `@Request` (argument 3) is added to what `CRUDRoute` already injects so `validateAliasChange()` can check a
     // self-service caller's usernames; the inherited `@Param("id")`/`@User` metadata is kept.
     protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser, @Request req?: HttpRequest): Promise<void> {
+        // `aliasAddresses.3`/`keys.0` would be Mongo update paths past every check below - see `util/RequestBodyUtils.ts`.
+        assertNoPathKeys(obj);
+        stripClientId(obj);
+        coerceDateFields(obj, MAILBOX_DATE_FIELDS);
         const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
         await this.validateEscrowScopeAssignment(id, obj, isTrusted);
         rejectServerManagedFields(obj);
@@ -749,6 +774,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * endpoint (renaming to an address already claimed by a `DistributionList`) caught that it didn't.
      */
     public async updateProperty(id: string, propertyName: string, obj: any, user?: JWTUser, @Request req?: HttpRequest): Promise<T> {
+        assertPlainPropertyName(propertyName);
         if (propertyName === "primarySmtpAddress") {
             const current: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
             if (!current) {
@@ -782,7 +808,83 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // a normalized alias list or owner uid, not the raw one.
         const patch: Record<string, any> = { [propertyName]: obj };
         await this.validateUpdate(id, patch as UpdateObject<T>, user, req);
-        return await this.doUpdateProperty(id, propertyName, patch[propertyName], { user });
+        const previousOwner: string | undefined = propertyName === "ownerUserUid" ? await this.ownerOf(id) : undefined;
+        const updated: T = await this.doUpdateProperty(id, propertyName, patch[propertyName], { user });
+        if (propertyName === "ownerUserUid") {
+            await this.syncOwnerAcl(updated.uid, previousOwner, updated.ownerUserUid);
+        }
+        return updated;
+    }
+
+    /** As `CRUDRoute.update()`, moving the owner's ACL record when the update changed `ownerUserUid`. */
+    public async update(id: string, obj: UpdateObject<T>, req: HttpRequest, user?: JWTUser): Promise<T> {
+        const ownerChange: boolean = Object.keys(Object(obj)).includes("ownerUserUid");
+        const previousOwner: string | undefined = ownerChange ? await this.ownerOf(id) : undefined;
+        const updated: T = await super.update(id, obj, req, user);
+        if (ownerChange) {
+            await this.syncOwnerAcl(updated.uid, previousOwner, updated.ownerUserUid);
+        }
+        return updated;
+    }
+
+    /** As `CRUDRoute.updateBulk()`, moving each changed owner's ACL record. */
+    public async updateBulk(obj: UpdateObject<T>[], req: HttpRequest, user?: JWTUser): Promise<T[]> {
+        const previousOwners: Map<string, string | undefined> = new Map();
+        for (const single of obj) {
+            if (Object.keys(Object(single)).includes("ownerUserUid")) {
+                previousOwners.set(String(single.uid), await this.ownerOf(String(single.uid)));
+            }
+        }
+        const updated: T[] = await super.updateBulk(obj, req, user);
+        for (const mailbox of updated) {
+            if (previousOwners.has(mailbox.uid)) {
+                await this.syncOwnerAcl(mailbox.uid, previousOwners.get(mailbox.uid), mailbox.ownerUserUid);
+            }
+        }
+        return updated;
+    }
+
+    private async ownerOf(id: string): Promise<string | undefined> {
+        const mailbox: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true, skipCache: true });
+        return mailbox?.ownerUserUid || undefined;
+    }
+
+    /**
+     * Keeps the mailbox's owner grant on its `AccessControlList` in step with `ownerUserUid`: removes `previousOwner`'s
+     * record and gives `newOwner` a `FULL` record (replacing any narrower one). A no-op when the owner didn't change
+     * (case-insensitive) or the mailbox has no ACL. Retried on a concurrent ACL save.
+     */
+    private async syncOwnerAcl(mailboxUid: string, previousOwner: string | undefined, newOwner: string | undefined): Promise<void> {
+        const previous: string | undefined = previousOwner?.toLowerCase();
+        const next: string | undefined = newOwner?.toLowerCase();
+        if (previous === next) {
+            return;
+        }
+        for (let attempt = 1; ; attempt++) {
+            const acl = await this.aclUtils!.findACL(mailboxUid, [], { skipCache: true });
+            /* v8 ignore if -- every mailbox is created with an ACL */
+            if (!acl) {
+                return;
+            }
+            const records = acl.records.filter((record) => {
+                const member: string = String(record.userOrRoleId).toLowerCase();
+                return member !== previous && member !== next;
+            });
+            if (newOwner) {
+                records.push({ userOrRoleId: newOwner, actions: [ACLAction.FULL] });
+            }
+            acl.records = records;
+            try {
+                await this.aclUtils!.saveACL(acl);
+                return;
+                /* v8 ignore start -- only a concurrent ACL write between the read and the save reaches here */
+            } catch (err) {
+                if (attempt >= 3) {
+                    throw err;
+                }
+            }
+            /* v8 ignore stop */
+        }
     }
 
     /**

@@ -13,6 +13,7 @@ const { Model } = RouteDecorators;
 export class TaskRouteSQL extends BaseScopedChildRoute<TaskSQL> {
     protected readonly repoUtilsClass: any = RecoverableRepoUtils;
     protected readonly scopeProperty: string = "folderUid";
+    protected readonly dateFields: readonly string[] = ["dueDate", "reminderDate"];
 
     /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `Task` carries its own
      * denormalized `mailboxUid` that must never diverge from its actual folder's mailbox. */

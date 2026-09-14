@@ -13,6 +13,8 @@ const { Model } = RouteDecorators;
 export class TaskRouteMongo extends BaseScopedChildRoute<TaskMongo> {
     protected readonly repoUtilsClass: any = RecoverableRepoUtils;
     protected readonly scopeProperty: string = "folderUid";
+    /** Stored as real `Date`s so due/reminder range queries match on Mongo (see `BaseScopedChildRoute.dateFields`). */
+    protected readonly dateFields: readonly string[] = ["dueDate", "reminderDate"];
 
     /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `Task` carries its own
      * denormalized `mailboxUid` that must never diverge from its actual folder's mailbox. */

@@ -190,6 +190,57 @@ describe("QuarantineRetentionJobSQL Tests (real DB + DI)", () => {
         expect(await blobStore.exists(pendingKey)).toBe(true);
     });
 
+    it("Purges old DELIVERED ingest entries and their unreferenced raw blobs, keeping recent, pending and held ones and still-referenced blobs.", async () => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const orphanKey = `ingest/${uuid.v4()}`;
+        const messageKey = `ingest/${uuid.v4()}`;
+        for (const key of [orphanKey, messageKey]) {
+            await blobStore.put(key, Buffer.from("raw"));
+        }
+        const heldMailboxUid = uuid.v4();
+        await matterRepo.save(
+            new MatterSQL({ name: "Held", escrowScopeId: uuid.v4(), custodianMailboxUids: [heldMailboxUid], dateRangeStart: new Date("2000-01-01"), dateRangeEnd: new Date("2100-01-01") }),
+        );
+        const saveIngest = async (rawBlobKey: string, status: IngestStatus, ageDays: number, mailboxUid: string = uuid.v4()) => {
+            const row = await ingestQueueEntryRepo.save(
+                new IngestQueueEntrySQL({ mailboxUid, envelopeFrom: "a@example.com", envelopeTo: ["b@example.com"], rawBlobKey, status }),
+            );
+            await ingestQueueEntryRepo.update({ uid: row.uid }, { dateModified: new Date(Date.now() - ageDays * DAY_MS) });
+            return row;
+        };
+        const orphaned = await saveIngest(orphanKey, IngestStatus.DELIVERED, RETENTION_DAYS + 5);
+        const delivered = await saveIngest(messageKey, IngestStatus.DELIVERED, RETENTION_DAYS + 5);
+        await messageRepo.save(
+            new MessageSQL({
+                mailboxUid: delivered.mailboxUid,
+                folderUid: uuid.v4(),
+                messageId: "m@example.com",
+                subject: "Hi",
+                from: { address: "a@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date(),
+                receivedDate: new Date(),
+                bodyBlobKey: messageKey,
+                flags: { read: false, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: false,
+            }),
+        );
+        const recent = await saveIngest(`ingest/${uuid.v4()}`, IngestStatus.DELIVERED, 1);
+        const pending = await saveIngest(`ingest/${uuid.v4()}`, IngestStatus.PENDING, RETENTION_DAYS + 5);
+        const held = await saveIngest(`ingest/${uuid.v4()}`, IngestStatus.DELIVERED, RETENTION_DAYS + 5, heldMailboxUid);
+
+        await job.run();
+
+        expect(await ingestQueueEntryRepo.findOne({ where: { uid: orphaned.uid } })).toBeNull();
+        expect(await ingestQueueEntryRepo.findOne({ where: { uid: delivered.uid } })).toBeNull();
+        expect(await blobStore.exists(orphanKey)).toBe(false);
+        expect(await blobStore.exists(messageKey)).toBe(true);
+        for (const kept of [recent, pending, held]) {
+            expect(await ingestQueueEntryRepo.findOne({ where: { uid: kept.uid } })).not.toBeNull();
+        }
+    });
+
     it("Keeps an expired entry whose mailbox is under an open legal hold.", async () => {
         const entry = await createEntry({ dateCreated: new Date(Date.now() - (RETENTION_DAYS + 5) * DAY_MS) });
         await matterRepo.save(
@@ -225,6 +276,53 @@ describe("QuarantineRetentionJobSQL Tests (real DB + DI)", () => {
 
         const remaining = await quarantineEntryRepo.find({ where: { uid: In(entries.map((e) => e.uid)) } });
         expect(remaining.length).toBe(1);
+    });
+
+    it("Logs and continues past a delivered ingest entry whose delete throws, and one whose raw blob cleanup throws.", async () => {
+        // As the quarantine-entry variant below: faults injected at the job's own `RepoUtils.delete()` and blob store
+        // calls for the "bad" rows only; every other call goes to the real database/blob store.
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const saveOldDelivered = async () => {
+            const rawBlobKey = `ingest/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, Buffer.from("raw"));
+            const row = await ingestQueueEntryRepo.save(
+                new IngestQueueEntrySQL({ mailboxUid: uuid.v4(), envelopeFrom: "a@example.com", envelopeTo: ["b@example.com"], rawBlobKey, status: IngestStatus.DELIVERED }),
+            );
+            await ingestQueueEntryRepo.update({ uid: row.uid }, { dateModified: new Date(Date.now() - (RETENTION_DAYS + 5) * DAY_MS) });
+            return row;
+        };
+        const undeletable = await saveOldDelivered();
+        const blobFails = await saveOldDelivered();
+        const good = await saveOldDelivered();
+
+        const repoUtils = (job as any).ingestQueueEntryRepo;
+        const originalDelete = repoUtils.delete.bind(repoUtils);
+        vi.spyOn(repoUtils, "delete").mockImplementation(async (uid: any, opts: any) => {
+            if (uid === undeletable.uid) {
+                throw new Error("simulated database failure");
+            }
+            return originalDelete(uid, opts);
+        });
+        const originalBlobDelete = blobStore.delete.bind(blobStore);
+        vi.spyOn(blobStore, "delete").mockImplementation(async (key: string) => {
+            if (key === blobFails.rawBlobKey) {
+                throw new Error("simulated blob store failure");
+            }
+            return originalBlobDelete(key);
+        });
+        const warn = vi.spyOn((job as any).logger, "warn");
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        expect(await ingestQueueEntryRepo.findOne({ where: { uid: undeletable.uid } })).not.toBeNull();
+        expect(await blobStore.exists(undeletable.rawBlobKey)).toBe(true);
+        expect(await ingestQueueEntryRepo.findOne({ where: { uid: blobFails.uid } })).toBeNull();
+        expect(await blobStore.exists(blobFails.rawBlobKey)).toBe(true);
+        expect(await ingestQueueEntryRepo.findOne({ where: { uid: good.uid } })).toBeNull();
+        expect(await blobStore.exists(good.rawBlobKey)).toBe(false);
+        const messages: string[] = warn.mock.calls.map((call: any[]) => String(call[0]));
+        expect(messages.some((m) => m.includes(`failed to purge delivered ingest entry ${undeletable.uid}`))).toBe(true);
+        expect(messages.some((m) => m.includes(`failed to clean up the raw blob of delivered ingest entry ${blobFails.uid}`))).toBe(true);
     });
 
     it("Logs a warning and continues purging subsequent entries when one delete throws.", async () => {

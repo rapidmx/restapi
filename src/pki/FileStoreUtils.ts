@@ -51,8 +51,79 @@ export function lockKeyForPath(filePath: string): string {
     return path.resolve(filePath);
 }
 
+/** Temp files older than this are considered abandoned (a crash between write and rename/link) - see
+ * `sweepStaleTempFiles()`. Far longer than any legitimate write takes, so another live process's in-flight temp
+ * file is never removed. */
+export const STALE_TEMP_FILE_AGE_MS = 60 * 60 * 1000;
+
+/** Matches the temp names `writeTempFile()` generates: `<name>.<pid>.<uuid>.tmp`. */
+const TEMP_FILE_PATTERN = /\.\d+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/i;
+
+/** Directories already swept by this process - see `sweepStaleTempFilesOnce()`. */
+const sweptDirectories: Set<string> = new Set();
+
+/**
+ * Best-effort removal of abandoned `writeTempFile()` temp files in `dir` whose mtime is older than `maxAgeMs`.
+ * Never throws; returns how many were removed.
+ */
+export async function sweepStaleTempFiles(dir: string, maxAgeMs: number = STALE_TEMP_FILE_AGE_MS): Promise<number> {
+    let removed = 0;
+    let names: string[];
+    try {
+        names = await fs.readdir(dir);
+    } catch {
+        return 0;
+    }
+    const cutoff: number = Date.now() - maxAgeMs;
+    for (const name of names) {
+        if (!TEMP_FILE_PATTERN.test(name)) {
+            continue;
+        }
+        const tempPath: string = path.join(dir, name);
+        try {
+            const stat = await fs.stat(tempPath);
+            if (stat.isFile() && stat.mtimeMs < cutoff) {
+                await fs.rm(tempPath, { force: true });
+                removed++;
+            }
+        } catch {
+            // Raced with another sweeper/writer, or unreadable - leave it.
+        }
+    }
+    return removed;
+}
+
+/** Sweeps `dir` for stale temp files on this process's first write into it. */
+async function sweepStaleTempFilesOnce(dir: string): Promise<void> {
+    const key: string = path.resolve(dir);
+    if (sweptDirectories.has(key)) {
+        return;
+    }
+    sweptDirectories.add(key);
+    await sweepStaleTempFiles(key);
+}
+
+/**
+ * Best-effort `fsync()` of a directory, so a just-completed `rename()`/`link()` inside it survives a power loss.
+ * Never throws: platforms that can't fsync a directory (Windows reports `EPERM`/`EISDIR`, some filesystems
+ * `EINVAL`) simply keep the weaker guarantee.
+ */
+export async function fsyncDirectory(dir: string): Promise<void> {
+    try {
+        const handle: fs.FileHandle = await fs.open(dir, "r");
+        try {
+            await handle.sync();
+        } finally {
+            await handle.close();
+        }
+    } catch {
+        // Best-effort only - see above.
+    }
+}
+
 /** Writes `data` to a fresh, uniquely-named temp file next to `filePath` and fsyncs it. */
 async function writeTempFile(filePath: string, data: string | Buffer, mode: number): Promise<string> {
+    await sweepStaleTempFilesOnce(path.dirname(filePath));
     const tempPath: string = `${filePath}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`;
     const handle = await fs.open(tempPath, "wx", mode);
     try {
@@ -66,7 +137,7 @@ async function writeTempFile(filePath: string, data: string | Buffer, mode: numb
 
 /**
  * Atomically replaces (or creates) `filePath` with `data`: write a temp file in the same directory, then
- * `rename()` it over the target. Creates the parent directory (`dirMode` only applies on first creation).
+ * `rename()` it over the target, then (best-effort) fsync the directory so the rename itself is durable. Creates the parent directory (`dirMode` only applies on first creation).
  */
 export async function writeFileAtomic(filePath: string, data: string | Buffer, mode: number, dirMode: number = 0o700): Promise<void> {
     await fs.mkdir(path.dirname(filePath), { recursive: true, mode: dirMode });
@@ -77,6 +148,7 @@ export async function writeFileAtomic(filePath: string, data: string | Buffer, m
         await fs.rm(tempPath, { force: true });
         throw err;
     }
+    await fsyncDirectory(path.dirname(filePath));
 }
 
 /**
@@ -91,6 +163,7 @@ export async function createFileExclusive(filePath: string, data: string | Buffe
     const tempPath: string = await writeTempFile(filePath, data, mode);
     try {
         await fs.link(tempPath, filePath);
+        await fsyncDirectory(path.dirname(filePath));
         return true;
     } catch (err: any) {
         if (err.code === "EEXIST") {

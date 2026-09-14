@@ -5,6 +5,7 @@
 import * as crypto from "crypto";
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ExtractorRegistry } from "../search/extraction/ExtractorRegistry.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
@@ -13,6 +14,9 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** The longest error message persisted onto `Attachment.extractionError`. */
 const MAX_ERROR_LENGTH = 1000;
+
+/** How many times a message's re-index invalidation is retried on a version conflict. */
+const MAX_INVALIDATE_ATTEMPTS = 3;
 
 /**
  * Runs `ExtractorRegistry` (PDF/DOCX/plain-text/HTML text extraction) over `Attachment` records that haven't
@@ -24,7 +28,8 @@ const MAX_ERROR_LENGTH = 1000;
  * found (an empty-content blob) — this is what marks an attachment as "already attempted" so an unsupported
  * MIME type (e.g. an image) isn't re-selected by this job forever. When extraction *does* produce non-empty
  * text for an attachment whose parent `Message` was already search-indexed, this job clears that message's
- * `searchIndexedAt` back to `undefined` so `SearchIndexJob` re-indexes it with the newly available text.
+ * `searchIndexedAt` back to `undefined` so `SearchIndexJob` re-indexes it with the newly available text (see
+ * `invalidateSearchIndex()` for how the race with an in-flight `SearchIndexJob` run is closed).
  *
  * An attachment whose processing throws (e.g. a transient blob-store failure, or a malformed file that crashes
  * its extractor every time) is retried with exponential backoff (`extractionAttempts`/`extractionNextAttemptAt`,
@@ -152,7 +157,7 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
                     extractionNextAttemptAt: exhausted ? null : new Date(Date.now() + delayMs),
                     extractionError: reason.slice(0, MAX_ERROR_LENGTH),
                 } as any,
-                attachment,
+                asEntity(this.attachmentRepo!, attachment),
                 { ignoreACL: true },
             );
         } catch (err: any) {
@@ -208,29 +213,74 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
             attachmentUpdate.extractionNextAttemptAt = null;
             attachmentUpdate.extractionError = null;
         }
-        await this.attachmentRepo!.update(attachmentUpdate, attachment, { ignoreACL: true });
+        // `asEntity()`: Mongo `find()` returns plain documents, for which `update()` is unversioned - two
+        // overlapping runs could otherwise both stamp the attachment (one orphaning its extracted-text blob).
+        try {
+            await this.attachmentRepo!.update(attachmentUpdate, asEntity(this.attachmentRepo!, attachment), { ignoreACL: true });
+        } catch (err) {
+            // Lost the race (or the write failed) - nothing references this run's text blob, so don't leak it.
+            await this.blobStore!.delete(extractedTextBlobKey).catch(() => undefined);
+            throw err;
+        }
 
-        if (text && text.length > 0 && message?.searchIndexedAt) {
-            // Explicit `null`, not `undefined`: TypeORM's `Repository.update()` silently drops any property
-            // whose value is `undefined` from its generated `SET` clause, so on the SQL backend an
-            // `undefined` here would leave the persisted `searchIndexedAt` completely untouched (still
-            // reporting "already indexed") - a real, confirmed cross-backend bug caught by real-database
-            // testing. MongoDB's own `updateOne($set: ...)` happens to coerce either value to `null`
-            // equivalently, so `null` is correct there too.
-            //
-            // `SearchIndexJob`'s own retry bookkeeping is reset too, so the re-index gets a full set of attempts.
-            await this.messageRepo!.update(
-                {
-                    uid: message.uid,
-                    version: (message as any).version,
-                    searchIndexedAt: null,
-                    searchIndexAttempts: null,
-                    searchIndexNextAttemptAt: null,
-                    searchIndexError: null,
-                } as any,
-                message,
-                { ignoreACL: true, skipPush: true },
-            );
+        if (text && text.length > 0 && message) {
+            await this.invalidateSearchIndex(message.uid);
+        }
+    }
+
+    /**
+     * Marks the message for re-indexing, now that one of its attachments has extractable text, if it has already been
+     * search-indexed.
+     *
+     * The message is RE-READ here, after the attachment's `extractedTextBlobKey` was committed, rather than trusting
+     * the copy read before extraction: a `SearchIndexJob` run could have indexed and stamped it (without this text)
+     * in between, and the stale copy would still say "not indexed". Paired with `SearchIndexJob`'s own post-stamp
+     * re-check of the message's extracted attachments, this closes the race from both sides: whichever of the two
+     * commits last sees the other's write. A message that is still unindexed is left untouched - `SearchIndexJob`
+     * will pick up the text when it indexes it.
+     *
+     * Version-checked (`asEntity()`), re-reading and retrying on a conflict (e.g. a concurrent flag change), so a
+     * concurrent edit is neither clobbered nor allowed to swallow the invalidation.
+     */
+    private async invalidateSearchIndex(messageUid: string): Promise<void> {
+        for (let attempt = 0; attempt < MAX_INVALIDATE_ATTEMPTS; attempt++) {
+            let current: M | undefined;
+            try {
+                current = await this.messageRepo!.findOne(messageUid, { ignoreACL: true, includeDeleted: true, skipCache: true });
+            } catch (err: any) {
+                this.logger?.warn(`AttachmentExtractionJob: failed to re-read message ${messageUid} for re-indexing: ${err?.message}`);
+                return;
+            }
+            if (!current?.searchIndexedAt) {
+                return;
+            }
+            try {
+                // Explicit `null`, not `undefined`: TypeORM's `Repository.update()` silently drops any property
+                // whose value is `undefined` from its generated `SET` clause, so on the SQL backend an
+                // `undefined` here would leave the persisted `searchIndexedAt` completely untouched (still
+                // reporting "already indexed") - a real, confirmed cross-backend bug caught by real-database
+                // testing. MongoDB's own `updateOne($set: ...)` happens to coerce either value to `null`
+                // equivalently, so `null` is correct there too.
+                //
+                // `SearchIndexJob`'s own retry bookkeeping is reset too, so the re-index gets a full set of attempts.
+                await this.messageRepo!.update(
+                    {
+                        uid: current.uid,
+                        version: (current as any).version,
+                        searchIndexedAt: null,
+                        searchIndexAttempts: null,
+                        searchIndexNextAttemptAt: null,
+                        searchIndexError: null,
+                    } as any,
+                    asEntity(this.messageRepo!, current),
+                    { ignoreACL: true, skipPush: true },
+                );
+                return;
+            } catch (err: any) {
+                if (attempt === MAX_INVALIDATE_ATTEMPTS - 1) {
+                    this.logger?.warn(`AttachmentExtractionJob: failed to mark message ${messageUid} for re-indexing: ${err?.message}`);
+                }
+            }
         }
     }
 }

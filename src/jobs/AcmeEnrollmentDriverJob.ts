@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { asEntity } from "../util/EntityUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { publicKeyFromCertificatePem } from "../util/CertificateInstallUtils.js";
 import { AuditAction, KeyVault, Mailbox, PublicKey, WrappedPrivateKey } from "../models/types.js";
@@ -206,7 +207,7 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
             const keyVault: K = current
                 ? await this.keyVaultRepo!.update(
                       { uid: current.uid, version: (current as any).version, wrappedKeys: [...(current.wrappedKeys ?? []), wrappedKey] } as any,
-                      current,
+                      asEntity(this.keyVaultRepo!, current),
                       { ignoreACL: true },
                   )
                 : await this.keyVaultRepo!.create(new this.keyVaultClass({ mailboxUid: found.uid, wrappedKeys: [wrappedKey] }), {
@@ -219,7 +220,7 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
             const mailbox: MB = (await this.mailboxRepo!.findOne(found.uid, { ignoreACL: true })) ?? found;
             await this.mailboxRepo!.update(
                 { uid: mailbox.uid, version: (mailbox as any).version, keys: [...(mailbox.keys ?? []), publicKey] } as any,
-                mailbox,
+                asEntity(this.mailboxRepo!, mailbox),
                 { ignoreACL: true },
             );
         }
@@ -277,7 +278,7 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
                 // preferable to the reverse order, where a failing marker write would re-audit on every run.
                 await this.keyVaultRepo!.update(
                     { uid: keyVault.uid, version: (keyVault as any).version, expiryAuditedFingerprint: newest.fingerprint } as any,
-                    keyVault,
+                    asEntity(this.keyVaultRepo!, keyVault),
                     { ignoreACL: true },
                 );
                 await recordAuditLog(

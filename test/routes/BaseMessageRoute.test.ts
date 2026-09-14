@@ -39,7 +39,7 @@ describe("BaseMessageRoute Tests (dependency guard clause only)", () => {
         const route = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
         const req: any = {};
 
-        await expect(route.send("msg-1", req, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
+        await expect(route.send("msg-1", undefined, req, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
     });
 
     it("recall() throws INTERNAL_ERROR when repoUtils/mailTransport are not set.", async () => {

@@ -66,6 +66,94 @@ describe("parseAuthenticationResults() Tests", () => {
         expect(result[0].result).toBe("pass");
         expect(result[0].properties["header.d"]).toBe("Example.COM");
     });
+
+    describe("RFC 8601 comments and quoted strings", () => {
+        it("Ignores a comment that contains a forged 'dkim=pass' result.", () => {
+            const result = parseAuthenticationResults("mx.example.com; dkim=fail (dkim=pass header.d=example.com) header.d=example.com");
+            expect(result).toEqual([{ authservId: "mx.example.com", method: "dkim", result: "fail", properties: { "header.d": "example.com" } }]);
+        });
+
+        it("Ignores a comment containing ';', so it can't start a forged result segment.", () => {
+            const result = parseAuthenticationResults("mx.example.com; dkim=fail header.d=example.com (bad sig; dkim=pass header.d=example.com)");
+            expect(result).toHaveLength(1);
+            expect(result[0].result).toBe("fail");
+        });
+
+        it("Handles nested comments and escaped parentheses inside a comment.", () => {
+            const header = "mx.example.com; dkim=fail (outer (inner \\) still inner; dkim=pass header.d=example.com) still outer \\( ; dkim=pass) header.d=example.com";
+            const result = parseAuthenticationResults(header);
+            expect(result).toEqual([{ authservId: "mx.example.com", method: "dkim", result: "fail", properties: { "header.d": "example.com" } }]);
+        });
+
+        it("Treats an unterminated comment as running to the end of the value.", () => {
+            const result = parseAuthenticationResults("mx.example.com; dkim=fail (dkim=pass header.d=example.com; dkim=pass header.d=example.com");
+            expect(result).toEqual([{ authservId: "mx.example.com", method: "dkim", result: "fail", properties: {} }]);
+        });
+
+        it("Strips a comment from the authserv-id segment (including a ';' inside it).", () => {
+            const result = parseAuthenticationResults("mx.example.com (trusted; dkim=pass header.d=example.com); dkim=fail header.d=example.com");
+            expect(result).toEqual([{ authservId: "mx.example.com", method: "dkim", result: "fail", properties: { "header.d": "example.com" } }]);
+        });
+
+        it("A comment before the authserv-id is not mistaken for it.", () => {
+            const result = parseAuthenticationResults("(mx.example.com) evil.example; dkim=pass header.d=example.com");
+            expect(result[0].authservId).toBe("evil.example");
+            expect(hasAlignedPassingDkim("(mx.example.com) evil.example; dkim=pass header.d=example.com", "example.com", "mx.example.com")).toBe(false);
+        });
+
+        it("Keeps a quoted value containing ';' and whitespace intact rather than splitting on it.", () => {
+            const header = 'mx.example.com; dkim=fail reason="bad; dkim=pass header.d=example.com" header.d=evil.com header.s=sel';
+            const result = parseAuthenticationResults(header);
+            expect(result).toEqual([
+                {
+                    authservId: "mx.example.com",
+                    method: "dkim",
+                    result: "fail",
+                    properties: { reason: "bad; dkim=pass header.d=example.com", "header.d": "evil.com", "header.s": "sel" },
+                },
+            ]);
+            expect(hasAlignedPassingDkim(header, "example.com", "mx.example.com")).toBe(false);
+        });
+
+        it("Doesn't treat parentheses inside a quoted string as a comment.", () => {
+            const result = parseAuthenticationResults('mx.example.com; dkim=pass reason="looks (like a" header.d=example.com');
+            expect(result[0].properties).toEqual({ reason: "looks (like a", "header.d": "example.com" });
+        });
+
+        it("Resolves backslash escapes inside a quoted string, including an escaped quote.", () => {
+            const result = parseAuthenticationResults('mx.example.com; dkim=pass reason="say \\"hi\\"; ok" header.d=example.com');
+            expect(result[0].properties).toEqual({ reason: 'say "hi"; ok', "header.d": "example.com" });
+        });
+
+        it("Accepts whitespace/comments around '=', an authserv-id version, and a method version.", () => {
+            const header = "mx.example.com 1; dkim/1 = pass header.d (signing domain) = example.com";
+            const result = parseAuthenticationResults(header);
+            expect(result).toEqual([{ authservId: "mx.example.com", method: "dkim", result: "pass", properties: { "header.d": "example.com" } }]);
+            expect(hasAlignedPassingDkim(header, "example.com", "mx.example.com")).toBe(true);
+        });
+
+        it("Allows a comment directly after '=' (key=(comment)value).", () => {
+            const result = parseAuthenticationResults("mx.example.com; dkim=pass header.s=(selector)sel1 header.d=example.com");
+            expect(result[0].properties).toEqual({ "header.s": "sel1", "header.d": "example.com" });
+        });
+
+        it("Never throws on malformed '=' placement or unterminated quoted strings.", () => {
+            const stray = parseAuthenticationResults("mx.example.com; =pass; dkim=pass header.d=example.com =oops");
+            expect(stray.find((entry) => entry.method === "dkim")!.properties["header.d"]).toBe("example.com");
+
+            expect(parseAuthenticationResults('mx.example.com; dkim=pass header.d="example.com')[0].properties["header.d"]).toBe("example.com");
+            expect(parseAuthenticationResults('mx.example.com; dkim=pass header.d="')[0].properties["header.d"]).toBe("");
+        });
+
+        it("Skips a non-string entry in an array of header values.", () => {
+            const result = parseAuthenticationResults([undefined as unknown as string, "mx.example.com; dkim=pass header.d=example.com"]);
+            expect(result).toHaveLength(1);
+        });
+
+        it("Accepts a quoted authserv-id.", () => {
+            expect(parseAuthenticationResults('"mx.example.com"; dkim=pass header.d=example.com')[0].authservId).toBe("mx.example.com");
+        });
+    });
 });
 
 describe("hasAlignedPassingDkim() Tests", () => {

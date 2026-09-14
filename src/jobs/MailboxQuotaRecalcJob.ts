@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, BaseEntity, ObjectFactory, RepoUtils, SimpleEntity } from "@rapidrest/service-core";
+import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { Attachment, Mailbox, Message } from "../models/types.js";
@@ -189,7 +190,7 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
             const current: MB = (await this.mailboxRepo!.findOne(mailbox.uid, { ignoreACL: true })) ?? mailbox;
             await this.mailboxRepo!.update(
                 { uid: current.uid, version: (current as any).version, usedBytes } as any,
-                current,
+                asEntity(this.mailboxRepo!, current),
                 { ignoreACL: true, skipPush: true },
             );
         }

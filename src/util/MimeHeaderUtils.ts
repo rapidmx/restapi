@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 
+import addressparser from "nodemailer/lib/addressparser/index.js";
+
 /**
  * Shared low-level RFC 5322 header-block primitives - a small line-scan, deliberately not a full MIME
  * parse (see `BaseMailIngestRoute`'s "minimum synchronous work" design). Used by both
@@ -84,6 +86,117 @@ export function extractHeaders(raw: Buffer, name: string): string[] {
         }
     }
     return values;
+}
+
+/**
+ * Strips quoted strings and (nested) comments out of a structured header value, so what is left is only the part a
+ * mail client would interpret as address syntax. An unterminated quote/comment swallows the rest of the value.
+ */
+function stripQuotedStringsAndComments(value: string): string {
+    let result: string = "";
+    let inQuote: boolean = false;
+    let commentDepth: number = 0;
+    for (let i = 0; i < value.length; i++) {
+        const ch: string = value[i];
+        if (ch === "\\" && (inQuote || commentDepth > 0)) {
+            i++;
+            continue;
+        }
+        if (inQuote) {
+            if (ch === '"') {
+                inQuote = false;
+                result += " ";
+            }
+            continue;
+        }
+        if (ch === "(") {
+            commentDepth++;
+            continue;
+        }
+        if (commentDepth > 0) {
+            if (ch === ")") {
+                commentDepth--;
+                if (commentDepth === 0) {
+                    result += " ";
+                }
+            }
+            continue;
+        }
+        if (ch === '"') {
+            inQuote = true;
+            continue;
+        }
+        result += ch;
+    }
+    return result;
+}
+
+/**
+ * Refuses a raw RFC 5322 message whose originator headers name anyone other than an allowed sender. Every `From`
+ * and `Sender` header in the top-level header block is checked - header names case-insensitively (including the
+ * obsolete `From :` form with whitespace before the colon), folded values unfolded, and a bare CR treated as a line
+ * break too, so a header can't be hidden from this scan behind a line ending another parser would honor. Returns a
+ * refusal reason, or `undefined` if the message passes. Fails closed on:
+ * - no `From` header, more than one `From` header, or more than one `Sender` header;
+ * - a `From`/`Sender` value that yields no address at all (e.g. only an empty group);
+ * - any parsed entry without an address (a malformed list, e.g. an unquoted display name containing a comma);
+ * - any parsed address - group members included - that `isAllowed` rejects;
+ * - any addr-spec-looking token outside quoted strings/comments that `isAllowed` rejects - covers the tolerant
+ * parser recovering `<me@example.com> <other@example.com>` as one mailbox with the second as its "display name".
+ *
+ * Quoted display names and RFC 2047 encoded words are never treated as addresses. `isAllowed` receives each address
+ * exactly as parsed; normalize (e.g. lowercase) inside it.
+ */
+export function checkOriginatorHeaders(raw: Buffer, isAllowed: (address: string) => boolean): string | undefined {
+    const { headerText } = splitRawIntoHeaderAndBody(raw);
+    const logical: string[] = [];
+    for (const line of headerText.split(/\r\n|\n|\r/)) {
+        if (/^[ \t]/.test(line) && logical.length > 0) {
+            logical[logical.length - 1] += " " + line.trim();
+        } else if (line.length > 0) {
+            logical.push(line);
+        }
+    }
+
+    const values: { from: string[]; sender: string[] } = { from: [], sender: [] };
+    for (const line of logical) {
+        const match: RegExpMatchArray | null = line.match(/^(from|sender)[ \t]*:(.*)$/i);
+        if (match) {
+            values[match[1].toLowerCase() as "from" | "sender"].push(match[2].trim());
+        }
+    }
+    if (values.from.length === 0) {
+        return "The message has no From header.";
+    }
+    if (values.from.length > 1) {
+        return "The message has more than one From header.";
+    }
+    if (values.sender.length > 1) {
+        return "The message has more than one Sender header.";
+    }
+
+    const refusal = (name: string): string => `The ${name} header names an address that is not one of the sending mailbox's own addresses.`;
+    for (const [name, headerValues] of [
+        ["From", values.from],
+        ["Sender", values.sender],
+    ] as [string, string[]][]) {
+        for (const value of headerValues) {
+            const parsed: { address?: string }[] = addressparser(value, { flatten: true });
+            if (parsed.length === 0) {
+                return `The ${name} header contains no address.`;
+            }
+            if (parsed.some((entry) => !entry.address || !isAllowed(entry.address))) {
+                return refusal(name);
+            }
+            const tokens: string[] = stripQuotedStringsAndComments(value)
+                .split(/[\s<>,;:]+/)
+                .filter((token) => token.includes("@"));
+            if (tokens.some((token) => !isAllowed(token))) {
+                return refusal(name);
+            }
+        }
+    }
+    return undefined;
 }
 
 /**

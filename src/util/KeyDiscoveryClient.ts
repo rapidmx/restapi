@@ -223,11 +223,47 @@ const MAX_RESPONSE_BYTES = 1_000_000;
  * `fetchRemoteKeys()`'s `redirect: "error"` provide today.
  */
 function isSafeDiscoveryHost(host: string): boolean {
-    const withoutPort: string = host.split(":")[0];
+    const parts: string[] = host.split(":");
+    if (parts.length > 2) {
+        // More than one `:` - an IPv6 literal or garbage, never a `hostname[:port]`.
+        return false;
+    }
+    const [withoutPort, port] = parts;
+    if (port !== undefined && (!/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535)) {
+        return false;
+    }
     if (net.isIP(withoutPort) !== 0) {
         return false;
     }
-    return HOSTNAME_PATTERN.test(host);
+    return HOSTNAME_PATTERN.test(withoutPort);
+}
+
+/** An email address split into its local part and (lowercased) domain - see `parseKeyDiscoveryAddress()`. */
+export interface KeyDiscoveryAddressParts {
+    localPart: string;
+    domain: string;
+}
+
+/**
+ * The single address parser shared by key discovery (`fetchRemoteKeys()`) and its caller
+ * (`KeyringUtils.discoverAndMergeKeys()`), so the domain whose `_rapidmx` policy is resolved is always the same
+ * domain the keys are then requested for. Returns `undefined` for an address with no `@`, more than one `@`, an empty
+ * local part, or a domain that isn't a syntactically valid hostname (no port).
+ */
+export function parseKeyDiscoveryAddress(address: string): KeyDiscoveryAddressParts | undefined {
+    if (typeof address !== "string") {
+        return undefined;
+    }
+    const parts: string[] = address.split("@");
+    if (parts.length !== 2) {
+        return undefined;
+    }
+    const [localPart, rawDomain] = parts;
+    const domain: string = rawDomain.toLowerCase();
+    if (!localPart || !HOSTNAME_PATTERN.test(domain)) {
+        return undefined;
+    }
+    return { localPart, domain };
 }
 
 /**
@@ -266,7 +302,7 @@ async function readBoundedJson(response: Response, maxBytes: number): Promise<un
 /**
  * Fetches `address`'s published keys/preference from `host`'s discovery endpoint
  * (`GET https://<host>/.well-known/rapidmx/keys/<hash>?domain=<domain>`), honoring `ETag`/`Cache-Control` per
- * the spec. `domain` (lowercased, the part of `address` after its last `@`) disambiguates a multi-domain peer
+ * the spec. `domain` (lowercased, the part of `address` after its `@` - see `parseKeyDiscoveryAddress()`) disambiguates a multi-domain peer
  * where two addresses share a local part - `BaseKeyDiscoveryRoute` matches on it, falling back to the request
  * `Host` for an older client that doesn't send it. The body is structurally validated
  * (`parseKeyDiscoveryResponse()`) before it is ever cached or returned.
@@ -297,16 +333,19 @@ export async function fetchRemoteKeys(
     address: string,
     options: FetchRemoteKeysOptions = {},
 ): Promise<KeyDiscoveryResponse | undefined> {
-    const atIndex: number = address.lastIndexOf("@");
-    const localPart: string = atIndex === -1 ? address : address.slice(0, atIndex);
-    const domain: string = atIndex === -1 ? "" : address.slice(atIndex + 1).toLowerCase();
+    const parsed: KeyDiscoveryAddressParts | undefined = parseKeyDiscoveryAddress(address);
+    if (!parsed) {
+        // Nothing could ever have been fetched (and so cached) for an unparseable address.
+        return undefined;
+    }
+    const { localPart, domain } = parsed;
     const hash: string = computeKeyDiscoveryHash(localPart);
     // The domain is part of both the cache key and the request: `hash` covers the local part only, so on a
     // multi-domain peer `ceo@acme.com` and `ceo@contoso.com` share a hash and must never share a cache entry.
     const cacheKey: string = `${CACHE_KEY_PREFIX}${host.toLowerCase()}:${domain}:${hash}`;
     const cached: CachedKeyDiscoveryResult | undefined = (await keyCache.load(cacheKey)) as CachedKeyDiscoveryResult | undefined;
 
-    if (!isSafeDiscoveryHost(host) || !HOSTNAME_PATTERN.test(domain)) {
+    if (!isSafeDiscoveryHost(host)) {
         return cached?.response;
     }
 

@@ -487,4 +487,133 @@ describe("MeetingSchedulingJobSQL Tests (real DB + DI)", () => {
             expect(updated.inviteSequenceSent).toBe(0);
         });
     });
+
+    describe("Attendee copies edited/deleted by a client, and batch starvation", () => {
+        const transport = (): RecordingMailTransport => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const remoteOrganizer = { address: "someone@remote.example", displayName: "Remote", type: RecipientType.TO };
+        // What an ActiveSync/MAPI client's delete/edit of a synced row amounts to at the storage level.
+        const clientEdit = async (uid: string, changes: Record<string, any>): Promise<void> => {
+            await calendarEventRepo.update({ uid }, { ...changes, dateModified: new Date() });
+            await calendarEventRepo.increment({ uid }, "version", 1);
+        };
+        const softDelete = async (uid: string): Promise<void> => await clientEdit(uid, { deleted: true });
+        const withBatching = async (batchSize: number, maxPages: number, fn: () => Promise<void>): Promise<void> => {
+            const original = { batchSize: (job as any).batchSize, maxPages: (job as any).maxPages };
+            (job as any).batchSize = batchSize;
+            (job as any).maxPages = maxPages;
+            try {
+                await fn();
+            } finally {
+                Object.assign(job as any, original);
+            }
+        };
+
+        it("Sends no CANCEL when a client deletes an attendee copy of someone else's meeting, but stamps cancelNoticeSentAt.", async () => {
+            // As ScanQueueJob creates it on receipt of the invite: already marked as invited.
+            const event = await createEvent({ organizer: remoteOrganizer, inviteSequenceSent: 0, sequence: 0 });
+            await softDelete(event.uid);
+
+            await job.run();
+
+            expect(transport().sent.length).toBe(0);
+            const updated: any = await reload(event.uid);
+            expect(updated.cancelNoticeSentAt).toBeTruthy();
+        });
+
+        it("Sends no REQUEST when a client edits an attendee copy (bumping sequence), but stamps inviteSequenceSent.", async () => {
+            const event = await createEvent({ organizer: remoteOrganizer, inviteSequenceSent: 0, sequence: 0 });
+            await job.run();
+            await clientEdit(event.uid, { sequence: 1, title: "Edited locally" });
+
+            await job.run();
+
+            expect(transport().sent.length).toBe(0);
+            expect((await reload(event.uid))!.inviteSequenceSent).toBe(1);
+        });
+
+        it("Sends only from the organizer's own copy when both it and a local attendee's copy of the same meeting are edited and deleted.", async () => {
+            const icalUid = uuid.v4();
+            // A local attendee's copy lives in a mailbox that doesn't own organizer@example.com.
+            const attendeeCopy = await createEvent({ icalUid, mailboxUid: aliasMailboxUid, inviteSequenceSent: 0, sequence: 0 });
+            const organizerCopy = await createEvent({ icalUid, inviteSequenceSent: 0, sequence: 0 });
+            await clientEdit(attendeeCopy.uid, { sequence: 1 });
+            await clientEdit(organizerCopy.uid, { sequence: 1 });
+
+            await job.run();
+            expect(transport().sent.length).toBe(1);
+            expect(transport().sent[0].raw.toString()).toContain("METHOD:REQUEST");
+
+            transport().sent = [];
+            await softDelete(attendeeCopy.uid);
+            await job.run();
+            expect(transport().sent.length).toBe(0);
+        });
+
+        it("Stamps attendee-less cancelled rows so they can't starve a real cancellation behind them.", async () => {
+            await withBatching(3, 10, async () => {
+                const old = new Date(Date.now() - 60 * 60 * 1000);
+                const empties: any[] = [];
+                for (let i = 0; i < 5; i++) {
+                    empties.push(await createEvent({ attendees: [], status: CalendarEventStatus.CANCELLED, dateModified: old }));
+                }
+                await createEvent({ status: CalendarEventStatus.CANCELLED });
+
+                await job.run();
+                await job.run();
+
+                expect(transport().sent.length).toBe(1);
+                expect(transport().sent[0].raw.toString()).toContain("METHOD:CANCEL");
+                for (const empty of empties) {
+                    expect((await reload(empty.uid))!.cancelNoticeSentAt).toBeTruthy();
+                }
+            });
+        });
+
+        it("A process's first run also catches up on invites for rows last modified before it started, without delaying new ones.", async () => {
+            await withBatching(2, 1, async () => {
+                (job as any).liveInviteCursor = undefined;
+                const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+                const stale: any[] = [];
+                for (let i = 0; i < 3; i++) {
+                    stale.push(await createEvent({ dateModified: old, attendees: [{ address: `old${i}@example.com`, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }] }));
+                }
+                expect(new Date((await reload(stale[0].uid))!.dateModified).getTime()).toBe(old.getTime());
+                await createEvent({ attendees: [{ address: "new@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }] });
+
+                await job.run();
+                expect(transport().sent.map((m) => m.envelopeTo[0])).toContain("new@example.com");
+                expect(transport().sent.length).toBe(3);
+                expect((job as any).catchUpInviteCursor).toBeDefined();
+
+                await job.run();
+                expect(transport().sent.map((m) => m.envelopeTo[0]).sort()).toEqual(["new@example.com", "old0@example.com", "old1@example.com", "old2@example.com"]);
+                expect((job as any).catchUpInviteCursor).toBeUndefined();
+            });
+        });
+
+        it("Sends every pending invite when more than batch_size need one - rows the job itself just stamped never block the rest.", async () => {
+            await withBatching(3, 1, async () => {
+                const pending: any[] = [];
+                for (let i = 0; i < 7; i++) {
+                    pending.push(await createEvent({ attendees: [{ address: `a${i}@example.com`, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }] }));
+                }
+
+                for (let i = 0; i < 4; i++) {
+                    await job.run();
+                }
+
+                expect(transport().sent.map((m) => m.envelopeTo[0]).sort()).toEqual(pending.map((_, i) => `a${i}@example.com`).sort());
+                for (const event of pending) {
+                    expect((await reload(event.uid))!.inviteSequenceSent).toBe(0);
+                }
+
+                // And a brand-new event after all that still goes out on the next run.
+                transport().sent = [];
+                await createEvent();
+                await job.run();
+                await job.run();
+                expect(transport().sent.length).toBe(1);
+            });
+        });
+    });
 });

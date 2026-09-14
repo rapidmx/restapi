@@ -62,6 +62,18 @@ describe("recordAuditLog() Tests", () => {
         expect(options).toEqual({ ignoreACL: true });
     });
 
+    it("Resolves the client IP through CIDR trusted_proxies and X-Forwarded-For.", async () => {
+        const req = { headers: { "x-forwarded-for": "6.6.6.6, 198.51.100.7, 10.1.0.4" }, socket: { remoteAddress: "::ffff:10.0.0.2" } };
+        await recordAuditLog(
+            objectFactory as any,
+            makeStubClass(),
+            { config: { get: (key: string) => (key === "trusted_proxies" ? ["10.0.0.0/8"] : undefined) }, req: req as any, logger },
+            { action: AuditAction.MAILBOX_CREATE, targetType: "Mailbox", targetUid: "mbx-2" },
+        );
+
+        expect(repo.create.mock.calls[0][0].ip).toBe("198.51.100.7");
+    });
+
     it("Leaves ip/actorUserUid undefined when no req/user is given.", async () => {
         await recordAuditLog(
             objectFactory as any,

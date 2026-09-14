@@ -1058,3 +1058,176 @@ Testing notes
   repo's server, which doesn't have these routes (404 for everything). The `activesync` run failed its own `EasRoute`
   Mongo tests the same way. Nothing wrong in the code: re-running under the lock with nothing else running passed all
   4193 tests. Before trusting a failing run, check for other `vitest` processes in sibling repos.
+
+## 2026-09-14 — Review fixes, round 4 (part RA2): booking, key vault, escrow/matters, domain/branding/plugins, calendar events
+
+Uncommitted. Concurrent with RA1 (mail/mailbox/scoped-child routes; added `util/RequestBodyUtils.ts`, reused here) and
+RB/RC (jobs, transport, scan, util, pki, search, models; `util/ClientIpUtils.ts`).
+
+Escrow / matters (finding 1, 9)
+- `Matter` and `EscrowScope` creates always mint the uid: client `uid` is deleted and `stripClientCreateFields()` drops
+  `_id`/`version`/`dateCreated`/`dateModified`/dotted/`$` keys (Domain create uses the same strip; its uid is still the
+  normalized name).
+- `util/EscrowUtils.ts`: `isQuerySafeUid()` (no `,()`, not `me`/`null`) and `exactInFilter(values)` (an `in(...)` of the
+  safe, distinct values, `undefined` when none are left). Used for every held-scope / matter-id `in()` in
+  `BaseMatterRoute` find/count/truncate, `BaseEscrowAccessRequestRoute.find`, `BaseEscrowAuditLogRoute` (visible matter
+  ids), `BaseMatterExportRequestRoute.find` and `BaseEscrowScopeRoute.hasActiveApprovals()`. A legacy uid with a comma
+  is simply left out of those lists (fail closed) - such rows stay reachable by id.
+- `BaseMatterRoute.truncate` deletes each checked matter as `eq(uid)` (unsafe legacy uid: `repoUtils.delete(uid)`).
+- `GET /matter-export-requests/:id/download` on a closed matter -> 409 (after the holder check).
+- Escrow scope update: `publicKey` is a change only if `publicKey`/`type` differ, `fingerprint` differs
+  case-insensitively, or `notBefore`/`notAfter`/`revokedAt` differ to the second (epoch ms, numeric string, ISO string
+  or Date; `null` == absent). An unchanged key in the body is dropped from the patch, so the stored value (not the
+  reformatted copy) is kept. Contract: the web client can round-trip the scope object without tripping the
+  holder-403 / live-approval-409 rules.
+- `update`/`updateBulk`/`updateProperty` on matters, escrow scopes and domains: non-object body 400,
+  `assertNoPathKeys()` / `assertPlainPropertyName()` 400. Branding `PUT` also `assertNoPathKeys()`. Not applicable
+  (bodies never spread into `RepoUtils.update`): key vault, encryption/retention/mailbox policies (field whitelists),
+  plugins (explicit patch), setup. BookingType/CalendarEvent get it from RA1's `BaseScopedChildRoute`.
+
+Optimistic locking on MongoDB (finding 2) - `find()` rows now go through `asEntity()` before an update
+- `BaseKeyVaultRoute.findKeyVault()` (feeds enroll/addWrap/removeWrap/rekey; also `skipCache`), `BaseBookingRoute`
+  `requireBookingByToken()`, `BasePluginRoute.installedPlugins()` and `installRow()`'s lookup, `BaseKeyLookupRoute`'s
+  existing contact. A lost race is now a 409 instead of a silent overwrite (e.g. a rekey dropping a just-enrolled
+  wrapped key). Audited the rest of RA2's routes: every other update's `existing` comes from `findOne()` (entity) or
+  `create()`/`update()` results. Tests force the race by spying `RepoUtils.prototype.find` and bumping the row's
+  version between the read and the write (Mongo and SQL KeyVault tests, booking suite).
+
+Key vault rekey (finding 3): `keys`, `wrappedKeys`, `masterKeyWraps` must each be arrays (400 `<field> must be an
+array.`), and `masterKeyWraps` must be non-empty (400 `masterKeyWraps must include at least one non-escrow wrap.`;
+escrow entries are still 403 and existing escrow wraps are still preserved). Checked after the 404/403 checks, before
+any write. `validateWrappedPrivateKey` no longer throws a TypeError on a null entry.
+
+Booking (findings 4-8)
+- `validateAvailability()` (BookingType create/update): `durationMinutes` and `slotIntervalMinutes` whole minutes in
+  [5, 1440]; `bufferBefore/AfterMinutes` whole in [0, 1440]; `minimumNoticeMinutes` whole in [0, 365 days];
+  `bookingWindowDays` whole in [1, 365]; `maxPerDay` positive whole or null; `availability` <= 50 windows, each
+  override <= 50 windows, `dateOverrides` <= 366 entries with no repeated date; window minutes whole. Existing rows are
+  not re-validated.
+- `generateCandidateSlots()` safety nets for stored rows: step or duration < 1 (or non-numeric) -> no slots; at most 50
+  windows a day; duplicate starts offered once; stops after the local day on which 5000 candidates are reached.
+- `GET /types/:slug/slots` returns at most 500 slots (`MAX_SLOTS_PER_RESPONSE`, earliest first) - contract: page with a
+  later `from`. It is now rate limited per client IP + booking type on its own `booking-slots|ip|slug` counter (booking
+  keeps `booking|ip|slug`), so browsing never consumes booking attempts; the limiter's own per-IP layer applies to
+  both. The class doc comment's "reads carry no limit" was updated.
+- Both limiters run after `requireBookingType()` (empty normalized slug -> 404 first; the stored slug is the key), so
+  unknown slugs never create counters. Client IP: `clientAddress(req)` -> `resolveClientIp(req, trusted_proxies)`
+  (CIDR-aware; a forged `X-Forwarded-For` from an untrusted peer is ignored). Tests spy
+  `BaseBookingRoute.prototype.clientAddress` instead of `NetUtils.getIPAddress`.
+- `cancel()`/`reschedule()` write the booking first (version-checked), then the event, so a cancel racing a reschedule
+  409s before touching the event. A repeat cancel is still 200 and now also cancels the event if it isn't yet
+  (recovers a cancel whose event write lost a race). Reschedule refuses (409) when the booking's event is CANCELLED.
+- `maxPerDay` on reschedule excludes the booking itself (`uid: ne(<uid>)`).
+- Busy folders: the well-known calendar lookup uses the same `sort: { dateCreated: ASC, uid: ASC }` as
+  `findOrCreateWellKnownFolder()`; busy events are queried per folder with `eq(uid)` (+ exact `folderUid` post-filter)
+  instead of `in(a,b)`.
+- Stale DST note on the class doc replaced (FreeBusyUtils now expands recurring events in their own timezone).
+
+Other
+- Branding logo/icon uploads accept `image/gif` (raster, served with nosniff). `writeGuardsSuite` now expects 200.
+- `BaseCalendarEventRoute.serverManagedFields = ["inviteSequenceSent", "cancelNoticeSentAt", "reminderSentFor"]`
+  (dropped from non-trusted create/update bodies; `sequence` stays route-managed via the auto-bump). RA1 had not added
+  one.
+
+Contract changes for web-client: booking type validation limits above (400s); slots capped at 500 and rate limited;
+reschedule of a booking whose event was cancelled is 409; rekey 400s above; escrow scope publicKey semantic comparison;
+GIF branding uploads; dotted/`$` keys in matter/escrow-scope/domain/branding updates are 400; matter export download
+of a closed matter is 409; client-supplied uids on matter/escrow-scope create are ignored.
+
+Tests (all under `.vitest-lock`, `--coverage.enabled=false`, targeted files only): KeyVault unit + mongo/sql (+ sign
+enrollment automated), Booking + BookingType mongo/sql, BookingUtils, EscrowUtils, SecurityControls mongo/sql
+(escrowControlsSuite + writeGuardsSuite), CalendarEvent, EscrowAccessRequest, EscrowAuditLog, EscrowScope, KeyLookup,
+MatterExportRequest, Matter, Plugin, Domain, Branding mongo/sql and their Base* unit tests - all passing. `tsc` clean
+outside `src/jobs/` (RB/RC mid-edit); eslint clean on the touched files.
+
+## 2026-09-14 — Review fixes, round 4 (part RA1): mail/mailbox/scoped-child/folder/attachment/message/label/ingest routes
+
+Shared helper (RA2 uses it too): `src/util/RequestBodyUtils.ts`, re-exported from `util/index.ts` -
+`assertNoPathKeys(obj)` (400 on any top-level key containing `.` or starting with `$`, object or each array element),
+`assertPlainPropertyName(name)` (400 for an empty/dotted/`$` `:property`), `stripClientCreateFields(obj)` (drops `_id`,
+`version`, `dateCreated`, `dateModified` and path keys in place, object or array), `stripClientId(obj)`,
+`isPathKey(key)`, `isDuplicateKeyError(err)` (Mongo 11000 / Postgres 23505 / MySQL ER_DUP_ENTRY / SQLite UNIQUE).
+
+1. CRITICAL, confirmed: a create body's `_id` reached `MongoRepository.save()` -> `replaceOne({_id}, ..., upsert)`, so a
+   message POSTed with another mailbox's message `_id` replaced that message (the new Mongo test fails without the fix:
+   the victim row disappears). Fixed in `BaseScopedChildRoute.create()` (all scoped children: messages, attachments,
+   contacts, events, tasks, notes, labels, filter rules, focused-inbox overrides, share links, quarantine, ingest queue,
+   signatures, task/contact lists), `BaseFolderRoute.create()`, `BaseMailboxRoute.create()`,
+   `BaseDistributionListRoute.create()`, `BaseTransportRuleRoute.create()`; bulk arrays too. `RepoUtils.update()` already
+   copies the stored `_id` for model instances; update bodies also get `stripClientId()`.
+2. HIGH, confirmed: `$set: {...body}` let `aliasAddresses.3`, `keys.0`, `receiptStatus.0`, `actions.0.labelUid` skip the
+   field checks. 400 now in `BaseScopedChildRoute.update/updateBulk/updateProperty`, `BaseFolderRoute.validateUpdate/
+   updateProperty`, `BaseMailboxRoute.validateUpdate/updateProperty`, and `BaseDistributionListRoute`/
+   `BaseTransportRuleRoute` `update/validateUpdate/updateProperty`. A non-array `PUT /` never reaches the bulk handlers
+   (`CRUDRoute`'s bulk validator answers first - 400 for scoped routes, 500 "objs is not iterable" for mailboxes;
+   framework behavior, left alone).
+3. HIGH, confirmed (the scheduled branch only checked `from.address`; a client could also PUT `scheduledSendTime` and
+   move a draft into Outbox directly, where `ScheduledSendJob` relays it). Now:
+   - `send()` reads the stored source and runs `assertSenderAllowed(..., raw)` before either branch. It uses RB/RC's
+     `checkOriginatorHeaders()` (MimeHeaderUtils: exactly one From, at most one Sender, every address the mailbox's,
+     no stray address-like text) plus a route-local check refusing any From/Sender display name or comment containing
+     `@` (RFC 2047 Q/B decoded) - `"ceo@example.com" <me@...>` passes the shared helper by design.
+   - `POST /messages/:id/send` takes an optional body `{ scheduledSendTime }` (400 if unparseable). A future value (or a
+     stored one written by server code) queues in Outbox; otherwise immediate.
+   - Non-trusted update: a `scheduledSendTime` that would change the stored value is 400 (unchanged/`null` dropped, so
+     round trips and react-shared's `cancelScheduledSend()` still work); a move into Outbox is 403; a create into
+     Outbox is 403 and never carries `scheduledSendTime`; moving out of Outbox clears `scheduledSendTime`/attempts/
+     error (409 if `scheduledSendRelayedAt` is set - relayed, only filing pending).
+   - `send()` on a message in Outbox is 409 (queued or claimed - move it back to Drafts first); in Sent Items or with
+     `scheduledSendRelayedAt` 409.
+4. HIGH, confirmed: `BaseScopedChildRoute.update()` runs `checkLegalHold(existing)` when the resolved `mailboxUid`
+   changes (only `BaseMessageRoute` overrides it; holds only cover messages). Not covered: an `Attachment` of a held
+   message can still be moved on its own (no hold override on attachments).
+5. MEDIUM, confirmed: a trusted create with `ownerUserUid` now writes an owner `FULL` (`*`) ACL record;
+   `update`/`updateBulk`/`updateProperty("ownerUserUid")` overrides move it (remove every record of the old owner,
+   replace the new owner's records with one FULL record; clearing the owner removes it). ACL save retried 3x.
+6. MEDIUM, confirmed: immediate `send()` now claims first - version-checked move into Outbox with
+   `scheduledSendTime: null` (the job ignores it) - then relays through a tracking transport. A scan/relay failure
+   before acceptance moves it back to its original folder; any failure after acceptance calls `markRelayed()`
+   (`scheduledSendRelayedAt` + due `scheduledSendTime`) so `ScheduledSendJob`'s already-relayed path only files it.
+   Filing re-reads the version. Known gap: a process crash between claim and relay leaves the message in Outbox with
+   no schedule (the user must move it back to Drafts to resend).
+7. MEDIUM, confirmed: `BaseMailIngestRoute.handleUnsubscribe` and `BaseLabelRoute.cleanUpDeletedLabel` now `asEntity()` +
+   re-read/retry on 409; `BaseMessageRoute.upsertSenderOverride` `asEntity()` + retry on 409/duplicate key. Audited the
+   rest of the scope: every other route write uses `findOne()` (which instantiates the model) - send/recall/archive/
+   classify/receipts, DL/TR update, scoped update - so those were already version-checked.
+8. LOW-MED, confirmed: `?deleted=true` on scoped `find/count/findById/exists/truncate` and folder `find/count/exists` is
+   honored only when the effective caller (share-link identity included) has DELETE and UPDATE on the scope; otherwise
+   the filter is dropped / the record is 404.
+9. LOW, confirmed: `Attachment.messageUid` (and `extractionAttempts/NextAttemptAt/Error`) server-managed;
+   `Message.hasAttachments` server-managed and derived - `upload()` and attachment `delete()` recount the message's
+   attachments and set it (version-checked, best-effort). Not covered: attachment `truncate` doesn't recount.
+10. LOW, confirmed: a list unsubscribe is honored only if the message has exactly one `From` equal to the envelope
+    sender and an aligned passing DKIM result under `mail:security:trusted_authserv_id`; otherwise it is logged, not
+    applied, and not fanned out (`queued: false`).
+11. (a) `BaseScopedChildRoute.dateFields` (strict coercion on create/update/updateBulk/updateProperty): Message
+    (sentDate, receivedDate, searchIndexedAt, searchIndexNextAttemptAt, scheduledSendTime, scheduledSendRelayedAt,
+    recallRequestedAt, delivery/readReceiptSentAt), Attachment (extractionNextAttemptAt), CalendarShareLink (expiresAt),
+    Task (dueDate, reminderDate - in `TaskRoute{Mongo,SQL}`), IngestQueueEntry (nextAttemptAt, scanLeaseExpiresAt - in
+    `IngestQueueRoute{Mongo,SQL}`); Mailbox oofStartTime/oofEndTime in `BaseMailboxRoute` create/validateUpdate (covers
+    updateProperty). `send()` compares `scheduledSendTime` via `toValidDate()`. Lenient reads in OofUtils are RC's.
+    (b) SERVER_MANAGED_MESSAGE_FIELDS += searchIndexAttempts, searchIndexNextAttemptAt, searchIndexError,
+    scheduledSendAttempts, scheduledSendError, scheduledSendRelayedAt, hasAttachments. BaseCalendarEventRoute's list was
+    already added by RA2 - not touched. (c) FocusedInboxOverride create and `classify()` re-read and update on a
+    duplicate-key error (relevant once a unique (mailbox, sender) index exists).
+
+Contract changes (web-client / react-shared)
+- `setMessageScheduledSendTime()` (PUT scheduledSendTime) is now 400. Schedule with `POST /mail/messages/:id/send` and
+  body `{ "scheduledSendTime": "<ISO>" }` (react-shared `sendMessage()` needs an optional body).
+- `cancelScheduledSend()` keeps working (null time + folderUid Drafts). Moving a message into Outbox by PUT is 403.
+- "Send now" on a scheduled message: move it back to Drafts, then send (send on an Outbox message is 409). Sending a
+  message in Sent Items is 409.
+- `hasAttachments`, `Attachment.messageUid` and job retry fields are ignored on non-trusted writes.
+- Dotted/`$` body keys and `:property` names are 400 on all mail routes. Unparseable dates are 400.
+- Admin-created mailboxes: the owner gets a FULL ACL record; owner changes move it.
+- Soft-deleted items via `?deleted=true` need delete+update access.
+- List unsubscribe needs DKIM (the MTA must stamp Authentication-Results with trusted_authserv_id).
+
+Tests: new `test/routes/mailAuthzRound4Suite.ts` (+ `{mongo,sql}/MailAuthzRound4.test.ts`, 15 each) and
+`test/util/RequestBodyUtils.test.ts`; unsubscribe tests in `{mongo,sql}/MailIngestRoute.test.ts` and
+`BaseMailIngestRoute.DistributionLists.test.ts` now carry an Authentication-Results header (plus a forged-unsubscribe
+test); `BaseMessageRoute.test.ts` calls `send(id, undefined, req, user)`. Ran under the lock (targeted: 63 files, 1245
+tests, all passing): Message/MailAuthzRound3/Round4/Mailbox/Folder/Attachment/Label/MailIngest/DistributionList
+(+Domains)/TransportRule/CalendarShareLink/Task/IngestQueue/Quarantine/MailFilterRule/Contact/MailboxAutoProvision
+(+Static)/SecurityControls/MailboxAccess/CalendarEvent/Note/ContactList/TaskList/MailSignature/BookingType mongo+sql, the
+Base* unit tests, MailPushRoute, BaseAdminWriteGuards. tsc and eslint clean on the touched files.

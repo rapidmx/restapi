@@ -20,6 +20,7 @@ import {
     RecipientType,
     RecurrenceRule,
 } from "../types.js";
+import { boundIndexedValue } from "../../util/ConversationUtils.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Nullable } = ObjectDecorators;
@@ -37,6 +38,8 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Index("calevent_folder", ["folderUid"])
 @Index("calevent_ical_uid", ["icalUid"])
 @Index("calevent_mailbox", ["mailboxUid"])
+@Index("calevent_folder_modified", ["folderUid", "dateModified", "uid"])
+@Index("calevent_mailbox_modified", ["mailboxUid", "dateModified", "uid"])
 @Index("calevent_start_date", ["startDate"])
 @Index("calevent_status", ["status"])
 @Index("calevent_cancel_notice_sent_at", ["cancelNoticeSentAt"])
@@ -119,7 +122,8 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
 
     @Column()
     @Description(
-        "A stable identifier (RFC 5545 `UID`) for this event, shared across all clients/protocols and iTIP messages.",
+        "A stable identifier (RFC 5545 `UID`) for this event, shared across all clients/protocols and iTIP messages. " +
+            "A value longer than 255 characters is stored as `sha256:<hex>` of the original.",
     )
     public icalUid: string = "";
 
@@ -184,7 +188,7 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
                 "reminderMinutesBeforeStart" in other
                     ? other.reminderMinutesBeforeStart
                     : this.reminderMinutesBeforeStart;
-            this.icalUid = other.icalUid !== undefined ? other.icalUid : this.icalUid;
+            this.icalUid = other.icalUid !== undefined ? boundIndexedValue(other.icalUid) : this.icalUid;
             this.sequence = other.sequence !== undefined ? other.sequence : this.sequence;
             this.autoReplyEnabled = "autoReplyEnabled" in other ? other.autoReplyEnabled : this.autoReplyEnabled;
             this.autoReplyMessage = "autoReplyMessage" in other ? other.autoReplyMessage : this.autoReplyMessage;

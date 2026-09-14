@@ -492,5 +492,133 @@ describe("SearchIndexJobMongo Tests (real DB + DI)", () => {
             const updated = await findMessage(message.uid);
             expect(updated!.searchIndexAttempts ?? null).toBeNull();
         });
+        const interleaveAfterBulkIndex = (fn: () => Promise<void>) => {
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            const realBulkIndex = searchProvider.bulkIndex.bind(searchProvider);
+            vi.spyOn(searchProvider, "bulkIndex").mockImplementationOnce(async (docs: any) => {
+                const result = await realBulkIndex(docs);
+                await fn();
+                return result;
+            });
+            return searchProvider;
+        };
+
+        it("Does not stamp searchIndexedAt over a concurrent edit made while the message was being indexed (version-checked stamp), and keeps the edit.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey });
+            interleaveAfterBulkIndex(async () => {
+                await messageRepo.updateOne({ uid: message.uid } as any, { $inc: { version: 1 }, $set: { subject: "Edited concurrently" } });
+            });
+
+            await job.run();
+
+            const updated = await findMessage(message.uid);
+            expect(updated!.subject).toBe("Edited concurrently");
+            expect(updated!.searchIndexedAt).toBeFalsy();
+        });
+
+        it("Removes the just-indexed document again when the message was soft-deleted while it was being indexed.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey });
+            const searchProvider = interleaveAfterBulkIndex(async () => {
+                await messageRepo.updateOne({ uid: message.uid } as any, { $inc: { version: 1 }, $set: { deleted: true } });
+            });
+
+            await job.run();
+
+            expect(searchProvider.indexed.has(`message:${message.uid}`)).toBe(false);
+        });
+
+        it("Keeps the document of a still-live message whose stamp merely conflicted.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey });
+            const searchProvider = interleaveAfterBulkIndex(async () => {
+                await messageRepo.updateOne({ uid: message.uid } as any, { $inc: { version: 1 }, $set: { subject: "Edited concurrently" } });
+            });
+
+            await job.run();
+
+            expect(searchProvider.indexed.has(`message:${message.uid}`)).toBe(true);
+        });
+
+        it("Clears its own stamp again when an attachment's text was extracted after the document was built, so the text gets indexed next run.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey, hasAttachments: true });
+            const extractedBlobKey = `attachment-text/${uuid.v4()}`;
+            await blobStore.put(extractedBlobKey, Buffer.from("late attachment text"));
+            interleaveAfterBulkIndex(async () => {
+                await createAttachment({ messageUid: message.uid, extractedTextBlobKey: extractedBlobKey });
+            });
+
+            await job.run();
+            expect((await findMessage(message.uid))!.searchIndexedAt).toBeFalsy();
+
+            await job.run();
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            expect(searchProvider.indexed.get(`message:${message.uid}`)!.attachmentText).toEqual(["late attachment text"]);
+            expect((await findMessage(message.uid))!.searchIndexedAt).toBeInstanceOf(Date);
+        });
+        it("Logs a warning (no throw) when re-checking a message after a failed stamp itself fails, keeping its document.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey });
+            vi.spyOn((job as any).messageRepo, "update").mockRejectedValueOnce(new Error("simulated stamp conflict"));
+            vi.spyOn((job as any).messageRepo, "findOne").mockRejectedValueOnce(new Error("simulated re-check failure"));
+            const warnSpy = vi.spyOn((job as any).logger, "warn");
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated re-check failure"));
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            expect(searchProvider.indexed.has(`message:${message.uid}`)).toBe(true);
+        });
+
+        it("Retries clearing its own stamp against a fresh read when that clear hits a version conflict.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey, hasAttachments: true });
+            const extractedBlobKey = `attachment-text/${uuid.v4()}`;
+            await blobStore.put(extractedBlobKey, Buffer.from("late attachment text"));
+            interleaveAfterBulkIndex(async () => {
+                await createAttachment({ messageUid: message.uid, extractedTextBlobKey: extractedBlobKey });
+            });
+            const messageRepoUtils = (job as any).messageRepo;
+            const realUpdate = messageRepoUtils.update.bind(messageRepoUtils);
+            vi.spyOn(messageRepoUtils, "update")
+                .mockImplementationOnce(async (...args: any[]) => await realUpdate(...args))
+                .mockRejectedValueOnce(new Error("simulated clear conflict"));
+
+            await job.run();
+
+            expect((await findMessage(message.uid))!.searchIndexedAt).toBeFalsy();
+        });
+
+        it("Logs a warning (no throw) when the post-stamp attachment re-check fails.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey, hasAttachments: true });
+            const attachmentRepoUtils = (job as any).attachmentRepo;
+            const realFind = attachmentRepoUtils.find.bind(attachmentRepoUtils);
+            vi.spyOn(attachmentRepoUtils, "find")
+                .mockImplementationOnce(async (...args: any[]) => await realFind(...args))
+                .mockRejectedValueOnce(new Error("simulated re-check lookup failure"));
+            const warnSpy = vi.spyOn((job as any).logger, "warn");
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated re-check lookup failure"));
+            expect((await findMessage(message.uid))!.searchIndexedAt).toBeInstanceOf(Date);
+        });
     });
 });

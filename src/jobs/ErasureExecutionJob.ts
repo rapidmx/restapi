@@ -9,9 +9,26 @@ import { BlobStore } from "../blob/BlobStore.js";
 import { BlobReferenceSource, deleteBlobsIfUnreferenced, messageBlobReferenceSources } from "../util/BlobReferenceUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { findPagesByUid } from "../util/MailboxContentUtils.js";
+import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
+import type { SearchEntityType, SearchProvider } from "../search/SearchProvider.js";
 import { AuditAction, DataSubjectErasureRequest, Mailbox, Plugin } from "../models/types.js";
 import { isMailboxScopedData, PluginRegistry } from "../plugins/PluginRegistry.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
+
+/**
+ * The `DataSubjectErasureRequest.status` a request has while a worker is running its cascade - set by a version-checked
+ * claim (see `ErasureExecutionJob.claimRequest()`), kept alive by periodic renewals, and handed back to `"approved"`
+ * when the cascade has to wait (a legal hold, an unloaded plugin, an error). Not (yet) part of the
+ * `DataSubjectErasureStatus` union in `models/types.ts`; the column is a plain string on both backends.
+ *
+ * Anything that must not add content to a mailbox being erased (e.g. delivery) should treat a request with status
+ * `"approved"` or `"in_progress"` for that `mailboxUid` as "erasure pending".
+ */
+export const ERASURE_IN_PROGRESS = "in_progress" as DataSubjectErasureRequest["status"];
+
+/** How many times `purgeByCriteria()` re-scans an entity type to catch rows written concurrently with the cascade. */
+const MAX_PURGE_PASSES = 3;
 
 /**
  * Processes `DataSubjectErasureRequest` rows an admin has already approved (see that entity's own doc
@@ -52,6 +69,14 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * `folderUid`-scoped). Deliberately NOT purged: `EscrowAccessRequest`/`EscrowAuditLogEntry` (this mailbox's own
  * escrow-access audit trail, which - like `AuditLogEntry` elsewhere in this codebase - must outlive the record
  * it audits, not disappear the moment that record does).
+ *
+ * A request is claimed before its cascade runs: a version-checked update from `"approved"` to `"in_progress"`
+ * (`ERASURE_IN_PROGRESS`), so two workers (a multi-node deployment - `BackgroundService`'s overlap guard is
+ * per-process) can't run the same erasure. The claim is renewed while the cascade runs and handed back to `"approved"`
+ * whenever the request has to wait; one left `"in_progress"` by a dead worker is picked up again once
+ * `claim_lease_seconds` passes without a renewal. Each entity type is purged in keyset-ordered, streamed batches, and
+ * re-scanned to catch rows a concurrent delivery wrote behind the cursor. Messages, contacts, calendar events, tasks
+ * and notes also have their search index documents removed.
  *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`ErasureExecutionJobMongo`/
  * `ErasureExecutionJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob`/
@@ -106,6 +131,22 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     @Inject("BlobStore")
     private blobStore?: BlobStore;
 
+    /** Optional: when search isn't configured, index removal is a no-op. */
+    @Inject("SearchProvider")
+    private searchProvider?: SearchProvider;
+
+    /** This worker's current claim on the request it's processing - see `claimRequest()`. */
+    private claim?: { request: T; renewedAt: number };
+
+    /** How long an `"in_progress"` claim may go unrenewed before another worker treats it as abandoned. A running
+     * cascade renews it every third of this. */
+    @Config("mail:jobs:erasure_execution:claim_lease_seconds", 900)
+    private claimLeaseSeconds: number = 900;
+
+    /** Rows read (and deleted) per keyset page while purging one entity type. */
+    @Config("mail:jobs:erasure_execution:purge_page_size", 500)
+    private purgePageSize: number = 500;
+
     @Config("mail:jobs:erasure_execution:schedule", "*/30 * * * * *")
     private scheduleExpr: string = "*/30 * * * * *";
 
@@ -149,17 +190,86 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             return;
         }
 
-        const approved: T[] = await this.requestRepo.find(
-            { status: "approved", limit: this.batchSize } as any,
-            { ignoreACL: true, limit: this.batchSize },
+        // Candidates: approved requests, plus in-progress ones whose claim has gone stale (the worker that claimed it
+        // died mid-cascade - an active worker renews its claim well within the lease, see `renewClaimIfDue()`).
+        // `limit` goes in both the query object (SQL) and `options` (Mongo); sorted so the oldest request runs first.
+        const limit: number = Math.max(1, Math.min(this.batchSize, 1000));
+        const staleBefore: Date = new Date(Date.now() - this.claimLeaseSeconds * 1000);
+        const candidates: T[] = await this.requestRepo.find(
+            {
+                $or: [{ status: `eq(approved)` }, { status: `eq(${ERASURE_IN_PROGRESS})`, dateModified: `lt(${staleBefore.toISOString()})` }],
+                sort: { dateCreated: "ASC", uid: "ASC" },
+                limit,
+            } as any,
+            { ignoreACL: true, limit, skipCache: true },
         );
 
-        for (const request of approved) {
+        for (const candidate of candidates) {
             try {
-                await this.processRequest(request);
+                await this.processRequest(candidate);
             } catch (err: any) {
-                this.logger?.error(`ErasureExecutionJob: failed to process erasure request ${request.uid}: ${err.message}`);
+                this.logger?.error(`ErasureExecutionJob: failed to process erasure request ${candidate.uid}: ${err.message}`);
+                // Hand an unexpectedly failed request straight back rather than leaving it claimed until the lease runs out.
+                await this.releaseClaim();
+            } finally {
+                this.claim = undefined;
             }
+        }
+    }
+
+    /**
+     * Claims `request` for this worker: a version-checked update of its `status` to `"in_progress"` (see
+     * `ERASURE_IN_PROGRESS`). Two workers that read the same request both hold the same `version`; only one update can
+     * match it, the other gets a 409 and skips the request. Returns `false` if the claim was lost.
+     */
+    private async claimRequest(request: T): Promise<boolean> {
+        try {
+            const claimed: T = await this.requestRepo!.update(
+                { uid: request.uid, version: (request as any).version, status: ERASURE_IN_PROGRESS } as any,
+                asEntity(this.requestRepo!, request),
+                { ignoreACL: true },
+            );
+            this.claim = { request: claimed, renewedAt: Date.now() };
+            return true;
+        } catch (err: any) {
+            this.logger?.debug?.(`ErasureExecutionJob: erasure request ${request.uid} was claimed by another worker: ${err.message}`);
+            return false;
+        }
+    }
+
+    /**
+     * Renews this worker's claim (a version-checked no-op status write, which bumps `dateModified`) once a third of the
+     * lease has passed, so a long cascade is never mistaken for an abandoned one. Throws if the claim was lost (another
+     * worker took the request over after the lease lapsed), which stops this worker's cascade.
+     */
+    private async renewClaimIfDue(): Promise<void> {
+        const claim = this.claim;
+        if (!claim || Date.now() - claim.renewedAt < (this.claimLeaseSeconds * 1000) / 3) {
+            return;
+        }
+        const renewed: T = await this.requestRepo!.update(
+            { uid: claim.request.uid, version: (claim.request as any).version, status: ERASURE_IN_PROGRESS } as any,
+            asEntity(this.requestRepo!, claim.request),
+            { ignoreACL: true },
+        );
+        this.claim = { request: renewed, renewedAt: Date.now() };
+    }
+
+    /** Hands a claimed request back as `"approved"` so a later run retries it (a hold, an unloaded plugin, an error).
+     * Best-effort: if it fails, the claim simply expires after `claim_lease_seconds`. Only ever called while this worker
+     * holds a claim: every path that can fail or hand a request back (including `run()`'s catch - nothing in
+     * `processRequest()` before `claimRequest()` can throw) runs after a successful `claimRequest()`. */
+    private async releaseClaim(): Promise<void> {
+        const claim = this.claim!;
+        this.claim = undefined;
+        try {
+            await this.requestRepo!.update(
+                { uid: claim.request.uid, version: (claim.request as any).version, status: "approved" } as any,
+                asEntity(this.requestRepo!, claim.request),
+                { ignoreACL: true },
+            );
+        } catch (err: any) {
+            this.logger?.warn(`ErasureExecutionJob: failed to release erasure request ${claim.request.uid}: ${err.message}`);
         }
     }
 
@@ -168,8 +278,19 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             await assertNotOnLegalHold(this._objectFactory!, this.matterClass, request.mailboxUid);
         } catch {
             // Still held - skip, don't error. Retried automatically on a later run once the matter closes.
+            if (request.status !== "approved") {
+                // A stale in-progress request found held: hand it back so it reads as waiting, not running.
+                if (await this.claimRequest(request)) {
+                    await this.releaseClaim();
+                }
+            }
             return;
         }
+
+        if (!(await this.claimRequest(request))) {
+            return;
+        }
+        request = this.claim!.request;
 
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(request.mailboxUid, { ignoreACL: true });
 
@@ -191,18 +312,32 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         purgedCount += await this.purgeEntityType(this.attachmentClass, request.mailboxUid, undefined, async (row: any) => {
             await deleteSharedBlobs(row.blobKey, row.extractedTextBlobKey);
         });
+        // Every indexed entity type also has its search document removed once its row is gone - otherwise the search
+        // provider keeps serving the erased subject/body/attachment text (the "message" document covers a message's
+        // attachment text too). Best-effort: see `removeFromSearchIndex()`.
+        const removeFromIndex =
+            (entityType: SearchEntityType) =>
+            async (row: any): Promise<void> => {
+                await removeFromSearchIndex(this.searchProvider, entityType, row.uid, this.logger);
+            };
         purgedCount += await this.purgeEntityType(this.messageClass, request.mailboxUid, undefined, async (row: any) => {
+            await removeFromIndex("message")(row);
             await deleteSharedBlobs(row.bodyBlobKey, row.sanitizedHtmlBlobKey);
         });
-        purgedCount += await this.purgeEntityType(this.contactClass, request.mailboxUid, async (row: any) => {
-            if (row.photoBlobKey) {
-                await this.blobStore!.delete(row.photoBlobKey);
-            }
-        });
+        purgedCount += await this.purgeEntityType(
+            this.contactClass,
+            request.mailboxUid,
+            async (row: any) => {
+                if (row.photoBlobKey) {
+                    await this.blobStore!.delete(row.photoBlobKey);
+                }
+            },
+            removeFromIndex("contact"),
+        );
         purgedCount += await this.purgeEntityType(this.contactListClass, request.mailboxUid);
-        purgedCount += await this.purgeEntityType(this.calendarEventClass, request.mailboxUid);
-        purgedCount += await this.purgeEntityType(this.taskClass, request.mailboxUid);
-        purgedCount += await this.purgeEntityType(this.noteClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.calendarEventClass, request.mailboxUid, undefined, removeFromIndex("calendarEvent"));
+        purgedCount += await this.purgeEntityType(this.taskClass, request.mailboxUid, undefined, removeFromIndex("task"));
+        purgedCount += await this.purgeEntityType(this.noteClass, request.mailboxUid, undefined, removeFromIndex("note"));
         // `CalendarShareLink` is scoped by `folderUid`, not `mailboxUid`, so its rows are found through each folder
         // before that folder is purged (purging the folder also removes the folder ACL holding the link's token).
         let shareLinkCount = 0;
@@ -246,7 +381,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
                 // running. This mailbox's own content is already gone by this point regardless (a
                 // narrow, documented TOCTOU window - see this class's own doc comment), but stopping here
                 // at least keeps the anchor `Mailbox` record itself in place rather than also destroying
-                // the one thing a hold is meant to keep discoverable. `status` is deliberately left
+                // the one thing a hold is meant to keep discoverable. `status` is deliberately handed back as
                 // `"approved"` (not advanced to `"completed"`) so a later run retries this exact final
                 // step once the hold resolves - every entity type purged above is already empty by then,
                 // so the retry is a cheap no-op cascade followed by just this one remaining check, the
@@ -257,6 +392,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
                 this.logger?.error(
                     `ErasureExecutionJob: a legal hold appeared on mailbox ${request.mailboxUid} while erasure request ${request.uid} was already running - ${purgedCount} rows were purged before it was detected; the mailbox record itself was preserved pending the hold's resolution.`,
                 );
+                await this.releaseClaim();
                 return;
             }
             try {
@@ -278,6 +414,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             this.logger?.error(
                 `ErasureExecutionJob: erasure request ${request.uid} is waiting for plugins that store mailbox data but aren't loaded (${unloaded.join(", ")}) - their data for mailbox ${request.mailboxUid} can't be purged until they are. Enable them or fix their loading; the request is retried on a later run.`,
             );
+            await this.releaseClaim();
             return;
         }
         if (removed.length > 0) {
@@ -288,13 +425,18 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             );
         }
 
-        await this.markCompleted(request, purgedCount);
+        // The claim's own latest version (renewals included), so a worker that lost its claim can't complete the request.
+        await this.markCompleted(this.claim!.request, purgedCount);
+        this.claim = undefined;
     }
 
     /** The plugins declaring `mailboxScopedData` in their stored manifest that aren't loaded in this process, per
      * `PluginRegistry`: installed ones (`unloaded`) and removed ones (`removed`). */
     private async unloadedMailboxDataPlugins(): Promise<{ unloaded: string[]; removed: string[] }> {
-        const rows: Plugin[] = await this.findAllPages(await this.getRepo(this.pluginClass), {});
+        const rows: Plugin[] = [];
+        for await (const batch of findPagesByUid<Plugin>(await this.getRepo(this.pluginClass), {})) {
+            rows.push(...batch);
+        }
         const candidates: Plugin[] = rows.filter((row) => row.manifest.mailboxScopedData === true && !PluginRegistry.isActive(row.name));
         const names = (removed: boolean): string[] =>
             candidates
@@ -328,24 +470,44 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         const repo: RepoUtils<any> = await this.getRepo(entityClass);
         // A soft-deleted row of a recoverable entity (e.g. a message in Deleted Items) is still this mailbox's data,
         // but `find()` excludes it unless `deleted: true` is asked for explicitly.
-        const rows: any[] = [
-            ...(await this.findAllPages(repo, criteria)),
-            ...(new entityClass() instanceof RecoverableBaseEntity ? await this.findAllPages(repo, { ...criteria, deleted: true }) : []),
-        ];
+        const criteriaSets: Record<string, any>[] =
+            new entityClass() instanceof RecoverableBaseEntity ? [criteria, { ...criteria, deleted: true }] : [criteria];
 
+        // Rows are streamed in keyset-ordered batches (`findPagesByUid()`) and deleted as each batch arrives, never
+        // loaded all at once. A single pass can still miss a row written concurrently behind its cursor (e.g. a
+        // delivery that raced this erasure), so passes repeat until one purges nothing, bounded by `MAX_PURGE_PASSES`.
+        // A row that failed this run is not retried by a later pass (it's counted as seen), so a persistently failing
+        // row ends the loop instead of spinning it.
+        const failed: Set<string> = new Set();
         let purgedCount = 0;
-        for (const row of rows) {
-            try {
-                if (onBeforeDelete) {
-                    await onBeforeDelete(row);
+        for (let pass = 0; pass < MAX_PURGE_PASSES; pass++) {
+            let purgedThisPass = 0;
+            for (const passCriteria of criteriaSets) {
+                for await (const batch of findPagesByUid(repo, passCriteria, this.purgePageSize)) {
+                    await this.renewClaimIfDue();
+                    for (const row of batch) {
+                        if (failed.has(row.uid)) {
+                            continue;
+                        }
+                        try {
+                            if (onBeforeDelete) {
+                                await onBeforeDelete(row);
+                            }
+                            await repo.delete(row.uid, { ignoreACL: true, purge: true });
+                            purgedCount++;
+                            purgedThisPass++;
+                            if (onAfterDelete) {
+                                await onAfterDelete(row);
+                            }
+                        } catch (err: any) {
+                            failed.add(row.uid);
+                            this.logger?.warn(`ErasureExecutionJob: failed to purge ${entityClass.name} ${row.uid}: ${err.message}`);
+                        }
+                    }
                 }
-                await repo.delete(row.uid, { ignoreACL: true, purge: true });
-                purgedCount++;
-                if (onAfterDelete) {
-                    await onAfterDelete(row);
-                }
-            } catch (err: any) {
-                this.logger?.warn(`ErasureExecutionJob: failed to purge ${entityClass.name} ${row.uid}: ${err.message}`);
+            }
+            if (purgedThisPass === 0) {
+                break;
             }
         }
         return purgedCount;
@@ -368,24 +530,10 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         return await this._objectFactory!.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
     }
 
-    /** Fetches every page of `repo.find(criteria, ...)` results - see `MailboxContentUtils`'
-     * identical rationale (a bare, unpaginated `find()` silently truncates at 100 rows). An erasure must
-     * be complete, not a sample. */
-    private async findAllPages(repo: RepoUtils<any>, criteria: Record<string, any>, pageSize: number = 500): Promise<any[]> {
-        const all: any[] = [];
-        for (let page = 0; ; page++) {
-            const batch: any[] = await repo.find({ ...criteria, limit: pageSize, page } as any, { ignoreACL: true, limit: pageSize, page });
-            all.push(...batch);
-            if (batch.length < pageSize) {
-                break;
-            }
-        }
-        return all;
-    }
 
     private async markCompleted(request: T, purgedCount: number): Promise<void> {
-        // Deliberately uses `request`'s own ORIGINALLY-fetched `version` (from the `find()` call at the
-        // top of `run()`), never a version refetched right before this write - the same "let a stale
+        // Deliberately uses `request`'s own `version` as this worker last wrote it (its claim, or latest claim
+        // renewal), never a version refetched right before this write - the same "let a stale
         // version be genuinely rejected" discipline `DataExportJob`/`MatterExportJob`'s own final `update()`
         // calls already use. A refetch-then-write here would defeat optimistic locking entirely: two
         // concurrent job instances (a real possibility in a multi-node deployment - `BackgroundService`'s

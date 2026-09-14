@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { asEntity } from "../util/EntityUtils.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { checkDomainVerification } from "../util/DomainVerificationUtils.js";
@@ -91,7 +92,10 @@ export abstract class DomainVerificationJob<D extends Domain> extends Background
                     patch.verified = true;
                     patch.verifiedAt = new Date();
                 }
-                await this.domainRepo.update(patch, domain, { version: domain.version, ignoreACL: true });
+                // `asEntity()`: Mongo `find()` returns plain documents, for which `update()` is unversioned and would
+                // clobber a concurrent admin edit (e.g. disabling the domain) made while DNS was being checked. On a
+                // version conflict this throws, is logged below, and the domain is simply re-checked next run.
+                await this.domainRepo.update(patch, asEntity(this.domainRepo, domain), { version: domain.version, ignoreACL: true });
 
                 if (verified) {
                     await recordAuditLog(

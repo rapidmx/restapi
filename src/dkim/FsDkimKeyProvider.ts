@@ -6,6 +6,7 @@ import * as crypto from "crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { ObjectDecorators } from "@rapidrest/core";
+import { createFileExclusive } from "../pki/FileStoreUtils.js";
 import { DkimKeyPair, DkimKeyProvider } from "./DkimKeyProvider.js";
 const { Config, Logger } = ObjectDecorators;
 
@@ -67,13 +68,21 @@ export class FsDkimKeyProvider implements DkimKeyProvider {
             publicKeyEncoding: { type: "spki", format: "pem" },
         });
 
-        await fs.mkdir(this.keyDir, { recursive: true });
         // 0644, not 0600: this file is read by a different container's process (rspamd, a different Linux
         // user) over a shared volume, with no cross-container UID/GID coordination in place - see this
         // class's own doc comment. The directory itself should still be access-restricted at the volume/
         // host level in any deployment that cares about defense in depth beyond "not world-readable on the
-        // host filesystem".
-        await fs.writeFile(filePath, privateKey, { mode: 0o644 });
+        // host filesystem". The directory is created 0755 for the same reason (rspamd must be able to traverse it).
+        //
+        // Written exclusively (temp file + atomic `link()`, never overwriting): two concurrent calls for the same
+        // domain - in this process or another replica sharing the volume - each generate a key, but only the first
+        // to land wins; the loser re-reads and returns the winner's key, so the published DNS record and the key
+        // rspamd signs with can never diverge, and rspamd never reads a half-written file.
+        const created: boolean = await createFileExclusive(filePath, privateKey, 0o644, 0o755);
+        if (!created) {
+            const winnerPem: string = await fs.readFile(filePath, "utf-8");
+            return { selector: this.selector, publicKey: FsDkimKeyProvider.publicKeyFromPrivate(winnerPem) };
+        }
         this.logger?.info(`FsDkimKeyProvider: generated new DKIM key pair for domain '${domain}' (selector '${this.selector}').`);
 
         return { selector: this.selector, publicKey: FsDkimKeyProvider.publicKeyFromPrivate(privateKey) };

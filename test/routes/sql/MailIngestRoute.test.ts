@@ -477,11 +477,38 @@ describe("Route:MailIngestRouteSQL Tests", () => {
         expect(transport.sent.length).toBe(0);
     });
 
+    it("An unsubscribe without aligned passing DKIM from the trusted MTA (a forgeable envelope sender) is ignored and not fanned out.", async () => {
+        const member = await createMailbox();
+        const list = await createList({ memberAddresses: [member.primarySmtpAddress, "other@example.com"] });
+        const forgeries: string[] = [
+            `From: ${member.primarySmtpAddress}\r\nSubject: unsubscribe\r\n\r\nBye\r\n`,
+            `Authentication-Results: attacker.example; dkim=pass header.d=example.com\r\nFrom: ${member.primarySmtpAddress}\r\nSubject: unsubscribe\r\n\r\nBye\r\n`,
+            `Authentication-Results: mx.example.com; dkim=pass header.d=elsewhere.test\r\nFrom: ${member.primarySmtpAddress}\r\nSubject: unsubscribe\r\n\r\nBye\r\n`,
+            `Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\nFrom: someone-else@example.com\r\nSubject: unsubscribe\r\n\r\nBye\r\n`,
+            `Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\nFrom: ${member.primarySmtpAddress}\r\nFrom: ${member.primarySmtpAddress}\r\nSubject: unsubscribe\r\n\r\nBye\r\n`,
+        ];
+        for (const raw of forgeries) {
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/deliver`)
+                .set("Authorization", `Bearer ${secret}`)
+                .set("X-Envelope-From", member.primarySmtpAddress)
+                .set("X-Envelope-To", list.primarySmtpAddress)
+                .set("Content-Type", "message/rfc822")
+                .send(Buffer.from(raw));
+            expect(result.status).toBe(202);
+            expect(result.body.results).toEqual([{ rcpt: list.primarySmtpAddress, queued: false }]);
+        }
+        const updated = await distributionListRepo.findOne({ where: { uid: list.uid } });
+        expect(updated?.memberAddresses).toEqual([member.primarySmtpAddress, "other@example.com"]);
+        expect(objectFactory.getInstance<RecordingMailTransport>("MailTransport")!.sent.length).toBe(0);
+        expect((await ingestQueueRepo.find({ where: { mailboxUid: member.uid } })).length).toBe(0);
+    });
+
     it("A current member emailing the list with Subject: unsubscribe is removed from memberAddresses and receives a confirmation, without fan-out.", async () => {
         const member = await createMailbox();
         const list = await createList({ memberAddresses: [member.primarySmtpAddress, "other@example.com"] });
         const raw = Buffer.from(
-            `From: ${member.primarySmtpAddress}\r\nTo: ${list.primarySmtpAddress}\r\nSubject: unsubscribe\r\n\r\nBye\r\n`,
+            `Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\nFrom: ${member.primarySmtpAddress}\r\nTo: ${list.primarySmtpAddress}\r\nSubject: unsubscribe\r\n\r\nBye\r\n`,
         );
 
         const result = await request(server.getApplication())

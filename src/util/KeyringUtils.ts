@@ -5,7 +5,7 @@
 import * as crypto from "crypto";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { resolveFederationPolicy } from "./FederationUtils.js";
-import { fetchRemoteKeys, parseKeyDiscoveryResponse } from "./KeyDiscoveryClient.js";
+import { fetchRemoteKeys, parseKeyDiscoveryAddress, parseKeyDiscoveryResponse } from "./KeyDiscoveryClient.js";
 import { Contact, EncryptionPreference, KeyDiscoveryResponse, PublicKey } from "../models/types.js";
 
 /** The subset of `Contact` this module reads/writes - callers pass exactly this shape whether the caller has
@@ -140,11 +140,13 @@ export async function discoverAndMergeKeys(
     existing: ContactKeyState | undefined,
     observedAt: number = Date.now(),
 ): Promise<KeyringUpdate | undefined> {
-    const domain: string | undefined = address.split("@")[1];
-    if (!domain) {
+    // The same parser `fetchRemoteKeys()` uses, so the policy is resolved for exactly the domain keys are fetched for
+    // (e.g. `a@evil.example@victim.example` is rejected rather than split differently by each step).
+    const parsed = parseKeyDiscoveryAddress(address);
+    if (!parsed) {
         return undefined;
     }
-    const policy = await resolveFederationPolicy(dnsResolver, domain);
+    const policy = await resolveFederationPolicy(dnsResolver, parsed.domain);
     if (!policy) {
         return undefined;
     }

@@ -13,11 +13,17 @@ import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, Sca
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { hasAlignedPassingDkim } from "../util/AuthenticationResultsUtils.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
-import { deriveConversationId } from "../util/ConversationUtils.js";
+import { boundIndexedValue, deriveConversationId } from "../util/ConversationUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
+import { isHeaderOversignedByAlignedDkim } from "../util/DkimOversignUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
-import { buildEventIcs, expandOccurrences, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
+import { buildEventIcs, expandOccurrencesDetailed, OccurrenceExpansion, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
+import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
+import type { SearchProvider } from "../search/SearchProvider.js";
+import { DataSubjectErasureRequestMongo } from "../models/mongo/DataSubjectErasureRequestMongo.js";
+import { DataSubjectErasureRequestSQL } from "../models/sql/DataSubjectErasureRequestSQL.js";
+import { ERASURE_IN_PROGRESS } from "./ErasureExecutionJob.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
 import { extractHeader, extractHeaders, prependHeaders } from "../util/MimeHeaderUtils.js";
@@ -103,6 +109,24 @@ const RESOURCE_BOOKING_HORIZON_MS = 731 * MS_PER_DAY;
 const RESOURCE_BOOKING_EXISTING_ROWS_LIMIT = 500;
 /** How many pages of existing bookings `decideResourceBooking()` reads before declining as unverifiable. */
 const RESOURCE_BOOKING_MAX_PAGES = 20;
+/** How far before a booking request's start `decideResourceBooking()` looks for override rows (`recurrenceId`) of an
+ * existing recurring booking - an override moved away from an original instant slightly before the request can
+ * still vacate a phantom occurrence that overlaps it. Missing one only makes the check more conservative. */
+const RESOURCE_BOOKING_OVERRIDE_LOOKBACK_MS = MS_PER_DAY;
+
+/** The headers whose mere presence triggers a state change here, and so must be DKIM-oversigned by the `From`
+ * domain before they're honored - see `util/DkimOversignUtils.ts`. */
+const RAPIDMX_KEY_HEADER = "RapidMX-Key";
+const RECALL_HEADER = "X-RapidMX-Recall-Of";
+
+/** A claim on one `IngestQueueEntry` by this worker: `row` is always the latest version this worker wrote, so
+ * any later write (lease renewal, `DELIVERED`, `FAILED`) is version-checked against exactly that - a mismatch
+ * means another worker took the entry over (or finished it), and this worker must stop touching it. */
+interface EntryClaim<Q> {
+    row: Q;
+    /** When the current lease was granted (epoch ms) - see `renewLeaseIfDue()`. */
+    leaseGrantedAt: number;
+}
 
 /** An attachment already persisted to the `BlobStore`, ready to be attached to one or more `Message` rows. */
 interface StoredAttachment {
@@ -180,6 +204,16 @@ export abstract class ScanQueueJob<
     private oofReplySuppressionRepo?: RepoUtils<OS>;
     private focusedInboxOverrideRepo?: RepoUtils<FIO>;
     private contactRepo?: RecoverableRepoUtils<C>;
+    /** Read-only: consulted before filing so nothing is delivered into a mailbox `ErasureExecutionJob` is erasing. */
+    private erasureRequestRepo?: RepoUtils<any>;
+
+    /** The `DataSubjectErasureRequest` model class for this backend. Defaults to the Mongo or SQL class matching
+     * `ingestQueueClass`'s backend; a subclass may set it explicitly. */
+    protected dataSubjectErasureRequestClass?: any;
+
+    /** Optional - when search isn't configured, index removal is a no-op (see `removeFromSearchIndex()`). */
+    @Inject("SearchProvider")
+    private searchProvider?: SearchProvider;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -315,6 +349,19 @@ export abstract class ScanQueueJob<
             name: this.contactClass.name,
             args: [this.contactClass],
         });
+        const erasureClass: any =
+            this.dataSubjectErasureRequestClass ??
+            (String(this.ingestQueueClass?.name ?? "").endsWith("SQL") ? DataSubjectErasureRequestSQL : DataSubjectErasureRequestMongo);
+        try {
+            this.erasureRequestRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: erasureClass.name,
+                args: [erasureClass],
+            });
+        } catch (err: any) {
+            // Only possible when the datastore wasn't given this model at all (a trimmed-down wiring) - the erasure
+            // check then can't run, which is logged on every delivery attempt rather than blocking all mail.
+            this.logger?.warn(`ScanQueueJob: erasure-status checks unavailable (${erasureClass.name} repo failed to initialize): ${err?.message}`);
+        }
     }
 
     public async start(): Promise<void> {
@@ -333,25 +380,31 @@ export abstract class ScanQueueJob<
      * A processing failure schedules a retry with exponential backoff (`retry_backoff_seconds` × 2^(attempts-1))
      * until `max_attempts`, after which the entry stays `FAILED` with its last error for an operator. Delivery is
      * idempotent across retries and takeovers (see `processEntry()`), so a retry never files a second copy.
+     *
+     * `attempts` counts *claims*, not recorded failures: it's incremented inside the version-checked claim itself, so
+     * a message that kills its worker outright (and so never reaches `recordFailure()`) still exhausts
+     * `max_attempts` through repeated lease takeovers instead of crash-looping forever.
      */
     public async run(): Promise<void> {
-        const now: Date = new Date();
-        const candidates: Q[] = await this.findDueEntries(now);
+        const candidates: Q[] = await this.findDueEntries(new Date());
 
         for (const entry of candidates) {
-            let scanning: Q;
+            let claim: EntryClaim<Q> | undefined;
             try {
-                scanning = await this.claimEntry(entry, now);
+                claim = await this.claimEntry(entry);
             } catch (err: any) {
                 // Another replica claimed (or finished) it first - not an error, and nothing to record.
                 this.logger?.debug(`ScanQueueJob: skipped ingest entry ${entry.uid}, claimed elsewhere: ${err.message}`);
                 continue;
             }
+            if (!claim) {
+                continue;
+            }
             try {
-                await this.processEntry(scanning);
+                await this.processEntry(claim);
             } catch (err: any) {
                 this.logger?.error(`ScanQueueJob: failed to process ingest entry ${entry.uid}: ${err.message}`);
-                await this.recordFailure(entry, err);
+                await this.recordFailure(claim, err);
             }
         }
     }
@@ -389,45 +442,92 @@ export abstract class ScanQueueJob<
         return due.slice(0, this.batchSize);
     }
 
-    /** Claims `entry` for this worker (version-checked, so it throws when another worker got there first) and
-     * returns the claimed row. */
-    private async claimEntry(entry: Q, now: Date): Promise<Q> {
+    /**
+     * Claims `entry` for this worker with one version-checked update (it throws when another worker got there first)
+     * that also increments `attempts` and starts the lease from *now* - not from when `run()` began, which would
+     * shorten the lease of every entry later in the batch. Returns the claim, or `undefined` when the entry has
+     * already used every attempt (only reachable through lease takeovers of a worker that died mid-processing), in
+     * which case it's parked `FAILED` for good instead of being processed again.
+     */
+    private async claimEntry(entry: Q): Promise<EntryClaim<Q> | undefined> {
+        const attempts: number = (entry.attempts ?? 0) + 1;
+        if (attempts > this.maxAttempts) {
+            await this.ingestQueueRepo!.update(
+                {
+                    uid: entry.uid,
+                    version: (entry as any).version,
+                    status: IngestStatus.FAILED,
+                    errorMessage: (entry.errorMessage ?? `Abandoned by its worker after ${this.maxAttempts} attempts.`).slice(0, 4000),
+                    nextAttemptAt: null,
+                    scanLeaseExpiresAt: null,
+                } as any,
+                asEntity(this.ingestQueueRepo!, entry),
+                { ignoreACL: true },
+            );
+            this.logger?.error(`ScanQueueJob: giving up on ingest entry ${entry.uid} after ${this.maxAttempts} attempts.`);
+            return undefined;
+        }
+        const grantedAt: number = Date.now();
         await this.ingestQueueRepo!.update(
             {
                 uid: entry.uid,
                 version: (entry as any).version,
                 status: IngestStatus.SCANNING,
-                scanLeaseExpiresAt: new Date(now.getTime() + this.leaseSeconds * 1000),
+                attempts,
+                scanLeaseExpiresAt: new Date(grantedAt + this.leaseSeconds * 1000),
             } as any,
             asEntity(this.ingestQueueRepo!, entry),
             { ignoreACL: true },
         );
         // `entry` is now stale (its `version` no longer matches the persisted row) — re-fetch before the next
         // optimistic-locked update rather than reusing the pre-update snapshot.
-        return (await this.ingestQueueRepo!.findOne(entry.uid, { ignoreACL: true }))!;
+        return { row: (await this.ingestQueueRepo!.findOne(entry.uid, { ignoreACL: true }))!, leaseGrantedAt: grantedAt };
+    }
+
+    /**
+     * Extends `claim`'s lease once half of it has elapsed - called at checkpoints between `processEntry()`'s slow
+     * steps (the scan itself, filing). Version-checked like every other write to a claimed entry, so it throws when
+     * another worker already took the entry over after this lease lapsed; that aborts this worker's processing
+     * before it files anything further, and `recordFailure()` then leaves the entry to its new owner.
+     */
+    private async renewLeaseIfDue(claim: EntryClaim<Q>): Promise<void> {
+        const leaseMs: number = this.leaseSeconds * 1000;
+        const now: number = Date.now();
+        if (now - claim.leaseGrantedAt < leaseMs / 2) {
+            return;
+        }
+        await this.ingestQueueRepo!.update(
+            { uid: claim.row.uid, version: (claim.row as any).version, scanLeaseExpiresAt: new Date(now + leaseMs) } as any,
+            asEntity(this.ingestQueueRepo!, claim.row),
+            { ignoreACL: true },
+        );
+        claim.row = (await this.ingestQueueRepo!.findOne(claim.row.uid, { ignoreACL: true }))!;
+        claim.leaseGrantedAt = now;
     }
 
     /** Records a processing failure: schedules the next retry, or leaves the entry `FAILED` for good once
-     * `max_attempts` is reached. Re-fetches first, since processing may have bumped the row's version; an entry
-     * another worker has since delivered is left alone. */
-    private async recordFailure(entry: Q, err: any): Promise<void> {
+     * `max_attempts` is reached (`attempts` was already counted by the claim). Only while the entry is still this
+     * worker's claim - its version still the one this worker last wrote: an entry another worker has since taken
+     * over after a lapsed lease, or delivered, is left entirely to that worker. */
+    private async recordFailure(claim: EntryClaim<Q>, err: any): Promise<void> {
+        const uid: string = claim.row.uid;
         try {
-            const current: Q = (await this.ingestQueueRepo!.findOne(entry.uid, { ignoreACL: true })) ?? entry;
-            if (current.status === IngestStatus.DELIVERED) {
+            const current: Q | undefined = await this.ingestQueueRepo!.findOne(uid, { ignoreACL: true });
+            if (!current || (current as any).version !== (claim.row as any).version || current.status !== IngestStatus.SCANNING) {
+                this.logger?.warn(`ScanQueueJob: not recording the failure of ingest entry ${uid} - it's no longer this worker's claim.`);
                 return;
             }
-            const attempts: number = (current.attempts ?? 0) + 1;
+            const attempts: number = current.attempts ?? 1;
             const exhausted: boolean = attempts >= this.maxAttempts;
             const nextAttemptAt: Date | null = exhausted
                 ? null
                 : new Date(Date.now() + this.retryBackoffSeconds * 1000 * Math.pow(2, attempts - 1));
             await this.ingestQueueRepo!.update(
                 {
-                    uid: entry.uid,
+                    uid,
                     version: (current as any).version,
                     status: IngestStatus.FAILED,
                     errorMessage: String(err?.message ?? err).slice(0, 4000),
-                    attempts,
                     nextAttemptAt,
                     scanLeaseExpiresAt: null,
                 } as any,
@@ -435,11 +535,36 @@ export abstract class ScanQueueJob<
                 { ignoreACL: true },
             );
             if (exhausted) {
-                this.logger?.error(`ScanQueueJob: giving up on ingest entry ${entry.uid} after ${attempts} attempts.`);
+                this.logger?.error(`ScanQueueJob: giving up on ingest entry ${uid} after ${attempts} attempts.`);
             }
         } catch (updateErr: any) {
-            this.logger?.warn(`ScanQueueJob: failed to record the failure of ingest entry ${entry.uid}: ${updateErr.message}`);
+            this.logger?.warn(`ScanQueueJob: failed to record the failure of ingest entry ${uid}: ${updateErr.message}`);
         }
+    }
+
+    /**
+     * `true` when `mailboxUid` has a `DataSubjectErasureRequest` that is `"approved"` (about to run), `"in_progress"`
+     * (`ERASURE_IN_PROGRESS`, running) or `"completed"` (the mailbox's content - and normally the mailbox itself -
+     * is gone) - see `processEntry()`. Throws on a datastore error, so a transient failure retries the entry rather
+     * than filing into a mailbox that might be under erasure.
+     */
+    private async isMailboxBeingErased(mailboxUid: string): Promise<boolean> {
+        if (!this.erasureRequestRepo) {
+            this.logger?.warn(`ScanQueueJob: can't check erasure status of mailbox ${mailboxUid} - no DataSubjectErasureRequest repo.`);
+            return false;
+        }
+        const statuses: string[] = ["approved", ERASURE_IN_PROGRESS, "completed"];
+        const rows: any[] = await this.erasureRequestRepo.find({ mailboxUid, status: `in(${statuses.join(",")})`, limit: 5 } as any, {
+            ignoreACL: true,
+            limit: 5,
+            skipCache: true,
+        });
+        return rows.some((row) => row.mailboxUid === mailboxUid && statuses.includes(row.status));
+    }
+
+    /** Blob key of the marker `forwardByRuleOnce()` writes once an entry's rule forward has been relayed. */
+    private forwardMarkerKey(entryUid: string): string {
+        return `ingest-markers/${entryUid}/forwarded`;
     }
 
     /**
@@ -449,15 +574,34 @@ export abstract class ScanQueueJob<
      * files a second copy, quarantines twice or records a second `ScanResult`. Side effects that follow delivery
      * (automatic replies, iTIP) only run when this attempt actually filed the message, so a retry doesn't repeat
      * them either.
+     *
+     * **Mailbox under erasure.** An entry addressed to a mailbox with an approved, in-progress or completed
+     * `DataSubjectErasureRequest` is dropped - no `ScanResult`, quarantine, filing, recall/receipt/iTIP mutation - and
+     * closed as `DELIVERED` with an explanatory `errorMessage`: the same terminal "accepted, nothing filed" outcome a
+     * `MailFilterRule` delete produces. Dropped rather than deferred: erasure means the data subject's content must
+     * go, and a deferred message would only be filed once the cascade finished - re-creating content in an erased
+     * (or already deleted) mailbox. The entry row and its raw blob are left for `ErasureExecutionJob`, which purges
+     * `IngestQueueEntry` rows (and their blobs) by `mailboxUid`; an entry created after its purge pass already ran
+     * keeps its row and raw blob - a residual this job doesn't delete itself, since the raw blob may be shared with
+     * other recipients' entries.
      */
-    private async processEntry(scanning: Q): Promise<void> {
-        const entry: Q = scanning;
+    private async processEntry(claim: EntryClaim<Q>): Promise<void> {
+        const entry: Q = claim.row;
 
         const raw: Buffer = await this.blobStore!.get(entry.rawBlobKey);
         const result: ScanPipelineResult = await this.scanPipeline!.run(raw, {
             from: entry.envelopeFrom,
             to: entry.envelopeTo,
         });
+        // Scanning is the slow part - make sure this worker still owns the entry before writing anything.
+        await this.renewLeaseIfDue(claim);
+
+        if (await this.isMailboxBeingErased(entry.mailboxUid)) {
+            this.logger?.warn(`ScanQueueJob: dropping ingest entry ${entry.uid} - mailbox ${entry.mailboxUid} is being erased.`);
+            await this.markDelivered(claim, "Dropped: the mailbox is being erased.");
+            return;
+        }
+
         // A `TransportRule`'s `quarantine` action (stamped by `BaseMailIngestRoute.deliver()`) always wins over
         // an AV/spam-derived verdict of "deliver"/"junk" - but scanning still ran normally above, so a
         // policy-quarantined message still gets a real `ScanResult` for the reviewer to see.
@@ -489,10 +633,14 @@ export abstract class ScanQueueJob<
                 { ignoreACL: true },
             ));
 
-        // The recall header is only ever honored from the original message's own, DKIM-verified sender - see
-        // `isVerifiedSender()` and `processRecall()`. From anyone else it's ordinary mail.
+        // The recall header is only ever honored from the original message's own, DKIM-verified sender, and only when
+        // that sender's aligned signature oversigns it (so it can't be appended to some other genuinely signed message
+        // from the same domain and replayed) - see `verifiedFromAddress()`, `isOversignedByFromDomain()` and
+        // `processRecall()`. Otherwise it's ordinary mail.
         const recallOfMessageId: string | undefined =
-            result.recallOfMessageId && this.verifiedFromAddress(raw, result) ? result.recallOfMessageId : undefined;
+            result.recallOfMessageId && this.verifiedFromAddress(raw, result) && this.isOversignedByFromDomain(raw, result, RECALL_HEADER)
+                ? result.recallOfMessageId
+                : undefined;
 
         if (verdict === "quarantine") {
             if (!(await this.quarantineEntryRepo!.findOne(targetUid, { ignoreACL: true }))) {
@@ -525,7 +673,7 @@ export abstract class ScanQueueJob<
             // case `tryCorrelateAcmeChallenge()` itself returns `false` and this branch is never taken, so
             // the message falls through to ordinary delivery below rather than being silently dropped.
         } else {
-            const filed: boolean = await this.deliverMessage(entry, raw, targetUid, scanResult, result, verdict === "junk");
+            const filed: boolean = await this.deliverMessage(claim, raw, targetUid, scanResult, result, verdict === "junk");
 
             // Mail filter rules, automatic replies, and iTIP processing only apply to mail actually delivered
             // to the Inbox - matching Exchange's own behavior, junk-routed mail never runs any of them. An
@@ -539,29 +687,62 @@ export abstract class ScanQueueJob<
             }
         }
 
+        await this.markDelivered(claim);
+    }
+
+    /** Closes `claim`'s entry as `DELIVERED` (version-checked against this worker's claim), then best-effort removes
+     * the per-entry marker blob `forwardByRuleOnce()` may have written - no retry can need it any more. */
+    private async markDelivered(claim: EntryClaim<Q>, note?: string): Promise<void> {
         await this.ingestQueueRepo!.update(
-            { uid: scanning.uid, version: (scanning as any).version, status: IngestStatus.DELIVERED, scanLeaseExpiresAt: null } as any,
-            asEntity(this.ingestQueueRepo!, scanning),
+            {
+                uid: claim.row.uid,
+                version: (claim.row as any).version,
+                status: IngestStatus.DELIVERED,
+                scanLeaseExpiresAt: null,
+                ...(note ? { errorMessage: note } : {}),
+            } as any,
+            asEntity(this.ingestQueueRepo!, claim.row),
             { ignoreACL: true },
+        );
+        try {
+            await this.blobStore!.delete(this.forwardMarkerKey(claim.row.uid));
+        } catch (err: any) {
+            this.logger?.debug(`ScanQueueJob: failed to remove the forward marker of ingest entry ${claim.row.uid}: ${err?.message}`);
+        }
+    }
+
+    /** `true` if `headerName` is oversigned by a trusted-verified DKIM signature aligned with the message's `From`
+     * domain - see `util/DkimOversignUtils.ts`. */
+    private isOversignedByFromDomain(raw: Buffer, result: ScanPipelineResult, headerName: string): boolean {
+        const fromDomain: string | undefined = result.fromAddress ? normalizeAddress(result.fromAddress).split("@")[1] : undefined;
+        return (
+            !!fromDomain &&
+            isHeaderOversignedByAlignedDkim(raw, headerName, fromDomain, extractHeaders(raw, "Authentication-Results"), this.trustedAuthservId)
         );
     }
 
     /**
      * Files a "deliver"/"junk"-verdicted message, applying any matching `MailFilterRule`'s actions first (only
      * for a "deliver" verdict - `isJunk` mail skips rule evaluation entirely). A requested delivery receipt
-     * (see `maybeSendDeliveryReceipt()`) is decided and sent - or held pending approval - only for the
+     * (see `completeDeliveryReceipt()`) is decided and sent - or held pending approval - only for the
      * *primary* message (never a rule's `copyToFolderUids` copy), and not at all for a message a rule deletes
      * outright: a receipt for a message the mailbox owner's own rule routed elsewhere or discarded entirely
      * would be misleading.
+     *
+     * The receipt is only sent once the `Message` row (and its attachments/counters) exists - never before - and
+     * the send is recorded on that row (`deliveryReceiptSentAt`/`deliveryReceiptPending`), which is what a retry
+     * checks: see `completeDeliveryReceipt()`. A rule forward is likewise relayed at most once per entry, whether
+     * or not the rule also deleted the message: see `forwardByRuleOnce()`.
      */
     private async deliverMessage(
-        entry: Q,
+        claim: EntryClaim<Q>,
         raw: Buffer,
         targetUid: string,
         scanResult: SR,
         result: ScanPipelineResult,
         isJunk: boolean,
     ): Promise<boolean> {
+        const entry: Q = claim.row;
         // Independent of everything below (filtering, filing, junk classification) - `specs/
         // end-to-end_encryption.md`'s "Only inbound messages are processed, keyed on the From address" rule
         // applies to every delivered message regardless of which folder (or none) it ends up filed into.
@@ -603,7 +784,10 @@ export abstract class ScanQueueJob<
         }
 
         if (filterResult.deleted && filterResult.copyToFolderUids.length === 0) {
-            // The message is discarded outright and no rule asked for a copy anywhere - nothing further to file.
+            // The message is discarded outright and no rule asked for a copy anywhere - nothing further to file, but a
+            // matching rule's forward still applies (Exchange's "forward, then delete" rule combination).
+            await this.renewLeaseIfDue(claim);
+            await this.forwardByRuleOnce(entry, raw, result, filterResult.forwardTo);
             return true;
         }
 
@@ -616,6 +800,8 @@ export abstract class ScanQueueJob<
             if (existingFolder) {
                 await this.attachRows(storedAttachments, existing, existingFolder, entry.mailboxUid);
             }
+            // The earlier attempt may have failed after filing but before its receipt was sent/recorded.
+            await this.completeDeliveryReceipt(entry, raw, result, existing);
         } else if (!filterResult.deleted) {
             const defaultFolderType = isJunk ? FolderType.JUNK : FolderType.INBOX;
             const folder: F = await this.resolveTargetFolder(entry.mailboxUid, filterResult.moveToFolderUid, defaultFolderType);
@@ -630,45 +816,7 @@ export abstract class ScanQueueJob<
                 isJunk,
                 conversationId,
             );
-            // A delivery receipt (if requested) is decided and sent - or held pending approval - before the
-            // row exists, so the outcome can be written directly into the initial `create()` rather than a
-            // second follow-up `update()`. Gated on `dispositionNotificationTo` being present at all: the
-            // overwhelmingly common case is no receipt requested, which costs nothing beyond one property
-            // check - no mailbox lookup, no `classifyRecipientTier()` query.
-            let deliveryReceiptSentAt: Date | undefined;
-            let deliveryReceiptPending = false;
-            // `specs/end-to-end_encryption.md` §Header Integrity: `Disposition-Notification-To` MUST be
-            // DKIM-verified (an unverified header is treated as absent) and MUST be compared against `From`
-            // before a response is generated, so an attacker can't inject an arbitrary redirect address into a
-            // message and turn this mailbox into an MDN reflector. Also gated on RFC 3834 auto-reply
-            // eligibility (`isAutoReplyEligible()`, the same check `maybeSendAutoReply()` uses) - an MDN is
-            // itself an automatic reply and shouldn't be generated for bulk/auto-submitted mail either.
-            if (
-                result.dispositionNotificationTo &&
-                result.fromAddress &&
-                normalizeAddress(result.dispositionNotificationTo) === normalizeAddress(result.fromAddress) &&
-                hasAlignedPassingDkim(
-                    extractHeaders(raw, "Authentication-Results"),
-                    result.fromAddress.split("@")[1] ?? "",
-                    this.trustedAuthservId,
-                ) &&
-                isAutoReplyEligible(entry.envelopeFrom, {
-                    autoSubmittedHeader: result.autoSubmittedHeader,
-                    precedenceHeader: result.precedenceHeader,
-                })
-            ) {
-                const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
-                if (mailbox) {
-                    const outcome = await this.maybeSendDeliveryReceipt(
-                        result.dispositionNotificationTo,
-                        mailbox,
-                        messageId,
-                        result.subject ?? "",
-                    );
-                    deliveryReceiptSentAt = outcome.sentAt;
-                    deliveryReceiptPending = outcome.pending;
-                }
-            }
+            await this.renewLeaseIfDue(claim);
             const message: M = await this.messageRepo!.create(
                 new this.messageClass({
                     uid: targetUid,
@@ -694,14 +842,14 @@ export abstract class ScanQueueJob<
                     encrypted: result.encrypted,
                     scanResultUid: scanResult.uid,
                     dispositionNotificationTo: result.dispositionNotificationTo,
-                    deliveryReceiptSentAt,
-                    deliveryReceiptPending,
+                    deliveryReceiptPending: false,
                 }),
                 { ignoreACL: true },
             );
             this.notificationUtils?.sendMessage(folder.uid, this.messageClass.name, "create", message);
             await this.attachRows(storedAttachments, message, folder, entry.mailboxUid);
             await this.bumpFolderCounters(folder, filterResult.markRead ? 0 : 1);
+            await this.completeDeliveryReceipt(entry, raw, result, message);
         }
 
         for (const copyFolderUid of filterResult.copyToFolderUids) {
@@ -765,10 +913,99 @@ export abstract class ScanQueueJob<
             await this.bumpFolderCounters(copyFolder, filterResult.markRead ? 0 : 1);
         }
 
-        if (!alreadyFiled && filterResult.forwardTo.length > 0) {
-            await this.forwardByRule(entry, raw, result, filterResult.forwardTo);
-        }
+        await this.renewLeaseIfDue(claim);
+        await this.forwardByRuleOnce(entry, raw, result, filterResult.forwardTo);
         return !alreadyFiled;
+    }
+
+    /**
+     * Relays a rule forward (`forwardByRule()`) at most once per ingest entry, across retries and whether or not
+     * the rule also deleted the message (so there may be no `Message` row to remember it by). Idempotency is a
+     * marker blob keyed by the entry's uid (`forwardMarkerKey()`), checked before and written right *after* the
+     * relay - the same "send, then record" order `completeDeliveryReceipt()` uses - so only a failure between the
+     * relay and the marker write can repeat it. `markDelivered()` removes the marker once the entry is closed.
+     */
+    private async forwardByRuleOnce(entry: Q, raw: Buffer, result: ScanPipelineResult, forwardTo: string[]): Promise<void> {
+        if (forwardTo.length === 0) {
+            return;
+        }
+        const markerKey: string = this.forwardMarkerKey(entry.uid);
+        if (await this.blobStore!.exists(markerKey)) {
+            return;
+        }
+        await this.forwardByRule(entry, raw, result, forwardTo);
+        await this.blobStore!.put(markerKey, Buffer.from(new Date().toISOString(), "utf-8"), { contentType: "text/plain" });
+    }
+
+    /**
+     * Sends (or holds pending approval) the delivery receipt `message` asked for, *after* the row has been filed, and
+     * records the outcome on the row with a version-checked update. Re-reads the row first and does nothing when a
+     * receipt was already sent, is pending, or was declined - so a retry of an entry whose earlier attempt filed the
+     * message never sends a second receipt, and one whose earlier attempt failed before its receipt went out still
+     * sends it. The send is recorded right after it happens; only a failure of that one write can repeat it.
+     *
+     * Gated exactly as before: `specs/end-to-end_encryption.md` §Header Integrity - `Disposition-Notification-To`
+     * MUST be DKIM-verified (an unverified header is treated as absent) and MUST equal `From`, so an attacker can't
+     * turn this mailbox into an MDN reflector - plus RFC 3834 auto-reply eligibility (`isAutoReplyEligible()`), since
+     * an MDN is itself an automatic reply.
+     */
+    private async completeDeliveryReceipt(entry: Q, raw: Buffer, result: ScanPipelineResult, message: M): Promise<void> {
+        if (
+            !result.dispositionNotificationTo ||
+            !result.fromAddress ||
+            normalizeAddress(result.dispositionNotificationTo) !== normalizeAddress(result.fromAddress) ||
+            !hasAlignedPassingDkim(extractHeaders(raw, "Authentication-Results"), result.fromAddress.split("@")[1] ?? "", this.trustedAuthservId) ||
+            !isAutoReplyEligible(entry.envelopeFrom, {
+                autoSubmittedHeader: result.autoSubmittedHeader,
+                precedenceHeader: result.precedenceHeader,
+            })
+        ) {
+            return;
+        }
+        const current: M | undefined = await this.messageRepo!.findOne(message.uid, { ignoreACL: true });
+        if (!current || current.deliveryReceiptSentAt || current.deliveryReceiptPending || current.deliveryReceiptDeclined) {
+            return;
+        }
+        const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            return;
+        }
+
+        const tier = await classifyRecipientTier(
+            this._objectFactory!,
+            this.domainClass,
+            result.dispositionNotificationTo,
+            createFederatedPeerCheck(this.dnsResolver!),
+        );
+        const autoSend: boolean =
+            tier === "same-org"
+                ? mailbox.autoSendReceiptsInternal
+                : tier === "federated"
+                  ? mailbox.autoSendReceiptsFederated
+                  : mailbox.autoSendReceiptsExternal;
+        let patch: Record<string, any>;
+        if (!autoSend) {
+            // Left for the mailbox owner's explicit approval (`BaseMessageRoute`'s `POST /:id/receipt/approve`).
+            patch = { deliveryReceiptPending: true };
+        } else {
+            const sent: boolean = await this.sendDispositionNotification(
+                result.dispositionNotificationTo,
+                mailbox,
+                current.messageId,
+                current.subject ?? "",
+                "delivery",
+            );
+            if (!sent) {
+                // Best-effort, as before: a failed send is logged and not left "pending".
+                return;
+            }
+            patch = { deliveryReceiptSentAt: new Date() };
+        }
+        await this.messageRepo!.update(
+            { uid: current.uid, version: (current as any).version, ...patch } as any,
+            asEntity(this.messageRepo!, current),
+            { ignoreACL: true },
+        );
     }
 
     /**
@@ -868,10 +1105,14 @@ export abstract class ScanQueueJob<
         }
 
         let discovered: KeyDiscoveryResponse | undefined;
-        const keyHeaders: string[] = extractHeaders(raw, "RapidMX-Key");
+        const keyHeaders: string[] = extractHeaders(raw, RAPIDMX_KEY_HEADER);
+        // Aligned, passing DKIM alone isn't enough: the header must also be *oversigned* by that aligned signature,
+        // or anyone holding one genuinely signed message from this domain could append their own key header to it
+        // and replay it (`util/DkimOversignUtils.ts`).
         if (
             keyHeaders.length > 0 &&
-            hasAlignedPassingDkim(extractHeaders(raw, "Authentication-Results"), fromDomain, this.trustedAuthservId)
+            hasAlignedPassingDkim(extractHeaders(raw, "Authentication-Results"), fromDomain, this.trustedAuthservId) &&
+            isHeaderOversignedByAlignedDkim(raw, RAPIDMX_KEY_HEADER, fromDomain, extractHeaders(raw, "Authentication-Results"), this.trustedAuthservId)
         ) {
             const parsed = parseRapidMxKeyHeader(keyHeaders, fromAddress);
             if (parsed) {
@@ -926,7 +1167,7 @@ export abstract class ScanQueueJob<
         if (existingContact) {
             await this.contactRepo!.update(
                 { uid: existingContact.uid, version: (existingContact as any).version, ...update, lastMessageSeen: now } as any,
-                asEntity(this.ingestQueueRepo!, existingContact),
+                asEntity(this.contactRepo!, existingContact),
                 { ignoreACL: true },
             );
             return;
@@ -1170,10 +1411,15 @@ export abstract class ScanQueueJob<
             return;
         }
 
-        const existing: OS[] = await this.oofReplySuppressionRepo!.find(
-            { mailboxUid: entry.mailboxUid, senderAddress: entry.envelopeFrom, limit: 1 } as any,
-            { ignoreACL: true, limit: 1 },
-        );
+        // Stored bounded (`OofReplySuppression`'s constructor), so looked up bounded; re-checked in memory since the
+        // unchecked envelope sender could otherwise be read as a query operator (e.g. `ne(x)`).
+        const senderKey: string = boundIndexedValue(entry.envelopeFrom);
+        const existing: OS[] = (
+            await this.oofReplySuppressionRepo!.find({ mailboxUid: entry.mailboxUid, senderAddress: senderKey, limit: 1 } as any, {
+                ignoreACL: true,
+                limit: 1,
+            })
+        ).filter((row) => row.senderAddress === senderKey);
         const suppression: OS | undefined = existing[0];
         if (suppression) {
             const resuppressWindowMs = this.resuppressAfterHours * 60 * 60 * 1000;
@@ -1249,17 +1495,22 @@ export abstract class ScanQueueJob<
      */
     private async processRecall(entry: Q, raw: Buffer, result: ScanPipelineResult, recallOfMessageId: string): Promise<void> {
         const sender: string = this.verifiedFromAddress(raw, result)!;
+        // `Message.messageId` is stored bounded (`boundIndexedValue()`), so the lookup is bounded too - and re-checked for
+        // exact equality, since a sender-supplied value like `ne(x)` would otherwise be parsed as a query operator.
+        const messageKey: string = boundIndexedValue(recallOfMessageId);
         const matches: M[] = (
             await this.messageRepo!.find(
-                { mailboxUid: entry.mailboxUid, messageId: recallOfMessageId, limit: 5 } as any,
+                { mailboxUid: entry.mailboxUid, messageId: messageKey, limit: 5 } as any,
                 { ignoreACL: true, limit: 5 },
             )
-        ).filter((message) => normalizeAddress(message.from?.address ?? "") === sender);
-        const target: M | undefined = matches.find((message) => !message.flags.read);
+        ).filter((message) => message.messageId === messageKey && normalizeAddress(message.from?.address ?? "") === sender);
+        const target: M | undefined = matches.find((message) => !message.flags?.read);
 
         let outcome: "succeeded" | "already_read" | "not_found";
-        if (target) {
+        if (target && (await this.lockUnreadForRecall(target))) {
             await this.messageRepo!.delete(target.uid, { ignoreACL: true });
+            // Recalled content must stop being searchable, not just hidden from folder views.
+            await removeFromSearchIndex(this.searchProvider, "message", target.uid, this.logger);
             outcome = "succeeded";
         } else {
             outcome = matches.length > 0 ? "already_read" : "not_found";
@@ -1274,6 +1525,33 @@ export abstract class ScanQueueJob<
      * behavior (a normal email in the sender's Inbox, not a synced status flag). Best-effort, same as every
      * other cross-mailbox notification in this codebase.
      */
+    /**
+     * Confirms `target` is still unread with a version-checked no-op write (bumping its version) right before
+     * `processRecall()` deletes it, so a read that lands between the recall's `find()` and its delete makes the
+     * recall report "already read" instead of silently deleting a message the recipient has just opened. Retries
+     * a version conflict caused by some other change a few times. `RepoUtils.delete()` itself has no version
+     * check, so this narrows the race to the gap between this write and the delete rather than closing it.
+     */
+    private async lockUnreadForRecall(target: M): Promise<boolean> {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            const current: M | undefined = await this.messageRepo!.findOne(target.uid, { ignoreACL: true });
+            if (!current || current.deleted || current.flags?.read) {
+                return false;
+            }
+            try {
+                await this.messageRepo!.update(
+                    { uid: current.uid, version: (current as any).version, flags: current.flags } as any,
+                    asEntity(this.messageRepo!, current),
+                    { ignoreACL: true, skipPush: true },
+                );
+                return true;
+            } catch (err: any) {
+                this.logger?.debug(`ScanQueueJob: recall lock on message ${target.uid} conflicted (attempt ${attempt}): ${err?.message}`);
+            }
+        }
+        return false;
+    }
+
     private async sendRecallReport(entry: Q, sender: string, outcome: "succeeded" | "already_read" | "not_found"): Promise<void> {
         const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
@@ -1371,54 +1649,8 @@ export abstract class ScanQueueJob<
     }
 
     /**
-     * Decides and, if appropriate, immediately sends the delivery-receipt MDN for a message about to be filed
-     * into `mailbox`'s Inbox - called from `deliverMessage()` only when `dispositionNotificationTo` (the
-     * requester's address, from the inbound `Disposition-Notification-To` header) is present at all.
-     *
-     * The requester is classified via `classifyRecipientTier()` (`util/DomainUtils.ts` - same-org/federated/
-     * external, built on the same "this server's domains" check Focused Inbox's own `classifyForInbox()`
-     * already uses), which decides whether `Mailbox.autoSendReceiptsInternal`/`Federated`/`External` applies.
-     * When that setting is `false`, nothing is sent - the receipt is left for the mailbox owner's explicit
-     * approval instead (see `BaseMessageRoute`'s `POST /:id/receipt/approve`/`/decline`, which call
-     * `sendDispositionNotification()` below directly). A send failure is logged and treated the same as never
-     * having sent one at all (not left "pending") - matching every other best-effort cross-mailbox
-     * notification in this class, none of which retry.
-     */
-    private async maybeSendDeliveryReceipt(
-        dispositionNotificationTo: string,
-        mailbox: X,
-        originalMessageId: string,
-        originalSubject: string,
-    ): Promise<{ sentAt?: Date; pending: boolean }> {
-        const tier = await classifyRecipientTier(
-            this._objectFactory!,
-            this.domainClass,
-            dispositionNotificationTo,
-            createFederatedPeerCheck(this.dnsResolver!),
-        );
-        const autoSend: boolean =
-            tier === "same-org"
-                ? mailbox.autoSendReceiptsInternal
-                : tier === "federated"
-                  ? mailbox.autoSendReceiptsFederated
-                  : mailbox.autoSendReceiptsExternal;
-        if (!autoSend) {
-            return { pending: true };
-        }
-
-        const sent: boolean = await this.sendDispositionNotification(
-            dispositionNotificationTo,
-            mailbox,
-            originalMessageId,
-            originalSubject,
-            "delivery",
-        );
-        return sent ? { sentAt: new Date(), pending: false } : { pending: false };
-    }
-
-    /**
      * Composes and relays one real RFC 3798 MDN via `util/ReceiptUtils.ts`'s `buildDispositionNotification()`
-     * - shared by `maybeSendDeliveryReceipt()` (called automatically at delivery time) and
+     * - shared by `completeDeliveryReceipt()` (called automatically at delivery time) and
      * `BaseMessageRoute`'s `POST /:id/receipt/approve` (called explicitly, once the mailbox owner approves a
      * receipt this method originally declined to auto-send). Returns whether the send actually succeeded, so
      * each caller can decide for itself what to persist (a `*SentAt` stamp vs. leaving a pending flag alone).
@@ -1533,10 +1765,11 @@ export abstract class ScanQueueJob<
             await this.maybeRefreshRotatedKey(entry.mailboxUid, parsed.finalRecipient);
         }
 
-        const matches: M[] = await this.messageRepo!.find(
-            { mailboxUid: entry.mailboxUid, messageId: parsed.originalMessageId, limit: 5 } as any,
-            { ignoreACL: true, limit: 5 },
-        );
+        // Bounded and exact-matched for the same reasons as `processRecall()`'s lookup.
+        const messageKey: string = boundIndexedValue(parsed.originalMessageId);
+        const matches: M[] = (
+            await this.messageRepo!.find({ mailboxUid: entry.mailboxUid, messageId: messageKey, limit: 5 } as any, { ignoreACL: true, limit: 5 })
+        ).filter((message) => message.messageId === messageKey);
         const target: M | undefined = matches[0];
         if (!target) {
             return;
@@ -1611,9 +1844,13 @@ export abstract class ScanQueueJob<
         }
     }
 
-    /** Every `CalendarEvent` row in `mailboxUid` sharing `icalUid` (a master and its override rows). */
+    /** Every `CalendarEvent` row in `mailboxUid` sharing `icalUid` (a master and its override rows). `icalUid` is
+     * stored bounded (`boundIndexedValue()`), so it's looked up bounded, and exact-matched in memory: a sender-supplied
+     * UID like `ne(x)` would otherwise be parsed as a query operator and match (and let a CANCEL delete) other events. */
     private async findCalendarEventRows(mailboxUid: string, icalUid: string): Promise<CE[]> {
-        return await this.calendarEventRepo!.find({ mailboxUid, icalUid, limit: 50 } as any, { ignoreACL: true, limit: 50 });
+        const key: string = boundIndexedValue(icalUid);
+        const rows: CE[] = await this.calendarEventRepo!.find({ mailboxUid, icalUid: key, limit: 50 } as any, { ignoreACL: true, limit: 50 });
+        return rows.filter((row) => row.icalUid === key);
     }
 
     /** Finds the `CalendarEvent` row in `mailboxUid` matching `(icalUid, recurrenceId)` together, if any. */
@@ -1734,8 +1971,8 @@ export abstract class ScanQueueJob<
      * policy checks (duration/booking-window limits evaluated against the request's first occurrence only,
      * matching real Exchange's "can't partially book a series" behavior, then conflict detection unless
      * `allowConflicts` is set). Both the incoming request and every existing booking are expanded through
-     * `expandOccurrences()` so a recurring series is checked occurrence-by-occurrence, not just at its first
-     * instance - see this job's own doc comment / the plan this shipped under for the full rationale.
+     * `expandOccurrencesDetailed()` so a recurring series is checked occurrence-by-occurrence, not just at its first
+     * instance; an expansion a safety cap truncated (either side) declines, since it can't prove "no conflict".
      */
     private async decideResourceBooking(mailbox: X, parsed: ParsedIcsEvent): Promise<AttendeeResponseStatus> {
         const startDate = parsed.startDate!;
@@ -1761,41 +1998,75 @@ export abstract class ScanQueueJob<
         }
 
         const horizonEnd = new Date(startDate.getTime() + RESOURCE_BOOKING_HORIZON_MS);
-        const requestedOccurrences: OccurrenceWindow[] = expandOccurrences(
-            { startDate, endDate, recurrenceRule: parsed.recurrenceRule, timezone: parsed.timezone },
+        const requested: OccurrenceExpansion = expandOccurrencesDetailed(
+            // `allDay: false` matches the row `processItipRequest()` stores for this request (`ParsedIcsEvent` carries
+            // no all-day flag); `timezone` keeps a recurring request's wall-clock stepping DST-correct.
+            { startDate, endDate, recurrenceRule: parsed.recurrenceRule, timezone: parsed.timezone, allDay: false },
             startDate,
             horizonEnd,
             parsed.recurrenceRule?.exceptions,
         );
-
-        // Every booking that could overlap: rows starting before the horizon ends (a recurring master that started
-        // long ago can still recur into the requested window, so there's no lower bound), read page by page in a
-        // stable order rather than the first N rows the database happens to return. A calendar too large to read
-        // completely declines, rather than risking a double booking on the rows it didn't read.
-        const existingRows: CE[] = [];
-        for (let page = 0; ; page++) {
-            if (page >= RESOURCE_BOOKING_MAX_PAGES) {
-                this.logger?.warn(`ScanQueueJob: declining booking request ${parsed.uid} for resource ${mailbox.uid} - too many existing bookings to check for conflicts.`);
-                return AttendeeResponseStatus.DECLINED;
+        if (requested.truncated) {
+            // Every occurrence past the expansion cap would go unchecked - can't prove there's no conflict.
+            this.logger?.warn(`ScanQueueJob: declining booking request ${parsed.uid} for resource ${mailbox.uid} - too many requested occurrences to check for conflicts.`);
+            return AttendeeResponseStatus.DECLINED;
+        }
+        // Per-occurrence overrides sent alongside the master move (or keep) individual occurrences. Their own windows are
+        // checked *in addition to* the master's unmodified occurrences, not instead of them: only the master row is
+        // stored for this booking, so the vacated original instants still read as busy to every later request - checking
+        // both keeps this decision consistent with what's persisted while never accepting a moved occurrence that
+        // conflicts. A cancelled override adds nothing.
+        for (const override of parsed.overrides ?? []) {
+            if (override.startDate && override.endDate && override.status?.toUpperCase() !== "CANCELLED" && override.startDate.getTime() < horizonEnd.getTime()) {
+                requested.occurrences.push({ start: override.startDate, end: override.endDate });
             }
-            const rows: CE[] = await this.calendarEventRepo!.find(
-                {
-                    mailboxUid: mailbox.uid,
-                    startDate: `lt(${horizonEnd.toISOString()})`,
-                    sort: { startDate: "ASC", uid: "ASC" },
-                    limit: RESOURCE_BOOKING_EXISTING_ROWS_LIMIT,
-                    page,
-                } as any,
-                { ignoreACL: true, limit: RESOURCE_BOOKING_EXISTING_ROWS_LIMIT, page, skipCache: true },
-            );
-            existingRows.push(...rows.filter((row) => !!row.recurrenceRule || new Date(row.endDate).getTime() > startDate.getTime()));
-            if (rows.length < RESOURCE_BOOKING_EXISTING_ROWS_LIMIT) {
-                break;
+        }
+        if (requested.occurrences.length === 0) {
+            return AttendeeResponseStatus.ACCEPTED;
+        }
+        // Existing bookings only matter where they could touch a requested occurrence.
+        const windowStart: Date = new Date(Math.min(...requested.occurrences.map((occurrence) => occurrence.start.getTime())));
+        const windowEnd: Date = new Date(Math.max(...requested.occurrences.map((occurrence) => occurrence.end.getTime())));
+
+        // Three bounded reads instead of "every row starting before the horizon" (which also returned every past
+        // booking, so a resource with a long history hit the page cap and declined everything):
+        // 1. rows that themselves overlap the window (non-recurring bookings and override rows, plus any recurring
+        //    master whose first instance does);
+        // 2. recurring masters, whose later occurrences can reach the window however long ago they started - ended
+        //    series (`until` before the window) are dropped in memory, since `recurrenceRule` isn't queryable by field
+        //    on the SQL backend;
+        // 3. override rows near/after the window, whose `recurrenceId`s exclude the master's phantom occurrence.
+        // A read too large to complete declines, rather than risking a double booking on the rows it didn't see.
+        const overlapping: CE[] | undefined = await this.readBookingPages({
+            mailboxUid: mailbox.uid,
+            startDate: `lt(${windowEnd.toISOString()})`,
+            endDate: `gt(${windowStart.toISOString()})`,
+        });
+        const masters: CE[] | undefined = overlapping && (await this.readBookingPages({ mailboxUid: mailbox.uid, recurrenceRule: "ne(null)" }));
+        const overrides: CE[] | undefined =
+            masters &&
+            (await this.readBookingPages({
+                mailboxUid: mailbox.uid,
+                recurrenceId: `gte(${new Date(windowStart.getTime() - RESOURCE_BOOKING_OVERRIDE_LOOKBACK_MS).toISOString()})`,
+            }));
+        if (!overlapping || !masters || !overrides) {
+            this.logger?.warn(`ScanQueueJob: declining booking request ${parsed.uid} for resource ${mailbox.uid} - too many existing bookings to check for conflicts.`);
+            return AttendeeResponseStatus.DECLINED;
+        }
+
+        const candidates: Map<string, CE> = new Map();
+        for (const row of overlapping) {
+            candidates.set(row.uid, row);
+        }
+        for (const row of masters) {
+            const until: Date | undefined = row.recurrenceRule?.until ? new Date(row.recurrenceRule.until) : undefined;
+            if (!row.recurrenceId && (!until || Number.isNaN(until.getTime()) || until.getTime() >= windowStart.getTime())) {
+                candidates.set(row.uid, row);
             }
         }
 
-        for (const candidateRow of existingRows) {
-            if (candidateRow.icalUid === parsed.uid) {
+        for (const candidateRow of candidates.values()) {
+            if (candidateRow.icalUid === boundIndexedValue(parsed.uid)) {
                 // A prior row of this very request (a resend/update) - never conflicts with itself.
                 continue;
             }
@@ -1803,12 +2074,12 @@ export abstract class ScanQueueJob<
             const excludeDates = isMaster
                 ? [
                       ...(candidateRow.recurrenceRule?.exceptions ?? []),
-                      ...existingRows
+                      ...[...overlapping, ...overrides]
                           .filter((row) => row.icalUid === candidateRow.icalUid && row.recurrenceId)
                           .map((row) => row.recurrenceId!),
                   ]
                 : undefined;
-            const existingOccurrences = expandOccurrences(
+            const existing: OccurrenceExpansion = expandOccurrencesDetailed(
                 {
                     startDate: candidateRow.startDate,
                     endDate: candidateRow.endDate,
@@ -1816,16 +2087,20 @@ export abstract class ScanQueueJob<
                     timezone: candidateRow.timezone,
                     allDay: candidateRow.allDay,
                 },
-                startDate,
-                horizonEnd,
+                windowStart,
+                windowEnd,
                 excludeDates,
             );
+            if (existing.truncated) {
+                this.logger?.warn(`ScanQueueJob: declining booking request ${parsed.uid} for resource ${mailbox.uid} - existing booking ${candidateRow.uid} has too many occurrences to check for conflicts.`);
+                return AttendeeResponseStatus.DECLINED;
+            }
 
-            for (const requested of requestedOccurrences) {
-                for (const existingOccurrence of existingOccurrences) {
+            for (const requestedOccurrence of requested.occurrences) {
+                for (const existingOccurrence of existing.occurrences) {
                     if (
-                        requested.start.getTime() < existingOccurrence.end.getTime() &&
-                        requested.end.getTime() > existingOccurrence.start.getTime()
+                        requestedOccurrence.start.getTime() < existingOccurrence.end.getTime() &&
+                        requestedOccurrence.end.getTime() > existingOccurrence.start.getTime()
                     ) {
                         return AttendeeResponseStatus.DECLINED;
                     }
@@ -1834,6 +2109,23 @@ export abstract class ScanQueueJob<
         }
 
         return AttendeeResponseStatus.ACCEPTED;
+    }
+
+    /** Reads every page of a resource's `CalendarEvent` rows matching `criteria`, in a stable order - or `undefined`
+     * once `RESOURCE_BOOKING_MAX_PAGES` full pages have been read without reaching the end. */
+    private async readBookingPages(criteria: Record<string, any>): Promise<CE[] | undefined> {
+        const all: CE[] = [];
+        for (let page = 0; page < RESOURCE_BOOKING_MAX_PAGES; page++) {
+            const rows: CE[] = await this.calendarEventRepo!.find(
+                { ...criteria, sort: { startDate: "ASC", uid: "ASC" }, limit: RESOURCE_BOOKING_EXISTING_ROWS_LIMIT, page } as any,
+                { ignoreACL: true, limit: RESOURCE_BOOKING_EXISTING_ROWS_LIMIT, page, skipCache: true },
+            );
+            all.push(...rows);
+            if (rows.length < RESOURCE_BOOKING_EXISTING_ROWS_LIMIT) {
+                return all;
+            }
+        }
+        return undefined;
     }
 
     /**
@@ -1900,6 +2192,13 @@ export abstract class ScanQueueJob<
             this.logger?.warn(`ScanQueueJob: ignoring iTIP REPLY for event ${parsed.uid} - its sender isn't the attendee replying.`);
             return;
         }
+        // RFC 5546 §2.1.5: a REPLY to an older revision of the event (lower SEQUENCE) is stale - applying it would
+        // resurrect a response the attendee gave to a meeting that has since changed. Same-SEQUENCE replies are still
+        // applied in arrival order: `parseIcsEvent()` doesn't expose DTSTAMP, and no per-attendee reply stamp is stored.
+        if ((parsed.sequence ?? 0) < (existing.sequence ?? 0)) {
+            this.logger?.info(`ScanQueueJob: ignoring stale iTIP REPLY for event ${parsed.uid} (SEQUENCE ${parsed.sequence} < ${existing.sequence}).`);
+            return;
+        }
 
         const attendees = existing.attendees.map((attendee) =>
             normalizeAddress(attendee.address) === sender ? { ...attendee, responseStatus: replyingAttendee.partstat! } : attendee,
@@ -1919,6 +2218,15 @@ export abstract class ScanQueueJob<
         }
         if (!this.isOrganizerOf(rows, sender)) {
             this.logger?.warn(`ScanQueueJob: ignoring iTIP CANCEL for event ${parsed.uid} - its sender isn't the event's organizer.`);
+            return;
+        }
+        // A CANCEL for an older revision (lower SEQUENCE than the row it would cancel - the matching override, else the
+        // master) is stale: the organizer has since re-sent the meeting, so it must not delete the current copy.
+        const cancelled: CE | undefined =
+            (parsed.recurrenceId ? rows.find((row) => recurrenceIdsMatch(row.recurrenceId, parsed.recurrenceId)) : undefined) ??
+            rows.find((row) => !row.recurrenceId);
+        if (cancelled && (parsed.sequence ?? 0) < (cancelled.sequence ?? 0)) {
+            this.logger?.info(`ScanQueueJob: ignoring stale iTIP CANCEL for event ${parsed.uid} (SEQUENCE ${parsed.sequence} < ${cancelled.sequence}).`);
             return;
         }
 

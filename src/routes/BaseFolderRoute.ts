@@ -15,6 +15,7 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import type { CalendarShareLink, Folder } from "../models/types.js";
+import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 const { Get, Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** See the identical constants (and why they're duplicated rather than shared) on `BaseScopedChildRoute.ts`. */
@@ -124,6 +125,25 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         return { uid: `${SHARE_TOKEN_UID_PREFIX}${token}`, roles: [], scopes: [] };
     }
 
+    /** Whether `user` may see soft-deleted folders under `aclUid`: DELETE and UPDATE there (see
+     * `BaseScopedChildRoute.canViewDeleted()`). */
+    private async canViewDeleted(user: JWTUser | undefined, aclUid: string): Promise<boolean> {
+        return (
+            (await this.aclUtils!.hasPermission(user, aclUid, ACLAction.DELETE)) &&
+            (await this.aclUtils!.hasPermission(user, aclUid, ACLAction.UPDATE))
+        );
+    }
+
+    /** The list filter for `find()`/`count()`: the client query can't widen the checked mailbox (see
+     * `stripUnsafeQueryKeys()`), and a `deleted` filter is dropped unless `user` may view deleted folders. */
+    private async listFilter(params: any, query: any, mailboxUid: string, user: JWTUser | undefined): Promise<any> {
+        const filter: any = { ...stripUnsafeQueryKeys(query), ...params, mailboxUid: `eq(${mailboxUid})` };
+        if ("deleted" in filter && !(await this.canViewDeleted(user, mailboxUid))) {
+            delete filter.deleted;
+        }
+        return filter;
+    }
+
     /** Drops `SERVER_MANAGED_FOLDER_FIELDS` from a non-trusted caller's update patch. */
     private stripServerManagedFields(obj: Record<string, any>, user: JWTUser | undefined): void {
         if (user && UserUtils.hasRoles(user, this.trustedRoles)) {
@@ -136,6 +156,9 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
 
     /** Runs for `update()` (via its `@Validate`) and each element of `updateBulk()` - the patch is persisted by reference. */
     protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser): Promise<void> {
+        // Dotted/`$` keys are Mongo update paths past this check - see `util/RequestBodyUtils.ts`.
+        assertNoPathKeys(obj);
+        stripClientId(obj);
         this.stripServerManagedFields(obj as Record<string, any>, user);
         return super.validateUpdate(id, obj, user);
     }
@@ -143,6 +166,7 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
     /** `CRUDRoute.updateProperty()` validates a throwaway wrapper and persists the raw value, so the field check is
      * repeated here against the property itself. */
     public async updateProperty(id: string, propertyName: string, obj: any, user?: JWTUser): Promise<T> {
+        assertPlainPropertyName(propertyName);
         const patch: Record<string, any> = { [propertyName]: obj };
         this.stripServerManagedFields(patch, user);
         if (!(propertyName in patch)) {
@@ -169,7 +193,7 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
             return res.status(200).setHeader("content-length", 0);
         }
         const result: number = await this.repoUtils.count(
-            { ...stripUnsafeQueryKeys(query), ...params, mailboxUid: `eq(${mailboxUid})` },
+            await this.listFilter(params, query, mailboxUid, user),
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
         return res.status(200).setHeader("content-length", result);
@@ -198,7 +222,8 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
             // equals the new record's and adds the creator to it with full rights, so a client-chosen uid naming
             // another mailbox (uid = its address), a class ACL (`Mailbox`, `Domain`, ...) or an orphaned folder ACL
             // would hand the caller that ACL. The counters start at zero whatever the body says.
-            const { uid: _uid, ...fields } = raw as any;
+            // `_id` would replace another document on Mongo; `version`/dates and path keys are never the client's.
+            const { uid: _uid, ...fields } = stripClientCreateFields({ ...(raw as any) });
             const instance: T = this.repoUtils.instantiateObject({ ...fields, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 });
             const created: T = await this.repoUtils.create(instance, {
                 user,
@@ -225,7 +250,7 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         }
         // The client query can't widen the checked mailbox - see `stripUnsafeQueryKeys()`.
         return await this.repoUtils.find(
-            { ...stripUnsafeQueryKeys(query), ...params, mailboxUid: `eq(${mailboxUid})` },
+            await this.listFilter(params, query, mailboxUid, user),
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
     }
@@ -245,8 +270,10 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
             includeDeleted: query?.deleted === true || query?.deleted === "true",
             ignoreACL: true,
         });
+        const effectiveUser: JWTUser | undefined = existing ? await this.resolveEffectiveUser(user, query, existing.uid) : undefined;
         const permitted: boolean = existing
-            ? await this.aclUtils!.hasPermission(await this.resolveEffectiveUser(user, query, existing.uid), existing.uid, ACLAction.EXISTS)
+            ? (await this.aclUtils!.hasPermission(effectiveUser, existing.uid, ACLAction.EXISTS)) &&
+              ((existing as any).deleted !== true || (await this.canViewDeleted(effectiveUser, existing.uid)))
             : false;
         return permitted
             ? res.status(200).setHeader("content-length", 1)

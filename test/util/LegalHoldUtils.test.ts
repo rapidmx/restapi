@@ -94,12 +94,14 @@ describe("findActiveHoldsFor() Tests", () => {
     it("Detects a hold on a matter beyond the first page, proving the query is paginated.", async () => {
         const pageSize = 500;
         const heldMatter = makeMatter({ uid: "matter-late", custodianMailboxUids: ["mailbox-1"] });
-        const find = vi.fn().mockImplementation(async (_criteria: any, options: any) => {
-            const page = options.page ?? 0;
-            if (page === 0) {
-                return Array.from({ length: pageSize }, (_, i) => makeMatter({ uid: `matter-page0-${i}`, custodianMailboxUids: ["someone-else"] }));
+        const firstPage = Array.from({ length: pageSize }, (_, i) =>
+            makeMatter({ uid: `matter-page0-${String(i).padStart(4, "0")}`, custodianMailboxUids: ["someone-else"] }),
+        );
+        const find = vi.fn().mockImplementation(async (criteria: any) => {
+            if (criteria.uid === undefined) {
+                return firstPage;
             }
-            if (page === 1) {
+            if (criteria.uid === `gt(${firstPage[pageSize - 1].uid})`) {
                 return [heldMatter];
             }
             return [];
@@ -112,6 +114,12 @@ describe("findActiveHoldsFor() Tests", () => {
         expect(result.map((m) => m.uid)).toEqual(["matter-late"]);
         // Page 1 returns fewer than `pageSize` rows, so the loop correctly stops there without a 3rd call.
         expect(find).toHaveBeenCalledTimes(2);
+        // Keyset-paged on a stable uid sort, not unsorted offset paging.
+        for (const [criteria, options] of find.mock.calls) {
+            expect(criteria.sort).toEqual({ uid: "ASC" });
+            expect(criteria.page).toBeUndefined();
+            expect(options.page).toBeUndefined();
+        }
     });
 });
 

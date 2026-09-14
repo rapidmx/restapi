@@ -16,6 +16,7 @@ import {
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { assertNoPathKeys } from "../util/RequestBodyUtils.js";
 import { AuditAction, Branding } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Delete, Get, Post, Put, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
@@ -25,8 +26,9 @@ const { Delete, Get, Post, Put, Request, RequiresTrustedRole, Response, User: Au
 const BRANDING_UID = "branding";
 
 /** The image types a logo/icon upload may be. Not any `image/*`: an `image/svg+xml` upload is a document that can
- * carry script, served publicly from this API's own origin. */
-const IMAGE_CONTENT_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/webp", "image/x-icon", "image/vnd.microsoft.icon"];
+ * carry script, served publicly from this API's own origin. GIF is a raster format like the rest (and served with
+ * `nosniff`), and the web client's branding form accepts it. */
+const IMAGE_CONTENT_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/gif", "image/webp", "image/x-icon", "image/vnd.microsoft.icon"];
 
 const STYLESHEET_CONTENT_TYPES: readonly string[] = ["text/css"];
 
@@ -256,6 +258,8 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     @RequiresTrustedRole()
     @Put()
     public async update(obj: Partial<T> | undefined, @AuthUser user?: JWTUser): Promise<PublicBranding> {
+        // A dotted/`$` key is a Mongo update path past the field stripping below (see `util/RequestBodyUtils.ts`).
+        assertNoPathKeys(obj);
         await this.init();
         const existing: T = await this.findOrCreate();
 

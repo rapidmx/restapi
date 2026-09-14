@@ -37,6 +37,10 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
     const blobStore = (): any => objectFactory.getInstance<any>("BlobStore")!;
     const findMessage = async (uid: string): Promise<MessageMongo> => (await messageRepo.findOne({ uid } as any))!;
 
+    const expireLease = async (uid: string): Promise<void> => {
+        await messageRepo.updateOne({ uid } as any, { $set: { scheduledSendTime: new Date(Date.now() - 1000) } });
+    };
+
     const putBody = async (raw: string = "From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n") => {
         const bodyBlobKey = `bodies/${uuid.v4()}`;
         await blobStore().put(bodyBlobKey, Buffer.from(raw));
@@ -446,9 +450,95 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
         await expect(job.run()).resolves.toBeUndefined();
 
         expect(transport().sent.length).toBe(0);
-        // The failed write never landed, so scheduledSendTime stays cleared (the claim's own successful
-        // write) - the message simply drops out of the queue rather than being retried.
+        // The failed write never landed, so the claim's own lease is what remains: scheduledSendTime is pushed
+        // into the future (not cleared), so the message is retried once the lease expires rather than lost.
         const current = await findMessage(message.uid);
-        expect(current.scheduledSendTime).toBeFalsy();
+        expect(new Date(current.scheduledSendTime as any).getTime()).toBeGreaterThan(Date.now() + 60_000);
+    });
+
+    describe("Claim lease", () => {
+        it("Claims with a lease (scheduledSendTime pushed lease_ms ahead) rather than clearing it, so a crash mid-relay doesn't lose the send.", async () => {
+            (job as any).leaseMs = 10 * 60 * 1000;
+            const message = await createMessage({ bodyBlobKey: await putBody(), scheduledSendTime: new Date(Date.now() - 60 * 1000) });
+            let midFlight: any;
+            // Simulates the process dying mid-relay: the claim has landed, then nothing after it gets to run.
+            vi.spyOn(blobStore(), "get").mockImplementationOnce(async () => {
+                midFlight = await findMessage(message.uid);
+                throw new Error("simulated crash");
+            });
+            vi.spyOn(job as any, "recordFailedAttempt").mockResolvedValueOnce(undefined);
+
+            await job.run();
+
+            expect(transport().sent.length).toBe(0);
+            const leasedUntil: number = new Date(midFlight.scheduledSendTime).getTime();
+            expect(leasedUntil).toBeGreaterThan(Date.now() + 5 * 60 * 1000);
+            expect(new Date((await findMessage(message.uid)).scheduledSendTime as any).getTime()).toBe(leasedUntil);
+            vi.restoreAllMocks();
+
+            // Not due again until the lease expires...
+            await job.run();
+            expect(transport().sent.length).toBe(0);
+
+            // ...and once it has, it is relayed and the lease is released.
+            await expireLease(message.uid);
+            await job.run();
+            expect(transport().sent.length).toBe(1);
+            expect((await findMessage(message.uid)).scheduledSendTime).toBeFalsy();
+        });
+    });
+
+    describe("Stored MIME originator headers", () => {
+        const runWithBody = async (raw: string): Promise<any> => {
+            const message = await createMessage({ bodyBlobKey: await putBody(raw), scheduledSendTime: new Date(Date.now() - 60 * 1000) });
+            await job.run();
+            return await findMessage(message.uid);
+        };
+
+        it("Refuses (and dequeues) a message whose stored From header names another address, even though from.address is valid.", async () => {
+            const updated = await runWithBody("From: CEO <ceo@example.com>\r\nTo: recipient@example.com\r\n\r\nHi\r\n");
+            expect(transport().sent.length).toBe(0);
+            expect(updated.scheduledSendTime).toBeFalsy();
+            expect(updated.scheduledSendError).toContain("From header");
+            expect(updated.folderUid).toBe(outboxUid);
+        });
+
+        it("Refuses a stored From header listing an allowed address alongside a foreign one.", async () => {
+            const updated = await runWithBody("From: owner@example.com, ceo@example.com\r\nTo: recipient@example.com\r\n\r\nHi\r\n");
+            expect(transport().sent.length).toBe(0);
+            expect(updated.scheduledSendError).toContain("From header");
+        });
+
+        it("Refuses a message with two From headers.", async () => {
+            const updated = await runWithBody("From: owner@example.com\r\nfrom: ceo@example.com\r\n\r\nHi\r\n");
+            expect(transport().sent.length).toBe(0);
+            expect(updated.scheduledSendError).toContain("more than one From");
+        });
+
+        it("Refuses a folded From header whose continuation line carries a foreign address.", async () => {
+            const updated = await runWithBody("From: owner@example.com,\r\n ceo@example.com\r\n\r\nHi\r\n");
+            expect(transport().sent.length).toBe(0);
+            expect(updated.scheduledSendError).toContain("From header");
+        });
+
+        it("Refuses a Sender header naming a foreign address.", async () => {
+            const updated = await runWithBody("From: owner@example.com\r\nSENDER: ceo@example.com\r\n\r\nHi\r\n");
+            expect(transport().sent.length).toBe(0);
+            expect(updated.scheduledSendError).toContain("Sender header");
+        });
+
+        it("Refuses a stored message with no From header at all.", async () => {
+            const updated = await runWithBody("To: recipient@example.com\r\n\r\nHi\r\n");
+            expect(transport().sent.length).toBe(0);
+            expect(updated.scheduledSendError).toContain("no From header");
+        });
+
+        it("Relays when every From/Sender address (quoted display names, group syntax, aliases, any case) is the mailbox's own.", async () => {
+            const updated = await runWithBody(
+                'From: "Doe, Owner (ceo@example.com)" <Owner@Example.com>, team: =?utf-8?Q?Alias?= <alias@example.com>;\r\nSender: owner@example.com\r\nTo: recipient@example.com\r\n\r\nHi\r\n',
+            );
+            expect(transport().sent.length).toBe(1);
+            expect(updated.scheduledSendError).toBeFalsy();
+        });
     });
 });

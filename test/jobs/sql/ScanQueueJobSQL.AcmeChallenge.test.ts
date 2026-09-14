@@ -32,6 +32,7 @@ import { MailFilterRuleSQL } from "../../../src/models/sql/MailFilterRuleSQL.js"
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
 import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
+import { DataSubjectErasureRequestSQL } from "../../../src/models/sql/DataSubjectErasureRequestSQL.js";
 import { FocusedInboxOverrideSQL } from "../../../src/models/sql/FocusedInboxOverrideSQL.js";
 import { OofReplySuppressionSQL } from "../../../src/models/sql/OofReplySuppressionSQL.js";
 import { IngestStatus } from "../../../src/models/types.js";
@@ -165,6 +166,8 @@ describe("ScanQueueJobSQL Tests - RFC 8823 challenge-email correlation", () => {
         models.set("FocusedInboxOverrideSQL", FocusedInboxOverrideSQL);
         models.set("ContactSQL", ContactSQL);
         models.set("DomainSQL", DomainSQL);
+        // Consulted before filing (is the mailbox being erased?) - see ScanQueueJob.isMailboxBeingErased().
+        models.set("DataSubjectErasureRequestSQL", DataSubjectErasureRequestSQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");

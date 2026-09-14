@@ -14,8 +14,9 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { evaluateEscrowApprovals, resolveEscrowApprovalTtlHours } from "../util/EscrowUtils.js";
-import { AuditAction, EscrowAccessRequest, EscrowScope, Matter } from "../models/types.js";
+import { evaluateEscrowApprovals, exactInFilter, resolveEscrowApprovalTtlHours } from "../util/EscrowUtils.js";
+import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
+import { AuditAction, EscrowAccessRequest, EscrowScope, EscrowScopePublicKey, Matter } from "../models/types.js";
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /** Page size for scanning a scope's matters and their access requests - see `hasActiveApprovals()`. */
@@ -39,6 +40,34 @@ function sameMembers(a: string[], b: string[] | undefined): boolean {
     const left: string[] = [...a].sort();
     const right: string[] = [...(b ?? [])].sort();
     return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+/** An epoch-ms (number, numeric string, ISO string or `Date`) timestamp truncated to whole seconds; `undefined` for a
+ * missing (`undefined`/`null`) value and `NaN` for an unparseable one. */
+function toEpochSeconds(value: unknown): number | undefined {
+    if (value === undefined || value === null) {
+        return undefined;
+    }
+    const raw: unknown = typeof value === "string" && /^\d+$/.test(value.trim()) ? Number(value) : value;
+    return Math.floor(new Date(raw as any).getTime() / 1000);
+}
+
+/** `true` when `incoming` names a different key than `existing`: key material, type, fingerprint (case-insensitive),
+ * validity window or revocation, with timestamps compared to the second. Anything else - key order, a date sent back
+ * as an ISO string, `revokedAt: null` vs absent, extra fields - is a round trip, not a key change. */
+function publicKeyChanged(incoming: any, existing: EscrowScopePublicKey | undefined): boolean {
+    // `NaN !== NaN`, so an unparseable timestamp always counts as a change.
+    const sameSeconds = (a: unknown, b: unknown): boolean => toEpochSeconds(a) === toEpochSeconds(b);
+    return (
+        !incoming ||
+        typeof incoming !== "object" ||
+        incoming.publicKey !== existing?.publicKey ||
+        incoming.type !== existing?.type ||
+        String(incoming.fingerprint ?? "").toLowerCase() !== String(existing?.fingerprint ?? "").toLowerCase() ||
+        !sameSeconds(incoming.notBefore, existing?.notBefore) ||
+        !sameSeconds(incoming.notAfter, existing?.notAfter) ||
+        !sameSeconds(incoming.revokedAt, existing?.revokedAt)
+    );
 }
 
 /** Validates the parts of an `EscrowScope` a client can actually set, against the merged (existing +
@@ -174,12 +203,12 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
                 { escrowScopeId: scope.uid, sort: "uid", limit: SCAN_PAGE_SIZE, page } as any,
                 { ignoreACL: true, limit: SCAN_PAGE_SIZE, page },
             );
-            if (matters.length > 0) {
-                const matterIds: string = matters.map((m) => m.uid).join(",");
+            const matterIds: string | undefined = exactInFilter(matters.map((m) => m.uid));
+            if (matterIds) {
                 for (let requestPage = 0; ; requestPage++) {
                     const requests: EscrowAccessRequest[] = await requestRepo.find(
                         {
-                            matterId: `in(${matterIds})`,
+                            matterId: matterIds,
                             status: "in(approved,fulfilled)",
                             sort: "uid",
                             limit: SCAN_PAGE_SIZE,
@@ -210,6 +239,13 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
         for (const o of objs) {
+            if (!o || typeof o !== "object" || Array.isArray(o)) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+            }
+            // Always a server-minted uid: scope uids end up inside `in(...)` filters (see `exactInFilter()`), where a
+            // client-chosen `"a,victim"` would widen a holder's view. `_id`/bookkeeping/dotted keys are dropped too.
+            delete (o as any).uid;
+            stripClientCreateFields(o);
             validateEscrowScope(o);
             this.requireNotSelfHolder(o.holderUserUids, user);
         }
@@ -242,18 +278,27 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
+        if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        // A dotted/`$` key (`holderUserUids.0`, `publicKey.fingerprint`) is a Mongo update path that would skip the
+        // dual-control checks below, which only look at top-level fields.
+        assertNoPathKeys(obj);
         const existing: T | undefined = await this.repoUtils!.findOne(id, { skipCache: true, ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        const patch: any = obj ?? {};
+        const patch: any = obj;
         validateEscrowScope({ ...existing, ...patch });
 
         const holdersChanged: boolean = patch.holderUserUids !== undefined && !sameMembers(patch.holderUserUids, existing.holderUserUids);
         const thresholdLowered: boolean = patch.requiredHolders !== undefined && patch.requiredHolders < existing.requiredHolders;
         const thresholdChanged: boolean = patch.requiredHolders !== undefined && patch.requiredHolders !== existing.requiredHolders;
-        const publicKeyChanged: boolean =
-            patch.publicKey !== undefined && JSON.stringify(patch.publicKey) !== JSON.stringify(existing.publicKey);
+        const keyChanged: boolean = patch.publicKey !== undefined && publicKeyChanged(patch.publicKey, existing.publicKey);
+        if (patch.publicKey !== undefined && !keyChanged) {
+            // A round trip of the stored key - keep the stored value rather than its reformatted copy.
+            delete patch.publicKey;
+        }
 
         // Only a real change is checked, so re-sending an unchanged holder list (e.g. a full-object PUT) that someone
         // else already put the caller on isn't mistaken for adding themselves - rule 2 still stops that caller
@@ -261,14 +306,14 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         if (holdersChanged) {
             this.requireNotSelfHolder(patch.holderUserUids, user);
         }
-        if (user && existing.holderUserUids.includes(user.uid) && (holdersChanged || thresholdChanged || publicKeyChanged)) {
+        if (user && existing.holderUserUids.includes(user.uid) && (holdersChanged || thresholdChanged || keyChanged)) {
             throw new ApiError(
                 ApiErrors.AUTH_PERMISSION_FAILURE,
                 403,
                 "A holder of an escrow scope cannot change its holders, required holders or public key.",
             );
         }
-        if ((holdersChanged || thresholdLowered || publicKeyChanged) && (await this.hasActiveApprovals(existing))) {
+        if ((holdersChanged || thresholdLowered || keyChanged) && (await this.hasActiveApprovals(existing))) {
             throw new ApiError(
                 ApiErrors.IDENTIFIER_EXISTS,
                 409,
@@ -302,6 +347,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         if (!Array.isArray(objs)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
+        assertNoPathKeys(objs);
         const updated: T[] = [];
         for (const obj of objs) {
             updated.push(await this.update((obj as any)?.uid, obj, req, user));
@@ -317,6 +363,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         obj: any,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
+        assertPlainPropertyName(propertyName);
         if (propertyName === "uid") {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }

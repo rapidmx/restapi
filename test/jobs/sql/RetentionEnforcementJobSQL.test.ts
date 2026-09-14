@@ -250,10 +250,10 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
         expect(await attachmentRepo.findOne({ where: { uid: attachment.uid } })).toBeNull();
     });
 
-    it("Logs a warning and still purges the parent message when one of its attachments fails to purge.", async () => {
+    it("Keeps the parent message (retrying it next run) when one of its attachments fails to purge, instead of orphaning the attachment.", async () => {
         await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
         const old = await createMessage({ sentDate: new Date(Date.now() - 35 * DAY_MS), hasAttachments: true });
-        await attachmentRepo.save(
+        const attachment = await attachmentRepo.save(
             new AttachmentSQL({
                 mailboxUid: old.mailboxUid,
                 folderUid: old.folderUid,
@@ -268,7 +268,61 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
 
         await expect(job.run()).resolves.toBeUndefined();
 
+        expect(await messageRepo.findOne({ where: { uid: old.uid } })).not.toBeNull();
+        expect(await attachmentRepo.findOne({ where: { uid: attachment.uid } })).not.toBeNull();
+
+        await job.run();
+
         expect(await messageRepo.findOne({ where: { uid: old.uid } })).toBeNull();
+        expect(await attachmentRepo.findOne({ where: { uid: attachment.uid } })).toBeNull();
+    });
+
+    it("Keeps the attachment and its message when deleting the attachment's blob fails, so the blob is retried rather than orphaned.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const attachmentBlobKey = `attachments/${uuid.v4()}`;
+        await blobStore.put(attachmentBlobKey, Buffer.from("attachment"));
+        const old = await createMessage({ sentDate: new Date(Date.now() - 35 * DAY_MS), hasAttachments: true });
+        const attachment = await attachmentRepo.save(
+            new AttachmentSQL({ mailboxUid: old.mailboxUid, folderUid: old.folderUid, messageUid: old.uid, filename: "a.txt", mimeType: "text/plain", blobKey: attachmentBlobKey }),
+        );
+        vi.spyOn(blobStore, "delete").mockRejectedValueOnce(new Error("simulated blob store failure"));
+
+        await job.run();
+
+        expect(await attachmentRepo.findOne({ where: { uid: attachment.uid } })).not.toBeNull();
+        expect(await messageRepo.findOne({ where: { uid: old.uid } })).not.toBeNull();
+        expect(await blobStore.exists(attachmentBlobKey)).toBe(true);
+
+        await job.run();
+
+        expect(await attachmentRepo.findOne({ where: { uid: attachment.uid } })).toBeNull();
+        expect(await messageRepo.findOne({ where: { uid: old.uid } })).toBeNull();
+        expect(await blobStore.exists(attachmentBlobKey)).toBe(false);
+    });
+
+    it("Purges an expired soft-deleted message too, with its blob, and removes purged messages' search documents.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        await blobStore.put(bodyBlobKey, Buffer.from("raw"));
+        const softDeleted = await createMessage({ sentDate: new Date(Date.now() - 35 * DAY_MS), bodyBlobKey });
+        const old = await createMessage({ sentDate: new Date(Date.now() - 36 * DAY_MS) });
+        const recentSoftDeleted = await createMessage({ sentDate: new Date(Date.now() - 5 * DAY_MS) });
+        await messageRepo.update({ uid: softDeleted.uid }, { deleted: true });
+        await messageRepo.update({ uid: recentSoftDeleted.uid }, { deleted: true });
+        const searchProvider: any = objectFactory.getInstance("SearchProvider");
+        const removeSpy = vi.spyOn(searchProvider, "remove");
+
+        await job.run();
+
+        expect(await messageRepo.findOne({ where: { uid: softDeleted.uid } })).toBeNull();
+        expect(await messageRepo.findOne({ where: { uid: old.uid } })).toBeNull();
+        expect(await messageRepo.findOne({ where: { uid: recentSoftDeleted.uid } })).not.toBeNull();
+        expect(await blobStore.exists(bodyBlobKey)).toBe(false);
+        expect(removeSpy.mock.calls.map((call) => `${call[0]}:${call[1]}`).sort()).toEqual([`message:${softDeleted.uid}`, `message:${old.uid}`].sort());
+        const entries = await auditLogRepo.find({ where: { action: AuditAction.RETENTION_PURGE_EXECUTED } });
+        expect(entries[0].details).toEqual({ count: 2, maxAgeDays: 30 });
     });
 
     it("Keeps an expired message's body and attachment blobs while another mailbox's copy still references them.", async () => {

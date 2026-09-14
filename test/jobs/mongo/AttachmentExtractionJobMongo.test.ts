@@ -384,5 +384,134 @@ describe("AttachmentExtractionJobMongo Tests (real DB + DI)", () => {
             expect(updated!.searchIndexNextAttemptAt ?? null).toBeNull();
             expect(updated!.searchIndexError ?? null).toBeNull();
         });
+        it("Clears searchIndexedAt when SearchIndexJob stamped the message after this job's initial read but before the attachment was stamped (re-reads the message).", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `attachments/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("late text"));
+            const message = await createMessage({ searchIndexedAt: undefined });
+            await createAttachment({ messageUid: message.uid, mimeType: "text/plain", blobKey });
+            const attachmentRepoUtils = (job as any).attachmentRepo;
+            const realUpdate = attachmentRepoUtils.update.bind(attachmentRepoUtils);
+            const spy = vi.spyOn(attachmentRepoUtils, "update").mockImplementationOnce(async (...args: any[]) => {
+                const result = await realUpdate(...args);
+                await messageRepo.updateOne({ uid: message.uid } as any, { $inc: { version: 1 }, $set: { searchIndexedAt: new Date("2026-01-01T00:00:00Z") } });
+                return result;
+            });
+            try {
+                await job.run();
+            } finally {
+                spy.mockRestore();
+            }
+
+            const updated = await findMessage(message.uid);
+            expect(updated!.searchIndexedAt ?? null).toBeNull();
+        });
+
+        it("Retries the re-index invalidation against a fresh read when it hits a version conflict, rather than dropping it.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `attachments/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("fresh text"));
+            const message = await createMessage({ searchIndexedAt: new Date("2026-01-01T00:00:00Z") });
+            await createAttachment({ messageUid: message.uid, mimeType: "text/plain", blobKey });
+            const messageRepoUtils = (job as any).messageRepo;
+            const realUpdate = messageRepoUtils.update.bind(messageRepoUtils);
+            const spy = vi.spyOn(messageRepoUtils, "update").mockImplementationOnce(async (...args: any[]) => {
+                // A concurrent edit lands first; this stale write must conflict (not clobber it) and be retried.
+                await messageRepo.updateOne({ uid: message.uid } as any, { $inc: { version: 1 }, $set: { subject: "Edited concurrently" } });
+                return await realUpdate(...args);
+            });
+            try {
+                await job.run();
+                expect(spy).toHaveBeenCalledTimes(2);
+            } finally {
+                spy.mockRestore();
+            }
+
+            const updated = await findMessage(message.uid);
+            expect(updated!.subject).toBe("Edited concurrently");
+            expect(updated!.searchIndexedAt ?? null).toBeNull();
+        });
+
+        it("Only one of two overlapping runs holding the same stale attachment row stamps it; the loser deletes its own text blob.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `attachments/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("some text"));
+            const message = await createMessage();
+            const attachment = await createAttachment({ messageUid: message.uid, mimeType: "text/plain", blobKey });
+            const attachmentRepoUtils = (job as any).attachmentRepo;
+            const [stale] = await attachmentRepoUtils.find({ uid: attachment.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+            const deleteSpy = vi.spyOn(blobStore, "delete");
+            try {
+                await (job as any).processAttachment(stale);
+                await expect((job as any).processAttachment(stale)).rejects.toThrow();
+                expect(deleteSpy).toHaveBeenCalledTimes(1);
+            } finally {
+                deleteSpy.mockRestore();
+            }
+
+            const updated = await findAttachment(attachment.uid);
+            expect(await blobStore.exists(updated!.extractedTextBlobKey!)).toBe(true);
+        });
+        it("Logs a warning (no throw) when re-reading the message for re-indexing fails.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `attachments/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("fresh text"));
+            const message = await createMessage({ searchIndexedAt: new Date("2026-01-01T00:00:00Z") });
+            const attachment = await createAttachment({ messageUid: message.uid, mimeType: "text/plain", blobKey });
+            const messageRepoUtils = (job as any).messageRepo;
+            const realFindOne = messageRepoUtils.findOne.bind(messageRepoUtils);
+            const findSpy = vi
+                .spyOn(messageRepoUtils, "findOne")
+                .mockImplementationOnce(async (...args: any[]) => await realFindOne(...args))
+                .mockRejectedValueOnce(new Error("simulated re-read failure"));
+            const warnSpy = vi.spyOn((job as any).logger, "warn");
+            try {
+                await expect(job.run()).resolves.toBeUndefined();
+                expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated re-read failure"));
+            } finally {
+                findSpy.mockRestore();
+                warnSpy.mockRestore();
+            }
+            expect((await findAttachment(attachment.uid))!.extractedTextBlobKey).toContain("attachment-text/");
+        });
+
+        it("Logs a warning (no throw) once every re-index invalidation attempt conflicts.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `attachments/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("fresh text"));
+            const message = await createMessage({ searchIndexedAt: new Date("2026-01-01T00:00:00Z") });
+            await createAttachment({ messageUid: message.uid, mimeType: "text/plain", blobKey });
+            const updateSpy = vi.spyOn((job as any).messageRepo, "update").mockRejectedValue(new Error("simulated persistent conflict"));
+            const warnSpy = vi.spyOn((job as any).logger, "warn");
+            try {
+                await expect(job.run()).resolves.toBeUndefined();
+                expect(updateSpy).toHaveBeenCalledTimes(3);
+                expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated persistent conflict"));
+            } finally {
+                updateSpy.mockRestore();
+                warnSpy.mockRestore();
+            }
+            expect((await findMessage(message.uid))!.searchIndexedAt).toBeInstanceOf(Date);
+        });
+
+        it("Still records the failure when deleting the losing run's text blob itself fails.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `attachments/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("some text"));
+            const message = await createMessage();
+            const attachment = await createAttachment({ messageUid: message.uid, mimeType: "text/plain", blobKey });
+            const updateSpy = vi.spyOn((job as any).attachmentRepo, "update").mockRejectedValueOnce(new Error("simulated stamp conflict"));
+            const deleteSpy = vi.spyOn(blobStore, "delete").mockRejectedValueOnce(new Error("simulated delete failure"));
+            try {
+                await expect(job.run()).resolves.toBeUndefined();
+                expect(deleteSpy).toHaveBeenCalledTimes(1);
+            } finally {
+                updateSpy.mockRestore();
+                deleteSpy.mockRestore();
+            }
+            const updated = await findAttachment(attachment.uid);
+            expect(updated!.extractionAttempts).toBe(1);
+            expect(updated!.extractionError).toContain("simulated stamp conflict");
+        });
     });
 });

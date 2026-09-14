@@ -849,6 +849,17 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
             });
             expect(invalid.status).toBe(400);
 
+            // Someone without access to the mailbox can't add an override to it for a new sender (the create's own
+            // permission failure is surfaced as-is, not treated as a lost create race).
+            const intruder = await auth(request(ctx.app()).post(url("/focused-inbox-overrides")), other).send({
+                mailboxUid: mailbox.uid,
+                senderAddress: "intruder@example.net",
+                classifyAs: "focused",
+            });
+            expect(intruder.status).toBe(403);
+            const afterIntruder = await auth(request(ctx.app()).get(url(`/focused-inbox-overrides?mailboxUid=${mailbox.uid}`)), owner);
+            expect(afterIntruder.body.map((o: any) => o.senderAddress).sort()).toEqual(["a@example.net", "b@example.net"]);
+
             const [a, b] = bulk.body;
             const onto = await auth(request(ctx.app()).put(url(`/focused-inbox-overrides/${b.uid}`)), owner).send({
                 uid: b.uid,

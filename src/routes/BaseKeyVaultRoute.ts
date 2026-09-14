@@ -21,6 +21,7 @@ import { EncryptionCertificateAuthority } from "../pki/EncryptionCertificateAuth
 import { EnrollmentResult, SigningCertificateEnrollment } from "../pki/SigningCertificateEnrollment.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { publicKeyFromCertificatePem } from "../util/CertificateInstallUtils.js";
+import { asEntity } from "../util/EntityUtils.js";
 import { AuditAction, EscrowScope, KeyVault, Mailbox, MasterKeyWrap, PublicKey, WrappedPrivateKey } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
@@ -129,7 +130,7 @@ function validateMasterKeyWrap(wrap: MasterKeyWrap, { allowEscrow }: { allowEscr
  * doc comment describes for `MasterKeyWrap`. */
 function validateWrappedPrivateKey(key: Pick<WrappedPrivateKey, "ciphertext" | "nonce" | "algorithm">): void {
     for (const field of ["ciphertext", "nonce", "algorithm"] as const) {
-        const value: unknown = key[field];
+        const value: unknown = key?.[field];
         if (typeof value !== "string" || value.length === 0 || value.length > MAX_WRAP_FIELD_LENGTH) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `${field} must be a non-empty string of at most ${MAX_WRAP_FIELD_LENGTH} characters.`);
         }
@@ -282,9 +283,13 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         }
     }
 
+    /** Returned as an entity instance (`asEntity()`): every vault write below passes it as `existing` to
+     * `RepoUtils.update()`, whose optimistic lock only applies to one - MongoDB's `find()` returns plain documents, so
+     * two concurrent writes (e.g. `enrollKey()` and `rekey()`) could otherwise both succeed, the later one silently
+     * dropping the other's wrapped private key. A lost race is now a `409`. */
     private async findKeyVault(mailboxUid: string): Promise<K | undefined> {
-        const existing: K[] = await this.keyVaultRepo!.find({ mailboxUid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
-        return existing[0];
+        const existing: K[] = await this.keyVaultRepo!.find({ mailboxUid, limit: 1 } as any, { ignoreACL: true, limit: 1, skipCache: true });
+        return existing[0] ? asEntity(this.keyVaultRepo!, existing[0]) : undefined;
     }
 
     /** Same TOCTOU-tolerant create-or-fetch as `BaseEncryptionPolicyRoute.findOrCreate()`, keyed by
@@ -670,9 +675,24 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "This mailbox has not enrolled a key yet.");
         }
 
+        // A rekey REPLACES the vault wholesale, so every list is required - a missing one used to be read as "empty"
+        // (wiping every published key or wrapped private key) or crash `persistRekey()` after the mailbox was
+        // already written.
+        for (const field of ["wrappedKeys", "masterKeyWraps", "keys"] as const) {
+            if (!Array.isArray(body?.[field])) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `${field} must be an array.`);
+            }
+        }
+        // Escrow wraps are refused below and preserved from the existing vault instead, so this is "at least one wrap
+        // the owner can unlock with" - with none, the new master key is lost to the owner (the same rule
+        // `removeMasterKeyWrap()` enforces for a single removal).
+        if (body.masterKeyWraps.length === 0) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "masterKeyWraps must include at least one non-escrow wrap.");
+        }
+
         const existingByFingerprint = new Map((mailbox.keys ?? []).map((k) => [k.fingerprint, k]));
-        for (const key of body.keys ?? []) {
-            const existing: PublicKey | undefined = existingByFingerprint.get(key.fingerprint);
+        for (const key of body.keys) {
+            const existing: PublicKey | undefined = existingByFingerprint.get(key?.fingerprint);
             if (
                 !existing ||
                 existing.publicKey !== key.publicKey ||

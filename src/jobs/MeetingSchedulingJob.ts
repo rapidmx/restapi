@@ -12,6 +12,12 @@ import type { MailTransport } from "../transport/MailTransport.js";
 import { CalendarEvent, CalendarEventStatus, Mailbox } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
+/** A keyset position in `(dateModified, uid)` order. */
+interface InviteCursor {
+    dateModified: Date;
+    uid: string;
+}
+
 /**
  * Sends outbound iTIP meeting-request/cancellation emails on behalf of an organizer: an organizer creates/
  * updates a `CalendarEvent` with attendees, and this job sends each one an iTIP `REQUEST` (`.ics` invite);
@@ -68,6 +74,18 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
 
     @Config("mail:jobs:meeting_scheduling:batch_size", 100)
     private batchSize: number = 100;
+
+    /** Page budget per run for each invite keyset walk (see `sendInvites()`). */
+    @Config("mail:jobs:meeting_scheduling:max_pages", 10)
+    private maxPages: number = 10;
+
+    /** How far behind "now" the live invite walk rewinds once caught up (see `sendInvites()`). */
+    @Config("mail:jobs:meeting_scheduling:rescan_lag_seconds", 600)
+    private rescanLagSeconds: number = 600;
+
+    private liveInviteCursor?: InviteCursor;
+    private catchUpInviteCursor?: InviteCursor;
+    private catchUpInviteUntilMs?: number;
 
     @Logger
     private logger: any;
@@ -146,26 +164,97 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
         }
     }
 
-    private async sendInvites(ownAddresses: Map<string, Set<string>>): Promise<void> {
-        // `limit` must be passed both via `options` (used by the Mongo backend) *and* baked into the query
-        // object itself (all `ModelUtils.buildSearchQuerySQL` reads - it ignores `options.limit` entirely and
-        // falls back to its own default of 100 otherwise). Confirmed by real-database testing: on the SQL
-        // backend, `options.limit` alone silently caps at 100 regardless of the configured batch size.
-        //
-        // `inviteSequenceSent !== sequence` (the real eligibility check) is a field-to-field comparison the
-        // shared query DSL can't express, so it stays a client-side filter below - but an unfiltered,
-        // unsorted `find()` meant that once total `CalendarEvent` rows exceeded `batchSize`, whichever fixed
-        // set of rows the DB happened to return first (typically the oldest, by insertion order) permanently
-        // occupied the whole window, silently starving any event that needed an invite. `status: ne(CANCELLED)`
-        // prunes the (usually large) share of rows that can never need an invite, and `sort: -dateModified`
-        // guarantees a genuinely new or just-edited event - which always has the most recent `dateModified`,
-        // since `RepoUtils.update()` unconditionally refreshes it - sorts to the front of the window ahead of
-        // old, already-fully-processed rows, rather than being starved behind them.
-        const candidates: CE[] = await this.calendarEventRepo!.find(
-            { status: `ne(${CalendarEventStatus.CANCELLED})`, sort: "-dateModified", limit: this.batchSize } as any,
-            { ignoreACL: true, limit: this.batchSize },
-        );
+    /**
+     * Reads the next page of invite candidates strictly after `cursor`, ordered by `(dateModified, uid)`.
+     *
+     * `inviteSequenceSent !== sequence` (the real eligibility check) is a field-to-field comparison the shared query
+     * DSL can't express, so it stays a client-side filter - which is why this can't just be a "top `batchSize`"
+     * query. Any fixed top-N window starves: an unsorted one is permanently occupied by whichever rows the DB
+     * returns first, and a `-dateModified` one is permanently occupied by the rows *this job itself* just stamped
+     * (every claim refreshes `dateModified`), so once more than `batchSize` rows need an invite the rest never get
+     * one. Instead the job walks the table with a keyset cursor: every row modified after the cursor is visited
+     * exactly once per edit, including a row this job stamped (it reappears once, past the cursor, and is filtered
+     * out without being touched again - so the walk converges).
+     *
+     * `limit` must be passed both via `options` (used by the Mongo backend) *and* baked into the query object
+     * itself (all `ModelUtils.buildSearchQuerySQL` reads - it ignores `options.limit` entirely).
+     */
+    private async readInvitePage(cursor: InviteCursor): Promise<CE[]> {
+        const query: Record<string, any> = {
+            status: `ne(${CalendarEventStatus.CANCELLED})`,
+            sort: { dateModified: "ASC", uid: "ASC" },
+            limit: this.batchSize,
+        };
+        const at: string = cursor.dateModified.toISOString();
+        query.$or = [{ dateModified: `gt(${at})` }, { dateModified: `eq(${at})`, uid: `gt(${cursor.uid})` }];
+        return await this.calendarEventRepo!.find(query as any, { ignoreACL: true, limit: this.batchSize });
+    }
 
+    /**
+     * Two keyset walks, both in-memory per process:
+     * - The **live** walk, which every run advances first: on a process's first run it starts `rescan_lag_seconds`
+     * in the past, and persists across runs (a backlog larger than `max_pages` pages simply continues next run).
+     * Once it catches up it rewinds to `rescan_lag_seconds` ago (never forward), so a row whose `dateModified` was
+     * stamped slightly behind the cursor - clock skew between replicas, or a write that committed after a
+     * later-stamped one was already read - is still seen by the next run.
+     * - The one-off **catch-up** walk from the beginning of the table up to where the live walk started, so rows
+     * that needed an invite before this process started (e.g. edited during an outage) are still handled - with
+     * its own page budget, after the live walk, so a large table never delays a new invite.
+     */
+    private async sendInvites(ownAddresses: Map<string, Set<string>>): Promise<void> {
+        const lagMs: number = Number(this.rescanLagSeconds) * 1000;
+        if (!this.liveInviteCursor) {
+            this.liveInviteCursor = { dateModified: new Date(Date.now() - lagMs), uid: "" };
+            this.catchUpInviteCursor = { dateModified: new Date(0), uid: "" };
+            this.catchUpInviteUntilMs = this.liveInviteCursor.dateModified.getTime();
+        }
+
+        const live = await this.walkInvites(this.liveInviteCursor, ownAddresses);
+        this.liveInviteCursor = live.cursor;
+        if (live.exhausted) {
+            const rewindTo: Date = new Date(Date.now() - lagMs);
+            if (this.liveInviteCursor.dateModified.getTime() > rewindTo.getTime()) {
+                this.liveInviteCursor = { dateModified: rewindTo, uid: "" };
+            }
+        }
+
+        if (this.catchUpInviteCursor) {
+            const catchUp = await this.walkInvites(this.catchUpInviteCursor, ownAddresses, this.catchUpInviteUntilMs);
+            this.catchUpInviteCursor = catchUp.exhausted ? undefined : catchUp.cursor;
+        }
+    }
+
+    /** Walks up to `max_pages` pages from `cursor`, processing each row (and stopping at the first row modified after
+     * `untilMs`, when given). `exhausted` means the walk reached the end (or `untilMs`). */
+    private async walkInvites(
+        cursor: InviteCursor,
+        ownAddresses: Map<string, Set<string>>,
+        untilMs?: number,
+    ): Promise<{ cursor: InviteCursor; exhausted: boolean }> {
+        for (let page = 0; page < Math.max(1, Number(this.maxPages)); page++) {
+            let candidates: CE[] = await this.readInvitePage(cursor);
+            const fullPage: boolean = candidates.length >= this.batchSize;
+            let pastUntil: boolean = false;
+            if (untilMs !== undefined) {
+                const cut: number = candidates.findIndex((row) => new Date(row.dateModified).getTime() > untilMs);
+                if (cut >= 0) {
+                    candidates = candidates.slice(0, cut);
+                    pastUntil = true;
+                }
+            }
+            await this.processInviteCandidates(candidates, ownAddresses);
+            if (candidates.length > 0) {
+                const last: CE = candidates[candidates.length - 1];
+                cursor = { dateModified: new Date(last.dateModified), uid: last.uid };
+            }
+            if (pastUntil || !fullPage) {
+                return { cursor, exhausted: true };
+            }
+        }
+        return { cursor, exhausted: false };
+    }
+
+    private async processInviteCandidates(candidates: CE[], ownAddresses: Map<string, Set<string>>): Promise<void> {
         for (const event of candidates) {
             try {
                 if (!event.attendees || event.attendees.length === 0) {
@@ -215,27 +304,42 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
         // as a literal filter value rather than "include deleted rows too." So this runs two separate
         // queries (an active `status: CANCELLED` one, and a soft-deleted-regardless-of-status one) and
         // merges them, deduplicating by `uid` in case a row somehow matches both.
+        //
+        // `cancelNoticeSentAt: null` is the whole eligibility condition, and every row either query returns is
+        // stamped below (sent or not), so handled rows leave the result set and each batch makes progress. That
+        // includes attendee-less rows: they need no notice, but left unstamped they would refill every batch
+        // forever and starve real cancellations. Ordered by `(dateModified, uid)` for a stable, oldest-first batch.
+        const sort = { dateModified: "ASC", uid: "ASC" };
         const statusCancelled: CE[] = await this.calendarEventRepo!.find(
-            { status: CalendarEventStatus.CANCELLED, cancelNoticeSentAt: null, limit: this.batchSize } as any,
+            { status: CalendarEventStatus.CANCELLED, cancelNoticeSentAt: null, sort, limit: this.batchSize } as any,
             { ignoreACL: true, limit: this.batchSize },
         );
         const softDeleted: CE[] = await this.calendarEventRepo!.find(
-            { deleted: true, cancelNoticeSentAt: null, limit: this.batchSize } as any,
+            { deleted: true, cancelNoticeSentAt: null, sort, limit: this.batchSize } as any,
             { ignoreACL: true, limit: this.batchSize },
         );
         const seenUids = new Set<string>();
         const cancelling: CE[] = [];
         for (const event of [...statusCancelled, ...softDeleted]) {
-            if (!seenUids.has(event.uid) && event.attendees && event.attendees.length > 0) {
+            if (!seenUids.has(event.uid)) {
                 seenUids.add(event.uid);
                 cancelling.push(event);
             }
         }
-        const cancellingMasterIcalUids = new Set(cancelling.filter((event) => !event.recurrenceId).map((event) => event.icalUid));
+        const hasAttendees = (event: CE): boolean => !!event.attendees && event.attendees.length > 0;
+        // Keyed per mailbox: an attendee's own copy of the same series (same `icalUid`, different mailbox) being
+        // deleted in the same batch must not suppress the organizer's occurrence-level CANCEL.
+        const seriesKey = (event: CE): string => `${event.mailboxUid}|${event.icalUid}`;
+        const cancellingMasterIcalUids = new Set(cancelling.filter((event) => !event.recurrenceId && hasAttendees(event)).map(seriesKey));
 
         for (const event of cancelling) {
             try {
-                const isRedundantOccurrenceCancel = !!event.recurrenceId && cancellingMasterIcalUids.has(event.icalUid);
+                if (!hasAttendees(event)) {
+                    // Nothing to send - stamped only so it drops out of the candidate set (see above).
+                    await this.claim(event, { cancelNoticeSentAt: new Date() });
+                    continue;
+                }
+                const isRedundantOccurrenceCancel = !!event.recurrenceId && cancellingMasterIcalUids.has(seriesKey(event));
                 // Same "client's own responsibility" reasoning as `sendInvites()` above - an encrypted
                 // event's CANCEL is never composed/sent by this job either.
                 const isClientManagedEncrypted = event.encryptionOrigin === "originated";

@@ -173,6 +173,76 @@ describe("OpenSearchProvider Tests", () => {
             expect(sent.body).toHaveLength(MAX_SEARCH_DOCUMENT_TEXT_CHARS);
         });
 
+        it("bulkIndex() splits requests by serialized byte size, sending an oversized document alone.", async () => {
+            (provider as any).maxBulkBytes = 600;
+            const docs = [
+                makeDoc({ entityUid: "a", body: "x".repeat(100) }),
+                makeDoc({ entityUid: "b", body: "x".repeat(100) }),
+                makeDoc({ entityUid: "c", body: "x".repeat(1000) }),
+                makeDoc({ entityUid: "d", body: "x".repeat(10) }),
+            ];
+            mockClientInstance.bulk.mockResolvedValue({ body: { errors: false } });
+
+            const result = await provider.bulkIndex(docs);
+
+            expect(result).toEqual(["a", "b", "c", "d"]);
+            const bodies = mockClientInstance.bulk.mock.calls.map((call: any[]) =>
+                call[0].body.filter((_: any, i: number) => i % 2 === 1).map((d: any) => d.entityUid),
+            );
+            expect(bodies).toEqual([["a", "b"], ["c"], ["d"]]);
+            for (const call of mockClientInstance.bulk.mock.calls) {
+                const size = call[0].body.reduce((n: number, line: any) => n + Buffer.byteLength(JSON.stringify(line)) + 1, 0);
+                expect(size <= 600 || call[0].body.length === 2).toBe(true);
+            }
+        });
+
+        it("bulkIndex() falls back to single-document indexing for a chunk rejected with HTTP 413.", async () => {
+            (provider as any).maxBulkBytes = 500;
+            const warn = vi.fn();
+            (provider as any).logger = { warn };
+            mockClientInstance.bulk
+                .mockRejectedValueOnce(Object.assign(new Error("Request Entity Too Large"), { meta: { statusCode: 413 } }))
+                .mockResolvedValueOnce({ body: { errors: false } });
+            mockClientInstance.index.mockResolvedValueOnce({}).mockRejectedValueOnce(new Error("still too large"));
+
+            const result = await provider.bulkIndex([
+                makeDoc({ entityUid: "a", body: "x".repeat(50) }),
+                makeDoc({ entityUid: "b", body: "x".repeat(50) }),
+                makeDoc({ entityUid: "c", body: "x".repeat(200) }),
+            ]);
+
+            expect(mockClientInstance.bulk).toHaveBeenCalledTimes(2);
+            expect(mockClientInstance.index.mock.calls.map((call: any[]) => call[0].id)).toEqual(["message:a", "message:b"]);
+            expect(result).toEqual(["a", "c"]);
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("message b: still too large"));
+        });
+
+        it("bulkIndex() rejects when the first chunk fails with a non-413 error.", async () => {
+            mockClientInstance.bulk.mockRejectedValueOnce(Object.assign(new Error("unreachable"), { meta: { statusCode: 503 } }));
+
+            await expect(provider.bulkIndex([makeDoc()])).rejects.toThrow(/unreachable/);
+        });
+
+        it("bulkIndex() returns the already-indexed uids when a later chunk fails with a non-413 error.", async () => {
+            (provider as any).maxBulkBytes = 1;
+            const warn = vi.fn();
+            (provider as any).logger = { warn };
+            mockClientInstance.bulk.mockResolvedValueOnce({ body: { errors: false } }).mockRejectedValueOnce(new Error("connection reset"));
+
+            const result = await provider.bulkIndex([makeDoc({ entityUid: "a" }), makeDoc({ entityUid: "b" }), makeDoc({ entityUid: "c" })]);
+
+            expect(result).toEqual(["a"]);
+            expect(mockClientInstance.bulk).toHaveBeenCalledTimes(2);
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("connection reset"));
+
+            (provider as any).logger = undefined;
+            mockClientInstance.bulk.mockResolvedValueOnce({ body: { errors: false } }).mockRejectedValueOnce("raw failure");
+            await expect(provider.bulkIndex([makeDoc({ entityUid: "a" }), makeDoc({ entityUid: "b" })])).resolves.toEqual(["a"]);
+            mockClientInstance.bulk.mockRejectedValueOnce(Object.assign(new Error("too large"), { meta: { statusCode: 413 } }));
+            mockClientInstance.index.mockRejectedValueOnce("raw index failure");
+            await expect(provider.bulkIndex([makeDoc({ entityUid: "z" })])).resolves.toEqual([]);
+        });
+
         it("bulkIndex() is a no-op when given an empty array.", async () => {
             await expect(provider.bulkIndex([])).resolves.toEqual([]);
 

@@ -141,6 +141,33 @@ describe("LocalFsBlobStore Tests", () => {
         expect(await store.get(key)).toEqual(data);
     });
 
+    it("put() replaces an existing blob atomically, leaving no temp file behind.", async () => {
+        const key = "atomic-replace";
+        await store.put(key, Buffer.from("old content"));
+        await store.put(key, Buffer.from("new"));
+
+        expect((await store.get(key)).toString()).toBe("new");
+        const dir = path.dirname((store as any).resolvePath(key));
+        expect((await fs.readdir(dir)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    });
+
+    it("put() keeps the previous content and removes the temp file when the input stream fails mid-write.", async () => {
+        const key = "atomic-stream-failure";
+        await store.put(key, Buffer.from("previous"));
+
+        const failing = new Readable({
+            read() {
+                this.push(Buffer.from("partial data"));
+                this.destroy(new Error("source stream failed"));
+            },
+        });
+        await expect(store.put(key, failing)).rejects.toThrow(/source stream failed/);
+
+        expect((await store.get(key)).toString()).toBe("previous");
+        const dir = path.dirname((store as any).resolvePath(key));
+        expect((await fs.readdir(dir)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    });
+
     describe("toBuffer()", () => {
         it("Passes a Buffer through unchanged.", async () => {
             const data = Buffer.from("already a buffer");

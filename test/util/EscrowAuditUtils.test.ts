@@ -614,6 +614,41 @@ describe("EscrowAuditUtils head record Tests", () => {
         expect(await fixture.verify()).toEqual({ valid: true });
     });
 
+    it("Passes the head to update() as a real head-class instance so the optimistic version lock is enforced (Mongo find() returns plain documents).", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        (fixture.headRepo as any).modelClass = fixture.HeadClass;
+        await fixture.append();
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        expect(fixture.headRepo.update).toHaveBeenCalledTimes(1);
+        const existing = fixture.headRepo.update.mock.calls[0][1];
+        expect(existing).toBeInstanceOf(fixture.HeadClass);
+        expect(existing.version).toBe(0);
+    });
+
+    it("Requires a head MAC whenever a key is configured, even when the head points at a legacy SHA-256 entry.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        pushLegacyEntry(fixture);
+        await fixture.append();
+
+        // Attacker deletes every HMAC entry and rolls the head back onto the legacy entry, stripping the MAC.
+        fixture.entries.pop();
+        fixture.heads[0] = { ...fixture.heads[0], sequence: 0, hash: fixture.entries[0].hash, mac: null, hashAlgorithm: null };
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "head_mac_mismatch" });
+    });
+
+    it("Fails closed on a MAC-less head written before the key was enabled, and heals on the next keyed append.", async () => {
+        const fixture = makeChainFixture();
+        await fixture.append();
+        fixture.setKey("secret-key");
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "head_mac_mismatch" });
+
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+        expect(await fixture.verify()).toEqual({ valid: true });
+    });
+
     it("Skips head maintenance entirely for an entry class with no head class.", async () => {
         const fixture = makeChainFixture({ key: "secret-key", withHead: false });
         await fixture.append();

@@ -438,5 +438,82 @@ describe("SearchIndexJobSQL Tests (real DB + DI)", () => {
             expect(updated!.searchIndexAttempts).toBe(1);
             expect(updated!.searchIndexError).toContain("provider unreachable");
         });
+        const interleaveAfterBulkIndex = (fn: () => Promise<void>) => {
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            const realBulkIndex = searchProvider.bulkIndex.bind(searchProvider);
+            vi.spyOn(searchProvider, "bulkIndex").mockImplementationOnce(async (docs: any) => {
+                const result = await realBulkIndex(docs);
+                await fn();
+                return result;
+            });
+            return searchProvider;
+        };
+
+        it("Does not stamp searchIndexedAt over a concurrent edit made while the message was being indexed (version-checked stamp), and keeps the edit.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey });
+            interleaveAfterBulkIndex(async () => {
+                const current = (await messageRepo.findOne({ where: { uid: message.uid } }))!;
+                await messageRepo.update({ uid: message.uid }, { ...{ subject: "Edited concurrently" }, version: current.version + 1 });
+            });
+
+            await job.run();
+
+            const updated = await findMessage(message.uid);
+            expect(updated!.subject).toBe("Edited concurrently");
+            expect(updated!.searchIndexedAt).toBeFalsy();
+        });
+
+        it("Removes the just-indexed document again when the message was soft-deleted while it was being indexed.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey });
+            const searchProvider = interleaveAfterBulkIndex(async () => {
+                const current = (await messageRepo.findOne({ where: { uid: message.uid } }))!;
+                await messageRepo.update({ uid: message.uid }, { ...{ deleted: true }, version: current.version + 1 });
+            });
+
+            await job.run();
+
+            expect(searchProvider.indexed.has(`message:${message.uid}`)).toBe(false);
+        });
+
+        it("Keeps the document of a still-live message whose stamp merely conflicted.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey });
+            const searchProvider = interleaveAfterBulkIndex(async () => {
+                const current = (await messageRepo.findOne({ where: { uid: message.uid } }))!;
+                await messageRepo.update({ uid: message.uid }, { ...{ subject: "Edited concurrently" }, version: current.version + 1 });
+            });
+
+            await job.run();
+
+            expect(searchProvider.indexed.has(`message:${message.uid}`)).toBe(true);
+        });
+
+        it("Clears its own stamp again when an attachment's text was extracted after the document was built, so the text gets indexed next run.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey, hasAttachments: true });
+            const extractedBlobKey = `attachment-text/${uuid.v4()}`;
+            await blobStore.put(extractedBlobKey, Buffer.from("late attachment text"));
+            interleaveAfterBulkIndex(async () => {
+                await createAttachment({ messageUid: message.uid, extractedTextBlobKey: extractedBlobKey });
+            });
+
+            await job.run();
+            expect((await findMessage(message.uid))!.searchIndexedAt).toBeFalsy();
+
+            await job.run();
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            expect(searchProvider.indexed.get(`message:${message.uid}`)!.attachmentText).toEqual(["late attachment text"]);
+            expect((await findMessage(message.uid))!.searchIndexedAt).toBeInstanceOf(Date);
+        });
     });
 });

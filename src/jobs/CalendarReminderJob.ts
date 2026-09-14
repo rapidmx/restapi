@@ -10,8 +10,6 @@ import { CalendarEvent, CalendarEventStatus } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 const MS_PER_MINUTE = 60 * 1000;
-/** Safety net on how many `batch_size` pages of candidates one run will read per query. */
-const MAX_PAGES = 50;
 
 /**
  * Dispatches a `"reminder"` push notification (to the event's folder and mailbox channels) when an event
@@ -30,8 +28,10 @@ const MAX_PAGES = 50;
  * fires its own reminder from its own row.
  *
  * **Candidates.** Non-recurring rows and override rows are read by `startDate` from the watermark up to
- * `now + window_seconds + max_lead_minutes`, paged in `batch_size` pages; recurring masters are read separately
- * (their `startDate` is the series start, not the next occurrence). A reminder set further ahead than
+ * `now + window_seconds + max_lead_minutes`, keyset-paged on `(startDate, uid)` in `batch_size` pages; recurring
+ * masters are read separately (their `startDate` is the series start, not the next occurrence), narrowed to
+ * non-cancelled masters starting before that same upper bound, and skipped before expansion when their
+ * `recurrenceRule.until` has already passed. There is no page cap: every candidate is read each run. A reminder set further ahead than
  * `max_lead_minutes` (default 14 days) on a non-recurring event is never picked up - raise the setting if such
  * reminders matter.
  *
@@ -116,27 +116,45 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         // `limit` is passed both via `options` (Mongo) and in the query itself (SQL's `buildSearchQuerySQL` reads
         // only the query) - same for `page`.
         const upperStartMs: number = horizonMs + Number(this.maxLeadMinutes) * MS_PER_MINUTE;
-        await this.readPages(
-            { startDate: `gte(${new Date(lowerMs).toISOString()})`, reminderMinutesBeforeStart: "ne(null)", sort: "startDate" },
+        await this.readKeyset(
+            { reminderMinutesBeforeStart: "ne(null)" },
+            "startDate",
+            new Date(lowerMs),
             (rows) => {
-                let pastUpper = false;
                 for (const row of rows) {
                     if (new Date(row.startDate).getTime() > upperStartMs) {
-                        pastUpper = true;
-                    } else {
-                        candidates.set(row.uid, row);
+                        return true;
                     }
+                    candidates.set(row.uid, row);
                 }
-                return pastUpper;
+                return false;
             },
         );
-        // Recurring masters: `startDate` is the series start, so they can't be narrowed by it.
-        await this.readPages({ recurrenceRule: "ne(null)", reminderMinutesBeforeStart: "ne(null)", sort: "startDate" }, (rows) => {
-            for (const row of rows) {
-                candidates.set(row.uid, row);
-            }
-            return false;
-        });
+        // Recurring masters: `startDate` is the series start, so it only bounds them from above (a series can't have
+        // an occurrence before it starts). A series whose `recurrenceRule.until` is already before the fire window
+        // can't have a due occurrence either, but `recurrenceRule` is a JSON column on SQL that the query DSL can't
+        // filter into, so that check is client-side - before any (potentially long) occurrence expansion.
+        await this.readKeyset(
+            {
+                recurrenceRule: "ne(null)",
+                recurrenceId: null,
+                reminderMinutesBeforeStart: "ne(null)",
+                status: `ne(${CalendarEventStatus.CANCELLED})`,
+                startDate: `lte(${new Date(upperStartMs).toISOString()})`,
+            },
+            undefined,
+            undefined,
+            (rows) => {
+                for (const row of rows) {
+                    const until: any = row.recurrenceRule?.until;
+                    if (until !== undefined && until !== null && new Date(until).getTime() < lowerMs) {
+                        continue;
+                    }
+                    candidates.set(row.uid, row);
+                }
+                return false;
+            },
+        );
 
         for (const event of candidates.values()) {
             try {
@@ -149,19 +167,44 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         this.watermarkMs = horizonMs;
     }
 
-    private async readPages(query: Record<string, any>, consume: (rows: CE[]) => boolean): Promise<void> {
-        for (let page = 0; page < MAX_PAGES; page++) {
-            const rows: CE[] = await this.calendarEventRepo!.find({ ...query, limit: this.batchSize, page } as any, {
-                ignoreACL: true,
+    /**
+     * Reads every row matching `query` in `batch_size` pages, by keyset rather than offset: ordered by
+     * `(field, uid)` when `field` is given (else by `uid` alone), each page continuing strictly after the previous
+     * page's last row. Unlike offset paging, rows sharing the same `field` value can't be skipped or repeated
+     * across a page boundary, and there's no page cap - every matching row is read (until `consume` returns `true`).
+     *
+     * `firstPageLowerBound` is the first page's inclusive lower bound on `field` (required when `field` is). `limit` is
+     * passed both via `options` (Mongo) and in the query itself (SQL's `buildSearchQuerySQL` reads only the query).
+     */
+    private async readKeyset(
+        query: Record<string, any>,
+        field: "startDate" | undefined,
+        firstPageLowerBound: Date | undefined,
+        consume: (rows: CE[]) => boolean,
+    ): Promise<void> {
+        let last: CE | undefined;
+        for (;;) {
+            const pageQuery: Record<string, any> = {
+                ...query,
+                sort: field ? { [field]: "ASC", uid: "ASC" } : { uid: "ASC" },
                 limit: this.batchSize,
-                page,
-            });
-            const stop: boolean = consume(rows);
-            if (stop || rows.length < this.batchSize) {
+            };
+            if (!field) {
+                if (last) {
+                    pageQuery.uid = `gt(${last.uid})`;
+                }
+            } else if (!last) {
+                pageQuery[field] = `gte(${firstPageLowerBound!.toISOString()})`;
+            } else {
+                const at: string = new Date((last as any)[field]).toISOString();
+                pageQuery.$or = [{ [field]: `gt(${at})` }, { [field]: `eq(${at})`, uid: `gt(${last.uid})` }];
+            }
+            const rows: CE[] = await this.calendarEventRepo!.find(pageQuery as any, { ignoreACL: true, limit: this.batchSize });
+            if (consume(rows) || rows.length < this.batchSize) {
                 return;
             }
+            last = rows[rows.length - 1];
         }
-        this.logger?.warn(`CalendarReminderJob: candidate query ${JSON.stringify(query)} exceeded ${MAX_PAGES} pages; remaining rows skipped this run.`);
     }
 
     private async processEvent(event: CE, lowerMs: number, horizonMs: number): Promise<void> {

@@ -10,7 +10,7 @@ import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
-import { extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
+import { checkOriginatorHeaders, extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { FolderType, Mailbox, Message } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
@@ -24,7 +24,7 @@ const MAX_ERROR_LENGTH = 1000;
  * then moves it into the mailbox's Sent Items folder and clears `scheduledSendTime` - mirroring exactly what
  * `send()` itself does for a message with no deferred send time.
  *
- * `relayDueMessage()` claims a message (a version-checked clear of `scheduledSendTime`) before doing any
+ * `relayDueMessage()` claims a message (a version-checked lease pushing `scheduledSendTime` forward) before doing any
  * relay/side-effecting work, the same "claim first, work second" discipline `DataExportJob.
  * processRequest()` uses - see that method's own doc comment for why: without it, a concurrent cancel/edit
  * of the same message could race the actual SMTP send, resulting in a delivered email the DB ends up
@@ -35,7 +35,9 @@ const MAX_ERROR_LENGTH = 1000;
  * - The message must sit in its own mailbox's `OUTBOX` folder - the only place `send()` stages a deferred send.
  * - `from.address` must be one of the owning mailbox's own addresses (`primarySmtpAddress`/
  * `aliasAddresses`, case-insensitive).
- * A message failing either guard is taken out of the due queue unsent (`scheduledSendTime` cleared,
+ * - Every address in the stored MIME's `From`/`Sender` headers must be one of those addresses too, with at most one
+ * of each header (`checkOriginatorHeaders()`, run on the exact bytes about to be relayed).
+ * A message failing any guard is taken out of the due queue unsent (`scheduledSendTime` cleared,
  * `scheduledSendError` set) so it can never block the queue.
  *
  * Failure handling:
@@ -87,6 +89,10 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
 
     @Config("mail:jobs:scheduled_send:retry_backoff_ms", 60_000)
     private retryBackoffMs: number = 60_000;
+
+    /** How far a claim pushes `scheduledSendTime` ahead while a relay is in flight (see `relayDueMessage()`). */
+    @Config("mail:jobs:scheduled_send:lease_ms", 900_000)
+    private leaseMs: number = 900_000;
 
     @Logger
     private logger: any;
@@ -156,36 +162,32 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
         const dueAt: any = (message as any).scheduledSendTime;
         const alreadyRelayed: boolean = !!(message as any).scheduledSendRelayedAt;
 
+        let ownAddresses: Set<string> = new Set();
         if (!alreadyRelayed) {
-            const refusal: string | undefined = await this.validateForRelay(message);
-            if (refusal) {
-                // Version-checked, so a concurrent edit (e.g. the user moving it into Outbox properly) wins.
-                await this.messageRepo!.update(
-                    {
-                        uid: message.uid,
-                        version: (message as any).version,
-                        scheduledSendTime: null,
-                        scheduledSendAttempts: null,
-                        scheduledSendError: refusal,
-                    } as any,
-                    asEntity(this.messageRepo!, message),
-                    { ignoreACL: true },
-                );
-                this.logger?.warn(`ScheduledSendJob: refusing to send scheduled message ${message.uid}: ${refusal}`);
+            const validation = await this.validateForRelay(message);
+            if (validation.refusal) {
+                await this.refuse(message, validation.refusal);
                 return;
             }
+            ownAddresses = validation.ownAddresses!;
         }
 
-        // Claimed via a version-checked clear of `scheduledSendTime` BEFORE any relay/side-effecting work
-        // happens - the same "claim first, work second" discipline `DataExportJob.processRequest()` uses.
-        // Without this, `scanAndRelay()` below (an irreversible external SMTP send) could run against a
-        // message a concurrent cancel/edit has already superseded. Claiming first means whichever side's
-        // version is stale loses cleanly: if a cancel/edit already bumped the version by the time this runs,
-        // this claim itself throws immediately and nothing below - `scanAndRelay()` included - ever runs; if
-        // this claim wins first, a concurrent cancel/edit attempt now targets a stale version and fails on the
-        // user's own side instead of racing silently against an in-flight send.
+        // Claimed via a version-checked update BEFORE any relay/side-effecting work happens - the same "claim
+        // first, work second" discipline `DataExportJob.processRequest()` uses. Without this, `scanAndRelay()`
+        // below (an irreversible external SMTP send) could run against a message a concurrent cancel/edit has
+        // already superseded. Claiming first means whichever side's version is stale loses cleanly: if a
+        // cancel/edit already bumped the version by the time this runs, this claim itself throws immediately and
+        // nothing below - `scanAndRelay()` included - ever runs; if this claim wins first, a concurrent cancel/edit
+        // attempt now targets a stale version and fails on the user's own side instead of racing silently against
+        // an in-flight send.
+        //
+        // The claim is a *lease*, not a clear: `scheduledSendTime` is pushed `lease_ms` into the future, so the row
+        // drops out of the due query while this run works on it, but a process crash mid-relay leaves it due again
+        // once the lease expires instead of silently losing the send. `scheduledSendTime` is only cleared by the
+        // final filing update after a successful relay (or by `refuse()`/`recordFailedAttempt()`). `lease_ms` must
+        // comfortably exceed a relay's worst-case duration, or another replica could re-claim an in-flight send.
         const claimed: M = await this.messageRepo!.update(
-            { uid: message.uid, version: (message as any).version, scheduledSendTime: null } as any,
+            { uid: message.uid, version: (message as any).version, scheduledSendTime: new Date(Date.now() + Number(this.leaseMs)) } as any,
             asEntity(this.messageRepo!, message),
             { ignoreACL: true },
         );
@@ -213,6 +215,14 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             };
             try {
                 raw = await this.blobStore!.get(claimed.bodyBlobKey);
+                // The stored MIME's own originator headers are what recipients actually see - `from.address` alone
+                // (checked in `validateForRelay()`) says nothing about them. Checked on the exact bytes relayed
+                // below, so a concurrent blob rewrite can't slip past between check and send.
+                const headerRefusal: string | undefined = checkOriginatorHeaders(raw, (address) => ownAddresses.has(normalizeAddress(address)));
+                if (headerRefusal) {
+                    await this.refuse(claimed, headerRefusal);
+                    return;
+                }
                 const envelopeTo: string[] = claimed.recipients.map((r) => r.address);
                 const result = await scanAndRelay(
                     raw,
@@ -279,6 +289,8 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     sanitizedHtmlBlobKey: sanitizedHtmlBlobKey ?? null,
                     ...(messageId ? { messageId } : {}),
                     conversationId: conversationId ?? null,
+                    // Releases the claim's lease.
+                    scheduledSendTime: null,
                     scheduledSendAttempts: null,
                     scheduledSendError: null,
                     scheduledSendRelayedAt: null,
@@ -300,34 +312,52 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
         }
     }
 
-    /** Returns a refusal reason if `message` must not be relayed, or `undefined` if it passes every guard. */
-    private async validateForRelay(message: M): Promise<string | undefined> {
+    /** Takes `message` out of the due queue unsent with `reason` recorded. Version-checked, so a concurrent edit
+     * (e.g. the user moving it into Outbox properly) wins. */
+    private async refuse(message: M, reason: string): Promise<void> {
+        await this.messageRepo!.update(
+            {
+                uid: message.uid,
+                version: (message as any).version,
+                scheduledSendTime: null,
+                scheduledSendAttempts: null,
+                scheduledSendError: reason,
+            } as any,
+            asEntity(this.messageRepo!, message),
+            { ignoreACL: true },
+        );
+        this.logger?.warn(`ScheduledSendJob: refusing to send scheduled message ${message.uid}: ${reason}`);
+    }
+
+    /** Returns a refusal reason if `message` must not be relayed; otherwise the sending mailbox's own (normalized)
+     * addresses, for the stored MIME's originator-header check. */
+    private async validateForRelay(message: M): Promise<{ refusal?: string; ownAddresses?: Set<string> }> {
         const folder: any = message.folderUid
             ? await this.folderRepo!.findOne(message.folderUid, { ignoreACL: true })
             : undefined;
         if (!folder || folder.type !== FolderType.OUTBOX || folder.mailboxUid !== message.mailboxUid) {
-            return "Message is not in its mailbox's Outbox folder.";
+            return { refusal: "Message is not in its mailbox's Outbox folder." };
         }
 
         const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
-            return "The sending mailbox no longer exists.";
+            return { refusal: "The sending mailbox no longer exists." };
         }
         const ownAddresses: Set<string> = new Set(
-            [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].filter((a) => !!a).map((a) => normalizeAddress(a)),
+            [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].filter((a) => typeof a === "string" && !!a).map((a) => normalizeAddress(a)),
         );
         const fromAddress: string = message.from?.address ? normalizeAddress(message.from.address) : "";
         if (!fromAddress || !ownAddresses.has(fromAddress)) {
-            return "The From address is not one of the sending mailbox's own addresses.";
+            return { refusal: "The From address is not one of the sending mailbox's own addresses." };
         }
-        return undefined;
+        return { ownAddresses };
     }
 
     /**
      * Records a failed attempt on an already-claimed message: increments `scheduledSendAttempts` and either
      * re-queues it with linear backoff (`scheduledSendTime = now + attempts x retryBackoffMs`) or, once
      * `maxAttempts` is reached, leaves it out of the queue with `scheduledSendError` set. Best-effort: a failure
-     * here is logged, and the message simply stays out of the queue (the claim already cleared its schedule).
+     * here is logged, and the message is simply retried once the claim's lease expires.
      */
     private async recordFailedAttempt(uid: string, dueAt: any, err: any, extra: Record<string, any>): Promise<void> {
         try {

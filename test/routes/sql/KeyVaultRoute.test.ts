@@ -5,7 +5,7 @@
 import "reflect-metadata";
 import config from "../../config.sql.js";
 import { request } from "@rapidrest/service-core/test";
-import { ACLRecord, Server, ObjectFactory, ConnectionManager, ACLAction, AccessControlListSQL, isSqlDataSource } from "@rapidrest/service-core";
+import { ACLRecord, Server, ObjectFactory, ConnectionManager, ACLAction, AccessControlListSQL, isSqlDataSource, RepoUtils } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as x509 from "@peculiar/x509";
 import * as uuid from "uuid";
@@ -873,10 +873,69 @@ describe("Route:KeyVaultSQL Tests", () => {
                         { publicKey: "forged-b64", type: "x509", useType: "encrypt", fingerprint: "never-enrolled", notBefore: Date.now(), notAfter: Date.now() + 1000 },
                     ],
                     wrappedKeys: [],
-                    masterKeyWraps: [],
+                    masterKeyWraps: [
+                        { method: "password", ciphertext: "mkct", nonce: "mkn", salt: "salt", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() },
+                    ],
                 });
+            expect(result.body.message).toMatch(/must already be enrolled/);
 
             expect(result.status).toBe(400);
+        });
+
+        it("Rejects a rekey missing keys/wrappedKeys/masterKeyWraps, or with no master key wrap at all (400), leaving the vault as it was.", async () => {
+            const mailbox = await createMailbox();
+            const enrolledKey = await enrollFirstKey(mailbox);
+            const wrappedKeys = [{ ciphertext: "x", nonce: "y", algorithm: "AES-256-GCM", fingerprint: enrolledKey.fingerprint, useType: "encrypt" }];
+            const masterKeyWraps = [{ method: "recovery", ciphertext: "rc", nonce: "rn", salt: "rs", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() }];
+
+            for (const body of [
+                { wrappedKeys, masterKeyWraps },
+                { keys: [enrolledKey], masterKeyWraps },
+                { keys: [enrolledKey], wrappedKeys },
+                { keys: [enrolledKey], wrappedKeys, masterKeyWraps: [] },
+            ]) {
+                const result = await request(server.getApplication())
+                    .put(`${baseUrl}/${mailbox.uid}/keyvault/rekey`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .send(body);
+                expect(result.status).toBe(400);
+            }
+
+            const vault = await keyVaultRepo.findOne({ where: { mailboxUid: mailbox.uid } });
+            expect(vault!.wrappedKeys[0].ciphertext).toBe("ct");
+            expect(vault!.masterKeyWraps).toHaveLength(1);
+        });
+
+        it("Refuses (409) a vault write that races another write, instead of silently overwriting the other write's keys.", async () => {
+            const mailbox = await createMailbox();
+            const enrolledKey = await enrollFirstKey(mailbox);
+            const originalFind = RepoUtils.prototype.find;
+            let raced = false;
+            const spy = vi.spyOn(RepoUtils.prototype, "find").mockImplementation(async function (this: any, ...args: any[]) {
+                const rows = await (originalFind as any).apply(this, args);
+                if (!raced && this.modelClass === KeyVaultSQL) {
+                    raced = true;
+                    // Another request's write lands between the route's read and its own update.
+                    await keyVaultRepo.increment({ mailboxUid: mailbox.uid }, "version", 1);
+                }
+                return rows;
+            });
+            try {
+                const result = await request(server.getApplication())
+                    .put(`${baseUrl}/${mailbox.uid}/keyvault/rekey`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .send({
+                        keys: [enrolledKey],
+                        wrappedKeys: [{ ciphertext: "lost", nonce: "n", algorithm: "AES-256-GCM", fingerprint: enrolledKey.fingerprint, useType: "encrypt" }],
+                        masterKeyWraps: [{ method: "recovery", ciphertext: "rc", nonce: "rn", salt: "rs", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() }],
+                    });
+                expect(raced).toBe(true);
+                expect(result.status).toBe(409);
+            } finally {
+                spy.mockRestore();
+            }
+            const vault = await keyVaultRepo.findOne({ where: { mailboxUid: mailbox.uid } });
+            expect(vault!.wrappedKeys[0].ciphertext).toBe("ct");
         });
 
         it("Returns 404 re-keying a mailbox with no vault yet.", async () => {

@@ -130,6 +130,35 @@ describe("computeBusyWindows() Tests", () => {
             expect(isoStarts(busy)).toContain("2026-06-02T13:00:00.000Z");
         });
 
+        it("Expands a recurring series in its own timezone, keeping local time of day across a DST change.", () => {
+            // 09:00 America/New_York weekly - 14:00Z before the 2026-03-08 spring-forward, 13:00Z after it.
+            const event = makeEvent({
+                startDate: new Date("2026-03-02T14:00:00.000Z"),
+                endDate: new Date("2026-03-02T15:00:00.000Z"),
+                timezone: "America/New_York",
+                recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, count: 3 },
+            });
+
+            const busy = computeBusyWindows([event], new Date("2026-03-01T00:00:00.000Z"), new Date("2026-04-01T00:00:00.000Z"));
+
+            expect(isoStarts(busy)).toEqual(["2026-03-02T14:00:00.000Z", "2026-03-09T13:00:00.000Z", "2026-03-16T13:00:00.000Z"]);
+            expect(busy.map((window) => window.end.getTime() - window.start.getTime())).toEqual([3600000, 3600000, 3600000]);
+        });
+
+        it("Expands an allDay series in UTC even when it has a timezone.", () => {
+            const event = makeEvent({
+                startDate: new Date("2026-03-07T00:00:00.000Z"),
+                endDate: new Date("2026-03-08T00:00:00.000Z"),
+                allDay: true,
+                timezone: "America/New_York",
+                recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, count: 3 },
+            });
+
+            const busy = computeBusyWindows([event], new Date("2026-03-01T00:00:00.000Z"), new Date("2026-04-01T00:00:00.000Z"));
+
+            expect(isoStarts(busy)).toEqual(["2026-03-07T00:00:00.000Z", "2026-03-08T00:00:00.000Z", "2026-03-09T00:00:00.000Z"]);
+        });
+
         it("Treats an override row on its own as an ordinary single event, with no exclusions applied.", () => {
             const override = makeEvent({ recurrenceId: new Date("2026-06-01T13:00:00.000Z") });
 

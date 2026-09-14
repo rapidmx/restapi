@@ -29,10 +29,8 @@ import { expandOccurrences, type OccurrenceWindow } from "./IcsUtils.js";
  * deliberately left calling its own existing code - changing shipped resource-booking behavior is not a side
  * effect this belongs to.
  *
- * Note the DST caveat inherited from `expandOccurrences()`, which is documented as UTC-only and DST-naive: a
- * recurring busy block whose series crosses a daylight-saving transition expands at a fixed UTC offset from its
- * series start, so its occurrences after the transition are an hour off local wall-clock time. That affects
- * recurring busy blocks only, not the one-off events the overwhelming majority of bookings collide with.
+ * Each row's own `timezone` and `allDay` are passed through to `expandOccurrences()`, so a recurring busy block
+ * steps in its own local wall-clock time and keeps its local time of day across a daylight-saving transition.
  *
  * @param events The candidate events to consider. Rows outside the window contribute nothing.
  * @param windowStart The inclusive start of the window of interest.
@@ -58,7 +56,13 @@ export function computeBusyWindows(events: CalendarEvent[], windowStart: Date, w
 
         busy.push(
             ...expandOccurrences(
-                { startDate: event.startDate, endDate: event.endDate, recurrenceRule: event.recurrenceRule },
+                {
+                    startDate: event.startDate,
+                    endDate: event.endDate,
+                    recurrenceRule: event.recurrenceRule,
+                    timezone: event.timezone,
+                    allDay: event.allDay,
+                },
                 windowStart,
                 windowEnd,
                 excludeDates,

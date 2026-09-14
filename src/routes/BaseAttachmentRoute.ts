@@ -20,7 +20,7 @@ import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { Attachment, Message } from "../models/types.js";
 const { Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
-const { Get, Param, Post, Request, Response, User: AuthUser } = RouteDecorators;
+const { Delete, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** Strips CR/LF (header injection) from a client-supplied filename before it's ever stored - matches
  * `DistributionListUtils.rewriteHeadersForList()`'s identical `safeName` convention for any other value
@@ -41,7 +41,20 @@ function escapeContentDispositionFilename(filename: string): string {
 
 /** `Attachment` fields only the server sets: the blob keys (`upload()`/extraction - a client-chosen key would read any
  * stored object back through `download()`), the scan result, and the size/type measured at upload. */
-const SERVER_MANAGED_ATTACHMENT_FIELDS = ["blobKey", "extractedTextBlobKey", "scanResultUid", "sizeBytes", "mimeType"] as const;
+const SERVER_MANAGED_ATTACHMENT_FIELDS = [
+    "blobKey",
+    "extractedTextBlobKey",
+    "scanResultUid",
+    "sizeBytes",
+    "mimeType",
+    // Fixed by `upload()` from the message it was checked against; re-pointing it would attach this content (and its
+    // quota) to another mailbox's message.
+    "messageUid",
+    // `AttachmentExtractionJob`'s retry state.
+    "extractionAttempts",
+    "extractionNextAttemptAt",
+    "extractionError",
+] as const;
 
 /** Types `download()` serves under their own `Content-Type` and, when `isInline`, `inline`: raster images only. Every
  * other type - HTML, SVG, XML, PDF, scripts, anything a browser might render or execute in this origin - is served as
@@ -62,6 +75,8 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
     protected readonly scopeProperty: string = "folderUid";
 
     protected readonly serverManagedFields: readonly string[] = SERVER_MANAGED_ATTACHMENT_FIELDS;
+
+    protected readonly dateFields: readonly string[] = ["extractionNextAttemptAt"];
 
     /** The class of the owning `Message` entity, supplied by the Mongo/SQL concrete subclass. */
     protected abstract messageClass: any;
@@ -143,7 +158,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
             contentType: Array.isArray(mimeType) ? mimeType[0] : mimeType,
         });
 
-        return await this.doCreateObject(
+        const created: T = await this.doCreateObject(
             {
                 messageUid,
                 folderUid: message.folderUid,
@@ -157,6 +172,60 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
             } as any,
             { user, ignoreACL: true },
         );
+        await this.syncMessageHasAttachments(message.uid);
+        return created;
+    }
+
+    /**
+     * Sets the message's `hasAttachments` from whether any `Attachment` still references it - the flag clients filter
+     * and search by is derived here rather than written by clients (see `BaseMessageRoute`'s server-managed fields).
+     * Version-checked and retried on a concurrent write; best-effort (logged) beyond that.
+     */
+    private async syncMessageHasAttachments(messageUid: string): Promise<void> {
+        const messageRepo: RecoverableRepoUtils<M> = await this.getMessageRepo();
+        try {
+            for (let attempt = 1; ; attempt++) {
+                const count: number = await this.repoUtils!.count({ messageUid: `eq(${messageUid})` } as any, { ignoreACL: true });
+                // A message deleted meanwhile throws here and is logged below.
+                const message: M = (await messageRepo.findOne(messageUid, { ignoreACL: true, skipCache: true }))!;
+                if (!!message.hasAttachments === count > 0) {
+                    return;
+                }
+                try {
+                    await messageRepo.update(
+                        { uid: message.uid, version: (message as any).version, hasAttachments: count > 0 } as any,
+                        message,
+                        { ignoreACL: true },
+                    );
+                    return;
+                    /* v8 ignore start -- only a concurrent write to the same message reaches here */
+                } catch (err: any) {
+                    if (attempt >= 3 || err?.status !== 409) {
+                        throw err;
+                    }
+                }
+                /* v8 ignore stop */
+            }
+            /* v8 ignore start -- database failure */
+        } catch (err: any) {
+            this.logger?.warn(`BaseAttachmentRoute: failed to update hasAttachments on message ${messageUid}: ${err.message}`);
+        }
+        /* v8 ignore stop */
+    }
+
+    /** As `BaseScopedChildRoute.delete()`, then re-derives the owning message's `hasAttachments`. */
+    @Delete("/:id")
+    public async delete(
+        @Param("id") id: string,
+        @Query("version") version: string | undefined,
+        @Query("purge") purge: string | undefined,
+        @Request req: HttpRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<void> {
+        const existing: T | undefined = await this.repoUtils!.findOne(id, { version, ignoreACL: true });
+        await super.delete(id, version, purge, req, user);
+        // `super.delete()` has already answered 404 when there was nothing to delete.
+        await this.syncMessageHasAttachments(existing!.messageUid);
     }
 
     @Summary("Download attachment content")

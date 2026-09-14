@@ -107,6 +107,59 @@ describe("resolveFederationPolicy() Tests", () => {
         expect(resolver.resolveTxt).toHaveBeenCalledTimes(1);
     });
 
+    it("Negative-caches NXDOMAIN (ENOTFOUND) and ENODATA for the full negative TTL.", async () => {
+        for (const [code, domain] of [["ENOTFOUND", "example13.com"], ["ENODATA", "example14.com"]]) {
+            const resolver = { resolveTxt: vi.fn().mockRejectedValue(Object.assign(new Error(code), { code })), resolveMx: vi.fn() };
+
+            await resolveFederationPolicy(resolver, domain);
+            await resolveFederationPolicy(resolver, domain);
+
+            expect(resolver.resolveTxt).toHaveBeenCalledTimes(1);
+        }
+    });
+
+    it("Caches a transient DNS failure (SERVFAIL/timeout) only for the short transient TTL.", async () => {
+        vi.useFakeTimers();
+        try {
+            const resolver = {
+                resolveTxt: vi
+                    .fn()
+                    .mockRejectedValueOnce(Object.assign(new Error("queryTxt ESERVFAIL"), { code: "ESERVFAIL" }))
+                    .mockResolvedValue([["v=RMXv1; id=1; host=mail.example15.com;"]]),
+                resolveMx: vi.fn(),
+            };
+
+            await expect(resolveFederationPolicy(resolver, "example15.com")).resolves.toBeUndefined();
+            await expect(resolveFederationPolicy(resolver, "example15.com")).resolves.toBeUndefined();
+            expect(resolver.resolveTxt).toHaveBeenCalledTimes(1);
+
+            vi.advanceTimersByTime(61_000);
+            await expect(resolveFederationPolicy(resolver, "example15.com")).resolves.toEqual({ host: "mail.example15.com", id: "1" });
+            expect(resolver.resolveTxt).toHaveBeenCalledTimes(2);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("Does not cache a transient failure at all when transientFailureTtlSeconds is 0 (including errors without a code).", async () => {
+        const resolver = {
+            resolveTxt: vi
+                .fn()
+                .mockRejectedValueOnce(Object.assign(new Error("timeout"), { code: "ETIMEOUT" }))
+                .mockRejectedValueOnce("raw failure")
+                .mockResolvedValue([["v=RMXv1; id=1; host=mail.example16.com;"]]),
+            resolveMx: vi.fn(),
+        };
+
+        await expect(resolveFederationPolicy(resolver, "example16.com", { transientFailureTtlSeconds: 0 })).resolves.toBeUndefined();
+        await expect(resolveFederationPolicy(resolver, "example16.com", { transientFailureTtlSeconds: 0 })).resolves.toBeUndefined();
+        await expect(resolveFederationPolicy(resolver, "example16.com", { transientFailureTtlSeconds: 0 })).resolves.toEqual({
+            host: "mail.example16.com",
+            id: "1",
+        });
+        expect(resolver.resolveTxt).toHaveBeenCalledTimes(3);
+    });
+
     it("Is case-insensitive on the domain for both the DNS query and the cache key.", async () => {
         const resolver = makeResolver([["v=RMXv1; id=1; host=mail.example12.com;"]]);
 

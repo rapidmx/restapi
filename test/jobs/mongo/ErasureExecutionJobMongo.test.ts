@@ -727,6 +727,189 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         expect(stillFirst!.purgedCount).toBe(5);
     });
 
+    it("Removes the search index documents of every purged message, contact, calendar event, task and note.", async () => {
+        const mailbox = await createMailbox();
+        const folderUid = uuid.v4();
+        const message = await messageRepo.save(
+            new MessageMongo({
+                mailboxUid: mailbox.uid,
+                folderUid,
+                messageId: `${uuid.v4()}@example.com`,
+                subject: "Hi",
+                from: { address: "alice@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date(),
+                receivedDate: new Date(),
+                bodyBlobKey: `bodies/${uuid.v4()}`,
+                flags: { read: false, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: false,
+            }),
+        );
+        const softDeletedContact = await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid, displayName: "Deleted" }));
+        await contactRepo.updateOne({ uid: softDeletedContact.uid } as any, { $set: { deleted: true } });
+        const event = await calendarEventRepo.save(new CalendarEventMongo({ mailboxUid: mailbox.uid, folderUid, title: "An Event" }));
+        const task = await taskRepo.save(new TaskMongo({ mailboxUid: mailbox.uid, folderUid, title: "A Task" }));
+        const note = await noteRepo.save(new NoteMongo({ mailboxUid: mailbox.uid, folderUid, title: "A Note", body: "Body" }));
+        const otherContact = await contactRepo.save(new ContactMongo({ mailboxUid: uuid.v4(), folderUid, displayName: "Not mine" }));
+        await createRequest({ mailboxUid: mailbox.uid });
+        const searchProvider: any = objectFactory.getInstance("SearchProvider");
+        const removeSpy = vi.spyOn(searchProvider, "remove");
+
+        await job.run();
+
+        const removed = removeSpy.mock.calls.map((call) => `${call[0]}:${call[1]}`).sort();
+        expect(removed).toEqual(
+            [`message:${message.uid}`, `contact:${softDeletedContact.uid}`, `calendarEvent:${event.uid}`, `task:${task.uid}`, `note:${note.uid}`].sort(),
+        );
+        expect(removed).not.toContain(`contact:${otherContact.uid}`);
+    });
+
+    it("Purges every row across several keyset pages, including rows written behind the cursor mid-purge.", async () => {
+        const mailbox = await createMailbox();
+        for (let i = 0; i < 7; i++) {
+            await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: `C${i}` }));
+        }
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+        (job as any).purgePageSize = 2;
+        const searchProvider: any = objectFactory.getInstance("SearchProvider");
+        let injected = false;
+        vi.spyOn(searchProvider, "remove").mockImplementation(async (entityType: any) => {
+            if (entityType === "contact" && !injected) {
+                injected = true;
+                // A concurrent write whose uid sorts before the cursor - a single keyset pass would miss it.
+                const late = await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "Late" }));
+                await contactRepo.updateOne({ uid: late.uid } as any, { $set: { uid: "00000000-0000-0000-0000-000000000000" } });
+            }
+        });
+
+        try {
+            await job.run();
+        } finally {
+            (job as any).purgePageSize = 500;
+        }
+
+        expect(await contactRepo.count({ mailboxUid: mailbox.uid })).toBe(0);
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.status).toBe("completed");
+        // 8 contacts + mailbox
+        expect(updated!.purgedCount).toBe(9);
+    });
+
+    it("Claims a request before running it, so a second worker holding the same stale read skips it.", async () => {
+        const mailbox = await createMailbox();
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "A" }));
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+        const stale = await requestRepo.findOne({ uid: request.uid } as any);
+        let statusDuringCascade: string | undefined;
+        const originalFindOne = (job as any).mailboxRepo.findOne.bind((job as any).mailboxRepo);
+        vi.spyOn((job as any).mailboxRepo, "findOne").mockImplementationOnce(async (...args: any[]) => {
+            statusDuringCascade = (await requestRepo.findOne({ uid: request.uid } as any))!.status;
+            return await originalFindOne(...args);
+        });
+
+        await job.run();
+
+        expect(statusDuringCascade).toBe("in_progress");
+        const completed = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(completed!.status).toBe("completed");
+
+        // A second worker that read the request before the first claimed it can't claim it.
+        const processSpy = vi.spyOn(job as any, "markCompleted");
+        await (job as any).processRequest(stale);
+        expect(processSpy).not.toHaveBeenCalled();
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.purgedCount).toBe(completed!.purgedCount);
+        expect(await auditLogRepo.count({ action: AuditAction.ERASURE_REQUEST_COMPLETED })).toBe(1);
+    });
+
+    it("Leaves a freshly claimed in-progress request alone, but takes over one whose claim went stale.", async () => {
+        const mailbox = await createMailbox();
+        const request = await createRequest({ mailboxUid: mailbox.uid, status: "in_progress" });
+
+        await job.run();
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.status).toBe("in_progress");
+        expect(await mailboxRepo.findOne({ uid: mailbox.uid } as any)).not.toBeNull();
+
+        await requestRepo.updateOne({ uid: request.uid } as any, { $set: { dateModified: new Date(Date.now() - 3600 * 1000) } });
+        await job.run();
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.status).toBe("completed");
+        expect(await mailboxRepo.findOne({ uid: mailbox.uid } as any)).toBeNull();
+    });
+
+    it("Renews its claim during a long cascade and stops if the claim was taken over.", async () => {
+        const mailbox = await createMailbox();
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "A" }));
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+        (job as any).claimLeaseSeconds = 0;
+        const originalFindOne = (job as any).mailboxRepo.findOne.bind((job as any).mailboxRepo);
+        vi.spyOn((job as any).mailboxRepo, "findOne").mockImplementationOnce(async (...args: any[]) => {
+            // Another worker takes the request over (bumping its version) before this one's first renewal.
+            await requestRepo.updateOne({ uid: request.uid } as any, { $inc: { version: 1 } });
+            return await originalFindOne(...args);
+        });
+
+        try {
+            await job.run();
+        } finally {
+            (job as any).claimLeaseSeconds = 900;
+        }
+
+        expect(await contactRepo.count({ mailboxUid: mailbox.uid })).toBe(1);
+        expect(await mailboxRepo.findOne({ uid: mailbox.uid } as any)).not.toBeNull();
+        expect(await auditLogRepo.count({ action: AuditAction.ERASURE_REQUEST_COMPLETED })).toBe(0);
+    });
+
+    it("Hands a stale in-progress request found under a legal hold back as approved, leaving its mailbox alone.", async () => {
+        const mailbox = await createMailbox();
+        await matterRepo.save(
+            new MatterMongo({
+                name: "Held",
+                escrowScopeId: uuid.v4(),
+                custodianMailboxUids: [mailbox.uid],
+                dateRangeStart: new Date("2020-01-01"),
+                dateRangeEnd: new Date("2030-01-01"),
+            }),
+        );
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "A" }));
+        const request = await createRequest({ mailboxUid: mailbox.uid, status: "in_progress" });
+        await requestRepo.updateOne({ uid: request.uid } as any, { $set: { dateModified: new Date(Date.now() - 3600 * 1000) } });
+
+        await job.run();
+
+        // Reads as waiting (retried once the hold ends), not as a cascade still running.
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.status).toBe("approved");
+        expect(await mailboxRepo.findOne({ uid: mailbox.uid } as any)).not.toBeNull();
+        expect(await contactRepo.count({ mailboxUid: mailbox.uid })).toBe(1);
+        expect(await auditLogRepo.count({ action: AuditAction.ERASURE_REQUEST_COMPLETED })).toBe(0);
+    });
+
+    it("Renews its claim on every page of a long cascade and completes using the renewed claim.", async () => {
+        const mailbox = await createMailbox();
+        for (let i = 0; i < 3; i++) {
+            await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: `C${i}` }));
+        }
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+        const updateSpy = vi.spyOn((job as any).requestRepo, "update");
+        (job as any).claimLeaseSeconds = 0;
+        (job as any).purgePageSize = 1;
+
+        try {
+            await job.run();
+        } finally {
+            (job as any).claimLeaseSeconds = 900;
+            (job as any).purgePageSize = 500;
+        }
+
+        // The claim, at least one renewal per purged page, then the completion - each version-checked against the last.
+        expect(updateSpy.mock.calls.length).toBeGreaterThanOrEqual(2 + 3);
+        const completed = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(completed!.status).toBe("completed");
+        expect(completed!.purgedCount).toBe(4);
+        expect(await contactRepo.count({ mailboxUid: mailbox.uid })).toBe(0);
+        expect(await mailboxRepo.findOne({ uid: mailbox.uid } as any)).toBeNull();
+        expect(await auditLogRepo.count({ action: AuditAction.ERASURE_REQUEST_COMPLETED })).toBe(1);
+    });
+
     it("Does nothing when the repos are not yet initialized.", async () => {
         const original = (job as any).requestRepo;
         (job as any).requestRepo = undefined;

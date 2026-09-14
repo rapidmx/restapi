@@ -445,6 +445,30 @@ describe("Route:CalendarEventSQL Tests", () => {
             expect(result.status).toBe(200);
             expect(result.body.sequence).toBe(0);
         });
+
+        it("Drops the scheduling/reminder jobs' bookkeeping fields from an owner's update, keeping the stored values (round 4).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createCalendarEvent(mailbox.uid, folder.uid);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    uid: event.uid,
+                    version: event.version,
+                    title: "Renamed",
+                    inviteSequenceSent: 99,
+                    cancelNoticeSentAt: new Date(),
+                    reminderSentFor: new Date(),
+                });
+
+            expect(result.status).toBe(200);
+            expect(result.body.title).toBe("Renamed");
+            expect(result.body.inviteSequenceSent ?? null).toBeNull();
+            expect(result.body.cancelNoticeSentAt ?? null).toBeNull();
+            expect(result.body.reminderSentFor ?? null).toBeNull();
+        });
     });
 
     describe("POST /:id/respond", () => {

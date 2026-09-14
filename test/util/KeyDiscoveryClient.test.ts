@@ -10,6 +10,7 @@ import {
     computeKeyDiscoveryHash,
     fetchRemoteKeys,
     isValidKeyDiscoveryHash,
+    parseKeyDiscoveryAddress,
     parseKeyDiscoveryResponse,
     zBase32Encode,
 } from "../../src/util/KeyDiscoveryClient.js";
@@ -381,9 +382,22 @@ describe("fetchRemoteKeys() domain scoping and validation Tests", () => {
     it("Never fetches for an address with no (or an invalid) domain.", async () => {
         expect(await fetchRemoteKeys("mail.shared-host-2.com", "no-domain")).toBeUndefined();
         expect(await fetchRemoteKeys("mail.shared-host-2.com", "a@bad/domain?x=")).toBeUndefined();
+        expect(await fetchRemoteKeys("mail.shared-host-2.com", "a@evil.example@victim.example")).toBeUndefined();
+        expect(await fetchRemoteKeys("mail.shared-host-2.com", "@victim.example")).toBeUndefined();
         expect(mockFetch).not.toHaveBeenCalled();
     });
 
+    it("Accepts a host with a valid port, validating the hostname without the port, and rejects bad ports/IPv6 literals.", async () => {
+        mockFetch.mockResolvedValueOnce(makeFetchResponse());
+        expect(await fetchRemoteKeys("mail.port-host-1.com:8443", "alice@port-1.com")).toEqual(makeDiscoveryResponse());
+        expect(mockFetch.mock.calls[0][0]).toMatch(/^https:\/\/mail\.port-host-1\.com:8443\/\.well-known\/rapidmx\/keys\//);
+        mockFetch.mockClear();
+
+        for (const host of ["mail.port-host-2.com:0", "mail.port-host-2.com:65536", "mail.port-host-2.com:84a", "mail.port-host-2.com:", "::1", "127.0.0.1:443", "bad_host.com:443"]) {
+            expect(await fetchRemoteKeys(host, "alice@port-2.com")).toBeUndefined();
+        }
+        expect(mockFetch).not.toHaveBeenCalled();
+    });
     it("Never caches or returns a malformed response - falls back to the last good cached response.", async () => {
         const good = makeDiscoveryResponse({ escrow: true });
         mockFetch.mockResolvedValueOnce(makeFetchResponse({ json: vi.fn().mockResolvedValue(good), headerValues: { etag: '"good"' } }));
@@ -403,5 +417,18 @@ describe("fetchRemoteKeys() domain scoping and validation Tests", () => {
         mockFetch.mockResolvedValue(makeFetchResponse({ json: vi.fn().mockResolvedValue({ escrow: "yes" }) }));
 
         expect(await fetchRemoteKeys("mail.example-malformed-2.com", "alice@example-malformed-2.com")).toBeUndefined();
+    });
+});
+
+describe("parseKeyDiscoveryAddress() Tests", () => {
+    it("Splits a single-@ address, lowercasing the domain only.", () => {
+        expect(parseKeyDiscoveryAddress("Alice@Example.COM")).toEqual({ localPart: "Alice", domain: "example.com" });
+    });
+
+    it("Rejects no @, multiple @, empty local part/domain, invalid domains, and non-strings.", () => {
+        for (const address of ["alice", "a@b@example.com", "@example.com", "alice@", "alice@exa mple.com", "alice@example.com:25"]) {
+            expect(parseKeyDiscoveryAddress(address)).toBeUndefined();
+        }
+        expect(parseKeyDiscoveryAddress(undefined as any)).toBeUndefined();
     });
 });

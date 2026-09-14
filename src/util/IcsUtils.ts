@@ -21,8 +21,11 @@ import {
  * deliberately *not* a general RFC 5545 parser either - real-world invites arrive from arbitrary senders
  * (Outlook, Gmail, etc.), but this only ever needs a small, fixed set of properties
  * (`METHOD`/`UID`/`SEQUENCE`/`SUMMARY`/`LOCATION`/`STATUS`/`DTSTART`/`DTEND`/`ORGANIZER`/`ATTENDEE`+
- * `PARTSTAT`/`RRULE`/`EXDATE`/`RECURRENCE-ID`), so it unfolds lines and extracts exactly those, ignoring
- * everything else (`VALARM` blocks, `X-` extensions, etc.) rather than attempting to model the full standard.
+ * `PARTSTAT`/`RRULE`/`EXDATE`/`RECURRENCE-ID`/`DTSTAMP`), so it unfolds lines and extracts exactly those, ignoring
+ * everything else (`X-` extensions, etc.) rather than attempting to model the full standard. It does track
+ * `BEGIN`/`END` component nesting, so only properties directly inside a top-level `VEVENT` are read - a nested
+ * `VALARM`'s `ATTENDEE`s or a `VTIMEZONE`'s `DTSTART`/`RRULE` are never mistaken for the event's own, and multiple
+ * VEVENTs are never merged into one.
  *
  * Known, accepted limitations (a deliberate scope boundary, not an oversight):
  * - No RFC 5545 line-folding on generated output - folding is a SHOULD for writers, not a MUST for readers;
@@ -67,6 +70,13 @@ export interface ParsedIcsEvent {
     /** Present only on a master/whole-series VEVENT - this event's recurrence definition. `exceptions` is
      * populated from every `EXDATE` line, regardless of where it appears relative to `RRULE`. */
     recurrenceRule?: RecurrenceRule;
+    /** The VEVENT's `DTSTAMP` (when this iTIP message instance was created), if present - lets a consumer tell a
+     * stale, re-delivered message apart from a newer one carrying the same `SEQUENCE`. */
+    dtstamp?: Date;
+    /** Every *other* VEVENT in the same message that shares this event's `uid` and carries a `RECURRENCE-ID` -
+     * i.e. the per-occurrence overrides an organizer sends alongside the master VEVENT. Omitted when there are
+     * none. The top-level fields always describe only one VEVENT (see `parseIcsEvent()`). */
+    overrides?: Omit<ParsedIcsEvent, "method" | "overrides">[];
 }
 
 const PARTSTAT_TO_RESPONSE_STATUS: Record<string, AttendeeResponseStatus> = {
@@ -83,8 +93,42 @@ const RESPONSE_STATUS_TO_PARTSTAT: Record<AttendeeResponseStatus, string> = {
     [AttendeeResponseStatus.NEEDS_ACTION]: "NEEDS-ACTION",
 };
 
+/** Escapes an RFC 5545 §3.3.11 `TEXT` value. Every line break form (`\r\n`, `\n`, bare `\r`) becomes the literal
+ * `\n` escape, and every other control character (RFC 5545 forbids CTLs in TEXT, except HTAB) is stripped - so a
+ * user-supplied value (e.g. an event title) can never end the content line early and inject its own
+ * properties/components. */
 function escapeText(value: string): string {
-    return value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/,/g, "\\,").replace(/;/g, "\\;");
+    return String(value)
+        .replace(/\r\n|\r|\n/g, "\n")
+        .split("")
+        .filter((ch) => ch === "\t" || ch === "\n" || !isControlChar(ch))
+        .join("")
+        .replace(/\\/g, "\\\\")
+        .replace(/\n/g, "\\n")
+        .replace(/,/g, "\\,")
+        .replace(/;/g, "\\;");
+}
+
+/** Formats an RFC 5545 §3.2 parameter value: always DQUOTE-wrapped (so `;`, `:` and `,` can't end the parameter
+ * or start the property value), with `"` and every control character (CR/LF included) removed, since a quoted
+ * parameter value can contain neither. */
+function quoteParamValue(value: string): string {
+    return `"${stripControlChars(value).replace(/"/g, "")}"`;
+}
+
+/** Strips every control character (CR/LF included) from a non-TEXT property value this module interpolates
+ * verbatim (a `UID`, a `mailto:` address), so it can't break out of its content line either. */
+function stripControlChars(value: string): string {
+    return String(value)
+        .split("")
+        .filter((ch) => !isControlChar(ch))
+        .join("");
+}
+
+/** A C0 control character or DEL (RFC 5545 `CONTROL`, plus the HTAB/LF/CR it excludes). */
+function isControlChar(ch: string): boolean {
+    const code: number = ch.charCodeAt(0);
+    return code < 0x20 || code === 0x7f;
 }
 
 function unescapeText(value: string): string {
@@ -358,7 +402,27 @@ function buildRrule(rule: RecurrenceRule): string {
     return parts.join(";");
 }
 
-function parseRrule(value: string): RecurrenceRule {
+/** Parses an `RRULE`'s `UNTIL` value. `tzid` is the owning VEVENT's `DTSTART` `TZID` (if any):
+ * - A `DATE`-form value (`UNTIL=20261231`) bounds the series by that whole *local* calendar day in `tzid`, so it
+ * resolves to the last millisecond of that day there - an occurrence later that same day is still included,
+ * rather than being cut off by a UTC-midnight reading of the date.
+ * - A floating `DATE-TIME` value (no `Z`) is read in `tzid` too, matching how `DTSTART` itself was read; a
+ * `Z`-suffixed value is UTC as usual. */
+function parseUntil(value: string, tzid?: string): Date | undefined {
+    const dateOnly = /^(\d{4})(\d{2})(\d{2})$/.exec(value.trim());
+    if (!dateOnly) {
+        return parseIcsDateTime(value, tzid);
+    }
+    const next = dayNumberToDate(dayNumber(Number(dateOnly[1]), Number(dateOnly[2]), Number(dateOnly[3])) + 1);
+    const zone: string | undefined = resolveTimeZone(tzid);
+    // `resolveTimeZone()` only returns a zone `Intl` recognizes, so `convertLocalToUtc()` can't return undefined here.
+    const nextMidnightMs: number = zone
+        ? convertLocalToUtc(next.year, next.month, next.day, 0, 0, 0, zone)!.getTime()
+        : Date.UTC(next.year, next.month - 1, next.day);
+    return new Date(nextMidnightMs - 1);
+}
+
+function parseRrule(value: string, tzid?: string): RecurrenceRule {
     const params = parseParams(`;${value}`);
     return {
         freq: (params.FREQ ?? "").toLowerCase() as RecurrenceFrequency,
@@ -367,7 +431,7 @@ function parseRrule(value: string): RecurrenceRule {
         byMonthDay: params.BYMONTHDAY ? params.BYMONTHDAY.split(",").map(Number) : undefined,
         byMonth: params.BYMONTH ? params.BYMONTH.split(",").map(Number) : undefined,
         count: params.COUNT ? parseInt(params.COUNT, 10) : undefined,
-        until: params.UNTIL ? parseIcsDateTime(params.UNTIL) : undefined,
+        until: params.UNTIL ? parseUntil(params.UNTIL, tzid) : undefined,
         exceptions: [],
     };
 }
@@ -381,7 +445,7 @@ function parseRrule(value: string): RecurrenceRule {
  */
 export function buildEventIcs(event: CalendarEvent, method: "REQUEST" | "CANCEL" | "REPLY", options?: { onlyAttendee?: Attendee }): string {
     const lines: string[] = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//RapidMX//Mail Server//EN", `METHOD:${method}`, "BEGIN:VEVENT"];
-    lines.push(`UID:${event.icalUid}`);
+    lines.push(`UID:${stripControlChars(event.icalUid)}`);
     lines.push(`DTSTAMP:${formatDateUtc(new Date())}`);
     lines.push(`DTSTART:${formatDateUtc(event.startDate)}`);
     lines.push(`DTEND:${formatDateUtc(event.endDate)}`);
@@ -393,8 +457,8 @@ export function buildEventIcs(event: CalendarEvent, method: "REQUEST" | "CANCEL"
     }
     lines.push(`SEQUENCE:${event.sequence}`);
     lines.push(`STATUS:${method === "CANCEL" ? "CANCELLED" : event.status.toUpperCase()}`);
-    const organizerCn = event.organizer.displayName ? `;CN=${escapeText(event.organizer.displayName)}` : "";
-    lines.push(`ORGANIZER${organizerCn}:mailto:${event.organizer.address}`);
+    const organizerCn = event.organizer.displayName ? `;CN=${quoteParamValue(event.organizer.displayName)}` : "";
+    lines.push(`ORGANIZER${organizerCn}:mailto:${stripControlChars(event.organizer.address)}`);
 
     if (event.recurrenceId) {
         lines.push(`RECURRENCE-ID:${formatDateUtc(event.recurrenceId)}`);
@@ -407,11 +471,11 @@ export function buildEventIcs(event: CalendarEvent, method: "REQUEST" | "CANCEL"
 
     const attendeesToEmit = method === "REPLY" ? (options?.onlyAttendee ? [options.onlyAttendee] : []) : event.attendees;
     for (const attendee of attendeesToEmit) {
-        const cn = attendee.displayName ? `;CN=${escapeText(attendee.displayName)}` : "";
+        const cn = attendee.displayName ? `;CN=${quoteParamValue(attendee.displayName)}` : "";
         const partstat = `;PARTSTAT=${RESPONSE_STATUS_TO_PARTSTAT[attendee.responseStatus]}`;
         const role =
             attendee.role === AttendeeRole.RESOURCE ? "RESOURCE" : attendee.role === AttendeeRole.OPTIONAL ? "OPT-PARTICIPANT" : "REQ-PARTICIPANT";
-        lines.push(`ATTENDEE;ROLE=${role}${partstat}${cn}:mailto:${attendee.address}`);
+        lines.push(`ATTENDEE;ROLE=${role}${partstat}${cn}:mailto:${stripControlChars(attendee.address)}`);
     }
 
     lines.push("END:VEVENT", "END:VCALENDAR");
@@ -421,25 +485,24 @@ export function buildEventIcs(event: CalendarEvent, method: "REQUEST" | "CANCEL"
 /**
  * Parses the fields this feature needs out of a raw iTIP `text/calendar` payload. Returns `undefined` if
  * `raw` has no recognizable `UID`+`METHOD` (not a real/complete iTIP message).
+ *
+ * The top-level fields describe exactly one VEVENT: the first one with no `RECURRENCE-ID` (the series master),
+ * or - when every VEVENT has one, as in a single-occurrence REQUEST/CANCEL - the first VEVENT. Any other VEVENTs
+ * for the same `UID` that carry a `RECURRENCE-ID` are returned in `overrides`. `METHOD` is only read at the
+ * `VCALENDAR` level.
  */
 export function parseIcsEvent(raw: string): ParsedIcsEvent | undefined {
     const unfolded = raw.replace(/\r\n[ \t]/g, "").replace(/\n[ \t]/g, "").replace(/\r[ \t]/g, "");
     const lines = unfolded.split(/\r\n|\r|\n/);
 
     let method: string | undefined;
-    let uid: string | undefined;
-    let sequence = 0;
-    let summary: string | undefined;
-    let location: string | undefined;
-    let status: string | undefined;
-    let startDate: Date | undefined;
-    let endDate: Date | undefined;
-    let timezone: string | undefined;
-    let recurrenceId: Date | undefined;
-    let recurrenceRule: RecurrenceRule | undefined;
-    const exceptions: Date[] = [];
-    let organizer: { address: string; displayName?: string } | undefined;
-    const attendees: { address: string; displayName?: string; partstat?: AttendeeResponseStatus }[] = [];
+    const vevents: VEventAccumulator[] = [];
+    // Open components, innermost last. Only a property whose innermost open component is a VEVENT belongs to
+    // that VEVENT - a nested VALARM's `ATTENDEE`, or a VTIMEZONE's `DTSTART`/`RRULE`, must never be read as the
+    // event's own.
+    const stack: string[] = [];
+    let current: VEventAccumulator | undefined;
+    let currentDepth = 0;
 
     for (const line of lines) {
         // The parameter group allows DQUOTE-wrapped values containing `:` (e.g. `CN="Doe: John"`), so the
@@ -452,69 +515,162 @@ export function parseIcsEvent(raw: string): ParsedIcsEvent | undefined {
         const params = parseParams(match[2]);
         const value = match[3];
 
-        switch (property) {
-            case "METHOD":
-                method = value.trim().toUpperCase();
-                break;
-            case "UID":
-                uid = value.trim();
-                break;
-            case "SEQUENCE":
-                sequence = parseInt(value.trim(), 10) || 0;
-                break;
-            case "SUMMARY":
-                summary = unescapeText(value);
-                break;
-            case "LOCATION":
-                location = unescapeText(value);
-                break;
-            case "STATUS":
-                status = value.trim().toUpperCase();
-                break;
-            case "DTSTART":
-                startDate = parseIcsDateTime(value, params.TZID);
-                timezone = /Z\s*$/i.test(value) ? undefined : resolveTimeZone(params.TZID);
-                break;
-            case "DTEND":
-                endDate = parseIcsDateTime(value, params.TZID);
-                break;
-            case "RECURRENCE-ID":
-                recurrenceId = parseIcsDateTime(value, params.TZID);
-                break;
-            case "EXDATE":
-                for (const part of value.split(",")) {
-                    const parsedException = parseIcsDateTime(part, params.TZID);
-                    if (parsedException) {
-                        exceptions.push(parsedException);
-                    }
-                }
-                break;
-            case "RRULE":
-                recurrenceRule = parseRrule(value);
-                break;
-            case "ORGANIZER":
-                organizer = { address: stripMailto(value), displayName: params.CN };
-                break;
-            case "ATTENDEE":
-                attendees.push({
-                    address: stripMailto(value),
-                    displayName: params.CN,
-                    partstat: params.PARTSTAT ? PARTSTAT_TO_RESPONSE_STATUS[params.PARTSTAT.toUpperCase()] : undefined,
-                });
-                break;
-            default:
-                break;
+        if (property === "BEGIN") {
+            const component = value.trim().toUpperCase();
+            stack.push(component);
+            if (component === "VEVENT" && stack.length <= 2 && (stack.length === 1 || stack[0] === "VCALENDAR")) {
+                current = newVEventAccumulator();
+                currentDepth = stack.length;
+                vevents.push(current);
+            }
+            continue;
         }
+        if (property === "END") {
+            const component = value.trim().toUpperCase();
+            // Tolerate a mismatched END by unwinding to the nearest matching BEGIN, if there is one.
+            const index = stack.lastIndexOf(component);
+            if (index >= 0) {
+                stack.length = index;
+            }
+            if (stack.length < currentDepth) {
+                current = undefined;
+            }
+            continue;
+        }
+
+        const top: string | undefined = stack[stack.length - 1];
+        if (property === "METHOD") {
+            if (top === undefined || top === "VCALENDAR") {
+                method = value.trim().toUpperCase();
+            }
+            continue;
+        }
+        if (!current || stack.length !== currentDepth) {
+            continue;
+        }
+        applyVEventProperty(current, property, params, value);
     }
 
-    if (!uid || !method) {
+    // The master is the first VEVENT without a RECURRENCE-ID; a message carrying only override VEVENTs (e.g. a
+    // single-occurrence REQUEST/CANCEL) falls back to its first VEVENT, as before.
+    const primaryIndex: number = Math.max(0, vevents.findIndex((vevent) => !vevent.recurrenceId));
+    const primary: VEventAccumulator | undefined = vevents[primaryIndex];
+    if (!primary || !primary.uid || !method) {
         return undefined;
     }
-    if (recurrenceRule) {
-        recurrenceRule.exceptions = exceptions;
-    }
 
-    return { method, uid, sequence, summary, location, status, startDate, endDate, timezone, organizer, attendees, recurrenceId, recurrenceRule };
+    const master: ParsedIcsVEvent = finishVEvent(primary);
+    const overrides: ParsedIcsVEvent[] = vevents
+        .filter((vevent, index) => index !== primaryIndex && vevent.uid === primary.uid && vevent.recurrenceId)
+        .map(finishVEvent);
+
+    return { method, ...master, ...(overrides.length > 0 ? { overrides } : {}) };
+}
+
+/** The per-VEVENT fields of a `ParsedIcsEvent` (everything but the calendar-level `method`). */
+export type ParsedIcsVEvent = Omit<ParsedIcsEvent, "method" | "overrides">;
+
+interface VEventAccumulator {
+    uid?: string;
+    sequence: number;
+    summary?: string;
+    location?: string;
+    status?: string;
+    startDate?: Date;
+    endDate?: Date;
+    timezone?: string;
+    dtstartTzid?: string;
+    dtstamp?: Date;
+    recurrenceId?: Date;
+    rruleValue?: string;
+    exceptions: Date[];
+    organizer?: { address: string; displayName?: string };
+    attendees: { address: string; displayName?: string; partstat?: AttendeeResponseStatus }[];
+}
+
+function newVEventAccumulator(): VEventAccumulator {
+    return { sequence: 0, exceptions: [], attendees: [] };
+}
+
+function applyVEventProperty(vevent: VEventAccumulator, property: string, params: Record<string, string>, value: string): void {
+    switch (property) {
+        case "UID":
+            vevent.uid = value.trim();
+            break;
+        case "SEQUENCE":
+            vevent.sequence = parseInt(value.trim(), 10) || 0;
+            break;
+        case "SUMMARY":
+            vevent.summary = unescapeText(value);
+            break;
+        case "LOCATION":
+            vevent.location = unescapeText(value);
+            break;
+        case "STATUS":
+            vevent.status = value.trim().toUpperCase();
+            break;
+        case "DTSTAMP":
+            vevent.dtstamp = parseIcsDateTime(value, params.TZID);
+            break;
+        case "DTSTART":
+            vevent.startDate = parseIcsDateTime(value, params.TZID);
+            vevent.timezone = /Z\s*$/i.test(value) ? undefined : resolveTimeZone(params.TZID);
+            vevent.dtstartTzid = /Z\s*$/i.test(value) ? undefined : params.TZID;
+            break;
+        case "DTEND":
+            vevent.endDate = parseIcsDateTime(value, params.TZID);
+            break;
+        case "RECURRENCE-ID":
+            vevent.recurrenceId = parseIcsDateTime(value, params.TZID);
+            break;
+        case "EXDATE":
+            for (const part of value.split(",")) {
+                const parsedException = parseIcsDateTime(part, params.TZID);
+                if (parsedException) {
+                    vevent.exceptions.push(parsedException);
+                }
+            }
+            break;
+        case "RRULE":
+            vevent.rruleValue = value;
+            break;
+        case "ORGANIZER":
+            vevent.organizer = { address: stripMailto(value), displayName: params.CN };
+            break;
+        case "ATTENDEE":
+            vevent.attendees.push({
+                address: stripMailto(value),
+                displayName: params.CN,
+                partstat: params.PARTSTAT ? PARTSTAT_TO_RESPONSE_STATUS[params.PARTSTAT.toUpperCase()] : undefined,
+            });
+            break;
+        default:
+            break;
+    }
+}
+
+function finishVEvent(vevent: VEventAccumulator): ParsedIcsVEvent {
+    // RRULE is only interpreted once the whole VEVENT has been read, since its `UNTIL` depends on `DTSTART`'s
+    // `TZID` and the two may appear in either order.
+    const recurrenceRule: RecurrenceRule | undefined = vevent.rruleValue !== undefined ? parseRrule(vevent.rruleValue, vevent.dtstartTzid) : undefined;
+    if (recurrenceRule) {
+        recurrenceRule.exceptions = vevent.exceptions;
+    }
+    return {
+        uid: vevent.uid ?? "",
+        sequence: vevent.sequence,
+        summary: vevent.summary,
+        location: vevent.location,
+        status: vevent.status,
+        startDate: vevent.startDate,
+        endDate: vevent.endDate,
+        timezone: vevent.timezone,
+        organizer: vevent.organizer,
+        attendees: vevent.attendees,
+        recurrenceId: vevent.recurrenceId,
+        recurrenceRule,
+        ...(vevent.dtstamp ? { dtstamp: vevent.dtstamp } : {}),
+    };
 }
 
 /** A single concrete occurrence instant produced by `expandOccurrences()`. */
@@ -655,6 +811,39 @@ export function expandOccurrences(
     windowStart: Date,
     windowEnd: Date,
     excludeDates?: (Date | string)[],
+): OccurrenceWindow[] {
+    return expandOccurrencesDetailed(event, windowStart, windowEnd, excludeDates).occurrences;
+}
+
+/** The result of `expandOccurrencesDetailed()`. */
+export interface OccurrenceExpansion {
+    occurrences: OccurrenceWindow[];
+    /**
+     * `true` when a safety cap (`MAX_OCCURRENCES`/`MAX_PERIODS`) stopped the expansion before the window was fully
+     * covered, so `occurrences` is known to be incomplete. A caller doing conflict detection must treat this as
+     * "cannot prove there's no conflict" rather than as "no conflict".
+     */
+    truncated: boolean;
+}
+
+/** `expandOccurrences()`, but also reports whether a safety cap truncated the result - see `OccurrenceExpansion`. */
+export function expandOccurrencesDetailed(
+    event: { startDate: Date | string; endDate: Date | string; recurrenceRule?: RecurrenceRule; timezone?: string; allDay?: boolean },
+    windowStart: Date,
+    windowEnd: Date,
+    excludeDates?: (Date | string)[],
+): OccurrenceExpansion {
+    const info = { truncated: false };
+    const occurrences = expandOccurrencesInternal(event, windowStart, windowEnd, excludeDates, info);
+    return { occurrences, truncated: info.truncated };
+}
+
+function expandOccurrencesInternal(
+    event: { startDate: Date | string; endDate: Date | string; recurrenceRule?: RecurrenceRule; timezone?: string; allDay?: boolean },
+    windowStart: Date,
+    windowEnd: Date,
+    excludeDates: (Date | string)[] | undefined,
+    info: { truncated: boolean },
 ): OccurrenceWindow[] {
     const seriesStart: Date = toDate(event.startDate);
     const seriesEnd: Date = toDate(event.endDate);
@@ -808,7 +997,8 @@ export function expandOccurrences(
 
     const occurrences: OccurrenceWindow[] = [];
     let matchCount = 0;
-    for (let k = firstPeriod; k < firstPeriod + MAX_PERIODS; k++) {
+    let k = firstPeriod;
+    for (; k < firstPeriod + MAX_PERIODS; k++) {
         if (periodFirstDay(k) > lastRelevantDay) {
             break;
         }
@@ -838,11 +1028,15 @@ export function expandOccurrences(
                 if (occurrenceOverlapsWindow(candidateStart, candidateEnd, windowStart, windowEnd)) {
                     occurrences.push({ start: candidateStart, end: candidateEnd });
                     if (occurrences.length >= MAX_OCCURRENCES) {
+                        info.truncated = true;
                         return occurrences;
                     }
                 }
             }
         }
+    }
+    if (k >= firstPeriod + MAX_PERIODS) {
+        info.truncated = true;
     }
     return occurrences;
 }

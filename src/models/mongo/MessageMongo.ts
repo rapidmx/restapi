@@ -19,6 +19,7 @@ import {
     Recipient,
     RecipientType,
 } from "../types.js";
+import { boundIndexedValue } from "../../util/ConversationUtils.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Nullable } = ObjectDecorators;
@@ -39,6 +40,9 @@ const { Column, Entity, Index } = PersistenceDecorators;
 )
 @Index("message_folder", ["folderUid"])
 @Index("message_mailbox", ["mailboxUid"])
+@Index("message_mailbox_conversation", ["mailboxUid", "conversationId"])
+@Index("message_folder_modified", ["folderUid", "dateModified", "uid"])
+@Index("message_mailbox_modified", ["mailboxUid", "dateModified", "uid"])
 @Index("message_id", ["messageId"])
 @Index("message_sent_date", ["sentDate"])
 @Index("message_scheduled_send_time", ["scheduledSendTime"])
@@ -64,8 +68,13 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     @Description("The unique identifier of the `Mailbox` this message belongs to.")
     public mailboxUid: string = "";
 
+    // Bounded by `boundIndexedValue()` in the constructor, matching `MessageSQL`, so a lookup bounded the same way
+    // matches on either backend.
     @Column()
-    @Description("The RFC 5322 `Message-ID` header value, used to deduplicate and thread messages.")
+    @Description(
+        "The RFC 5322 `Message-ID` header value, used to deduplicate and thread messages. A value longer than 255 " +
+            "characters is stored as `sha256:<hex>` of the original.",
+    )
     public messageId: string = "";
 
     @Column()
@@ -267,7 +276,7 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
         if (other) {
             this.folderUid = other.folderUid !== undefined ? other.folderUid : this.folderUid;
             this.mailboxUid = other.mailboxUid !== undefined ? other.mailboxUid : this.mailboxUid;
-            this.messageId = other.messageId !== undefined ? other.messageId : this.messageId;
+            this.messageId = other.messageId !== undefined ? boundIndexedValue(other.messageId) : this.messageId;
             this.subject = other.subject !== undefined ? other.subject : this.subject;
             this.from = other.from !== undefined ? other.from : this.from;
             this.recipients = other.recipients !== undefined ? other.recipients : this.recipients;
@@ -293,7 +302,7 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.scheduledSendError = "scheduledSendError" in other ? other.scheduledSendError : this.scheduledSendError;
             this.scheduledSendRelayedAt = "scheduledSendRelayedAt" in other ? other.scheduledSendRelayedAt : this.scheduledSendRelayedAt;
             this.recallRequestedAt = "recallRequestedAt" in other ? other.recallRequestedAt : this.recallRequestedAt;
-            this.conversationId = "conversationId" in other ? other.conversationId : this.conversationId;
+            this.conversationId = "conversationId" in other ? boundIndexedValue(other.conversationId) : this.conversationId;
             this.inferenceClassification =
                 "inferenceClassification" in other ? other.inferenceClassification : this.inferenceClassification;
             this.requestReceipt = "requestReceipt" in other ? other.requestReceipt : this.requestReceipt;

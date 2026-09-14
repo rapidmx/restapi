@@ -326,6 +326,67 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
         expect(fakeRedis.published).toHaveLength(2);
     });
 
+    it("Keyset-pages every candidate with no page cap, never skipping rows that share a startDate across page boundaries.", async () => {
+        const now = Date.now();
+        const savedBatchSize = (job as any).batchSize;
+        (job as any).batchSize = 2;
+        try {
+            const start = new Date(now + 5 * 60 * 1000);
+            for (let i = 0; i < 7; i++) {
+                await createEvent({ startDate: start, reminderMinutesBeforeStart: 4.5 });
+            }
+            const icalStart = new Date(Math.floor((now + 5 * 60 * 1000) / 1000) * 1000 - 3 * 24 * 60 * 60 * 1000);
+            for (let i = 0; i < 5; i++) {
+                await createEvent({
+                    startDate: icalStart,
+                    endDate: new Date(icalStart.getTime() + 30 * 60 * 1000),
+                    recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] },
+                    reminderMinutesBeforeStart: 4.5,
+                });
+            }
+
+            await job.run();
+
+            // 12 events, each published to its folder and mailbox channels.
+            expect(fakeRedis.published).toHaveLength(24);
+        } finally {
+            (job as any).batchSize = savedBatchSize;
+        }
+    });
+
+    it("Never reads recurring masters that can't have a due occurrence (cancelled, starting after the lead horizon) and skips expanding an ended series.", async () => {
+        const now = Date.now();
+        const seriesStart = new Date(Math.floor((now + 5 * 60 * 1000) / 1000) * 1000 - 10 * 24 * 60 * 60 * 1000);
+        const daily = { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] };
+        const ended = await createEvent({
+            startDate: seriesStart,
+            endDate: new Date(seriesStart.getTime() + 30 * 60 * 1000),
+            recurrenceRule: { ...daily, until: new Date(now - 2 * 24 * 60 * 60 * 1000) },
+            reminderMinutesBeforeStart: 4.5,
+        });
+        const cancelled = await createEvent({
+            startDate: seriesStart,
+            recurrenceRule: daily,
+            status: CalendarEventStatus.CANCELLED,
+            reminderMinutesBeforeStart: 4.5,
+        });
+        const future = await createEvent({ startDate: new Date(now + 60 * 24 * 60 * 60 * 1000), recurrenceRule: daily, reminderMinutesBeforeStart: 4.5 });
+        const live = await createEvent({ startDate: seriesStart, recurrenceRule: { ...daily, until: new Date(now + 24 * 60 * 60 * 1000) }, reminderMinutesBeforeStart: 4.5 });
+        const processSpy = vi.spyOn(job as any, "processEvent");
+        try {
+            await job.run();
+
+            const processed: string[] = processSpy.mock.calls.map((call: any[]) => call[0].uid);
+            expect(processed).toContain(live.uid);
+            expect(processed).not.toContain(ended.uid);
+            expect(processed).not.toContain(cancelled.uid);
+            expect(processed).not.toContain(future.uid);
+            expect(fakeRedis.published).toHaveLength(2);
+        } finally {
+            processSpy.mockRestore();
+        }
+    });
+
     it("Expands a recurring master that started long ago and fires for today's occurrence.", async () => {
         const now = Date.now();
         // A daily series that started 400 days ago, at a time of day that puts today's occurrence 5 minutes out.

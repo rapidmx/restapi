@@ -16,4 +16,5 @@ export class IngestQueueRouteSQL extends BaseScopedChildRoute<IngestQueueEntrySQ
     protected readonly scopeProperty: string = "mailboxUid";
     /** Entries are produced by ingest; only a trusted caller (ops) may change them. */
     protected readonly trustedOnlyWrites: boolean = true;
+    protected readonly dateFields: readonly string[] = ["nextAttemptAt", "scanLeaseExpiresAt"];
 }

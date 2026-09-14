@@ -6,6 +6,7 @@ import * as crypto from "crypto";
 import { type ObjectFactory } from "@rapidrest/core";
 import { RepoUtils } from "@rapidrest/service-core";
 import { EscrowAuditAction, EscrowAuditHashAlgorithm, EscrowAuditHead, EscrowAuditLogEntry } from "../models/types.js";
+import { asEntity } from "./EntityUtils.js";
 
 /**
  * The config key holding the HMAC-SHA256 key new escrow audit entries (and the chain's head record) are keyed
@@ -199,7 +200,12 @@ async function advanceHead(objectFactory: ObjectFactory, ctx: ResolvedContext, e
             if (!head) {
                 await headRepo.create(new ctx.headClass(fields), { ignoreACL: true });
             } else {
-                await headRepo.update(new ctx.headClass({ ...head, ...fields }), head, { ignoreACL: true });
+                // `asEntity()`: on Mongo `find()` returns a plain document, and `RepoUtils.update()` only
+                // enforces its optimistic `version` lock when `existing` is a real entity instance - without it
+                // two concurrent appenders could both overwrite the head (a lost update that can leave the head
+                // behind a later append, or pointing at the wrong entry), instead of the loser getting a
+                // conflict and re-reading here.
+                await headRepo.update(new ctx.headClass({ ...head, ...fields }), asEntity(headRepo, head), { ignoreACL: true });
             }
             return;
         } catch (err) {
@@ -308,7 +314,8 @@ export interface EscrowAuditVerificationResult {
  * - head `sequence` beyond the last entry present -> `truncated` (tail deletion).
  * - the entry at head `sequence` has a different hash -> `head_mismatch`. Entries AFTER the head are
  * tolerated (a head lagging after a failed `advanceHead()`); they still had to pass the per-entry checks.
- * - head MAC present -> must verify with the configured key.
+ * - head MAC present -> must verify with the configured key. With a key configured, a head MAC is required
+ * (`head_mac_mismatch` when missing).
  * - no head row at all -> "no head yet" (valid) only while every entry is a pre-upgrade legacy entry (no
  * `hashAlgorithm`), i.e. a deployment that hasn't appended since upgrading - its first append creates the
  * head. Once any entry carries `hashAlgorithm`, a head must exist (`head_missing`).
@@ -380,7 +387,17 @@ export async function verifyEscrowAuditChain(
         return { valid: true };
     }
     if (!head) {
+        // Residual: a chain with no entries AND no head (both deleted wholesale) is indistinguishable from a
+        // fresh deployment that has never appended - there is nothing left in the datastore to compare
+        // against. Only an external anchor (see this function's doc comment) can detect that.
         return sawExplicitAlgorithm ? { valid: false, brokenAtSequence: last?.sequence, reason: "head_missing" } : { valid: true };
+    }
+    if (ctx.hmacKey && !head.mac) {
+        // With a key configured every head write carries a MAC (`advanceHead()`), so a MAC-less head is either
+        // stripped/forged (e.g. rolled back onto a legacy SHA-256 entry after deleting every HMAC entry, which
+        // the per-entry checks alone can't see) or was last written before the key was enabled. The latter
+        // heals on the next append after enabling the key; until then verification fails closed.
+        return { valid: false, brokenAtSequence: head.sequence, reason: "head_mac_mismatch" };
     }
     if (head.mac || head.hashAlgorithm) {
         if (!ctx.hmacKey) {
@@ -389,9 +406,6 @@ export async function verifyEscrowAuditChain(
         if (!safeEqual(head.mac, computeHeadMac(head.chainId, head.sequence, head.hash, ctx.hmacKey))) {
             return { valid: false, brokenAtSequence: head.sequence, reason: "head_mac_mismatch" };
         }
-    } else if (headEntry?.hashAlgorithm === EscrowAuditHashAlgorithm.HMAC_SHA256) {
-        // Every head written alongside an HMAC entry carries a MAC - a MAC-less head pointing at one was stripped.
-        return { valid: false, brokenAtSequence: head.sequence, reason: "head_mac_mismatch" };
     }
     if (!last || head.sequence > last.sequence) {
         return { valid: false, brokenAtSequence: last ? last.sequence + 1 : 0, reason: "truncated" };

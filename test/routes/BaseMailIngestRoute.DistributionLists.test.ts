@@ -73,6 +73,7 @@ async function makeRoute(overrides: {
     const mailTransport = { send: vi.fn().mockResolvedValue({ accepted: ["x"], rejected: [] }) };
 
     (route as any).ingestSecret = "s3cr3t";
+    (route as any).trustedAuthservId = "mx.example.com";
     (route as any).logger = logger;
     (route as any).blobStore = { put: vi.fn() };
     (route as any).mailTransport = mailTransport;
@@ -192,7 +193,7 @@ describe("BaseMailIngestRoute Tests (distribution list expansion/relay/unsubscri
             makeReq(
                 "member@example.com",
                 "target@example.com",
-                "From: member@example.com\r\nSubject: unsubscribe\r\n\r\nBye\r\n",
+                "Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\nFrom: member@example.com\r\nSubject: unsubscribe\r\n\r\nBye\r\n",
             ),
             res,
         );
@@ -215,7 +216,7 @@ describe("BaseMailIngestRoute Tests (distribution list expansion/relay/unsubscri
             makeReq(
                 "member@example.com",
                 "target@example.com",
-                "From: member@example.com\r\nSubject: unsubscribe\r\n\r\nBye\r\n",
+                "Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\nFrom: member@example.com\r\nSubject: unsubscribe\r\n\r\nBye\r\n",
             ),
             res,
         );

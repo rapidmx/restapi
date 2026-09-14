@@ -281,7 +281,7 @@ describe("CalendarReminderJobMongo Tests (real DB + DI)", () => {
             await job.run();
 
             expect(fakeRedis.published).toHaveLength(2);
-            const nonRecurringPages = findSpy.mock.calls.filter((call: any[]) => call[0].startDate !== undefined);
+            const nonRecurringPages = findSpy.mock.calls.filter((call: any[]) => call[0].recurrenceRule === undefined);
             expect(nonRecurringPages).toHaveLength(2);
         } finally {
             findSpy.mockRestore();
@@ -289,22 +289,64 @@ describe("CalendarReminderJobMongo Tests (real DB + DI)", () => {
         }
     });
 
-    it("Logs a warning and stops reading once a candidate query exceeds the page cap.", async () => {
+    it("Keyset-pages every candidate with no page cap, never skipping rows that share a startDate across page boundaries.", async () => {
         const now = Date.now();
         const savedBatchSize = (job as any).batchSize;
-        (job as any).batchSize = 1;
-        const warnSpy = vi.spyOn((job as any).logger, "warn");
+        (job as any).batchSize = 2;
         try {
-            for (let i = 0; i < 51; i++) {
-                await createEvent({ startDate: new Date(now + (60 + i) * 60 * 1000), reminderMinutesBeforeStart: 1 });
+            const start = new Date(now + 5 * 60 * 1000);
+            for (let i = 0; i < 7; i++) {
+                await createEvent({ startDate: start, reminderMinutesBeforeStart: 4.5 });
+            }
+            const icalStart = new Date(Math.floor((now + 5 * 60 * 1000) / 1000) * 1000 - 3 * 24 * 60 * 60 * 1000);
+            for (let i = 0; i < 5; i++) {
+                await createEvent({
+                    startDate: icalStart,
+                    endDate: new Date(icalStart.getTime() + 30 * 60 * 1000),
+                    recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] },
+                    reminderMinutesBeforeStart: 4.5,
+                });
             }
 
-            await expect(job.run()).resolves.toBeUndefined();
+            await job.run();
 
-            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("exceeded 50 pages"));
+            // 12 events, each published to its folder and mailbox channels.
+            expect(fakeRedis.published).toHaveLength(24);
         } finally {
-            warnSpy.mockRestore();
             (job as any).batchSize = savedBatchSize;
+        }
+    });
+
+    it("Never reads recurring masters that can't have a due occurrence (cancelled, starting after the lead horizon) and skips expanding an ended series.", async () => {
+        const now = Date.now();
+        const seriesStart = new Date(Math.floor((now + 5 * 60 * 1000) / 1000) * 1000 - 10 * 24 * 60 * 60 * 1000);
+        const daily = { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] };
+        const ended = await createEvent({
+            startDate: seriesStart,
+            endDate: new Date(seriesStart.getTime() + 30 * 60 * 1000),
+            recurrenceRule: { ...daily, until: new Date(now - 2 * 24 * 60 * 60 * 1000) },
+            reminderMinutesBeforeStart: 4.5,
+        });
+        const cancelled = await createEvent({
+            startDate: seriesStart,
+            recurrenceRule: daily,
+            status: CalendarEventStatus.CANCELLED,
+            reminderMinutesBeforeStart: 4.5,
+        });
+        const future = await createEvent({ startDate: new Date(now + 60 * 24 * 60 * 60 * 1000), recurrenceRule: daily, reminderMinutesBeforeStart: 4.5 });
+        const live = await createEvent({ startDate: seriesStart, recurrenceRule: { ...daily, until: new Date(now + 24 * 60 * 60 * 1000) }, reminderMinutesBeforeStart: 4.5 });
+        const processSpy = vi.spyOn(job as any, "processEvent");
+        try {
+            await job.run();
+
+            const processed: string[] = processSpy.mock.calls.map((call: any[]) => call[0].uid);
+            expect(processed).toContain(live.uid);
+            expect(processed).not.toContain(ended.uid);
+            expect(processed).not.toContain(cancelled.uid);
+            expect(processed).not.toContain(future.uid);
+            expect(fakeRedis.published).toHaveLength(2);
+        } finally {
+            processSpy.mockRestore();
         }
     });
 

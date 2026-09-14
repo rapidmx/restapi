@@ -36,6 +36,9 @@ function isShareTokenRecord(userOrRoleId: string, token: string): boolean {
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseCalendarShareLinkRoute<T extends CalendarShareLink> extends BaseScopedChildRoute<T> {
+    /** `ExternalShareExpirationJob` range-queries `expiresAt`, which never matches a string on Mongo. */
+    protected readonly dateFields: readonly string[] = ["expiresAt"];
+
     /** Grants (or re-grants, upserting) `link.token` access to `link.folderUid`'s ACL, matching `link`'s
      * current `permittedActions`. A no-op if the folder has no ACL document (should never happen in practice —
      * every `Folder` is seeded with one on creation — but this is a background-adjacent write, not a

@@ -6,6 +6,7 @@ import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { createClient } from "redis";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { asEntity } from "../util/EntityUtils.js";
 import { AuditAction, Plugin, PluginManifest } from "../models/types.js";
 import {
     DEFAULT_PLUGIN_REGISTRY,
@@ -259,7 +260,11 @@ export abstract class BasePluginRoute<T extends Plugin> {
 
     private async installedPlugins(): Promise<T[]> {
         await this.init();
-        return (await this.pluginRepo!.find({} as any, { ignoreACL: true })).filter((plugin) => !plugin.removed);
+        // Entity instances (`asEntity()`), since `applyPlan()` updates these rows: MongoDB's `find()` returns plain
+        // documents, which `RepoUtils.update()` writes without its version check.
+        return (await this.pluginRepo!.find({} as any, { ignoreACL: true, skipCache: true }))
+            .filter((plugin) => !plugin.removed)
+            .map((plugin) => asEntity(this.pluginRepo!, plugin));
     }
 
     /** Announces a change to every server copy. A deployment without `datastores:events` has a single copy
@@ -505,7 +510,9 @@ export abstract class BasePluginRoute<T extends Plugin> {
 
     /** Creates, or revives the removed row of, a plugin at a resolved version, recording how to undo that. */
     private async installRow(install: PlannedPluginInstall, user: JWTUser | undefined, undo: PluginUndo[]): Promise<T> {
-        const [existing]: T[] = await this.pluginRepo!.find({ name: install.name } as any, { ignoreACL: true, limit: 1 });
+        const [found]: T[] = await this.pluginRepo!.find({ name: install.name } as any, { ignoreACL: true, limit: 1, skipCache: true });
+        // An entity instance, so reviving the row below is version-checked (see `installedPlugins()`).
+        const existing: T | undefined = found ? asEntity(this.pluginRepo!, found) : undefined;
         if (existing && !existing.removed) {
             // Installed by someone else since this change was planned - never overwrite their version and settings.
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, `'${install.name}' changed while this change was being planned. Try again.`);
