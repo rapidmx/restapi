@@ -48,6 +48,9 @@ describe("Route:MailboxMongo auto-provision (static aliases) Tests", () => {
             throw new Error("Could not find mongo connection");
         }
         const domainRepo: MongoRepository<DomainMongo> = conn.getMongoRepository("DomainMongo");
+        // The mailbox policy is seeded from config on first use; drop any row another suite seeded so this file's
+        // config (auto-provisioning on) is what gets seeded here.
+        await conn.getMongoRepository("MailboxPolicyMongo").clear().catch(() => undefined);
         await domainRepo.save(
             new DomainMongo({
                 name: "example.com",

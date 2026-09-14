@@ -23,6 +23,8 @@ import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
+import { MailboxPolicyMongo } from "../../../src/models/mongo/MailboxPolicyMongo.js";
+import { MAILBOX_POLICY_UID } from "../../../src/util/MailboxPolicyUtils.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
 
@@ -40,6 +42,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
     const baseUrl = "/mongo/mailboxes";
     let repo: MongoRepository<MailboxMongo>;
     let domainRepo: MongoRepository<DomainMongo>;
+    let policyRepo: MongoRepository<MailboxPolicyMongo>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -71,6 +74,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
         if (conn instanceof MongoConnection) {
             repo = conn.getMongoRepository("MailboxMongo");
             domainRepo = conn.getMongoRepository("DomainMongo");
+            policyRepo = conn.getMongoRepository("MailboxPolicyMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -94,6 +98,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
                 throw err;
             }
         }
+        await policyRepo.clear().catch(() => undefined);
         mockFetch = vi.fn();
         vi.stubGlobal("fetch", mockFetch);
     });
@@ -220,6 +225,37 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
             userToken,
         );
         expect(folders.body.map((f: any) => f.type).sort()).toEqual(["calendar", "contacts", "drafts", "inbox", "tasks"]);
+    });
+
+    it("Uses the saved MailboxPolicy's quota for a self-created mailbox instead of the config value.", async () => {
+        await policyRepo.save(new MailboxPolicyMongo({ uid: MAILBOX_POLICY_UID, autoProvisionQuotaBytes: 123_456 }));
+        mockFetch.mockResolvedValue(aliasResponse(["policyuser"]));
+
+        const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken).send({
+            alias: "policyuser",
+            domain: "example.org",
+        });
+
+        expect(result.status).toBe(200);
+        expect(result.body.mailbox.quotaBytes).toBe(123_456);
+    });
+
+    it("Seeds the MailboxPolicy from config on first use, so config-enabled auto-provisioning keeps working.", async () => {
+        mockFetch.mockResolvedValue(aliasResponse(["seeded"]));
+        const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
+        expect(result.status).toBe(200);
+        const policy: any = await policyRepo.findOne({ uid: MAILBOX_POLICY_UID } as any);
+        expect(policy).toEqual(expect.objectContaining({ autoProvisionEnabled: true, autoProvisionQuotaBytes: 5_000_000_000, defaultQuotaBytes: 5_000_000_000 }));
+    });
+
+    it("Returns 404 when the saved MailboxPolicy turns self-created mailboxes off, even though config enables them.", async () => {
+        await policyRepo.save(new MailboxPolicyMongo({ uid: MAILBOX_POLICY_UID, autoProvisionEnabled: false }));
+        mockFetch.mockResolvedValue(aliasResponse(["policyuser"]));
+
+        const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
+
+        expect(result.status).toBe(404);
+        expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it("Returns 502 when auth-server responds with a non-OK status.", async () => {

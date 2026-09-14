@@ -1,0 +1,56 @@
+///////////////////////////////////////////////////////////////////////////////
+// Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
+// SPDX-License-Identifier: MPL-2.0
+///////////////////////////////////////////////////////////////////////////////
+import { ObjectDecorators } from "@rapidrest/core";
+import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
+import { SetupState } from "../types.js";
+const { Description } = DocDecorators;
+const { DataStore, Protect } = ModelDecorators;
+const { Column, Entity } = PersistenceDecorators;
+const { Nullable } = ObjectDecorators;
+
+/**
+ * Implementation of the `SetupState` interface for storage in MongoDB.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+@DataStore("mongo")
+@Entity()
+@Description("Progress through the first-run setup wizard.")
+@Protect(
+    {
+        uid: "SetupState",
+        records: [
+            { userOrRoleId: "anonymous", actions: [] },
+            { userOrRoleId: ".*", actions: [] },
+        ],
+    },
+    false,
+)
+export class SetupStateMongo extends BaseMongoEntity implements SetupState {
+    @Column()
+    @Description("When an administrator first opened (or reopened) the setup wizard.")
+    @Nullable
+    public startedAt?: Date;
+
+    @Column()
+    @Description("When an administrator finished the setup wizard.")
+    @Nullable
+    public completedAt?: Date;
+
+    @Column()
+    @Description("The setup wizard step the administrator was last on.")
+    @Nullable
+    public currentStep?: string;
+
+    constructor(other?: Partial<SetupStateMongo>) {
+        super(other);
+
+        if (other) {
+            this.startedAt = "startedAt" in other ? other.startedAt : this.startedAt;
+            this.completedAt = "completedAt" in other ? other.completedAt : this.completedAt;
+            this.currentStep = "currentStep" in other ? other.currentStep : this.currentStep;
+        }
+    }
+}

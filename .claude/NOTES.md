@@ -538,3 +538,19 @@ gap, and this repo's own lint gate - all three found and validated by an adversa
   registered model decorated `@MailboxScopedData()` in its own datastore instead - a plugin model without that decorator
   would survive a data-subject erasure.
 - Config keys are `system:plugins:registry`/`registry_token`/`allowed_packages` (default allow-list `@rapidmx/*`).
+
+## 2026-09-13 — MailboxPolicy and SetupState (first-run setup wizard backend)
+
+- `system/mailbox-policy` (`BaseMailboxPolicyRoute`): default quota, self-service auto-provisioning on/off and its quota.
+  Config (`mail:default_quota_bytes`, `mail:auto_provision:enabled`/`quota_bytes`) is used both ways, per JP: it
+  *seeds* the singleton row the first time anything reads it, and stays a *live fallback* for any unset field and for
+  a failed read (`findOrSeedMailboxPolicy()` logs and returns config). Writes (`PUT`) need the real row and do fail.
+  `BaseMailboxRoute.autoProvision()` reads the policy, so once seeded the row, not config, decides.
+- Test gotcha: SQL test files (and Mongo ones on port 9999) share a database, and seeding persists - a policy row seeded
+  by one suite with auto-provisioning off broke another suite that enables it via config. Suites that depend on the
+  config value clear `MailboxPolicy` first.
+- `system/setup` (`BaseSetupRoute`, trusted role only): `required = !completedAt && (startedAt || no Domain rows)`, so an
+  existing deployment with domains is never pulled into the wizard by upgrading. `PUT {currentStep}` records progress and
+  `startedAt`; `POST /complete`; `POST /reopen` clears completion and step. Non-admins get 403, which the web apps use to
+  decide not to redirect.
+- `findOrCreateSingleton()` (util/MailboxPolicyUtils.ts) is the shared create-or-fetch for singleton rows.

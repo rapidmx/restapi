@@ -21,6 +21,7 @@ import { getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
+import { DEFAULT_MAILBOX_QUOTA_BYTES, findOrSeedMailboxPolicy } from "../util/MailboxPolicyUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 const { Auth, Delete, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 const { Config } = ObjectDecorators;
@@ -133,13 +134,17 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     @Config("mail:auto_provision:static_aliases", [] as string[])
     protected staticAliases: string[] = [];
 
-    /** Master switch for `autoProvision()` — off by default, since silently minting mailboxes is a real
+    /** Seeds `MailboxPolicy.autoProvisionEnabled`, the master switch for `autoProvision()` — off by default, since silently minting mailboxes is a real
      * behavior change a deployment must opt into, not something safe to default on. */
     @Config("mail:auto_provision:enabled", false)
     protected autoProvisionEnabled: boolean = false;
 
     @Config("mail:auto_provision:quota_bytes", 5_000_000_000)
     protected autoProvisionQuotaBytes: number = 5_000_000_000;
+
+    /** Only seeds the `MailboxPolicy` row the first time it's read - see `findOrSeedMailboxPolicy()`. */
+    @Config("mail:default_quota_bytes", DEFAULT_MAILBOX_QUOTA_BYTES)
+    protected defaultQuotaBytes: number = DEFAULT_MAILBOX_QUOTA_BYTES;
 
     @Config("mail:auto_provision:timeout_ms", 10_000)
     protected autoProvisionTimeoutMs: number = 10_000;
@@ -176,6 +181,10 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     /** Supplied by the Mongo/SQL concrete subclasses so `delete()` can resolve an active `Matter` without
      * depending on either backend directly - see `util/LegalHoldUtils.ts`. */
     protected abstract matterClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so `autoProvision()` can read the admin-editable
+     * `MailboxPolicy`, whose saved values take precedence over the `mail:auto_provision:*` config. */
+    protected abstract mailboxPolicyClass: any;
 
     private folderRepo?: RecoverableRepoUtils<any>;
 
@@ -546,7 +555,12 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         const hasAliasSource = this.staticAliases.length > 0 || !!this.authServerUrl;
         const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
-        if (!this.autoProvisionEnabled || domains.length === 0 || !hasAliasSource) {
+        const policy = await findOrSeedMailboxPolicy(this._objectFactory!, this.mailboxPolicyClass, {
+            defaultQuotaBytes: this.defaultQuotaBytes,
+            autoProvisionEnabled: this.autoProvisionEnabled,
+            autoProvisionQuotaBytes: this.autoProvisionQuotaBytes,
+        }, this.logger);
+        if (!policy.autoProvisionEnabled || domains.length === 0 || !hasAliasSource) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "Automatic mailbox provisioning is not enabled.");
         }
 
@@ -581,7 +595,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 displayName: body.alias,
                 ownerUserUid: user.uid,
                 timezone: "UTC",
-                quotaBytes: this.autoProvisionQuotaBytes,
+                quotaBytes: policy.autoProvisionQuotaBytes,
             } as T,
             req,
             user,

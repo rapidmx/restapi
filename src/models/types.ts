@@ -403,6 +403,37 @@ export interface RetentionPolicy extends BaseEntity {
     auditLogRetentionDays?: number;
 }
 
+/**
+ * Deployment-wide defaults for mailboxes - a singleton row, admin-editable, readable by any authenticated user.
+ * Every field is optional: an unset field falls back to the matching server config value
+ * (`mail:auto_provision:*`), so a deployment that never saves a policy behaves exactly as before.
+ */
+export interface MailboxPolicy extends BaseEntity {
+    /** The quota a newly created mailbox starts with, in bytes. */
+    defaultQuotaBytes?: number;
+
+    /** Whether a signed-in user without a mailbox may create their own on first sign-in. */
+    autoProvisionEnabled?: boolean;
+
+    /** The quota of a mailbox a user creates for themselves, in bytes. */
+    autoProvisionQuotaBytes?: number;
+}
+
+/**
+ * Progress through the admin console's first-run setup wizard - a singleton row, trusted-role only.
+ * Absent entirely on a deployment that has never started the wizard.
+ */
+export interface SetupState extends BaseEntity {
+    /** When an administrator first opened (or reopened) the wizard. */
+    startedAt?: Date;
+
+    /** When an administrator finished the wizard. Unset while setup is still in progress. */
+    completedAt?: Date;
+
+    /** The wizard step the administrator was last on, so leaving and coming back resumes there. */
+    currentStep?: string;
+}
+
 export type DataExportFormat = "json" | "mbox";
 export type DataExportStatus = "pending" | "processing" | "ready" | "failed";
 
@@ -1437,6 +1468,9 @@ export enum AuditAction {
     PLUGIN_UPDATE = "plugin.update",
     PLUGIN_REMOVE = "plugin.remove",
     RETENTION_POLICY_UPDATE = "retention_policy.update",
+    MAILBOX_POLICY_UPDATE = "mailbox_policy.update",
+    SETUP_COMPLETE = "setup.complete",
+    SETUP_REOPEN = "setup.reopen",
     /** Recorded once per `RetentionEnforcementJob` run per entity type actually purged (a count, not one
      * entry per record - a routine background job purging thousands of expired rows would otherwise
      * flood the audit trail it's supposed to keep readable). */

@@ -27,6 +27,7 @@ export * from "./FreeBusyUtils.js";
 export * from "./IcsUtils.js";
 export * from "./MailFilterUtils.js";
 export * from "./MailSendUtils.js";
+export * from "./MailboxPolicyUtils.js";
 export * from "./MailSignatureUtils.js";
 export * from "./MailboxScopeUtils.js";
 export * from "./MimeHeaderUtils.js";

@@ -18,6 +18,7 @@ import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { MailboxPolicySQL } from "../../../src/models/sql/MailboxPolicySQL.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
 describe("Route:MailboxSQL auto-provision/domain Tests", () => {
@@ -27,6 +28,7 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
     const baseUrl = "/sql/mailboxes";
     let repo: Repository<MailboxSQL>;
     let domainRepo: Repository<DomainSQL>;
+    let policyRepo: Repository<MailboxPolicySQL>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -57,6 +59,7 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
         if (isSqlDataSource(conn)) {
             repo = conn.getRepository(MailboxSQL);
             domainRepo = conn.getRepository(DomainSQL);
+            policyRepo = conn.getRepository(MailboxPolicySQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -84,6 +87,9 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
 
     beforeEach(async () => {
         await repo.clear();
+        // The mailbox policy is seeded from config on first use and SQL test files share a database, so a row
+        // another suite seeded (with auto-provisioning off) must not leak into this one.
+        await policyRepo.clear();
         mockFetch = vi.fn();
         vi.stubGlobal("fetch", mockFetch);
     });
