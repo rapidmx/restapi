@@ -25,17 +25,67 @@ import { PSTAttachment, PSTFile, PSTFolder, PSTMessage } from "pst-extractor";
  * sticky-note items stored as MAPI objects with no meaningful "raw email" representation at all; importing
  * those is a fast-follow (real per-type import, not a mis-shapen `Message` row) if ever needed.
  */
-export async function extractPstMessages(pstBuffer: Buffer): Promise<Buffer[]> {
+/** Hard ceiling on the cumulative bytes `extractPstMessages()` will allocate for one PST file (4 GiB),
+ * whatever the file's own size - see `defaultPstExtractionBudget()`. */
+export const DEFAULT_PST_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024;
+
+/** How many times the PST file's own size its reconstructed messages may legitimately add up to. PST stores
+ * attachment bytes uncompressed and MIME reconstruction base64-encodes them (~1.37x) plus headers, so a
+ * genuine file stays well under this; a crafted one whose many items all point at the same large data blocks
+ * (each individually passing the per-attachment `filesize <= file size` check) does not. */
+export const PST_EXTRACTION_SIZE_FACTOR = 4;
+
+/** Floor for the default budget, so a tiny PST isn't starved by the size factor alone. */
+const MIN_PST_EXTRACTION_BUDGET = 64 * 1024 * 1024;
+
+/** The default cumulative allocation budget for extracting a PST file of `fileSize` bytes:
+ * `fileSize * PST_EXTRACTION_SIZE_FACTOR`, floored at 64 MiB and capped at `DEFAULT_PST_MAX_TOTAL_BYTES`. */
+export function defaultPstExtractionBudget(fileSize: number): number {
+    return Math.min(DEFAULT_PST_MAX_TOTAL_BYTES, Math.max(MIN_PST_EXTRACTION_BUDGET, fileSize * PST_EXTRACTION_SIZE_FACTOR));
+}
+
+/**
+ * A cumulative allocation budget shared across every attachment/message extracted from one PST file. The
+ * per-attachment `maxSize` bound (`readAttachmentContent()`) alone only stops a single item from claiming more
+ * than the whole file; without a running total, a crafted PST with thousands of items each claiming an
+ * allowed size could still drive total memory use far past anything the file could genuinely contain.
+ * Exceeding it throws, failing the whole import (no message has been persisted yet at extraction time)
+ * rather than importing a silently truncated subset.
+ */
+export class PstAllocationBudget {
+    public readonly limit: number;
+    private used: number = 0;
+
+    constructor(limit: number) {
+        this.limit = limit;
+    }
+
+    /** Records `bytes` against the budget, throwing if that would exceed it. Call BEFORE allocating. */
+    public consume(bytes: number): void {
+        if (bytes > this.limit - this.used) {
+            throw new Error(`PST import exceeds the maximum total extracted size of ${this.limit} bytes.`);
+        }
+        this.used += bytes;
+    }
+
+    public get usedBytes(): number {
+        return this.used;
+    }
+}
+
+export async function extractPstMessages(pstBuffer: Buffer, maxTotalBytes: number = defaultPstExtractionBudget(pstBuffer.length)): Promise<Buffer[]> {
     const pstFile = new PSTFile(pstBuffer);
     const messages: PSTMessage[] = [];
     collectMailItems(pstFile.getRootFolder(), messages);
 
+    const budget = new PstAllocationBudget(maxTotalBytes);
     const raw: Buffer[] = [];
     for (const message of messages) {
         // An attachment can never legitimately be larger than the PST file containing it - bounding
         // `readAttachmentContent()`'s allocation by this file's own size is what keeps a corrupted or
-        // maliciously crafted `filesize` property from driving an unbounded `Buffer.alloc()`.
-        raw.push(await buildRawMimeFromPstMessage(message, pstBuffer.length));
+        // maliciously crafted `filesize` property from driving an unbounded `Buffer.alloc()`. `budget` bounds
+        // the running total across every item.
+        raw.push(await buildRawMimeFromPstMessage(message, pstBuffer.length, budget));
     }
     return raw;
 }
@@ -66,7 +116,7 @@ export function collectMailItems(folder: PSTFolder, out: PSTMessage[]): void {
 /** Reads one attachment's binary content in full - `PSTNodeInputStream.readCompletely()` needs a
  * pre-sized destination buffer (`filesize`), unlike a Node stream's own chunked `read()`. Exported for the
  * same reason as `collectMailItems()` above - the real fixture's every attachment has a readable stream. */
-export function readAttachmentContent(attachment: PSTAttachment, maxSize: number = Infinity): Buffer | undefined {
+export function readAttachmentContent(attachment: PSTAttachment, maxSize: number = Infinity, budget?: PstAllocationBudget): Buffer | undefined {
     const stream = attachment.fileInputStream;
     if (!stream) {
         // An attachment with no readable content stream (e.g. an OLE-embedded object PST stores in a form
@@ -82,6 +132,8 @@ export function readAttachmentContent(attachment: PSTAttachment, maxSize: number
         // pre-allocate from it.
         return undefined;
     }
+    // Throws (rather than skipping) once the cumulative budget is exhausted - see `PstAllocationBudget`.
+    budget?.consume(attachment.filesize);
     const content = Buffer.alloc(attachment.filesize);
     stream.readCompletely(content);
     return content;
@@ -93,9 +145,12 @@ export function readAttachmentContent(attachment: PSTAttachment, maxSize: number
  * `multipart/alternative` when the item has both. Exported for the same reason as `collectMailItems()`
  * above - lets a unit test assert on one message's exact reconstructed headers/body without needing to
  * also exercise the folder-walking/attachment-reading logic around it. */
-export function buildRawMimeFromPstMessage(message: PSTMessage, maxAttachmentSize: number = Infinity): Promise<Buffer> {
+export async function buildRawMimeFromPstMessage(message: PSTMessage, maxAttachmentSize: number = Infinity, budget?: PstAllocationBudget): Promise<Buffer> {
+    const usedBefore: number = budget?.usedBytes ?? 0;
     const hasHtml = !!message.bodyHTML;
     const hasPlain = !!message.body;
+    // Body text counts against the running total too (it is copied into the reconstructed output).
+    budget?.consume((hasHtml ? message.bodyHTML.length : 0) + (hasPlain ? message.body.length : 0));
 
     let bodyNode: MimeNode;
     if (hasHtml && hasPlain) {
@@ -114,7 +169,7 @@ export function buildRawMimeFromPstMessage(message: PSTMessage, maxAttachmentSiz
         root.appendChild(bodyNode);
         for (let i = 0; i < message.numberOfAttachments; i++) {
             const attachment: PSTAttachment = message.getAttachment(i);
-            const content: Buffer | undefined = readAttachmentContent(attachment, maxAttachmentSize);
+            const content: Buffer | undefined = readAttachmentContent(attachment, maxAttachmentSize, budget);
             if (!content) {
                 continue;
             }
@@ -160,8 +215,8 @@ export function buildRawMimeFromPstMessage(message: PSTMessage, maxAttachmentSiz
         root.setHeader("Message-ID", message.internetMessageId);
     }
 
-    return new Promise<Buffer>((resolve, reject) => {
-        root.build((err: Error | null, output: Buffer) => {
+    const output: Buffer = await new Promise<Buffer>((resolve, reject) => {
+        root.build((err: Error | null, built: Buffer) => {
             /* v8 ignore next 3 -- unreachable in practice: `MimeNode.build()` fails only for a stream source
                it can't read - every part built here is set via `setContent()` with a plain string/Buffer,
                never a stream. Same unreachable callback-to-promise error path `util/ReceiptUtils.ts`'s
@@ -169,8 +224,15 @@ export function buildRawMimeFromPstMessage(message: PSTMessage, maxAttachmentSiz
             if (err) {
                 reject(err);
             } else {
-                resolve(output);
+                resolve(built);
             }
         });
     });
+    if (budget) {
+        // The retained output is what accumulates across messages; attachment bytes already consumed above
+        // for this message are credited so the same content isn't counted twice (raw attachment + its
+        // base64 form inside `output`).
+        budget.consume(Math.max(0, output.length - (budget.usedBytes - usedBefore)));
+    }
+    return output;
 }

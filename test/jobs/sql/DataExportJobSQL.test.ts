@@ -433,6 +433,194 @@ describe("DataExportJobSQL Tests (real DB + DI)", () => {
         expect(stillPending!.status).toBe("pending");
     });
 
+    const saveMessageWithBody = async (mailboxUid: string, body: string): Promise<void> => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        await blobStore.put(bodyBlobKey, Buffer.from(`Subject: X\r\n\r\n${body}`));
+        await messageRepo.save(
+            new MessageSQL({
+                mailboxUid,
+                folderUid: uuid.v4(),
+                messageId: `${uuid.v4()}@example.com`,
+                subject: "X",
+                from: { address: "alice@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date(),
+                receivedDate: new Date(),
+                bodyBlobKey,
+                flags: { read: false, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: false,
+            }),
+        );
+    };
+
+    const withJobField = async (field: string, value: any, fn: () => Promise<void>): Promise<void> => {
+        const original = (job as any)[field];
+        (job as any)[field] = value;
+        try {
+            await fn();
+        } finally {
+            (job as any)[field] = original;
+        }
+    };
+
+    it("Reclaims a 'processing' request whose lease expired (its replica died) and processes it again in the same run.", async () => {
+        const mailbox = await createMailbox();
+        const request = await createRequest({
+            mailboxUid: mailbox.uid,
+            format: "json",
+            status: "processing",
+            processingAttempts: 1,
+            dateModified: new Date(Date.now() - 2 * 60 * 60_000),
+        });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("ready");
+        expect(updated!.processingAttempts).toBe(2);
+        expect(updated!.blobKey).toBe(`data-exports/${request.uid}-2.ndjson`);
+    });
+
+    it("Leaves a 'processing' request alone while its lease is still fresh.", async () => {
+        const mailbox = await createMailbox();
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "json", status: "processing", processingAttempts: 1 });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("processing");
+        expect(updated!.version).toBe(request.version);
+    });
+
+    it("Marks an abandoned request failed instead of reclaiming it once max_attempts is reached.", async () => {
+        const mailbox = await createMailbox();
+        const request = await createRequest({
+            mailboxUid: mailbox.uid,
+            status: "processing",
+            processingAttempts: 3,
+            dateModified: new Date(Date.now() - 2 * 60 * 60_000),
+        });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("failed");
+        expect(updated!.errorMessage).toContain("did not complete after 3 attempt(s)");
+        expect((await auditLogRepo.find({ where: { action: AuditAction.DATA_EXPORT_FAILED } })).length).toBe(1);
+    });
+
+    it("Only one of two replicas racing to reclaim the same abandoned request wins (version-checked reclaim).", async () => {
+        const mailbox = await createMailbox();
+        const request = await createRequest({
+            mailboxUid: mailbox.uid,
+            status: "processing",
+            processingAttempts: 1,
+            dateModified: new Date(Date.now() - 2 * 60 * 60_000),
+        });
+        const repoUtils = (job as any).dataExportRequestRepo;
+        const stale = await repoUtils.findOne(request.uid, { ignoreACL: true });
+        // Both "replicas" read the same abandoned row before either writes.
+        vi.spyOn(repoUtils, "find").mockResolvedValueOnce([stale]).mockResolvedValueOnce([stale]);
+        const updateSpy = vi.spyOn(repoUtils, "update");
+
+        await (job as any).reclaimAbandonedRequests();
+        await (job as any).reclaimAbandonedRequests();
+
+        expect(updateSpy).toHaveBeenCalledTimes(2);
+        expect(updateSpy.mock.results[0].type).toBe("return");
+        await expect(updateSpy.mock.results[1].value).rejects.toThrow();
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("pending");
+        expect(updated!.version).toBe(request.version + 1);
+    });
+
+    it("Fails an mbox export that exceeds mail:export:max_bytes with a clear message, leaving no partial blob behind.", async () => {
+        const mailbox = await createMailbox();
+        await saveMessageWithBody(mailbox.uid, "a".repeat(200));
+        await saveMessageWithBody(mailbox.uid, "b".repeat(200));
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "mbox" });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const deleteSpy = vi.spyOn(blobStore, "delete");
+
+        await withJobField("maxBytes", 300, async () => {
+            await job.run();
+        });
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("failed");
+        expect(updated!.errorMessage).toBe("Export exceeds the maximum export size of 300 bytes.");
+        expect(updated!.blobKey).toBeFalsy();
+        expect(deleteSpy).toHaveBeenCalledWith(`data-exports/${request.uid}-1.mbox`);
+        expect(await blobStore.exists(`data-exports/${request.uid}-1.mbox`)).toBe(false);
+    });
+
+    it("Streams the mbox bundle into BlobStore.put() rather than handing it one pre-built Buffer.", async () => {
+        const mailbox = await createMailbox();
+        await saveMessageWithBody(mailbox.uid, "streamed body");
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "mbox" });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const putSpy = vi.spyOn(blobStore, "put");
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("ready");
+        expect(Buffer.isBuffer(putSpy.mock.calls[0][1])).toBe(false);
+        expect((await blobStore.get(updated!.blobKey!)).toString("utf-8")).toContain("streamed body");
+    });
+
+    it("Fails a JSON export that exceeds mail:export:max_bytes.", async () => {
+        const mailbox = await createMailbox();
+        await contactRepo.save(new ContactSQL({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "x".repeat(500) }));
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "json" });
+
+        await withJobField("maxBytes", 100, async () => {
+            await job.run();
+        });
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("failed");
+        expect(updated!.errorMessage).toBe("Export exceeds the maximum export size of 100 bytes.");
+    });
+
+    it("Renews its lease while streaming a long mbox export, and still completes.", async () => {
+        const mailbox = await createMailbox();
+        await saveMessageWithBody(mailbox.uid, "renewed body");
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "mbox" });
+
+        // A lease of 0 minutes means every renewal check is due - after the one page of messages here.
+        await withJobField("leaseMinutes", 0, async () => {
+            await (job as any).processRequest(request);
+        });
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("ready");
+        // claim + one renewal + ready
+        expect(updated!.version).toBe(request.version + 3);
+    });
+
+    it("A run that lost its lease mid-export (another replica reclaimed the request) neither marks it ready nor leaves its blob behind.", async () => {
+        const mailbox = await createMailbox();
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "json" });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const realPut = blobStore.put.bind(blobStore);
+        vi.spyOn(blobStore, "put").mockImplementationOnce(async (key: string, data: any, options?: any) => {
+            await realPut(key, data, options);
+            // Simulates a reclaim by another replica while this run was still writing its bundle.
+            const current = (await requestRepo.findOne({ where: { uid: request.uid } }))!;
+            await requestRepo.update({ uid: request.uid }, { version: current.version + 1, status: "pending" });
+        });
+
+        await (job as any).processRequest(request);
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("pending");
+        expect(updated!.blobKey).toBeFalsy();
+        expect(await blobStore.exists(`data-exports/${request.uid}-1.ndjson`)).toBe(false);
+    });
+
     it("Does nothing when the repos are not yet initialized.", async () => {
         const original = (job as any).dataExportRequestRepo;
         (job as any).dataExportRequestRepo = undefined;

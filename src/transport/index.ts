@@ -6,3 +6,4 @@ export * from "./MailTransport.js";
 export * from "./PostfixSendmailTransport.js";
 export * from "./MTAIngestAdapter.js";
 export * from "./SesMailTransport.js";
+export * from "./TransportResultUtils.js";

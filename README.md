@@ -93,6 +93,117 @@ ALTER TABLE contact_sql MODIFY `keysFirstSeen` DOUBLE NULL, MODIFY `lastMessageS
 Skip any table that doesn't exist yet (it's created with the right types). A MySQL column already created as `double`
 is left alone.
 
+### SQL: long free-text columns are `text` (Postgres and MySQL/MariaDB)
+
+A plain string column is `varchar(255)`, which MySQL rejects (strict mode) or truncates for a longer subject, preview,
+note, DKIM key or error message. These columns are now `text`:
+
+| Table | Columns |
+| --- | --- |
+| `message_sql` | `subject`, `bodyPreview` |
+| `calendar_event_sql` | `title`, `location` |
+| `note_sql` | `body` |
+| `task_sql` | `body` |
+| `contact_sql` | `notes` |
+| `domain_sql` | `dkimPublicKey` |
+| `branding_sql` | `logoUrl`, `iconUrl`, `stylesheetUrl`, `headerHtml`, `footerHtml` |
+| `booking_sql` | `bookerNotes` |
+| `booking_type_sql` | `description` |
+| `matter_sql` | `description` |
+| `escrow_scope_sql` | `description` |
+| `data_export_request_sql` | `errorMessage` |
+| `mailbox_import_request_sql` | `errorMessage` |
+| `matter_export_request_sql` | `errorMessage` |
+| `ingest_queue_entry_sql` | `errorMessage` |
+| `data_subject_erasure_request_sql` | `reason` |
+
+As with the numeric columns above, `synchronize: true` applies a `varchar` -> `text` change on Postgres and MySQL by
+dropping and re-adding the column: every stored subject, preview, note body, etc. is lost, and re-adding a `NOT NULL`
+column (`subject`, `bodyPreview`, `title`, note `body`) fails on a non-empty Postgres table. SQLite needs nothing.
+Before starting this version on an existing Postgres or MySQL database, change the types in place:
+
+```sql
+-- Postgres
+ALTER TABLE message_sql ALTER COLUMN "subject" TYPE text, ALTER COLUMN "bodyPreview" TYPE text;
+ALTER TABLE calendar_event_sql ALTER COLUMN "title" TYPE text, ALTER COLUMN "location" TYPE text;
+ALTER TABLE note_sql ALTER COLUMN "body" TYPE text;
+ALTER TABLE task_sql ALTER COLUMN "body" TYPE text;
+ALTER TABLE contact_sql ALTER COLUMN "notes" TYPE text;
+ALTER TABLE domain_sql ALTER COLUMN "dkimPublicKey" TYPE text;
+ALTER TABLE branding_sql ALTER COLUMN "logoUrl" TYPE text, ALTER COLUMN "iconUrl" TYPE text,
+    ALTER COLUMN "stylesheetUrl" TYPE text, ALTER COLUMN "headerHtml" TYPE text, ALTER COLUMN "footerHtml" TYPE text;
+ALTER TABLE booking_sql ALTER COLUMN "bookerNotes" TYPE text;
+ALTER TABLE booking_type_sql ALTER COLUMN "description" TYPE text;
+ALTER TABLE matter_sql ALTER COLUMN "description" TYPE text;
+ALTER TABLE escrow_scope_sql ALTER COLUMN "description" TYPE text;
+ALTER TABLE data_export_request_sql ALTER COLUMN "errorMessage" TYPE text;
+ALTER TABLE mailbox_import_request_sql ALTER COLUMN "errorMessage" TYPE text;
+ALTER TABLE matter_export_request_sql ALTER COLUMN "errorMessage" TYPE text;
+ALTER TABLE ingest_queue_entry_sql ALTER COLUMN "errorMessage" TYPE text;
+ALTER TABLE data_subject_erasure_request_sql ALTER COLUMN "reason" TYPE text;
+
+-- MySQL / MariaDB
+ALTER TABLE message_sql MODIFY `subject` TEXT NOT NULL, MODIFY `bodyPreview` TEXT NOT NULL;
+ALTER TABLE calendar_event_sql MODIFY `title` TEXT NOT NULL, MODIFY `location` TEXT NULL;
+ALTER TABLE note_sql MODIFY `body` TEXT NOT NULL;
+ALTER TABLE task_sql MODIFY `body` TEXT NULL;
+ALTER TABLE contact_sql MODIFY `notes` TEXT NULL;
+ALTER TABLE domain_sql MODIFY `dkimPublicKey` TEXT NULL;
+ALTER TABLE branding_sql MODIFY `logoUrl` TEXT NULL, MODIFY `iconUrl` TEXT NULL, MODIFY `stylesheetUrl` TEXT NULL,
+    MODIFY `headerHtml` TEXT NULL, MODIFY `footerHtml` TEXT NULL;
+ALTER TABLE booking_sql MODIFY `bookerNotes` TEXT NULL;
+ALTER TABLE booking_type_sql MODIFY `description` TEXT NULL;
+ALTER TABLE matter_sql MODIFY `description` TEXT NULL;
+ALTER TABLE escrow_scope_sql MODIFY `description` TEXT NULL;
+ALTER TABLE data_export_request_sql MODIFY `errorMessage` TEXT NULL;
+ALTER TABLE mailbox_import_request_sql MODIFY `errorMessage` TEXT NULL;
+ALTER TABLE matter_export_request_sql MODIFY `errorMessage` TEXT NULL;
+ALTER TABLE ingest_queue_entry_sql MODIFY `errorMessage` TEXT NULL;
+ALTER TABLE data_subject_erasure_request_sql MODIFY `reason` TEXT NULL;
+```
+
+Skip any table that doesn't exist yet. None of these columns is indexed, so no index has to be dropped first.
+
+### New indexes, and a unique Focused Inbox override per sender (all backends)
+
+New indexes are created automatically at startup (TypeORM `synchronize` / `MongoSchemaSync`); on a large `message_sql` /
+`message_mongo` table expect the first start to take a while. One existing index changes meaning:
+`focusedinboxoverride_mailbox` on (`mailboxUid`, `senderAddress`) is now **unique**. If a mailbox already has two
+overrides for the same sender, index creation fails at startup. Remove the duplicates first (keeps the most recently
+modified row per sender):
+
+```sql
+-- Postgres
+DELETE FROM focused_inbox_override_sql a USING focused_inbox_override_sql b
+ WHERE a."mailboxUid" = b."mailboxUid" AND a."senderAddress" = b."senderAddress"
+   AND (a."dateModified" < b."dateModified" OR (a."dateModified" = b."dateModified" AND a.uid < b.uid));
+
+-- MySQL / MariaDB
+DELETE a FROM focused_inbox_override_sql a JOIN focused_inbox_override_sql b
+    ON a.`mailboxUid` = b.`mailboxUid` AND a.`senderAddress` = b.`senderAddress`
+   AND (a.`dateModified` < b.`dateModified` OR (a.`dateModified` = b.`dateModified` AND a.uid < b.uid));
+
+-- SQLite
+DELETE FROM focused_inbox_override_sql WHERE EXISTS (
+    SELECT 1 FROM focused_inbox_override_sql b
+     WHERE b.mailboxUid = focused_inbox_override_sql.mailboxUid
+       AND b.senderAddress = focused_inbox_override_sql.senderAddress
+       AND (b.dateModified > focused_inbox_override_sql.dateModified
+            OR (b.dateModified = focused_inbox_override_sql.dateModified AND b.uid > focused_inbox_override_sql.uid)));
+```
+
+```js
+// MongoDB (mongosh)
+db.focused_inbox_override_mongo.aggregate([
+    { $sort: { dateModified: -1 } },
+    { $group: { _id: { m: "$mailboxUid", s: "$senderAddress" }, ids: { $push: "$_id" } } },
+    { $match: { "ids.1": { $exists: true } } },
+]).forEach((g) => db.focused_inbox_override_mongo.deleteMany({ _id: { $in: g.ids.slice(1) } }));
+```
+
+MySQL's default collation compares case-insensitively, so there `Sender@x` and `sender@x` also count as duplicates;
+overrides written by the server itself are already lowercased.
+
 ## Status
 
 This library is under active development. Phase 1 (the core data model, the standard RapidREST CRUD API, mail

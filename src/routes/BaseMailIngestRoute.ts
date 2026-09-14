@@ -17,6 +17,7 @@ import {
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import type { MailTransport } from "../transport/MailTransport.js";
+import { sendOrThrow } from "../transport/TransportResultUtils.js";
 import { DistributionList, IngestQueueEntry, IngestStatus, Mailbox, QuarantineReason, TransportRule } from "../models/types.js";
 import { normalizeAddress, stripPlusTag } from "../util/AddressUtils.js";
 import { rewriteHeadersForList } from "../util/DistributionListUtils.js";
@@ -350,7 +351,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             })
                 .compile()
                 .build();
-            await this.mailTransport!.send({ raw: composed, envelopeFrom: list.primarySmtpAddress, envelopeTo: [envelopeFrom] });
+            await sendOrThrow(this.mailTransport!, { raw: composed, envelopeFrom: list.primarySmtpAddress, envelopeTo: [envelopeFrom] });
         } catch (err: any) {
             this.logger?.warn(`MailIngestRoute: failed to send unsubscribe confirmation to '${envelopeFrom}': ${err.message}`);
         }
@@ -403,7 +404,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 })
                     .compile()
                     .build();
-                await this.mailTransport!.send({ raw: composed, envelopeFrom: "", envelopeTo: [envelopeFrom] });
+                await sendOrThrow(this.mailTransport!, { raw: composed, envelopeFrom: "", envelopeTo: [envelopeFrom] });
             } catch (err: any) {
                 this.logger?.warn(`MailIngestRoute: failed to send transport-rule rejection notice to '${envelopeFrom}': ${err.message}`);
             }
@@ -622,7 +623,8 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
 
             for (const external of externalAddresses) {
                 try {
-                    await this.mailTransport!.send({
+                    // Throws on a transport rejection too, so a relay that reached nobody is logged like an error.
+                    await sendOrThrow(this.mailTransport!, {
                         raw: listRaw,
                         envelopeFrom: list.primarySmtpAddress,
                         envelopeTo: [external],

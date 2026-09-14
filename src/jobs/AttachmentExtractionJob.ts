@@ -11,6 +11,9 @@ import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { Attachment, Message } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
+/** The longest error message persisted onto `Attachment.extractionError`. */
+const MAX_ERROR_LENGTH = 1000;
+
 /**
  * Runs `ExtractorRegistry` (PDF/DOCX/plain-text/HTML text extraction) over `Attachment` records that haven't
  * been processed yet (`extractedTextBlobKey` unset), as a background job — never inline on ingestion, since
@@ -22,6 +25,12 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * MIME type (e.g. an image) isn't re-selected by this job forever. When extraction *does* produce non-empty
  * text for an attachment whose parent `Message` was already search-indexed, this job clears that message's
  * `searchIndexedAt` back to `undefined` so `SearchIndexJob` re-indexes it with the newly available text.
+ *
+ * An attachment whose processing throws (e.g. a transient blob-store failure, or a malformed file that crashes
+ * its extractor every time) is retried with exponential backoff (`extractionAttempts`/`extractionNextAttemptAt`,
+ * base delay `mail:jobs:attachment_extraction:retry_backoff_seconds`) up to
+ * `mail:jobs:attachment_extraction:max_attempts` times, then left unextracted with `extractionError` recorded -
+ * excluded from every later candidate query, so it can never occupy the head of the queue forever.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -45,6 +54,12 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
 
     @Config("mail:jobs:attachment_extraction:batch_size", 25)
     private batchSize: number = 25;
+
+    @Config("mail:jobs:attachment_extraction:max_attempts", 5)
+    private maxAttempts: number = 5;
+
+    @Config("mail:jobs:attachment_extraction:retry_backoff_seconds", 60)
+    private retryBackoffSeconds: number = 60;
 
     @Logger
     private logger: any;
@@ -82,8 +97,24 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
         // object itself (all `ModelUtils.buildSearchQuerySQL` reads - it ignores `options.limit` entirely and
         // falls back to its own default of 100 otherwise). Confirmed by real-database testing: on the SQL
         // backend, `options.limit` alone silently caps at 100 regardless of the configured batch size.
+        //
+        // Candidates are an attachment that has never failed, or one that has failed fewer than `maxAttempts`
+        // times and whose backoff has elapsed - one at `maxAttempts` is excluded outright. Sorted oldest-first
+        // (with `uid` as a tiebreaker) so batches are drawn in a stable order.
+        const now: Date = new Date();
         const pending: A[] = await this.attachmentRepo.find(
-            { extractedTextBlobKey: null, limit: this.batchSize } as any,
+            {
+                extractedTextBlobKey: null,
+                $or: [
+                    { extractionAttempts: "null" },
+                    {
+                        extractionAttempts: `lt(${this.maxAttempts})`,
+                        extractionNextAttemptAt: `lte(${now.toISOString()})`,
+                    },
+                ],
+                sort: { dateCreated: "ASC", uid: "ASC" },
+                limit: this.batchSize,
+            } as any,
             { ignoreACL: true, limit: this.batchSize },
         );
 
@@ -91,8 +122,43 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
             try {
                 await this.processAttachment(attachment);
             } catch (err: any) {
-                this.logger?.warn(`AttachmentExtractionJob: failed to process attachment ${attachment.uid}: ${err.message}`);
+                await this.recordFailure(attachment, err?.message ?? String(err));
             }
+        }
+    }
+
+    /**
+     * Records one failed processing attempt on `attachment`: increments `extractionAttempts`, schedules the next
+     * attempt with exponential backoff, and stores the error. Once `maxAttempts` is reached the attachment is no
+     * longer selected by `run()` and the failure is logged as an error.
+     */
+    private async recordFailure(attachment: A, reason: string): Promise<void> {
+        const attempts: number = (attachment.extractionAttempts ?? 0) + 1;
+        const exhausted: boolean = attempts >= this.maxAttempts;
+        const delayMs: number = this.retryBackoffSeconds * 1000 * Math.pow(2, attempts - 1);
+        if (exhausted) {
+            this.logger?.error(
+                `AttachmentExtractionJob: giving up on attachment ${attachment.uid} after ${attempts} failed attempt(s): ${reason}`,
+            );
+        } else {
+            this.logger?.warn(`AttachmentExtractionJob: attempt ${attempts} to process attachment ${attachment.uid} failed: ${reason}`);
+        }
+        try {
+            await this.attachmentRepo!.update(
+                {
+                    uid: attachment.uid,
+                    version: (attachment as any).version,
+                    extractionAttempts: attempts,
+                    extractionNextAttemptAt: exhausted ? null : new Date(Date.now() + delayMs),
+                    extractionError: reason.slice(0, MAX_ERROR_LENGTH),
+                } as any,
+                attachment,
+                { ignoreACL: true },
+            );
+        } catch (err: any) {
+            this.logger?.warn(
+                `AttachmentExtractionJob: failed to record extraction failure on attachment ${attachment.uid}: ${err?.message}`,
+            );
         }
     }
 
@@ -131,11 +197,18 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
             contentType: "text/plain",
         });
 
-        await this.attachmentRepo!.update(
-            { uid: attachment.uid, version: (attachment as any).version, extractedTextBlobKey } as any,
-            attachment,
-            { ignoreACL: true },
-        );
+        const attachmentUpdate: any = { uid: attachment.uid, version: (attachment as any).version, extractedTextBlobKey };
+        if (
+            (attachment.extractionAttempts ?? null) !== null ||
+            (attachment.extractionNextAttemptAt ?? null) !== null ||
+            (attachment.extractionError ?? null) !== null
+        ) {
+            // A retry that finally succeeded - clear the failure bookkeeping (explicit `null` for SQL).
+            attachmentUpdate.extractionAttempts = null;
+            attachmentUpdate.extractionNextAttemptAt = null;
+            attachmentUpdate.extractionError = null;
+        }
+        await this.attachmentRepo!.update(attachmentUpdate, attachment, { ignoreACL: true });
 
         if (text && text.length > 0 && message?.searchIndexedAt) {
             // Explicit `null`, not `undefined`: TypeORM's `Repository.update()` silently drops any property
@@ -144,8 +217,17 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
             // reporting "already indexed") - a real, confirmed cross-backend bug caught by real-database
             // testing. MongoDB's own `updateOne($set: ...)` happens to coerce either value to `null`
             // equivalently, so `null` is correct there too.
+            //
+            // `SearchIndexJob`'s own retry bookkeeping is reset too, so the re-index gets a full set of attempts.
             await this.messageRepo!.update(
-                { uid: message.uid, version: (message as any).version, searchIndexedAt: null } as any,
+                {
+                    uid: message.uid,
+                    version: (message as any).version,
+                    searchIndexedAt: null,
+                    searchIndexAttempts: null,
+                    searchIndexNextAttemptAt: null,
+                    searchIndexError: null,
+                } as any,
                 message,
                 { ignoreACL: true, skipPush: true },
             );

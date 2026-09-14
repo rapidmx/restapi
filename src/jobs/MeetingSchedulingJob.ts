@@ -4,10 +4,12 @@
 ///////////////////////////////////////////////////////////////////////////////
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ObjectDecorators } from "@rapidrest/core";
-import { BackgroundService, ObjectFactory } from "@rapidrest/service-core";
+import { ApiErrors, BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { buildEventIcs } from "../util/IcsUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-import { CalendarEvent, CalendarEventStatus } from "../models/types.js";
+import { sendOrThrow } from "../transport/TransportResultUtils.js";
+import type { MailTransport } from "../transport/MailTransport.js";
+import { CalendarEvent, CalendarEventStatus, Mailbox } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /**
@@ -27,10 +29,21 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * row's own occurrence-level `CANCEL` is skipped (its `cancelNoticeSentAt` is still stamped, so it doesn't
  * linger as a candidate) whenever its master is *also* being cancelled in the same pass.
  *
- * **Known limitation** (matching this codebase's existing "simplest correct-enough" precedent - see
- * `CalendarReminderJob`'s own doc comment for the same style): no per-attendee send-retry tracking. A
- * single bad attendee address doesn't block marking the whole event `inviteSequenceSent`/
- * `cancelNoticeSentAt` - it's logged and skipped, not retried indefinitely.
+ * **Organizer-owned rows only.** Every mailbox that receives an invite gets its own `CalendarEvent` row (created by
+ * `ScanQueueJob`'s iTIP processing) carrying the *remote* organizer and the full attendee list. Only a row whose
+ * `organizer.address` is one of its own mailbox's addresses (`primarySmtpAddress`/`aliasAddresses`,
+ * case-insensitive) is sent for - anything else would impersonate that organizer to every attendee. A row that
+ * isn't organizer-owned (or whose mailbox no longer exists) is still stamped `inviteSequenceSent`/
+ * `cancelNoticeSentAt` so it drops out of the candidate set, but nothing is sent.
+ *
+ * **Claim, then send.** Each row is claimed by the optimistic-lock (versioned) update of `inviteSequenceSent`/
+ * `cancelNoticeSentAt` *before* anything is sent, and only sent if that update succeeded - a version conflict means
+ * another replica (or a concurrent edit) got there first, and the row is left for whoever holds the newer version.
+ * Every send goes through `sendOrThrow()`, so a transport that reports a rejected recipient counts as a failure.
+ *
+ * **Known limitation**: no per-attendee send-retry tracking. A failed send to one attendee is logged and the rest
+ * still go out; the row stays claimed (not rolled back), so that attendee isn't retried - un-claiming would resend
+ * to every attendee that did succeed.
  *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`MeetingSchedulingJobMongo`/
  * `MeetingSchedulingJobSQL`), following the same generic pattern `ScanQueueJob` uses.
@@ -39,14 +52,16 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  */
 export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends BackgroundService {
     protected abstract calendarEventClass: any;
+    protected abstract mailboxClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     private calendarEventRepo?: RecoverableRepoUtils<CE>;
+    private mailboxRepo?: RepoUtils<any>;
 
     @Inject("MailTransport")
-    private mailTransport?: any;
+    private mailTransport?: MailTransport;
 
     @Config("mail:jobs:meeting_scheduling:schedule", "0 */5 * * * *")
     private scheduleExpr: string = "0 */5 * * * *";
@@ -67,6 +82,10 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
             name: this.calendarEventClass.name,
             args: [this.calendarEventClass],
         });
+        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.mailboxClass.name,
+            args: [this.mailboxClass],
+        });
     }
 
     public async start(): Promise<void> {
@@ -82,11 +101,52 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
             return;
         }
 
-        await this.sendInvites();
-        await this.sendCancellations();
+        // Per-run cache of each mailbox's own (lowercased) addresses, keyed by mailbox uid.
+        const ownAddresses: Map<string, Set<string>> = new Map();
+        await this.sendInvites(ownAddresses);
+        await this.sendCancellations(ownAddresses);
     }
 
-    private async sendInvites(): Promise<void> {
+    /** `true` if `event`'s organizer is one of its owning mailbox's own addresses - i.e. this row is the organizer's
+     * copy, not an attendee copy received from someone else. */
+    private async isOrganizerCopy(event: CE, cache: Map<string, Set<string>>): Promise<boolean> {
+        const organizerAddress: string = (event.organizer?.address ?? "").trim().toLowerCase();
+        if (!organizerAddress || !event.mailboxUid) {
+            return false;
+        }
+        let addresses: Set<string> | undefined = cache.get(event.mailboxUid);
+        if (!addresses) {
+            const mailbox: Mailbox | undefined = await this.mailboxRepo?.findOne(event.mailboxUid, { ignoreACL: true });
+            addresses = new Set(
+                (mailbox ? [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])] : [])
+                    .filter((address) => typeof address === "string")
+                    .map((address) => address.trim().toLowerCase()),
+            );
+            cache.set(event.mailboxUid, addresses);
+        }
+        return addresses.has(organizerAddress);
+    }
+
+    /** Applies `changes` with an optimistic-lock update. Returns `false` (instead of throwing) only for a version
+     * conflict - someone else already claimed or changed the row. */
+    private async claim(event: CE, changes: Partial<CalendarEvent>): Promise<boolean> {
+        // `RepoUtils.find()` on the Mongo backend returns raw documents, not entity instances, and
+        // `RepoUtils.update()` only enforces the optimistic lock when `existing instanceof BaseEntity` - otherwise
+        // it silently falls back to an unversioned `updateOne({ uid })` (and `$set`s the stale `version` back).
+        // Instantiating the model class first is what makes this a real compare-and-set on both backends.
+        const existing: CE = event instanceof this.calendarEventClass ? event : new this.calendarEventClass(event);
+        try {
+            await this.calendarEventRepo!.update({ uid: existing.uid, version: (existing as any).version, ...changes } as any, existing, { ignoreACL: true });
+            return true;
+        } catch (err: any) {
+            if (err?.code === ApiErrors.INVALID_OBJECT_VERSION) {
+                return false;
+            }
+            throw err;
+        }
+    }
+
+    private async sendInvites(ownAddresses: Map<string, Set<string>>): Promise<void> {
         // `limit` must be passed both via `options` (used by the Mongo backend) *and* baked into the query
         // object itself (all `ModelUtils.buildSearchQuerySQL` reads - it ignores `options.limit` entirely and
         // falls back to its own default of 100 otherwise). Confirmed by real-database testing: on the SQL
@@ -124,45 +184,32 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                     continue;
                 }
 
-                // An event the organizer explicitly chose to send encrypted is entirely the client's own
-                // responsibility to compose and send (see this repo's server-side scope boundary - real
-                // sign/encrypt only ever happens client-side) - this job never composes a plaintext iTIP
-                // REQUEST for it. Still stamps `inviteSequenceSent` so this job doesn't keep re-fetching an
-                // event it will never actually send, the same "skip the send, still mark handled" shape
-                // `isRedundantOccurrenceCancel` below already uses for a different reason.
-                if (event.encryptionOrigin === "originated") {
-                    await this.calendarEventRepo!.update(
-                        { uid: event.uid, version: (event as any).version, inviteSequenceSent: event.sequence } as any,
-                        event,
-                        { ignoreACL: true },
-                    );
+                const isOrganizerCopy: boolean = await this.isOrganizerCopy(event, ownAddresses);
+
+                // Claim first: only the replica whose versioned update wins may send.
+                if (!(await this.claim(event, { inviteSequenceSent: event.sequence }))) {
+                    continue;
+                }
+
+                // Not the organizer's own copy (an attendee copy of someone else's meeting): stamped above so it
+                // drops out, never sent. And an event the organizer explicitly chose to send encrypted is entirely
+                // the client's own responsibility to compose and send (see this repo's server-side scope boundary -
+                // real sign/encrypt only ever happens client-side) - this job never composes a plaintext iTIP
+                // REQUEST for it. Both are the same "skip the send, still mark handled" shape
+                // `isRedundantOccurrenceCancel` below uses.
+                if (!isOrganizerCopy || event.encryptionOrigin === "originated") {
                     continue;
                 }
 
                 const ics = buildEventIcs(event, "REQUEST");
-                for (const attendee of event.attendees) {
-                    if (attendee.address.toLowerCase() === event.organizer.address.toLowerCase()) {
-                        continue;
-                    }
-                    try {
-                        await this.sendItipMail(event, ics, "request", attendee.address);
-                    } catch (err: any) {
-                        this.logger?.warn(`MeetingSchedulingJob: failed to send invite for event ${event.uid} to ${attendee.address}: ${err.message}`);
-                    }
-                }
-
-                await this.calendarEventRepo!.update(
-                    { uid: event.uid, version: (event as any).version, inviteSequenceSent: event.sequence } as any,
-                    event,
-                    { ignoreACL: true },
-                );
+                await this.sendToAttendees(event, ics, "request");
             } catch (err: any) {
                 this.logger?.warn(`MeetingSchedulingJob: failed to process invites for event ${event.uid}: ${err.message}`);
             }
         }
     }
 
-    private async sendCancellations(): Promise<void> {
+    private async sendCancellations(ownAddresses: Map<string, Set<string>>): Promise<void> {
         // `find()` has no `includeDeleted` option (unlike `findOne()`) - a soft-deleted row is only ever
         // returned by explicitly querying `{ deleted: true }`, which `ModelUtils.buildSearchQuery()` honors
         // as a literal filter value rather than "include deleted rows too." So this runs two separate
@@ -192,27 +239,35 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                 // Same "client's own responsibility" reasoning as `sendInvites()` above - an encrypted
                 // event's CANCEL is never composed/sent by this job either.
                 const isClientManagedEncrypted = event.encryptionOrigin === "originated";
-                if (!isRedundantOccurrenceCancel && !isClientManagedEncrypted) {
-                    const ics = buildEventIcs(event, "CANCEL");
-                    for (const attendee of event.attendees) {
-                        if (attendee.address.toLowerCase() === event.organizer.address.toLowerCase()) {
-                            continue;
-                        }
-                        try {
-                            await this.sendItipMail(event, ics, "cancel", attendee.address);
-                        } catch (err: any) {
-                            this.logger?.warn(`MeetingSchedulingJob: failed to send cancellation for event ${event.uid} to ${attendee.address}: ${err.message}`);
-                        }
-                    }
+                const isOrganizerCopy: boolean = await this.isOrganizerCopy(event, ownAddresses);
+
+                // Claim first, same as `sendInvites()`.
+                if (!(await this.claim(event, { cancelNoticeSentAt: new Date() }))) {
+                    continue;
                 }
 
-                await this.calendarEventRepo!.update(
-                    { uid: event.uid, version: (event as any).version, cancelNoticeSentAt: new Date() } as any,
-                    event,
-                    { ignoreACL: true },
-                );
+                if (!isRedundantOccurrenceCancel && !isClientManagedEncrypted && isOrganizerCopy) {
+                    const ics = buildEventIcs(event, "CANCEL");
+                    await this.sendToAttendees(event, ics, "cancel");
+                }
             } catch (err: any) {
                 this.logger?.warn(`MeetingSchedulingJob: failed to process cancellation for event ${event.uid}: ${err.message}`);
+            }
+        }
+    }
+
+    /** Sends `ics` to every attendee except the organizer. A failure for one attendee is logged and the rest
+     * still go out (see this class's doc comment for why the row stays claimed). */
+    private async sendToAttendees(event: CE, ics: string, method: "request" | "cancel"): Promise<void> {
+        for (const attendee of event.attendees) {
+            if (!attendee?.address || attendee.address.toLowerCase() === event.organizer.address.toLowerCase()) {
+                continue;
+            }
+            try {
+                await this.sendItipMail(event, ics, method, attendee.address);
+            } catch (err: any) {
+                const what = method === "cancel" ? "cancellation" : "invite";
+                this.logger?.warn(`MeetingSchedulingJob: failed to send ${what} for event ${event.uid} to ${attendee.address}: ${err.message}`);
             }
         }
     }
@@ -229,6 +284,6 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
             .compile()
             .build();
 
-        await this.mailTransport!.send({ raw: composed, envelopeFrom: event.organizer.address, envelopeTo: [to] });
+        await sendOrThrow(this.mailTransport!, { raw: composed, envelopeFrom: event.organizer.address, envelopeTo: [to] });
     }
 }

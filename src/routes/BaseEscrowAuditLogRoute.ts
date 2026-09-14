@@ -18,6 +18,9 @@ import { findHeldScopeIds } from "../util/EscrowUtils.js";
 import { EscrowAuditLogEntry, Matter } from "../models/types.js";
 const { Before, Delete, Get, Param, Post, Put, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
+/** Page size for reading every matter under a holder's scopes - see `resolveVisibleMatterIds()`. */
+const MATTER_PAGE_SIZE = 500;
+
 /**
  * Extends the standard `CRUDRoute` CRUD scaffolding for `EscrowAuditLogEntry` with read-only,
  * holder-or-trusted-admin access - `find`/`count`/`findById` are overridden below with no
@@ -26,7 +29,7 @@ const { Before, Delete, Get, Param, Post, Put, Query, Request, RequiresTrustedRo
  * unfiltered visibility (independent oversight of holders, mirroring `BaseAuditLogRoute`'s own
  * admin-readable precedent); a holder sees only entries for matters under scopes they hold.
  *
- * `create`/`update`/`delete`/`truncate` are overridden to unconditionally reject *every* caller, trusted
+ * `create`/`update`/`updateBulk`/`updateProperty`/`delete`/`truncate` are overridden to unconditionally reject *every* caller, trusted
  * included - identical reasoning to `BaseAuditLogRoute`'s own `rejectWrite()`: an audit trail editable by
  * the people it holds accountable isn't trustworthy. The only writer is `util/EscrowAuditUtils.ts`'s
  * `recordEscrowAuditEntry()`, called directly by `BaseEscrowAccessRequestRoute` with `{ ignoreACL: true }`,
@@ -72,22 +75,52 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
             return [];
         }
         const matterRepo: RepoUtils<Matter> = await this.getMatterRepo();
-        const matters: Matter[] = await matterRepo.find(
-            { escrowScopeId: `in(${heldScopeIds.join(",")})` } as any,
-            { ignoreACL: true },
-        );
-        return matters.map((m) => m.uid);
+        // Every page - a single `find()` stops at the framework's default page size, which would silently hide
+        // the entries of every matter past the first 100 from their own holders.
+        const matterIds: string[] = [];
+        for (let page = 0; ; page++) {
+            const batch: Matter[] = await matterRepo.find(
+                { escrowScopeId: `in(${heldScopeIds.join(",")})`, sort: "uid", limit: MATTER_PAGE_SIZE, page } as any,
+                { ignoreACL: true, limit: MATTER_PAGE_SIZE, page },
+            );
+            matterIds.push(...batch.map((m) => m.uid));
+            if (batch.length < MATTER_PAGE_SIZE) {
+                return matterIds;
+            }
+        }
+    }
+
+    /** The list filter for `find()`/`count()`. For a holder, `matterId` is forced to the matters they may see, so
+     * the client's query loses every `$`-prefixed key (`$or`...) and its own `matterId` first: the SQL backend
+     * composes a `$or` branch's keys over the other filters, which would replace the forced `matterId`. */
+    private buildFilter(query: any, params: any, visibleMatterIds: string[] | undefined): any {
+        if (!visibleMatterIds) {
+            return { ...query, ...params };
+        }
+        const filter: any = {};
+        for (const [key, value] of Object.entries(query ?? {})) {
+            if (!key.startsWith("$") && key !== "matterId") {
+                filter[key] = value;
+            }
+        }
+        return { ...filter, ...params, matterId: `in(${visibleMatterIds.join(",")})` };
+    }
+
+    /** Narrows a holder's visible matters to the client's own plain `?matterId=` filter, when one is given. */
+    private async resolveFilterMatterIds(query: any, user: JWTUser | undefined): Promise<string[] | undefined> {
+        const visibleMatterIds: string[] | undefined = await this.resolveVisibleMatterIds(user);
+        if (visibleMatterIds && typeof query?.matterId === "string") {
+            return visibleMatterIds.filter((uid) => uid === query.matterId);
+        }
+        return visibleMatterIds;
     }
 
     public async find(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<T[]> {
-        const visibleMatterIds: string[] | undefined = await this.resolveVisibleMatterIds(user);
+        const visibleMatterIds: string[] | undefined = await this.resolveFilterMatterIds(query, user);
         if (visibleMatterIds && visibleMatterIds.length === 0) {
             return [];
         }
-        const filter: any = { ...query, ...params };
-        if (visibleMatterIds) {
-            filter.matterId = `in(${visibleMatterIds.join(",")})`;
-        }
+        const filter: any = this.buildFilter(query, params, visibleMatterIds);
         return await this.repoUtils!.find(
             filter,
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
@@ -100,14 +133,11 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
         @Response res: HttpResponse,
         @AuthUser user?: JWTUser,
     ): Promise<any> {
-        const visibleMatterIds: string[] | undefined = await this.resolveVisibleMatterIds(user);
+        const visibleMatterIds: string[] | undefined = await this.resolveFilterMatterIds(query, user);
         if (visibleMatterIds && visibleMatterIds.length === 0) {
             return res.status(200).setHeader("content-length", 0);
         }
-        const filter: any = { ...query, ...params };
-        if (visibleMatterIds) {
-            filter.matterId = `in(${visibleMatterIds.join(",")})`;
-        }
+        const filter: any = this.buildFilter(query, params, visibleMatterIds);
         const result: number = await this.repoUtils!.count(
             filter,
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
@@ -166,6 +196,26 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
         @Param("id") id: string,
         obj: UpdateObject<T>,
         @Request req: HttpRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<T> {
+        return this.rejectWrite();
+    }
+
+    /** `CRUDRoute`'s own `PUT /` would otherwise reach `doBulkUpdate()` directly, where a trusted admin passes the
+     * class ACL and could rewrite entries (hashes included) without ever going through `update()` above. */
+    @Put()
+    @Before("rejectWrite")
+    public async updateBulk(obj: UpdateObject<T>[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
+        return this.rejectWrite();
+    }
+
+    /** Same as `updateBulk()`, for `CRUDRoute`'s `PUT /:id/:property`. */
+    @Put(":id/:property")
+    @Before("rejectWrite")
+    public async updateProperty(
+        @Param("id") id: string,
+        @Param("property") propertyName: string,
+        obj: any,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
         return this.rejectWrite();

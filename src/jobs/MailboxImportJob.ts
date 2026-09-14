@@ -5,6 +5,7 @@
 import * as crypto from "crypto";
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline, ScanPipelineResult } from "../scan/ScanPipeline.js";
 import { deriveConversationId } from "../util/ConversationUtils.js";
@@ -25,6 +26,23 @@ import {
 } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
+/** Thrown by `persistImportedMessage()` when importing one more message would exceed the target mailbox's
+ * quota - stops the whole import (see `MailboxImportJob.processRequest()`). */
+class MailboxQuotaExceededError extends Error {}
+
+/** Tracks the target mailbox's quota across one import run. `quotaBytes <= 0` means unlimited (the model
+ * default of `0` is an unprovisioned quota, not a zero-byte mailbox). */
+interface ImportQuota {
+    quotaBytes: number;
+    usedBytes: number;
+}
+
+/** The lease a running attempt holds on its request row - see `DataExportJob`'s identical scheme. */
+interface ImportLease<MIR> {
+    held: MIR;
+    renewedAt: number;
+}
+
 /**
  * Processes pending `MailboxImportRequest` rows (see that entity's own doc comment) - the portability
  * counterpart to `DataExportJob`, mirroring its single-page-per-run shape. A PST/Mbox file can hold
@@ -42,10 +60,26 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * `ScanPipeline` (parsing + AV/spam scanning) both `ScanQueueJob` and `BaseMessageRoute` already depend on -
  * every imported message is still AV-scanned (a historical PST/Mbox is as plausible a malware vector as
  * live mail) and an AV-`INFECTED` verdict on the raw message OR any individual attachment causes that one
- * item to be skipped and counted in `failedCount`, never persisted. Spam scoring runs too (`ScanPipeline.
+ * item to be skipped and counted in `failedCount`, never persisted. An AV-`ERROR` verdict (the scanner itself
+ * failed, e.g. an engine outage) is treated exactly the same way - the item was never actually scanned, so it
+ * must not be imported as if clean (the same fail-closed reading `ScanPipeline.resolveDeliveryVerdict()`
+ * gives live mail, which quarantines on `ERROR`). Spam scoring runs too (`ScanPipeline.
  * run()` always computes both together) but its result is deliberately ignored - imported mail is filed to
  * the caller's chosen folder, never junk-routed, matching this plan's own "not inbound mail in the ordinary
  * sense" scope note.
+ *
+ * **Quota.** The target mailbox's `quotaBytes` is enforced before each message is stored (counting the raw
+ * message plus its attachments, the same formula `MailboxQuotaRecalcJob` uses, on top of the mailbox's
+ * `usedBytes` at the start of the run); a `quotaBytes` of `0` means unlimited. Once the next message would
+ * exceed it, the import stops and the request is marked `"failed"` with a quota error, keeping the
+ * `importedCount`/`failedCount` of what was already imported (those messages stay).
+ *
+ * **Lease/reclaim.** Same scheme as `DataExportJob` (see its doc comment): the claim bumps
+ * `processingAttempts` and starts a lease on the row's `dateModified`, renewed while importing; a
+ * `"processing"` row whose lease is older than `lease_minutes` is reclaimed to `"pending"` (or `"failed"`
+ * after `max_attempts`) by a version-checked update. A retried attempt skips any message whose `Message-ID`
+ * already exists in the target folder, so messages a dead attempt had already persisted aren't duplicated
+ * (a message with no `Message-ID` header can't be matched and may be imported again).
  *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`MailboxImportJobMongo`/
  * `MailboxImportJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob`/
@@ -82,6 +116,16 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     // One uploaded file per run - see this class's own doc comment for why (unlike `DataExportJob`'s 10).
     @Config("mail:jobs:mailbox_import:batch_size", 1)
     private batchSize: number = 1;
+
+    /** How long a request may sit in `"processing"` without its lease being renewed before it is presumed
+     * abandoned and reclaimed - longer than `DataExportJob`'s, since one PST parse is a single synchronous
+     * step that can't renew the lease while it runs. */
+    @Config("mail:jobs:mailbox_import:lease_minutes", 120)
+    private leaseMinutes: number = 120;
+
+    /** How many claims a request gets before an abandoned `"processing"` row is marked `"failed"`. */
+    @Config("mail:jobs:mailbox_import:max_attempts", 3)
+    private maxAttempts: number = 3;
 
     /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
     @Config()
@@ -131,6 +175,8 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             return;
         }
 
+        await this.reclaimAbandonedRequests();
+
         const pending: MIR[] = await this.requestRepo.find(
             { status: "pending", limit: this.batchSize } as any,
             { ignoreACL: true, limit: this.batchSize },
@@ -146,6 +192,59 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
         }
     }
 
+    private get leaseMs(): number {
+        return this.leaseMinutes * 60_000;
+    }
+
+    /** Reclaims `"processing"` rows whose lease (`dateModified`) expired - see `DataExportJob.
+     * reclaimAbandonedRequests()`'s identical logic. Version-checked, so two replicas can't both reclaim. */
+    private async reclaimAbandonedRequests(): Promise<void> {
+        const cutoff: Date = new Date(Date.now() - this.leaseMs);
+        let abandoned: MIR[];
+        try {
+            abandoned = await this.requestRepo!.find(
+                { status: "processing", dateModified: `lt(${cutoff.toISOString()})`, limit: this.batchSize } as any,
+                { ignoreACL: true, limit: this.batchSize },
+            );
+        } catch (err: any) {
+            this.logger?.warn(`MailboxImportJob: failed to look up abandoned import requests: ${err.message}`);
+            return;
+        }
+        for (const request of abandoned) {
+            // A row claimed before `processingAttempts` existed has had (at least) one attempt.
+            const attempts: number = request.processingAttempts ?? 1;
+            try {
+                if (attempts >= this.maxAttempts) {
+                    this.logger?.warn(`MailboxImportJob: import request ${request.uid} abandoned after ${attempts} attempt(s); marking failed.`);
+                    await this.transitionToFailed(request, `The import did not complete after ${attempts} attempt(s) - processing was interrupted each time.`);
+                } else {
+                    this.logger?.warn(`MailboxImportJob: reclaiming abandoned import request ${request.uid} (attempt ${attempts} of ${this.maxAttempts}).`);
+                    await this.requestRepo!.update(
+                        { uid: request.uid, version: (request as any).version, status: "pending" } as any,
+                        asEntity(this.requestRepo!, request),
+                        { ignoreACL: true },
+                    );
+                }
+            } catch (err: any) {
+                this.logger?.warn(`MailboxImportJob: failed to reclaim abandoned import request ${request.uid}: ${err.message}`);
+            }
+        }
+    }
+
+    /** Renews this attempt's lease once a quarter of the lease period has elapsed - see `DataExportJob.
+     * renewLease()`. Throws (aborting the import) if the lease was lost to a reclaim. */
+    private async renewLease(lease: ImportLease<MIR>): Promise<void> {
+        if (Date.now() - lease.renewedAt < this.leaseMs / 4) {
+            return;
+        }
+        lease.held = await this.requestRepo!.update(
+            { uid: lease.held.uid, version: (lease.held as any).version, status: "processing" } as any,
+            asEntity(this.requestRepo!, lease.held),
+            { ignoreACL: true },
+        );
+        lease.renewedAt = Date.now();
+    }
+
     private async processRequest(request: MIR): Promise<void> {
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(request.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
@@ -158,31 +257,49 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             return;
         }
 
-        // Every failure path below must mark against `processing`'s own version, never `request`'s - this
+        // Every failure path below must mark against the lease's own held version, never `request`'s - this
         // very update has already bumped the persisted row's version, so `request`'s own is now stale. The
         // same "re-fetch before the next optimistic-locked update" discipline `ScanQueueJob.processEntry()`
         // already documents for its identical shape (there, the `scanning` variable plays this same role).
-        const processing: MIR = await this.requestRepo!.update(
-            { uid: request.uid, version: (request as any).version, status: "processing" } as any,
-            request,
-            { ignoreACL: true },
-        );
+        const attempt: number = (request.processingAttempts ?? 0) + 1;
+        const lease: ImportLease<MIR> = {
+            held: await this.requestRepo!.update(
+                { uid: request.uid, version: (request as any).version, status: "processing", processingAttempts: attempt } as any,
+                asEntity(this.requestRepo!, request),
+                { ignoreACL: true },
+            ),
+            renewedAt: Date.now(),
+        };
+        const processing: MIR = lease.held;
 
         try {
             const source: Buffer = await this.blobStore!.get(processing.sourceBlobKey);
             const rawMessages: Buffer[] = processing.format === "mbox" ? parseMbox(source) : await extractPstMessages(source);
 
+            const quota: ImportQuota = { quotaBytes: mailbox.quotaBytes ?? 0, usedBytes: mailbox.usedBytes ?? 0 };
             let importedCount = 0;
             let failedCount = 0;
+            let quotaError: string | undefined;
             for (const raw of rawMessages) {
+                // Deliberately outside the per-message try/catch below: a lost lease must abort the whole run.
+                await this.renewLease(lease);
                 try {
-                    const persisted: boolean = await this.persistImportedMessage(raw, mailbox, folder);
+                    if (attempt > 1 && (await this.alreadyImported(raw, folder))) {
+                        // Persisted by an earlier attempt that died before completing - see this class's doc comment.
+                        importedCount++;
+                        continue;
+                    }
+                    const persisted: boolean = await this.persistImportedMessage(raw, mailbox, folder, quota);
                     if (persisted) {
                         importedCount++;
                     } else {
                         failedCount++;
                     }
                 } catch (err: any) {
+                    if (err instanceof MailboxQuotaExceededError) {
+                        quotaError = err.message;
+                        break;
+                    }
                     this.logger?.warn(`MailboxImportJob: failed to import one message for request ${processing.uid}: ${err.message}`);
                     failedCount++;
                 }
@@ -194,7 +311,8 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             // concurrently delivered into the same folder by ScanQueueJob, a realistic race during a live
             // mailbox migration - must not turn a fully-successful import into a reported "failed" one. A
             // caller trusting that status would otherwise be invited to re-run the same import against the
-            // same source file, duplicating every message (no dedup on messageId/source exists for imports).
+            // same source file, duplicating every message (a fresh request gets no Message-ID dedup - only a
+            // reclaimed retry of the SAME request does).
             if (importedCount > 0) {
                 try {
                     const currentFolder: F | undefined = await this.folderRepo!.findOne(folder.uid, { ignoreACL: true });
@@ -206,7 +324,7 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                                 totalCount: currentFolder.totalCount + importedCount,
                                 syncKeyVersion: currentFolder.syncKeyVersion + 1,
                             } as any,
-                            currentFolder,
+                            asEntity(this.folderRepo!, currentFolder),
                             { ignoreACL: true },
                         );
                     }
@@ -217,47 +335,81 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                 }
             }
 
-            const refetched: MIR = (await this.requestRepo!.findOne(processing.uid, { ignoreACL: true }))!;
+            // Version-checked against the lease this run still holds (renewed while importing), deliberately
+            // NOT a re-fetch: if this attempt's lease expired and another replica reclaimed the request, this
+            // update must lose rather than overwrite the newer attempt's status.
             const updated: MIR = await this.requestRepo!.update(
-                { uid: refetched.uid, version: (refetched as any).version, status: "completed", importedCount, failedCount } as any,
-                refetched,
+                {
+                    uid: lease.held.uid,
+                    version: (lease.held as any).version,
+                    status: quotaError ? "failed" : "completed",
+                    importedCount,
+                    failedCount,
+                    ...(quotaError ? { errorMessage: quotaError } : {}),
+                } as any,
+                asEntity(this.requestRepo!, lease.held),
                 { ignoreACL: true },
             );
             await recordAuditLog(
                 this._objectFactory!,
                 this.auditLogClass,
                 { config: this.config, logger: this.logger },
-                { action: AuditAction.MAILBOX_IMPORT_COMPLETED, targetType: "MailboxImportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid },
+                {
+                    action: quotaError ? AuditAction.MAILBOX_IMPORT_FAILED : AuditAction.MAILBOX_IMPORT_COMPLETED,
+                    targetType: "MailboxImportRequest",
+                    targetUid: updated.uid,
+                    mailboxUid: updated.mailboxUid,
+                },
             );
         } catch (err: any) {
-            await this.markFailed(processing, err.message);
+            await this.markFailed(lease.held, err.message);
         }
+    }
+
+    /** Whether a message with `raw`'s own `Message-ID` already exists in `folder` - used only on a retried
+     * attempt, to skip what the earlier (abandoned) attempt already persisted. */
+    private async alreadyImported(raw: Buffer, folder: F): Promise<boolean> {
+        const header: string | undefined = extractHeader(raw, "Message-ID");
+        const messageId: string = (header ?? "").trim().replace(/^<|>$/g, "");
+        if (!messageId) {
+            return false;
+        }
+        const existing: M[] = await this.messageRepo!.find({ folderUid: folder.uid, messageId, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+        return existing.length > 0;
     }
 
     private async markFailed(request: MIR, errorMessage: string): Promise<void> {
         try {
-            const updated: MIR = await this.requestRepo!.update(
-                { uid: request.uid, version: (request as any).version, status: "failed", errorMessage } as any,
-                request,
-                { ignoreACL: true },
-            );
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, logger: this.logger },
-                { action: AuditAction.MAILBOX_IMPORT_FAILED, targetType: "MailboxImportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid },
-            );
+            await this.transitionToFailed(request, errorMessage);
         } catch (err: any) {
             this.logger?.error(`MailboxImportJob: failed to mark import request ${request.uid} as failed: ${err.message}`);
         }
     }
 
+    private async transitionToFailed(request: MIR, errorMessage: string): Promise<void> {
+        const updated: MIR = await this.requestRepo!.update(
+            { uid: request.uid, version: (request as any).version, status: "failed", errorMessage } as any,
+            asEntity(this.requestRepo!, request),
+            { ignoreACL: true },
+        );
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, logger: this.logger },
+            { action: AuditAction.MAILBOX_IMPORT_FAILED, targetType: "MailboxImportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid },
+        );
+    }
+
     /** Persists one already-extracted raw RFC 5322 message as a `Message` (plus any `Attachment` rows) in
      * `folder` - see this class's own doc comment for why this is a new, purpose-built step rather than a
-     * reuse of `ScanQueueJob.deliverMessage()`. Returns `false` (skipped, not thrown) for a raw AV-`INFECTED`
-     * verdict - imported historical malware is a real risk, not a hypothetical this repo need only assert
-     * against. */
-    private async persistImportedMessage(raw: Buffer, mailbox: MB, folder: F): Promise<boolean> {
+     * reuse of `ScanQueueJob.deliverMessage()`. Returns `false` (skipped, not thrown) for an AV-`INFECTED` or
+     * AV-`ERROR` verdict - imported historical malware is a real risk, not a hypothetical this repo need only
+     * assert against. Throws `MailboxQuotaExceededError` (before storing anything) when this message would
+     * push the mailbox past `quota`; otherwise adds its size to `quota.usedBytes`. */
+    private async persistImportedMessage(raw: Buffer, mailbox: MB, folder: F, quota: ImportQuota): Promise<boolean> {
+        // Cheap pre-check on the raw size alone, before paying for a scan.
+        this.assertWithinQuota(quota, raw.length);
+
         const result: ScanPipelineResult = await this.scanPipeline!.run(raw, { from: "", to: [] });
         // `result.av` is already the WORST of the raw message's own scan and every attachment's own scan
         // (see `ScanPipelineResult.av`'s own doc comment) - so this one check alone also catches an
@@ -269,6 +421,16 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             this.logger?.warn("MailboxImportJob: skipping an imported message - AV scan flagged it (or an attachment) infected.");
             return false;
         }
+        // The scanner failed, so the message was never actually scanned - fail closed, exactly like INFECTED
+        // (see this class's own doc comment), rather than importing an unscanned item as if it were clean.
+        if (result.av.verdict === AvVerdict.ERROR) {
+            this.logger?.warn("MailboxImportJob: skipping an imported message - AV scan could not complete (scanner error).");
+            return false;
+        }
+
+        // Same size formula `MailboxQuotaRecalcJob` uses: the stored raw body plus every attachment row's size.
+        const messageBytes: number = raw.length + result.attachments.reduce((sum, a) => sum + a.content.length, 0);
+        this.assertWithinQuota(quota, messageBytes);
 
         const bodyBlobKey = `imported/${crypto.randomUUID()}`;
         await this.blobStore!.put(bodyBlobKey, raw, { contentType: "message/rfc822" });
@@ -341,6 +503,15 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             );
         }
 
+        quota.usedBytes += messageBytes;
         return true;
+    }
+
+    private assertWithinQuota(quota: ImportQuota, additionalBytes: number): void {
+        if (quota.quotaBytes > 0 && quota.usedBytes + additionalBytes > quota.quotaBytes) {
+            throw new MailboxQuotaExceededError(
+                `Import stopped: the mailbox quota of ${quota.quotaBytes} bytes would be exceeded by the next message.`,
+            );
+        }
     }
 }

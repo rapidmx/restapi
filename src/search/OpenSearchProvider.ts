@@ -7,11 +7,15 @@ import { importOptional } from "../util/OptionalDeps.js";
 import {
     CandidateQuery,
     CandidateResultPage,
+    MAX_SEARCH_OFFSET,
+    nextSearchCursor,
+    resolveSearchPaging,
     SearchDocument,
     SearchEntityType,
     SearchProvider,
     SearchQuery,
     SearchResultPage,
+    truncateSearchDocumentText,
 } from "./SearchProvider.js";
 const { Config, Init, Logger } = ObjectDecorators;
 
@@ -89,20 +93,40 @@ export class OpenSearchProvider implements SearchProvider {
         await this.client.index({
             index: this.index_,
             id: this.docId(doc.entityType, doc.entityUid),
-            body: doc,
+            body: truncateSearchDocumentText(doc),
             refresh: false,
         });
     }
 
-    public async bulkIndex(docs: SearchDocument[]): Promise<void> {
+    public async bulkIndex(docs: SearchDocument[]): Promise<string[]> {
         if (docs.length === 0) {
-            return;
+            return [];
         }
         const body: any[] = docs.flatMap((doc) => [
             { index: { _index: this.index_, _id: this.docId(doc.entityType, doc.entityUid) } },
-            doc,
+            truncateSearchDocumentText(doc),
         ]);
-        await this.client.bulk({ body });
+        const response = await this.client.bulk({ body });
+
+        // The `_bulk` API responds 200 even when individual items fail, flagging that only via a top-level
+        // `errors: true` plus a per-item `error` - so success must be read per item, in request order, rather
+        // than inferred from the call resolving.
+        const result: any = response?.body ?? response;
+        if (!result?.errors) {
+            return docs.map((doc) => doc.entityUid);
+        }
+        const items: any[] = Array.isArray(result.items) ? result.items : [];
+        const indexed: string[] = [];
+        docs.forEach((doc, i) => {
+            const item: any = items[i] ? (items[i].index ?? Object.values(items[i])[0]) : undefined;
+            if (item && !item.error && (item.status === undefined || item.status < 300)) {
+                indexed.push(doc.entityUid);
+            } else {
+                const reason: string = item?.error ? (item.error.reason ?? item.error.type ?? JSON.stringify(item.error)) : "no bulk response item";
+                this.logger?.warn(`OpenSearchProvider: failed to index ${doc.entityType} ${doc.entityUid}: ${reason}`);
+            }
+        });
+        return indexed;
     }
 
     public async remove(entityType: SearchEntityType, entityUid: string): Promise<void> {
@@ -156,8 +180,10 @@ export class OpenSearchProvider implements SearchProvider {
     }
 
     public async search(query: SearchQuery): Promise<SearchResultPage> {
-        const limit: number = Math.min(query.limit ?? 25, 200);
-        const from: number = query.cursor ? Math.max(0, parseInt(query.cursor, 10) || 0) : 0;
+        const { limit, offset: from } = resolveSearchPaging(query.limit, query.cursor);
+        // `from + size` must stay within OpenSearch's default `max_result_window` (10,000), or the request is
+        // rejected outright - near that ceiling, fetch fewer rows rather than erroring.
+        const size: number = Math.max(0, Math.min(limit + 1, MAX_SEARCH_OFFSET - from));
 
         const filter: any[] = this.structuredFilter(
             query.mailboxUid,
@@ -208,7 +234,7 @@ export class OpenSearchProvider implements SearchProvider {
                 highlight: { fields: { subject: {}, body: {}, attachmentText: {} } },
                 sort: query.text || query.subject ? undefined : [{ dateForSort: "desc" }],
                 from,
-                size: limit + 1,
+                size,
             },
         });
 
@@ -224,13 +250,15 @@ export class OpenSearchProvider implements SearchProvider {
                 snippet: hit.highlight ? Object.values(hit.highlight).flat().join(" … ") : undefined,
                 metadataOnly: hit._source.metadataOnly,
             })),
-            nextCursor: hasMore ? String(from + limit) : undefined,
+            nextCursor: nextSearchCursor(hasMore, from, limit),
         };
     }
 
     public async candidates(query: CandidateQuery): Promise<CandidateResultPage> {
-        const limit: number = Math.min(query.limit ?? 25, 200);
-        const from: number = query.cursor ? Math.max(0, parseInt(query.cursor, 10) || 0) : 0;
+        const { limit, offset: from } = resolveSearchPaging(query.limit, query.cursor);
+        // `from + size` must stay within OpenSearch's default `max_result_window` (10,000), or the request is
+        // rejected outright - near that ceiling, fetch fewer rows rather than erroring.
+        const size: number = Math.max(0, Math.min(limit + 1, MAX_SEARCH_OFFSET - from));
 
         const filter: any[] = this.structuredFilter(
             query.mailboxUid,
@@ -256,7 +284,7 @@ export class OpenSearchProvider implements SearchProvider {
                 query: { bool: { must, filter } },
                 sort: [{ dateForSort: "desc" }],
                 from,
-                size: limit + 1,
+                size,
             },
         });
 
@@ -266,7 +294,7 @@ export class OpenSearchProvider implements SearchProvider {
 
         return {
             candidates: page.map((hit) => ({ entityType: hit._source.entityType, entityUid: hit._source.entityUid })),
-            nextCursor: hasMore ? String(from + limit) : undefined,
+            nextCursor: nextSearchCursor(hasMore, from, limit),
         };
     }
 }

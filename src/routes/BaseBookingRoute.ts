@@ -10,12 +10,16 @@ import {
     ApiErrors,
     DatabaseDecorators,
     DocDecorators,
+    HttpRequest,
+    NetUtils,
     ObjectFactory,
+    RateLimiter,
     RepoUtils,
     RouteDecorators,
 } from "@rapidrest/service-core";
 import type { MailTransport } from "../transport/MailTransport.js";
 import { generateCandidateSlots, normalizeSlug, subtractBusy } from "../util/BookingUtils.js";
+import { coerceCalendarEventDates } from "../util/DateCoercionUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { computeBusyWindows } from "../util/FreeBusyUtils.js";
 import { buildEventIcs, convertLocalToUtc, type OccurrenceWindow } from "../util/IcsUtils.js";
@@ -36,10 +40,23 @@ import {
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Description, Summary } = DocDecorators;
 const { Transactional } = DatabaseDecorators;
-const { Get, Param, Post, Query, RateLimit, Validate } = RouteDecorators;
+const { Get, Param, Post, Query, RateLimit, Request, Validate } = RouteDecorators;
 
-/** Caps how many `CalendarEvent` rows any one availability lookup will pull back per query. */
-const BUSY_EVENT_ROWS_LIMIT = 500;
+/** The page size each availability busy-time query pages through its matches with - every page is read (see
+ * `findAllEvents()`), so this bounds the size of one round trip, not how many events are considered. */
+const BUSY_EVENT_PAGE_SIZE = 500;
+
+/** The exact shape `persistBooking()` mints a `manageToken` in: 32 random bytes, base64url without padding. A
+ * token outside this shape can never match a booking, and is rejected before it gets anywhere near a query - the
+ * query DSL parses `op(value)` in any value, so an unchecked `like(*)` would otherwise match any booking. */
+const MANAGE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+/** Upper bounds on the free-text fields an anonymous booker supplies - they are stored on the booking, copied
+ * into the host's calendar event and mailed back out, so they must not be unbounded. */
+const MAX_BOOKER_NAME_LENGTH = 200;
+const MAX_BOOKER_EMAIL_LENGTH = 254;
+const MAX_BOOKER_NOTES_LENGTH = 2000;
+const MAX_BOOKER_TIMEZONE_LENGTH = 64;
 
 /** The default number of days of availability returned when the caller supplies no `to`. Further constrained
  * by the booking type's own `bookingWindowDays`, which `generateCandidateSlots()` applies. */
@@ -119,9 +136,11 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@.]+\.[^\s@]+$/;
  *
  * ## Rate limiting
  *
- * The three mutating endpoints carry `@RateLimit()`. That decorator keys its primary counter on
- * `` `${method} ${path}` `` - which, because the path embeds the slug, works out to a per-booking-type limit -
- * plus an independent, more permissive per-source-IP counter. The read endpoints deliberately do NOT carry it:
+ * `cancel()`/`reschedule()` carry `@RateLimit()`, which keys its primary counter on `` `${method} ${path}` `` -
+ * the path embeds the manage token, so that is a per-booking limit - plus an independent, more permissive
+ * per-source-IP counter. `book()` does NOT use the decorator: keyed per booking type, one client could exhaust
+ * a link's counter and lock every other booker out of it, so it checks the same limiter itself, keyed per source
+ * IP *and* booking type (`checkBookingRateLimit()`). The read endpoints deliberately do NOT carry it:
  * limits come from one shared `rateLimit` config block whose defaults (5 attempts / 5 minutes) are tuned for
  * credential endpoints, and applying that to a public availability page would throttle a single visitor simply
  * paging through a few weeks. A deployment exposing these routes should raise `rateLimit.maxAttempts` to suit
@@ -168,6 +187,12 @@ export abstract class BaseBookingRoute<
 
     @Inject("MailTransport")
     private mailTransport?: MailTransport;
+
+    @Inject(RateLimiter)
+    private rateLimiter?: RateLimiter;
+
+    @Config("trusted_proxies", [])
+    private trustedProxies: string[] = [];
 
     /** The externally reachable base URL this route is mounted at, used to build the manage link mailed to the
      * booker. Same single-value-config pattern as `mail:auth_server_url`; when unset the confirmation simply
@@ -235,7 +260,10 @@ export abstract class BaseBookingRoute<
     }
 
     private async requireBookingByToken(token: string): Promise<B> {
-        const matches: B[] = await this.bookingRepo!.find({ manageToken: token ?? "" } as any, { ignoreACL: true, limit: 1 });
+        if (typeof token !== "string" || !MANAGE_TOKEN_PATTERN.test(token)) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        const matches: B[] = await this.bookingRepo!.find({ manageToken: `eq(${token})` } as any, { ignoreACL: true, limit: 1 });
         if (matches.length === 0) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
@@ -293,34 +321,79 @@ export abstract class BaseBookingRoute<
      * Recurring rows are a small minority of any real calendar, so queries 2 and 3 stay cheap while query 1
      * carries the volume. Results are de-duplicated by `uid`, since a row can legitimately match more than one.
      */
-    private async findBusyEvents(folderUid: string, windowStart: Date, windowEnd: Date): Promise<CE[]> {
+    private async findBusyEvents(folderUids: string[], windowStart: Date, windowEnd: Date): Promise<CE[]> {
+        const folderUid: string = folderUids.length === 1 ? folderUids[0] : `in(${folderUids.join(",")})`;
         const [overlapping, masters, overrides] = await Promise.all([
-            this.calendarEventRepo!.find(
-                {
-                    folderUid,
-                    startDate: `lt(${windowEnd.toISOString()})`,
-                    endDate: `gt(${windowStart.toISOString()})`,
-                    status: `ne(${CalendarEventStatus.CANCELLED})`,
-                    busyStatus: `ne(${BusyStatus.FREE})`,
-                    limit: BUSY_EVENT_ROWS_LIMIT,
-                } as any,
-                { ignoreACL: true, limit: BUSY_EVENT_ROWS_LIMIT },
-            ),
-            this.calendarEventRepo!.find({ folderUid, recurrenceRule: "ne(null)", limit: BUSY_EVENT_ROWS_LIMIT } as any, {
-                ignoreACL: true,
-                limit: BUSY_EVENT_ROWS_LIMIT,
+            this.findAllEvents({
+                folderUid,
+                startDate: `lt(${windowEnd.toISOString()})`,
+                endDate: `gt(${windowStart.toISOString()})`,
+                status: `ne(${CalendarEventStatus.CANCELLED})`,
+                busyStatus: `ne(${BusyStatus.FREE})`,
             }),
-            this.calendarEventRepo!.find({ folderUid, recurrenceId: "ne(null)", limit: BUSY_EVENT_ROWS_LIMIT } as any, {
-                ignoreACL: true,
-                limit: BUSY_EVENT_ROWS_LIMIT,
-            }),
+            this.findAllEvents({ folderUid, recurrenceRule: "ne(null)" }),
+            this.findAllEvents({ folderUid, recurrenceId: "ne(null)" }),
         ]);
 
         const byUid: Map<string, CE> = new Map();
         for (const event of [...overlapping, ...masters, ...overrides]) {
-            byUid.set(event.uid, event);
+            // Rows written by an older web client can hold ISO strings rather than real dates (MongoDB stores the
+            // raw JSON value) - `computeBusyWindows()` does date arithmetic on these fields.
+            byUid.set(event.uid, coerceCalendarEventDates(event, { lenient: true }));
         }
         return [...byUid.values()];
+    }
+
+    /** Reads every page of `criteria`'s matches, sorted by `uid` so paging is stable - a single page would
+     * silently drop busy time on a busy calendar, offering slots the host isn't actually free for. */
+    private async findAllEvents(criteria: Record<string, any>): Promise<CE[]> {
+        const all: CE[] = [];
+        for (let page = 0; ; page++) {
+            const batch: CE[] = await this.calendarEventRepo!.find(
+                { ...criteria, sort: "uid", limit: BUSY_EVENT_PAGE_SIZE, page } as any,
+                { ignoreACL: true, limit: BUSY_EVENT_PAGE_SIZE, page },
+            );
+            all.push(...batch);
+            if (batch.length < BUSY_EVENT_PAGE_SIZE) {
+                return all;
+            }
+        }
+    }
+
+    /** `true` when `folder` is a live calendar folder of the booking type's own mailbox. */
+    private isUsableCalendarFolder(folder: F | undefined, bookingType: BT): folder is F {
+        return !!folder && folder.mailboxUid === bookingType.mailboxUid && folder.type === FolderType.CALENDAR && !(folder as any).deleted;
+    }
+
+    /**
+     * The folder a new booking's event is written into: the booking type's own `calendarFolderUid` when it is
+     * still a calendar folder of the same mailbox (`BaseBookingTypeRoute` enforces that on write, but the folder
+     * can be deleted or moved afterwards), otherwise the mailbox's well-known calendar folder, created if needed.
+     */
+    private async resolveBookingFolder(bookingType: BT): Promise<F> {
+        const configured: F | undefined = await this.folderRepo!.findOne(bookingType.calendarFolderUid, { ignoreACL: true });
+        if (this.isUsableCalendarFolder(configured, bookingType)) {
+            return configured;
+        }
+        return await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, bookingType.mailboxUid, FolderType.CALENDAR);
+    }
+
+    /**
+     * The folders whose events count as the host's busy time: the booking type's `calendarFolderUid` (where
+     * bookings are written) plus the mailbox's well-known calendar folder, if it has one. The latter is where
+     * bookings were written before they went into `calendarFolderUid`, and where a fallback booking lands (see
+     * `resolveBookingFolder()`), so leaving it out would let those bookings be double-booked.
+     */
+    private async busyFolderUids(bookingType: BT): Promise<string[]> {
+        const uids: Set<string> = new Set([bookingType.calendarFolderUid]);
+        const wellKnown: F[] = await this.folderRepo!.find({ mailboxUid: bookingType.mailboxUid, type: FolderType.CALENDAR } as any, {
+            ignoreACL: true,
+            limit: 1,
+        });
+        if (wellKnown.length > 0) {
+            uids.add(wellKnown[0].uid);
+        }
+        return [...uids];
     }
 
     /**
@@ -376,7 +449,7 @@ export abstract class BaseBookingRoute<
 
         const paddedStart: Date = new Date(slot.start.getTime() - bookingType.bufferBeforeMinutes * 60_000);
         const paddedEnd: Date = new Date(slot.end.getTime() + bookingType.bufferAfterMinutes * 60_000);
-        const events: CE[] = (await this.findBusyEvents(bookingType.calendarFolderUid, paddedStart, paddedEnd)).filter(
+        const events: CE[] = (await this.findBusyEvents(await this.busyFolderUids(bookingType), paddedStart, paddedEnd)).filter(
             (event) => event.uid !== excludeEventUid,
         );
         const busy: OccurrenceWindow[] = computeBusyWindows(events, paddedStart, paddedEnd);
@@ -550,7 +623,7 @@ export abstract class BaseBookingRoute<
 
         const busyFrom: Date = new Date(candidates[0].start.getTime() - bookingType.bufferBeforeMinutes * 60_000);
         const busyTo: Date = new Date(candidates[candidates.length - 1].end.getTime() + bookingType.bufferAfterMinutes * 60_000);
-        const events: CE[] = await this.findBusyEvents(bookingType.calendarFolderUid, busyFrom, busyTo);
+        const events: CE[] = await this.findBusyEvents(await this.busyFolderUids(bookingType), busyFrom, busyTo);
         const busy: OccurrenceWindow[] = computeBusyWindows(events, busyFrom, busyTo);
 
         return subtractBusy(candidates, busy, bookingType.bufferBeforeMinutes, bookingType.bufferAfterMinutes);
@@ -560,12 +633,43 @@ export abstract class BaseBookingRoute<
      * checks on the request body only, independent of the `:slug` booking type or slot availability
      * (which need a DB round-trip and stay in `book()` itself as business-rule checks). */
     protected validateBook(body: BookingRequestBody | undefined): void {
-        if (!body?.bookerName?.trim()) {
+        if (typeof body?.bookerName !== "string" || !body.bookerName.trim()) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'bookerName' is required.");
         }
-        if (!body.bookerEmail || !EMAIL_PATTERN.test(body.bookerEmail.trim())) {
+        if (body.bookerName.trim().length > MAX_BOOKER_NAME_LENGTH) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'bookerName' must be at most ${MAX_BOOKER_NAME_LENGTH} characters.`);
+        }
+        if (
+            typeof body.bookerEmail !== "string" ||
+            body.bookerEmail.trim().length > MAX_BOOKER_EMAIL_LENGTH ||
+            !EMAIL_PATTERN.test(body.bookerEmail.trim())
+        ) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'bookerEmail' must be a valid email address.");
         }
+        if (body.bookerNotes != null && (typeof body.bookerNotes !== "string" || body.bookerNotes.length > MAX_BOOKER_NOTES_LENGTH)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'bookerNotes' must be a string of at most ${MAX_BOOKER_NOTES_LENGTH} characters.`);
+        }
+        if (
+            body.bookerTimezone != null &&
+            (typeof body.bookerTimezone !== "string" || body.bookerTimezone.length > MAX_BOOKER_TIMEZONE_LENGTH)
+        ) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                `'bookerTimezone' must be a string of at most ${MAX_BOOKER_TIMEZONE_LENGTH} characters.`,
+            );
+        }
+    }
+
+    /**
+     * Rate limits `book()` per source IP and booking type. `@RateLimit()` can't express that: its counter is keyed
+     * on `METHOD path` alone, i.e. shared by every visitor to one booking link, so a single client could exhaust
+     * it and lock every legitimate booker out of that link. The rate limiter's own independent per-IP counter
+     * still applies on top (`req` is passed through), bounding one source across every booking type.
+     */
+    private async checkBookingRateLimit(slug: string, req: HttpRequest | undefined): Promise<void> {
+        const address: string = (req ? NetUtils.getIPAddress(req, this.trustedProxies) : undefined) ?? "unknown";
+        await this.rateLimiter?.checkAndIncrement(`booking|${address}|${normalizeSlug(slug ?? "")}`, undefined, req);
     }
 
     @Summary("Books an appointment.")
@@ -573,18 +677,22 @@ export abstract class BaseBookingRoute<
         "Books the requested slot, creating a real calendar event on the host's calendar and emailing the " +
             "booker a confirmation containing their manage link. Requires no authentication.",
     )
-    @RateLimit()
     @Post("/types/:slug")
     @Validate("validateBook")
-    public async book(@Param("slug") slug: string, rawBody: BookingRequestBody | undefined): Promise<PublicBooking> {
+    public async book(
+        @Param("slug") slug: string,
+        rawBody: BookingRequestBody | undefined,
+        @Request req?: HttpRequest,
+    ): Promise<PublicBooking> {
         // `validateBook()` (run by `@Validate` before this handler) already guarantees `rawBody` is defined.
         const body: BookingRequestBody = rawBody!;
+        await this.checkBookingRateLimit(slug, req);
         await this.init();
         const bookingType: BT = await this.requireBookingType(slug);
         const start: Date = this.requireDate(body.start, "start");
         const slot: OccurrenceWindow = await this.requireAvailableSlot(bookingType, start, new Date());
 
-        const folder: F = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, bookingType.mailboxUid, FolderType.CALENDAR);
+        const folder: F = await this.resolveBookingFolder(bookingType);
         const mailbox: M | undefined = await this.mailboxRepo!.findOne(bookingType.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);

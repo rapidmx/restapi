@@ -14,4 +14,6 @@ const { Model } = RouteDecorators;
 export class IngestQueueRouteSQL extends BaseScopedChildRoute<IngestQueueEntrySQL> {
     protected readonly repoUtilsClass: any = RepoUtils;
     protected readonly scopeProperty: string = "mailboxUid";
+    /** Entries are produced by ingest; only a trusted caller (ops) may change them. */
+    protected readonly trustedOnlyWrites: boolean = true;
 }

@@ -20,6 +20,7 @@ const { Nullable } = ObjectDecorators;
 @Entity()
 @Description("A GDPR Article 17 (right to erasure) request for one mailbox.")
 @Index("data_subject_erasure_request_mailbox", ["mailboxUid"])
+@Index("data_subject_erasure_request_status", ["status"])
 @Protect(
     {
         uid: "DataSubjectErasureRequest",
@@ -47,7 +48,7 @@ export class DataSubjectErasureRequestSQL extends BaseEntity implements DataSubj
     @Nullable
     public reviewedByUserUid?: string;
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Nullable
     public reason?: string;
 

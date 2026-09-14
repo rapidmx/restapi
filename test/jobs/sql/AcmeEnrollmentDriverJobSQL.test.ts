@@ -213,7 +213,7 @@ describe("AcmeEnrollmentDriverJobSQL Tests (real DB + DI)", () => {
         expect(keyVaults[0].wrappedKeys).toHaveLength(1);
     });
 
-    it("Skips re-installing (idempotent) when the certificate's fingerprint is already on Mailbox.keys.", async () => {
+    it("Installs only the missing KeyVault half (no duplicate Mailbox.keys entry) when the fingerprint is already on Mailbox.keys but not in the KeyVault.", async () => {
         const mailbox = await createMailbox();
         const certificate = await generateSelfSignedCertPem(mailbox.primarySmtpAddress);
         // Pre-install the same certificate directly, simulating a prior tick that installed it but crashed
@@ -248,7 +248,68 @@ describe("AcmeEnrollmentDriverJobSQL Tests (real DB + DI)", () => {
         const updatedMailbox = await mailboxRepo.findOne({ where: { uid: mailbox.uid } });
         expect(updatedMailbox?.keys).toHaveLength(1);
         const keyVault = await keyVaultRepo.findOne({ where: { mailboxUid: mailbox.uid } });
-        expect(keyVault).toBeNull();
+        expect(keyVault?.wrappedKeys).toHaveLength(1);
+        expect(keyVault?.wrappedKeys[0].fingerprint).toBe(fingerprint);
+        expect(FakeDrivenEnrollment.entries.get("e4")!.installed).toBe(true);
+    });
+
+    it("Skips entirely and marks installed when BOTH the KeyVault and Mailbox.keys already hold the certificate.", async () => {
+        const mailbox = await createMailbox();
+        const certificate = await generateSelfSignedCertPem(mailbox.primarySmtpAddress);
+        const { publicKey, fingerprint } = publicKeyFromCertificatePem(certificate, "sign", mailbox.primarySmtpAddress);
+        const mb = await mailboxRepo.findOne({ where: { uid: mailbox.uid } });
+        mb!.keys = [publicKey];
+        await mailboxRepo.save(mb!);
+        await keyVaultRepo.save(
+            new KeyVaultSQL({
+                mailboxUid: mailbox.uid,
+                wrappedKeys: [{ ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM", fingerprint, useType: "sign" } as any],
+                masterKeyWraps: [],
+            }),
+        );
+        FakeDrivenEnrollment.entries.set("e-both", {
+            identity: mailbox.primarySmtpAddress,
+            status: "issued",
+            material: { certificate, wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } },
+            advanceCallCount: 0,
+        });
+
+        await job.run();
+
+        expect(FakeDrivenEnrollment.entries.get("e-both")!.installed).toBe(true);
+        expect((await keyVaultRepo.findOne({ where: { mailboxUid: mailbox.uid } }))?.wrappedKeys).toHaveLength(1);
+        expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))?.keys).toHaveLength(1);
+    });
+
+    it("Writes the KeyVault before Mailbox.keys - a failure publishing the certificate leaves the private key stored and the enrollment un-installed, and the next run completes it.", async () => {
+        const mailbox = await createMailbox();
+        const certificate = await generateSelfSignedCertPem(mailbox.primarySmtpAddress);
+        FakeDrivenEnrollment.entries.set("e-order", {
+            identity: mailbox.primarySmtpAddress,
+            status: "issued",
+            material: { certificate, wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } },
+            advanceCallCount: 0,
+        });
+        const mailboxRepoUtils: any = (job as any).mailboxRepo;
+        const originalUpdate = mailboxRepoUtils.update;
+        mailboxRepoUtils.update = async () => {
+            throw new Error("simulated mailbox write failure");
+        };
+        try {
+            await job.run();
+        } finally {
+            mailboxRepoUtils.update = originalUpdate;
+        }
+
+        expect(FakeDrivenEnrollment.entries.get("e-order")!.installed).toBeFalsy();
+        expect((await keyVaultRepo.findOne({ where: { mailboxUid: mailbox.uid } }))?.wrappedKeys).toHaveLength(1);
+        expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))?.keys ?? []).toHaveLength(0);
+
+        await job.run();
+
+        expect(FakeDrivenEnrollment.entries.get("e-order")!.installed).toBe(true);
+        expect((await keyVaultRepo.findOne({ where: { mailboxUid: mailbox.uid } }))?.wrappedKeys).toHaveLength(1);
+        expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))?.keys).toHaveLength(1);
     });
 
     it("Installs onto a legacy mailbox row where keys reads back as null instead of an empty array.", async () => {
@@ -320,6 +381,56 @@ describe("AcmeEnrollmentDriverJobSQL Tests (real DB + DI)", () => {
     });
 
     describe("flagExpiringSigningCerts()", () => {
+        it("Records the expiry audit entry only once per certificate across repeated runs, persisting the fingerprint on the KeyVault, and again for a new certificate.", async () => {
+            const soon = (fp: string) => ({ publicKey: "x", type: "x509", useType: "sign" as const, fingerprint: fp, notBefore: Date.now() - 1000, notAfter: Date.now() + 24 * 60 * 60 * 1000 });
+            const mailbox = await createMailbox({ keys: [soon("fp-1")] });
+            await keyVaultRepo.save(new KeyVaultSQL({ mailboxUid: mailbox.uid, wrappedKeys: [], masterKeyWraps: [] }));
+
+            await job.run();
+            await job.run();
+            await job.run();
+
+            let entries = (await auditLogRepo.find({ where: { targetUid: mailbox.uid } })).filter((e) => e.action === AuditAction.SIGNING_CERT_EXPIRING);
+            expect(entries).toHaveLength(1);
+            expect((await keyVaultRepo.findOne({ where: { mailboxUid: mailbox.uid } }))?.expiryAuditedFingerprint).toBe("fp-1");
+
+            const mb = await mailboxRepo.findOne({ where: { uid: mailbox.uid } });
+            mb!.keys = [soon("fp-2")];
+            await mailboxRepo.save(mb!);
+            await job.run();
+            await job.run();
+
+            entries = (await auditLogRepo.find({ where: { targetUid: mailbox.uid } })).filter((e) => e.action === AuditAction.SIGNING_CERT_EXPIRING);
+            expect(entries).toHaveLength(2);
+            expect((await keyVaultRepo.findOne({ where: { mailboxUid: mailbox.uid } }))?.expiryAuditedFingerprint).toBe("fp-2");
+        });
+
+        it("Skips (no audit, no throw) an expiring signing key on a mailbox with no KeyVault to persist the marker on.", async () => {
+            const mailbox = await createMailbox({
+                keys: [{ publicKey: "x", type: "x509", useType: "sign", fingerprint: "abc", notBefore: Date.now() - 1000, notAfter: Date.now() + 24 * 60 * 60 * 1000 }],
+            });
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            expect((await auditLogRepo.find({ where: { targetUid: mailbox.uid } })).filter((e) => e.action === AuditAction.SIGNING_CERT_EXPIRING)).toHaveLength(0);
+        });
+
+        it("Pages through every mailbox, not just the first 100.", async () => {
+            for (let i = 0; i < 105; i++) {
+                await createMailbox();
+            }
+            // Highest possible uid, so it sorts onto the last page.
+            const mailbox = await createMailbox({
+                uid: "ffffffff-ffff-4fff-bfff-ffffffffffff",
+                keys: [{ publicKey: "x", type: "x509", useType: "sign", fingerprint: "last", notBefore: Date.now() - 1000, notAfter: Date.now() + 24 * 60 * 60 * 1000 }],
+            } as any);
+            await keyVaultRepo.save(new KeyVaultSQL({ mailboxUid: mailbox.uid, wrappedKeys: [], masterKeyWraps: [] }));
+
+            await job.run();
+
+            expect((await auditLogRepo.find({ where: { targetUid: mailbox.uid } })).some((e) => e.action === AuditAction.SIGNING_CERT_EXPIRING)).toBe(true);
+        });
+
         it("Flags a mailbox whose newest non-revoked signing key is within the expiry warning window.", async () => {
             const mailbox = await createMailbox({
                 keys: [
@@ -333,6 +444,8 @@ describe("AcmeEnrollmentDriverJobSQL Tests (real DB + DI)", () => {
                     },
                 ],
             });
+
+            await keyVaultRepo.save(new KeyVaultSQL({ mailboxUid: mailbox.uid, wrappedKeys: [], masterKeyWraps: [] }));
 
             await job.run();
 

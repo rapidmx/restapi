@@ -8,15 +8,27 @@ import { ConnectionManager } from "@rapidrest/service-core";
 import {
     CandidateQuery,
     CandidateResultPage,
+    MAX_SEARCH_DOCUMENT_TEXT_CHARS,
+    nextSearchCursor,
+    resolveSearchPaging,
     SearchDocument,
     SearchEntityType,
     SearchProvider,
     SearchQuery,
     SearchResultPage,
+    truncateSearchDocumentText,
 } from "./SearchProvider.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 const TABLE_NAME = "mail_search_index";
+
+/**
+ * The per-document free-text budget for this provider - a quarter of `MAX_SEARCH_DOCUMENT_TEXT_CHARS`, because
+ * Postgres's own `tsvector` type is hard-capped at 1MB and `to_tsvector()` raises an error (failing that
+ * document's insert) rather than truncating when a document's combined vector would exceed it. A worst-case
+ * input of all-distinct short words costs roughly 2x its character count as `tsvector` storage.
+ */
+const POSTGRES_MAX_TEXT_CHARS: number = Math.floor(MAX_SEARCH_DOCUMENT_TEXT_CHARS / 4);
 
 /**
  * `SearchProvider` backed by Postgres's native full-text search (`tsvector`/`to_tsquery` with a GIN index) —
@@ -98,60 +110,76 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
         await this.bulkIndex([doc]);
     }
 
-    public async bulkIndex(docs: SearchDocument[]): Promise<void> {
+    public async bulkIndex(docs: SearchDocument[]): Promise<string[]> {
         if (!this.dataSource || docs.length === 0) {
-            return;
+            return [];
         }
-        for (const doc of docs) {
-            const attachmentText: string = (doc.attachmentText ?? []).join("\n");
-            const participants: string = (doc.participants ?? []).join(" ");
-            await this.dataSource.query(
-                `INSERT INTO ${TABLE_NAME}
-                    (entity_type, entity_uid, mailbox_uid, subject, body, attachment_text, participants,
-                     date_for_sort, search_vector, from_address, to_addresses, cc_addresses, folder_uid,
-                     flags, label_uids, has_attachments, metadata_only)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                    setweight(to_tsvector('english', coalesce($4, '')), 'A') ||
-                    setweight(to_tsvector('english', coalesce($5, '')), 'B') ||
-                    setweight(to_tsvector('english', coalesce($6, '')), 'C') ||
-                    setweight(to_tsvector('english', coalesce($7, '')), 'D'),
-                    $9, $10, $11, $12, $13, $14, $15, $16)
-                 ON CONFLICT (entity_type, entity_uid) DO UPDATE SET
-                    mailbox_uid = EXCLUDED.mailbox_uid,
-                    subject = EXCLUDED.subject,
-                    body = EXCLUDED.body,
-                    attachment_text = EXCLUDED.attachment_text,
-                    participants = EXCLUDED.participants,
-                    date_for_sort = EXCLUDED.date_for_sort,
-                    search_vector = EXCLUDED.search_vector,
-                    from_address = EXCLUDED.from_address,
-                    to_addresses = EXCLUDED.to_addresses,
-                    cc_addresses = EXCLUDED.cc_addresses,
-                    folder_uid = EXCLUDED.folder_uid,
-                    flags = EXCLUDED.flags,
-                    label_uids = EXCLUDED.label_uids,
-                    has_attachments = EXCLUDED.has_attachments,
-                    metadata_only = EXCLUDED.metadata_only`,
-                [
-                    doc.entityType,
-                    doc.entityUid,
-                    doc.mailboxUid,
-                    doc.subject ?? null,
-                    doc.body ?? null,
-                    attachmentText || null,
-                    participants || null,
-                    doc.dateForSort ?? null,
-                    doc.from ?? null,
-                    doc.to ?? null,
-                    doc.cc ?? null,
-                    doc.folderUid ?? null,
-                    doc.flags ?? null,
-                    doc.labels ?? null,
-                    doc.hasAttachments ?? null,
-                    doc.metadataOnly ?? null,
-                ],
-            );
+        const indexed: string[] = [];
+        // Each document is its own autocommitted statement, so one failing insert (e.g. a `tsvector` that
+        // still exceeds Postgres's size limit) is logged and skipped rather than aborting every document after
+        // it in the batch.
+        for (const input of docs) {
+            try {
+                await this.indexOne(truncateSearchDocumentText(input, POSTGRES_MAX_TEXT_CHARS));
+                indexed.push(input.entityUid);
+            } catch (err: any) {
+                this.logger?.warn(
+                    `PostgresFullTextSearchProvider: failed to index ${input.entityType} ${input.entityUid}: ${err?.message}`,
+                );
+            }
         }
+        return indexed;
+    }
+
+    private async indexOne(doc: SearchDocument): Promise<void> {
+        const attachmentText: string = (doc.attachmentText ?? []).join("\n");
+        const participants: string = (doc.participants ?? []).join(" ");
+        await this.dataSource!.query(
+            `INSERT INTO ${TABLE_NAME}
+                (entity_type, entity_uid, mailbox_uid, subject, body, attachment_text, participants,
+                 date_for_sort, search_vector, from_address, to_addresses, cc_addresses, folder_uid,
+                 flags, label_uids, has_attachments, metadata_only)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                setweight(to_tsvector('english', coalesce($4, '')), 'A') ||
+                setweight(to_tsvector('english', coalesce($5, '')), 'B') ||
+                setweight(to_tsvector('english', coalesce($6, '')), 'C') ||
+                setweight(to_tsvector('english', coalesce($7, '')), 'D'),
+                $9, $10, $11, $12, $13, $14, $15, $16)
+             ON CONFLICT (entity_type, entity_uid) DO UPDATE SET
+                mailbox_uid = EXCLUDED.mailbox_uid,
+                subject = EXCLUDED.subject,
+                body = EXCLUDED.body,
+                attachment_text = EXCLUDED.attachment_text,
+                participants = EXCLUDED.participants,
+                date_for_sort = EXCLUDED.date_for_sort,
+                search_vector = EXCLUDED.search_vector,
+                from_address = EXCLUDED.from_address,
+                to_addresses = EXCLUDED.to_addresses,
+                cc_addresses = EXCLUDED.cc_addresses,
+                folder_uid = EXCLUDED.folder_uid,
+                flags = EXCLUDED.flags,
+                label_uids = EXCLUDED.label_uids,
+                has_attachments = EXCLUDED.has_attachments,
+                metadata_only = EXCLUDED.metadata_only`,
+            [
+                doc.entityType,
+                doc.entityUid,
+                doc.mailboxUid,
+                doc.subject ?? null,
+                doc.body ?? null,
+                attachmentText || null,
+                participants || null,
+                doc.dateForSort ?? null,
+                doc.from ?? null,
+                doc.to ?? null,
+                doc.cc ?? null,
+                doc.folderUid ?? null,
+                doc.flags ?? null,
+                doc.labels ?? null,
+                doc.hasAttachments ?? null,
+                doc.metadataOnly ?? null,
+            ],
+        );
     }
 
     public async remove(entityType: SearchEntityType, entityUid: string): Promise<void> {
@@ -174,8 +202,7 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
             return { results: [] };
         }
 
-        const limit: number = Math.min(query.limit ?? 25, 200);
-        const offset: number = query.cursor ? Math.max(0, parseInt(query.cursor, 10) || 0) : 0;
+        const { limit, offset } = resolveSearchPaging(query.limit, query.cursor);
 
         const params: any[] = [query.mailboxUid];
         const conditions: string[] = ["mailbox_uid = $1"];
@@ -258,7 +285,7 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
                 score: Number(row.rank),
                 metadataOnly: row.metadata_only ?? undefined,
             })),
-            nextCursor: hasMore ? String(offset + limit) : undefined,
+            nextCursor: nextSearchCursor(hasMore, offset, limit),
         };
     }
 
@@ -267,8 +294,7 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
             return { candidates: [] };
         }
 
-        const limit: number = Math.min(query.limit ?? 25, 200);
-        const offset: number = query.cursor ? Math.max(0, parseInt(query.cursor, 10) || 0) : 0;
+        const { limit, offset } = resolveSearchPaging(query.limit, query.cursor);
 
         const params: any[] = [query.mailboxUid];
         const conditions: string[] = ["mailbox_uid = $1"];
@@ -324,7 +350,7 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
 
         return {
             candidates: page.map((row) => ({ entityType: row.entity_type, entityUid: row.entity_uid })),
-            nextCursor: hasMore ? String(offset + limit) : undefined,
+            nextCursor: nextSearchCursor(hasMore, offset, limit),
         };
     }
 }

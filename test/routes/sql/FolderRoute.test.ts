@@ -276,10 +276,13 @@ describe("Route:FolderSQL Tests", () => {
         it("An anonymous caller with a token granted `exists` on the folder's own ACL can confirm it exists.", async () => {
             const mailbox = await createMailbox(owner.uid);
             const folder = await createFolder(mailbox.uid);
-            const token = uuid.v4();
-            const acl = await aclRepo.findOne({ where: { uid: folder.uid } });
-            acl!.records = [{ userOrRoleId: token, actions: [ACLAction.EXISTS] }];
-            await aclRepo.save(acl!);
+            // A token only resolves for a real, unexpired link on this very folder - see `BaseFolderRoute.resolveEffectiveUser()`.
+            const link = await request(server.getApplication())
+                .post("/sql/calendar-share-links")
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ folderUid: folder.uid, permittedActions: [ACLAction.EXISTS], createdByUserUid: owner.uid });
+            expect(link.status).toBe(200);
+            const token: string = link.body.token;
 
             const result = await request(server.getApplication()).head(`${baseUrl}/${folder.uid}?shareToken=${token}`);
 

@@ -10,9 +10,10 @@ import { ApiErrorMessages, ApiErrors, HttpResponse, ObjectFactory, RepoUtils, Ro
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
+import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, DataExportFormat, DataExportRequest, Mailbox } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
-const { Get, Param, Post, Response, User: AuthUser } = RouteDecorators;
+const { Get, Param, Post, Query, Response, User: AuthUser } = RouteDecorators;
 
 const VALID_FORMATS: ReadonlySet<string> = new Set<DataExportFormat>(["json", "mbox"]);
 
@@ -137,29 +138,26 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
      * requested an export on an owner's behalf - the owner can still see/download it themselves") is
      * otherwise silently broken for the one entry point meant to let them discover it exists at all. */
     @Get()
-    public async find(@AuthUser user?: JWTUser): Promise<T[]> {
+    public async find(@Query("limit") limitParam: unknown, @Query("page") pageParam: unknown, @AuthUser user?: JWTUser): Promise<T[]> {
         await this.init();
+        // Newest first, `?limit=` (default 100, at most 500) / `?page=` (0-based) - see `util/RequestListUtils.ts`.
+        const { limit, page } = parseListPaging({ limit: limitParam, page: pageParam });
         if (!user) {
             return [];
         }
+        const paging = { sort: "-dateCreated", limit, page };
         if (UserUtils.hasRoles(user, this.trustedRoles)) {
-            return await this.requestRepo!.find({}, { ignoreACL: true });
+            return await this.requestRepo!.find(paging as any, { ignoreACL: true, limit, page });
         }
-        const ownRequests: T[] = await this.requestRepo!.find({ requestedByUserUid: user.uid } as any, { ignoreACL: true });
-        const ownedMailboxes: MB[] = await this.mailboxRepo!.find({ ownerUserUid: user.uid } as any, { ignoreACL: true });
-        if (ownedMailboxes.length === 0) {
-            return ownRequests;
-        }
-        const ownedMailboxUids: string[] = ownedMailboxes.map((m) => m.uid);
-        const requestsForOwnedMailboxes: T[] = await this.requestRepo!.find(
-            { mailboxUid: `in(${ownedMailboxUids.join(",")})` } as any,
-            { ignoreACL: true },
+        // One query (`$or`) rather than two merged lists, so a page is a real page of the combined set.
+        const ownedMailboxUids: string[] = (await this.mailboxRepo!.find({ ownerUserUid: `eq(${user.uid})` } as any, { ignoreACL: true })).map(
+            (m) => m.uid,
         );
-        const byUid = new Map<string, T>();
-        for (const request of [...ownRequests, ...requestsForOwnedMailboxes]) {
-            byUid.set(request.uid, request);
+        const visible: any[] = [{ requestedByUserUid: `eq(${user.uid})` }];
+        if (ownedMailboxUids.length > 0) {
+            visible.push({ mailboxUid: `in(${ownedMailboxUids.join(",")})` });
         }
-        return Array.from(byUid.values());
+        return await this.requestRepo!.find({ $or: visible, ...paging } as any, { ignoreACL: true, limit, page });
     }
 
     @Get("/:id")

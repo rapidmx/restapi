@@ -141,12 +141,20 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
         }
 
         const matter: M = await this.requireHolderMatter(matterId, user);
+        // A closed matter is over - its review authority ends with it, the same as for new escrow access requests
+        // (`BaseEscrowAccessRequestRoute.create()`) and exports (`BaseMatterExportRequestRoute.create()`).
+        if (matter.closedAt) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This matter is closed.");
+        }
 
+        // `new Date()` rather than using the stored values directly: a matter saved on MongoDB before its dates
+        // were coerced on write holds ISO strings (see `util/DateCoercionUtils.ts`).
+        const rangeEnd: Date = new Date(matter.dateRangeEnd);
+        const rangeStart: Date = new Date(matter.dateRangeStart);
         const requestedBefore: Date | undefined = parseDateParam(beforeParam);
         const requestedAfter: Date | undefined = parseDateParam(afterParam);
-        const before: Date = requestedBefore && requestedBefore.getTime() < matter.dateRangeEnd.getTime() ? requestedBefore : matter.dateRangeEnd;
-        const after: Date =
-            requestedAfter && requestedAfter.getTime() > matter.dateRangeStart.getTime() ? requestedAfter : matter.dateRangeStart;
+        const before: Date = requestedBefore && requestedBefore.getTime() < rangeEnd.getTime() ? requestedBefore : rangeEnd;
+        const after: Date = requestedAfter && requestedAfter.getTime() > rangeStart.getTime() ? requestedAfter : rangeStart;
 
         const entityTypes: SearchEntityType[] | undefined = typesParam ? (typesParam.split(",") as SearchEntityType[]) : undefined;
 

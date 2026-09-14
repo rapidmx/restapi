@@ -410,7 +410,7 @@ describe("Route:CalendarShareLinkMongo Tests", () => {
             expect(result.status).toBeLessThan(300);
 
             const acl = await aclRepo.findOne({ uid: folder.uid } as any);
-            const record = acl.records.find((r: ACLRecord) => r.userOrRoleId === result.body.token);
+            const record = acl.records.find((r: ACLRecord) => r.userOrRoleId === `share:${result.body.token}`);
             expect(record).toBeDefined();
             expect(record.actions).toEqual(["read", "freebusy"]);
         });
@@ -428,7 +428,7 @@ describe("Route:CalendarShareLinkMongo Tests", () => {
                 .set("Authorization", "jwt " + ownerToken);
 
             const acl = await aclRepo.findOne({ uid: folder.uid } as any);
-            expect(acl.records.find((r: ACLRecord) => r.userOrRoleId === created.body.token)).toBeUndefined();
+            expect(acl.records.find((r: ACLRecord) => r.userOrRoleId === `share:${created.body.token}`)).toBeUndefined();
         });
 
         it("Updating a share link's folderUid revokes the ACLRecord from the old folder and grants it on the new one.", async () => {
@@ -448,8 +448,8 @@ describe("Route:CalendarShareLinkMongo Tests", () => {
 
             const acl1 = await aclRepo.findOne({ uid: folder1.uid } as any);
             const acl2 = await aclRepo.findOne({ uid: folder2.uid } as any);
-            expect(acl1.records.find((r: ACLRecord) => r.userOrRoleId === created.body.token)).toBeUndefined();
-            expect(acl2.records.find((r: ACLRecord) => r.userOrRoleId === created.body.token)).toBeDefined();
+            expect(acl1.records.find((r: ACLRecord) => r.userOrRoleId === `share:${created.body.token}`)).toBeUndefined();
+            expect(acl2.records.find((r: ACLRecord) => r.userOrRoleId === `share:${created.body.token}`)).toBeDefined();
         });
 
         it("Updating a share link's permittedActions re-grants (upserts) the ACLRecord to match.", async () => {
@@ -466,7 +466,7 @@ describe("Route:CalendarShareLinkMongo Tests", () => {
                 .send({ uid: created.body.uid, version: created.body.version, permittedActions: ["read", "freebusy"] });
 
             const acl = await aclRepo.findOne({ uid: folder.uid } as any);
-            const record = acl.records.find((r: ACLRecord) => r.userOrRoleId === created.body.token);
+            const record = acl.records.find((r: ACLRecord) => r.userOrRoleId === `share:${created.body.token}`);
             expect(record.actions).toEqual(["read", "freebusy"]);
         });
 

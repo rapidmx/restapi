@@ -13,6 +13,7 @@ export * from "./DistributionListMongo.js";
 export * from "./DomainMongo.js";
 export * from "./EncryptionPolicyMongo.js";
 export * from "./EscrowAccessRequestMongo.js";
+export * from "./EscrowAuditHeadMongo.js";
 export * from "./EscrowAuditLogEntryMongo.js";
 export * from "./EscrowScopeMongo.js";
 export * from "./FocusedInboxOverrideMongo.js";

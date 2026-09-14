@@ -84,8 +84,12 @@ export abstract class ExternalShareExpirationJob<S extends CalendarShareLink> ex
 
         for (const link of links) {
             try {
-                await this.calendarShareLinkRepo.delete(link.uid, { ignoreACL: true, purge: true });
+                // Revoke the token's ACL grant BEFORE deleting the row: the row is the only thing that
+                // remembers which token/folder pair needs revoking, so if revocation fails the row must
+                // survive for the next run to retry. Deleting first would leave a live anonymous ACL grant
+                // with nothing left to ever clean it up.
                 await this.revokeShareTokenAccess(link.folderUid, link.token);
+                await this.calendarShareLinkRepo.delete(link.uid, { ignoreACL: true, purge: true });
             } catch (err: any) {
                 this.logger?.warn(`ExternalShareExpirationJob: failed to delete expired share link ${link.uid}: ${err.message}`);
             }
@@ -98,15 +102,19 @@ export abstract class ExternalShareExpirationJob<S extends CalendarShareLink> ex
      * ACL document or no matching record - failing open here keeps a missing/corrupt folder ACL from turning a
      * routine expiration sweep into a failed job run for every OTHER link in the same batch. */
     private async revokeShareTokenAccess(folderUid: string, token: string): Promise<void> {
-        const acl: AccessControlList | undefined = await this.aclUtils?.findACL(folderUid);
+        // `skipCache`, and the filtered records are saved on a copy rather than assigned onto `acl`: `findACL()`
+        // may hand back the cached object itself, so mutating it before a `saveACL()` that then fails would make
+        // the cache claim the grant is already gone - the next run would see "no matching record", skip the
+        // revocation, and delete the share row while the grant still exists in the database.
+        const acl: AccessControlList | undefined = await this.aclUtils?.findACL(folderUid, [], { skipCache: true });
         if (!acl) {
             return;
         }
-        const records = acl.records.filter((record) => record.userOrRoleId !== token);
+        // Grants are keyed `share:<token>` (see `BaseCalendarShareLinkRoute`); the bare token is the pre-prefix form.
+        const records = acl.records.filter((record) => record.userOrRoleId !== `share:${token}` && record.userOrRoleId !== token);
         if (records.length === acl.records.length) {
             return;
         }
-        acl.records = records;
-        await this.aclUtils!.saveACL(acl);
+        await this.aclUtils!.saveACL({ ...acl, records });
     }
 }

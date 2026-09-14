@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
+import sanitizeHtml from "sanitize-html";
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import {
     ApiErrorMessages,
@@ -22,6 +23,33 @@ const { Delete, Get, Post, Put, Request, RequiresTrustedRole, Response, User: Au
 /** The fixed, well-known identifier of the one `Branding` row this route ever reads/writes - there is no
  * list/collection semantics here, exactly one row, created lazily on the first admin write. */
 const BRANDING_UID = "branding";
+
+/** The image types a logo/icon upload may be. Not any `image/*`: an `image/svg+xml` upload is a document that can
+ * carry script, served publicly from this API's own origin. */
+const IMAGE_CONTENT_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/webp", "image/x-icon", "image/vnd.microsoft.icon"];
+
+const STYLESHEET_CONTENT_TYPES: readonly string[] = ["text/css"];
+
+/**
+ * Sanitizes admin-supplied `headerHtml`/`footerHtml`: sanitize-html's default tag set (which has no `script`,
+ * `style`, `iframe`, `object`, `form`...) plus `img`, only `http`/`https`/`mailto` URLs (so no `javascript:` or
+ * `data:`), and no attributes beyond sanitize-html's defaults plus `class`/`style` - in particular no `on*` event
+ * handlers. Disallowed tags are dropped along with their content where sanitize-html does so by default.
+ */
+function sanitizeBrandingHtml(html: string): string {
+    return sanitizeHtml(html, {
+        allowedTags: [...sanitizeHtml.defaults.allowedTags.filter((tag) => tag !== "script" && tag !== "style"), "img"],
+        allowedAttributes: {
+            ...sanitizeHtml.defaults.allowedAttributes,
+            "*": ["class", "style"],
+        },
+        allowedSchemes: ["http", "https", "mailto"],
+        allowedSchemesAppliedToAttributes: ["href", "src", "cite"],
+        allowProtocolRelative: false,
+        allowVulnerableTags: false,
+        disallowedTagsMode: "discard",
+    });
+}
 
 /** The public projection of `Branding` - omits the upload bookkeeping fields (`*BlobKey`/`*ContentType`),
  * which are this route's own internal implementation detail, never something a client needs. Mirrors
@@ -241,6 +269,18 @@ export abstract class BaseBrandingRoute<T extends Branding> {
         delete patch.stylesheetBlobKey;
         delete patch.stylesheetContentType;
 
+        // Sanitized here, once, so every client that renders the chrome gets markup that can't run script -
+        // rather than trusting each of them to sanitize it themselves.
+        for (const field of ["headerHtml", "footerHtml"] as const) {
+            if (patch[field] === undefined || patch[field] === null) {
+                continue;
+            }
+            if (typeof patch[field] !== "string") {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${field}' must be a string.`);
+            }
+            patch[field] = sanitizeBrandingHtml(patch[field]);
+        }
+
         // Setting a URL directly means "use this external asset instead" - clear and best-effort delete
         // whichever self-hosted blob it's replacing, so switching back and forth doesn't orphan storage.
         // `null`, not `undefined`: TypeORM's `Repository.update()` silently drops any key whose value is
@@ -275,7 +315,7 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     @RequiresTrustedRole()
     @Post("/logo")
     public async uploadLogo(@Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<PublicBranding> {
-        return await this.uploadAsset(req, user, "image/", {
+        return await this.uploadAsset(req, user, IMAGE_CONTENT_TYPES, {
             urlField: "logoUrl",
             blobKeyField: "logoBlobKey",
             contentTypeField: "logoContentType",
@@ -298,7 +338,7 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     @RequiresTrustedRole()
     @Post("/icon")
     public async uploadIcon(@Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<PublicBranding> {
-        return await this.uploadAsset(req, user, "image/", {
+        return await this.uploadAsset(req, user, IMAGE_CONTENT_TYPES, {
             urlField: "iconUrl",
             blobKeyField: "iconBlobKey",
             contentTypeField: "iconContentType",
@@ -321,7 +361,7 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     @RequiresTrustedRole()
     @Post("/stylesheet")
     public async uploadStylesheet(@Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<PublicBranding> {
-        return await this.uploadAsset(req, user, "text/css", {
+        return await this.uploadAsset(req, user, STYLESHEET_CONTENT_TYPES, {
             urlField: "stylesheetUrl",
             blobKeyField: "stylesheetBlobKey",
             contentTypeField: "stylesheetContentType",
@@ -342,14 +382,13 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     }
 
     /**
-     * Shared upload logic for both `POST /branding/logo` and `POST /branding/stylesheet`. `requiredContentTypePrefix`
-     * is checked with `startsWith()` so `"image/"` accepts any `image/*` and `"text/css"` requires an exact
-     * match (there is no meaningful `text/css/*` subtype family the way there is for images).
+     * Shared upload logic for the logo, icon and stylesheet uploads. The request's media type must be exactly one
+     * of `allowedContentTypes` - see `IMAGE_CONTENT_TYPES` for why that is a fixed list rather than any `image/*`.
      */
     private async uploadAsset(
         req: HttpRequest,
         user: JWTUser | undefined,
-        requiredContentTypePrefix: string,
+        allowedContentTypes: readonly string[],
         fields: {
             urlField: "logoUrl" | "iconUrl" | "stylesheetUrl";
             blobKeyField: "logoBlobKey" | "iconBlobKey" | "stylesheetBlobKey";
@@ -359,13 +398,10 @@ export abstract class BaseBrandingRoute<T extends Branding> {
         },
     ): Promise<PublicBranding> {
         await this.init();
-        const contentType: string = firstHeader(req, "content-type") ?? "";
-        if (!contentType.startsWith(requiredContentTypePrefix)) {
-            throw new ApiError(
-                ApiErrors.INVALID_REQUEST,
-                400,
-                `Content-Type must be '${requiredContentTypePrefix}${requiredContentTypePrefix.endsWith("/") ? "*" : ""}'.`,
-            );
+        // Only the media type itself, lowercased, is compared and stored - parameters (`; charset=...`) dropped.
+        const contentType: string = (firstHeader(req, "content-type") ?? "").split(";")[0].trim().toLowerCase();
+        if (!allowedContentTypes.includes(contentType)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `Content-Type must be one of: ${allowedContentTypes.join(", ")}.`);
         }
         const raw: Buffer | undefined = req.rawBody;
         if (!raw || raw.length === 0) {
@@ -407,6 +443,10 @@ export abstract class BaseBrandingRoute<T extends Branding> {
         const content: Buffer = await this.blobStore!.get(blobKey);
         res.setHeader("content-type", (existing as any)[contentTypeField] ?? "application/octet-stream");
         res.setHeader("cache-control", "no-cache");
+        // Served from this API's own origin, publicly: never let a browser sniff an asset into something active,
+        // and sandbox it if opened directly - that also neutralizes an SVG uploaded before SVG was refused.
+        res.setHeader("x-content-type-options", "nosniff");
+        res.setHeader("content-security-policy", "sandbox");
         res.send(content);
     }
 

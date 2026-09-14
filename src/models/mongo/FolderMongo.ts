@@ -30,6 +30,7 @@ const { Column, Entity, Index } = PersistenceDecorators;
 )
 @Index("folder_mailbox", ["mailboxUid"])
 @Index("folder_parent", ["parentFolderUid"])
+@Index("folder_mailbox_type", ["mailboxUid", "type"])
 @Protect(
     {
         uid: "Folder",

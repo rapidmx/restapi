@@ -41,6 +41,10 @@ export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CR
 
     @RequiresTrustedRole()
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
+        // Always a server-minted uid, like every other create route (see `BaseScopedChildRoute`'s doc comment).
+        for (const single of Array.isArray(obj) ? obj : [obj]) {
+            delete (single as any).uid;
+        }
         const created: T[] = Array.isArray(obj)
             ? await this.doBulkCreate(obj, { req, user, ignoreACL: true })
             : [await this.doCreateObject(obj, { req, user, ignoreACL: true })];

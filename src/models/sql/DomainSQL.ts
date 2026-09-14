@@ -61,7 +61,7 @@ export class DomainSQL extends BaseEntity implements Domain {
     @Nullable
     public dkimSelector?: string;
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("The base64 public-key portion (the p= value) of that same DKIM key pair.")
     @Nullable
     public dkimPublicKey?: string;

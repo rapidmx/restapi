@@ -22,9 +22,9 @@ import { normalizeAddress } from "../util/AddressUtils.js";
 import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
-import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
+import { findActiveHoldsFor } from "../util/LegalHoldUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
-import { prependHeaders } from "../util/MimeHeaderUtils.js";
+import { extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { buildRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification } from "../util/ReceiptUtils.js";
@@ -65,6 +65,40 @@ export interface ConversationSummary {
     participants: Recipient[];
     /** `true` if any message in the conversation has an attachment. */
     hasAttachments: boolean;
+}
+
+/** `Message` fields only server-side code sets (ingest/scan, send, receipts, recall, indexing, compose). A non-trusted
+ * caller's create/update never sets them - see `BaseScopedChildRoute.serverManagedFields`. The blob keys in particular
+ * would otherwise let a caller point their message at any stored object (another mailbox's body or attachment) and
+ * read it back through `content()`/raw download. `sentDate`/`receivedDate`/`dispositionNotificationTo` are handled
+ * separately in `prepareCreate()`/`prepareUpdate()`. */
+const SERVER_MANAGED_MESSAGE_FIELDS = [
+    "bodyBlobKey",
+    "sanitizedHtmlBlobKey",
+    "encrypted",
+    "scanResultUid",
+    "searchIndexedAt",
+    "recallRequestedAt",
+    "receiptStatus",
+    "readReceiptSentAt",
+    "readReceiptPending",
+    "readReceiptDeclined",
+    "deliveryReceiptSentAt",
+    "deliveryReceiptPending",
+    "deliveryReceiptDeclined",
+] as const;
+
+/** Parses a stored date that may come back as a `Date` or (Mongo) an ISO string; `undefined` if it isn't one. */
+function toValidDate(value: unknown): Date | undefined {
+    const date: Date | undefined =
+        value instanceof Date ? value : typeof value === "string" || typeof value === "number" ? new Date(value) : undefined;
+    return date && !Number.isNaN(date.getTime()) ? date : undefined;
+}
+
+/** The addresses in an RFC 5322 `From` header value: every `<addr>`, or the comma-separated bare addresses. */
+function addressesInFromHeader(value: string): string[] {
+    const bracketed: string[] = [...value.matchAll(/<([^<>\s]+)>/g)].map((match) => match[1]);
+    return bracketed.length > 0 ? bracketed : value.split(",").map((part) => part.trim()).filter((part) => part.length > 0);
 }
 
 /** Builds one `ConversationSummary` from every `Message` sharing `conversationId`. */
@@ -109,6 +143,8 @@ function summarizeConversation(conversationId: string, messages: Message[]): Con
  */
 export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChildRoute<T> {
     protected readonly scopeProperty: string = "folderUid";
+
+    protected readonly serverManagedFields: readonly string[] = SERVER_MANAGED_MESSAGE_FIELDS;
 
     protected abstract folderClass: any;
 
@@ -192,6 +228,70 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             });
         }
         return this.mailboxRepo;
+    }
+
+    /** Both callers pass a folder uid that already passed a permission check, so it's always a real string. */
+    private async isDraftsFolder(folderUid: string): Promise<boolean> {
+        const folder: any = await (await this.getFolderRepo()).findOne(folderUid, { ignoreACL: true });
+        return folder?.type === FolderType.DRAFTS;
+    }
+
+    /**
+     * Beyond `SERVER_MANAGED_MESSAGE_FIELDS`, a non-trusted caller may only set `sentDate`/`receivedDate` and
+     * `dispositionNotificationTo` when creating a draft (target folder is Drafts). Dates on anything else are the
+     * server's (`now`, the model default): `checkLegalHold()` scopes a hold by them, so a client-chosen date would take
+     * a message out of a hold's range.
+     */
+    protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
+        await super.prepareCreate(obj, user);
+        if (this.isTrusted(user) || (await this.isDraftsFolder(obj.folderUid))) {
+            return;
+        }
+        delete obj.sentDate;
+        delete obj.receivedDate;
+        delete obj.dispositionNotificationTo;
+    }
+
+    /**
+     * A non-trusted update never changes `sentDate`/`receivedDate` (a draft's dates are the compose/send path's, which
+     * writes through the repository directly) - otherwise a held message could be re-dated out of its hold's range,
+     * or moved to Drafts, re-dated and moved back. `dispositionNotificationTo` stays settable on a message currently
+     * in Drafts only.
+     */
+    protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
+        await super.prepareUpdate(obj, existing, user);
+        if (this.isTrusted(user)) {
+            return;
+        }
+        delete obj.sentDate;
+        delete obj.receivedDate;
+        if ("dispositionNotificationTo" in obj && !(await this.isDraftsFolder(existing.folderUid))) {
+            delete obj.dispositionNotificationTo;
+        }
+    }
+
+    /**
+     * Refuses (403) a send/recall whose sender isn't the sending mailbox: `from.address` - and every address in the
+     * composed source's own `From` header, when there is one - must be the mailbox's primary address or one of its
+     * aliases. `from` is ordinary draft data, and it becomes the envelope sender, so without this any caller with
+     * write access to one mailbox could send as any address at all.
+     */
+    private assertSenderAllowed(mailbox: Mailbox | undefined, message: T, raw?: Buffer): void {
+        const allowed: Set<string> = new Set(
+            mailbox ? [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].filter((a) => typeof a === "string").map(normalizeAddress) : [],
+        );
+        const addresses: unknown[] = [message.from?.address];
+        const headerFrom: string | undefined = raw ? extractHeader(raw, "From") : undefined;
+        if (headerFrom) {
+            addresses.push(...addressesInFromHeader(headerFrom));
+        }
+        if (addresses.some((address) => typeof address !== "string" || !allowed.has(normalizeAddress(address)))) {
+            throw new ApiError(
+                ApiErrors.AUTH_PERMISSION_FAILURE,
+                403,
+                "A message can only be sent from its mailbox's own address or one of its aliases.",
+            );
+        }
     }
 
     /**
@@ -308,6 +408,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
+        const sendingMailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, {
+            ignoreACL: true,
+        });
+        // Checked for a scheduled send too, before it's queued - `ScheduledSendJob` relays with `from.address` as the
+        // envelope sender.
+        this.assertSenderAllowed(sendingMailbox, message);
+
         // "Do not deliver before" (`PR_DEFERRED_SEND_TIME`) - a future `scheduledSendTime`, set via an ordinary
         // `PUT` on the draft before calling this endpoint, defers relay instead of sending now. The message sits
         // in the mailbox's Outbox folder until `ScheduledSendJob` relays it and clears this field. Canceling a
@@ -327,6 +434,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // webmail compose UI, or an EAS/MAPI "send" handler, before this endpoint is called) — this route's
         // job is scanning and relay, not MIME composition.
         let raw: Buffer = await this.blobStore.get(message.bodyBlobKey);
+        this.assertSenderAllowed(sendingMailbox, message, raw);
         const envelopeTo: string[] = message.recipients.map((r) => r.address);
 
         // A receipt request is a single message-level header - RFC 3798 has no "only notify me for these
@@ -335,9 +443,6 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // `classifyRecipientTier()` (`util/DomainUtils.ts` - same-org/federated/external), and an explicit
         // per-draft `message.requestReceipt` overrides all three of the sending mailbox's own
         // `alwaysRequestReceipt*` defaults at once when set.
-        const sendingMailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, {
-            ignoreACL: true,
-        });
         let attachesReceiptRequest = false;
         if (sendingMailbox) {
             const effectiveInternal: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptInternal;
@@ -502,6 +607,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (!message.messageId) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This message cannot be recalled.");
         }
+        // The recall notice goes out with `from.address` as its sender - same rule as `send()`.
+        this.assertSenderAllowed(await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true }), message);
 
         const envelopeTo: string[] = message.recipients.map((r) => r.address);
         const composed: Buffer = await new MailComposer({
@@ -694,9 +801,14 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const updated: T = await super.update(id, obj, req, user);
 
         const justMarkedRead: boolean = !!existing && !existing.flags.read && updated.flags.read;
+        // Judged on the state before this update as well as after it, so a trusted caller clearing the receipt fields
+        // in the same request can't make an already-answered receipt look unanswered.
         if (
             justMarkedRead &&
             updated.dispositionNotificationTo &&
+            !existing!.readReceiptSentAt &&
+            !existing!.readReceiptPending &&
+            !existing!.readReceiptDeclined &&
             !updated.readReceiptSentAt &&
             !updated.readReceiptPending &&
             !updated.readReceiptDeclined
@@ -745,6 +857,24 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             );
         }
 
+        // Claim the receipt before sending it: the stamp is written under the optimistic lock first, so of two
+        // concurrent "mark read" requests only one gets past this point, and a message's read receipt is sent at most
+        // once. A failed send releases the claim, leaving it unrecorded as before (retried on a later read).
+        let claimed: T;
+        try {
+            claimed = await this.repoUtils!.update(
+                { uid: message.uid, version: (message as any).version, readReceiptSentAt: new Date() } as any,
+                message,
+                { ignoreACL: true },
+            );
+            // The catch is only reachable by losing the optimistic-lock race to a concurrent update of this same message
+            // between `update()`'s write and this claim, which no HTTP-level test can reliably win; the other request then
+            // owns the receipt, so this one returns without sending.
+            /* v8 ignore start */
+        } catch {
+            return message;
+        }
+        /* v8 ignore stop */
         const sent: boolean = await this.sendDispositionNotification(
             message.dispositionNotificationTo!,
             mailbox,
@@ -753,13 +883,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             "read",
         );
         if (sent) {
-            return await this.repoUtils!.update(
-                { uid: message.uid, version: (message as any).version, readReceiptSentAt: new Date() } as any,
-                message,
-                { ignoreACL: true },
-            );
+            return claimed;
         }
-        return message;
+        return await this.repoUtils!.update(
+            { uid: claimed.uid, version: (claimed as any).version, readReceiptSentAt: null } as any,
+            claimed,
+            { ignoreACL: true },
+        );
     }
 
     /**
@@ -862,9 +992,33 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
     /** See `BaseScopedChildRoute.checkLegalHold()`'s own doc comment - `Message` is the one entity a
      * `Matter`'s `custodianMailboxUids` actually protects, checked against its own denormalized
-     * `mailboxUid` and `sentDate` (the date a hold's `dateRangeStart`/`dateRangeEnd` is scoped by). */
+     * `mailboxUid` and `sentDate` (the date a hold's `dateRangeStart`/`dateRangeEnd` is scoped by).
+     *
+     * Dates are coerced first (a Mongo row can hold an ISO string, which a bare `getTime()` comparison can't use). The
+     * reference date is `sentDate`, else `receivedDate`, else the server-set, immutable `dateCreated`; with no valid date
+     * at all, any open hold on the mailbox blocks - the conservative direction for a hold. `sentDate`/`receivedDate`
+     * aren't client-writable outside drafts (see `prepareCreate()`/`prepareUpdate()`), so a held message can't be
+     * re-dated out of range first. */
     protected async checkLegalHold(existing: T): Promise<void> {
-        await assertNotOnLegalHold(this._objectFactory!, this.matterClass, existing.mailboxUid, existing.sentDate);
+        const holds = await findActiveHoldsFor(this._objectFactory!, this.matterClass, existing.mailboxUid);
+        if (holds.length === 0) {
+            return;
+        }
+        const reference: Date | undefined =
+            toValidDate(existing.sentDate) ?? toValidDate(existing.receivedDate) ?? toValidDate((existing as any).dateCreated);
+        const time: number | undefined = reference?.getTime();
+        const blocking = holds.filter((matter) => {
+            const start: Date | undefined = toValidDate(matter.dateRangeStart);
+            const end: Date | undefined = toValidDate(matter.dateRangeEnd);
+            return time === undefined || ((!start || time >= start.getTime()) && (!end || time <= end.getTime()));
+        });
+        if (blocking.length > 0) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                `This action is blocked by an active legal hold: ${blocking.map((m) => m.uid).join(", ")}.`,
+            );
+        }
     }
 
     /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `Message` is exactly the
@@ -974,6 +1128,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             );
         }
 
+        // Defense in depth behind the sanitizer, for a client that opens this URL directly rather than rendering the
+        // HTML in its own sandbox: no sniffing, no script, no network fetches, and a sandboxed (opaque-origin) document.
+        res.setHeader("x-content-type-options", "nosniff");
+        res.setHeader("content-security-policy", "default-src 'none'; img-src data: cid:; style-src 'unsafe-inline'; sandbox");
         if (message.sanitizedHtmlBlobKey) {
             const html: Buffer = await this.blobStore.get(message.sanitizedHtmlBlobKey);
             res.setHeader("content-type", "text/html; charset=utf-8");

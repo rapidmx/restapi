@@ -85,13 +85,24 @@ async function makeKey(overrides: Partial<PublicKey> = {}): Promise<PublicKey> {
     // re-validated) key, possibly with an intentionally-unparseable `publicKey` - skip recomputing in that
     // case rather than throwing trying to parse it.
     const fingerprint: string = overrides.fingerprint ?? certFingerprint(publicKey);
+    // `sanitizeDiscoveredKey()` also takes `notBefore`/`notAfter` from the certificate itself, so default to
+    // the certificate's real validity window (falling back to placeholders for an unparseable pinned-only key).
+    let notBefore = 0;
+    let notAfter: number = Date.now() + 1_000_000;
+    try {
+        const cert = new nodeCrypto.X509Certificate(Buffer.from(publicKey, "base64"));
+        notBefore = new Date(cert.validFrom).getTime();
+        notAfter = new Date(cert.validTo).getTime();
+    } catch {
+        // Placeholder values stand.
+    }
     return {
         publicKey,
         type: "x509",
         useType: "encrypt",
         fingerprint,
-        notBefore: 0,
-        notAfter: Date.now() + 1_000_000,
+        notBefore,
+        notAfter,
         ...overrides,
     };
 }
@@ -138,26 +149,26 @@ describe("applyDiscoveredKeys() Tests", () => {
         expect(result.keyConflict).toEqual({ observedFingerprint: observed.fingerprint, observedAt: 2000, source: "header" });
     });
 
-    it("Auto-replaces without a conflict when the pinned key is expired AND the new one is genuinely CA-issued sharing its issuer.", async () => {
+    it("Records a conflict (never auto-replaces) when the pinned key is expired, even when the new one is genuinely issued by the same CA - issuer equality can't be proven without the issuer's own certificate, which a PublicKey never carries.", async () => {
         const { first, second } = await makeCaIssuedCertPair();
         const pinned = await makeKey({ publicKey: first, notAfter: 500 });
         const observed = await makeKey({ publicKey: second });
 
         const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery");
 
-        expect(result.keys).toEqual([observed]);
-        expect(result.keyConflict).toBeUndefined();
+        expect(result.keys).toEqual([pinned]);
+        expect(result.keyConflict).toEqual({ observedFingerprint: observed.fingerprint, observedAt: 1000, source: "discovery" });
     });
 
-    it("Auto-replaces without a conflict when the pinned key is revoked AND the new one is genuinely CA-issued sharing its issuer.", async () => {
+    it("Records a conflict (never auto-replaces) when the pinned key is revoked and the new one shares its issuer DN.", async () => {
         const { first, second } = await makeCaIssuedCertPair();
         const pinned = await makeKey({ publicKey: first, notAfter: Date.now() + 1_000_000, revokedAt: 999 });
         const observed = await makeKey({ publicKey: second });
 
         const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery");
 
-        expect(result.keys).toEqual([observed]);
-        expect(result.keyConflict).toBeUndefined();
+        expect(result.keys).toEqual([pinned]);
+        expect(result.keyConflict?.observedFingerprint).toBe(observed.fingerprint);
     });
 
     it("Records a conflict (does not auto-replace) when the pinned key is expired but the issuers genuinely differ.", async () => {
@@ -207,6 +218,64 @@ describe("applyDiscoveredKeys() Tests", () => {
 
         expect(result.keys).toEqual([pinned]);
         expect(result.keyConflict).toBeUndefined();
+    });
+
+    it("Silently drops a discovered key whose well-formed base64 isn't a certificate at all.", async () => {
+        const pinned = await makeKey();
+        const notACert: PublicKey = {
+            publicKey: Buffer.from("definitely not a DER certificate").toString("base64"),
+            type: "x509",
+            useType: "encrypt",
+            fingerprint: "fp-whatever",
+            notBefore: 0,
+            notAfter: Date.now() + 1_000_000,
+        };
+
+        const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([notACert]), 1000, "discovery");
+
+        expect(result.keys).toEqual([pinned]);
+        expect(result.keyConflict).toBeUndefined();
+    });
+
+    it("Silently drops a discovered certificate whose validity dates don't parse (e.g. an out-of-range month).", async () => {
+        const keys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+        const cert = await x509.X509CertificateGenerator.createSelfSigned({
+            name: "CN=bad-time@example.com",
+            notBefore: new Date("2026-01-01T00:00:00.000Z"),
+            notAfter: new Date("2099-01-01T00:00:00.000Z"),
+            keys,
+            signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+        });
+        const der: Buffer = Buffer.from(cert.rawData);
+        const offset: number = der.toString("latin1").indexOf("260101000000Z");
+        expect(offset).toBeGreaterThan(0);
+        // Month 13: Node still parses the certificate, but reports its validFrom as "Bad time value".
+        der.write("261301000000Z", offset, "latin1");
+        expect(Number.isFinite(new Date(new nodeCrypto.X509Certificate(der).validFrom).getTime())).toBe(false);
+        const badTime: PublicKey = { publicKey: der.toString("base64"), type: "x509", useType: "sign", fingerprint: "fp", notBefore: 0, notAfter: 1 };
+
+        const result = applyDiscoveredKeys(undefined, makeDiscovery([badTime]), 1000, "discovery");
+
+        expect(result.keys).toEqual([]);
+    });
+
+    it("Takes notBefore/notAfter from the certificate itself, ignoring peer-asserted values.", async () => {
+        const realKey = await makeKey();
+        const lying: PublicKey = { ...realKey, notBefore: 1, notAfter: 8_000_000_000_000 };
+
+        const result = applyDiscoveredKeys(undefined, makeDiscovery([lying]), 1000, "discovery");
+
+        expect(result.keys).toEqual([realKey]);
+        expect(result.keys![0].notAfter).not.toBe(8_000_000_000_000);
+    });
+
+    it("Treats a structurally malformed response as no response at all (no throw, nothing applied).", async () => {
+        const existing: ContactKeyState = { keys: [], encryptPreference: { preferEncrypt: "mutual", lastSeen: 1 } };
+        const malformed = { keys: [await makeKey()], escrow: false } as unknown as KeyDiscoveryResponse;
+
+        const result = applyDiscoveredKeys(existing, malformed, 1000, "discovery");
+
+        expect(result).toEqual({ ...existing, keysFirstSeen: undefined, keyConflict: undefined });
     });
 
     it("Silently drops a discovered key whose useType isn't 'sign'/'encrypt'.", async () => {

@@ -4,14 +4,15 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { QuarantineEntrySQL } from "../../sql.js";
-import { BaseScopedChildRoute } from "../BaseScopedChildRoute.js";
+import { BaseQuarantineRoute } from "../BaseQuarantineRoute.js";
 const { Model } = RouteDecorators;
 
 /**
- * See `QuarantineRouteMongo` for the rationale — identical behavior against the SQL backend.
+ * `QuarantineEntry` has no `AccessControlList` of its own: it is scoped by `mailboxUid` like `ContactList`, readable by
+ * the mailbox's owner and delegates and writable only by a trusted caller - see `BaseQuarantineRoute`, including how a
+ * release is recorded.
  */
 @Model(QuarantineEntrySQL)
-export class QuarantineRouteSQL extends BaseScopedChildRoute<QuarantineEntrySQL> {
+export class QuarantineRouteSQL extends BaseQuarantineRoute<QuarantineEntrySQL> {
     protected readonly repoUtilsClass: any = RepoUtils;
-    protected readonly scopeProperty: string = "mailboxUid";
 }

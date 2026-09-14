@@ -12,10 +12,12 @@ const { Model } = RouteDecorators;
  * `ContactListRouteMongo`), `BaseScopedChildRoute` already provides exactly the CRUD/permission behavior
  * needed: a mailbox owner or delegate sees their own mailbox's pending/failed ingest entries, a trusted caller
  * (ops diagnosing stuck delivery) sees everything via the same ACL bypass every other route in this library
- * already gets for free.
+ * already gets for free. Writes are trusted-only (`trustedOnlyWrites`).
  */
 @Model(IngestQueueEntryMongo)
 export class IngestQueueRouteMongo extends BaseScopedChildRoute<IngestQueueEntryMongo> {
     protected readonly repoUtilsClass: any = RepoUtils;
     protected readonly scopeProperty: string = "mailboxUid";
+    /** Entries are produced by ingest; only a trusted caller (ops) may change them. */
+    protected readonly trustedOnlyWrites: boolean = true;
 }

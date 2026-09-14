@@ -5,7 +5,7 @@
 import * as crypto from "crypto";
 import * as net from "net";
 import { MemoryStore, SimpleStore } from "@rapidrest/core";
-import { KeyDiscoveryResponse } from "../models/types.js";
+import { EncryptionPreference, KeyDiscoveryResponse, PublicKey } from "../models/types.js";
 
 /**
  * z-base32's alphabet (Zooko Wilcox-O'Hearn's human-oriented base32 variant) - the encoding
@@ -58,6 +58,94 @@ export function zBase32Encode(data: Buffer): string {
 export function computeKeyDiscoveryHash(localPart: string): string {
     const digest: Buffer = crypto.createHash("sha256").update(localPart.toLowerCase()).digest();
     return zBase32Encode(digest);
+}
+
+/** Exactly the shape `computeKeyDiscoveryHash()` produces: 52 z-base32 characters (a 256-bit digest). */
+const KEY_DISCOVERY_HASH_PATTERN = new RegExp(`^[${ZBASE32_ALPHABET}]{52}$`);
+
+/** Reports whether `hash` is a syntactically valid discovery-endpoint path segment (see
+ * `computeKeyDiscoveryHash()`) - used by `BaseKeyDiscoveryRoute` to reject anything else before it reaches a
+ * database query. */
+export function isValidKeyDiscoveryHash(hash: unknown): hash is string {
+    return typeof hash === "string" && KEY_DISCOVERY_HASH_PATTERN.test(hash);
+}
+
+/** Generous upper bound, in characters, for a base64-encoded DER certificate - a real P-256 certificate is a
+ * few hundred bytes (~700 base64 characters); wide enough for an RSA-4096 certificate with a large extension
+ * set, small enough to block a deliberately oversized blob. Same bound `RapidMxKeyHeaderUtils` applies. */
+export const MAX_PUBLIC_KEY_BASE64_LENGTH = 8192;
+
+const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function isFiniteNumber(value: unknown): value is number {
+    return typeof value === "number" && Number.isFinite(value);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parsePublicKey(raw: unknown): PublicKey | undefined {
+    if (!isPlainObject(raw)) {
+        return undefined;
+    }
+    const { publicKey, type, useType, fingerprint, notBefore, notAfter, revokedAt } = raw;
+    if (
+        typeof publicKey !== "string" ||
+        publicKey.length === 0 ||
+        publicKey.length > MAX_PUBLIC_KEY_BASE64_LENGTH ||
+        !BASE64_PATTERN.test(publicKey) ||
+        typeof type !== "string" ||
+        type.length === 0 ||
+        type.length > 64 ||
+        (useType !== "sign" && useType !== "encrypt") ||
+        typeof fingerprint !== "string" ||
+        fingerprint.length > 256 ||
+        !isFiniteNumber(notBefore) ||
+        !isFiniteNumber(notAfter) ||
+        (revokedAt !== undefined && revokedAt !== null && !isFiniteNumber(revokedAt))
+    ) {
+        return undefined;
+    }
+    const key: PublicKey = { publicKey, type, useType, fingerprint, notBefore, notAfter };
+    if (isFiniteNumber(revokedAt)) {
+        key.revokedAt = revokedAt;
+    }
+    return key;
+}
+
+/**
+ * Strictly validates an untrusted `KeyDiscoveryResponse` (a remote peer's JSON body, or any other
+ * attacker-influenced source) and returns a freshly built copy containing only the known fields - or
+ * `undefined` if anything about its structure is malformed (wrong/missing envelope fields, a `keys` entry that
+ * isn't a well-formed `PublicKey`, an unknown `preferEncrypt`/`useType` value, ...). The whole response is
+ * rejected rather than partially salvaged: a peer serving structurally invalid data is misbehaving, and
+ * `fetchRemoteKeys()` must never cache (or hand onward) anything built from it.
+ *
+ * Structural only - certificate parsing, fingerprint recomputation, and taking `notBefore`/`notAfter` from the
+ * certificate itself happen in `KeyringUtils.applyDiscoveredKeys()`'s per-key sanitization.
+ */
+export function parseKeyDiscoveryResponse(raw: unknown): KeyDiscoveryResponse | undefined {
+    if (!isPlainObject(raw) || !isPlainObject(raw.encryptPreference) || !Array.isArray(raw.keys) || typeof raw.escrow !== "boolean") {
+        return undefined;
+    }
+    const { preferEncrypt, lastSeen } = raw.encryptPreference;
+    if ((preferEncrypt !== "mutual" && preferEncrypt !== "nopreference") || (lastSeen !== undefined && lastSeen !== null && !isFiniteNumber(lastSeen))) {
+        return undefined;
+    }
+    const encryptPreference: EncryptionPreference = { preferEncrypt };
+    if (isFiniteNumber(lastSeen)) {
+        encryptPreference.lastSeen = lastSeen;
+    }
+    const keys: PublicKey[] = [];
+    for (const rawKey of raw.keys) {
+        const key: PublicKey | undefined = parsePublicKey(rawKey);
+        if (!key) {
+            return undefined;
+        }
+        keys.push(key);
+    }
+    return { encryptPreference, keys, escrow: raw.escrow };
 }
 
 /** One cached discovery response, alongside the `ETag` it was served with (if any) so a later request can
@@ -177,7 +265,11 @@ async function readBoundedJson(response: Response, maxBytes: number): Promise<un
 
 /**
  * Fetches `address`'s published keys/preference from `host`'s discovery endpoint
- * (`GET https://<host>/.well-known/rapidmx/keys/<hash>`), honoring `ETag`/`Cache-Control` per the spec.
+ * (`GET https://<host>/.well-known/rapidmx/keys/<hash>?domain=<domain>`), honoring `ETag`/`Cache-Control` per
+ * the spec. `domain` (lowercased, the part of `address` after its last `@`) disambiguates a multi-domain peer
+ * where two addresses share a local part - `BaseKeyDiscoveryRoute` matches on it, falling back to the request
+ * `Host` for an older client that doesn't send it. The body is structurally validated
+ * (`parseKeyDiscoveryResponse()`) before it is ever cached or returned.
  *
  * **TLS verification is handled entirely by Node's default `fetch()` behavior** - an `https://` URL is
  * rejected by the platform itself if the presented certificate doesn't chain to a trusted root or doesn't
@@ -205,12 +297,16 @@ export async function fetchRemoteKeys(
     address: string,
     options: FetchRemoteKeysOptions = {},
 ): Promise<KeyDiscoveryResponse | undefined> {
-    const localPart: string = address.split("@")[0];
+    const atIndex: number = address.lastIndexOf("@");
+    const localPart: string = atIndex === -1 ? address : address.slice(0, atIndex);
+    const domain: string = atIndex === -1 ? "" : address.slice(atIndex + 1).toLowerCase();
     const hash: string = computeKeyDiscoveryHash(localPart);
-    const cacheKey: string = `${CACHE_KEY_PREFIX}${host.toLowerCase()}:${hash}`;
+    // The domain is part of both the cache key and the request: `hash` covers the local part only, so on a
+    // multi-domain peer `ceo@acme.com` and `ceo@contoso.com` share a hash and must never share a cache entry.
+    const cacheKey: string = `${CACHE_KEY_PREFIX}${host.toLowerCase()}:${domain}:${hash}`;
     const cached: CachedKeyDiscoveryResult | undefined = (await keyCache.load(cacheKey)) as CachedKeyDiscoveryResult | undefined;
 
-    if (!isSafeDiscoveryHost(host)) {
+    if (!isSafeDiscoveryHost(host) || !HOSTNAME_PATTERN.test(domain)) {
         return cached?.response;
     }
 
@@ -222,7 +318,7 @@ export async function fetchRemoteKeys(
     const controller = new AbortController();
     const timeoutHandle = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     try {
-        const response = await fetch(`https://${host}/.well-known/rapidmx/keys/${hash}`, {
+        const response = await fetch(`https://${host}/.well-known/rapidmx/keys/${hash}?domain=${encodeURIComponent(domain)}`, {
             headers,
             signal: controller.signal,
             redirect: "error",
@@ -239,7 +335,11 @@ export async function fetchRemoteKeys(
             return cached?.response;
         }
 
-        const body: KeyDiscoveryResponse = (await readBoundedJson(response, MAX_RESPONSE_BYTES)) as KeyDiscoveryResponse;
+        const body: KeyDiscoveryResponse | undefined = parseKeyDiscoveryResponse(await readBoundedJson(response, MAX_RESPONSE_BYTES));
+        if (!body) {
+            // Malformed - never cached, never returned; same fallback as any other failed fetch.
+            return cached?.response;
+        }
         const etag: string | undefined = response.headers.get("etag") ?? undefined;
         const ttl: number = parseMaxAgeSeconds(response.headers.get("cache-control")) ?? DEFAULT_TTL_SECONDS;
         await keyCache.save(cacheKey, { response: body, etag }, ttl);

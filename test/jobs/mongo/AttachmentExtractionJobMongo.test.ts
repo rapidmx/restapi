@@ -262,4 +262,127 @@ describe("AttachmentExtractionJobMongo Tests (real DB + DI)", () => {
         const updatedGood = await attachmentRepo.findOne({ uid: goodAttachment.uid } as any);
         expect(updatedGood!.extractedTextBlobKey).toContain("attachment-text/");
     });
+
+    it("Logs a warning (no throw) when recording an extraction failure itself fails.", async () => {
+        const message = await createMessage();
+        const attachment = await createAttachment({ messageUid: message.uid, blobKey: `attachments/${uuid.v4()}` });
+        const updateSpy = vi.spyOn((job as any).attachmentRepo, "update").mockRejectedValue(new Error("simulated bookkeeping failure"));
+        const warnSpy = vi.spyOn((job as any).logger, "warn");
+
+        try {
+            await expect(job.run()).resolves.toBeUndefined();
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated bookkeeping failure"));
+        } finally {
+            updateSpy.mockRestore();
+            warnSpy.mockRestore();
+        }
+
+        const updated = await attachmentRepo.findOne({ uid: attachment.uid } as any);
+        expect(updated!.extractionAttempts ?? null).toBeNull();
+    });
+
+    describe("retry bookkeeping (stuck-attachment isolation)", () => {
+        let savedBatchSize: number;
+        let savedMaxAttempts: number;
+
+        beforeEach(() => {
+            savedBatchSize = (job as any).batchSize;
+            savedMaxAttempts = (job as any).maxAttempts;
+        });
+
+        afterEach(() => {
+            (job as any).batchSize = savedBatchSize;
+            (job as any).maxAttempts = savedMaxAttempts;
+        });
+
+        const findAttachment = async (uid: string) => await attachmentRepo.findOne({ uid } as any);
+        const setAttachment = async (uid: string, fields: any) => await attachmentRepo.updateOne({ uid } as any, { $set: fields });
+        const findMessage = async (uid: string) => await messageRepo.findOne({ uid } as any);
+
+        it("Records extractionAttempts/extractionNextAttemptAt/extractionError on failure, honors the backoff, and clears them once a retry succeeds.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const message = await createMessage();
+            const blobKey = `attachments/${uuid.v4()}`;
+            const attachment = await createAttachment({ messageUid: message.uid, blobKey });
+
+            const before = Date.now();
+            await job.run();
+
+            let updated = await findAttachment(attachment.uid);
+            expect(updated!.extractedTextBlobKey ?? null).toBeNull();
+            expect(updated!.extractionAttempts).toBe(1);
+            expect(new Date(updated!.extractionNextAttemptAt!).getTime()).toBeGreaterThan(before);
+            expect(updated!.extractionError).toContain("no blob");
+
+            await blobStore.put(blobKey, Buffer.from("now it exists"));
+            await job.run();
+            updated = await findAttachment(attachment.uid);
+            expect(updated!.extractedTextBlobKey ?? null).toBeNull();
+
+            await setAttachment(attachment.uid, { extractionNextAttemptAt: new Date(Date.now() - 1000) });
+            await job.run();
+            updated = await findAttachment(attachment.uid);
+            expect(updated!.extractedTextBlobKey).toContain("attachment-text/");
+            expect(updated!.extractionAttempts ?? null).toBeNull();
+            expect(updated!.extractionNextAttemptAt ?? null).toBeNull();
+            expect(updated!.extractionError ?? null).toBeNull();
+        });
+
+        it("Never lets a permanently failing attachment block newer ones (batch size 1), and stops selecting it at max_attempts.", async () => {
+            (job as any).batchSize = 1;
+            (job as any).maxAttempts = 2;
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const badMessage = await createMessage();
+            const goodMessage = await createMessage();
+            // Inserted first but dated newer, so dateCreated ordering - not insertion order - decides the head.
+            const goodBlobKey = `attachments/${uuid.v4()}`;
+            await blobStore.put(goodBlobKey, Buffer.from("good content"));
+            const goodAttachment = await createAttachment({ messageUid: goodMessage.uid, blobKey: goodBlobKey });
+            const badAttachment = await createAttachment({
+                messageUid: badMessage.uid,
+                blobKey: `attachments/${uuid.v4()}`,
+                dateCreated: new Date(Date.now() - 60_000),
+            });
+
+            await job.run();
+            expect((await findAttachment(badAttachment.uid))!.extractionAttempts).toBe(1);
+            expect((await findAttachment(goodAttachment.uid))!.extractedTextBlobKey ?? null).toBeNull();
+
+            await job.run();
+            expect((await findAttachment(goodAttachment.uid))!.extractedTextBlobKey).toContain("attachment-text/");
+
+            await setAttachment(badAttachment.uid, { extractionNextAttemptAt: new Date(Date.now() - 1000) });
+            await job.run();
+            let bad = await findAttachment(badAttachment.uid);
+            expect(bad!.extractionAttempts).toBe(2);
+            expect(bad!.extractionNextAttemptAt ?? null).toBeNull();
+
+            await setAttachment(badAttachment.uid, { extractionNextAttemptAt: new Date(Date.now() - 1000) });
+            await job.run();
+            bad = await findAttachment(badAttachment.uid);
+            expect(bad!.extractionAttempts).toBe(2);
+            expect(bad!.extractedTextBlobKey ?? null).toBeNull();
+        });
+
+        it("Resets the parent message's SearchIndexJob retry bookkeeping along with searchIndexedAt when new text is extracted.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `attachments/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("fresh text"));
+            const message = await createMessage({
+                searchIndexedAt: new Date("2026-01-01T00:00:00Z"),
+                searchIndexAttempts: 3,
+                searchIndexNextAttemptAt: new Date("2026-01-02T00:00:00Z"),
+                searchIndexError: "old failure",
+            });
+            await createAttachment({ messageUid: message.uid, mimeType: "text/plain", blobKey });
+
+            await job.run();
+
+            const updated = await findMessage(message.uid);
+            expect(updated!.searchIndexedAt ?? null).toBeNull();
+            expect(updated!.searchIndexAttempts ?? null).toBeNull();
+            expect(updated!.searchIndexNextAttemptAt ?? null).toBeNull();
+            expect(updated!.searchIndexError ?? null).toBeNull();
+        });
+    });
 });

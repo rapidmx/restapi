@@ -20,6 +20,7 @@ const { Nullable } = ObjectDecorators;
 @Entity()
 @Description("A holder-invoked eDiscovery export spanning a Matter's full custodian set.")
 @Index("matter_export_request_matter", ["matterId"])
+@Index("matter_export_request_status", ["status"])
 @Protect(
     {
         uid: "MatterExportRequest",
@@ -48,7 +49,7 @@ export class MatterExportRequestSQL extends BaseEntity implements MatterExportRe
     @Nullable
     public blobKey?: string;
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Nullable
     public errorMessage?: string;
 

@@ -19,7 +19,7 @@ import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { MailboxImportRequestSQL } from "../../../src/models/sql/MailboxImportRequestSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
-import { AuditAction } from "../../../src/models/types.js";
+import { AuditAction, RecipientType } from "../../../src/models/types.js";
 import { buildMboxEntry } from "../../../src/util/MboxUtils.js";
 import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 
@@ -493,6 +493,180 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
 
         const stillPending = await requestRepo.findOne({ where: { uid: request.uid } });
         expect(stillPending!.status).toBe("pending");
+    });
+
+    const withJobField = async (field: string, value: any, fn: () => Promise<void>): Promise<void> => {
+        const original = (job as any)[field];
+        (job as any)[field] = value;
+        try {
+            await fn();
+        } finally {
+            (job as any)[field] = original;
+        }
+    };
+
+    const putMbox = async (entries: Buffer[]): Promise<string> => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        await blobStore.put(sourceBlobKey, Buffer.concat(entries));
+        return sourceBlobKey;
+    };
+
+    it("Skips (never imports as clean) a message whose AV scan errored, counting it as failed.", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const sourceBlobKey = await putMbox([
+            buildMboxEntry(makeRawMessage({ extraHeader: "X-Test-Force-Av-Error: true" }), "eve@example.com", new Date("2020-01-01")),
+            buildMboxEntry(makeRawMessage(), "bob@example.com", new Date("2020-01-02")),
+        ]);
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("completed");
+        expect(updated!.importedCount).toBe(1);
+        expect(updated!.failedCount).toBe(1);
+        expect((await messageRepo.find({ where: { folderUid: folder.uid } })).length).toBe(1);
+    });
+
+    it("Stops the import with a clear quota error once the next message would exceed the mailbox quota, keeping what was already imported.", async () => {
+        const raw = makeRawMessage();
+        // Room for exactly one message (raw + its decoded attachment), not two.
+        const mailbox = await mailboxRepo.save(
+            new MailboxSQL({
+                ownerUserUid: uuid.v4(),
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Small Mailbox",
+                timezone: "UTC",
+                quotaBytes: 1_000 + raw.length * 2,
+                usedBytes: 1_000,
+            }),
+        );
+        const folder = await createFolder(mailbox.uid);
+        const sourceBlobKey = await putMbox([
+            buildMboxEntry(raw, "alice@example.com", new Date("2020-01-01")),
+            buildMboxEntry(raw, "bob@example.com", new Date("2020-01-02")),
+            buildMboxEntry(raw, "carol@example.com", new Date("2020-01-03")),
+        ]);
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("failed");
+        expect(updated!.errorMessage).toContain("mailbox quota");
+        expect(updated!.importedCount).toBe(1);
+        expect((await messageRepo.find({ where: { folderUid: folder.uid } })).length).toBe(1);
+        expect((await auditLogRepo.find({ where: { action: AuditAction.MAILBOX_IMPORT_FAILED } })).length).toBe(1);
+    });
+
+    it("Treats a quotaBytes of 0 as unlimited.", async () => {
+        const mailbox = await mailboxRepo.save(
+            new MailboxSQL({
+                ownerUserUid: uuid.v4(),
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Unlimited Mailbox",
+                timezone: "UTC",
+                quotaBytes: 0,
+                usedBytes: 5_000_000,
+            }),
+        );
+        const folder = await createFolder(mailbox.uid);
+        const sourceBlobKey = await putMbox([buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01"))]);
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("completed");
+        expect(updated!.importedCount).toBe(1);
+    });
+
+    it("Reclaims an abandoned 'processing' import and, on the retry, skips messages the dead attempt already persisted (by Message-ID).", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        await messageRepo.save(
+            new MessageSQL({
+                mailboxUid: mailbox.uid,
+                folderUid: folder.uid,
+                messageId: "already-imported@example.com",
+                subject: "Test message",
+                from: { address: "sender@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date("2020-01-01"),
+                receivedDate: new Date("2020-01-01"),
+                bodyBlobKey: `imported/${uuid.v4()}`,
+                flags: { read: true, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: false,
+            }),
+        );
+        const sourceBlobKey = await putMbox([
+            buildMboxEntry(makeRawMessage({ extraHeader: "Message-ID: <already-imported@example.com>" }), "alice@example.com", new Date("2020-01-01")),
+            buildMboxEntry(makeRawMessage({ extraHeader: "Message-ID: <new@example.com>" }), "bob@example.com", new Date("2020-01-02")),
+        ]);
+        const request = await createRequest({
+            mailboxUid: mailbox.uid,
+            targetFolderUid: folder.uid,
+            format: "mbox",
+            sourceBlobKey,
+            status: "processing",
+            processingAttempts: 1,
+            dateModified: new Date(Date.now() - 3 * 60 * 60_000),
+        });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("completed");
+        expect(updated!.processingAttempts).toBe(2);
+        expect(updated!.importedCount).toBe(2);
+        expect((await messageRepo.find({ where: { folderUid: folder.uid, messageId: "already-imported@example.com" } })).length).toBe(1);
+        expect((await messageRepo.find({ where: { folderUid: folder.uid, messageId: "new@example.com" } })).length).toBe(1);
+    });
+
+    it("Leaves a 'processing' import alone while its lease is still fresh, and fails one abandoned max_attempts times.", async () => {
+        const fresh = await createRequest({ status: "processing", processingAttempts: 1 });
+        const exhausted = await createRequest({ status: "processing", processingAttempts: 3, dateModified: new Date(Date.now() - 3 * 60 * 60_000) });
+
+        await job.run();
+
+        const freshAfter = await requestRepo.findOne({ where: { uid: fresh.uid } });
+        expect(freshAfter!.status).toBe("processing");
+        expect(freshAfter!.version).toBe(fresh.version);
+        const exhaustedAfter = await requestRepo.findOne({ where: { uid: exhausted.uid } });
+        expect(exhaustedAfter!.status).toBe("failed");
+        expect(exhaustedAfter!.errorMessage).toContain("did not complete after 3 attempt(s)");
+    });
+
+    it("Aborts without completing when its lease is lost mid-import (another replica reclaimed the request).", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const sourceBlobKey = await putMbox([
+            buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01")),
+            buildMboxEntry(makeRawMessage(), "bob@example.com", new Date("2020-01-02")),
+        ]);
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+        const realPersist = (job as any).persistImportedMessage.bind(job);
+        vi.spyOn(job as any, "persistImportedMessage").mockImplementationOnce(async (...args: any[]) => {
+            const result = await realPersist(...args);
+            // Simulates another replica reclaiming the request while this run was still importing.
+            const current = (await requestRepo.findOne({ where: { uid: request.uid } }))!;
+            await requestRepo.update({ uid: request.uid }, { version: current.version + 1, status: "pending" });
+            return result;
+        });
+
+        // A 0-minute lease makes every per-message renewal due, so the second message's renewal hits the conflict.
+        await withJobField("leaseMinutes", 0, async () => {
+            await (job as any).processRequest(request);
+        });
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("pending");
+        expect((await messageRepo.find({ where: { folderUid: folder.uid } })).length).toBe(1);
     });
 
     it("Does nothing when the repos are not yet initialized.", async () => {

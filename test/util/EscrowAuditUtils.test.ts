@@ -11,8 +11,9 @@
 // process, not reset between tests. Each test below therefore declares its own fresh, locally-scoped stub
 // class rather than a single shared one, so no test's cache entry can leak into (and mask a missing
 // `newInstance()` call in) another.
+import * as crypto from "crypto";
 import { recordEscrowAuditEntry, verifyEscrowAuditChain } from "../../src/util/EscrowAuditUtils.js";
-import { EscrowAuditAction } from "../../src/models/types.js";
+import { EscrowAuditAction, EscrowAuditHashAlgorithm } from "../../src/models/types.js";
 
 function makeStubClass(): any {
     return class StubEscrowAuditLogEntry {
@@ -195,5 +196,430 @@ describe("verifyEscrowAuditChain() Tests", () => {
 
         expect(result.valid).toBe(false);
         expect(result.brokenAtSequence).toBe(1);
+    });
+});
+
+// --- HMAC keying + head record (tail-truncation detection) -------------------------------------------------
+// A small in-memory fake of both repos: `entries` enforces the unique `sequence` index, `heads` enforces the
+// unique `chainId` and `RepoUtils.update()`'s optimistic `version` lock.
+function makeChainFixture(options: { key?: any; withHead?: boolean } = {}) {
+    const entries: any[] = [];
+    const heads: any[] = [];
+    const EntryClass = makeStubClass();
+    const HeadClass = makeStubClass();
+    if (options.withHead !== false) {
+        EntryClass.escrowAuditHeadClass = HeadClass;
+    }
+    let key: any = options.key;
+    const entryRepo = {
+        find: vi.fn(async (query: any) => {
+            const sorted = [...entries].sort((a, b) => a.sequence - b.sequence);
+            if (query.page !== undefined) {
+                return query.page === 0 ? sorted : [];
+            }
+            return sorted.length ? [sorted[sorted.length - 1]] : [];
+        }),
+        create: vi.fn(async (entry: any) => {
+            if (entries.some((e) => e.sequence === entry.sequence)) {
+                throw new Error("duplicate key");
+            }
+            entries.push(entry);
+            return entry;
+        }),
+    };
+    const headRepo = {
+        find: vi.fn(async () => heads.map((h) => ({ ...h }))),
+        create: vi.fn(async (head: any) => {
+            if (heads.length) {
+                throw new Error("duplicate key");
+            }
+            heads.push({ ...head, version: 0 });
+            return head;
+        }),
+        update: vi.fn(async (obj: any, existing: any) => {
+            if (!heads[0] || heads[0].version !== existing.version || obj.version !== existing.version) {
+                throw new Error("version conflict");
+            }
+            heads[0] = { ...obj, version: existing.version + 1 };
+            return heads[0];
+        }),
+    };
+    const logger = { warn: vi.fn(), error: vi.fn() };
+    const objectFactory: any = {
+        newInstance: vi.fn(async (_clazz: any, opts: any) => (opts.args[0] === HeadClass ? headRepo : entryRepo)),
+        logger,
+        config: { get: vi.fn((k: string) => (k === "mail:escrow:audit_hmac_key" ? key : undefined)) },
+    };
+    return {
+        entries,
+        heads,
+        EntryClass,
+        HeadClass,
+        entryRepo,
+        headRepo,
+        logger,
+        objectFactory,
+        setKey: (k: any) => (key = k),
+        append: (overrides: any = {}) => recordEscrowAuditEntry(objectFactory, EntryClass, makeParams(overrides)),
+        verify: () => verifyEscrowAuditChain(objectFactory, EntryClass),
+    };
+}
+
+function legacySha256(entry: any): string {
+    const payload = JSON.stringify({
+        sequence: entry.sequence,
+        previousHash: entry.previousHash ?? "",
+        action: entry.action,
+        holderUserUid: entry.holderUserUid,
+        matterId: entry.matterId,
+        mailboxUid: entry.mailboxUid,
+        requestId: entry.requestId,
+        occurredAt: entry.occurredAt.toISOString(),
+        details: entry.details ?? {},
+    });
+    return crypto.createHash("sha256").update(payload).digest("hex");
+}
+
+/** Inserts a pre-upgrade entry directly (no `hashAlgorithm`, plain SHA-256), exactly as the old code wrote them. */
+function pushLegacyEntry(fixture: ReturnType<typeof makeChainFixture>, overrides: any = {}): any {
+    const previous = fixture.entries[fixture.entries.length - 1];
+    const entry: any = {
+        ...makeParams(overrides),
+        sequence: previous ? previous.sequence + 1 : 0,
+        previousHash: previous?.hash,
+        occurredAt: new Date(),
+    };
+    entry.hash = legacySha256(entry);
+    fixture.entries.push(entry);
+    return entry;
+}
+
+describe("EscrowAuditUtils HMAC keying Tests", () => {
+    afterEach(() => {
+        vi.unstubAllEnvs();
+    });
+
+    it("Keys new entries with HMAC-SHA256 from mail:escrow:audit_hmac_key and marks them hmac-sha256.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+
+        const first = await fixture.append();
+        const second = await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        expect(fixture.objectFactory.config.get).toHaveBeenCalledWith("mail:escrow:audit_hmac_key");
+        expect(first.hashAlgorithm).toBe(EscrowAuditHashAlgorithm.HMAC_SHA256);
+        expect(second.hashAlgorithm).toBe(EscrowAuditHashAlgorithm.HMAC_SHA256);
+        // Not the unkeyed digest of the same content.
+        expect(first.hash).not.toBe(legacySha256(first));
+        expect(await fixture.verify()).toEqual({ valid: true });
+        expect(fixture.logger.warn).not.toHaveBeenCalled();
+        expect(fixture.logger.error).not.toHaveBeenCalled();
+    });
+
+    it("Detects an entry an attacker without the key rewrote with a consistently recomputed SHA-256 digest.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        // Rewrite entry 1 and recompute its digest with unkeyed SHA-256 - a forgery the pre-fix scheme accepted.
+        fixture.entries[1].details = { tampered: true };
+        fixture.entries[1].hash = legacySha256(fixture.entries[1]);
+        fixture.heads[0].hash = fixture.entries[1].hash;
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 1, reason: "hash_mismatch" });
+    });
+
+    it("Rejects stripping hashAlgorithm off an entry that follows an HMAC entry as a downgrade.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        delete fixture.entries[1].hashAlgorithm;
+        fixture.entries[1].hash = legacySha256(fixture.entries[1]);
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 1, reason: "algorithm_downgrade" });
+    });
+
+    it("Fails verification with a different key, and reports hmac_key_unavailable with no key at all.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+
+        fixture.setKey("other-key");
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "hash_mismatch" });
+
+        fixture.setKey(undefined);
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "hmac_key_unavailable" });
+    });
+
+    it("Rejects an entry carrying an unrecognized hashAlgorithm.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+        fixture.entries[0].hashAlgorithm = "md5";
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "unknown_algorithm" });
+    });
+
+    it("Accepts a numeric key (nconf parseValues) rather than silently falling back to SHA-256.", async () => {
+        const fixture = makeChainFixture({ key: 123456 });
+        const entry = await fixture.append();
+
+        expect(entry.hashAlgorithm).toBe(EscrowAuditHashAlgorithm.HMAC_SHA256);
+        expect(await fixture.verify()).toEqual({ valid: true });
+    });
+
+    it("Prefers an explicit hmacKey option over config.", async () => {
+        const fixture = makeChainFixture({ key: "config-key" });
+        await recordEscrowAuditEntry(fixture.objectFactory, fixture.EntryClass, makeParams(), { hmacKey: "option-key" });
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "hash_mismatch" });
+        expect(await verifyEscrowAuditChain(fixture.objectFactory, fixture.EntryClass, { hmacKey: "option-key" })).toEqual({
+            valid: true,
+        });
+    });
+
+    it("Without a key, falls back to SHA-256 (marked sha256) and warns exactly once.", async () => {
+        const fixture = makeChainFixture();
+
+        const first = await fixture.append();
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        expect(first.hashAlgorithm).toBe(EscrowAuditHashAlgorithm.SHA256);
+        expect(first.hash).toBe(legacySha256(first));
+        expect(await fixture.verify()).toEqual({ valid: true });
+        expect(fixture.logger.warn).toHaveBeenCalledTimes(1);
+        expect(fixture.logger.warn.mock.calls[0][0]).toContain("mail:escrow:audit_hmac_key");
+        expect(fixture.logger.error).not.toHaveBeenCalled();
+    });
+
+    it("Without a key in production, logs at error level instead of warn, and still does not throw.", async () => {
+        vi.stubEnv("NODE_ENV", "production");
+        const fixture = makeChainFixture();
+
+        await expect(fixture.append()).resolves.toBeDefined();
+
+        expect(fixture.logger.error).toHaveBeenCalledTimes(1);
+        expect(fixture.logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("Still verifies pre-upgrade legacy entries (no hashAlgorithm, no head yet), followed by new HMAC entries.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        pushLegacyEntry(fixture);
+        pushLegacyEntry(fixture, { action: EscrowAuditAction.REQUEST_APPROVED });
+
+        // No head row yet and only legacy entries: "no head yet", not a failure.
+        expect(await fixture.verify()).toEqual({ valid: true });
+
+        const appended = await fixture.append({ action: EscrowAuditAction.MATERIAL_READ });
+
+        expect(appended.sequence).toBe(2);
+        expect(appended.previousHash).toBe(fixture.entries[1].hash);
+        expect(fixture.heads).toHaveLength(1);
+        expect(fixture.heads[0].sequence).toBe(2);
+        expect(await fixture.verify()).toEqual({ valid: true });
+    });
+
+    it("Detects tampering with a legacy entry that HMAC entries follow.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        pushLegacyEntry(fixture);
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        fixture.entries[0].details = { tampered: true };
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "hash_mismatch" });
+    });
+});
+
+describe("EscrowAuditUtils head record Tests", () => {
+    it("Creates the head on the first append and advances it (with a MAC) on each later one.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+
+        await fixture.append();
+        expect(fixture.heads[0]).toMatchObject({ chainId: "global", sequence: 0, hash: fixture.entries[0].hash });
+
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+        expect(fixture.heads).toHaveLength(1);
+        expect(fixture.heads[0]).toMatchObject({
+            sequence: 1,
+            hash: fixture.entries[1].hash,
+            hashAlgorithm: EscrowAuditHashAlgorithm.HMAC_SHA256,
+        });
+        expect(typeof fixture.heads[0].mac).toBe("string");
+    });
+
+    it("Writes a MAC-less head when no key is configured.", async () => {
+        const fixture = makeChainFixture();
+        await fixture.append();
+
+        expect(fixture.heads[0].mac).toBeNull();
+        expect(fixture.heads[0].hashAlgorithm).toBeNull();
+    });
+
+    it("Detects deletion of the chain's tail, which the chain alone cannot.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+        await fixture.append({ action: EscrowAuditAction.MATERIAL_READ });
+
+        fixture.entries.pop();
+
+        // The remaining chain is internally consistent - only the head reveals the missing tail.
+        expect(await verifyEscrowAuditChain(fixture.objectFactory, fixture.EntryClass, { escrowAuditHeadClass: null })).toEqual({
+            valid: true,
+        });
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 2, reason: "truncated" });
+    });
+
+    it("Detects deletion of every entry while the head remains.", async () => {
+        const fixture = makeChainFixture();
+        await fixture.append();
+        fixture.entries.length = 0;
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "truncated" });
+    });
+
+    it("Detects a MAC-less head whose hash doesn't match the entry at its sequence.", async () => {
+        const fixture = makeChainFixture();
+        await fixture.append();
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        fixture.heads[0].hash = "f".repeat(64);
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 1, reason: "head_mismatch" });
+    });
+
+    it("Detects a head rolled back to an earlier entry (after tail deletion) by its MAC.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        fixture.entries.pop();
+        fixture.heads[0].sequence = 0;
+        fixture.heads[0].hash = fixture.entries[0].hash;
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "head_mac_mismatch" });
+    });
+
+    it("Detects a head whose MAC was stripped while it points at an HMAC entry.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        fixture.entries.pop();
+        fixture.heads[0] = { ...fixture.heads[0], sequence: 0, hash: fixture.entries[0].hash, mac: null, hashAlgorithm: null };
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "head_mac_mismatch" });
+    });
+
+    it("Detects a head whose MAC was replaced by a value of the wrong length (never reaching the constant-time compare).", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+
+        fixture.heads[0].mac = "short";
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "head_mac_mismatch" });
+    });
+
+    it("Reports hash_mismatch for an entry whose stored hash is missing or truncated.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+
+        fixture.entries[0].hash = "abc";
+        expect(await fixture.verify()).toMatchObject({ valid: false, brokenAtSequence: 0, reason: "hash_mismatch" });
+
+        fixture.entries[0].hash = undefined;
+        expect(await fixture.verify()).toMatchObject({ valid: false, brokenAtSequence: 0, reason: "hash_mismatch" });
+    });
+
+    it("Reports hmac_key_unavailable for a MAC'd head when verifying without the key.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        pushLegacyEntry(fixture);
+        await fixture.append();
+        // Drop the HMAC entry and point the (still MAC'd) head at the legacy one, so only the head needs the key.
+        fixture.entries.pop();
+        fixture.heads[0].sequence = 0;
+        fixture.setKey(undefined);
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "hmac_key_unavailable" });
+    });
+
+    it("Reports head_missing when post-upgrade entries exist but the head row was deleted.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        fixture.heads.length = 0;
+
+        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 1, reason: "head_missing" });
+    });
+
+    it("Treats an empty chain with no head as valid.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+
+        expect(await fixture.verify()).toEqual({ valid: true });
+    });
+
+    it("Retries a head version conflict and still advances the head.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+        fixture.headRepo.update.mockRejectedValueOnce(new Error("version conflict"));
+
+        await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        expect(fixture.headRepo.update).toHaveBeenCalledTimes(2);
+        expect(fixture.heads[0].sequence).toBe(1);
+        expect(await fixture.verify()).toEqual({ valid: true });
+    });
+
+    it("Retries a racing head create by re-reading and updating the head instead.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        fixture.headRepo.create.mockImplementationOnce(async () => {
+            // A concurrent appender created the head first.
+            fixture.heads.push({ chainId: "global", sequence: -1, hash: "", version: 0 });
+            throw new Error("duplicate key");
+        });
+
+        await fixture.append();
+
+        expect(fixture.headRepo.update).toHaveBeenCalledTimes(1);
+        expect(fixture.heads[0].sequence).toBe(0);
+    });
+
+    it("Never moves the head backwards when a later append already advanced it.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        fixture.heads.push({ chainId: "global", sequence: 5, hash: "later", version: 3 });
+
+        await fixture.append();
+
+        expect(fixture.headRepo.update).not.toHaveBeenCalled();
+        expect(fixture.heads[0]).toMatchObject({ sequence: 5, hash: "later", version: 3 });
+    });
+
+    it("Logs, but does not throw, when the head can't be advanced - and verification tolerates the lagging head.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key" });
+        await fixture.append();
+        const realUpdate = fixture.headRepo.update.getMockImplementation()!;
+        fixture.headRepo.update.mockRejectedValue(new Error("db down"));
+
+        const entry = await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
+
+        expect(entry.sequence).toBe(1);
+        expect(fixture.logger.error).toHaveBeenCalledTimes(1);
+        expect(fixture.logger.error.mock.calls[0][0]).toContain("db down");
+        expect(fixture.heads[0].sequence).toBe(0);
+        expect(await fixture.verify()).toEqual({ valid: true });
+
+        // The next successful append heals the lag.
+        fixture.headRepo.update.mockImplementation(realUpdate);
+        await fixture.append({ action: EscrowAuditAction.MATERIAL_READ });
+        expect(fixture.heads[0].sequence).toBe(2);
+        expect(await fixture.verify()).toEqual({ valid: true });
+    });
+
+    it("Skips head maintenance entirely for an entry class with no head class.", async () => {
+        const fixture = makeChainFixture({ key: "secret-key", withHead: false });
+        await fixture.append();
+        fixture.entries.length = 0;
+
+        expect(fixture.headRepo.find).not.toHaveBeenCalled();
+        expect(await fixture.verify()).toEqual({ valid: true });
     });
 });

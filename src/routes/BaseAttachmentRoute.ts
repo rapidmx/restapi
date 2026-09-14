@@ -39,6 +39,15 @@ function escapeContentDispositionFilename(filename: string): string {
     return filename.replace(/[\r\n]/g, "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+/** `Attachment` fields only the server sets: the blob keys (`upload()`/extraction - a client-chosen key would read any
+ * stored object back through `download()`), the scan result, and the size/type measured at upload. */
+const SERVER_MANAGED_ATTACHMENT_FIELDS = ["blobKey", "extractedTextBlobKey", "scanResultUid", "sizeBytes", "mimeType"] as const;
+
+/** Types `download()` serves under their own `Content-Type` and, when `isInline`, `inline`: raster images only. Every
+ * other type - HTML, SVG, XML, PDF, scripts, anything a browser might render or execute in this origin - is served as
+ * an `application/octet-stream` download. */
+const INLINE_SAFE_MIME_TYPES: ReadonlySet<string> = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"]);
+
 /**
  * Extends `BaseScopedChildRoute` (scoped by `folderUid` — see the architecture note on `Message.mailboxUid`)
  * for `Attachment` with `upload`/`download` endpoints that move binary content through the configured
@@ -51,6 +60,8 @@ function escapeContentDispositionFilename(filename: string): string {
  */
 export abstract class BaseAttachmentRoute<T extends Attachment, M extends Message = Message> extends BaseScopedChildRoute<T> {
     protected readonly scopeProperty: string = "folderUid";
+
+    protected readonly serverManagedFields: readonly string[] = SERVER_MANAGED_ATTACHMENT_FIELDS;
 
     /** The class of the owning `Message` entity, supplied by the Mongo/SQL concrete subclass. */
     protected abstract messageClass: any;
@@ -79,6 +90,13 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
      * its actual folder's mailbox, the same reasoning already applied to `upload()`'s own comment above. */
     protected async resolveMailboxUidFor(scopeUid: string): Promise<string | undefined> {
         return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid);
+    }
+
+    /** Refused (400): an attachment record is only ever created by `upload()`, which stores the content and mints the
+     * blob key. A metadata-only create would either reference no content or a key the client chose. */
+    @Post()
+    public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Attachments are created with POST /upload.");
     }
 
     @Summary("Upload attachment")
@@ -164,11 +182,17 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         // streaming (e.g. an `HttpResponse.pipeFrom()` runtime primitive) if large-attachment memory use
         // becomes a real problem; deferred here the same way MAPI Fast Transfer streaming is deferred.
         const content: Buffer = await this.blobStore.get(attachment.blobKey);
-        res.setHeader("content-type", attachment.mimeType);
-        res.setHeader("content-length", attachment.sizeBytes);
+        // `mimeType` comes from the sender (or uploader), so only an allowlisted raster image keeps its type or is ever
+        // shown inline - anything else rendered in this origin (HTML, SVG, ...) would be stored XSS.
+        const baseType: string = String(attachment.mimeType ?? "").split(";")[0].trim().toLowerCase();
+        const inlineSafe: boolean = INLINE_SAFE_MIME_TYPES.has(baseType);
+        res.setHeader("content-type", inlineSafe ? baseType : "application/octet-stream");
+        res.setHeader("content-length", content.length);
+        res.setHeader("x-content-type-options", "nosniff");
+        res.setHeader("content-security-policy", "default-src 'none'; sandbox");
         res.setHeader(
             "content-disposition",
-            `${attachment.isInline ? "inline" : "attachment"}; filename="${escapeContentDispositionFilename(attachment.filename)}"`,
+            `${attachment.isInline && inlineSafe ? "inline" : "attachment"}; filename="${escapeContentDispositionFilename(attachment.filename)}"`,
         );
         res.send(content);
     }

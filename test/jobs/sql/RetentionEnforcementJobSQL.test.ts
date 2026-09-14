@@ -14,6 +14,8 @@ import { RetentionEnforcementJobSQL } from "../../../src/jobs/sql/RetentionEnfor
 import { AttachmentSQL } from "../../../src/models/sql/AttachmentSQL.js";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
+import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
+import { QuarantineEntrySQL } from "../../../src/models/sql/QuarantineEntrySQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
 import { RetentionPolicySQL } from "../../../src/models/sql/RetentionPolicySQL.js";
 import { AuditAction, AuditLogEntry, RecipientType } from "../../../src/models/types.js";
@@ -87,6 +89,8 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
         models.set("AuditLogEntrySQL", AuditLogEntrySQL);
         models.set("MatterSQL", MatterSQL);
         models.set("AttachmentSQL", AttachmentSQL);
+        models.set("QuarantineEntrySQL", QuarantineEntrySQL);
+        models.set("IngestQueueEntrySQL", IngestQueueEntrySQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");
@@ -265,6 +269,68 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
         await expect(job.run()).resolves.toBeUndefined();
 
         expect(await messageRepo.findOne({ where: { uid: old.uid } })).toBeNull();
+    });
+
+    it("Keeps an expired message's body and attachment blobs while another mailbox's copy still references them.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `ingest/${uuid.v4()}`;
+        const attachmentBlobKey = `attachments/${uuid.v4()}`;
+        await blobStore.put(bodyBlobKey, Buffer.from("raw"));
+        await blobStore.put(attachmentBlobKey, Buffer.from("attachment"));
+        const old = await createMessage({ bodyBlobKey, sentDate: new Date(Date.now() - 35 * DAY_MS) });
+        const recent = await createMessage({ bodyBlobKey });
+        for (const message of [old, recent]) {
+            await attachmentRepo.save(
+                new AttachmentSQL({ mailboxUid: message.mailboxUid, folderUid: message.folderUid, messageUid: message.uid, filename: "a.txt", mimeType: "text/plain", blobKey: attachmentBlobKey }),
+            );
+        }
+
+        await job.run();
+
+        expect(await messageRepo.findOne({ where: { uid: old.uid } })).toBeNull();
+        expect(await blobStore.exists(bodyBlobKey)).toBe(true);
+        expect(await blobStore.exists(attachmentBlobKey)).toBe(true);
+    });
+
+    it("Purges later expired messages in the same run when earlier ones are held or fail to purge, instead of re-reading the same stuck rows.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
+        (job as any).batchSize = 1;
+        const heldMailboxUid = uuid.v4();
+        await createMatter({ custodianMailboxUids: [heldMailboxUid] });
+        const held1 = await createMessage({ mailboxUid: heldMailboxUid, sentDate: new Date(Date.now() - 50 * DAY_MS) });
+        const held2 = await createMessage({ mailboxUid: heldMailboxUid, sentDate: new Date(Date.now() - 49 * DAY_MS) });
+        const failing = await createMessage({ sentDate: new Date(Date.now() - 45 * DAY_MS) });
+        const purgeable = await createMessage({ sentDate: new Date(Date.now() - 40 * DAY_MS) });
+        const repo = (job as any).messageRepo;
+        const originalDelete = repo.delete.bind(repo);
+        vi.spyOn(repo, "delete").mockImplementation(async (uid: any, options: any) => {
+            if (uid === failing.uid) {
+                throw new Error("simulated database failure");
+            }
+            return await originalDelete(uid, options);
+        });
+
+        await job.run();
+
+        expect(await messageRepo.findOne({ where: { uid: held1.uid } })).not.toBeNull();
+        expect(await messageRepo.findOne({ where: { uid: held2.uid } })).not.toBeNull();
+        expect(await messageRepo.findOne({ where: { uid: failing.uid } })).not.toBeNull();
+        expect(await messageRepo.findOne({ where: { uid: purgeable.uid } })).toBeNull();
+    });
+
+    it("Purges a later expired AuditLogEntry in the same run when an earlier one is held.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", auditLogRetentionDays: 2190 }));
+        (job as any).batchSize = 1;
+        const heldMailboxUid = uuid.v4();
+        await createMatter({ custodianMailboxUids: [heldMailboxUid], dateRangeStart: new Date("2000-01-01"), dateRangeEnd: new Date("2030-01-01") });
+        const held = await createAuditLogEntry({ mailboxUid: heldMailboxUid, dateCreated: new Date(Date.now() - 2300 * DAY_MS) });
+        const orgWide = await createAuditLogEntry({ dateCreated: new Date(Date.now() - 2200 * DAY_MS) });
+
+        await job.run();
+
+        expect(await auditLogRepo.findOne({ where: { uid: held.uid } })).not.toBeNull();
+        expect(await auditLogRepo.findOne({ where: { uid: orgWide.uid } })).toBeNull();
     });
 
     it("Keeps a message within the retention window.", async () => {

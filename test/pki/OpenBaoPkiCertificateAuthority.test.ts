@@ -106,7 +106,32 @@ describe("OpenBaoPkiCertificateAuthority Tests", () => {
         expect(map[issued.fingerprint]).toBe(serialNumber);
     });
 
-    it("A failed recordSerial() write doesn't poison serialMapQueue for the next issue() call.", async () => {
+    it("Concurrent issue() calls across two instances sharing a serial map never lose an entry.", async () => {
+        const other = new OpenBaoPkiCertificateAuthority();
+        Object.assign(other as any, {
+            address: (authority as any).address,
+            mount: "pki",
+            role: "rapidmx",
+            token: "test-token",
+            serialMapPath: (authority as any).serialMapPath,
+        });
+        const certs = await Promise.all(Array.from({ length: 10 }, (_, i) => makeSignedCertPem(`bulk${i}@example.com`)));
+        let next = 0;
+        mockFetch.mockImplementation(async () => {
+            const cert = certs[next++];
+            return makeFetchResponse({ json: vi.fn().mockResolvedValue({ data: { certificate: cert.pem, serial_number: cert.serialNumber } }) });
+        });
+
+        const issued: IssuedCertificate[] = await Promise.all(certs.map((_, i) => (i % 2 ? other : authority).issue(`bulk${i}@example.com`, "csr")));
+
+        const map = JSON.parse(await fs.readFile((authority as any).serialMapPath, "utf-8"));
+        expect(Object.keys(map)).toHaveLength(10);
+        for (const result of issued) {
+            expect(map[result.fingerprint]).toBe(result.serialNumber);
+        }
+    });
+
+    it("A failed recordSerial() write doesn't block the next issue() call.", async () => {
         const dirAsFile: string = path.join(tmpDir, `a-directory-not-a-file-${Math.random()}.json`);
         await fs.mkdir(dirAsFile, { recursive: true });
         (authority as any).serialMapPath = dirAsFile;

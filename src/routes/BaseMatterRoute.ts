@@ -14,6 +14,7 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { coerceDateFields, MATTER_DATE_FIELDS } from "../util/DateCoercionUtils.js";
 import { findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
 import { AuditAction, Matter } from "../models/types.js";
 const { Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
@@ -43,6 +44,22 @@ function validateMatter(o: Partial<Matter>): void {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "dateRangeStart must be before dateRangeEnd.");
         }
     }
+}
+
+/**
+ * Returns a copy of a client-supplied list query without any `$`-prefixed key (`$or`, ...) or any of `forcedKeys`.
+ * The SQL backend composes a `$or` branch's keys OVER the other filters (`{ ...filters, ...orBranch }`), so a
+ * client `$or: [{ escrowScopeId: "someone-elses" }]` would otherwise replace the held-scope restriction this
+ * route forces - and a forced key is set by this route alone, never by the client.
+ */
+function stripClientQuery(query: any, forcedKeys: readonly string[]): Record<string, any> {
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(query ?? {})) {
+        if (!key.startsWith("$") && !forcedKeys.includes(key)) {
+            result[key] = value;
+        }
+    }
+    return result;
 }
 
 /**
@@ -87,6 +104,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "escrowScopeId is required.");
             }
             await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, o.escrowScopeId, user);
+            coerceDateFields(o, MATTER_DATE_FIELDS);
             validateMatter(o);
         }
 
@@ -150,6 +168,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         if ((obj as any).escrowScopeId !== undefined && (obj as any).escrowScopeId !== existing.escrowScopeId) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A matter's escrow scope cannot be changed after creation.");
         }
+        coerceDateFields(obj, MATTER_DATE_FIELDS);
         validateMatter({ ...existing, ...obj });
 
         const updated: T = await this.repoUtils!.update(obj, existing, { user, version: (obj as any).version, ignoreACL: true });
@@ -200,6 +219,9 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         if (propertyName === "escrowScopeId" && obj !== existing.escrowScopeId) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A matter's escrow scope cannot be changed after creation.");
         }
+        if ((MATTER_DATE_FIELDS as readonly string[]).includes(propertyName)) {
+            obj = coerceDateFields({ [propertyName]: obj }, MATTER_DATE_FIELDS)[propertyName];
+        }
         validateMatter({ ...existing, [propertyName]: obj });
 
         const updated: T = await this.repoUtils!.update(
@@ -234,7 +256,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         if (heldScopeIds.length === 0) {
             return;
         }
-        const scopedQuery = { ...query, ...params, escrowScopeId: `in(${heldScopeIds.join(",")})` };
+        const scopedQuery = { ...stripClientQuery(query, ["escrowScopeId"]), ...params, escrowScopeId: `in(${heldScopeIds.join(",")})` };
         const findOptions = { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true };
         const matched: T[] = await this.repoUtils!.find(scopedQuery, findOptions);
         if (matched.length === 0) {
@@ -309,7 +331,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             return [];
         }
         return await this.repoUtils!.find(
-            { ...query, ...params, escrowScopeId: `in(${heldScopeIds.join(",")})` },
+            { ...stripClientQuery(query, ["escrowScopeId"]), ...params, escrowScopeId: `in(${heldScopeIds.join(",")})` },
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
     }
@@ -325,7 +347,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             return res.status(200).setHeader("content-length", 0);
         }
         const result: number = await this.repoUtils!.count(
-            { ...query, ...params, escrowScopeId: `in(${heldScopeIds.join(",")})` },
+            { ...stripClientQuery(query, ["escrowScopeId"]), ...params, escrowScopeId: `in(${heldScopeIds.join(",")})` },
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
         return res.status(200).setHeader("content-length", result);

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { buildEventIcs, expandOccurrences, parseIcsEvent } from "../../src/util/IcsUtils.js";
+import { buildEventIcs, convertLocalToUtc, expandOccurrences, parseIcsEvent, resolveTimeZone } from "../../src/util/IcsUtils.js";
 import {
     Attendee,
     AttendeeResponseStatus,
@@ -269,19 +269,82 @@ describe("buildEventIcs() / parseIcsEvent() Tests", () => {
             expect(parsed.startDate!.toISOString()).toBe("2026-06-15T19:00:00.000Z");
         });
 
-        it("Falls back to treating the value as UTC when TZID isn't a recognized IANA name.", () => {
+        it("Falls back to treating the value as UTC when TZID is neither an IANA name nor a known Windows zone name.", () => {
             const raw = [
                 "BEGIN:VCALENDAR",
                 "METHOD:REQUEST",
                 "BEGIN:VEVENT",
                 "UID:u1",
-                "DTSTART;TZID=Pacific Standard Time:20260615T120000",
+                "DTSTART;TZID=Not A Real Zone:20260615T120000",
                 "SEQUENCE:0",
                 "END:VEVENT",
                 "END:VCALENDAR",
             ].join("\r\n");
             const parsed = parseIcsEvent(raw)!;
             expect(parsed.startDate!.toISOString()).toBe("2026-06-15T12:00:00.000Z");
+            expect(parsed.timezone).toBeUndefined();
+        });
+
+        it("Maps a Windows zone name TZID (as classic Outlook emits) to its IANA zone.", () => {
+            const raw = [
+                "BEGIN:VCALENDAR",
+                "METHOD:REQUEST",
+                "BEGIN:VEVENT",
+                "UID:u1",
+                "DTSTART;TZID=Pacific Standard Time:20260615T120000",
+                'DTEND;TZID="W. Europe Standard Time":20260615T210000',
+                "SEQUENCE:0",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            ].join("\r\n");
+            const parsed = parseIcsEvent(raw)!;
+            expect(parsed.startDate!.toISOString()).toBe("2026-06-15T19:00:00.000Z");
+            // 21:00 CEST (UTC+2) -> 19:00 UTC.
+            expect(parsed.endDate!.toISOString()).toBe("2026-06-15T19:00:00.000Z");
+            expect(parsed.timezone).toBe("America/Los_Angeles");
+        });
+
+        it("Strips a DQUOTE-wrapped TZID value, and other quoted parameter values (even ones containing ':' or ';').", () => {
+            const raw = [
+                "BEGIN:VCALENDAR",
+                "METHOD:REQUEST",
+                "BEGIN:VEVENT",
+                "UID:u1",
+                'DTSTART;TZID="America/New_York":20260115T090000',
+                'ORGANIZER;CN="Doe; John: Org":mailto:org@example.com',
+                "SEQUENCE:0",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            ].join("\r\n");
+            const parsed = parseIcsEvent(raw)!;
+            expect(parsed.startDate!.toISOString()).toBe("2026-01-15T14:00:00.000Z");
+            expect(parsed.timezone).toBe("America/New_York");
+            expect(parsed.organizer).toEqual({ address: "org@example.com", displayName: "Doe; John: Org" });
+        });
+
+        it("resolveTimeZone() handles IANA names, Windows names (case-insensitive), quotes, and junk.", () => {
+            expect(resolveTimeZone("Europe/Paris")).toBe("Europe/Paris");
+            expect(resolveTimeZone('"Eastern Standard Time"')).toBe("America/New_York");
+            expect(resolveTimeZone("tokyo standard time")).toBe("Asia/Tokyo");
+            expect(resolveTimeZone("UTC")).toBe("UTC");
+            expect(resolveTimeZone("AUS Eastern Standard Time")).toBe("Australia/Sydney");
+            expect(resolveTimeZone("Not/AZone")).toBeUndefined();
+            expect(resolveTimeZone('""')).toBeUndefined();
+            expect(resolveTimeZone(undefined)).toBeUndefined();
+        });
+
+        it("convertLocalToUtc() is correct right around DST transitions (skipped and repeated wall-clock times).", () => {
+            // 2026-03-08 02:30 doesn't exist in New York (clocks jump 02:00 EST -> 03:00 EDT): RFC 5545 says use
+            // the pre-gap offset (EST, -5) -> 07:30Z.
+            expect(convertLocalToUtc(2026, 3, 8, 2, 30, 0, "America/New_York")!.toISOString()).toBe("2026-03-08T07:30:00.000Z");
+            // Just after the jump - 03:30 EDT (-4).
+            expect(convertLocalToUtc(2026, 3, 8, 3, 30, 0, "America/New_York")!.toISOString()).toBe("2026-03-08T07:30:00.000Z");
+            // Just before - 01:30 EST (-5).
+            expect(convertLocalToUtc(2026, 3, 8, 1, 30, 0, "America/New_York")!.toISOString()).toBe("2026-03-08T06:30:00.000Z");
+            // 2026-11-01 01:30 happens twice: the first (EDT, -4) wins.
+            expect(convertLocalToUtc(2026, 11, 1, 1, 30, 0, "America/New_York")!.toISOString()).toBe("2026-11-01T05:30:00.000Z");
+            expect(convertLocalToUtc(2026, 11, 1, 2, 30, 0, "America/New_York")!.toISOString()).toBe("2026-11-01T07:30:00.000Z");
+            expect(convertLocalToUtc(2026, 1, 1, 0, 0, 0, "Bogus/Zone")).toBeUndefined();
         });
 
         it("Falls back to UTC for a bare DATE-TIME value with no Z and no TZID.", () => {
@@ -386,7 +449,7 @@ describe("buildEventIcs() / parseIcsEvent() Tests", () => {
             ]);
         });
 
-        it("MONTHLY with BYDAY matches every occurrence of that weekday in the month (no ordinal support).", () => {
+        it("MONTHLY with a plain (non-ordinal) BYDAY matches every occurrence of that weekday in the month.", () => {
             const occurrences = expandOccurrences(
                 { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.MONTHLY, interval: 1, byDay: ["MO"], exceptions: [] } },
                 startDate,
@@ -523,13 +586,247 @@ describe("buildEventIcs() / parseIcsEvent() Tests", () => {
             expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-06-15T19:00:00.000Z", "2026-06-17T19:00:00.000Z"]);
         });
 
-        it("An indefinitely-recurring rule (no COUNT/UNTIL) is bounded by MAX_SCAN_DAYS/MAX_OCCURRENCES rather than hanging.", () => {
+        it("An indefinitely-recurring rule (no COUNT/UNTIL) is bounded by MAX_OCCURRENCES rather than hanging.", () => {
             const occurrences = expandOccurrences(
                 { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] } },
                 startDate,
                 new Date("2036-06-15T23:59:59.000Z"),
             );
             expect(occurrences.length).toBe(500);
+        });
+
+        it("Expands a long-running series (started years before the window) in today's window - no scan cap from the series start.", () => {
+            const occurrences = expandOccurrences(
+                {
+                    startDate: new Date("2019-01-07T15:00:00.000Z"),
+                    endDate: new Date("2019-01-07T15:15:00.000Z"),
+                    recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] },
+                },
+                new Date("2026-06-15T00:00:00.000Z"),
+                new Date("2026-06-17T00:00:00.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-06-15T15:00:00.000Z", "2026-06-16T15:00:00.000Z"]);
+
+            const weekly = expandOccurrences(
+                {
+                    startDate: new Date("2018-01-03T15:00:00.000Z"), // a Wednesday
+                    endDate: new Date("2018-01-03T16:00:00.000Z"),
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 2, byDay: ["WE"], exceptions: [] },
+                },
+                new Date("2026-06-01T00:00:00.000Z"),
+                new Date("2026-06-30T00:00:00.000Z"),
+            );
+            // Every other Wednesday from 2018-01-03 (2026-06-10 is exactly 440 weeks later).
+            expect(weekly.map((o) => o.start.toISOString())).toEqual(["2026-06-10T15:00:00.000Z", "2026-06-24T15:00:00.000Z"]);
+
+            const monthly = expandOccurrences(
+                {
+                    startDate: new Date("2010-03-31T12:00:00.000Z"),
+                    endDate: new Date("2010-03-31T13:00:00.000Z"),
+                    recurrenceRule: { freq: RecurrenceFrequency.MONTHLY, interval: 3, exceptions: [] },
+                },
+                new Date("2026-01-01T00:00:00.000Z"),
+                new Date("2027-01-01T00:00:00.000Z"),
+            );
+            // Every 3rd month on the 31st - months without a 31st (June, September) are skipped, per RFC 5545.
+            expect(monthly.map((o) => o.start.toISOString())).toEqual(["2026-03-31T12:00:00.000Z", "2026-12-31T12:00:00.000Z"]);
+        });
+
+        it("COUNT is still counted from the series start even when the window is far later.", () => {
+            const rule = { freq: RecurrenceFrequency.DAILY, interval: 1, count: 2000, exceptions: [] };
+            const event = { startDate: new Date("2020-01-01T10:00:00.000Z"), endDate: new Date("2020-01-01T11:00:00.000Z"), recurrenceRule: rule };
+            // Occurrence #2000 is 2020-01-01 + 1999 days = 2025-06-22.
+            const occurrences = expandOccurrences(event, new Date("2025-06-20T00:00:00.000Z"), new Date("2025-06-30T00:00:00.000Z"));
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual([
+                "2025-06-20T10:00:00.000Z",
+                "2025-06-21T10:00:00.000Z",
+                "2025-06-22T10:00:00.000Z",
+            ]);
+        });
+
+        it("MONTHLY with an ordinal BYDAY (2TU = second Tuesday, -1FR = last Friday).", () => {
+            const secondTuesday = expandOccurrences(
+                {
+                    startDate: new Date("2026-01-13T17:00:00.000Z"),
+                    endDate: new Date("2026-01-13T18:00:00.000Z"),
+                    recurrenceRule: { freq: RecurrenceFrequency.MONTHLY, interval: 1, byDay: ["2TU"], exceptions: [] },
+                },
+                new Date("2026-01-01T00:00:00.000Z"),
+                new Date("2026-04-30T00:00:00.000Z"),
+            );
+            expect(secondTuesday.map((o) => o.start.toISOString())).toEqual([
+                "2026-01-13T17:00:00.000Z",
+                "2026-02-10T17:00:00.000Z",
+                "2026-03-10T17:00:00.000Z",
+                "2026-04-14T17:00:00.000Z",
+            ]);
+
+            const lastFriday = expandOccurrences(
+                {
+                    startDate: new Date("2026-01-30T17:00:00.000Z"),
+                    endDate: new Date("2026-01-30T18:00:00.000Z"),
+                    recurrenceRule: { freq: RecurrenceFrequency.MONTHLY, interval: 1, byDay: ["-1FR"], count: 3, exceptions: [] },
+                },
+                new Date("2026-01-01T00:00:00.000Z"),
+                new Date("2026-12-31T00:00:00.000Z"),
+            );
+            expect(lastFriday.map((o) => o.start.toISOString())).toEqual(["2026-01-30T17:00:00.000Z", "2026-02-27T17:00:00.000Z", "2026-03-27T17:00:00.000Z"]);
+        });
+
+        it("MONTHLY with a negative BYMONTHDAY (-1 = last day of the month).", () => {
+            const occurrences = expandOccurrences(
+                {
+                    startDate: new Date("2026-01-31T09:00:00.000Z"),
+                    endDate: new Date("2026-01-31T10:00:00.000Z"),
+                    recurrenceRule: { freq: RecurrenceFrequency.MONTHLY, interval: 1, byMonthDay: [-1], exceptions: [] },
+                },
+                new Date("2026-01-01T00:00:00.000Z"),
+                new Date("2026-03-31T23:00:00.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-01-31T09:00:00.000Z", "2026-02-28T09:00:00.000Z", "2026-03-31T09:00:00.000Z"]);
+        });
+
+        it("YEARLY with BYMONTH + ordinal BYDAY (US Thanksgiving: 4th Thursday of November).", () => {
+            const occurrences = expandOccurrences(
+                {
+                    startDate: new Date("2026-11-26T17:00:00.000Z"),
+                    endDate: new Date("2026-11-26T18:00:00.000Z"),
+                    recurrenceRule: { freq: RecurrenceFrequency.YEARLY, interval: 1, byMonth: [11], byDay: ["4TH"], exceptions: [] },
+                },
+                new Date("2026-01-01T00:00:00.000Z"),
+                new Date("2028-12-31T00:00:00.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-11-26T17:00:00.000Z", "2027-11-25T17:00:00.000Z", "2028-11-23T17:00:00.000Z"]);
+        });
+
+        it("Steps in the event's own time zone, so local time of day survives a DST change (America/New_York).", () => {
+            // Mondays 09:00 New York: EST (UTC-5) before 2026-03-08, EDT (UTC-4) after.
+            const occurrences = expandOccurrences(
+                {
+                    startDate: new Date("2026-03-02T14:00:00.000Z"),
+                    endDate: new Date("2026-03-02T15:00:00.000Z"),
+                    timezone: "America/New_York",
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+                },
+                new Date("2026-03-01T00:00:00.000Z"),
+                new Date("2026-03-17T00:00:00.000Z"),
+                [new Date("2026-03-16T13:00:00.000Z")],
+            );
+            expect(occurrences.map((o) => [o.start.toISOString(), o.end.toISOString()])).toEqual([
+                ["2026-03-02T14:00:00.000Z", "2026-03-02T15:00:00.000Z"],
+                ["2026-03-09T13:00:00.000Z", "2026-03-09T14:00:00.000Z"],
+            ]);
+        });
+
+        it("Accepts a Windows zone name as the event timezone, and matches BYDAY against the local (not UTC) weekday.", () => {
+            // Tuesday 2026-06-16 18:00 in Los Angeles is Wednesday 01:00 UTC - BYDAY=TU must match the local day.
+            const occurrences = expandOccurrences(
+                {
+                    startDate: new Date("2026-06-17T01:00:00.000Z"),
+                    endDate: new Date("2026-06-17T02:00:00.000Z"),
+                    timezone: "Pacific Standard Time",
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, byDay: ["TU"], exceptions: [] },
+                },
+                new Date("2026-06-16T00:00:00.000Z"),
+                new Date("2026-06-25T00:00:00.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-06-17T01:00:00.000Z", "2026-06-24T01:00:00.000Z"]);
+        });
+
+        it("Expands an allDay event in UTC regardless of its timezone, and coerces string-typed persisted dates.", () => {
+            const occurrences = expandOccurrences(
+                {
+                    startDate: "2026-03-07T00:00:00.000Z",
+                    endDate: "2026-03-08T00:00:00.000Z",
+                    allDay: true,
+                    timezone: "America/New_York",
+                    recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, until: "2026-03-09T00:00:00.000Z" as any, exceptions: [] },
+                },
+                new Date("2026-03-01T00:00:00.000Z"),
+                new Date("2026-03-20T00:00:00.000Z"),
+                ["2026-03-08T00:00:00.000Z"],
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-03-07T00:00:00.000Z", "2026-03-09T00:00:00.000Z"]);
+        });
+
+        it("WEEKLY interval > 1 aligns weeks on Monday (WKST=MO) - a Monday BYDAY before a mid-week start belongs to the start's own week.", () => {
+            // Starts Wednesday 2026-06-17, every 2 weeks on MO,WE: week of 06-15 (its Monday is before DTSTART, so
+            // skipped), then week of 06-29.
+            const occurrences = expandOccurrences(
+                {
+                    startDate: new Date("2026-06-17T19:00:00.000Z"),
+                    endDate: new Date("2026-06-17T20:00:00.000Z"),
+                    recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 2, byDay: ["MO", "WE"], exceptions: [] },
+                },
+                new Date("2026-06-01T00:00:00.000Z"),
+                new Date("2026-07-05T00:00:00.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-06-17T19:00:00.000Z", "2026-06-29T19:00:00.000Z", "2026-07-01T19:00:00.000Z"]);
+        });
+
+        it("MONTHLY with both BYMONTHDAY and BYDAY matches only their intersection (Friday the 13th).", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.MONTHLY, interval: 1, byMonthDay: [13], byDay: ["FR"], exceptions: [] } },
+                startDate,
+                new Date("2027-01-01T00:00:00.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-11-13T19:00:00.000Z"]);
+        });
+
+        it("DAILY with BYMONTHDAY and BYDAY only keeps days matching both (a month's last day that's also a Tuesday).", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, byMonthDay: [-1], byDay: ["TU"], exceptions: [] } },
+                startDate,
+                new Date("2026-07-31T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-06-30T19:00:00.000Z"]);
+        });
+
+        it("DAILY with BYMONTH only keeps days in the named month(s), counting COUNT from there.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, byMonth: [7], count: 2, exceptions: [] } },
+                startDate,
+                new Date("2026-12-31T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-07-01T19:00:00.000Z", "2026-07-02T19:00:00.000Z"]);
+        });
+
+        it("YEARLY with BYMONTHDAY but no BYMONTH repeats on that day of every month.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.YEARLY, interval: 1, byMonthDay: [15], exceptions: [] } },
+                startDate,
+                new Date("2026-08-16T00:00:00.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2026-06-15T19:00:00.000Z", "2026-07-15T19:00:00.000Z", "2026-08-15T19:00:00.000Z"]);
+        });
+
+        it("YEARLY with an ordinal BYDAY but no BYMONTH counts within the whole year (20th Monday).", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.YEARLY, interval: 1, byDay: ["20MO"], exceptions: [] } },
+                startDate,
+                new Date("2027-12-31T23:59:59.000Z"),
+            );
+            // 2026's 20th Monday (May 18) is before DTSTART; 2027's is May 17.
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2027-05-17T19:00:00.000Z"]);
+        });
+
+        it("YEARLY with no COUNT jumps straight to a window years after the series start.", () => {
+            const occurrences = expandOccurrences(
+                { startDate, endDate, recurrenceRule: { freq: RecurrenceFrequency.YEARLY, interval: 1, exceptions: [] } },
+                new Date("2030-01-01T00:00:00.000Z"),
+                new Date("2031-12-31T23:59:59.000Z"),
+            );
+            expect(occurrences.map((o) => o.start.toISOString())).toEqual(["2030-06-15T19:00:00.000Z", "2031-06-15T19:00:00.000Z"]);
+        });
+    });
+
+    describe("resolveTimeZone() formatter cache", () => {
+        it("Keeps resolving correctly after the cache is reset by a flood of distinct unknown zone names.", () => {
+            for (let i = 0; i < 1002; i++) {
+                expect(resolveTimeZone(`Not/A_Real_Zone_${i}`)).toBeUndefined();
+            }
+            expect(resolveTimeZone("America/New_York")).toBe("America/New_York");
+            expect(resolveTimeZone("Not/A_Real_Zone_0")).toBeUndefined();
         });
     });
 });

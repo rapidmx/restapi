@@ -24,6 +24,7 @@ const { Column, Entity, Index } = PersistenceDecorators;
 )
 @Index("ingestqueue_status", ["status"])
 @Index("ingestqueue_mailbox", ["mailboxUid"])
+@Index("ingestqueue_raw_blob_key", ["rawBlobKey"])
 @Protect(
     {
         uid: "IngestQueueEntry",
@@ -59,7 +60,7 @@ export class IngestQueueEntrySQL extends BaseEntity implements IngestQueueEntry 
     @Description("The current processing status of this queue entry.")
     public status: IngestStatus = IngestStatus.PENDING;
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("The error message recorded if processing failed, if any.")
     @Nullable
     public errorMessage?: string;
@@ -69,6 +70,21 @@ export class IngestQueueEntrySQL extends BaseEntity implements IngestQueueEntry 
     @Description("Set when a `TransportRule`'s `quarantine` action matched this message.")
     @Nullable
     public quarantineReason?: QuarantineReason;
+
+    @Column({ nullable: true })
+    @Description("How many times `ScanQueueJob` has failed to process this entry - unset until the first failure.")
+    @Nullable
+    public attempts?: number;
+
+    @Column({ nullable: true })
+    @Description("When a failed entry becomes eligible to be retried - unset when it isn't waiting for a retry.")
+    @Nullable
+    public nextAttemptAt?: Date;
+
+    @Column({ nullable: true })
+    @Description("While scanning, when this claim expires and another worker may take the entry over.")
+    @Nullable
+    public scanLeaseExpiresAt?: Date;
 
     constructor(other?: Partial<IngestQueueEntrySQL>) {
         super(other);
@@ -81,6 +97,9 @@ export class IngestQueueEntrySQL extends BaseEntity implements IngestQueueEntry 
             this.status = other.status !== undefined ? other.status : this.status;
             this.errorMessage = "errorMessage" in other ? other.errorMessage : this.errorMessage;
             this.quarantineReason = "quarantineReason" in other ? other.quarantineReason : this.quarantineReason;
+            this.attempts = "attempts" in other ? other.attempts : this.attempts;
+            this.nextAttemptAt = "nextAttemptAt" in other ? other.nextAttemptAt : this.nextAttemptAt;
+            this.scanLeaseExpiresAt = "scanLeaseExpiresAt" in other ? other.scanLeaseExpiresAt : this.scanLeaseExpiresAt;
         }
     }
 }

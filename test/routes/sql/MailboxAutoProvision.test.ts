@@ -12,11 +12,12 @@ config.set("mail:auto_provision:enabled", true);
 config.set("mail:auth_server_url", "http://auth.test");
 
 import { request } from "@rapidrest/service-core/test";
-import { Server, ObjectFactory, ConnectionManager, isSqlDataSource } from "@rapidrest/service-core";
+import { AccessControlListSQL, Server, ObjectFactory, ConnectionManager, isSqlDataSource } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
+import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MailboxPolicySQL } from "../../../src/models/sql/MailboxPolicySQL.js";
 import { MAILBOX_POLICY_UID } from "../../../src/util/MailboxPolicyUtils.js";
@@ -89,6 +90,16 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
 
     beforeEach(async () => {
         await repo.clear();
+        // Clearing mailboxes alone leaves their folders and ACLs behind, and creating a mailbox at an address with a
+        // deleted mailbox's leftovers is refused (409) - these tests reuse fixed addresses.
+        const connMgr: ConnectionManager | undefined = objectFactory.getInstance(ConnectionManager);
+        await (connMgr?.connections.get("sql") as any).getRepository(FolderSQL).clear();
+        await (connMgr?.connections.get("acl") as any)
+            .getRepository(AccessControlListSQL)
+            .createQueryBuilder()
+            .delete()
+            .where("uid LIKE :pattern", { pattern: "%@%" })
+            .execute();
         // The mailbox policy is seeded from config on first use and SQL test files share a database, so a row
         // another suite seeded (with auto-provisioning off) must not leak into this one.
         await policyRepo.clear();

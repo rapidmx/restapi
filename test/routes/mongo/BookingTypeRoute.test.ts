@@ -8,9 +8,12 @@ import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionMana
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { BookingTypeMongo } from "../../../src/models/mongo/BookingTypeMongo.js";
+import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
+import { FolderType } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { bookingTypeFolderSuite } from "../bookingTypeFolderSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -26,6 +29,7 @@ describe("Route:BookingTypeMongo Tests", () => {
     const baseUrl = "/mongo/booking-types";
     let mailboxRepo: MongoRepository<MailboxMongo>;
     let bookingTypeRepo: MongoRepository<BookingTypeMongo>;
+    let folderRepo: MongoRepository<FolderMongo>;
     let aclRepo: MongoRepository<any>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -52,13 +56,35 @@ describe("Route:BookingTypeMongo Tests", () => {
             records: [{ userOrRoleId: ownerUid, actions: [ACLAction.FULL] }],
             parentUid: "Mailbox",
         });
+        await createCalendarFolder(result.uid);
         return result;
+    };
+
+    /** Every test mailbox gets a calendar folder (its ACL parented to the mailbox, as `BaseFolderRoute` creates
+     * them), which `body()` uses as the booking type's `calendarFolderUid`. */
+    const calendarFolders: Map<string, string> = new Map();
+    const createCalendarFolder = async function (mailboxUid: string, type: FolderType = FolderType.CALENDAR): Promise<FolderMongo> {
+        const folder: FolderMongo = await folderRepo.save(
+            new FolderMongo({ mailboxUid, name: "Calendar", type, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+        );
+        await aclRepo.save({
+            uid: folder.uid,
+            dateCreated: new Date(),
+            dateModified: new Date(),
+            version: 0,
+            records: [],
+            parentUid: mailboxUid,
+        });
+        if (type === FolderType.CALENDAR && !calendarFolders.has(mailboxUid)) {
+            calendarFolders.set(mailboxUid, folder.uid);
+        }
+        return folder;
     };
 
     /** A valid create body - every test varies one field of it. */
     const body = (mailboxUid: string, overrides?: any) => ({
         mailboxUid,
-        calendarFolderUid: uuid.v4(),
+        calendarFolderUid: calendarFolders.get(mailboxUid) ?? uuid.v4(),
         slug: `intro-${uuid.v4()}`,
         name: "Intro Call",
         hostDisplayName: "Ada Lovelace",
@@ -89,6 +115,7 @@ describe("Route:BookingTypeMongo Tests", () => {
         if (conn instanceof MongoConnection) {
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
             bookingTypeRepo = conn.getMongoRepository("BookingTypeMongo");
+            folderRepo = conn.getMongoRepository("FolderMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -101,7 +128,7 @@ describe("Route:BookingTypeMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, bookingTypeRepo]) {
+        for (const repo of [mailboxRepo, bookingTypeRepo, folderRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -146,6 +173,7 @@ describe("Route:BookingTypeMongo Tests", () => {
                 records: [{ userOrRoleId: otherUser.uid, actions }],
                 parentUid: "Mailbox",
             });
+            await createCalendarFolder(result.uid);
             return result;
         };
 
@@ -372,5 +400,15 @@ describe("Route:BookingTypeMongo Tests", () => {
 
             expect(result.status).toBe(403);
         });
+    });
+    bookingTypeFolderSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        ownerUid: owner.uid,
+        ownerToken,
+        otherUserUid: otherUser.uid,
+        createMailbox,
+        createCalendarFolder,
+        body,
     });
 });

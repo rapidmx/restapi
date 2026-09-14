@@ -132,6 +132,10 @@ export interface KeyVault extends BaseEntity {
     wrappedKeys: WrappedPrivateKey[];
 
     masterKeyWraps: MasterKeyWrap[];
+
+    /** Server-managed: fingerprint of the signing certificate `AcmeEnrollmentDriverJob` last recorded a
+     * `SIGNING_CERT_EXPIRING` audit entry for - so that entry is written once per certificate, not every run. */
+    expiryAuditedFingerprint?: string;
 }
 
 /** A scope's own public key, used only so a client can wrap a mailbox's master key against it - the server
@@ -319,8 +323,12 @@ export interface EscrowAuditLogEntry extends BaseEntity {
     /** The immediately-preceding entry's `hash`. `undefined` only for the very first entry (`sequence === 0`). */
     previousHash?: string;
 
-    /** SHA-256 hex digest over this entry's own content plus `previousHash`. */
+    /** Hex digest over this entry's own content plus `previousHash`, computed with `hashAlgorithm`. */
     hash: string;
+
+    /** The scheme `hash` was computed with. Absent (`undefined`/`null`) = a pre-HMAC legacy entry, verified
+     * with plain SHA-256 - see `EscrowAuditUtils.ts`. */
+    hashAlgorithm?: EscrowAuditHashAlgorithm;
 
     action: EscrowAuditAction;
 
@@ -339,6 +347,40 @@ export interface EscrowAuditLogEntry extends BaseEntity {
     occurredAt: Date;
 
     details?: Record<string, any>;
+}
+
+/** The hash scheme an `EscrowAuditLogEntry`'s `hash` (or an `EscrowAuditHead`'s `mac`) was computed with. */
+export enum EscrowAuditHashAlgorithm {
+    /** Unkeyed SHA-256 - written only when `mail:escrow:audit_hmac_key` is unset. Rewritable by anyone with DB
+     * write access; kept for backward compatibility. */
+    SHA256 = "sha256",
+    /** HMAC-SHA256 keyed by `mail:escrow:audit_hmac_key`. */
+    HMAC_SHA256 = "hmac-sha256",
+}
+
+/**
+ * The singleton (one row per `chainId`, currently always `"global"`) record of the escrow audit chain's
+ * latest `sequence`/`hash`, stored separately from the entries themselves so deleting the chain's tail is
+ * detectable by `EscrowAuditUtils.verifyEscrowAuditChain()` - see that file.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface EscrowAuditHead extends BaseEntity {
+    /** Identifies which chain this head belongs to. Unique. */
+    chainId: string;
+
+    /** The `sequence` of the latest entry appended to the chain. */
+    sequence: number;
+
+    /** The `hash` of the latest entry appended to the chain. */
+    hash: string;
+
+    /** `HMAC_SHA256` when `mac` is set; absent when the head was written without an HMAC key. */
+    hashAlgorithm?: EscrowAuditHashAlgorithm;
+
+    /** HMAC-SHA256 over `chainId`/`sequence`/`hash`, so the head can't be forged to point elsewhere without
+     * the key. Absent when written without an HMAC key. */
+    mac?: string;
 }
 
 /**
@@ -464,6 +506,12 @@ export interface DataExportRequest extends BaseEntity {
     blobKey?: string;
 
     errorMessage?: string;
+
+    /** How many times `DataExportJob` has claimed this request into `"processing"`. A request left in
+     * `"processing"` past its lease (`dateModified` older than `mail:jobs:data_export:lease_minutes`, e.g.
+     * the processing replica died) is reclaimed back to `"pending"` until this reaches
+     * `mail:jobs:data_export:max_attempts`, then marked `"failed"`. */
+    processingAttempts?: number;
 }
 
 export type MailboxImportFormat = "mbox" | "pst";
@@ -500,6 +548,10 @@ export interface MailboxImportRequest extends BaseEntity {
     failedCount?: number;
 
     errorMessage?: string;
+
+    /** How many times `MailboxImportJob` has claimed this request into `"processing"` - see
+     * `DataExportRequest.processingAttempts` (same lease/reclaim scheme, `mail:jobs:mailbox_import:*`). */
+    processingAttempts?: number;
 }
 
 export type DataSubjectErasureStatus = "pending" | "approved" | "denied" | "completed";
@@ -905,10 +957,32 @@ export interface Message extends RecoverableBaseEntity {
     /** The timestamp this message was last (re)indexed for full-text search, if ever. */
     searchIndexedAt?: Date;
 
+    /** How many consecutive times `SearchIndexJob` has failed to index this message since it was last indexed
+     * (unset when never failed). At `mail:jobs:search_index:max_attempts` the message is no longer retried. */
+    searchIndexAttempts?: number;
+
+    /** The earliest time `SearchIndexJob` will retry indexing this message after a failure (exponential backoff). */
+    searchIndexNextAttemptAt?: Date;
+
+    /** The error from this message's most recent failed indexing attempt, if any. */
+    searchIndexError?: string;
+
     /** When set to a future time, `send()` defers relay until then instead of sending immediately -
      * mirrors Outlook's "Do not deliver before" (`PR_DEFERRED_SEND_TIME`). The message sits in the mailbox's
      * `OUTBOX` folder until `ScheduledSendJob` relays it and clears this field. */
     scheduledSendTime?: Date;
+
+    /** Consecutive failed `ScheduledSendJob` attempts for the current scheduled send. Each failure pushes
+     * `scheduledSendTime` forward (linear backoff); cleared on success and when the job gives up. */
+    scheduledSendAttempts?: number;
+
+    /** Why `ScheduledSendJob` gave up on (or refused) this scheduled send - set together with clearing
+     * `scheduledSendTime`, so the message leaves the due queue unsent. Cleared on a successful send. */
+    scheduledSendError?: string;
+
+    /** Set by `ScheduledSendJob` once the transport accepted this message but filing it into Sent Items failed.
+     * A later run then only finishes filing - it never relays a message carrying this marker again. */
+    scheduledSendRelayedAt?: Date;
 
     /** Set by `BaseMessageRoute.recall()` the moment a recall is requested — purely informational (lets a
      * client show "recall requested" immediately). The eventual outcome (each recipient's own `ScanQueueJob`
@@ -1063,6 +1137,16 @@ export interface Attachment extends BaseEntity {
 
     /** The key under which this attachment's extracted plain text is stored in the `BlobStore`, once extracted. */
     extractedTextBlobKey?: string;
+
+    /** How many times `AttachmentExtractionJob` has failed to process this attachment (unset when never failed).
+     * At `mail:jobs:attachment_extraction:max_attempts` the attachment is no longer retried. */
+    extractionAttempts?: number;
+
+    /** The earliest time `AttachmentExtractionJob` will retry this attachment after a failure (exponential backoff). */
+    extractionNextAttemptAt?: Date;
+
+    /** The error from this attachment's most recent failed extraction attempt, if any. */
+    extractionError?: string;
 
     /** The unique identifier of this attachment's `ScanResult`, once scanning has completed. */
     scanResultUid?: string;
@@ -1615,8 +1699,8 @@ export interface Branding extends BaseEntity {
      * stylesheet back with. */
     stylesheetContentType?: string;
 
-    /** Free-form UI chrome the web client renders above the mail app - never touched by this library
-     * beyond storing/returning it verbatim. */
+    /** Free-form UI chrome the web client renders above the mail app. Sanitized on save (no script, event
+     * handlers or `javascript:` URLs - see `BaseBrandingRoute.update()`), otherwise stored as sent. */
     headerHtml?: string;
 
     /** Free-form UI chrome the web client renders below the mail app. */
@@ -1815,6 +1899,11 @@ export interface CalendarEvent extends RecoverableBaseEntity {
     /** Set once an iTIP CANCEL has been sent to attendees for this event (triggered by `status:
      * CANCELLED` or by deleting the event) - prevents resending on every poll. */
     cancelNoticeSentAt?: Date;
+
+    /** The start of the latest occurrence of this event whose reminder `CalendarReminderJob` has claimed/sent.
+     * Written with an optimistic-lock (versioned) update *before* the notification goes out, so only one replica
+     * ever sends a given occurrence's reminder. System-managed; `undefined` means no reminder sent yet. */
+    reminderSentFor?: Date;
 
     /**
      * Provenance for this event's encryption state, per `specs/search.md` §3 "Provenance" (refining
@@ -2265,6 +2354,17 @@ export interface IngestQueueEntry extends BaseEntity {
      * policy-quarantined message still gets a real `ScanResult` for the reviewer. `undefined` for an entry
      * whose eventual verdict is decided purely by `resolveDeliveryVerdict()`. */
     quarantineReason?: QuarantineReason;
+
+    /** How many times `ScanQueueJob` has failed to process this entry. Unset until the first failure. A failed entry is
+     * retried (status back through `SCANNING`) until `mail:jobs:scan_queue:max_attempts` is reached. */
+    attempts?: number;
+
+    /** When a `FAILED` entry becomes eligible for its next retry. Unset once no retry is scheduled (retries exhausted). */
+    nextAttemptAt?: Date;
+
+    /** Set when a worker claims the entry for scanning. Once it has passed, a `SCANNING` entry is treated as abandoned
+     * (its worker died) and can be claimed again. */
+    scanLeaseExpiresAt?: Date;
 }
 
 /**

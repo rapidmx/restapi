@@ -6,7 +6,13 @@
 // test/scan/RspamdSpamScanProvider.test.ts). The module-level keyCache is shared across every test in this
 // file, so each test uses its own unique host/address pair to avoid cross-test interference, same rationale
 // as test/util/FederationUtils.test.ts.
-import { computeKeyDiscoveryHash, fetchRemoteKeys, zBase32Encode } from "../../src/util/KeyDiscoveryClient.js";
+import {
+    computeKeyDiscoveryHash,
+    fetchRemoteKeys,
+    isValidKeyDiscoveryHash,
+    parseKeyDiscoveryResponse,
+    zBase32Encode,
+} from "../../src/util/KeyDiscoveryClient.js";
 import type { KeyDiscoveryResponse } from "../../src/models/types.js";
 
 function makeDiscoveryResponse(overrides: Partial<KeyDiscoveryResponse> = {}): KeyDiscoveryResponse {
@@ -79,7 +85,7 @@ describe("fetchRemoteKeys() Tests", () => {
 
         const hash = computeKeyDiscoveryHash("alice");
         expect(mockFetch).toHaveBeenCalledWith(
-            `https://mail.example1.com/.well-known/rapidmx/keys/${hash}`,
+            `https://mail.example1.com/.well-known/rapidmx/keys/${hash}?domain=example1.com`,
             expect.objectContaining({ headers: {} }),
         );
     });
@@ -272,5 +278,130 @@ describe("fetchRemoteKeys() Tests", () => {
         const second = await fetchRemoteKeys("mail.example16.com", "alice@example16.com");
 
         expect(second).toEqual(body);
+    });
+});
+
+describe("isValidKeyDiscoveryHash() Tests", () => {
+    it("Accepts a real computeKeyDiscoveryHash() output.", () => {
+        expect(isValidKeyDiscoveryHash(computeKeyDiscoveryHash("alice"))).toBe(true);
+    });
+
+    it("Rejects the wrong length, characters outside the z-base32 alphabet, operator syntax, and non-strings.", () => {
+        const hash = computeKeyDiscoveryHash("alice");
+        expect(isValidKeyDiscoveryHash(hash.slice(0, 51))).toBe(false);
+        expect(isValidKeyDiscoveryHash(`${hash}y`)).toBe(false);
+        // 'l', 'v', '0', '2' are not in the z-base32 alphabet.
+        expect(isValidKeyDiscoveryHash(`l${hash.slice(1)}`)).toBe(false);
+        expect(isValidKeyDiscoveryHash(`in(${hash.slice(0, 48)})`)).toBe(false);
+        expect(isValidKeyDiscoveryHash(undefined)).toBe(false);
+        expect(isValidKeyDiscoveryHash(["a"])).toBe(false);
+    });
+});
+
+describe("parseKeyDiscoveryResponse() Tests", () => {
+    const validKey = { publicKey: "QUJD", type: "x509", useType: "encrypt", fingerprint: "fp", notBefore: 0, notAfter: 1 };
+
+    it("Returns a fresh copy containing only known fields for a well-formed response.", () => {
+        const result = parseKeyDiscoveryResponse({
+            encryptPreference: { preferEncrypt: "mutual", lastSeen: 5, extra: "x" },
+            keys: [{ ...validKey, revokedAt: 3, junk: true }],
+            escrow: true,
+            other: 1,
+        });
+
+        expect(result).toEqual({
+            encryptPreference: { preferEncrypt: "mutual", lastSeen: 5 },
+            keys: [{ ...validKey, revokedAt: 3 }],
+            escrow: true,
+        });
+    });
+
+    it("Treats a null lastSeen/revokedAt as absent.", () => {
+        const result = parseKeyDiscoveryResponse({
+            encryptPreference: { preferEncrypt: "nopreference", lastSeen: null },
+            keys: [{ ...validKey, revokedAt: null }],
+            escrow: false,
+        });
+
+        expect(result).toEqual({ encryptPreference: { preferEncrypt: "nopreference" }, keys: [validKey], escrow: false });
+    });
+
+    it.each([
+        ["a non-object body", "nope"],
+        ["null", null],
+        ["an array body", []],
+        ["a missing encryptPreference", { keys: [], escrow: false }],
+        ["an unknown preferEncrypt", { encryptPreference: { preferEncrypt: "always" }, keys: [], escrow: false }],
+        ["a non-numeric lastSeen", { encryptPreference: { preferEncrypt: "mutual", lastSeen: "5" }, keys: [], escrow: false }],
+        ["a non-array keys", { encryptPreference: { preferEncrypt: "mutual" }, keys: {}, escrow: false }],
+        ["a non-boolean escrow", { encryptPreference: { preferEncrypt: "mutual" }, keys: [], escrow: "false" }],
+        ["a non-object key entry", { encryptPreference: { preferEncrypt: "mutual" }, keys: ["x"], escrow: false }],
+        ["an unknown useType", { encryptPreference: { preferEncrypt: "mutual" }, keys: [{ ...validKey, useType: "decode" }], escrow: false }],
+        ["an empty publicKey", { encryptPreference: { preferEncrypt: "mutual" }, keys: [{ ...validKey, publicKey: "" }], escrow: false }],
+        ["a non-base64 publicKey", { encryptPreference: { preferEncrypt: "mutual" }, keys: [{ ...validKey, publicKey: "QUJD!!" }], escrow: false }],
+        ["an oversized publicKey", { encryptPreference: { preferEncrypt: "mutual" }, keys: [{ ...validKey, publicKey: "A".repeat(9000) }], escrow: false }],
+        ["a missing type", { encryptPreference: { preferEncrypt: "mutual" }, keys: [{ ...validKey, type: undefined }], escrow: false }],
+        ["a non-string fingerprint", { encryptPreference: { preferEncrypt: "mutual" }, keys: [{ ...validKey, fingerprint: 1 }], escrow: false }],
+        ["a non-numeric notAfter", { encryptPreference: { preferEncrypt: "mutual" }, keys: [{ ...validKey, notAfter: "1" }], escrow: false }],
+        ["a non-numeric revokedAt", { encryptPreference: { preferEncrypt: "mutual" }, keys: [{ ...validKey, revokedAt: "1" }], escrow: false }],
+    ])("Rejects %s.", (_label, raw) => {
+        expect(parseKeyDiscoveryResponse(raw)).toBeUndefined();
+    });
+});
+
+describe("fetchRemoteKeys() domain scoping and validation Tests", () => {
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        mockFetch = vi.fn();
+        vi.stubGlobal("fetch", mockFetch);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    it("Sends the lowercased address domain as ?domain= and keeps a separate cache entry per domain for the same host/local part.", async () => {
+        const acme = makeDiscoveryResponse({ escrow: true });
+        const contoso = makeDiscoveryResponse({ escrow: false });
+        mockFetch.mockResolvedValueOnce(makeFetchResponse({ json: vi.fn().mockResolvedValue(acme), headerValues: { etag: '"acme"' } }));
+        mockFetch.mockResolvedValueOnce(makeFetchResponse({ json: vi.fn().mockResolvedValue(contoso), headerValues: { etag: '"contoso"' } }));
+
+        const first = await fetchRemoteKeys("mail.shared-host-1.com", "ceo@Acme-1.com");
+        const second = await fetchRemoteKeys("mail.shared-host-1.com", "ceo@contoso-1.com");
+
+        expect(first).toEqual(acme);
+        expect(second).toEqual(contoso);
+        expect(mockFetch.mock.calls[0][0]).toMatch(/\?domain=acme-1\.com$/);
+        expect(mockFetch.mock.calls[1][0]).toMatch(/\?domain=contoso-1\.com$/);
+        // The second domain's request must not have been served from (or conditioned on) the first's cache entry.
+        expect(mockFetch.mock.calls[1][1]).toEqual(expect.objectContaining({ headers: {} }));
+    });
+
+    it("Never fetches for an address with no (or an invalid) domain.", async () => {
+        expect(await fetchRemoteKeys("mail.shared-host-2.com", "no-domain")).toBeUndefined();
+        expect(await fetchRemoteKeys("mail.shared-host-2.com", "a@bad/domain?x=")).toBeUndefined();
+        expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("Never caches or returns a malformed response - falls back to the last good cached response.", async () => {
+        const good = makeDiscoveryResponse({ escrow: true });
+        mockFetch.mockResolvedValueOnce(makeFetchResponse({ json: vi.fn().mockResolvedValue(good), headerValues: { etag: '"good"' } }));
+        mockFetch.mockResolvedValueOnce(makeFetchResponse({ json: vi.fn().mockResolvedValue({ keys: "nope" }), headerValues: { etag: '"bad"' } }));
+        mockFetch.mockResolvedValueOnce(makeFetchResponse({ status: 304, ok: false, json: vi.fn() }));
+
+        await fetchRemoteKeys("mail.example-malformed-1.com", "alice@example-malformed-1.com");
+        const second = await fetchRemoteKeys("mail.example-malformed-1.com", "alice@example-malformed-1.com");
+        await fetchRemoteKeys("mail.example-malformed-1.com", "alice@example-malformed-1.com");
+
+        expect(second).toEqual(good);
+        // Still conditioned on the good response's ETag - the malformed one was never cached.
+        expect(mockFetch.mock.calls[2][1]).toEqual(expect.objectContaining({ headers: { "If-None-Match": '"good"' } }));
+    });
+
+    it("Returns undefined for a malformed response with nothing cached.", async () => {
+        mockFetch.mockResolvedValue(makeFetchResponse({ json: vi.fn().mockResolvedValue({ escrow: "yes" }) }));
+
+        expect(await fetchRemoteKeys("mail.example-malformed-2.com", "alice@example-malformed-2.com")).toBeUndefined();
     });
 });

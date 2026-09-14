@@ -4,7 +4,8 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { EscrowAuditAction, EscrowAuditLogEntry } from "../types.js";
+import { EscrowAuditAction, EscrowAuditHashAlgorithm, EscrowAuditLogEntry } from "../types.js";
+import { EscrowAuditHeadSQL } from "./EscrowAuditHeadSQL.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity, Index } = PersistenceDecorators;
@@ -32,6 +33,9 @@ const { Nullable } = ObjectDecorators;
     false,
 )
 export class EscrowAuditLogEntrySQL extends BaseEntity implements EscrowAuditLogEntry {
+    /** The head-record class `EscrowAuditUtils` maintains alongside this chain for tail-truncation detection. */
+    public static readonly escrowAuditHeadClass: any = EscrowAuditHeadSQL;
+
     @Column()
     @Description("Monotonic, global sequence number.")
     public sequence: number = 0;
@@ -42,8 +46,13 @@ export class EscrowAuditLogEntrySQL extends BaseEntity implements EscrowAuditLog
     public previousHash?: string;
 
     @Column()
-    @Description("SHA-256 hex digest over this entry's own content plus previousHash.")
+    @Description("Hex digest over this entry's own content plus previousHash, computed with hashAlgorithm.")
     public hash: string = "";
+
+    @Column({ type: "varchar", nullable: true })
+    @Description("The scheme hash was computed with - absent for a legacy (pre-HMAC) SHA-256 entry.")
+    @Nullable
+    public hashAlgorithm?: EscrowAuditHashAlgorithm;
 
     // `type: "varchar"` is required on every enum-typed column - see the identical note on
     // `AuditLogEntrySQL.action`.
@@ -83,6 +92,7 @@ export class EscrowAuditLogEntrySQL extends BaseEntity implements EscrowAuditLog
             this.sequence = other.sequence !== undefined ? other.sequence : this.sequence;
             this.previousHash = "previousHash" in other ? other.previousHash : this.previousHash;
             this.hash = other.hash !== undefined ? other.hash : this.hash;
+            this.hashAlgorithm = "hashAlgorithm" in other ? other.hashAlgorithm : this.hashAlgorithm;
             this.action = other.action !== undefined ? other.action : this.action;
             this.holderUserUid = other.holderUserUid !== undefined ? other.holderUserUid : this.holderUserUid;
             this.matterId = other.matterId !== undefined ? other.matterId : this.matterId;

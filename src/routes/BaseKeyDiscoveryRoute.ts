@@ -6,11 +6,12 @@
 // (see `BaseMailIngestRoute`'s identical note) - `@Get("/:hash")` below then resolves to
 // `GET /.well-known/rapidmx/keys/:hash`.
 import * as crypto from "crypto";
-import { ObjectDecorators } from "@rapidrest/core";
-import { type HttpRequest, type HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
+import { ApiError, ObjectDecorators } from "@rapidrest/core";
+import { ApiErrors, type HttpRequest, type HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { EncryptionPreference, KeyVault, Mailbox, PublicKey } from "../models/types.js";
+import { isValidKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 const { Config } = ObjectDecorators;
-const { Get, Param, RateLimit, Request, Response } = RouteDecorators;
+const { Get, Param, Query, RateLimit, Request, Response } = RouteDecorators;
 
 /** The all-defaults response served for a mailbox that either doesn't exist, or exists but has published
  * nothing - `specs/end-to-end_encryption.md` requires these to be byte-for-byte indistinguishable, since this
@@ -49,12 +50,19 @@ const NOT_PUBLISHED_RESPONSE = {
  * to test candidate addresses against this "indistinguishable" endpoint (the spec calls this out explicitly:
  * hashing the local part alone does not stop candidate testing, only raises its cost).
  *
- * **Domain scoping.** `keyDiscoveryHash` hashes the local part only (WKD-style) - the spec places the domain
- * in the request's `Host` header instead, specifically so a multi-domain deployment doesn't collide two
- * different mailboxes (`ceo@acme.com` / `ceo@contoso.com`) sharing the same local part onto the same lookup.
- * `keyDiscoveryHash` is therefore not, on its own, unique - `lookup()` fetches every mailbox matching the hash
- * and picks the one whose `primarySmtpAddress` domain matches `Host`, rather than trusting an arbitrary first
- * match (which would let a peer querying `mail.acme.com` be served `ceo@contoso.com`'s keys).
+ * **Domain scoping.** `keyDiscoveryHash` hashes the local part only (WKD-style), so it is not, on its own,
+ * unique on a multi-domain deployment (`ceo@acme.com` / `ceo@contoso.com`). The requesting server names the
+ * address's domain explicitly via the `?domain=<domain>` query parameter (`util/KeyDiscoveryClient.ts` always
+ * sends it) - necessary because the request's `Host` is the discovery server's own hostname from the peer's
+ * `_rapidmx` TXT record (e.g. `mail.acme.com`), which on a shared multi-domain server names neither domain.
+ * For an older client that omits `domain`, the `Host` header (port stripped, lowercased) is used instead, the
+ * previous behavior. `lookup()` fetches every mailbox matching the hash and picks the one whose
+ * `primarySmtpAddress` domain matches, never an arbitrary first match.
+ *
+ * **Input validation.** `:hash` must be exactly 52 z-base32 characters (`computeKeyDiscoveryHash()`'s output
+ * shape) or the request is rejected with `400` - a syntactic check on a value no real address can fail, so it
+ * reveals nothing about which mailboxes exist - and it is queried as `eq(<hash>)`, the query DSL's literal
+ * escape, so the value is never interpreted as a search operator.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -104,26 +112,46 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
         return { encryptPreference: mailbox.encryptPreference ?? NOT_PUBLISHED_RESPONSE.encryptPreference, keys: mailbox.keys ?? [], escrow };
     }
 
-    /** Lowercases and strips any `:port` suffix from a `Host` header value - `req.headers.host` on an
-     * HTTP/1.1 request, or the `:authority` pseudo-header's value as `HttpRequest` normalizes it for HTTP/2. */
-    private hostDomain(req: HttpRequest): string {
+    /** The domain to scope the lookup to: the `domain` query parameter when present (lowercased), otherwise
+     * the `Host` header with any `:port` suffix stripped, lowercased - `req.headers.host` on an HTTP/1.1
+     * request, or the `:authority` pseudo-header's value as `HttpRequest` normalizes it for HTTP/2. A repeated
+     * `domain` parameter (an array) is not a valid request and matches nothing. */
+    private requestedDomain(domainParam: unknown, req: HttpRequest): string {
+        if (domainParam !== undefined && domainParam !== null && domainParam !== "") {
+            return typeof domainParam === "string" ? domainParam.toLowerCase() : "";
+        }
         return (req.headers["host"] ?? "").toString().split(":")[0].toLowerCase();
     }
 
     @RateLimit()
     @Get("/:hash")
-    public async lookup(@Param("hash") hash: string, @Request req: HttpRequest, @Response res: HttpResponse): Promise<void> {
+    public async lookup(
+        @Param("hash") hash: string,
+        @Query("domain") domainParam: string | undefined,
+        @Request req: HttpRequest,
+        @Response res: HttpResponse,
+    ): Promise<void> {
         await this.init();
+
+        if (!isValidKeyDiscoveryHash(hash)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The discovery hash is malformed.");
+        }
 
         // `keyDiscoveryHash` hashes the local part only - not unique across domains on a multi-domain
         // deployment (see this class's own "Domain scoping" doc comment) - so every match is fetched and
-        // narrowed to the one whose address domain matches the requested `Host`, rather than trusting
+        // narrowed to the one whose address domain matches the requested domain, rather than trusting
         // whichever row a bare `limit: 1` happens to return first. Bounded (not unbounded) since a hash
-        // collision within one deployment should only ever be a handful of rows at most - a large match count
-        // would itself be a signal something is wrong, not a case worth paying for with an unbounded scan.
-        const candidates: M[] = await this.mailboxRepo!.find({ keyDiscoveryHash: hash } as any, { ignoreACL: true, limit: 20 });
-        const hostDomain: string = this.hostDomain(req);
-        const match: M | undefined = candidates.find((m) => m.primarySmtpAddress?.split("@")[1]?.toLowerCase() === hostDomain);
+        // collision within one deployment should only ever be a handful of rows at most (one per hosted
+        // domain) - `limit` is baked into the query as well as the options, since the SQL backend reads only
+        // the former.
+        const candidates: M[] = await this.mailboxRepo!.find({ keyDiscoveryHash: `eq(${hash})`, limit: 20 } as any, {
+            ignoreACL: true,
+            limit: 20,
+        });
+        const domain: string = this.requestedDomain(domainParam, req);
+        const match: M | undefined = domain
+            ? candidates.find((m) => m.primarySmtpAddress?.split("@")[1]?.toLowerCase() === domain)
+            : undefined;
         const body = await this.buildResponse(match);
 
         const etag = `"${crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")}"`;

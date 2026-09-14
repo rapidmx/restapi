@@ -3,6 +3,103 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 
+/**
+ * The maximum total number of characters of free text (`subject` + `body` + every `attachmentText` entry,
+ * counted in that order) a provider stores/indexes for a single `SearchDocument` - see
+ * `truncateSearchDocumentText()`. A message with a very large body or many large extracted attachments would
+ * otherwise exceed backend-specific hard limits (MongoDB's 16MB document limit, OpenSearch's `http.max_content_length`
+ * for a bulk request) and fail to index at all. 1,000,000 characters is far beyond what's useful for ranking.
+ */
+export const MAX_SEARCH_DOCUMENT_TEXT_CHARS = 1_000_000;
+
+/** The maximum page size any `SearchProvider.search()`/`candidates()` returns - a larger requested `limit` is
+ * clamped down to this; a `limit` below 1 is clamped up to 1. */
+export const MAX_SEARCH_PAGE_SIZE = 100;
+
+/** The default page size when a query specifies no (or a non-numeric) `limit`. */
+export const DEFAULT_SEARCH_PAGE_SIZE = 25;
+
+/** The maximum offset (decoded from an opaque `cursor`) any provider will page to - deep offset paging is
+ * expensive on every backend (and OpenSearch rejects `from + size` beyond its default `max_result_window` of
+ * 10,000 outright). A larger cursor is clamped to this, and no `nextCursor` is returned past it. */
+export const MAX_SEARCH_OFFSET = 10_000;
+
+/**
+ * Resolves a query's `limit`/`cursor` to a bounded `{ limit, offset }` pair (`limit` in
+ * `1..MAX_SEARCH_PAGE_SIZE`, `offset` in `0..MAX_SEARCH_OFFSET`), shared by every provider so paging bounds are
+ * identical regardless of backend.
+ */
+export function resolveSearchPaging(limit: number | undefined, cursor: string | undefined): { limit: number; offset: number } {
+    const requested: number = Number(limit);
+    const resolvedLimit: number =
+        limit === undefined || limit === null || !Number.isFinite(requested)
+            ? DEFAULT_SEARCH_PAGE_SIZE
+            : Math.min(MAX_SEARCH_PAGE_SIZE, Math.max(1, Math.floor(requested)));
+    const parsedOffset: number = cursor ? parseInt(cursor, 10) : 0;
+    const offset: number = Number.isFinite(parsedOffset) ? Math.min(MAX_SEARCH_OFFSET, Math.max(0, parsedOffset)) : 0;
+    return { limit: resolvedLimit, offset };
+}
+
+/** Returns the `nextCursor` for a page, or `undefined` when there are no more results or the next page would
+ * start past `MAX_SEARCH_OFFSET` (so a client paging forward terminates instead of re-reading the clamped page
+ * forever). */
+export function nextSearchCursor(hasMore: boolean, offset: number, limit: number): string | undefined {
+    return hasMore && offset + limit <= MAX_SEARCH_OFFSET ? String(offset + limit) : undefined;
+}
+
+/** Truncates `value` to at most `max` characters without splitting a UTF-16 surrogate pair. */
+function truncateChars(value: string, max: number): string {
+    if (value.length <= max) {
+        return value;
+    }
+    let end: number = Math.max(0, max);
+    const code: number = value.charCodeAt(end - 1);
+    if (end > 0 && code >= 0xd800 && code <= 0xdbff) {
+        end--;
+    }
+    return value.slice(0, end);
+}
+
+/**
+ * Returns a copy of `doc` whose `subject`/`body`/`attachmentText` together contain at most `maxChars`
+ * characters (default `MAX_SEARCH_DOCUMENT_TEXT_CHARS`), filled in priority order: subject, then body, then
+ * attachment text entries in order (an entry that no longer fits is truncated, and every later entry dropped).
+ * A document already within budget is returned unchanged (same object).
+ */
+export function truncateSearchDocumentText(doc: SearchDocument, maxChars: number = MAX_SEARCH_DOCUMENT_TEXT_CHARS): SearchDocument {
+    const total: number =
+        (doc.subject?.length ?? 0) +
+        (doc.body?.length ?? 0) +
+        (doc.attachmentText ?? []).reduce((sum, text) => sum + (text?.length ?? 0), 0);
+    if (total <= maxChars) {
+        return doc;
+    }
+
+    let remaining: number = maxChars;
+    const take = (value: string | undefined): string | undefined => {
+        if (value === undefined || value === null) {
+            return value;
+        }
+        const result: string = truncateChars(value, remaining);
+        remaining -= result.length;
+        return result;
+    };
+
+    const subject: string | undefined = take(doc.subject);
+    const body: string | undefined = take(doc.body);
+    let attachmentText: string[] | undefined;
+    if (doc.attachmentText) {
+        attachmentText = [];
+        for (const text of doc.attachmentText) {
+            if (remaining <= 0) {
+                break;
+            }
+            attachmentText.push(take(text) ?? "");
+        }
+    }
+    return { ...doc, subject, body, attachmentText };
+}
+
 /** The kind of entity a `SearchDocument` represents. */
 export type SearchEntityType = "message" | "contact" | "calendarEvent" | "note" | "task";
 
@@ -157,8 +254,16 @@ export interface SearchProvider {
     /** Indexes (or re-indexes) a single document. */
     index(doc: SearchDocument): Promise<void>;
 
-    /** Indexes (or re-indexes) a batch of documents in one call, for efficient backfill/reconciliation. */
-    bulkIndex(docs: SearchDocument[]): Promise<void>;
+    /**
+     * Indexes (or re-indexes) a batch of documents in one call, for efficient backfill/reconciliation.
+     *
+     * Failures are isolated per document: one document the backend rejects (e.g. an oversized field, a mapping
+     * conflict) must not prevent the rest of the batch from being indexed. Resolves with the `entityUid`s of the
+     * documents that were actually indexed - a caller (`SearchIndexJob`) treats any document whose uid is absent
+     * as not indexed and retries it later. May still reject outright for a failure that affects the whole batch
+     * (e.g. the backend is unreachable), in which case no document should be assumed indexed.
+     */
+    bulkIndex(docs: SearchDocument[]): Promise<string[]>;
 
     /** Removes a previously indexed document. A no-op if it was never indexed. */
     remove(entityType: SearchEntityType, entityUid: string): Promise<void>;

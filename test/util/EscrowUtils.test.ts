@@ -10,7 +10,13 @@
 // reset between tests. Each test below therefore declares its own fresh, locally-scoped stub class rather
 // than a single shared one, so no test's cache entry can leak into (and mask a missing `newInstance()`
 // call in) another.
-import { findHeldScopeIds, requireEscrowHolder } from "../../src/util/EscrowUtils.js";
+import {
+    DEFAULT_ESCROW_APPROVAL_TTL_HOURS,
+    evaluateEscrowApprovals,
+    findHeldScopeIds,
+    requireEscrowHolder,
+    resolveEscrowApprovalTtlHours,
+} from "../../src/util/EscrowUtils.js";
 
 function makeStubClass(): any {
     return class StubEscrowScope {};
@@ -92,5 +98,60 @@ describe("findHeldScopeIds() Tests", () => {
         const result = await findHeldScopeIds(objectFactory, makeStubClass(), { uid: "user-1" } as any);
 
         expect(result.sort()).toEqual(["scope-1", "scope-3"]);
+    });
+});
+
+describe("resolveEscrowApprovalTtlHours() Tests", () => {
+    it("Reads mail:escrow:approval_ttl_hours, falling back to the default for an unset, invalid or non-positive value.", () => {
+        const config = (value: unknown) => ({ get: (key: string) => (key === "mail:escrow:approval_ttl_hours" ? value : undefined) });
+        expect(resolveEscrowApprovalTtlHours(config(24))).toBe(24);
+        expect(resolveEscrowApprovalTtlHours(config("12"))).toBe(12);
+        for (const value of [undefined, "soon", 0, -5, Infinity]) {
+            expect(resolveEscrowApprovalTtlHours(config(value))).toBe(DEFAULT_ESCROW_APPROVAL_TTL_HOURS);
+        }
+        expect(resolveEscrowApprovalTtlHours(undefined)).toBe(DEFAULT_ESCROW_APPROVAL_TTL_HOURS);
+        expect(resolveEscrowApprovalTtlHours({})).toBe(DEFAULT_ESCROW_APPROVAL_TTL_HOURS);
+    });
+});
+
+describe("evaluateEscrowApprovals() Tests", () => {
+    const now = new Date("2099-01-10T00:00:00.000Z");
+    const hoursAgo = (hours: number) => new Date(now.getTime() - hours * 60 * 60 * 1000);
+    const scope: any = { holderUserUids: ["a", "b", "c"] };
+
+    it("Counts one approval per current holder, and expires the TTL after the approval that met the threshold.", () => {
+        const request: any = {
+            requiredHoldersAtCreation: 2,
+            approvals: [
+                { holderUserUid: "a", approvedAt: hoursAgo(100) },
+                { holderUserUid: "a", approvedAt: hoursAgo(90) },
+                { holderUserUid: "removed", approvedAt: hoursAgo(80) },
+                { holderUserUid: "b", approvedAt: hoursAgo(10).toISOString() },
+            ],
+        };
+
+        const state = evaluateEscrowApprovals(request, scope, 72, now);
+
+        expect(state.validApprovalCount).toBe(2);
+        expect(state.thresholdMet).toBe(true);
+        expect(state.thresholdMetAt).toEqual(hoursAgo(10));
+        expect(state.expiresAt).toEqual(new Date(hoursAgo(10).getTime() + 72 * 60 * 60 * 1000));
+        expect(state.expired).toBe(false);
+        expect(evaluateEscrowApprovals(request, scope, 5, now).expired).toBe(true);
+    });
+
+    it("Reports an unmet threshold when too few approvals come from current holders.", () => {
+        const request: any = {
+            requiredHoldersAtCreation: 2,
+            approvals: [
+                { holderUserUid: "a", approvedAt: hoursAgo(1) },
+                { holderUserUid: "x", approvedAt: hoursAgo(1) },
+            ],
+        };
+
+        expect(evaluateEscrowApprovals(request, scope, 72, now)).toEqual({ validApprovalCount: 1, thresholdMet: false, expired: false });
+        expect(evaluateEscrowApprovals({ requiredHoldersAtCreation: 0 } as any, {} as any, 72).thresholdMet).toBe(false);
+        const single: any = { requiredHoldersAtCreation: 1, approvals: [{ holderUserUid: "a", approvedAt: new Date() }] };
+        expect(evaluateEscrowApprovals(single, scope, 72).expired).toBe(false);
     });
 });

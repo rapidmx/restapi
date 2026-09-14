@@ -22,7 +22,7 @@ vi.mock("@opensearch-project/opensearch", () => ({
 }));
 
 import { OpenSearchProvider } from "../../src/search/OpenSearchProvider.js";
-import type { SearchDocument } from "../../src/search/SearchProvider.js";
+import { MAX_SEARCH_DOCUMENT_TEXT_CHARS, type SearchDocument } from "../../src/search/SearchProvider.js";
 
 function makeDoc(overrides: Partial<SearchDocument> = {}): SearchDocument {
     return {
@@ -125,8 +125,56 @@ describe("OpenSearchProvider Tests", () => {
             });
         });
 
+        it("bulkIndex() returns every entityUid when the bulk response reports no errors.", async () => {
+            mockClientInstance.bulk.mockResolvedValue({ body: { errors: false, items: [] } });
+
+            const result = await provider.bulkIndex([makeDoc({ entityUid: "msg-1" }), makeDoc({ entityUid: "msg-2" })]);
+
+            expect(result).toEqual(["msg-1", "msg-2"]);
+        });
+
+        it("bulkIndex() reads per-item errors from a 200 response with errors: true, returning only the indexed entityUids.", async () => {
+            mockClientInstance.bulk.mockResolvedValue({
+                body: {
+                    errors: true,
+                    items: [
+                        { index: { _id: "message:msg-1", status: 201 } },
+                        { index: { _id: "message:msg-2", status: 400, error: { type: "mapper_parsing_exception", reason: "bad field" } } },
+                        { index: { _id: "message:msg-3", status: 200 } },
+                    ],
+                },
+            });
+
+            const result = await provider.bulkIndex([
+                makeDoc({ entityUid: "msg-1" }),
+                makeDoc({ entityUid: "msg-2" }),
+                makeDoc({ entityUid: "msg-3" }),
+            ]);
+
+            expect(result).toEqual(["msg-1", "msg-3"]);
+        });
+
+        it("bulkIndex() treats a document with no corresponding response item as not indexed.", async () => {
+            mockClientInstance.bulk.mockResolvedValue({
+                body: { errors: true, items: [{ index: { _id: "message:msg-1", status: 429, error: { type: "es_rejected_execution_exception" } } }] },
+            });
+
+            const result = await provider.bulkIndex([makeDoc({ entityUid: "msg-1" }), makeDoc({ entityUid: "msg-2" })]);
+
+            expect(result).toEqual([]);
+        });
+
+        it("bulkIndex() truncates oversized text before sending it.", async () => {
+            const doc = makeDoc({ subject: undefined, body: "x".repeat(MAX_SEARCH_DOCUMENT_TEXT_CHARS + 10) });
+
+            await provider.bulkIndex([doc]);
+
+            const sent = mockClientInstance.bulk.mock.calls[0][0].body[1];
+            expect(sent.body).toHaveLength(MAX_SEARCH_DOCUMENT_TEXT_CHARS);
+        });
+
         it("bulkIndex() is a no-op when given an empty array.", async () => {
-            await provider.bulkIndex([]);
+            await expect(provider.bulkIndex([])).resolves.toEqual([]);
 
             expect(mockClientInstance.bulk).not.toHaveBeenCalled();
         });
@@ -248,11 +296,40 @@ describe("OpenSearchProvider Tests", () => {
             expect(result.nextCursor).toBe("2");
         });
 
-        it("Caps the effective limit at 200.", async () => {
+        it("Caps the effective limit at 100.", async () => {
             await provider.search({ mailboxUid: "mbx-1", text: "hello", limit: 10_000 });
 
             const call = mockClientInstance.search.mock.calls[0][0];
-            expect(call.body.size).toBe(201);
+            expect(call.body.size).toBe(101);
+        });
+
+        it("Clamps the cursor to 10000 and shrinks size so from + size stays within max_result_window.", async () => {
+            const result = await provider.search({ mailboxUid: "mbx-1", text: "hello", cursor: "50000", limit: 0 });
+
+            const call = mockClientInstance.search.mock.calls[0][0];
+            expect(call.body.from).toBe(10_000);
+            expect(call.body.size).toBe(0);
+            expect(result.nextCursor).toBeUndefined();
+        });
+
+        it("Does not return a nextCursor that would start past the maximum offset.", async () => {
+            mockClientInstance.search.mockResolvedValue({
+                body: {
+                    hits: {
+                        hits: Array.from({ length: 11 }, (_, i) => ({
+                            _source: { entityType: "message", entityUid: `msg-${i}` },
+                            _score: 1,
+                        })),
+                    },
+                },
+            });
+
+            const result = await provider.candidates({ mailboxUid: "mbx-1", cursor: "9995", limit: 10 });
+
+            const call = mockClientInstance.search.mock.calls[0][0];
+            expect(call.body.from).toBe(9995);
+            expect(call.body.size).toBe(5);
+            expect(result.nextCursor).toBeUndefined();
         });
 
         it("Populates snippet from the highlight response, joining fragments across fields.", async () => {

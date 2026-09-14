@@ -308,8 +308,10 @@ describe("Route:AttachmentMongo Tests", () => {
             .set("Authorization", "jwt " + ownerToken);
 
         expect(result.status).toBe(200);
-        expect(result.text).toBe("attachment content");
-        expect(result.headers["content-type"]).toBe("text/plain");
+        // Served as a download whatever its stored type (only raster images keep theirs) - see `BaseAttachmentRoute.download()`.
+        expect(result.text ?? Buffer.from(result.body).toString("utf-8")).toBe("attachment content");
+        expect(result.headers["content-type"]).toBe("application/octet-stream");
+        expect(result.headers["x-content-type-options"]).toBe("nosniff");
     });
 
     it("A different user cannot download an attachment's content they don't have access to.", async () => {
@@ -350,17 +352,23 @@ describe("Route:AttachmentMongo Tests", () => {
         expect(result.status).toBe(404);
     });
 
-    it("Sets a content-disposition of 'inline' for an inline attachment.", async () => {
+    it("Sets a content-disposition of 'inline' for an inline raster image, and 'attachment' for any other inline type.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid);
-        const attachment = await createAttachment(mailbox.uid, folder.uid, { isInline: true });
+        const image = await createAttachment(mailbox.uid, folder.uid, { isInline: true, mimeType: "image/png" });
+        const text = await createAttachment(mailbox.uid, folder.uid, { isInline: true });
 
         const result = await request(server.getApplication())
-            .get(`${baseUrl}/${attachment.uid}/content`)
+            .get(`${baseUrl}/${image.uid}/content`)
             .set("Authorization", "jwt " + ownerToken);
 
         expect(result.status).toBe(200);
         expect(result.headers["content-disposition"]).toContain("inline");
+
+        const other = await request(server.getApplication())
+            .get(`${baseUrl}/${text.uid}/content`)
+            .set("Authorization", "jwt " + ownerToken);
+        expect(other.headers["content-disposition"]).toMatch(/^attachment;/);
     });
 
     it("Owner can list attachments scoped to a folder they have access to.", async () => {

@@ -14,7 +14,9 @@ import { Repository } from "typeorm";
 import config from "../../config.sql.js";
 import { CalendarReminderJobSQL } from "../../../src/jobs/sql/CalendarReminderJobSQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
-import { BusyStatus, CalendarEventStatus, RecipientType } from "../../../src/models/types.js";
+import { BusyStatus, CalendarEventStatus, RecipientType, RecurrenceFrequency } from "../../../src/models/types.js";
+
+const JobClass = CalendarReminderJobSQL;
 
 /**
  * A minimal fake standing in for the real `redis` client `NotificationUtils` publishes through - the actual
@@ -108,6 +110,8 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
 
     beforeEach(async () => {
         fakeRedis.published = [];
+        // The job keeps a per-process fire-window watermark; each test starts as a fresh process would.
+        (job as any).watermarkMs = undefined;
         await calendarEventRepo.clear();
     });
 
@@ -189,7 +193,7 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
         expect(fakeRedis.published).toHaveLength(0);
     });
 
-    it("Skips an event whose startDate falls beyond the 24-hour lookahead bound.", async () => {
+    it("Skips an event whose reminder fire time is still far in the future.", async () => {
         const now = Date.now();
         await createEvent({ startDate: new Date(now + 25 * 60 * 60 * 1000), reminderMinutesBeforeStart: 5 });
 
@@ -239,5 +243,139 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
         for (const entry of goodPublishes) {
             expect(JSON.parse(entry.message).data.eventUid).toBe(goodEvent.uid);
         }
+    });
+
+    it("Never sends the same occurrence's reminder twice across runs, and persists reminderSentFor.", async () => {
+        const now = Date.now();
+        const event = await createEvent({ startDate: new Date(now + 5 * 60 * 1000), reminderMinutesBeforeStart: 4.5 });
+
+        await job.run();
+        (job as any).watermarkMs = undefined;
+        await job.run();
+
+        expect(fakeRedis.published).toHaveLength(2);
+        const stored: any = await calendarEventRepo.findOne({ where: { uid: event.uid } });
+        expect(new Date(stored.reminderSentFor).getTime()).toBe(new Date(event.startDate).getTime());
+    });
+
+    it("Sends exactly one reminder when two replicas run at the same moment (claim-then-send).", async () => {
+        const now = Date.now();
+        await createEvent({ startDate: new Date(now + 5 * 60 * 1000), reminderMinutesBeforeStart: 4.5 });
+        const replica = await objectFactory.newInstance(JobClass, { name: "replica" });
+        // Force the race deterministically: the replica reads its candidates (so it holds the row at its
+        // pre-claim version), then the other replica runs to completion - claiming and sending - before the first
+        // one continues. The first replica's own claim must then lose the optimistic-lock race and not send.
+        const replicaRepo: any = (replica as any).calendarEventRepo;
+        const realFind = replicaRepo.find.bind(replicaRepo);
+        let raced = false;
+        const findSpy = vi.spyOn(replicaRepo, "find").mockImplementation(async (...args: any[]) => {
+            const rows = await realFind(...args);
+            if (!raced) {
+                raced = true;
+                await job.run();
+            }
+            return rows;
+        });
+
+        try {
+            await replica.run();
+        } finally {
+            findSpy.mockRestore();
+        }
+
+        // One notification = one publish per channel (folder + mailbox).
+        expect(fakeRedis.published).toHaveLength(2);
+    });
+
+    it("Sends a new reminder when a non-recurring event with an already-sent reminder is rescheduled.", async () => {
+        const now = Date.now();
+        await createEvent({
+            startDate: new Date(now + 5 * 60 * 1000),
+            reminderMinutesBeforeStart: 4.5,
+            reminderSentFor: new Date(now + 3 * 24 * 60 * 60 * 1000),
+        });
+
+        await job.run();
+
+        expect(fakeRedis.published).toHaveLength(2);
+    });
+
+    it("Fires a reminder set more than 24 hours ahead.", async () => {
+        const now = Date.now();
+        // startDate = now + 3 days, lead = 3 days - 30s -> fireAt = now + 30s.
+        await createEvent({ startDate: new Date(now + 3 * 24 * 60 * 60 * 1000), reminderMinutesBeforeStart: 3 * 24 * 60 - 0.5 });
+
+        await job.run();
+
+        expect(fakeRedis.published).toHaveLength(2);
+    });
+
+    it("Catches a fire time that fell between runs after scheduler drift (watermark), but not one older than the initial lookback on a first run.", async () => {
+        const now = Date.now();
+        // fireAt = now - 5 min: older than the 120s first-run lookback...
+        await createEvent({ startDate: new Date(now + 60 * 1000), reminderMinutesBeforeStart: 6 });
+
+        await job.run();
+        expect(fakeRedis.published).toHaveLength(0);
+
+        // ...but inside the window since the previous run when that run was 10 minutes ago.
+        await calendarEventRepo.clear();
+        await createEvent({ startDate: new Date(now + 60 * 1000), reminderMinutesBeforeStart: 6 });
+        (job as any).watermarkMs = now - 10 * 60 * 1000;
+        await job.run();
+        expect(fakeRedis.published).toHaveLength(2);
+    });
+
+    it("Expands a recurring master that started long ago and fires for today's occurrence.", async () => {
+        const now = Date.now();
+        // A daily series that started 400 days ago, at a time of day that puts today's occurrence 5 minutes out.
+        const occurrenceStart = new Date(Math.floor((now + 5 * 60 * 1000) / 1000) * 1000);
+        const seriesStart = new Date(occurrenceStart.getTime() - 400 * 24 * 60 * 60 * 1000);
+        const event = await createEvent({
+            startDate: seriesStart,
+            endDate: new Date(seriesStart.getTime() + 30 * 60 * 1000),
+            recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] },
+            reminderMinutesBeforeStart: 4.5,
+        });
+
+        await job.run();
+
+        expect(fakeRedis.published).toHaveLength(2);
+        expect(JSON.parse(fakeRedis.published[0].message).data).toEqual({
+            eventUid: event.uid,
+            title: event.title,
+            startDate: occurrenceStart.toISOString(),
+        });
+    });
+
+    it("Does not fire a recurring master's reminder for an occurrence excluded by EXDATE or replaced by an override row.", async () => {
+        const now = Date.now();
+        const occurrenceStart = new Date(Math.floor((now + 5 * 60 * 1000) / 1000) * 1000);
+        const seriesStart = new Date(occurrenceStart.getTime() - 10 * 24 * 60 * 60 * 1000);
+        const icalUid = uuid.v4();
+        await createEvent({
+            icalUid,
+            startDate: seriesStart,
+            endDate: new Date(seriesStart.getTime() + 30 * 60 * 1000),
+            recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] },
+            reminderMinutesBeforeStart: 4.5,
+        });
+        // The override moved today's occurrence two hours later and has no reminder of its own.
+        await createEvent({
+            icalUid,
+            recurrenceId: occurrenceStart,
+            startDate: new Date(occurrenceStart.getTime() + 2 * 60 * 60 * 1000),
+            endDate: new Date(occurrenceStart.getTime() + 2.5 * 60 * 60 * 1000),
+        });
+        await createEvent({
+            startDate: seriesStart,
+            endDate: new Date(seriesStart.getTime() + 30 * 60 * 1000),
+            recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [occurrenceStart] },
+            reminderMinutesBeforeStart: 4.5,
+        });
+
+        await job.run();
+
+        expect(fakeRedis.published).toHaveLength(0);
     });
 });

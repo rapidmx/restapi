@@ -9,6 +9,15 @@ import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { CalendarShareLink } from "../models/types.js";
 const { Param, Query, Request, User: AuthUser } = RouteDecorators;
 
+/** The `userOrRoleId` a link's grant is written under - see the identical constant (and why it's duplicated) on
+ * `BaseScopedChildRoute.ts`. Records written before this prefix existed are keyed by the bare token; revocation and
+ * re-granting remove both forms, so updating such a link migrates it. */
+const SHARE_TOKEN_UID_PREFIX = "share:";
+
+function isShareTokenRecord(userOrRoleId: string, token: string): boolean {
+    return userOrRoleId === `${SHARE_TOKEN_UID_PREFIX}${token}` || userOrRoleId === token;
+}
+
 /**
  * Extends `BaseScopedChildRoute` (scoped by `folderUid`) for `CalendarShareLink` with the two pieces of
  * bookkeeping that make anonymous share-link consumption work with NO separate route or lookup of its own
@@ -20,7 +29,7 @@ const { Param, Query, Request, User: AuthUser } = RouteDecorators;
  * depend on the client, and it must never change after creation (a client "updating" it would orphan the ACL
  * record already granted under the old value).
  * 2. `create()`/`update()`/`delete()` keep a real `ACLRecord` for the link's token in sync on the shared
- * folder's `AccessControlList` (`{userOrRoleId: token, actions: permittedActions}`) — granted on create,
+ * folder's `AccessControlList` (`{userOrRoleId: "share:" + token, actions: permittedActions}`) — granted on create,
  * re-granted (upserted, picking up any `permittedActions`/`folderUid` change) on update, and revoked on
  * delete. `ExternalShareExpirationJob` does the same revocation for links it GCs after they expire.
  *
@@ -38,8 +47,8 @@ export abstract class BaseCalendarShareLinkRoute<T extends CalendarShareLink> ex
             return;
         }
         acl.records = [
-            ...acl.records.filter((record) => record.userOrRoleId !== link.token),
-            { userOrRoleId: link.token, actions: link.permittedActions },
+            ...acl.records.filter((record) => !isShareTokenRecord(record.userOrRoleId, link.token)),
+            { userOrRoleId: `${SHARE_TOKEN_UID_PREFIX}${link.token}`, actions: link.permittedActions },
         ];
         await this.aclUtils!.saveACL(acl);
     }
@@ -51,7 +60,7 @@ export abstract class BaseCalendarShareLinkRoute<T extends CalendarShareLink> ex
         if (!acl) {
             return;
         }
-        const records = acl.records.filter((record) => record.userOrRoleId !== token);
+        const records = acl.records.filter((record) => !isShareTokenRecord(record.userOrRoleId, token));
         if (records.length === acl.records.length) {
             return;
         }

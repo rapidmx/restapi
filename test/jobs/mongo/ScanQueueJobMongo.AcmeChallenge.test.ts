@@ -99,10 +99,12 @@ class TestEnrollment extends Rfc8823AcmeSigningCertificateEnrollment {
     }
 }
 
-function makeAcmeChallengeRaw(tokenPart1: string, opts: { from?: string; replyTo?: string } = {}): Buffer {
+function makeAcmeChallengeRaw(tokenPart1: string, opts: { from?: string; replyTo?: string; dkim?: boolean } = {}): Buffer {
     const from = opts.from ?? "acme-challenge+abc123@acme.test";
     const raw = [
         `From: ${from}`,
+        // A challenge is only correlated from a DKIM-verified CA sender - see ScanQueueJob.tryCorrelateAcmeChallenge().
+        ...(opts.dkim === false ? [] : [`Authentication-Results: mx.example.com; dkim=pass header.d=${from.split("@")[1]}`]),
         "To: recipient@example.com",
         ...(opts.replyTo ? [`Reply-To: ${opts.replyTo}`] : []),
         `Subject: ACME: ${tokenPart1}`,
@@ -355,5 +357,33 @@ describe("ScanQueueJobMongo Tests - RFC 8823 challenge-email correlation", () =>
         const store = JSON.parse(await fs.readFile(storePath, "utf-8"));
         expect(store[enrollmentId].replyTo).toBe("custom-reply@acme.test");
         expect(store[enrollmentId].tokenPart1).toBe("token-part-1-value");
+    });
+
+    it("Delivers a challenge-shaped email normally when its sender isn't DKIM-verified, recording nothing.", async () => {
+        const { enrollmentId } = await enrollment.startEnrollment("recipient@example.com", await generateCsr("recipient@example.com"));
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeAcmeChallengeRaw("forged-token", { dkim: false }));
+        await createIngestEntry(rawBlobKey);
+
+        await job.run();
+
+        expect(await messageRepo.find({ mailboxUid }).toArray()).toHaveLength(1);
+        const store = JSON.parse(await fs.readFile(path.join(tmpDir, "enrollments.json"), "utf-8"));
+        expect(store[enrollmentId].tokenPart1).toBeUndefined();
+    });
+
+    it("Delivers a verified challenge normally when its Reply-To is outside the CA's domain.", async () => {
+        const { enrollmentId } = await enrollment.startEnrollment("recipient@example.com", await generateCsr("recipient@example.com"));
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makeAcmeChallengeRaw("token-part-1-value", { replyTo: "attacker@evil.test" }));
+        await createIngestEntry(rawBlobKey);
+
+        await job.run();
+
+        expect(await messageRepo.find({ mailboxUid }).toArray()).toHaveLength(1);
+        const store = JSON.parse(await fs.readFile(path.join(tmpDir, "enrollments.json"), "utf-8"));
+        expect(store[enrollmentId].tokenPart1).toBeUndefined();
     });
 });

@@ -26,6 +26,9 @@ const { Config, Inject } = ObjectDecorators;
 
 const DMARC_POLICIES = new Set(["none", "quarantine", "reject"]);
 
+/** The fields only this class (and `DomainVerificationJob`) ever set - see `update()`. */
+const SERVER_MANAGED_DOMAIN_FIELDS: string[] = ["uid", "verified", "verificationToken", "verifiedAt", "lastCheckedAt"];
+
 /** Rejects an explicitly-provided `dmarcPolicy` that isn't one of the three real DMARC policy values -
  * `undefined` (not provided at all) is left alone, matching every other optional field's semantics. */
 function validateDmarcPolicy(dmarcPolicy: unknown): void {
@@ -191,6 +194,48 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         );
 
         return updated;
+    }
+
+    /** `CRUDRoute`'s own `PUT /` goes straight to `doBulkUpdate()`, which never strips `verified` & co. and writes
+     * no audit entry - each entry goes through the guarded `update()` above instead. One failing entry aborts the
+     * rest (same trade-off as `BaseMatterRoute.updateBulk()`). */
+    @RequiresTrustedRole()
+    public async updateBulk(objs: UpdateObject<T>[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
+        if (!Array.isArray(objs)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        const updated: T[] = [];
+        for (const obj of objs) {
+            updated.push(await this.update((obj as any)?.uid, obj, req, user));
+        }
+        return updated;
+    }
+
+    /** `CRUDRoute`'s own `PUT /:id/:property` would write any property, `verified` included, with no audit entry.
+     * Routed through `update()`; the fields only this class sets are refused outright rather than silently
+     * dropped, so a client can't mistake the call for having worked. */
+    @RequiresTrustedRole()
+    public async updateProperty(
+        @Param("id") id: string,
+        @Param("property") propertyName: string,
+        obj: any,
+        @AuthUser user?: JWTUser,
+    ): Promise<T> {
+        if (SERVER_MANAGED_DOMAIN_FIELDS.includes(propertyName)) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, `'${propertyName}' cannot be set through this API.`);
+        }
+        const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+        if (!existing) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        return await this.update(id, { uid: existing.uid, version: existing.version, [propertyName]: obj } as any, undefined as any, user);
+    }
+
+    /** `CRUDRoute`'s own `DELETE /` deletes every matching domain with no audit entry per domain - refused; delete
+     * domains one at a time (`DELETE /:id`). */
+    @RequiresTrustedRole()
+    public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
+        throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Domains must be deleted one at a time.");
     }
 
     @RequiresTrustedRole()

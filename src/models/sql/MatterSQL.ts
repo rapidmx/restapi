@@ -34,7 +34,7 @@ export class MatterSQL extends BaseEntity implements Matter {
     @Description("Admin-facing display name for this matter.")
     public name: string = "";
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("Optional free-text description of this matter's purpose.")
     @Nullable
     public description?: string;

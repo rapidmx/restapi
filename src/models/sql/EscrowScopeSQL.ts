@@ -34,7 +34,7 @@ export class EscrowScopeSQL extends BaseEntity implements EscrowScope {
     @Description("Admin-facing display name, e.g. 'legal', 'executive'.")
     public name: string = "";
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("Optional free-text description of this scope's purpose.")
     @Nullable
     public description?: string;

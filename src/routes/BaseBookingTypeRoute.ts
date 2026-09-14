@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, type JWTUser } from "@rapidrest/core";
-import { ApiErrors, HttpRequest, RouteDecorators, type UpdateObject } from "@rapidrest/service-core";
+import { ACLAction, ApiErrorMessages, ApiErrors, HttpRequest, RepoUtils, RouteDecorators, type UpdateObject } from "@rapidrest/service-core";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { normalizeSlug, validateAvailability } from "../util/BookingUtils.js";
-import { BookingType } from "../models/types.js";
+import { BookingType, Folder, FolderType } from "../models/types.js";
 const { Param, Request, User: AuthUser } = RouteDecorators;
 
 /**
@@ -29,6 +29,12 @@ const { Param, Request, User: AuthUser } = RouteDecorators;
  */
 export abstract class BaseBookingTypeRoute<T extends BookingType> extends BaseScopedChildRoute<T> {
     protected readonly scopeProperty: string = "mailboxUid";
+
+    /** The concrete `Folder` entity class, supplied by the Mongo/SQL concrete subclass - used to check
+     * `calendarFolderUid` (see `requireBookableFolder()`). */
+    protected abstract folderClass: any;
+
+    private folderRepo?: RepoUtils<Folder>;
 
     /**
      * Normalizes `o.slug` in place and rejects a `409` if another `BookingType` already holds it. `excludeUid`
@@ -55,11 +61,36 @@ export abstract class BaseBookingTypeRoute<T extends BookingType> extends BaseSc
         }
     }
 
+    /**
+     * `calendarFolderUid` is where anonymous bookings are written and whose events block slots, so it must be a
+     * calendar folder of the booking type's own mailbox that the caller can read - otherwise a caller managing
+     * their own mailbox's booking types could point one at somebody else's calendar, publishing its free/busy
+     * through the public slots endpoint and planting booking events in it. `400` for a folder of the wrong
+     * mailbox or type (or no such folder), `403` when the caller can't read it.
+     */
+    private async requireBookableFolder(mailboxUid: unknown, calendarFolderUid: unknown, user: JWTUser | undefined): Promise<void> {
+        if (typeof calendarFolderUid !== "string" || !calendarFolderUid) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "calendarFolderUid is required.");
+        }
+        if (!this.folderRepo) {
+            this.folderRepo = await this._objectFactory!.newInstance(RepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
+        }
+        const folder: Folder | undefined = await this.folderRepo.findOne(calendarFolderUid, { ignoreACL: true });
+        // Permission first, so a caller who can't read the folder learns nothing about which mailbox it belongs to.
+        if (folder && !(await this.aclUtils!.hasPermission(user, folder.uid, ACLAction.READ))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+        if (!folder || (folder as any).deleted || folder.mailboxUid !== mailboxUid || folder.type !== FolderType.CALENDAR) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "calendarFolderUid must name a calendar folder of the booking type's own mailbox.");
+        }
+    }
+
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
         const seenSlugs: Set<string> = new Set();
         for (const single of objs) {
             this.requireValidAvailability(single);
+            await this.requireBookableFolder(single?.mailboxUid, single?.calendarFolderUid, user);
             await this.normalizeAndCheckSlug(single);
             if (seenSlugs.has(single.slug)) {
                 throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "Duplicate booking slug within the same request.");
@@ -80,6 +111,19 @@ export abstract class BaseBookingTypeRoute<T extends BookingType> extends BaseSc
         this.requireValidAvailability(obj);
         if ((obj as any).slug !== undefined) {
             await this.normalizeAndCheckSlug(obj, id);
+        }
+        // Re-checked whenever either half of the folder/mailbox pairing changes. `super.update()` still does its
+        // own permission checks (UPDATE on the current mailbox, CREATE on a new one) afterwards, and a missing row
+        // is its 404 to report.
+        if ((obj as any).calendarFolderUid !== undefined || (obj as any).mailboxUid !== undefined) {
+            const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+            if (existing) {
+                await this.requireBookableFolder(
+                    (obj as any).mailboxUid ?? existing.mailboxUid,
+                    (obj as any).calendarFolderUid ?? existing.calendarFolderUid,
+                    user,
+                );
+            }
         }
         return await super.update(id, obj, req, user);
     }

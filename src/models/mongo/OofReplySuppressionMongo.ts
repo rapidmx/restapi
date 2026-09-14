@@ -22,6 +22,7 @@ const { Column, Entity, Index } = PersistenceDecorators;
     "Throttles automatic (out-of-office) replies to at most one per sender per mailbox within a rolling window.",
 )
 @Index("oofreplysuppression_mailbox_sender", ["mailboxUid", "senderAddress"])
+@Index("oofreplysuppression_last_replied_at", ["lastRepliedAt"])
 @Protect(
     {
         uid: "OofReplySuppression",

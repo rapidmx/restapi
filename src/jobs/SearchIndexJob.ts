@@ -16,6 +16,9 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * baked into the query object, not just `options`. */
 const MAX_ATTACHMENTS_PER_MESSAGE = 1000;
 
+/** The longest error message persisted onto `Message.searchIndexError`. */
+const MAX_ERROR_LENGTH = 1000;
+
 /**
  * Reconciles `SearchProvider`'s index against `Message` records that haven't been indexed yet
  * (`Message.searchIndexedAt` is unset). This is what decouples "committed to the primary datastore" from
@@ -30,6 +33,12 @@ const MAX_ATTACHMENTS_PER_MESSAGE = 1000;
  * `AttachmentExtractionJob` clears `searchIndexedAt` back to `undefined` on a message whose attachment text
  * extraction completes *after* this job already indexed it once, so it gets picked up again with the newly
  * available attachment text.
+ *
+ * A message that fails to index (its document can't be built, or the provider rejects it) is retried with
+ * exponential backoff (`searchIndexAttempts`/`searchIndexNextAttemptAt`, base delay
+ * `mail:jobs:search_index:retry_backoff_seconds`) up to `mail:jobs:search_index:max_attempts` times, then left
+ * unindexed with `searchIndexError` recorded - excluded from every later candidate query, so a permanently
+ * failing message can never occupy the head of the (oldest-first) queue and starve the rest of the backlog.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -54,6 +63,12 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
 
     @Config("mail:jobs:search_index:batch_size", 50)
     private batchSize: number = 50;
+
+    @Config("mail:jobs:search_index:max_attempts", 5)
+    private maxAttempts: number = 5;
+
+    @Config("mail:jobs:search_index:retry_backoff_seconds", 60)
+    private retryBackoffSeconds: number = 60;
 
     @Logger
     private logger: any;
@@ -87,26 +102,42 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
             return;
         }
 
+        const now: Date = new Date();
         // `limit` must be passed both via `options` (used by the Mongo backend) *and* baked into the query
         // object itself (all `ModelUtils.buildSearchQuerySQL` reads - it ignores `options.limit` entirely and
         // falls back to its own default of 100 otherwise). Confirmed by real-database testing: on the SQL
         // backend, `options.limit` alone silently caps at 100 regardless of the configured batch size.
+        //
+        // Candidates are a message that has never failed, or one that has failed fewer than `maxAttempts` times
+        // and whose backoff has elapsed - a message at `maxAttempts` is excluded outright. Sorted oldest-first
+        // (with `uid` as a tiebreaker) so batches are drawn in a stable order.
         const pending: M[] = await this.messageRepo.find(
-            { searchIndexedAt: null, limit: this.batchSize } as any,
+            {
+                searchIndexedAt: null,
+                $or: [
+                    { searchIndexAttempts: "null" },
+                    {
+                        searchIndexAttempts: `lt(${this.maxAttempts})`,
+                        searchIndexNextAttemptAt: `lte(${now.toISOString()})`,
+                    },
+                ],
+                sort: { dateCreated: "ASC", uid: "ASC" },
+                limit: this.batchSize,
+            } as any,
             { ignoreACL: true, limit: this.batchSize },
         );
 
         const docs: SearchDocument[] = [];
-        // Only messages that actually produced a document get stamped `searchIndexedAt` below - a message
-        // whose `buildDocument()` throws (e.g. a transient blob-store failure) must be picked up again by a
-        // later run, not silently marked "already indexed" and skipped forever.
-        const indexed: M[] = [];
+        // Only messages the provider actually reports as indexed get stamped `searchIndexedAt` below - a message
+        // whose `buildDocument()` throws (e.g. a transient blob-store failure) or that the provider rejects must
+        // be picked up again by a later run (up to `maxAttempts`), not silently marked "already indexed".
+        const built: M[] = [];
         for (const message of pending) {
             try {
                 docs.push(await this.buildDocument(message));
-                indexed.push(message);
+                built.push(message);
             } catch (err: any) {
-                this.logger?.warn(`SearchIndexJob: failed to build search document for message ${message.uid}: ${err.message}`);
+                await this.recordFailure(message, `failed to build search document: ${err?.message}`);
             }
         }
 
@@ -114,15 +145,74 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
             return;
         }
 
-        await this.searchProvider.bulkIndex(docs);
+        let indexedUids: Set<string>;
+        try {
+            const result: string[] = await this.searchProvider.bulkIndex(docs);
+            // Defensive: a provider not honoring the `string[]` contract (e.g. plain JS) is treated as having
+            // indexed the whole batch, matching this job's behavior before per-document results existed.
+            indexedUids = new Set(Array.isArray(result) ? result : docs.map((doc) => doc.entityUid));
+        } catch (err: any) {
+            // A whole-batch failure (e.g. the provider is unreachable): nothing can be assumed indexed.
+            for (const message of built) {
+                await this.recordFailure(message, `bulk index failed: ${err?.message}`);
+            }
+            return;
+        }
 
-        const now: Date = new Date();
-        for (const message of indexed) {
-            await this.messageRepo.update(
-                { uid: message.uid, version: (message as any).version, searchIndexedAt: now } as any,
+        const indexedAt: Date = new Date();
+        for (const message of built) {
+            if (!indexedUids.has(message.uid)) {
+                await this.recordFailure(message, "search provider did not index the document");
+                continue;
+            }
+            const update: any = { uid: message.uid, version: (message as any).version, searchIndexedAt: indexedAt };
+            if (
+                (message.searchIndexAttempts ?? null) !== null ||
+                (message.searchIndexNextAttemptAt ?? null) !== null ||
+                (message.searchIndexError ?? null) !== null
+            ) {
+                // Explicit `null` (not `undefined`) so TypeORM's `update()` actually clears these on SQL.
+                update.searchIndexAttempts = null;
+                update.searchIndexNextAttemptAt = null;
+                update.searchIndexError = null;
+            }
+            try {
+                await this.messageRepo.update(update, message, { ignoreACL: true, skipPush: true });
+            } catch (err: any) {
+                // e.g. a concurrent edit bumped the version - the message is simply re-indexed on a later run.
+                this.logger?.warn(`SearchIndexJob: failed to stamp searchIndexedAt on message ${message.uid}: ${err?.message}`);
+            }
+        }
+    }
+
+    /**
+     * Records one failed indexing attempt on `message`: increments `searchIndexAttempts`, schedules the next
+     * attempt with exponential backoff, and stores the error. Once `maxAttempts` is reached the message is no
+     * longer selected by `run()` and the failure is logged as an error.
+     */
+    private async recordFailure(message: M, reason: string): Promise<void> {
+        const attempts: number = (message.searchIndexAttempts ?? 0) + 1;
+        const exhausted: boolean = attempts >= this.maxAttempts;
+        const delayMs: number = this.retryBackoffSeconds * 1000 * Math.pow(2, attempts - 1);
+        if (exhausted) {
+            this.logger?.error(`SearchIndexJob: giving up on message ${message.uid} after ${attempts} failed attempt(s): ${reason}`);
+        } else {
+            this.logger?.warn(`SearchIndexJob: attempt ${attempts} to index message ${message.uid} failed: ${reason}`);
+        }
+        try {
+            await this.messageRepo!.update(
+                {
+                    uid: message.uid,
+                    version: (message as any).version,
+                    searchIndexAttempts: attempts,
+                    searchIndexNextAttemptAt: exhausted ? null : new Date(Date.now() + delayMs),
+                    searchIndexError: reason.slice(0, MAX_ERROR_LENGTH),
+                } as any,
                 message,
                 { ignoreACL: true, skipPush: true },
             );
+        } catch (err: any) {
+            this.logger?.warn(`SearchIndexJob: failed to record indexing failure on message ${message.uid}: ${err?.message}`);
         }
     }
 

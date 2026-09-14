@@ -20,7 +20,7 @@ const { Column, Entity, Index } = PersistenceDecorators;
     "A user's explicit 'always put mail from this sender in Focused/Other' instruction, overriding whatever " +
         "the Focused Inbox heuristics would otherwise decide for that sender.",
 )
-@Index("focusedinboxoverride_mailbox", ["mailboxUid", "senderAddress"])
+@Index("focusedinboxoverride_mailbox", ["mailboxUid", "senderAddress"], { unique: true })
 @Protect(
     {
         uid: "FocusedInboxOverride",

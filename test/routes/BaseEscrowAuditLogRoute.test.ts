@@ -51,4 +51,16 @@ describe("BaseEscrowAuditLogRoute Tests (rejectWrite()-guarded method bodies onl
             "EscrowAuditLogEntry records cannot be created, updated, or deleted through this API.",
         );
     });
+
+    it("updateBulk() throws AUTH_PERMISSION_FAILURE.", async () => {
+        const route = objectFactory.newInstance<TestEscrowAuditLogRoute>(TestEscrowAuditLogRoute, { initialize: false });
+
+        await expect(route.updateBulk([], {} as any)).rejects.toThrow("EscrowAuditLogEntry records cannot be created, updated, or deleted through this API.");
+    });
+
+    it("updateProperty() throws AUTH_PERMISSION_FAILURE.", async () => {
+        const route = objectFactory.newInstance<TestEscrowAuditLogRoute>(TestEscrowAuditLogRoute, { initialize: false });
+
+        await expect(route.updateProperty("id-1", "targetUid", "x")).rejects.toThrow("EscrowAuditLogEntry records cannot be created, updated, or deleted through this API.");
+    });
 });

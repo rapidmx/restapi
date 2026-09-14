@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
-import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { BackgroundService, ObjectFactory, RecoverableBaseEntity, RepoUtils } from "@rapidrest/service-core";
+import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
+import { BlobReferenceSource, deleteBlobsIfUnreferenced, messageBlobReferenceSources } from "../util/BlobReferenceUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { AuditAction, DataSubjectErasureRequest, Mailbox, Plugin } from "../models/types.js";
@@ -24,11 +26,11 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * later run once the matter closes, the same "skip, don't error" shape `RetentionEnforcementJob`'s own
  * `Message` purge already uses.
  *
- * Every purged `Message`/`Attachment`/`Contact` also has its `BlobStore` content explicitly deleted
- * (`bodyBlobKey`/`sanitizedHtmlBlobKey`, `blobKey`/`extractedTextBlobKey`, `photoBlobKey` respectively) -
- * the ORM layer has no idea these opaque byte payloads exist, so leaving them behind after the owning row
- * is gone would defeat the entire point of a "leave no trace" feature. `BlobStore.delete()` is
- * documented as a no-op for a key that doesn't exist, so no existence check is needed first.
+ * Every purged `Message`/`Attachment`/`QuarantineEntry`/`IngestQueueEntry` also has its `BlobStore` content
+ * deleted - once no other row, in any mailbox, still references it (message blobs are shared between recipient
+ * mailboxes and filter-rule copies; see `util/BlobReferenceUtils.ts`). A `Contact` photo, export bundle or import
+ * source belongs to one row and is deleted outright. `BlobStore.delete()` is documented as a no-op for a key that
+ * doesn't exist, so no existence check is needed first.
  *
  * Cascades across every real `mailboxUid`-scoped entity type this codebase has - not just the
  * `Message`/`Contact`/`ContactList`/`CalendarEvent`/`Task`/`Note`/`Attachment` set `DataExportJob`'s own
@@ -45,14 +47,11 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * past export bundle or an import's original source file - that must not outlive the mailbox it was taken
  * from).
  *
- * Deliberately still NOT purged: `KeyVault` (the mailbox's E2E-encryption key material - a distinct
- * subsystem with its own lifecycle/escrow interactions this job doesn't own, a scoped fast-follow rather
- * than something to touch without that subsystem's own review) and `EscrowAccessRequest`/
- * `EscrowAuditLogEntry` (this mailbox's own escrow-access audit trail, which - like `AuditLogEntry`
- * elsewhere in this codebase - must outlive the record it audits, not disappear the moment that record
- * does). `CalendarShareLink` is `folderUid`-scoped, not `mailboxUid`-scoped, so it isn't caught by this
- * job's per-mailbox-uid sweep either - purging it would need iterating the mailbox's own (already-deleted-
- * by-the-time-anyone-would-look) folder uids instead, a narrower, separate fast-follow.
+ * Also purged: `KeyVault` (the mailbox's E2E-encryption key material) and every `CalendarShareLink` on one of
+ * the mailbox's folders (found per folder, just before that folder is purged, since share links are
+ * `folderUid`-scoped). Deliberately NOT purged: `EscrowAccessRequest`/`EscrowAuditLogEntry` (this mailbox's own
+ * escrow-access audit trail, which - like `AuditLogEntry` elsewhere in this codebase - must outlive the record
+ * it audits, not disappear the moment that record does).
  *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`ErasureExecutionJobMongo`/
  * `ErasureExecutionJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob`/
@@ -83,6 +82,8 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     protected abstract ingestQueueEntryClass: any;
     protected abstract dataExportRequestClass: any;
     protected abstract mailboxImportRequestClass: any;
+    protected abstract keyVaultClass: any;
+    protected abstract calendarShareLinkClass: any;
 
     /** Supplied by the Mongo/SQL concrete subclasses so this job can tell which installed plugins aren't loaded in
      * this process - see `unloadedMailboxDataPlugins()`. */
@@ -173,21 +174,25 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(request.mailboxUid, { ignoreACL: true });
 
         let purgedCount = 0;
-        // `blobKey`/`bodyBlobKey` are required (non-optional) fields on `Attachment`/`Message` - deleted
-        // unconditionally, trusting that invariant rather than defensively re-checking it. Only the
-        // genuinely optional companions (`extractedTextBlobKey`/`sanitizedHtmlBlobKey`) need a presence
-        // check first.
-        purgedCount += await this.purgeEntityType(this.attachmentClass, request.mailboxUid, async (row: any) => {
-            await this.blobStore!.delete(row.blobKey);
-            if (row.extractedTextBlobKey) {
-                await this.blobStore!.delete(row.extractedTextBlobKey);
-            }
+        // Message content blobs are shared: one inbound raw blob is referenced by every recipient mailbox's
+        // `Message`/`IngestQueueEntry`/`QuarantineEntry`, and attachment/sanitized-HTML blobs by a message and its
+        // mail-filter copies. Each row is deleted first, then its blobs only if no other row (in any mailbox,
+        // soft-deleted included) still references them - see `util/BlobReferenceUtils.ts`. Erasing one recipient
+        // must never destroy another recipient's copy, least of all a legal-hold custodian's.
+        const blobSources: BlobReferenceSource[] = messageBlobReferenceSources({
+            messageClass: this.messageClass,
+            attachmentClass: this.attachmentClass,
+            quarantineEntryClass: this.quarantineEntryClass,
+            ingestQueueEntryClass: this.ingestQueueEntryClass,
         });
-        purgedCount += await this.purgeEntityType(this.messageClass, request.mailboxUid, async (row: any) => {
-            await this.blobStore!.delete(row.bodyBlobKey);
-            if (row.sanitizedHtmlBlobKey) {
-                await this.blobStore!.delete(row.sanitizedHtmlBlobKey);
-            }
+        const deleteSharedBlobs = async (...keys: (string | undefined)[]): Promise<void> => {
+            await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, keys);
+        };
+        purgedCount += await this.purgeEntityType(this.attachmentClass, request.mailboxUid, undefined, async (row: any) => {
+            await deleteSharedBlobs(row.blobKey, row.extractedTextBlobKey);
+        });
+        purgedCount += await this.purgeEntityType(this.messageClass, request.mailboxUid, undefined, async (row: any) => {
+            await deleteSharedBlobs(row.bodyBlobKey, row.sanitizedHtmlBlobKey);
         });
         purgedCount += await this.purgeEntityType(this.contactClass, request.mailboxUid, async (row: any) => {
             if (row.photoBlobKey) {
@@ -198,7 +203,13 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         purgedCount += await this.purgeEntityType(this.calendarEventClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.taskClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.noteClass, request.mailboxUid);
-        purgedCount += await this.purgeEntityType(this.folderClass, request.mailboxUid);
+        // `CalendarShareLink` is scoped by `folderUid`, not `mailboxUid`, so its rows are found through each folder
+        // before that folder is purged (purging the folder also removes the folder ACL holding the link's token).
+        let shareLinkCount = 0;
+        purgedCount += await this.purgeEntityType(this.folderClass, request.mailboxUid, async (row: any) => {
+            shareLinkCount += await this.purgeByCriteria(this.calendarShareLinkClass, { folderUid: row.uid });
+        });
+        purgedCount += shareLinkCount;
         purgedCount += await this.purgeEntityType(this.focusedInboxOverrideClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.taskListClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.labelClass, request.mailboxUid);
@@ -207,17 +218,17 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         purgedCount += await this.purgeEntityType(this.bookingTypeClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.bookingClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.oofReplySuppressionClass, request.mailboxUid);
+        // The mailbox's end-to-end encryption key material (wrapped private keys and master-key wraps).
+        purgedCount += await this.purgeEntityType(this.keyVaultClass, request.mailboxUid);
         // Plugin models marked `@MailboxScopedData()` (e.g. ActiveSync device state) hold this mailbox's data too.
         for (const entityClass of this.pluginMailboxScopedClasses()) {
             purgedCount += await this.purgeEntityType(entityClass, request.mailboxUid);
         }
-        // `rawBlobKey` is required (non-optional) on both `QuarantineEntry` and `IngestQueueEntry` -
-        // deleted unconditionally, same reasoning as `Attachment.blobKey`/`Message.bodyBlobKey` above.
-        purgedCount += await this.purgeEntityType(this.quarantineEntryClass, request.mailboxUid, async (row: any) => {
-            await this.blobStore!.delete(row.rawBlobKey);
+        purgedCount += await this.purgeEntityType(this.quarantineEntryClass, request.mailboxUid, undefined, async (row: any) => {
+            await deleteSharedBlobs(row.rawBlobKey);
         });
-        purgedCount += await this.purgeEntityType(this.ingestQueueEntryClass, request.mailboxUid, async (row: any) => {
-            await this.blobStore!.delete(row.rawBlobKey);
+        purgedCount += await this.purgeEntityType(this.ingestQueueEntryClass, request.mailboxUid, undefined, async (row: any) => {
+            await deleteSharedBlobs(row.rawBlobKey);
         });
         purgedCount += await this.purgeEntityType(this.dataExportRequestClass, request.mailboxUid, async (row: any) => {
             if (row.blobKey) {
@@ -293,13 +304,34 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         return { unloaded: names(false), removed: names(true) };
     }
 
-    /** Purges every `mailboxUid`-matching row of one entity type, best-effort per row (a single row's
-     * failure is logged and skipped, not fatal to the rest of the cascade - the same tolerance
-     * `RetentionEnforcementJob`'s own per-record purge loop already accepts). `onBeforeDelete`, when
-     * given, deletes that row's own `BlobStore` content first. */
-    private async purgeEntityType(entityClass: any, mailboxUid: string, onBeforeDelete?: (row: any) => Promise<void>): Promise<number> {
+    /** Purges every `mailboxUid`-matching row of one entity type - see `purgeByCriteria()`. */
+    private async purgeEntityType(
+        entityClass: any,
+        mailboxUid: string,
+        onBeforeDelete?: (row: any) => Promise<void>,
+        onAfterDelete?: (row: any) => Promise<void>,
+    ): Promise<number> {
+        return await this.purgeByCriteria(entityClass, { mailboxUid }, onBeforeDelete, onAfterDelete);
+    }
+
+    /** Purges every row of one entity type matching `criteria`, best-effort per row (a single row's failure is
+     * logged and skipped, not fatal to the rest of the cascade - the same tolerance `RetentionEnforcementJob`'s
+     * own per-record purge loop already accepts). `onBeforeDelete`, when given, runs first (a row's own unshared
+     * `BlobStore` content, or its dependent rows); `onAfterDelete` runs once the row is gone (shared blobs that no
+     * remaining row references). */
+    private async purgeByCriteria(
+        entityClass: any,
+        criteria: Record<string, any>,
+        onBeforeDelete?: (row: any) => Promise<void>,
+        onAfterDelete?: (row: any) => Promise<void>,
+    ): Promise<number> {
         const repo: RepoUtils<any> = await this.getRepo(entityClass);
-        const rows: any[] = await this.findAllPages(repo, { mailboxUid });
+        // A soft-deleted row of a recoverable entity (e.g. a message in Deleted Items) is still this mailbox's data,
+        // but `find()` excludes it unless `deleted: true` is asked for explicitly.
+        const rows: any[] = [
+            ...(await this.findAllPages(repo, criteria)),
+            ...(new entityClass() instanceof RecoverableBaseEntity ? await this.findAllPages(repo, { ...criteria, deleted: true }) : []),
+        ];
 
         let purgedCount = 0;
         for (const row of rows) {
@@ -309,6 +341,9 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
                 }
                 await repo.delete(row.uid, { ignoreACL: true, purge: true });
                 purgedCount++;
+                if (onAfterDelete) {
+                    await onAfterDelete(row);
+                }
             } catch (err: any) {
                 this.logger?.warn(`ErasureExecutionJob: failed to purge ${entityClass.name} ${row.uid}: ${err.message}`);
             }
@@ -333,7 +368,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         return await this._objectFactory!.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
     }
 
-    /** Fetches every page of `repo.find(criteria, ...)` results - see `DataExportJob.findAllPages()`'s
+    /** Fetches every page of `repo.find(criteria, ...)` results - see `MailboxContentUtils`'
      * identical rationale (a bare, unpaginated `find()` silently truncates at 100 rows). An erasure must
      * be complete, not a sample. */
     private async findAllPages(repo: RepoUtils<any>, criteria: Record<string, any>, pageSize: number = 500): Promise<any[]> {
@@ -363,7 +398,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         // like any other real processing failure.
         const updated: T = await this.requestRepo!.update(
             { uid: request.uid, version: (request as any).version, status: "completed", purgedCount } as any,
-            request,
+            asEntity(this.requestRepo!, request),
             { ignoreACL: true },
         );
         await recordAuditLog(

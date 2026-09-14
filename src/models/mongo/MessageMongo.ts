@@ -40,6 +40,11 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Index("message_folder", ["folderUid"])
 @Index("message_mailbox", ["mailboxUid"])
 @Index("message_id", ["messageId"])
+@Index("message_sent_date", ["sentDate"])
+@Index("message_scheduled_send_time", ["scheduledSendTime"])
+@Index("message_search_indexed_at", ["searchIndexedAt"])
+@Index("message_body_blob_key", ["bodyBlobKey"])
+@Index("message_sanitized_html_blob_key", ["sanitizedHtmlBlobKey"])
 @Protect(
     {
         uid: "Message",
@@ -139,12 +144,42 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     public searchIndexedAt?: Date;
 
     @Column()
+    @Description("How many times `SearchIndexJob` has failed to process this message (unset when never failed).")
+    @Nullable
+    public searchIndexAttempts?: number;
+
+    @Column()
+    @Description("The earliest time `SearchIndexJob` will retry this message after a failure.")
+    @Nullable
+    public searchIndexNextAttemptAt?: Date;
+
+    @Column()
+    @Description("The error from this message's most recent failed `SearchIndexJob` attempt, if any.")
+    @Nullable
+    public searchIndexError?: string;
+
+    @Column()
     @Description(
         "When set to a future time, `send()` defers relay until then instead of sending immediately - the " +
             "message sits in the mailbox's `OUTBOX` folder until `ScheduledSendJob` relays it and clears this field.",
     )
     @Nullable
     public scheduledSendTime?: Date;
+
+    @Column()
+    @Description("Consecutive failed ScheduledSendJob attempts for the current scheduled send.")
+    @Nullable
+    public scheduledSendAttempts?: number;
+
+    @Column()
+    @Description("Why ScheduledSendJob gave up on (or refused) this scheduled send, leaving it unsent.")
+    @Nullable
+    public scheduledSendError?: string;
+
+    @Column()
+    @Description("Set once the transport accepted this scheduled send but filing it into Sent Items failed - never relayed again.")
+    @Nullable
+    public scheduledSendRelayedAt?: Date;
 
     @Column()
     @Description(
@@ -250,7 +285,13 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.encrypted = other.encrypted !== undefined ? other.encrypted : this.encrypted;
             this.scanResultUid = "scanResultUid" in other ? other.scanResultUid : this.scanResultUid;
             this.searchIndexedAt = "searchIndexedAt" in other ? other.searchIndexedAt : this.searchIndexedAt;
+            this.searchIndexAttempts = "searchIndexAttempts" in other ? other.searchIndexAttempts : this.searchIndexAttempts;
+            this.searchIndexNextAttemptAt = "searchIndexNextAttemptAt" in other ? other.searchIndexNextAttemptAt : this.searchIndexNextAttemptAt;
+            this.searchIndexError = "searchIndexError" in other ? other.searchIndexError : this.searchIndexError;
             this.scheduledSendTime = "scheduledSendTime" in other ? other.scheduledSendTime : this.scheduledSendTime;
+            this.scheduledSendAttempts = "scheduledSendAttempts" in other ? other.scheduledSendAttempts : this.scheduledSendAttempts;
+            this.scheduledSendError = "scheduledSendError" in other ? other.scheduledSendError : this.scheduledSendError;
+            this.scheduledSendRelayedAt = "scheduledSendRelayedAt" in other ? other.scheduledSendRelayedAt : this.scheduledSendRelayedAt;
             this.recallRequestedAt = "recallRequestedAt" in other ? other.recallRequestedAt : this.recallRequestedAt;
             this.conversationId = "conversationId" in other ? other.conversationId : this.conversationId;
             this.inferenceClassification =

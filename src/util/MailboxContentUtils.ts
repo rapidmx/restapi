@@ -24,21 +24,6 @@ async function getRepo(objectFactory: ObjectFactory, entityClass: any): Promise<
     return await objectFactory.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
 }
 
-/** Fetches every page of `repo.find(criteria, ...)` results - see `MailboxQuotaRecalcJob.findAllPages()`'s
- * identical rationale (a bare, unpaginated `find()` silently truncates at 100 rows). An export/eDiscovery
- * collection must be complete, not a sample. */
-async function findAllPages(repo: RepoUtils<any>, criteria: Record<string, any>, pageSize: number = 500): Promise<any[]> {
-    const all: any[] = [];
-    for (let page = 0; ; page++) {
-        const batch: any[] = await repo.find({ ...criteria, limit: pageSize, page } as any, { ignoreACL: true, limit: pageSize, page });
-        all.push(...batch);
-        if (batch.length < pageSize) {
-            break;
-        }
-    }
-    return all;
-}
-
 /**
  * Aggregates one mailbox's full content - `Mailbox` itself plus every `Message`/`Contact`/`ContactList`/
  * `CalendarEvent`/`Task`/`Note`/`Attachment` row it owns - into newline-delimited JSON lines, one object
@@ -52,14 +37,17 @@ async function findAllPages(repo: RepoUtils<any>, criteria: Record<string, any>,
  * findActiveHoldsFor()`'s own asymmetric treatment (`Message.sentDate` is the one denormalized,
  * unambiguous "when did this happen" field across this set - `CalendarEvent`/`Task` have their own
  * differently-shaped date semantics that a generic single filter can't correctly express, and are left for
- * a future, more deliberate per-type treatment rather than approximated poorly now). The lower bound is
- * pushed into the query itself (`gte(...)`); the upper bound is applied in-process, matching
- * `CalendarReminderJob`'s own documented reason for avoiding the query-DSL's two-sided `range(...)`
- * operator (unconfirmed cross-backend Date coercion) in favor of a single-sided one.
+ * a future, more deliberate per-type treatment rather than approximated poorly now). Both bounds are pushed
+ * into the query itself as one inclusive `range(start,end)` - the installed `@rapidrest/service-core`'s
+ * `range(...)` coerces both operands through the same per-property Date coercion `gte(...)`/`lte(...)` use,
+ * on both backends (verified by `MatterExportJob{Mongo,SQL}.test.ts`'s before-start/after-end fixtures) - so
+ * out-of-range rows are never loaded, let alone counted against `maxRows`.
  *
  * `maxRows` bounds the total number of lines (across every entity type combined) this function will hold
  * in memory at once - an unbounded mailbox (or, for `MatterExportJob`, an unbounded custodian mailbox
- * within a larger matter) could otherwise grow this array without limit. Exceeding it throws rather than
+ * within a larger matter) could otherwise grow this array without limit. The remaining budget is enforced
+ * inside the paging loop, as each page arrives, so at most one page (`pageSize` rows) beyond the cap is ever
+ * loaded before giving up - never the whole oversized table. Exceeding it throws rather than
  * silently truncating the export, since a partial eDiscovery/GDPR bundle that looks complete is worse than
  * one that visibly failed - both `DataExportJob.run()`/`MatterExportJob.run()` already catch a thrown
  * `processRequest()` error and route it through their own `markFailed()`, the same path a missing
@@ -72,6 +60,7 @@ export async function collectMailboxContentLines(
     mailbox: Mailbox,
     messageDateRange?: { start: Date; end: Date },
     maxRows: number = DEFAULT_MAX_MAILBOX_CONTENT_ROWS,
+    pageSize: number = 500,
 ): Promise<string[]> {
     const lines: string[] = [JSON.stringify({ entityType: "Mailbox", ...mailbox })];
 
@@ -79,16 +68,22 @@ export async function collectMailboxContentLines(
         const repo: RepoUtils<any> = await getRepo(objectFactory, entityClass);
         const criteria: Record<string, any> = { mailboxUid };
         if (entityType === "message" && messageDateRange) {
-            criteria.sentDate = `gte(${messageDateRange.start.toISOString()})`;
+            criteria.sentDate = `range(${messageDateRange.start.toISOString()},${messageDateRange.end.toISOString()})`;
         }
-        let rows: any[] = await findAllPages(repo, criteria);
-        if (entityType === "message" && messageDateRange) {
-            rows = rows.filter((row) => new Date(row.sentDate).getTime() <= messageDateRange.end.getTime());
-        }
-        for (const row of rows) {
-            lines.push(JSON.stringify({ entityType, ...row }));
-            if (lines.length > maxRows) {
+        // Paged (a bare, unpaginated `find()` silently truncates at 100 rows - see `MailboxQuotaRecalcJob.
+        // findAllPages()`), with the row budget checked as each page arrives rather than after every page has
+        // been loaded - an export/eDiscovery collection must be complete, not a sample, but also must not load
+        // an unbounded table into memory just to discover it's too big.
+        for (let page = 0; ; page++) {
+            const batch: any[] = await repo.find({ ...criteria, limit: pageSize, page } as any, { ignoreACL: true, limit: pageSize, page });
+            if (lines.length + batch.length > maxRows) {
                 throw new Error(`Mailbox ${mailboxUid}'s content exceeds the maximum of ${maxRows} exportable rows.`);
+            }
+            for (const row of batch) {
+                lines.push(JSON.stringify({ entityType, ...row }));
+            }
+            if (batch.length < pageSize) {
+                break;
             }
         }
     }

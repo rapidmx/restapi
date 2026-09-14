@@ -38,7 +38,7 @@ export class BrandingSQL extends BaseEntity implements Branding {
     @Description("Browser-tab / product title shown by the web client.")
     public title: string = "";
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("The URL a client should render as the logo.")
     @Nullable
     public logoUrl?: string;
@@ -53,7 +53,7 @@ export class BrandingSQL extends BaseEntity implements Branding {
     @Nullable
     public logoContentType?: string;
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("The URL a client should render as the compact nav-header icon, as opposed to the full logo.")
     @Nullable
     public iconUrl?: string;
@@ -68,7 +68,7 @@ export class BrandingSQL extends BaseEntity implements Branding {
     @Nullable
     public iconContentType?: string;
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("The URL a client should render as the stylesheet.")
     @Nullable
     public stylesheetUrl?: string;
@@ -83,12 +83,12 @@ export class BrandingSQL extends BaseEntity implements Branding {
     @Nullable
     public stylesheetContentType?: string;
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("Free-form UI chrome the web client renders above the mail app.")
     @Nullable
     public headerHtml?: string;
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("Free-form UI chrome the web client renders below the mail app.")
     @Nullable
     public footerHtml?: string;

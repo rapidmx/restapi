@@ -25,6 +25,7 @@ import {
 } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
+import { bookingSecuritySuite } from "../bookingSecuritySuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -686,5 +687,23 @@ describe("Route:BookingMongo Tests (anonymous)", () => {
         // the mail is attempted, so there is nothing a thrown error could usefully undo.
         expect(result.status).toBe(200);
         expect(mailTransport.sent).toHaveLength(0);
+    });
+    bookingSecuritySuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        mailboxUid: () => mailbox.uid,
+        calendarFolderUid: () => calendarFolder.uid,
+        createBookingType,
+        createEvent,
+        createEvents: async (data: any[]) => {
+            for (let i = 0; i < data.length; i += 50) {
+                await Promise.all(data.slice(i, i + 50).map((d) => createEvent(d)));
+            }
+        },
+        createFolder: async (data: any) =>
+            await folderRepo.save(new FolderMongo({ unreadCount: 0, totalCount: 0, syncKeyVersion: 0, ...data })),
+        findEvents: async () => await calendarEventRepo.find({}).toArray(),
+        findBookings: async () => await bookingRepo.find({}).toArray(),
+        rateLimiter: () => objectFactory.getInstance(RateLimiter),
     });
 });

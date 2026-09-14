@@ -6,7 +6,7 @@
 // mocks so this can assert behavior without a real DB. See test/util/EscrowUtils.test.ts's identical
 // rationale for why each test declares its own fresh, locally-scoped stub class rather than a single
 // shared one - both functions cache one repo per `matterClass` object identity in a module-level WeakMap.
-import { assertNotOnLegalHold, findActiveHoldsFor } from "../../src/util/LegalHoldUtils.js";
+import { assertNotOnLegalHold, findActiveHoldsFor, loadLegalHoldIndex } from "../../src/util/LegalHoldUtils.js";
 
 function makeStubClass(): any {
     return class StubMatter {};
@@ -128,5 +128,26 @@ describe("assertNotOnLegalHold() Tests", () => {
         const objectFactory = makeObjectFactory(repo);
 
         await expect(assertNotOnLegalHold(objectFactory, makeStubClass(), "mailbox-1")).rejects.toThrow(/matter-1/);
+    });
+});
+
+describe("loadLegalHoldIndex() Tests", () => {
+    it("Indexes open matters by custodian, ignoring closed ones, and honors each matter's date range.", async () => {
+        const repo = {
+            find: vi.fn().mockResolvedValue([
+                makeMatter({ uid: "open", custodianMailboxUids: ["held", "both"], dateRangeStart: new Date("2020-01-01"), dateRangeEnd: new Date("2020-12-31") }),
+                makeMatter({ uid: "closed", custodianMailboxUids: ["closed-only", "both"], closedAt: new Date() }),
+                makeMatter({ uid: "no-custodians", custodianMailboxUids: undefined }),
+            ]),
+        };
+
+        const index = await loadLegalHoldIndex(makeObjectFactory(repo), makeStubClass());
+
+        expect([...index.heldMailboxUids].sort()).toEqual(["both", "held"]);
+        expect(index.isHeld("held")).toBe(true);
+        expect(index.isHeld("held", new Date("2020-06-01"))).toBe(true);
+        expect(index.isHeld("held", new Date("2021-06-01"))).toBe(false);
+        expect(index.isHeld("closed-only")).toBe(false);
+        expect(index.isHeld("nobody", new Date("2020-06-01"))).toBe(false);
     });
 });

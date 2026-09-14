@@ -14,7 +14,13 @@ import { In, Repository } from "typeorm";
 import config from "../../config.sql.js";
 import { QuarantineRetentionJobSQL } from "../../../src/jobs/sql/QuarantineRetentionJobSQL.js";
 import { QuarantineEntrySQL } from "../../../src/models/sql/QuarantineEntrySQL.js";
-import { QuarantineReason } from "../../../src/models/types.js";
+import { AttachmentSQL } from "../../../src/models/sql/AttachmentSQL.js";
+import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
+import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
+import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
+import { ScanResultSQL } from "../../../src/models/sql/ScanResultSQL.js";
+import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
+import { IngestStatus, QuarantineReason, RecipientType, ScanTargetType } from "../../../src/models/types.js";
 
 const RETENTION_DAYS = 30; // matches mail:jobs:quarantine_retention:retention_days in test/config.ts
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -25,6 +31,10 @@ describe("QuarantineRetentionJobSQL Tests (real DB + DI)", () => {
     let connectionManager: ConnectionManager;
     let job: QuarantineRetentionJobSQL;
     let quarantineEntryRepo: Repository<QuarantineEntrySQL>;
+    let scanResultRepo: Repository<ScanResultSQL>;
+    let messageRepo: Repository<MessageSQL>;
+    let ingestQueueEntryRepo: Repository<IngestQueueEntrySQL>;
+    let matterRepo: Repository<MatterSQL>;
 
     const createEntry = async (data?: Partial<QuarantineEntrySQL>): Promise<QuarantineEntrySQL> => {
         const obj = new QuarantineEntrySQL({
@@ -42,6 +52,7 @@ describe("QuarantineRetentionJobSQL Tests (real DB + DI)", () => {
         // Normally registered by `Server`'s own bootstrap - registered explicitly here since this file
         // deliberately bypasses `Server` (see QuarantineRetentionJobMongo.test.ts's header comment).
         objectFactory.register(ACLUtils);
+        registerTestDoubles(objectFactory);
 
         connectionManager = await objectFactory.newInstance(ConnectionManager, { name: "default" });
         const models = new Map<string, any>();
@@ -49,6 +60,11 @@ describe("QuarantineRetentionJobSQL Tests (real DB + DI)", () => {
         // throws "No metadata found" from `getRepository()` for any entity not explicitly in this map.
         models.set("AccessControlListSQL", AccessControlListSQL);
         models.set("QuarantineEntrySQL", QuarantineEntrySQL);
+        models.set("ScanResultSQL", ScanResultSQL);
+        models.set("MessageSQL", MessageSQL);
+        models.set("AttachmentSQL", AttachmentSQL);
+        models.set("IngestQueueEntrySQL", IngestQueueEntrySQL);
+        models.set("MatterSQL", MatterSQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");
@@ -56,6 +72,10 @@ describe("QuarantineRetentionJobSQL Tests (real DB + DI)", () => {
             throw new Error("Could not find sql connection");
         }
         quarantineEntryRepo = conn.getRepository(QuarantineEntrySQL);
+        scanResultRepo = conn.getRepository(ScanResultSQL);
+        messageRepo = conn.getRepository(MessageSQL);
+        ingestQueueEntryRepo = conn.getRepository(IngestQueueEntrySQL);
+        matterRepo = conn.getRepository(MatterSQL);
 
         // Constructed once via real ObjectFactory DI: `@Init` builds its one real `RepoUtils` against the live
         // connection above.
@@ -67,7 +87,9 @@ describe("QuarantineRetentionJobSQL Tests (real DB + DI)", () => {
     });
 
     beforeEach(async () => {
-        await quarantineEntryRepo.clear();
+        for (const repo of [quarantineEntryRepo, scanResultRepo, messageRepo, ingestQueueEntryRepo, matterRepo] as Repository<any>[]) {
+            await repo.clear();
+        }
         // Restore the job's batch size to the configured default between tests, in case a test overrode it.
         (job as any).batchSize = config.get("mail:jobs:quarantine_retention:batch_size") ?? 500;
     });
@@ -122,6 +144,63 @@ describe("QuarantineRetentionJobSQL Tests (real DB + DI)", () => {
 
         const found = await quarantineEntryRepo.findOne({ where: { uid: oldReleased.uid } });
         expect(found).toBeNull();
+    });
+
+    it("Purges an expired entry's ScanResult and raw blob, keeping a raw blob another recipient's message or pending ingest entry still references.", async () => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const scanResult = await scanResultRepo.save(new ScanResultSQL({ targetType: ScanTargetType.MESSAGE, targetUid: uuid.v4(), scannedAt: new Date() } as any));
+        const ownKey = `ingest/${uuid.v4()}`;
+        const deliveredKey = `ingest/${uuid.v4()}`;
+        const pendingKey = `ingest/${uuid.v4()}`;
+        for (const key of [ownKey, deliveredKey, pendingKey]) {
+            await blobStore.put(key, Buffer.from("raw"));
+        }
+        const entries = [
+            await createEntry({ rawBlobKey: ownKey, scanResultUid: scanResult.uid, dateCreated: new Date(Date.now() - (RETENTION_DAYS + 5) * DAY_MS) }),
+            await createEntry({ rawBlobKey: deliveredKey, dateCreated: new Date(Date.now() - (RETENTION_DAYS + 5) * DAY_MS) }),
+            await createEntry({ rawBlobKey: pendingKey, dateCreated: new Date(Date.now() - (RETENTION_DAYS + 5) * DAY_MS) }),
+        ];
+        expect(entries).toHaveLength(3);
+        await messageRepo.save(
+            new MessageSQL({
+                mailboxUid: uuid.v4(),
+                folderUid: uuid.v4(),
+                messageId: "m@example.com",
+                subject: "Hi",
+                from: { address: "a@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date(),
+                receivedDate: new Date(),
+                bodyBlobKey: deliveredKey,
+                flags: { read: false, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: false,
+            }),
+        );
+        await ingestQueueEntryRepo.save(
+            new IngestQueueEntrySQL({ mailboxUid: uuid.v4(), envelopeFrom: "a@example.com", envelopeTo: ["b@example.com"], rawBlobKey: pendingKey, status: IngestStatus.PENDING }),
+        );
+
+        await job.run();
+
+        expect(await quarantineEntryRepo.count()).toBe(0);
+        expect(await scanResultRepo.findOne({ where: { uid: scanResult.uid } })).toBeNull();
+        expect(await blobStore.exists(ownKey)).toBe(false);
+        expect(await blobStore.exists(deliveredKey)).toBe(true);
+        expect(await blobStore.exists(pendingKey)).toBe(true);
+    });
+
+    it("Keeps an expired entry whose mailbox is under an open legal hold.", async () => {
+        const entry = await createEntry({ dateCreated: new Date(Date.now() - (RETENTION_DAYS + 5) * DAY_MS) });
+        await matterRepo.save(
+            new MatterSQL({ name: "Held", escrowScopeId: uuid.v4(), custodianMailboxUids: [entry.mailboxUid], dateRangeStart: new Date("2000-01-01"), dateRangeEnd: new Date("2100-01-01") }),
+        );
+        const other = await createEntry({ dateCreated: new Date(Date.now() - (RETENTION_DAYS + 5) * DAY_MS) });
+
+        await job.run();
+
+        expect(await quarantineEntryRepo.findOne({ where: { uid: entry.uid } })).not.toBeNull();
+        expect(await quarantineEntryRepo.findOne({ where: { uid: other.uid } })).toBeNull();
     });
 
     it("Keeps an entry created within the retention window.", async () => {

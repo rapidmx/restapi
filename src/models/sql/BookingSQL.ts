@@ -57,7 +57,7 @@ export class BookingSQL extends BaseEntity implements Booking {
     @Description("The booker's email address, normalized to lowercase.")
     public bookerEmail: string = "";
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("Free-form notes the booker supplied when booking.")
     @Nullable
     public bookerNotes?: string;

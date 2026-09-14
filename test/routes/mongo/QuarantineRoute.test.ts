@@ -149,17 +149,23 @@ describe("Route:QuarantineMongo Tests", () => {
         expect(result.body.length).toBe(1);
     });
 
-    it("Owner can 'release' a quarantine entry via a normal update.", async () => {
+    it("A trusted caller 'releases' a quarantine entry via a normal update, stamped by the server; the owner can't (403).", async () => {
         const mailbox = await createMailbox(owner.uid);
         const entry = await createQuarantineEntry(mailbox.uid);
 
-        const result = await request(server.getApplication())
+        const denied = await request(server.getApplication())
             .put(`${baseUrl}/${entry.uid}`)
             .set("Authorization", "jwt " + ownerToken)
             .send({ uid: entry.uid, version: entry.version, releasedAt: new Date().toISOString(), releasedByUserUid: owner.uid });
+        expect(denied.status).toBe(403);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${entry.uid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: entry.uid, version: entry.version, releasedAt: new Date().toISOString(), releasedByUserUid: owner.uid });
 
         expect(result.status).toBe(200);
-        expect(result.body.releasedByUserUid).toBe(owner.uid);
+        expect(result.body.releasedByUserUid).toBe(admin.uid);
         expect(result.body.releasedAt).toBeDefined();
     });
 

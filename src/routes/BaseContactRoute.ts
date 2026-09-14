@@ -40,6 +40,10 @@ function rejectDiscoveryManagedFields(obj: Partial<Contact>): void {
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChildRoute<T> {
+    /** `photoBlobKey` names a stored object; a client-chosen key would point this contact's photo at any blob (another
+     * mailbox's message body or attachment). Nothing in this library mints one yet, so only a trusted caller sets it. */
+    protected readonly serverManagedFields: readonly string[] = ["photoBlobKey"];
+
     /** The concrete `Folder` entity class, supplied by the Mongo/SQL concrete subclass - used only by
      * `resolveMailboxUidFor()` below. */
     protected abstract folderClass: any;

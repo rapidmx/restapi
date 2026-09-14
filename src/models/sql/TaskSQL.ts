@@ -26,6 +26,7 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Entity()
 @Description("Defines a single to-do item stored in a `Folder` of type `TASKS`.")
 @Index("task_folder", ["folderUid"])
+@Index("task_mailbox", ["mailboxUid"])
 @Protect(
     {
         uid: "Task",
@@ -49,7 +50,7 @@ export class TaskSQL extends RecoverableBaseEntity implements Task {
     @Description("The title of the task.")
     public title: string = "";
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("The body/description of the task.")
     @Nullable
     public body?: string;

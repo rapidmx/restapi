@@ -67,6 +67,38 @@ function normalizeAddressFields(obj: Record<string, unknown>): void {
     }
 }
 
+/** A single plain `local@domain` address: no whitespace, and none of the characters the search-query parser treats as
+ * syntax (`,()`) or that belong to a display-name form (`<>"`). A mailbox's uid is its address, so this also keeps
+ * uids safe to use in a query. */
+function isPlainAddress(address: unknown): address is string {
+    return typeof address === "string" && /^[^\s@,()<>"]+@[^\s@,()<>"]+$/.test(address);
+}
+
+/** Refuses (400) any address in `addresses` that isn't `isPlainAddress()`. */
+function assertPlainAddresses(addresses: unknown[]): void {
+    if (addresses.some((address) => !isPlainAddress(address))) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Mailbox addresses must be single plain addresses.");
+    }
+}
+
+/** See `stripUnsafeQueryKeys()` on `BaseScopedChildRoute.ts` - drops `$or`/`$and`/... (and `$` path segments), which on
+ * SQL override the forced `uid` filter. */
+function stripUnsafeQueryKeys(query: any): Record<string, any> {
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(query ?? {})) {
+        if (!key.split(".").some((segment) => segment.startsWith("$"))) {
+            result[key] = value;
+        }
+    }
+    return result;
+}
+
+/** Whether `address` is `<one of aliases>@<one of domains>` (aliases lowercased). */
+function ownsAddress(aliases: string[], domains: string[], address: unknown): boolean {
+    const [local, domain, ...rest] = typeof address === "string" ? normalizeAddress(address).split("@") : [];
+    return rest.length === 0 && aliases.includes(local) && domains.includes(domain);
+}
+
 /** One (name alias, domain) combination the caller could register as their mailbox address — the full
  * cross product of their auth-server name aliases and this server's verified `Domain`s. */
 export interface MailboxAutoProvisionAliasOption {
@@ -217,6 +249,63 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      */
     protected abstract findAccessibleMailboxUids(user: JWTUser): Promise<string[]>;
 
+    /** The query value matching one element of an `aliasAddresses` column - a literal on Mongo (array-element
+     * equality); `MailboxRouteSQL` overrides it for the serialized `simple-json` column, like `MailIngestRouteSQL`. */
+    protected aliasQueryValue(address: string): any {
+        return `eq(${address})`;
+    }
+
+    /**
+     * Refuses (409) any of `addresses` already used by another mailbox or distribution list - as its uid, its primary
+     * address or one of its aliases. `selfUid` (the mailbox being updated) is ignored, so a mailbox can rename onto its
+     * own alias. Mail is delivered by exact primary/alias match, so a duplicate would hijack the other recipient's mail.
+     */
+    private async assertAddressesAvailable(selfUid: string | undefined, addresses: string[]): Promise<void> {
+        const distributionListRepo: RepoUtils<DistributionList> = await this.getDistributionListRepo();
+        for (const address of new Set(addresses)) {
+            const [mailboxByUid, listByUid, mailboxesByPrimary, mailboxesByAlias, listsByPrimary, listsByAlias] = await Promise.all([
+                this.repoUtils!.findOne(address, { ignoreACL: true }),
+                distributionListRepo.findOne(address, { ignoreACL: true, includeDeleted: true }),
+                this.repoUtils!.find({ primarySmtpAddress: `eq(${address})`, limit: 2 } as any, { ignoreACL: true, limit: 2 }),
+                this.repoUtils!.find({ aliasAddresses: this.aliasQueryValue(address), limit: 2 } as any, { ignoreACL: true, limit: 2 }),
+                distributionListRepo.find({ primarySmtpAddress: `eq(${address})`, limit: 1 } as any, { ignoreACL: true, limit: 1 }),
+                distributionListRepo.find({ aliasAddresses: this.aliasQueryValue(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }),
+            ]);
+            const otherMailbox: boolean = [mailboxByUid, ...mailboxesByPrimary, ...mailboxesByAlias].some(
+                (mailbox) => !!mailbox && mailbox.uid !== selfUid,
+            );
+            if (otherMailbox || listByUid || listsByPrimary.length > 0 || listsByAlias.length > 0) {
+                throw new ApiError(
+                    ApiErrors.IDENTIFIER_EXISTS,
+                    409,
+                    "This address is already in use by another mailbox or distribution list.",
+                );
+            }
+        }
+    }
+
+    /**
+     * Refuses (409) re-creating a mailbox at `uid` while data from a previously deleted mailbox with the same uid still
+     * exists: any `Folder` (soft-deleted included) naming it, or an `AccessControlList` with that uid. Deleting a mailbox
+     * removes only the mailbox row and its own ACL; its folders keep their ACLs (parented to the mailbox uid) and its
+     * content keeps `mailboxUid`. A new mailbox at the same address would re-create the parent ACL - handing the new
+     * owner every old folder and message - and `findOrCreateWellKnownFolder()` would reuse the old Inbox. An address is
+     * freed for reuse by erasing the mailbox (`DataSubjectErasureRequest`, which purges its content and then the mailbox)
+     * rather than deleting it outright.
+     */
+    private async assertNoLeftoverMailboxData(uid: string): Promise<void> {
+        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        const folderCount: number = await folderRepo.count({ mailboxUid: `eq(${uid})` } as any, { ignoreACL: true, includeDeleted: true });
+        const acl = await this.aclUtils?.findACL(uid, [], { skipCache: true });
+        if (folderCount > 0 || acl) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                "This address still has data from a deleted mailbox. Erase that data before reusing the address.",
+            );
+        }
+    }
+
     private async getFolderRepo(): Promise<RecoverableRepoUtils<any>> {
         if (!this.folderRepo) {
             this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
@@ -361,10 +450,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Creating your own mailbox is not enabled on this server.");
         }
         const aliases: string[] = (await this.fetchNameAliases(req)).map((alias) => alias.toLowerCase());
-        const ownAddress = (address: unknown): boolean => {
-            const [local, domain, ...rest] = typeof address === "string" ? normalizeAddress(address).split("@") : [];
-            return rest.length === 0 && aliases.includes(local) && domains.includes(domain);
-        };
+        const ownAddress = (address: unknown): boolean => ownsAddress(aliases, domains, address);
         for (const o of objs) {
             const addresses: unknown[] = [o.primarySmtpAddress, ...(Array.isArray(o.aliasAddresses) ? o.aliasAddresses : [])];
             // A missing primary address is left to the check below, which answers it with a 400.
@@ -385,6 +471,11 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     private async createMailboxes(obj: T | T[], objs: T[], req: HttpRequest, user: JWTUser, isTrusted: boolean): Promise<T | T[]> {
         for (const o of objs) {
             normalizeAddressFields(o as Record<string, unknown>);
+            if (o.aliasAddresses !== undefined && !Array.isArray(o.aliasAddresses)) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'aliasAddresses' must be a list of addresses.");
+            }
+            // A missing primary address is answered with its own 400 below.
+            assertPlainAddresses([...(o.primarySmtpAddress ? [o.primarySmtpAddress] : []), ...(o.aliasAddresses ?? [])]);
         }
         // Applies to every caller, trusted or not — this server's verified `Domain`s (once at least one
         // exists) are the one source of truth for which domains it accepts mail on at all, not just a
@@ -437,6 +528,10 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                     "This address is already in use by another mailbox or distribution list.",
                 );
             }
+            // Aliases are delivered to exactly like the primary address, so they get the same collision check; the
+            // primary is also checked against other mailboxes' current addresses (a renamed mailbox keeps its old uid).
+            await this.assertAddressesAvailable(undefined, [candidateUid, ...(o.aliasAddresses ?? [])]);
+            await this.assertNoLeftoverMailboxData(candidateUid);
         }
 
         const created: T[] = Array.isArray(obj)
@@ -502,12 +597,18 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * `doUpdateProperty()` never actually persists; see this class's own `updateProperty()` override below
      * for how that path is handled instead.
      */
-    protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser): Promise<void> {
+    //
+    // `@Request` (argument 3) is added to what `CRUDRoute` already injects so `validateAliasChange()` can check a
+    // self-service caller's usernames; the inherited `@Param("id")`/`@User` metadata is kept.
+    protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser, @Request req?: HttpRequest): Promise<void> {
         const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
         await this.validateEscrowScopeAssignment(id, obj, isTrusted);
         rejectServerManagedFields(obj);
         await this.validateTrustedOnlyFields(id, obj, user, isTrusted);
         normalizeAddressFields(obj);
+        if (obj.aliasAddresses !== undefined) {
+            await this.validateAliasChange(id, obj, isTrusted, req);
+        }
         if (obj.primarySmtpAddress !== undefined) {
             // Only re-validate when the address is genuinely changing, not merely present in the patch (a
             // client round-tripping the full object back unchanged must not start failing because e.g. a
@@ -520,6 +621,52 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             (obj as any).keyDiscoveryHash = computeKeyDiscoveryHash(obj.primarySmtpAddress.split("@")[0]);
         }
         return super.validateUpdate(id, obj, user);
+    }
+
+    /**
+     * Holds addresses an update ADDS to `aliasAddresses` to create's rules (removing aliases is always allowed): each
+     * must be a plain address on a verified domain (400), a non-trusted caller may only add addresses at their own
+     * auth-server usernames on a verified domain (403, as `assertSelfServiceCreate()`), and none may already belong to
+     * another mailbox or distribution list (409). Without this, a mailbox owner could add any address - another
+     * mailbox's, a distribution list's, an unverified domain's - as an alias and receive its mail.
+     *
+     * `req` (for the caller's `jwt` cookie) reaches here from `PUT /:id` and `PUT /:id/aliasAddresses`; `CRUDRoute`'s bulk
+     * validator doesn't pass it, so a non-trusted bulk update adding an alias fails closed unless static aliases are
+     * configured.
+     */
+    private async validateAliasChange(id: string, obj: Record<string, any>, isTrusted: boolean, req: HttpRequest | undefined): Promise<void> {
+        if (!Array.isArray(obj.aliasAddresses)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'aliasAddresses' must be a list of addresses.");
+        }
+        const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+        const current: Set<string> = new Set((existing?.aliasAddresses ?? []).map((alias) => normalizeAddress(alias)));
+        obj.aliasAddresses = [...new Set(obj.aliasAddresses as unknown[])];
+        const candidates: unknown[] = (obj.aliasAddresses as unknown[]).filter((alias) => typeof alias !== "string" || !current.has(alias));
+        if (candidates.length === 0) {
+            return;
+        }
+        assertPlainAddresses(candidates);
+        const added: string[] = candidates as string[];
+        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        if (domains.length > 0 && added.some((alias) => !domains.includes(alias.split("@")[1]))) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                `Mailbox addresses must be on one of this server's verified domains: ${domains.join(", ")}.`,
+            );
+        }
+        if (!isTrusted) {
+            const hasAliasSource: boolean = this.staticAliases.length > 0 || !!this.authServerUrl;
+            const usernames: string[] = hasAliasSource && domains.length > 0 ? (await this.fetchNameAliases(req)).map((a) => a.toLowerCase()) : [];
+            if (added.some((alias) => !ownsAddress(usernames, domains, alias))) {
+                throw new ApiError(
+                    ApiErrors.AUTH_PERMISSION_FAILURE,
+                    403,
+                    "You can only add an alias at one of your own usernames on this server's domains.",
+                );
+            }
+        }
+        await this.assertAddressesAvailable(id, added);
     }
 
     /**
@@ -568,6 +715,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * rename, so a `uid`-keyed collision check alone wouldn't catch this.
      */
     private async validateAddressChange(id: string, newAddress: string): Promise<void> {
+        assertPlainAddresses([newAddress]);
         const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
         if (domains.length > 0) {
             const domain = newAddress.split("@")[1]?.toLowerCase();
@@ -580,18 +728,8 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             }
         }
 
-        const distributionListRepo: RepoUtils<DistributionList> = await this.getDistributionListRepo();
-        const [collidingMailboxes, collidingLists] = await Promise.all([
-            this.repoUtils!.find({ primarySmtpAddress: newAddress } as any, { ignoreACL: true, limit: 1 }),
-            distributionListRepo.find({ primarySmtpAddress: newAddress } as any, { ignoreACL: true, limit: 1 }),
-        ]);
-        if (collidingMailboxes.length > 0 || collidingLists.length > 0) {
-            throw new ApiError(
-                ApiErrors.IDENTIFIER_EXISTS,
-                409,
-                "This address is already in use by another mailbox or distribution list.",
-            );
-        }
+        // Against other mailboxes' and lists' uids, primary addresses and aliases alike.
+        await this.assertAddressesAvailable(id, [newAddress]);
     }
 
     /**
@@ -610,7 +748,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * assumed `validateUpdate()` would run automatically here, and a regression test against this exact
      * endpoint (renaming to an address already claimed by a `DistributionList`) caught that it didn't.
      */
-    public async updateProperty(id: string, propertyName: string, obj: any, user?: JWTUser): Promise<T> {
+    public async updateProperty(id: string, propertyName: string, obj: any, user?: JWTUser, @Request req?: HttpRequest): Promise<T> {
         if (propertyName === "primarySmtpAddress") {
             const current: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
             if (!current) {
@@ -643,7 +781,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // As `CRUDRoute.updateProperty()`, except that what's saved is the value `validateUpdate()` left in the patch -
         // a normalized alias list or owner uid, not the raw one.
         const patch: Record<string, any> = { [propertyName]: obj };
-        await this.validateUpdate(id, patch as UpdateObject<T>, user);
+        await this.validateUpdate(id, patch as UpdateObject<T>, user, req);
         return await this.doUpdateProperty(id, propertyName, patch[propertyName], { user });
     }
 
@@ -741,12 +879,12 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     /** The caller's own auth-server "name" aliases (e.g. usernames), via `GET /api/aliases/me?type=name` —
      * forwarding their `jwt` cookie is what scopes the call to *their* aliases specifically. Skips that
      * call entirely (see `staticAliases`'s own doc comment for why) when a fixed list is configured. */
-    private async fetchNameAliases(req: HttpRequest): Promise<string[]> {
+    private async fetchNameAliases(req: HttpRequest | undefined): Promise<string[]> {
         if (this.staticAliases.length > 0) {
             return this.staticAliases;
         }
 
-        const jwtCookie = req.cookies?.["jwt"];
+        const jwtCookie = req?.cookies?.["jwt"];
         if (!jwtCookie) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 502, "Could not verify your identity with the identity service.");
         }
@@ -789,6 +927,8 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
         let scopedQuery: any = { ...query, ...params };
         if (!isTrusted) {
+            // `$or` and friends would override the forced `uid` filter below on SQL - see `stripUnsafeQueryKeys()`.
+            scopedQuery = { ...stripUnsafeQueryKeys(query), ...params };
             const accessibleUids: string[] = await this.findAccessibleMailboxUids(user);
             // An empty array must short-circuit rather than be passed through as a query filter value: the
             // underlying query builder "zips" an array filter value's *last* element onto any query branch
@@ -821,6 +961,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
         let scopedQuery: any = { ...query, ...params };
         if (!isTrusted) {
+            scopedQuery = { ...stripUnsafeQueryKeys(query), ...params };
             const accessibleUids: string[] = await this.findAccessibleMailboxUids(user);
             // See the identical short-circuit (and its rationale) in `find()` above.
             if (accessibleUids.length === 0) {
@@ -984,9 +1125,10 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 throw err;
             }
         }
-        await this.repoUtils.truncate({ uid: `in(${matched.map((existing) => existing.uid).join(",")})` } as any, {
-            user,
-            ignoreACL: true,
-        });
+        // One literal `eq(uid)` per mailbox: `in(a,b)` is split on commas by the query parser, so a uid containing one
+        // would have widened the delete.
+        for (const existing of matched) {
+            await this.repoUtils.truncate({ uid: `eq(${existing.uid})` } as any, { user, ignoreACL: true });
+        }
     }
 }

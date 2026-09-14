@@ -137,10 +137,14 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
 
         it("stores changed addresses lowercase, by PUT or property PUT", async () => {
             const mailbox: any = await ctx.createMailbox();
-            const aliases = await putMailbox(ctx.ownerToken, mailbox.uid, { aliasAddresses: ["Alias.One@Example.com", 3] });
+            // Adding an alias is held to create's rules (see `validateAliasChange()`): an admin here, since the owner has
+            // no auth-server usernames in this suite. A non-address entry is refused.
+            const invalid = await putMailbox(adminToken, mailbox.uid, { aliasAddresses: ["Alias.One@Example.com", 3] });
+            expect(invalid.status).toBe(400);
+            const aliases = await putMailbox(adminToken, mailbox.uid, { aliasAddresses: ["Alias.One@Example.com"] });
             expect(aliases.status).toBe(200);
-            expect(aliases.body.aliasAddresses).toEqual(["alias.one@example.com", 3]);
-            const property = await as(ctx.ownerToken, request(ctx.app()).put(mailboxUrl(mailbox.uid, "aliasAddresses"))).send(["Alias.Two@Example.com"]);
+            expect(aliases.body.aliasAddresses).toEqual(["alias.one@example.com"]);
+            const property = await as(adminToken, request(ctx.app()).put(mailboxUrl(mailbox.uid, "aliasAddresses"))).send(["Alias.Two@Example.com"]);
             expect(property.status).toBe(200);
             expect(property.body.aliasAddresses).toEqual(["alias.two@example.com"]);
             const renamed = await as(ctx.ownerToken, request(ctx.app()).put(mailboxUrl(mailbox.uid, "primarySmtpAddress"))).send(`New.${mailbox.primarySmtpAddress.toUpperCase()}`);

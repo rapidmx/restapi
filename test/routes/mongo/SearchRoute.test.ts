@@ -193,7 +193,7 @@ describe("Route:SearchRouteMongo Tests", () => {
     it("Rejects a request with neither q nor any structured filter (400).", async () => {
         await createMailbox(owner.uid);
         const result = await request(server.getApplication())
-            .get(`${baseUrl}?types=note`)
+            .get(`${baseUrl}?cursor=0`)
             .set("Authorization", "jwt " + ownerToken);
 
         expect(result.status).toBe(400);

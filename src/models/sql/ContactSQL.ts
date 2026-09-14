@@ -90,7 +90,7 @@ export class ContactSQL extends RecoverableBaseEntity implements Contact {
     @Nullable
     public jobTitle?: string;
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("Free-form notes about the contact.")
     @Nullable
     public notes?: string;

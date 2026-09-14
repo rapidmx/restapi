@@ -26,6 +26,7 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Entity()
 @Description("Defines a single to-do item stored in a `Folder` of type `TASKS`.")
 @Index("task_folder", ["folderUid"])
+@Index("task_mailbox", ["mailboxUid"])
 @Protect(
     {
         uid: "Task",

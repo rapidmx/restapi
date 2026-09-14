@@ -108,6 +108,41 @@ describe("ClamAvScanProvider Tests", () => {
         expect(result).toEqual({ verdict: AvVerdict.ERROR });
     });
 
+    it.each([
+        ["an INSTREAM size-limit reply without the ERROR suffix", "INSTREAM size limit exceeded.\0"],
+        ["an empty reply (connection closed with no answer)", ""],
+        ["a garbage reply", "garbage\0"],
+        ["a reply that merely contains OK somewhere", "stream: OK but not really\0"],
+        ["a reply that merely contains FOUND somewhere", "stream: FOUND nothing\0"],
+    ])("Fails closed to ERROR (not CLEAN) for %s.", async (_label: string, reply: string) => {
+        const promise = provider.scanBuffer(Buffer.from("x"));
+        connect();
+        if (reply) {
+            socket.emit("data", Buffer.from(reply));
+        }
+        socket.emit("end");
+
+        const result = await promise;
+
+        expect(result).toEqual({ verdict: AvVerdict.ERROR });
+    });
+
+    it("Tolerates trailing newlines/NULs when parsing OK and FOUND replies.", async () => {
+        let promise = provider.scanBuffer(Buffer.from("x"));
+        connect();
+        socket.emit("data", Buffer.from("stream: OK\n"));
+        socket.emit("end");
+        expect(await promise).toEqual({ verdict: AvVerdict.CLEAN });
+
+        socket = makeFakeSocket();
+        mockCreateConnection.mockReturnValue(socket);
+        promise = provider.scanBuffer(Buffer.from("x"));
+        connect();
+        socket.emit("data", Buffer.from("stream: Eicar-Test-Signature FOUND\n\0"));
+        socket.emit("end");
+        expect(await promise).toEqual({ verdict: AvVerdict.INFECTED, signatureName: "Eicar-Test-Signature" });
+    });
+
     it("Reassembles a reply split across multiple 'data' events.", async () => {
         const promise = provider.scanBuffer(Buffer.from("split"));
         connect();

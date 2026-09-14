@@ -20,6 +20,7 @@ const { Nullable } = ObjectDecorators;
 @Entity()
 @Description("A GDPR data-portability/access request for one mailbox's content.")
 @Index("data_export_request_mailbox", ["mailboxUid"])
+@Index("data_export_request_status", ["status"])
 @Protect(
     {
         uid: "DataExportRequest",
@@ -54,9 +55,14 @@ export class DataExportRequestSQL extends BaseEntity implements DataExportReques
     @Nullable
     public blobKey?: string;
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Nullable
     public errorMessage?: string;
+
+    @Column({ nullable: true })
+    @Description("How many times DataExportJob has claimed this request for processing (lease/retry counter).")
+    @Nullable
+    public processingAttempts?: number;
 
     constructor(other?: Partial<DataExportRequestSQL>) {
         super(other);
@@ -68,6 +74,7 @@ export class DataExportRequestSQL extends BaseEntity implements DataExportReques
             this.status = other.status !== undefined ? other.status : this.status;
             this.blobKey = "blobKey" in other ? other.blobKey : this.blobKey;
             this.errorMessage = "errorMessage" in other ? other.errorMessage : this.errorMessage;
+            this.processingAttempts = "processingAttempts" in other ? other.processingAttempts : this.processingAttempts;
         }
     }
 }

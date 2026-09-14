@@ -28,10 +28,15 @@ import {
  * - No RFC 5545 line-folding on generated output - folding is a SHOULD for writers, not a MUST for readers;
  * this library's own generated lines are short enough in practice that skipping it is safe.
  * - A `DTSTART`/`DTEND`/`RECURRENCE-ID`/`EXDATE`/`UNTIL` value with a `TZID` parameter is converted to UTC
- * via `Intl`'s built-in timezone database (no new dependency) when `TZID` is a real IANA name (e.g.
- * `America/Los_Angeles`); a non-IANA `TZID` (e.g. a legacy Windows zone name like `"Pacific Standard
- * Time"`, as classic Outlook sometimes emits) isn't recognized by `Intl` and falls back to treating the
- * value as UTC - a known, accepted inaccuracy for that one sender category.
+ * via `Intl`'s built-in timezone database (no new dependency). `TZID` may be quoted (`TZID="America/New_York"`)
+ * and may be a common Windows zone name (`"Pacific Standard Time"`, as classic Outlook emits) - see
+ * `resolveTimeZone()`'s `WINDOWS_TO_IANA` table. A `TZID` that is neither a real IANA name nor in that table
+ * (e.g. Outlook's display-style `"(UTC-08:00) Pacific Time (US & Canada)"`, or a custom `VTIMEZONE` name) still
+ * falls back to treating the value as UTC - `VTIMEZONE` blocks themselves are never parsed.
+ * - Recurrence expansion (`expandOccurrences()`) supports `FREQ`/`INTERVAL`/`COUNT`/`UNTIL`/`BYDAY` (including
+ * ordinal forms like `2TU`/`-1FR` for `MONTHLY`/`YEARLY`)/`BYMONTHDAY` (including negative days)/`BYMONTH`,
+ * with `WKST` fixed at the RFC default `MO`. `BYSETPOS`, `BYWEEKNO`, `BYYEARDAY`, `BYHOUR`/`BYMINUTE` and
+ * sub-daily frequencies are not supported.
  * - "This and future occurrences" recurring-event updates aren't a distinct mode - only "this occurrence"
  * (an override VEVENT, `RECURRENCE-ID` set) and "the whole series" (the master VEVENT, `RRULE` set) are
  * modeled, matching what `CalendarEvent.recurrenceRule`/`recurrenceId` already represent. Real Exchange
@@ -49,6 +54,10 @@ export interface ParsedIcsEvent {
     location?: string;
     startDate?: Date;
     endDate?: Date;
+    /** The IANA zone `DTSTART`'s `TZID` resolved to (see `resolveTimeZone()`), if it had a recognizable one -
+     * suitable for `CalendarEvent.timezone`, which `expandOccurrences()` uses for wall-clock (DST-correct)
+     * recurrence stepping. */
+    timezone?: string;
     status?: string;
     organizer?: { address: string; displayName?: string };
     attendees: { address: string; displayName?: string; partstat?: AttendeeResponseStatus }[];
@@ -113,35 +122,168 @@ function formatDateUtc(date: Date | string): string {
  * exactly this conversion to turn a `BookingType`'s local availability windows into real instants, and because
  * its `undefined` return doubles as the validation hook for a caller-supplied IANA timezone name. */
 export function convertLocalToUtc(y: number, mo: number, d: number, h: number, mi: number, s: number, tzid: string): Date | undefined {
-    try {
-        const reference = Date.UTC(y, mo - 1, d, h, mi, s);
-        const formatter = new Intl.DateTimeFormat("en-US", {
-            timeZone: tzid,
-            hourCycle: "h23",
-            year: "numeric",
-            month: "2-digit",
-            day: "2-digit",
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit",
-        });
-        const parts: Record<string, string> = {};
-        for (const part of formatter.formatToParts(new Date(reference))) {
-            parts[part.type] = part.value;
-        }
-        // `hourCycle: "h23"` can still render midnight as "24" depending on ICU data - normalize it.
-        const hour = parts.hour === "24" ? "0" : parts.hour;
-        const wallClockAsUtc = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(hour), Number(parts.minute), Number(parts.second));
-        const offsetMs = wallClockAsUtc - reference;
-        return new Date(reference - offsetMs);
-    } catch {
+    const formatter: Intl.DateTimeFormat | undefined = getZoneFormatter(tzid);
+    if (!formatter) {
         return undefined;
     }
+    const reference = Date.UTC(y, mo - 1, d, h, mi, s);
+    // A single "offset at `reference`" pass is off by an hour for wall-clock times near a DST transition, since
+    // `reference` (the wall clock read as if it were UTC) and the real instant can straddle the transition. So
+    // take the zone's offsets a day either side (which always bracket the real instant), and keep whichever
+    // candidate instant really renders back as the requested wall clock. Both valid = an ambiguous fall-back
+    // time: RFC 5545 §3.3.5 says use the first (earlier) one. Neither valid = a skipped spring-forward time:
+    // RFC 5545 says interpret it with the offset from before the gap, which is the later of the two instants.
+    const candidates = new Set<number>([
+        reference - zoneOffsetMs(reference - MS_PER_DAY, formatter),
+        reference - zoneOffsetMs(reference + MS_PER_DAY, formatter),
+    ]);
+    const valid: number[] = [...candidates].filter((instant) => zoneOffsetMs(instant, formatter) === reference - instant);
+    return new Date(valid.length > 0 ? Math.min(...valid) : Math.max(...candidates));
+}
+
+const zoneFormatterCache: Map<string, Intl.DateTimeFormat | null> = new Map();
+
+/** A cached `Intl.DateTimeFormat` rendering full wall-clock parts in IANA zone `tzid`, or `undefined` if `Intl`
+ * doesn't recognize `tzid`. Constructing a formatter is by far the expensive part of every zone conversion here,
+ * and a single recurrence expansion can convert hundreds of instants in the same zone. */
+function getZoneFormatter(tzid: string): Intl.DateTimeFormat | undefined {
+    let formatter: Intl.DateTimeFormat | null | undefined = zoneFormatterCache.get(tzid);
+    if (formatter === undefined) {
+        try {
+            formatter = new Intl.DateTimeFormat("en-US", {
+                timeZone: tzid,
+                hourCycle: "h23",
+                year: "numeric",
+                month: "2-digit",
+                day: "2-digit",
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+            });
+        } catch {
+            formatter = null;
+        }
+        // Bounded: only ever real zone names (a few hundred) or junk strings from inbound invites - reset rather
+        // than grow without limit if something keeps feeding it distinct garbage.
+        if (zoneFormatterCache.size > 1000) {
+            zoneFormatterCache.clear();
+        }
+        zoneFormatterCache.set(tzid, formatter);
+    }
+    return formatter ?? undefined;
+}
+
+interface WallClockParts {
+    year: number;
+    month: number;
+    day: number;
+    hour: number;
+    minute: number;
+    second: number;
+}
+
+function wallClockParts(instantMs: number, formatter: Intl.DateTimeFormat): WallClockParts {
+    const parts: Record<string, string> = {};
+    for (const part of formatter.formatToParts(new Date(instantMs))) {
+        parts[part.type] = part.value;
+    }
+    return {
+        year: Number(parts.year),
+        month: Number(parts.month),
+        day: Number(parts.day),
+        // `hourCycle: "h23"` can still render midnight as "24" depending on ICU data - normalize it.
+        hour: parts.hour === "24" ? 0 : Number(parts.hour),
+        minute: Number(parts.minute),
+        second: Number(parts.second),
+    };
+}
+
+/** The zone's UTC offset (local wall clock minus UTC) at `instantMs`, in whole seconds' worth of milliseconds. */
+function zoneOffsetMs(instantMs: number, formatter: Intl.DateTimeFormat): number {
+    const wholeSecond = instantMs - (((instantMs % 1000) + 1000) % 1000);
+    const p = wallClockParts(wholeSecond, formatter);
+    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - wholeSecond;
+}
+
+/** Windows time zone names (as classic Outlook/Exchange emit in `TZID`) mapped to their CLDR "001" IANA
+ * equivalents. Deliberately a small table of the most common zones, not the full CLDR `windowsZones.xml`. Keys
+ * are lowercase. */
+const WINDOWS_TO_IANA: Record<string, string> = {
+    "dateline standard time": "Etc/GMT+12",
+    "hawaiian standard time": "Pacific/Honolulu",
+    "alaskan standard time": "America/Anchorage",
+    "pacific standard time": "America/Los_Angeles",
+    "us mountain standard time": "America/Phoenix",
+    "mountain standard time": "America/Denver",
+    "central standard time": "America/Chicago",
+    "canada central standard time": "America/Regina",
+    "central america standard time": "America/Guatemala",
+    "eastern standard time": "America/New_York",
+    "sa pacific standard time": "America/Bogota",
+    "atlantic standard time": "America/Halifax",
+    "newfoundland standard time": "America/St_Johns",
+    "e. south america standard time": "America/Sao_Paulo",
+    "argentina standard time": "America/Buenos_Aires",
+    utc: "UTC",
+    "coordinated universal time": "UTC",
+    "gmt standard time": "Europe/London",
+    "greenwich standard time": "Atlantic/Reykjavik",
+    "w. europe standard time": "Europe/Berlin",
+    "central europe standard time": "Europe/Budapest",
+    "central european standard time": "Europe/Warsaw",
+    "romance standard time": "Europe/Paris",
+    "w. central africa standard time": "Africa/Lagos",
+    "e. europe standard time": "Europe/Chisinau",
+    "gtb standard time": "Europe/Bucharest",
+    "fle standard time": "Europe/Helsinki",
+    "israel standard time": "Asia/Jerusalem",
+    "south africa standard time": "Africa/Johannesburg",
+    "egypt standard time": "Africa/Cairo",
+    "turkey standard time": "Europe/Istanbul",
+    "russian standard time": "Europe/Moscow",
+    "arab standard time": "Asia/Riyadh",
+    "arabian standard time": "Asia/Dubai",
+    "iran standard time": "Asia/Tehran",
+    "pakistan standard time": "Asia/Karachi",
+    "india standard time": "Asia/Kolkata",
+    "bangladesh standard time": "Asia/Dhaka",
+    "se asia standard time": "Asia/Bangkok",
+    "singapore standard time": "Asia/Singapore",
+    "china standard time": "Asia/Shanghai",
+    "taipei standard time": "Asia/Taipei",
+    "w. australia standard time": "Australia/Perth",
+    "tokyo standard time": "Asia/Tokyo",
+    "korea standard time": "Asia/Seoul",
+    "cen. australia standard time": "Australia/Adelaide",
+    "aus central standard time": "Australia/Darwin",
+    "e. australia standard time": "Australia/Brisbane",
+    "aus eastern standard time": "Australia/Sydney",
+    "new zealand standard time": "Pacific/Auckland",
+};
+
+/**
+ * Resolves an iCalendar `TZID` (or a stored `CalendarEvent.timezone`) to an IANA zone name `Intl` recognizes:
+ * strips surrounding double quotes, maps common Windows zone names via `WINDOWS_TO_IANA`, and returns
+ * `undefined` for anything `Intl` still doesn't know.
+ */
+export function resolveTimeZone(tzid: string | undefined | null): string | undefined {
+    if (typeof tzid !== "string") {
+        return undefined;
+    }
+    let name: string = tzid.trim();
+    if (name.length >= 2 && name.startsWith('"') && name.endsWith('"')) {
+        name = name.slice(1, -1).trim();
+    }
+    if (!name) {
+        return undefined;
+    }
+    const candidate: string = WINDOWS_TO_IANA[name.toLowerCase()] ?? name;
+    return getZoneFormatter(candidate) ? candidate : undefined;
 }
 
 /** Parses a single RFC 5545 `DATE-TIME`/`DATE` value (`20260615T120000Z`, `20260615T120000`, or the
  * date-only `20260615`), honoring a `TZID` parameter if given - see this module's own doc comment for the
- * documented fallback behavior when `tzid` isn't a recognized IANA name. */
+ * documented fallback behavior when `tzid` can't be resolved (`resolveTimeZone()`). */
 function parseIcsDateTime(value: string, tzid?: string): Date | undefined {
     const match = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?$/.exec(value.trim());
     if (!match) {
@@ -154,8 +296,9 @@ function parseIcsDateTime(value: string, tzid?: string): Date | undefined {
     const hour = Number(h);
     const minute = Number(mi);
     const second = Number(s);
-    if (!z && tzid) {
-        const converted = convertLocalToUtc(year, month, day, hour, minute, second, tzid);
+    const zone: string | undefined = !z ? resolveTimeZone(tzid) : undefined;
+    if (zone) {
+        const converted = convertLocalToUtc(year, month, day, hour, minute, second, zone);
         if (converted) {
             return converted;
         }
@@ -163,12 +306,29 @@ function parseIcsDateTime(value: string, tzid?: string): Date | undefined {
     return new Date(Date.UTC(year, month - 1, day, hour, minute, second));
 }
 
+/** Parses `;NAME=value;NAME2="quoted; value"` parameters. RFC 5545 §3.2 allows a parameter value to be a
+ * DQUOTE-wrapped string (which may then contain `;`, `:` and `,`) - the quotes are stripped here. */
 function parseParams(paramString: string): Record<string, string> {
     const params: Record<string, string> = {};
-    for (const segment of paramString.replace(/^;/, "").split(";")) {
+    const segments: string[] = [];
+    let current = "";
+    let inQuotes = false;
+    for (const ch of paramString.replace(/^;/, "")) {
+        if (ch === '"') {
+            inQuotes = !inQuotes;
+            current += ch;
+        } else if (ch === ";" && !inQuotes) {
+            segments.push(current);
+            current = "";
+        } else {
+            current += ch;
+        }
+    }
+    segments.push(current);
+    for (const segment of segments) {
         const eq = segment.indexOf("=");
         if (eq > 0) {
-            params[segment.slice(0, eq).toUpperCase()] = segment.slice(eq + 1);
+            params[segment.slice(0, eq).toUpperCase()] = segment.slice(eq + 1).replace(/^"(.*)"$/, "$1");
         }
     }
     return params;
@@ -274,6 +434,7 @@ export function parseIcsEvent(raw: string): ParsedIcsEvent | undefined {
     let status: string | undefined;
     let startDate: Date | undefined;
     let endDate: Date | undefined;
+    let timezone: string | undefined;
     let recurrenceId: Date | undefined;
     let recurrenceRule: RecurrenceRule | undefined;
     const exceptions: Date[] = [];
@@ -281,7 +442,9 @@ export function parseIcsEvent(raw: string): ParsedIcsEvent | undefined {
     const attendees: { address: string; displayName?: string; partstat?: AttendeeResponseStatus }[] = [];
 
     for (const line of lines) {
-        const match = /^([A-Za-z0-9-]+)((?:;[^:]*)?):(.*)$/.exec(line);
+        // The parameter group allows DQUOTE-wrapped values containing `:` (e.g. `CN="Doe: John"`), so the
+        // property value only starts at the first colon outside quotes.
+        const match = /^([A-Za-z0-9-]+)((?:;(?:[^:;"]|"[^"]*")*)*):(.*)$/.exec(line);
         if (!match) {
             continue;
         }
@@ -310,6 +473,7 @@ export function parseIcsEvent(raw: string): ParsedIcsEvent | undefined {
                 break;
             case "DTSTART":
                 startDate = parseIcsDateTime(value, params.TZID);
+                timezone = /Z\s*$/i.test(value) ? undefined : resolveTimeZone(params.TZID);
                 break;
             case "DTEND":
                 endDate = parseIcsDateTime(value, params.TZID);
@@ -350,7 +514,7 @@ export function parseIcsEvent(raw: string): ParsedIcsEvent | undefined {
         recurrenceRule.exceptions = exceptions;
     }
 
-    return { method, uid, sequence, summary, location, status, startDate, endDate, organizer, attendees, recurrenceId, recurrenceRule };
+    return { method, uid, sequence, summary, location, status, startDate, endDate, timezone, organizer, attendees, recurrenceId, recurrenceRule };
 }
 
 /** A single concrete occurrence instant produced by `expandOccurrences()`. */
@@ -360,9 +524,10 @@ export interface OccurrenceWindow {
 }
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
-/** Safety-net cap on how far past `event.startDate` a day-by-day scan will walk for an indefinitely
- * recurring (no `count`/`until`) rule - not a real RRULE limit, just a bound on worst-case cost. */
-const MAX_SCAN_DAYS = 731;
+/** Safety-net cap on how many recurrence periods (days/weeks/months/years, per `FREQ`) a single
+ * `expandOccurrences()` call will walk - not a real RRULE limit, just a bound on worst-case cost (e.g. a rule whose
+ * `BYxxx` parts can never match, over a huge window). */
+const MAX_PERIODS = 50_000;
 /** Safety-net cap on the number of occurrences a single `expandOccurrences()` call will return. */
 const MAX_OCCURRENCES = 500;
 
@@ -372,123 +537,309 @@ function occurrenceOverlapsWindow(start: Date, end: Date, windowStart: Date, win
     return start.getTime() < windowEnd.getTime() && end.getTime() > windowStart.getTime();
 }
 
-/** `true` if `candidate` (a whole-day step from `seriesStart`, `daysSinceStart` days later) is a real
- * occurrence of `rule`. See `expandOccurrences()`'s own doc comment for the documented limitations this
- * inherits (no ordinal `BYDAY`, no `BYSETPOS`, no `WKST`-aware week alignment). */
-function matchesRecurrenceDay(rule: RecurrenceRule, seriesStart: Date, candidate: Date, daysSinceStart: number): boolean {
-    switch (rule.freq) {
-        case RecurrenceFrequency.DAILY:
-            return daysSinceStart % rule.interval === 0;
-        case RecurrenceFrequency.WEEKLY: {
-            const weekIndex = Math.floor(daysSinceStart / 7);
-            if (weekIndex % rule.interval !== 0) {
-                return false;
-            }
-            if (rule.byDay && rule.byDay.length > 0) {
-                return rule.byDay.some((day) => BYDAY_TO_WEEKDAY[day.toUpperCase()] === candidate.getUTCDay());
-            }
-            return candidate.getUTCDay() === seriesStart.getUTCDay();
-        }
-        case RecurrenceFrequency.MONTHLY: {
-            // `candidate` is always `seriesStart` plus a non-negative number of days, so `monthsSinceStart`
-            // is always >= 0 - no separate "candidate before series start" case to guard against here.
-            const monthsSinceStart =
-                (candidate.getUTCFullYear() - seriesStart.getUTCFullYear()) * 12 + (candidate.getUTCMonth() - seriesStart.getUTCMonth());
-            if (monthsSinceStart % rule.interval !== 0) {
-                return false;
-            }
-            if (rule.byMonthDay && rule.byMonthDay.length > 0) {
-                return rule.byMonthDay.includes(candidate.getUTCDate());
-            }
-            if (rule.byDay && rule.byDay.length > 0) {
-                return rule.byDay.some((day) => BYDAY_TO_WEEKDAY[day.toUpperCase()] === candidate.getUTCDay());
-            }
-            return candidate.getUTCDate() === seriesStart.getUTCDate();
-        }
-        case RecurrenceFrequency.YEARLY: {
-            // Same reasoning as MONTHLY above - `yearsSinceStart` is always >= 0.
-            const yearsSinceStart = candidate.getUTCFullYear() - seriesStart.getUTCFullYear();
-            if (yearsSinceStart % rule.interval !== 0) {
-                return false;
-            }
-            if (rule.byMonth && rule.byMonth.length > 0 && !rule.byMonth.includes(candidate.getUTCMonth() + 1)) {
-                return false;
-            }
-            if (rule.byMonthDay && rule.byMonthDay.length > 0) {
-                return rule.byMonthDay.includes(candidate.getUTCDate());
-            }
-            if (rule.byDay && rule.byDay.length > 0) {
-                return rule.byDay.some((day) => BYDAY_TO_WEEKDAY[day.toUpperCase()] === candidate.getUTCDay());
-            }
-            return candidate.getUTCMonth() === seriesStart.getUTCMonth() && candidate.getUTCDate() === seriesStart.getUTCDate();
-        }
-        default:
-            return false;
-    }
+function toDate(value: Date | string): Date {
+    return value instanceof Date ? value : new Date(value);
 }
 
+/** Days since 1970-01-01 for a proleptic-Gregorian calendar date - the unit all local-date arithmetic below uses. */
+function dayNumber(year: number, month: number, day: number): number {
+    return Math.floor(Date.UTC(year, month - 1, day) / MS_PER_DAY);
+}
+
+function dayNumberToDate(dayNum: number): { year: number; month: number; day: number } {
+    const d = new Date(dayNum * MS_PER_DAY);
+    return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+}
+
+/** 0 = Sunday ... 6 = Saturday. 1970-01-01 was a Thursday. */
+function weekdayOf(dayNum: number): number {
+    return (((dayNum + 4) % 7) + 7) % 7;
+}
+
+function daysInMonth(year: number, month: number): number {
+    return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+interface ParsedByDay {
+    weekday: number;
+    /** `undefined` = every such weekday in the period; positive = nth from the start; negative = nth from the end. */
+    ordinal?: number;
+}
+
+function parseByDay(byDay: string[] | undefined): ParsedByDay[] {
+    const result: ParsedByDay[] = [];
+    for (const entry of byDay ?? []) {
+        const match = /^([+-]?\d{1,2})?(SU|MO|TU|WE|TH|FR|SA)$/i.exec(String(entry).trim());
+        if (match) {
+            const ordinal = match[1] !== undefined ? parseInt(match[1], 10) : undefined;
+            result.push({ weekday: BYDAY_TO_WEEKDAY[match[2].toUpperCase()], ordinal: ordinal === 0 ? undefined : ordinal });
+        }
+    }
+    return result;
+}
+
+/** Every day in `[firstDay, lastDay]` matching `byDay`, honoring ordinals relative to that range. */
+function expandByDayInRange(firstDay: number, lastDay: number, byDay: ParsedByDay[]): number[] {
+    const days = new Set<number>();
+    for (const { weekday, ordinal } of byDay) {
+        const firstMatch = firstDay + ((weekday - weekdayOf(firstDay) + 7) % 7);
+        if (ordinal === undefined) {
+            for (let day = firstMatch; day <= lastDay; day += 7) {
+                days.add(day);
+            }
+        } else if (ordinal > 0) {
+            const day = firstMatch + (ordinal - 1) * 7;
+            if (day <= lastDay) {
+                days.add(day);
+            }
+        } else {
+            const lastMatch = lastDay - ((weekdayOf(lastDay) - weekday + 7) % 7);
+            const day = lastMatch + (ordinal + 1) * 7;
+            if (day >= firstDay) {
+                days.add(day);
+            }
+        }
+    }
+    return [...days];
+}
+
+/** The days of `year`/`month` selected by `byMonthDay`/`byDay` (both set = their intersection, with `byDay`
+ * ordinals ignored), defaulting to `fallbackDay` when neither is set. */
+function monthDays(year: number, month: number, byMonthDay: number[], byDay: ParsedByDay[], fallbackDay: number): number[] {
+    const dim = daysInMonth(year, month);
+    const first = dayNumber(year, month, 1);
+    if (byMonthDay.length > 0) {
+        const allowedWeekdays = new Set(byDay.map((entry) => entry.weekday));
+        return byMonthDay
+            .map((value) => (value < 0 ? dim + 1 + value : value))
+            .filter((value) => value >= 1 && value <= dim)
+            .map((value) => first + value - 1)
+            .filter((day) => byDay.length === 0 || allowedWeekdays.has(weekdayOf(day)));
+    }
+    if (byDay.length > 0) {
+        return expandByDayInRange(first, first + dim - 1, byDay);
+    }
+    return fallbackDay <= dim ? [first + fallbackDay - 1] : [];
+}
+
+const SUPPORTED_FREQUENCIES: string[] = [RecurrenceFrequency.DAILY, RecurrenceFrequency.WEEKLY, RecurrenceFrequency.MONTHLY, RecurrenceFrequency.YEARLY];
+
 /**
- * Expands `event` (a `CalendarEvent`-shaped `{startDate, endDate, recurrenceRule?}`) into every occurrence
- * whose `[start, end)` overlaps `[windowStart, windowEnd]`. A non-recurring event yields at most one
- * occurrence (its own `startDate`/`endDate`). `excludeDates` (matched by exact instant) skips a generated
+ * Expands `event` (a `CalendarEvent`-shaped `{startDate, endDate, recurrenceRule?, timezone?, allDay?}`) into
+ * every occurrence whose `[start, end)` overlaps `[windowStart, windowEnd]`. A non-recurring event yields at most
+ * one occurrence (its own `startDate`/`endDate`). `excludeDates` (matched by exact instant) skips a generated
  * occurrence entirely - used both for `RecurrenceRule.exceptions` (EXDATE-cancelled occurrences) and for a
- * sibling override row's own `recurrenceId` (so a master's expansion doesn't phantom-generate an occurrence
- * at its *original* time when a real override row already represents that occurrence's actual, possibly
- * different, time).
+ * sibling override row's own `recurrenceId` (so a master's expansion doesn't phantom-generate an occurrence at
+ * its *original* time when a real override row already represents that occurrence's actual, possibly different,
+ * time).
  *
- * Bounded by `MAX_OCCURRENCES` (a runaway-loop safety net, not a real RRULE limit) - scans day-by-day from
- * `event.startDate` (not `windowStart`), since `COUNT`/`UNTIL` are counted from the series' true beginning,
- * capped at `MAX_SCAN_DAYS` from `event.startDate` to bound worst-case cost for a very old, indefinitely
- * recurring series.
+ * **Wall-clock stepping.** Occurrences are generated as local calendar dates in `event.timezone` (resolved via
+ * `resolveTimeZone()`, so Windows zone names work too) at `startDate`'s own local time of day, then converted
+ * back to instants - so a 09:00 America/New_York weekly meeting stays 09:00 local across a DST change rather than
+ * drifting an hour. With no (recognizable) `timezone`, or for an `allDay` event (stored as UTC midnights), the
+ * expansion runs in UTC - callers that don't pass `timezone` get exactly the previous UTC behavior. Each
+ * occurrence's end is its start plus the master's real elapsed duration.
  *
- * A day-by-day scan (rather than four bespoke per-frequency steppers) is deliberately the simplest correct
- * approach here: the window is capped small enough that a day-by-day scan is cheap, and one unified loop is
- * far easier to verify correct than bespoke DAILY/WEEKLY/MONTHLY/YEARLY advancement logic.
+ * **Period-based, windowed.** Rather than scanning day by day from the series start, each `FREQ` period
+ * (day/week/month/year, every `INTERVAL`th) is expanded directly by its `BYxxx` parts, and when there's no `COUNT`
+ * the walk jumps straight to the period just before the query window - so a long-running series (e.g. a daily
+ * standup started years ago) still expands correctly in today's window. With `COUNT` the walk has to start at the
+ * series start (occurrences are counted from there), but is bounded by `COUNT` itself, and occurrences that are
+ * only being counted skip the zone conversion. Weeks start on Monday (`WKST=MO`, the RFC default). See this
+ * module's own doc comment for unsupported rule parts.
+ *
+ * Bounded by `MAX_OCCURRENCES` and `MAX_PERIODS` (runaway-loop safety nets, not real RRULE limits).
  */
 export function expandOccurrences(
-    event: { startDate: Date; endDate: Date; recurrenceRule?: RecurrenceRule },
+    event: { startDate: Date | string; endDate: Date | string; recurrenceRule?: RecurrenceRule; timezone?: string; allDay?: boolean },
     windowStart: Date,
     windowEnd: Date,
-    excludeDates?: Date[],
+    excludeDates?: (Date | string)[],
 ): OccurrenceWindow[] {
-    const durationMs = event.endDate.getTime() - event.startDate.getTime();
-    const excluded = new Set((excludeDates ?? []).map((date) => date.getTime()));
+    const seriesStart: Date = toDate(event.startDate);
+    const seriesEnd: Date = toDate(event.endDate);
+    const durationMs = seriesEnd.getTime() - seriesStart.getTime();
+    const excluded = new Set((excludeDates ?? []).map((date) => toDate(date).getTime()));
     const rule = event.recurrenceRule;
 
     if (!rule) {
-        if (excluded.has(event.startDate.getTime())) {
+        if (excluded.has(seriesStart.getTime())) {
             return [];
         }
-        return occurrenceOverlapsWindow(event.startDate, event.endDate, windowStart, windowEnd)
-            ? [{ start: event.startDate, end: event.endDate }]
-            : [];
+        return occurrenceOverlapsWindow(seriesStart, seriesEnd, windowStart, windowEnd) ? [{ start: seriesStart, end: seriesEnd }] : [];
+    }
+
+    const freq: string = String(rule.freq ?? "").toLowerCase();
+    if (!SUPPORTED_FREQUENCIES.includes(freq)) {
+        return [];
+    }
+    const interval: number = Number(rule.interval) >= 1 ? Math.floor(Number(rule.interval)) : 1;
+    const count: number | undefined = rule.count !== undefined && rule.count !== null ? Number(rule.count) : undefined;
+    const untilMs: number | undefined = rule.until !== undefined && rule.until !== null ? toDate(rule.until).getTime() : undefined;
+    const byDay: ParsedByDay[] = parseByDay(rule.byDay);
+    const byMonth: number[] = (rule.byMonth ?? []).map(Number);
+    const byMonthDay: number[] = (rule.byMonthDay ?? []).map(Number);
+
+    const zone: string = (!event.allDay && resolveTimeZone(event.timezone)) || "UTC";
+    const formatter: Intl.DateTimeFormat | undefined = zone === "UTC" ? undefined : getZoneFormatter(zone);
+    const localDayOf = (instantMs: number): number => {
+        if (!formatter) {
+            return Math.floor(instantMs / MS_PER_DAY);
+        }
+        const p = wallClockParts(instantMs, formatter);
+        return dayNumber(p.year, p.month, p.day);
+    };
+
+    const startLocal: WallClockParts = formatter
+        ? wallClockParts(seriesStart.getTime(), formatter)
+        : {
+              year: seriesStart.getUTCFullYear(),
+              month: seriesStart.getUTCMonth() + 1,
+              day: seriesStart.getUTCDate(),
+              hour: seriesStart.getUTCHours(),
+              minute: seriesStart.getUTCMinutes(),
+              second: seriesStart.getUTCSeconds(),
+          };
+    const startMillis = ((seriesStart.getTime() % 1000) + 1000) % 1000;
+    const startDay: number = dayNumber(startLocal.year, startLocal.month, startLocal.day);
+    const startMonthIndex: number = startLocal.year * 12 + (startLocal.month - 1);
+    const startWeekMonday: number = startDay - ((weekdayOf(startDay) + 6) % 7);
+
+    const toInstant = (dayNum: number): Date => {
+        const { year, month, day } = dayNumberToDate(dayNum);
+        const ms: number = formatter
+            ? convertLocalToUtc(year, month, day, startLocal.hour, startLocal.minute, startLocal.second, zone)!.getTime()
+            : Date.UTC(year, month - 1, day, startLocal.hour, startLocal.minute, startLocal.second);
+        return new Date(ms + startMillis);
+    };
+
+    const monthOfIndex = (monthIndex: number): { year: number; month: number } => ({
+        year: Math.floor(monthIndex / 12),
+        month: (((monthIndex % 12) + 12) % 12) + 1,
+    });
+
+    const periodFirstDay = (k: number): number => {
+        switch (freq) {
+            case RecurrenceFrequency.DAILY:
+                return startDay + k * interval;
+            case RecurrenceFrequency.WEEKLY:
+                return startWeekMonday + k * interval * 7;
+            case RecurrenceFrequency.MONTHLY: {
+                const { year, month } = monthOfIndex(startMonthIndex + k * interval);
+                return dayNumber(year, month, 1);
+            }
+            default:
+                return dayNumber(startLocal.year + k * interval, 1, 1);
+        }
+    };
+
+    const periodDays = (k: number): number[] => {
+        let days: number[];
+        switch (freq) {
+            case RecurrenceFrequency.DAILY: {
+                // BYMONTHDAY/BYDAY only limit a DAILY rule (ordinals meaningless here, so ignored).
+                const day = startDay + k * interval;
+                const { year, month, day: dom } = dayNumberToDate(day);
+                const dim = daysInMonth(year, month);
+                const matchesMonthDay = byMonthDay.length === 0 || byMonthDay.some((value) => (value < 0 ? dim + 1 + value : value) === dom);
+                const matchesWeekday = byDay.length === 0 || byDay.some((entry) => entry.weekday === weekdayOf(day));
+                days = matchesMonthDay && matchesWeekday ? [day] : [];
+                break;
+            }
+            case RecurrenceFrequency.WEEKLY: {
+                const monday = startWeekMonday + k * interval * 7;
+                const weekdays = byDay.length > 0 ? byDay.map((entry) => entry.weekday) : [weekdayOf(startDay)];
+                days = [...new Set(weekdays.map((weekday) => monday + ((weekday + 6) % 7)))];
+                break;
+            }
+            case RecurrenceFrequency.MONTHLY: {
+                const { year, month } = monthOfIndex(startMonthIndex + k * interval);
+                days = monthDays(year, month, byMonthDay, byDay, startLocal.day);
+                break;
+            }
+            default: {
+                const year = startLocal.year + k * interval;
+                if (byMonth.length > 0) {
+                    days = byMonth.flatMap((month) => (month >= 1 && month <= 12 ? monthDays(year, month, byMonthDay, byDay, startLocal.day) : []));
+                } else if (byMonthDay.length > 0) {
+                    days = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].flatMap((month) => monthDays(year, month, byMonthDay, byDay, startLocal.day));
+                } else if (byDay.length > 0) {
+                    // No BYMONTH: an ordinal BYDAY (e.g. `20MO`) counts within the whole year (RFC 5545 §3.3.10).
+                    days = expandByDayInRange(dayNumber(year, 1, 1), dayNumber(year, 12, 31), byDay);
+                } else {
+                    days = startLocal.day <= daysInMonth(year, startLocal.month) ? [dayNumber(year, startLocal.month, startLocal.day)] : [];
+                }
+                break;
+            }
+        }
+        // BYMONTH limits DAILY/WEEKLY/MONTHLY periods (YEARLY is already expanded by it above).
+        if (byMonth.length > 0 && freq !== RecurrenceFrequency.YEARLY) {
+            days = days.filter((day) => byMonth.includes(dayNumberToDate(day).month));
+        }
+        return days.sort((a, b) => a - b);
+    };
+
+    // Local days strictly before this can't produce an occurrence overlapping the window (a day of margin either
+    // side absorbs any zone-offset/time-of-day slack).
+    const earliestRelevantDay: number = localDayOf(windowStart.getTime() - Math.max(durationMs, 0)) - 1;
+    const lastRelevantDay: number = localDayOf(windowEnd.getTime()) + 1;
+    const untilDay: number | undefined = untilMs !== undefined ? localDayOf(untilMs) - 1 : undefined;
+
+    let firstPeriod = 0;
+    if (count === undefined && earliestRelevantDay > startDay) {
+        switch (freq) {
+            case RecurrenceFrequency.DAILY:
+                firstPeriod = Math.floor((earliestRelevantDay - startDay) / interval);
+                break;
+            case RecurrenceFrequency.WEEKLY:
+                firstPeriod = Math.floor((earliestRelevantDay - startWeekMonday) / (7 * interval));
+                break;
+            case RecurrenceFrequency.MONTHLY: {
+                const { year, month } = dayNumberToDate(earliestRelevantDay);
+                firstPeriod = Math.floor((year * 12 + (month - 1) - startMonthIndex) / interval);
+                break;
+            }
+            default:
+                firstPeriod = Math.floor((dayNumberToDate(earliestRelevantDay).year - startLocal.year) / interval);
+                break;
+        }
+        firstPeriod = Math.max(0, firstPeriod - 1);
     }
 
     const occurrences: OccurrenceWindow[] = [];
-    const scanEndMs = Math.min(windowEnd.getTime(), event.startDate.getTime() + MAX_SCAN_DAYS * MS_PER_DAY);
     let matchCount = 0;
-
-    for (let dayOffset = 0; ; dayOffset++) {
-        const candidateStart = new Date(event.startDate.getTime() + dayOffset * MS_PER_DAY);
-        if (candidateStart.getTime() > scanEndMs) {
+    for (let k = firstPeriod; k < firstPeriod + MAX_PERIODS; k++) {
+        if (periodFirstDay(k) > lastRelevantDay) {
             break;
         }
-        if (rule.until && candidateStart.getTime() > rule.until.getTime()) {
-            break;
-        }
-        if (!matchesRecurrenceDay(rule, event.startDate, candidateStart, dayOffset)) {
-            continue;
-        }
-        matchCount++;
-        if (rule.count !== undefined && matchCount > rule.count) {
-            break;
-        }
-        if (!excluded.has(candidateStart.getTime())) {
-            const candidateEnd = new Date(candidateStart.getTime() + durationMs);
-            if (occurrenceOverlapsWindow(candidateStart, candidateEnd, windowStart, windowEnd)) {
-                occurrences.push({ start: candidateStart, end: candidateEnd });
-                if (occurrences.length >= MAX_OCCURRENCES) {
-                    break;
+        for (const day of periodDays(k)) {
+            if (day < startDay) {
+                continue;
+            }
+            if (day < earliestRelevantDay && (untilDay === undefined || day < untilDay)) {
+                // Only being counted toward COUNT - can't overlap the window and can't be past UNTIL, so skip the
+                // zone conversion entirely.
+                matchCount++;
+                if (count !== undefined && matchCount >= count) {
+                    return occurrences;
+                }
+                continue;
+            }
+            const candidateStart = toInstant(day);
+            if (untilMs !== undefined && candidateStart.getTime() > untilMs) {
+                return occurrences;
+            }
+            matchCount++;
+            if (count !== undefined && matchCount > count) {
+                return occurrences;
+            }
+            if (!excluded.has(candidateStart.getTime())) {
+                const candidateEnd = new Date(candidateStart.getTime() + durationMs);
+                if (occurrenceOverlapsWindow(candidateStart, candidateEnd, windowStart, windowEnd)) {
+                    occurrences.push({ start: candidateStart, end: candidateEnd });
+                    if (occurrences.length >= MAX_OCCURRENCES) {
+                        return occurrences;
+                    }
                 }
             }
         }

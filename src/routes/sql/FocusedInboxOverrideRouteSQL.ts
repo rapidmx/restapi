@@ -4,11 +4,10 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { FocusedInboxOverrideSQL } from "../../sql.js";
-import { BaseScopedChildRoute } from "../BaseScopedChildRoute.js";
+import { BaseFocusedInboxOverrideRoute } from "../BaseFocusedInboxOverrideRoute.js";
 const { Model } = RouteDecorators;
 
 @Model(FocusedInboxOverrideSQL)
-export class FocusedInboxOverrideRouteSQL extends BaseScopedChildRoute<FocusedInboxOverrideSQL> {
+export class FocusedInboxOverrideRouteSQL extends BaseFocusedInboxOverrideRoute<FocusedInboxOverrideSQL> {
     protected readonly repoUtilsClass: any = RepoUtils;
-    protected readonly scopeProperty: string = "mailboxUid";
 }

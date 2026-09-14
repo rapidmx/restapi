@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
@@ -201,7 +202,7 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
 
         await this.requestRepo!.update(
             { uid: request.uid, version: (request as any).version, status: "ready", blobKey } as any,
-            request,
+            asEntity(this.requestRepo!, request),
             { ignoreACL: true },
         );
 
@@ -234,7 +235,7 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
         try {
             const updated: T = await this.requestRepo!.update(
                 { uid: request.uid, version: (request as any).version, status: "failed", errorMessage } as any,
-                request,
+                asEntity(this.requestRepo!, request),
                 { ignoreACL: true },
             );
             await recordAuditLog(

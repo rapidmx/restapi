@@ -145,7 +145,13 @@ describe("BaseScopedChildRoute Tests (truncate() TOCTOU-scoping fix only)", () =
         // that only starts existing AFTER this snapshot (e.g. mail delivered mid-request) is not in this
         // filter at all, so RepoUtils.truncate()'s own independent live re-query can't sweep it in
         // unchecked, unlike passing the original `{folderUid: "folder-1"}` filter straight through would.
-        expect(truncateSpy).toHaveBeenCalledWith({ uid: "in(msg-1,msg-2)" }, { user: { uid: "user-1" }, ignoreACL: true });
+        // One literal `eq()` per uid, never a comma-split `in(...)`.
+        expect(truncateSpy.mock.calls).toEqual([
+            [{ uid: "eq(msg-1)" }, { user: { uid: "user-1" }, ignoreACL: true }],
+            [{ uid: "eq(msg-2)" }, { user: { uid: "user-1" }, ignoreACL: true }],
+        ]);
+        // The snapshot query itself is scoped by the permission-checked folder, as a literal.
+        expect((route as any).repoUtils.find.mock.calls[0][0].folderUid).toBe("eq(folder-1)");
     });
 
     it("Never calls truncate() at all when nothing matches - nothing to check and nothing to delete.", async () => {

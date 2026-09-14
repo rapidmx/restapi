@@ -2,12 +2,11 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import * as fs from "fs/promises";
-import * as path from "path";
 import * as x509 from "@peculiar/x509";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { EncryptionCertificateAuthority, IssuedCertificate } from "./EncryptionCertificateAuthority.js";
+import { readFileIfExists, updateJsonFile } from "./FileStoreUtils.js";
 const { Config, Logger } = ObjectDecorators;
 
 /** Default HTTP request timeout (ms) for calls to the PKI server. */
@@ -68,9 +67,6 @@ export class OpenBaoPkiCertificateAuthority implements EncryptionCertificateAuth
     @Logger
     private logger: any;
 
-    /** Serializes `recordSerial()` calls within this process - see that method's own doc comment. */
-    private serialMapQueue: Promise<unknown> = Promise.resolve();
-
     /** `mail:pki:openbao:address` defaults to loopback, which is a safe default, but nothing previously
      * stopped it from being pointed at a remote, non-TLS address - `request()` always sends `X-Vault-Token`
      * (a live PKI-signing credential) as a plain header, so a plaintext `http://` address anywhere off
@@ -129,35 +125,30 @@ export class OpenBaoPkiCertificateAuthority implements EncryptionCertificateAuth
     }
 
     private async loadSerialMap(): Promise<Record<string, string>> {
-        try {
-            return JSON.parse(await fs.readFile(this.serialMapPath, "utf-8"));
-        } catch (err: any) {
-            if (err.code !== "ENOENT") {
-                throw err;
-            }
-            return {};
-        }
+        const raw: string | undefined = await readFileIfExists(this.serialMapPath);
+        return raw === undefined ? {} : JSON.parse(raw);
     }
 
     /**
-     * Read-modify-write against the serial map file - queued behind `serialMapQueue` so two `issue()` calls
-     * completing concurrently *within this process* can't race (the second read observing the file before the
-     * first's write lands, then overwriting it and dropping the first's entry - which would later make
-     * `revoke()` 404 for a certificate that really was issued). This closes the in-process race; it does not
-     * protect against two separate OS processes writing the same path (would need real file locking, e.g.
-     * `flock`/`proper-lockfile` - out of scope for this deployment's usual one-process-per-PKI-config shape).
+     * Read-modify-write against the serial map file via `FileStoreUtils.updateJsonFile()`: serialized by a
+     * process-wide lock keyed on the file's resolved path (not per-instance, so two instances configured with
+     * the same `serial_map_path` can't race either), and written atomically (temp file + rename) so a crash
+     * mid-write can't truncate the map and a concurrent `revoke()` read never observes a torn file. Without
+     * this, two `issue()` calls completing concurrently could drop one another's entry - which would later make
+     * `revoke()` 404 for a certificate that really was issued. A failed write never blocks the next call. This
+     * does not protect against two separate OS processes (e.g. replicas sharing a volume) racing on the same
+     * path - that would need real file locking or a database-backed map.
      */
     private async recordSerial(fingerprint: string, serialNumber: string): Promise<void> {
-        const next = this.serialMapQueue.then(async () => {
-            const map: Record<string, string> = await this.loadSerialMap();
-            map[fingerprint] = serialNumber;
-            await fs.mkdir(path.dirname(this.serialMapPath), { recursive: true });
-            await fs.writeFile(this.serialMapPath, JSON.stringify(map), { mode: 0o600 });
-        });
-        // Swallow a failure here so it doesn't poison the queue for the *next* call - the failure still
-        // propagates to `next`'s own caller via the `await next` below.
-        this.serialMapQueue = next.catch(() => undefined);
-        await next;
+        // Parent directory mode 0o777 (umask-filtered) matches this map's historical `mkdir` behavior.
+        await updateJsonFile<Record<string, string>, void>(
+            this.serialMapPath,
+            0o600,
+            (map) => {
+                map[fingerprint] = serialNumber;
+            },
+            0o777,
+        );
     }
 
     public async issue(identity: string, csr: string): Promise<IssuedCertificate> {

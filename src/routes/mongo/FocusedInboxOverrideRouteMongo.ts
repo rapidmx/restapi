@@ -4,11 +4,10 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { FocusedInboxOverrideMongo } from "../../mongo.js";
-import { BaseScopedChildRoute } from "../BaseScopedChildRoute.js";
+import { BaseFocusedInboxOverrideRoute } from "../BaseFocusedInboxOverrideRoute.js";
 const { Model } = RouteDecorators;
 
 @Model(FocusedInboxOverrideMongo)
-export class FocusedInboxOverrideRouteMongo extends BaseScopedChildRoute<FocusedInboxOverrideMongo> {
+export class FocusedInboxOverrideRouteMongo extends BaseFocusedInboxOverrideRoute<FocusedInboxOverrideMongo> {
     protected readonly repoUtilsClass: any = RepoUtils;
-    protected readonly scopeProperty: string = "mailboxUid";
 }

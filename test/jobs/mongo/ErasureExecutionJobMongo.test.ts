@@ -16,6 +16,8 @@ import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo
 import { BookingMongo } from "../../../src/models/mongo/BookingMongo.js";
 import { BookingTypeMongo } from "../../../src/models/mongo/BookingTypeMongo.js";
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
+import { CalendarShareLinkMongo } from "../../../src/models/mongo/CalendarShareLinkMongo.js";
+import { KeyVaultMongo } from "../../../src/models/mongo/KeyVaultMongo.js";
 import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
 import { ContactListMongo } from "../../../src/models/mongo/ContactListMongo.js";
 import { DataExportRequestMongo } from "../../../src/models/mongo/DataExportRequestMongo.js";
@@ -75,6 +77,8 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
     let dataExportRequestRepo: MongoRepository<DataExportRequestMongo>;
     let mailboxImportRequestRepo: MongoRepository<MailboxImportRequestMongo>;
     let matterRepo: MongoRepository<MatterMongo>;
+    let keyVaultRepo: MongoRepository<KeyVaultMongo>;
+    let calendarShareLinkRepo: MongoRepository<CalendarShareLinkMongo>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
 
     const createMailbox = async (): Promise<MailboxMongo> =>
@@ -130,6 +134,8 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         models.set("MailboxImportRequestMongo", MailboxImportRequestMongo);
         models.set("MatterMongo", MatterMongo);
         models.set("AuditLogEntryMongo", AuditLogEntryMongo);
+        models.set("KeyVaultMongo", KeyVaultMongo);
+        models.set("CalendarShareLinkMongo", CalendarShareLinkMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("mongo");
@@ -162,6 +168,8 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         mailboxImportRequestRepo = conn.getMongoRepository("MailboxImportRequestMongo");
         matterRepo = conn.getMongoRepository("MatterMongo");
         auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
+        keyVaultRepo = conn.getMongoRepository("KeyVaultMongo");
+        calendarShareLinkRepo = conn.getMongoRepository("CalendarShareLinkMongo");
 
         job = await objectFactory.newInstance(ErasureExecutionJobMongo, { name: "default" });
     });
@@ -199,6 +207,8 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
             mailboxImportRequestRepo,
             matterRepo,
             auditLogRepo,
+            keyVaultRepo,
+            calendarShareLinkRepo,
         ]) {
             await repo.clear();
         }
@@ -528,6 +538,101 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         } finally {
             PluginRegistry.setLoaded([]);
         }
+    });
+
+    it("Purges the mailbox's KeyVault and the CalendarShareLinks on its folders, but not another mailbox's.", async () => {
+        const mailbox = await createMailbox();
+        const otherMailbox = await createMailbox();
+        const folder = await folderRepo.save(new FolderMongo({ mailboxUid: mailbox.uid, name: "Calendar" }));
+        const otherFolder = await folderRepo.save(new FolderMongo({ mailboxUid: otherMailbox.uid, name: "Calendar" }));
+        await keyVaultRepo.save(new KeyVaultMongo({ mailboxUid: mailbox.uid, wrappedKeys: [], masterKeyWraps: [] }));
+        await keyVaultRepo.save(new KeyVaultMongo({ mailboxUid: otherMailbox.uid, wrappedKeys: [], masterKeyWraps: [] }));
+        const link = { permittedActions: ["freebusy"], createdByUserUid: uuid.v4() };
+        await calendarShareLinkRepo.save(new CalendarShareLinkMongo({ ...link, token: uuid.v4(), folderUid: folder.uid }));
+        await calendarShareLinkRepo.save(new CalendarShareLinkMongo({ ...link, token: uuid.v4(), folderUid: otherFolder.uid }));
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.status).toBe("completed");
+        // folder, share link, key vault, mailbox
+        expect(updated!.purgedCount).toBe(4);
+        expect(await keyVaultRepo.count({ mailboxUid: mailbox.uid })).toBe(0);
+        expect(await keyVaultRepo.count({ mailboxUid: otherMailbox.uid })).toBe(1);
+        expect(await calendarShareLinkRepo.count({ folderUid: folder.uid })).toBe(0);
+        expect(await calendarShareLinkRepo.count({ folderUid: otherFolder.uid })).toBe(1);
+    });
+
+    it("Keeps message, attachment and raw blobs another mailbox still references, deleting them once the last reference is erased.", async () => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const rawBlobKey = `ingest/${uuid.v4()}`;
+        const attachmentBlobKey = `attachments/${uuid.v4()}`;
+        const sanitizedHtmlBlobKey = `sanitized/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, Buffer.from("raw"));
+        await blobStore.put(attachmentBlobKey, Buffer.from("attachment"));
+        await blobStore.put(sanitizedHtmlBlobKey, Buffer.from("<p>html</p>"));
+        const recipientA = await createMailbox();
+        const custodian = await createMailbox();
+        const recipientC = await createMailbox();
+        // The custodian is under a legal hold: erasing another recipient must not destroy its copy's content.
+        await matterRepo.save(
+            new MatterMongo({
+                name: "Held",
+                escrowScopeId: uuid.v4(),
+                custodianMailboxUids: [custodian.uid],
+                dateRangeStart: new Date("2020-01-01"),
+                dateRangeEnd: new Date("2030-01-01"),
+            }),
+        );
+        const saveCopy = async (mailboxUid: string): Promise<void> => {
+            const message = await messageRepo.save(
+                new MessageMongo({
+                    mailboxUid,
+                    folderUid: uuid.v4(),
+                    messageId: "shared@example.com",
+                    subject: "Hi",
+                    from: { address: "alice@example.com", type: RecipientType.TO },
+                    recipients: [],
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey: rawBlobKey,
+                    sanitizedHtmlBlobKey,
+                    flags: { read: false, flagged: false, answered: false, forwarded: false },
+                    references: [],
+                    hasAttachments: true,
+                }),
+            );
+            await attachmentRepo.save(
+                new AttachmentMongo({ mailboxUid, folderUid: message.folderUid, messageUid: message.uid, filename: "a.txt", mimeType: "text/plain", blobKey: attachmentBlobKey }),
+            );
+        };
+        await saveCopy(recipientA.uid);
+        await saveCopy(custodian.uid);
+        // Recipient C's copy is still waiting in the ingest queue.
+        await ingestQueueEntryRepo.save(
+            new IngestQueueEntryMongo({ mailboxUid: recipientC.uid, envelopeFrom: "alice@example.com", envelopeTo: ["c@example.com"], rawBlobKey, status: "pending" as any }),
+        );
+
+        await createRequest({ mailboxUid: recipientA.uid });
+        await job.run();
+        expect(await blobStore.exists(rawBlobKey)).toBe(true);
+        expect(await blobStore.exists(attachmentBlobKey)).toBe(true);
+        expect(await blobStore.exists(sanitizedHtmlBlobKey)).toBe(true);
+
+        // A soft-deleted copy is still recoverable, so it still counts as a reference.
+        await messageRepo.updateMany({ mailboxUid: custodian.uid }, { $set: { deleted: true } });
+        await matterRepo.clear();
+        await createRequest({ mailboxUid: recipientC.uid });
+        await job.run();
+        expect(await blobStore.exists(rawBlobKey)).toBe(true);
+        expect(await blobStore.exists(sanitizedHtmlBlobKey)).toBe(true);
+
+        await createRequest({ mailboxUid: custodian.uid });
+        await job.run();
+        expect(await blobStore.exists(rawBlobKey)).toBe(false);
+        expect(await blobStore.exists(attachmentBlobKey)).toBe(false);
+        expect(await blobStore.exists(sanitizedHtmlBlobKey)).toBe(false);
     });
 
     it("Does not touch another mailbox's content.", async () => {

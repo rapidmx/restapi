@@ -56,7 +56,8 @@ describe("Route:MessageSQL Tests", () => {
         const obj: MailboxSQL = new MailboxSQL({
             ownerUserUid: ownerUid,
             primarySmtpAddress: `${uuid.v4()}@example.com`,
-            aliasAddresses: [],
+            // The address every draft below is sent from - `send()`/`recall()` only accept a sender that is the mailbox's own.
+            aliasAddresses: ["owner@example.com"],
             displayName: "Test Mailbox",
             timezone: "UTC",
             quotaBytes: 1_000_000_000,

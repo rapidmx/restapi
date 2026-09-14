@@ -734,3 +734,327 @@ Mailbox access / policy
 - Tests: shared suites `test/routes/mailboxSelfServiceCreateSuite.ts` (run by both MailboxAutoProvision files) and
   `test/routes/retentionPolicyClearSuite.ts`; additions in `mailboxAccessSecuritySuite.ts` and `pluginRouteSuite.ts`
   (context gains `updatePlugin`). MailboxRoute tests that created mailboxes as a non-trusted caller now do it as admin.
+
+## 2026-09-14 — Review fixes, round 3 (part RA2): booking, key vault, escrow, audit/domain/branding, matters, calendar dates, request lists
+
+Uncommitted. Other agents edited restapi concurrently (RA1: folder/message/mailbox/ingest/search routes; RB/RC: jobs,
+transport, scan, pki, search providers, key discovery, escrow audit utils, index declarations).
+
+Booking
+- `requireBookingByToken`: the token must match the minted shape `^[A-Za-z0-9_-]{43}$` (32 random bytes, base64url)
+  and is queried as `eq(token)`; `like(*)`/`regex(^A)`/anything else is a 404 before any query. Contract: manage tokens
+  are exactly 43 base64url characters.
+- Bookings are written into `BookingType.calendarFolderUid` when it's still a live calendar folder of the booking
+  type's mailbox, else the mailbox's well-known calendar folder (created if needed). Busy time is read from
+  `calendarFolderUid` plus the well-known calendar folder (legacy bookings were always written there). All three busy
+  queries page through every match (`sort: uid`, 500/page) instead of stopping at 500 unsorted rows.
+- `book()` no longer uses `@RateLimit()` (keyed on `METHOD path` = one shared counter per booking link, so one client
+  could lock out every booker): `checkBookingRateLimit()` calls `RateLimiter.checkAndIncrement("booking|<ip>|<slug>",
+  undefined, req)` - IP via `NetUtils.getIPAddress(req, trusted_proxies)`, and passing `req` keeps the limiter's own
+  per-IP layer. `cancel`/`reschedule` keep `@RateLimit()` (their path embeds the token, so already per booking).
+- `validateBook`: strings only; `bookerName` <= 200 (trimmed), `bookerEmail` <= 254, `bookerNotes` <= 2000,
+  `bookerTimezone` <= 64.
+- `BaseBookingTypeRoute` gains abstract `folderClass` (concrete Mongo/SQL classes updated): `calendarFolderUid` must
+  exist (400), be readable by the caller (403, checked first so a non-reader learns nothing), belong to the booking
+  type's mailbox and be `type: calendar` (400); re-checked on update when `calendarFolderUid` or `mailboxUid` changes
+  (updateBulk/updateProperty go through `update()`). Existing BookingType tests now create a real calendar folder.
+
+Escrow
+- `$or` override: `BaseMatterRoute` find/count/truncate, `BaseEscrowAccessRequestRoute.find`, `BaseEscrowAuditLogRoute`
+  find/count (holder path) drop `$`-prefixed keys and the forced key from the client query. NOTE: with this
+  service-core, `parseQueryString` is flat (`$or[0][matterId]=x` is a literal key; a repeated `$or=` gives an array of
+  strings), so a client can't actually build an object-valued `$or` from a query string today - verified by
+  temporarily reverting the strip: the old code 500s (`Property "$or[0][matterId]" was not found`) rather than leaking.
+  Kept as defense in depth; the tests assert the post-fix 200 and no leak on both backends.
+- Escrow audit log holder visibility and the access/export request lists now page through ALL matters under held
+  scopes (the old single `find` capped at 100). A plain `?matterId=` narrows within the visible set.
+- `BaseEscrowScopeRoute` dual-control rules (documented on the class): (1) the editing user can't be in the
+  `holderUserUids` a create sends, or add themselves on update (403; re-sending an unchanged list is fine); (2) a user
+  who is a holder can't change that scope's holders/requiredHolders/publicKey (403); (3) lowering `requiredHolders` or
+  changing holders/publicKey while any approved/fulfilled request under the scope has a met, unexpired approval -> 409;
+  (4) create/update/delete audit `details.before`/`after` = {name, holderUserUids, requiredHolders,
+  publicKeyFingerprint, notifySubjectOnAccess}. `updateBulk`/`updateProperty` route through `update()`, `truncate` is
+  403. New abstract `escrowAccessRequestClass` (concrete classes updated). Two colluding admins can still do it -
+  inherent to admin-managed holder lists.
+- `util/EscrowUtils.ts`: `DEFAULT_ESCROW_APPROVAL_TTL_HOURS` (72), `resolveEscrowApprovalTtlHours(config)` reading
+  `mail:escrow:approval_ttl_hours`, `evaluateEscrowApprovals(request, scope, ttl)` - approvals count once per holder
+  and only from CURRENT holders; the bar is still `requiredHoldersAtCreation`; expiry = the approval that met the
+  threshold + TTL.
+- `material()`: holder check, then matter closed -> 409; mailbox not in `custodianMailboxUids` or no longer assigned to
+  the matter's scope -> 409; threshold not met by current holders -> 403; approval expired -> 403. `approve()` on a
+  closed matter -> 400. `BaseMatterExportRequestRoute.create` and `BaseMatterSearchRoute` refuse closed matters (400).
+- Audit append retry: `retryOnAuditConflict()` re-runs the whole `@Transactional()` `persistCreate`/`persistApprove`/
+  `persistMaterialRead` up to 3 times on a non-`ApiError` failure (a failed insert aborts a Postgres transaction, so
+  `recordEscrowAuditEntry`'s inner retry can't help there). Retries stay idempotent on a MongoDB deployment without
+  transactions: `persistCreate` reuses the instance uid and skips an existing row, `persistApprove` re-reads the
+  request and skips an already-saved approval. `EscrowAuditUtils` itself untouched (RB/RC).
+- `EscrowAuditAction.MATTER_EXPORT_*` confirmed present in types.ts - no change.
+
+Admin write guards
+- `BaseAuditLogRoute`/`BaseEscrowAuditLogRoute`: `updateBulk` (PUT /) and `updateProperty` (PUT /:id/:property)
+  overridden with `@Before("rejectWrite")` (403 for everyone). `exists` left alone: these are admin-readable anyway and
+  non-trusted callers still hit the deny-all class ACL.
+- `BaseDomainRoute`: `updateBulk` loops the guarded `update()` (strips verified & co., audits); `updateProperty` 403s
+  for `uid`/`verified`/`verificationToken`/`verifiedAt`/`lastCheckedAt`, otherwise goes through `update()`; `truncate`
+  403 (it deleted every domain with no per-domain audit).
+
+Key vault
+- `enrollKey`/`startSignEnrollment`/`addMasterKeyWrap`/`removeMasterKeyWrap` are owner-only (`requireMailboxOwner`,
+  like `rekey`); delegates keep read access (`get`, `checkSignEnrollmentStatus`). Removal made owner-only too since it
+  is as destructive as rekey.
+- Removing a wrap that would leave no non-escrow wrap -> 409.
+
+Branding
+- Logo/icon uploads accept only `image/png`, `image/jpeg`, `image/webp`, `image/x-icon`, `image/vnd.microsoft.icon`;
+  stylesheet `text/css`. The media type is lowercased with parameters dropped before comparing/storing.
+- Served assets add `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox` (also neutralizes an SVG
+  uploaded before this change).
+- `headerHtml`/`footerHtml` sanitized on save with sanitize-html (already a dependency via ScanPipeline): default tags
+  minus script/style plus `img`, default attributes plus `class`/`style` on any tag (no `on*`), schemes
+  http/https/mailto only (no `javascript:`/`data:`), no protocol-relative URLs. Non-string -> 400, null clears.
+  Existing stored HTML is NOT re-sanitized until its next save.
+
+Dates
+- New `util/DateCoercionUtils.ts` (not exported from util/index.ts - index declarations are RB/RC's; add if wanted):
+  `coerceDateValue`/`coerceDateFields`/`coerceCalendarEventDates` (startDate, endDate, recurrenceId,
+  cancelNoticeSentAt, recurrenceRule.until, recurrenceRule.exceptions[]) and `MATTER_DATE_FIELDS`. Strict mode 400s an
+  unparseable value; `lenient` leaves it as is.
+- `BaseCalendarEventRoute` coerces on create and update (updateBulk/updateProperty go through update());
+  `isSchedulingRelevantChange` wraps stored dates in `new Date()`. `BaseMatterRoute` coerces on create/update/
+  updateProperty. `BaseBookingRoute.findBusyEvents` leniently coerces the events it reads; `BaseMatterSearchRoute` wraps
+  `dateRangeStart/End` in `new Date()`.
+- MIGRATION NEEDED (Mongo only): rows already stored with ISO-string dates stay strings. The reads above tolerate them,
+  but MongoDB range queries (booking busy query 1, reminder/OOF/retention jobs, LegalHoldUtils) never match a BSON
+  string, so such rows stay invisible to those queries until converted - a one-off `updateMany` with `$toDate` per
+  field (CalendarEventMongo: startDate, endDate, recurrenceId, cancelNoticeSentAt, recurrenceRule.until,
+  recurrenceRule.exceptions; MatterMongo: dateRangeStart, dateRangeEnd, closedAt), filtering on `{$type: "string"}`.
+  Job/LegalHoldUtils reads are RB/RC's.
+
+Request lists
+- `GET /data-export-requests`, `/erasure-requests`, `/mailbox-import-requests`, `/matter-export-requests`,
+  `/escrow-access-requests`: newest first (`sort: -dateCreated`), `?limit=` (default 100, capped at 500;
+  0/negative/fractional/non-numeric/repeated -> 400), `?page=` (0-based). Matter export and escrow access requests also
+  take `?matterId=`. Response stays a bare array. `util/RequestListUtils.ts` `parseListPaging()`. The non-trusted data
+  export/mailbox import lists are one `$or` query (own requests OR requests for owned mailboxes) so paging is real.
+- Signature change: those `find()` methods now take `@Query("limit")`, `@Query("page")` (and `@Query("matterId")` for
+  matter export) before `@AuthUser`.
+
+Tests
+- Shared suites run on both backends: `test/routes/bookingSecuritySuite.ts` (from the BookingRoute tests),
+  `bookingTypeFolderSuite.ts` (BookingTypeRoute tests), and via new `test/routes/{sql,mongo}/SecurityControls.test.ts`:
+  `escrowControlsSuite.ts`, `writeGuardsSuite.ts`, `datesAndListsSuite.ts`, on a small backend-neutral `EntityStore`
+  (`entityStore.ts`, `sqlEntityStore.ts`, `mongoEntityStore.ts`). Unit: `test/util/DateCoercionUtils.test.ts`,
+  `RequestListUtils.test.ts`, additions to `EscrowUtils.test.ts`, `BaseAuditLogRoute.test.ts`,
+  `BaseEscrowAuditLogRoute.test.ts`, new `test/routes/BaseAdminWriteGuards.test.ts`.
+- Full coverage suite not run here (coordinator runs it).
+
+## 2026-09-14 — Review fixes, round 3 (part RB/RC): jobs, transport, scan, PKI, search, key discovery, escrow audit, models
+
+Every finding confirmed in code first. Not committed, no version bump or release notes.
+
+Cross-cutting
+- **Mongo reads are plain documents** (service-core `MongoRepository.find()` is `collection.find()`), and
+  `RepoUtils.update()` only enforces the optimistic lock when `existing instanceof BaseEntity` - so every "versioned
+  claim" in a job was an unconditional overwrite on Mongo. `util/EntityUtils.ts` `asEntity(repo, row)` wraps
+  `existing`; applied to every update in ScanQueueJob, ScheduledSendJob, DataExportJob, MailboxImportJob,
+  MatterExportJob, ErasureExecutionJob (CalendarReminderJob/MeetingSchedulingJob wrap their own). Routes were not
+  changed; the same gap likely exists wherever a route passes a Mongo `findOne()` result as `existing` (not verified).
+- `transport/TransportResultUtils.ts`: `sendOrThrow()`/`isTransportResultDelivered()`. The bundled transports report a
+  failure via `rejected` and never throw, so anything that must not count a failed send as sent uses `sendOrThrow`
+  (ScanQueueJob auto-reply/MDN/recall report/resource reply/forward, MeetingSchedulingJob, BaseMailIngestRoute notices
+  and DL relays).
+- `util/UuidUtils.ts` `nameBasedUuid()` (RFC 4122 v5) for rows that must collide instead of duplicating.
+
+Shared blobs (finding 1)
+- Inbound raw blobs are shared by every recipient's IngestQueueEntry/Message/QuarantineEntry; attachment and sanitized
+  blobs by a message and its rule copies. `util/BlobReferenceUtils.ts`: delete the row first, then
+  `deleteBlobsIfUnreferenced()` counts `eq(key)` references (soft-deleted included, `includeDeleted`) in
+  Message.bodyBlobKey/sanitizedHtmlBlobKey, Attachment.blobKey/extractedTextBlobKey, QuarantineEntry.rawBlobKey and
+  non-DELIVERED IngestQueueEntry.rawBlobKey (DELIVERED entries are never cleaned up, so they can't count). Any remaining
+  reference - a held custodian's included - keeps the blob. Used by ErasureExecutionJob, RetentionEnforcementJob and
+  QuarantineRetentionJob. Routes that purge messages (RA1) should use it too.
+- ErasureExecutionJob also purges KeyVault and CalendarShareLink (found per folder, before the folder is purged), and
+  now also finds soft-deleted rows of recoverable entities - `find()` excluded them, so erasure silently skipped
+  e.g. Deleted Items. New abstract `keyVaultClass`/`calendarShareLinkClass`. RetentionEnforcementJob gains
+  `quarantineEntryClass`/`ingestQueueEntryClass`. QuarantineRetentionJob gains scanResult/message/attachment/
+  ingestQueueEntry/matter classes and now deletes the entry's ScanResult and (guarded) raw blob.
+
+Queues (findings 2, 7)
+- ScanQueueJob: due = PENDING + FAILED with `nextAttemptAt <= now` + SCANNING with an expired `scanLeaseExpiresAt` (+
+  legacy SCANNING with no lease whose `dateModified` is older than the lease), oldest first. The claim is versioned; a
+  lost claim is skipped, not failed. Failure: `attempts++`, `nextAttemptAt = now + backoff * 2^(attempts-1)`, null at
+  `max_attempts`. Config `mail:jobs:scan_queue:max_attempts` (5), `retry_backoff_seconds` (60), `lease_seconds` (600).
+  New nullable IngestQueueEntry fields `attempts`, `nextAttemptAt`, `scanLeaseExpiresAt`.
+- Idempotent delivery: the target Message/QuarantineEntry uid, ScanResult uid, rule-copy uids, attachment uids and the
+  attachment/sanitized blob keys are all derived from the entry uid and looked up before create. An already-filed
+  message isn't re-sent receipts, auto-replies or forwards; iTIP re-applies (it's idempotent). Folder counter bumps
+  retry on a version conflict. Residual: counters can be under-counted if a worker dies between filing and bumping.
+- RetentionEnforcementJob/QuarantineRetentionJob read `(date, uid)`-sorted pages past skipped/failed rows (the remaining
+  set is always "rows skipped so far, then unread rows"). Held mailboxes are excluded from the message/quarantine
+  query with `mailboxUid nin(...)` (conservative: ignores the hold's date range); audit entries are skipped in memory
+  instead (SQL `NOT IN` would drop NULL mailboxUid rows). `LegalHoldUtils.loadLegalHoldIndex()` loads holds once per
+  page instead of per record.
+- Leases/attempts elsewhere: DataExportJob/MailboxImportJob (lease on dateModified + `processingAttempts`),
+  ScheduledSendJob, SearchIndexJob/AttachmentExtractionJob - config keys below.
+
+Sender verification (findings 3, 4, 5, 10, 14)
+- `ScanQueueJob.verifiedFromAddress()`: the From address when it has aligned, passing DKIM (`hasAlignedPassingDkim`,
+  trusted authserv-id). Mail this server's own mailboxes send (recall notices, iTIP) leaves through the MTA and comes
+  back DKIM-signed, so it passes the same check - no separate internal-origin marker.
+- iTIP: REQUEST needs sender == the organizer it names AND == the organizer on any existing row of that icalUid; REPLY
+  needs sender == the replying attendee; CANCEL needs sender == the stored organizer. Unverified: ignored (the message
+  is still filed). Inbound copies get `inviteSequenceSent = sequence`; declined/cancelled copies get
+  `cancelNoticeSentAt` stamped before the soft delete. MeetingSchedulingJob only sends when the organizer is one of
+  the mailbox's own addresses and claims before sending. The resource conflict check pages every row with
+  `startDate < horizon` (500/page; more than 20 pages declines) and expands occurrences in the event's timezone.
+  Created events take the parsed TZID as `timezone`.
+- Recall: `X-RapidMX-Recall-Of` is honored only from a verified sender and only matches messages whose stored
+  `from.address` equals that sender (otherwise "not found"); an unverified recall is filed as ordinary mail with no
+  report. The header isn't stripped in ScanPipeline - it's inert unless verified.
+- ACME challenge email: needs a verified From; `recordChallengeToken` throws (-> not correlated, filed normally) for a
+  Reply-To outside the CA domain; a token can be re-recorded until the reply is sent.
+- Rule forwards: skip `Auto-Submitted` other than `no`, an `X-RapidMX-Loop` marker (own address, or >= 5 markers),
+  envelope from = the mailbox's primary address (minimal SRS), transport result checked. Move/copy targets must be
+  non-deleted folders of the rule's own mailbox.
+- FolderUtils: well-known folders are created under `nameBasedUuid("folder:<mailbox>:<type>")`, so the uid unique index
+  arbitrates concurrent creates and the loser re-reads; the oldest wins when legacy duplicates exist. A soft-deleted
+  folder holding that uid falls back to a random uid.
+
+Other parts (summaries)
+- PKI (`pki/FileStoreUtils.ts`): in-process per-path lock + re-read/modify/temp+rename, exclusive create via hard link.
+  LocalX509 recovers "key without cert" with the same key; the ACME account key is saved before registration and a
+  missing URL is recovered with the same key (RFC 8555 returns the existing account); 5-attempt caps. Multi-replica
+  file stores can still lose updates - a DB-backed store would be the real fix (not done).
+- Key discovery (contract change for server/plugins): client `GET /.well-known/rapidmx/keys/<hash>?domain=<domain>`,
+  domain in the cache key; server matches `domain`, falls back to the Host header; `:hash` must be 52 z-base32 chars
+  (else 400). `parseKeyDiscoveryResponse()` validates responses; cert validity comes from the certificate.
+  `sameIssuingCa` auto-replace removed (PublicKey carries no issuer certificate to verify against), so a changed
+  pinned fingerprint is always a conflict. AcmeEnrollmentDriverJob writes KeyVault before Mailbox.keys, audits expiry
+  once per cert (`KeyVault.expiryAuditedFingerprint`), and pages all mailboxes (MailboxQuotaRecalcJob too).
+- Search: `SearchProvider.bulkIndex()` returns the indexed ids (breaking for custom providers); per-document isolation
+  in all providers; text capped at 1M chars (Postgres 250k); Mongo participants stored as an array and matched by a
+  whole-address regex (legacy joined-string docs still match); limit 1..100, offset <= 10000.
+- IcsUtils: period-based expansion starting near the window, ordinal BYDAY, wall-clock stepping in the event timezone,
+  quoted TZID, Windows zone table. CalendarReminderJob: expands recurrences, in-memory watermark + lookback, versioned
+  `reminderSentFor` claim before sending.
+- Export/import: MailboxContentUtils caps per page with the date range in the query; mbox is streamed into the blob
+  store under `mail:export:max_bytes`; import refuses AvVerdict.ERROR, enforces quota, PST cumulative allocation budget.
+  S3BlobStore now multipart-uploads streams (PutObject can't take a stream of unknown length).
+- ScheduledSendJob: relays only Outbox messages of the same mailbox whose from address the mailbox owns; relay is tracked
+  (`scheduledSendRelayedAt`) so a post-relay failure retries filing only. ExternalShareExpirationJob revokes the ACL
+  record first (reading the ACL uncached). ClamAV: CLEAN only for a reply ending `: OK`.
+- Escrow audit: HMAC-SHA256 chain keyed by `mail:escrow:audit_hmac_key` (legacy SHA-256 entries still verify; an unset
+  key logs, at error level in production); new `EscrowAuditHead` singleton model detects tail truncation.
+- Models: long SQL strings are `type: "text"`, new indexes, unique FocusedInboxOverride(mailboxUid, senderAddress);
+  README Upgrading has the ALTER and dedupe SQL. RA2 notes Mongo rows with ISO-string dates are invisible to the jobs'
+  range queries until migrated.
+
+Config keys added: `mail:jobs:scan_queue:{max_attempts,retry_backoff_seconds,lease_seconds}`,
+`mail:jobs:scheduled_send:{max_attempts,retry_backoff_ms}`, `mail:jobs:search_index:{max_attempts,retry_backoff_seconds}`,
+`mail:jobs:attachment_extraction:{max_attempts,retry_backoff_seconds}`, `mail:jobs:data_export:{lease_minutes,max_attempts}`,
+`mail:jobs:mailbox_import:{lease_minutes,max_attempts}`, `mail:export:max_bytes`,
+`mail:jobs:calendar_reminder:{initial_lookback_seconds,max_lead_minutes}`, `mail:escrow:audit_hmac_key`,
+`mail:blob:s3:multipart_part_size_bytes`.
+
+Tests: targeted suites for every changed file, both backends; the full coverage suite wasn't run here (coordinator).
+
+## 2026-09-14 — Review fixes, round 3 (part RA1): mail/mailbox/folder authorization and server-managed fields
+
+Uncommitted, no version bump. Every finding was confirmed in code first; none skipped. Shared suite:
+`test/routes/mailAuthzRound3Suite.ts`, run by `test/routes/{mongo,sql}/MailAuthzRound3.test.ts` (34 tests each).
+
+Contracts other repos build on
+- Create routes never take a client `uid`: `BaseScopedChildRoute.create()` (messages, attachments, contacts, events,
+  tasks, notes, labels, lists, signatures, filter rules, overrides, share links, quarantine, ingest),
+  `BaseFolderRoute.create()` and `BaseTransportRuleRoute.create()` drop it. Mailbox/distribution-list uids stay
+  address-derived. Why: `RepoUtils.create()` reuses an existing ACL whose uid equals the new record's and adds the
+  creator with full rights, so a folder created with `uid` = another mailbox's address (or `Mailbox`, a well-known
+  folder's deterministic `nameBasedUuid("folder:<mailbox>:<type>")`, ...) got that ACL. No web-client/react-shared code
+  sends a uid on create.
+- Share links: the ACL record is now `userOrRoleId: "share:<token>"`. `?shareToken=` resolves only on routes with
+  `shareLinkClass` set (`CalendarEventRoute*` list/count/exists/findById, `FolderRoute*` exists), only for a token of
+  the minted shape `^[A-Za-z0-9_-]{43}$`, looked up as `eq(token)`, unexpired, and whose `folderUid` is exactly the
+  folder being read. The synthetic identity is `share:<token>`. Folder `find`/`count` no longer consult tokens.
+  Migration: records written before this are keyed by the bare token and stop granting anything. Revoke (route delete,
+  `ExternalShareExpirationJob`) removes both forms and `PUT` on a link re-grants under the new key, so re-saving each link
+  (or rewriting `userOrRoleId: <token>` -> `share:<token>` on folder ACLs) migrates it.
+- Search: `GET /mail/search?mailboxUid=<uid>` and `GET /mail/search/candidates?mailboxUid=<uid>` search that mailbox
+  when the caller has `READ` on it (owner, delegate, trusted); 404 when it doesn't exist or isn't readable, 400 when
+  empty. Without the param, the caller's own mailbox as before. `label` and `types` now count as filters (a
+  label-only search is 200).
+- Quarantine: create/update/updateBulk/updateProperty/delete/truncate are trusted-only (reads unchanged). A release is a
+  trusted `PUT /mail/quarantine/:id` with any non-empty `releasedAt`; the server stamps `releasedAt = now` and
+  `releasedByUserUid = caller`, ignoring the client's values, and an already-released entry keeps its stamp.
+  `react-shared`'s `releaseQuarantineEntry()` keeps working for admins. Ingest queue writes are trusted-only too.
+- `POST /mail/attachments` is 400 (`POST /upload` is the only way to create one).
+- Attachment download: only `image/png|jpeg|gif|webp|bmp` keep their type and may be `inline`; everything else is
+  `application/octet-stream` + `attachment`. Always `X-Content-Type-Options: nosniff` and `CSP: default-src 'none';
+  sandbox`; `content-length` is the stored blob's length. Message `GET /:id/content`: `nosniff` and
+  `CSP: default-src 'none'; img-src data: cid:; style-src 'unsafe-inline'; sandbox` - remote images in the web-client's
+  content iframe no longer load.
+- Send/schedule/recall: 403 unless `from.address` - and every address in the stored MIME's own `From` header - is the
+  sending mailbox's primary address or an alias (case-insensitive).
+- Re-creating a mailbox (create or auto-provision) at an address that still has folders (soft-deleted included) or an
+  ACL from a deleted mailbox is 409. Deleting a mailbox only removes the row and its ACL; its folders/ACLs/content keep
+  the uid. Refusing was chosen over cascading: a cascade would duplicate `ErasureExecutionJob` in a request, and
+  anything missed (messages are `mailboxUid`-scoped: `conversations()`, search, quota) would be inherited. To reuse an
+  address, erase the mailbox (erasure purges content then the mailbox). An address whose mailbox was already deleted
+  outright stays reserved until its folders/ACL are cleaned up by an operator.
+
+Scoping (finding 2, 9)
+- SQL `buildSearchQuerySQL` merges `$or` branches over the other keys, so `q={folderUid: mine, $or: [{folderUid: x}]}`
+  read `x`. `BaseScopedChildRoute` find/count/truncate, `BaseFolderRoute` find/count and non-trusted `BaseMailboxRoute`
+  find/count drop `$`-prefixed keys and `$` path segments, then force the checked scope last as `eq(<uid>)`. A
+  non-string scope (`?folderUid=a&folderUid=b`) is 400 on list, and a non-string scope in an update body is 400.
+- Truncate (scoped child and mailbox) deletes one `eq(uid)` at a time instead of `in(a,b,...)`, which splits on commas.
+  Mailbox addresses (create, alias add, rename) must be plain `local@domain` without whitespace or `,()<>"`.
+
+Fields a non-trusted caller can't write (dropped silently, so full-object round trips still work)
+- Message: `bodyBlobKey`, `sanitizedHtmlBlobKey`, `encrypted`, `scanResultUid`, `searchIndexedAt`,
+  `recallRequestedAt`, `receiptStatus`, `read|deliveryReceipt{SentAt,Pending,Declined}`. `sentDate`/`receivedDate` and
+  `dispositionNotificationTo` only on a create into Drafts; dates never on update (the compose/send path writes through
+  the repository); `dispositionNotificationTo` on update only while the message is in Drafts. Server compose
+  (`BaseMailComposeRoute`) uses `messageRepo` directly, so it's unaffected. Hooks: `serverManagedFields`,
+  `prepareCreate()`, `prepareUpdate()`, `trustedOnlyWrites` on `BaseScopedChildRoute`.
+- Attachment: `blobKey`, `extractedTextBlobKey`, `scanResultUid`, `sizeBytes`, `mimeType`. Contact: `photoBlobKey`.
+- Folder: `unreadCount`, `totalCount`, `syncKeyVersion`, `mailboxUid` (its ACL parent) - via `validateUpdate()` for
+  PUT/bulk; `PUT /:id/<field>` for one of them is 403. Create zeroes the counters.
+- Read receipts: the receipt is claimed (`readReceiptSentAt` written under the optimistic lock) before sending and
+  released on a failed send, and the trigger also requires the pre-update state to be unanswered - at most one send.
+
+Legal hold (finding 8): `BaseMessageRoute.checkLegalHold()` coerces dates (Mongo strings) and uses `sentDate`, else
+`receivedDate`, else `dateCreated`; no valid date at all blocks on any open hold.
+
+Mailbox aliases (finding 6): `validateUpdate()` (PUT, bulk, and `updateProperty` - which now also receives `@Request`)
+checks only aliases being added: plain address (400), verified domain when any exist (400), non-trusted callers only
+their own auth-server usernames (403; needs the `jwt` cookie or static aliases - `CRUDRoute`'s bulk validator passes no
+request, so a non-trusted bulk alias add fails closed), and no other mailbox or list uses it as uid/primary/alias (409;
+`MailboxRouteSQL.aliasQueryValue()` LIKE-matches the simple-json column). Create checks primary and aliases the same
+way; rename now also collides with other mailboxes' and lists' aliases. Not changed (flag): a self-service owner can
+still rename `primarySmtpAddress` to any unused address on a verified domain - the finding only covered aliases.
+
+Other routes
+- `BaseMailFilterRuleRoute` (new; `MailFilterRuleRoute*` extend it with `folderClass`/`labelClass`): action `folderUid`/
+  `labelUid` must exist in the rule's own mailbox (400), checked on create and when actions or the mailbox change.
+- `BaseFocusedInboxOverrideRoute` (new): `senderAddress` trimmed/lowercased (400 if not a string); a create for an
+  existing (mailbox, sender) updates that row's `classifyAs` and returns it; renaming onto another row's sender is 409.
+- `BaseQuarantineRoute` (new). New bases are exported from `routes/index.ts`.
+
+Testing notes
+- `MessageRoute` tests' mailbox helper now has alias `owner@example.com` (their drafts send from it);
+  `MailboxAutoProvision` tests clear folders and address-keyed ACLs in `beforeEach` (fixed addresses + the leftover
+  check); `FolderRoute` share-token test creates a real link; attachment download/quarantine release/search
+  "no filter" and `mailboxAccessSecuritySuite` alias tests updated to the new rules.
+- Seen repeatedly while running several route test files in one `vitest run`: a whole file answering 404 for every
+  request (different files each time, including files untouched here, e.g. `sql/BrandingRoute`,
+  `sql/MailSignatureRoute`); each passes when run alone. Looks like a server start/stop race on the fixed test port 3737,
+  not a route change - worth checking before trusting a failing full run.
+- Confirmed cause (round-3 full run, 54 failures in `mongo/MailIngestRoute`, `mongo/ContactListRoute`,
+  `ScanQueueJobMongo`): a concurrent `yarn vitest run` in `activesync` (17:17-17:18Z, overlapping this run's
+  17:16-17:25Z). `activesync`, `mapi` and `autodiscover` tests use the same fixed ports - HTTP 3737 and MongoDB 9999
+  (db `rrst-test`) - and don't take restapi's `.vitest-lock`. `MongoMemoryServer` quietly picks another port when 9999
+  is taken, but config still points at 9999, so both runs share one database (the other run's `beforeEach` clears wipe
+  rows mid-test: "sent message not found"). On Windows both servers can bind 3737 too, so requests reach the other
+  repo's server, which doesn't have these routes (404 for everything). The `activesync` run failed its own `EasRoute`
+  Mongo tests the same way. Nothing wrong in the code: re-running under the lock with nothing else running passed all
+  4193 tests. Before trusting a failing run, check for other `vitest` processes in sibling repos.

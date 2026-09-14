@@ -100,6 +100,11 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
             }
         }
         await policyRepo.clear().catch(() => undefined);
+        // Clearing mailboxes alone leaves their folders and ACLs behind, and creating a mailbox at an address with a
+        // deleted mailbox's leftovers is refused (409) - these tests reuse fixed addresses.
+        const connMgr: ConnectionManager | undefined = objectFactory.getInstance(ConnectionManager);
+        await (connMgr?.connections.get("mongo") as MongoConnection).getMongoRepository("FolderMongo").clear().catch(() => undefined);
+        await (connMgr?.connections.get("acl") as MongoConnection).getMongoRepository("AccessControlListMongo").deleteMany({ uid: { $regex: "@" } });
         mockFetch = vi.fn();
         vi.stubGlobal("fetch", mockFetch);
     });

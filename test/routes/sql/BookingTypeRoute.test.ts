@@ -9,8 +9,11 @@ import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import { BookingTypeSQL } from "../../../src/models/sql/BookingTypeSQL.js";
+import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { FolderType } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { bookingTypeFolderSuite } from "../bookingTypeFolderSuite.js";
 
 describe("Route:BookingTypeSQL Tests", () => {
     const logger = Logger();
@@ -19,6 +22,7 @@ describe("Route:BookingTypeSQL Tests", () => {
     const baseUrl = "/sql/booking-types";
     let mailboxRepo: Repository<MailboxSQL>;
     let bookingTypeRepo: Repository<BookingTypeSQL>;
+    let folderRepo: Repository<FolderSQL>;
     let aclRepo: Repository<AccessControlListSQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -45,13 +49,35 @@ describe("Route:BookingTypeSQL Tests", () => {
             records: [{ userOrRoleId: ownerUid, actions: [ACLAction.FULL] }],
             parentUid: "Mailbox",
         });
+        await createCalendarFolder(result.uid);
         return result;
+    };
+
+    /** Every test mailbox gets a calendar folder (its ACL parented to the mailbox, as `BaseFolderRoute` creates
+     * them), which `body()` uses as the booking type's `calendarFolderUid`. */
+    const calendarFolders: Map<string, string> = new Map();
+    const createCalendarFolder = async function (mailboxUid: string, type: FolderType = FolderType.CALENDAR): Promise<FolderSQL> {
+        const folder: FolderSQL = await folderRepo.save(
+            new FolderSQL({ mailboxUid, name: "Calendar", type, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+        );
+        await aclRepo.save({
+            uid: folder.uid,
+            dateCreated: new Date(),
+            dateModified: new Date(),
+            version: 0,
+            records: [],
+            parentUid: mailboxUid,
+        });
+        if (type === FolderType.CALENDAR && !calendarFolders.has(mailboxUid)) {
+            calendarFolders.set(mailboxUid, folder.uid);
+        }
+        return folder;
     };
 
     /** A valid create body - every test varies one field of it. */
     const body = (mailboxUid: string, overrides?: any) => ({
         mailboxUid,
-        calendarFolderUid: uuid.v4(),
+        calendarFolderUid: calendarFolders.get(mailboxUid) ?? uuid.v4(),
         slug: `intro-${uuid.v4()}`,
         name: "Intro Call",
         hostDisplayName: "Ada Lovelace",
@@ -83,6 +109,7 @@ describe("Route:BookingTypeSQL Tests", () => {
         if (isSqlDataSource(conn)) {
             mailboxRepo = conn.getRepository(MailboxSQL);
             bookingTypeRepo = conn.getRepository(BookingTypeSQL);
+            folderRepo = conn.getRepository(FolderSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -95,6 +122,7 @@ describe("Route:BookingTypeSQL Tests", () => {
 
     beforeEach(async () => {
         await bookingTypeRepo.clear();
+        await folderRepo.clear();
         await mailboxRepo.clear();
     });
 
@@ -309,5 +337,15 @@ describe("Route:BookingTypeSQL Tests", () => {
 
             expect(result.status).toBe(403);
         });
+    });
+    bookingTypeFolderSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        ownerUid: owner.uid,
+        ownerToken,
+        otherUserUid: otherUser.uid,
+        createMailbox,
+        createCalendarFolder,
+        body,
     });
 });

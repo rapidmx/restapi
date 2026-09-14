@@ -10,9 +10,10 @@ import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators 
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
+import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, DataSubjectErasureRequest, Mailbox } from "../models/types.js";
 const { Config, Logger } = ObjectDecorators;
-const { Get, Param, Post, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
+const { Get, Param, Post, Query, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
 
 /**
  * A GDPR Article 17 ("right to erasure") request - see `DataSubjectErasureRequest`'s own doc comment for
@@ -197,16 +198,20 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
         return updated;
     }
 
+    /** Newest first; `?limit=` (default 100, at most 500) and `?page=` (0-based) page through the list - see
+     * `util/RequestListUtils.ts`. */
     @Get()
-    public async find(@AuthUser user?: JWTUser): Promise<T[]> {
+    public async find(@Query("limit") limitParam: unknown, @Query("page") pageParam: unknown, @AuthUser user?: JWTUser): Promise<T[]> {
         await this.init();
+        const { limit, page } = parseListPaging({ limit: limitParam, page: pageParam });
         if (!user) {
             return [];
         }
+        const paging = { sort: "-dateCreated", limit, page };
         if (UserUtils.hasRoles(user, this.trustedRoles)) {
-            return await this.requestRepo!.find({}, { ignoreACL: true });
+            return await this.requestRepo!.find(paging as any, { ignoreACL: true, limit, page });
         }
-        return await this.requestRepo!.find({ requestedByUserUid: user.uid } as any, { ignoreACL: true });
+        return await this.requestRepo!.find({ requestedByUserUid: `eq(${user.uid})`, ...paging } as any, { ignoreACL: true, limit, page });
     }
 
     @Get("/:id")

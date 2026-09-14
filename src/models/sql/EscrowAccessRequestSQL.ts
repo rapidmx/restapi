@@ -20,6 +20,7 @@ const { Nullable } = ObjectDecorators;
 @Entity()
 @Description("One request by an escrow holder to access a mailbox's escrow-wrapped master key under a Matter.")
 @Index("escrow_access_request_matter", ["matterId"])
+@Index("escrow_access_request_status", ["status"])
 @Protect(
     {
         uid: "EscrowAccessRequest",

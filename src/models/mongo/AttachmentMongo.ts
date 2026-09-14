@@ -31,6 +31,8 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Index("attachment_message", ["messageUid"])
 @Index("attachment_folder", ["folderUid"])
 @Index("attachment_mailbox", ["mailboxUid"])
+@Index("attachment_blob_key", ["blobKey"])
+@Index("attachment_extracted_text_blob_key", ["extractedTextBlobKey"])
 @Protect(
     {
         uid: "Attachment",
@@ -85,6 +87,21 @@ export class AttachmentMongo extends BaseMongoEntity implements Attachment {
     public extractedTextBlobKey?: string;
 
     @Column()
+    @Description("How many times `AttachmentExtractionJob` has failed to process this attachment (unset when never failed).")
+    @Nullable
+    public extractionAttempts?: number;
+
+    @Column()
+    @Description("The earliest time `AttachmentExtractionJob` will retry this attachment after a failure.")
+    @Nullable
+    public extractionNextAttemptAt?: Date;
+
+    @Column()
+    @Description("The error from this attachment's most recent failed `AttachmentExtractionJob` attempt, if any.")
+    @Nullable
+    public extractionError?: string;
+
+    @Column()
     @Description("The unique identifier of this attachment's `ScanResult`, once scanning has completed.")
     @Nullable
     public scanResultUid?: string;
@@ -104,6 +121,9 @@ export class AttachmentMongo extends BaseMongoEntity implements Attachment {
             this.isInline = other.isInline !== undefined ? other.isInline : this.isInline;
             this.extractedTextBlobKey =
                 "extractedTextBlobKey" in other ? other.extractedTextBlobKey : this.extractedTextBlobKey;
+            this.extractionAttempts = "extractionAttempts" in other ? other.extractionAttempts : this.extractionAttempts;
+            this.extractionNextAttemptAt = "extractionNextAttemptAt" in other ? other.extractionNextAttemptAt : this.extractionNextAttemptAt;
+            this.extractionError = "extractionError" in other ? other.extractionError : this.extractionError;
             this.scanResultUid = "scanResultUid" in other ? other.scanResultUid : this.scanResultUid;
         }
     }

@@ -129,55 +129,100 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
     }
 
     /**
+     * Fetches every page of `repo.find(criteria)` (sorted by `uid` so pages are stable), not just
+     * `RepoUtils.find()`'s default first 100 rows. `limit`/`page` are passed both in `options` (all the Mongo
+     * backend reads) and baked into the criteria (all `ModelUtils.buildSearchQuerySQL` reads) - same pattern
+     * as `MailboxQuotaRecalcJob.findAllPages()`.
+     */
+    private async forEachPage<T>(
+        repo: RepoUtils<any>,
+        criteria: Record<string, any>,
+        handle: (row: T) => Promise<void>,
+        pageSize: number = 100,
+    ): Promise<void> {
+        for (let page = 0; ; page++) {
+            const batch: T[] = await repo.find({ ...criteria, sort: "uid", limit: pageSize, page } as any, {
+                ignoreACL: true,
+                limit: pageSize,
+                page,
+            });
+            for (const row of batch) {
+                await handle(row);
+            }
+            if (batch.length < pageSize) {
+                break;
+            }
+        }
+    }
+
+    /**
      * Installs an issued certificate + its already-wrapped private key into `identity`'s mailbox - the
      * exact same `Mailbox.keys`/`KeyVault.wrappedKeys` shape `BaseKeyVaultRoute.enrollKey()`'s manual
      * `useType: "sign"` path installs, sharing its certificate-parsing/identity-binding logic
      * (`publicKeyFromCertificatePem()`) but not its `@Transactional()` two-entity write: unlike a
      * synchronous HTTP request, this is a scheduled, retriable background step, so a partial failure here
-     * (mailbox updated, `KeyVault` write fails) self-heals on the next tick rather than needing true
-     * atomicity - the fingerprint-collision check below makes a retry idempotent rather than duplicating
-     * the key.
+     * self-heals on the next tick rather than needing true atomicity.
+     *
+     * **Write order**: the `KeyVault` wrapped key is saved *before* the certificate is published on
+     * `Mailbox.keys`. The reverse order could leave a published certificate whose private key the mailbox
+     * doesn't hold (a crash between the two writes) - and since the retry guard previously skipped on
+     * `Mailbox.keys` alone, that state was permanent. Each half is now checked independently by fingerprint
+     * and only the missing half(s) written; the enrollment counts as already installed only when BOTH are
+     * present.
      *
      * Returns `true` once this identity's `KeyVault`/`Mailbox.keys` genuinely reflect the certificate
      * (including when it turns out to already be installed - the idempotent retry case) - only then does
      * the caller call `markInstalled()`. Returns `false` when nothing could be done yet (no mailbox found
-     * for `identity`), so the caller leaves the enrollment exactly as-is for a later tick to retry, rather
-     * than marking it installed when it demonstrably isn't.
+     * for `identity`), so the caller leaves the enrollment exactly as-is for a later tick to retry.
      */
     private async installCertificate(
         identity: string,
         material: { certificate: string; wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType"> },
     ): Promise<boolean> {
-        const [mailbox] = await this.mailboxRepo!.find({ primarySmtpAddress: identity, limit: 1 } as any, { ignoreACL: true, limit: 1 });
-        if (!mailbox) {
+        const [found] = await this.mailboxRepo!.find({ primarySmtpAddress: identity, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+        if (!found) {
             this.logger?.warn(`AcmeEnrollmentDriverJob: no mailbox found for '${identity}' - cannot install its issued certificate.`);
             return false;
         }
 
-        const { publicKey, fingerprint } = publicKeyFromCertificatePem(material.certificate, "sign", mailbox.primarySmtpAddress);
-        // Idempotent retry guard: a prior tick may have installed this exact certificate already and then
-        // failed before reaching `markInstalled()` - re-adding it would duplicate the `Mailbox.keys` entry.
-        if ((mailbox.keys ?? []).some((k) => k.fingerprint === fingerprint)) {
+        const { publicKey, fingerprint } = publicKeyFromCertificatePem(material.certificate, "sign", found.primarySmtpAddress);
+
+        const [existingKeyVault] = await this.keyVaultRepo!.find({ mailboxUid: found.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+        const vaultHasKey: boolean = (existingKeyVault?.wrappedKeys ?? []).some((k) => k.fingerprint === fingerprint);
+        const mailboxHasKey: boolean = (found.keys ?? []).some((k) => k.fingerprint === fingerprint);
+        if (vaultHasKey && mailboxHasKey) {
             return true;
         }
 
-        await this.mailboxRepo!.update(
-            { uid: mailbox.uid, version: (mailbox as any).version, keys: [...(mailbox.keys ?? []), publicKey] } as any,
-            mailbox,
-            { ignoreACL: true },
-        );
+        let keyVaultUid: string = existingKeyVault?.uid ?? "";
+        if (!vaultHasKey) {
+            const wrappedKey: WrappedPrivateKey = { ...material.wrappedKey, fingerprint, useType: "sign" };
+            // Re-fetched via `findOne()` before updating: `find()` returns un-hydrated documents on the Mongo
+            // backend, for which `RepoUtils.update()` silently skips its optimistic-lock/version bump (see
+            // `MailboxQuotaRecalcJob.recalcMailbox()`'s identical note).
+            const current: K | undefined = existingKeyVault
+                ? ((await this.keyVaultRepo!.findOne(existingKeyVault.uid, { ignoreACL: true })) ?? existingKeyVault)
+                : undefined;
+            const keyVault: K = current
+                ? await this.keyVaultRepo!.update(
+                      { uid: current.uid, version: (current as any).version, wrappedKeys: [...(current.wrappedKeys ?? []), wrappedKey] } as any,
+                      current,
+                      { ignoreACL: true },
+                  )
+                : await this.keyVaultRepo!.create(new this.keyVaultClass({ mailboxUid: found.uid, wrappedKeys: [wrappedKey] }), {
+                      ignoreACL: true,
+                  });
+            keyVaultUid = keyVault.uid;
+        }
 
-        const [existingKeyVault] = await this.keyVaultRepo!.find({ mailboxUid: mailbox.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
-        const wrappedKey: WrappedPrivateKey = { ...material.wrappedKey, fingerprint, useType: "sign" };
-        const keyVault: K = existingKeyVault
-            ? await this.keyVaultRepo!.update(
-                  { uid: existingKeyVault.uid, version: (existingKeyVault as any).version, wrappedKeys: [...existingKeyVault.wrappedKeys, wrappedKey] } as any,
-                  existingKeyVault,
-                  { ignoreACL: true },
-              )
-            : await this.keyVaultRepo!.create(new this.keyVaultClass({ mailboxUid: mailbox.uid, wrappedKeys: [wrappedKey] }), {
-                  ignoreACL: true,
-              });
+        if (!mailboxHasKey) {
+            const mailbox: MB = (await this.mailboxRepo!.findOne(found.uid, { ignoreACL: true })) ?? found;
+            await this.mailboxRepo!.update(
+                { uid: mailbox.uid, version: (mailbox as any).version, keys: [...(mailbox.keys ?? []), publicKey] } as any,
+                mailbox,
+                { ignoreACL: true },
+            );
+        }
 
         await recordAuditLog(
             this._objectFactory!,
@@ -186,8 +231,8 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
             {
                 action: AuditAction.KEY_VAULT_ENROLL,
                 targetType: "KeyVault",
-                targetUid: keyVault.uid,
-                mailboxUid: mailbox.uid,
+                targetUid: keyVaultUid,
+                mailboxUid: found.uid,
                 details: { useType: "sign", fingerprint, automated: true },
             },
         );
@@ -198,18 +243,43 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
      * Flags (audit-log entry only - detection, never a fresh CSR this server can't originate) any
      * mailbox whose newest non-revoked signing key is within `expiryWarningDays` of `notAfter` with
      * nothing newer already enrolled to supersede it.
+     *
+     * Pages through every mailbox (not just the first 100), and records the entry **once per certificate**:
+     * the flagged fingerprint is persisted on the mailbox's `KeyVault.expiryAuditedFingerprint`, and a run
+     * that finds that fingerprint already recorded skips it. A newly enrolled certificate has a new
+     * fingerprint, so it is flagged again once it nears its own expiry. A mailbox with a signing key but no
+     * `KeyVault` row (not produced by any enrollment path - both write the vault) has nowhere to persist the
+     * marker; it is logged and skipped rather than audited on every run.
      */
     private async flagExpiringSigningCerts(): Promise<void> {
         const threshold: number = Date.now() + this.expiryWarningDays * MS_PER_DAY;
-        const mailboxes: MB[] = await this.mailboxRepo!.find({} as any, { ignoreACL: true });
 
-        for (const mailbox of mailboxes) {
+        await this.forEachPage<MB>(this.mailboxRepo!, {}, async (mailbox) => {
             const signingKeys: PublicKey[] = (mailbox.keys ?? []).filter((k) => k.useType === "sign" && !k.revokedAt);
             if (signingKeys.length === 0) {
-                continue;
+                return;
             }
             const newest: PublicKey = signingKeys.reduce((a, b) => (b.notAfter > a.notAfter ? b : a));
-            if (newest.notAfter <= threshold) {
+            if (newest.notAfter > threshold) {
+                return;
+            }
+            try {
+                const [found] = await this.keyVaultRepo!.find({ mailboxUid: mailbox.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+                const keyVault: K | undefined = found ? ((await this.keyVaultRepo!.findOne(found.uid, { ignoreACL: true })) ?? found) : undefined;
+                if (!keyVault) {
+                    this.logger?.warn(`AcmeEnrollmentDriverJob: mailbox '${mailbox.uid}' has an expiring signing key but no KeyVault - skipping expiry audit.`);
+                    return;
+                }
+                if (keyVault.expiryAuditedFingerprint === newest.fingerprint) {
+                    return;
+                }
+                // Marker first: a failed audit write is only logged (`recordAuditLog()` never throws), which is
+                // preferable to the reverse order, where a failing marker write would re-audit on every run.
+                await this.keyVaultRepo!.update(
+                    { uid: keyVault.uid, version: (keyVault as any).version, expiryAuditedFingerprint: newest.fingerprint } as any,
+                    keyVault,
+                    { ignoreACL: true },
+                );
                 await recordAuditLog(
                     this._objectFactory!,
                     this.auditLogClass,
@@ -222,7 +292,9 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
                         details: { fingerprint: newest.fingerprint, notAfter: newest.notAfter },
                     },
                 );
+            } catch (err: any) {
+                this.logger?.error(`AcmeEnrollmentDriverJob: failed to flag expiring signing certificate for mailbox '${mailbox.uid}': ${err.message}`);
             }
-        }
+        });
     }
 }

@@ -24,6 +24,7 @@ const { Column, Entity, Index } = PersistenceDecorators;
 )
 @Index("calsharelink_token", ["token"], { unique: true })
 @Index("calsharelink_folder", ["folderUid"])
+@Index("calsharelink_expires_at", ["expiresAt"])
 @Protect(
     {
         uid: "CalendarShareLink",

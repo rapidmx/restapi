@@ -29,6 +29,8 @@ const { Column, Entity, Index } = PersistenceDecorators;
         "because organizational policy quarantines spam above a configured threshold rather than delivering to Junk.",
 )
 @Index("quarantine_mailbox", ["mailboxUid"])
+@Index("quarantine_date_created", ["dateCreated"])
+@Index("quarantine_raw_blob_key", ["rawBlobKey"])
 @Protect(
     {
         uid: "QuarantineEntry",

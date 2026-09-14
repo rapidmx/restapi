@@ -20,6 +20,7 @@ const { Nullable } = ObjectDecorators;
 @Entity()
 @Description("A holder-invoked eDiscovery export spanning a Matter's full custodian set.")
 @Index("matter_export_request_matter", ["matterId"])
+@Index("matter_export_request_status", ["status"])
 @Protect(
     {
         uid: "MatterExportRequest",

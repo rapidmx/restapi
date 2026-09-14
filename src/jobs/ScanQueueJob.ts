@@ -6,6 +6,7 @@ import * as crypto from "crypto";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, ScanPipelineResult } from "../scan/ScanPipeline.js";
@@ -19,11 +20,13 @@ import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { buildEventIcs, expandOccurrences, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
-import { extractHeader, extractHeaders } from "../util/MimeHeaderUtils.js";
+import { extractHeader, extractHeaders, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification, parseDispositionNotification } from "../util/ReceiptUtils.js";
 import { parseRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
+import { nameBasedUuid } from "../util/UuidUtils.js";
+import { sendOrThrow } from "../transport/TransportResultUtils.js";
 import {
     Attachment,
     Attendee,
@@ -87,12 +90,19 @@ interface AcmeChallengeCorrelator {
 const ACME_CHALLENGE_SUBJECT = /^(?:Re: )?ACME: (.+)$/;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+/** Header each mail-filter-rule forward adds (value: the forwarding mailbox's address) - see `forwardByRule()`. */
+const FORWARD_LOOP_HEADER = "X-RapidMX-Loop";
+/** How many rule forwards a single message may pass through before it's treated as looping. */
+const MAX_FORWARD_HOPS = 5;
+/** How many times `bumpFolderCounters()` tries its version-checked update before giving up. */
+const FOLDER_COUNTER_ATTEMPTS = 5;
 /** How far past a booking request's own start `decideResourceBooking()` looks for conflicts against an
  * indefinitely-recurring existing booking - a bound on worst-case cost, not a real policy limit. */
 const RESOURCE_BOOKING_HORIZON_MS = 731 * MS_PER_DAY;
-/** Cap on how many of a resource's own existing `CalendarEvent` rows `decideResourceBooking()` compares
- * against - a busy resource calendar is expected to be reasonably bounded; this is a safety net. */
-const RESOURCE_BOOKING_EXISTING_ROWS_LIMIT = 200;
+/** Page size `decideResourceBooking()` reads a resource's existing `CalendarEvent` rows in. */
+const RESOURCE_BOOKING_EXISTING_ROWS_LIMIT = 500;
+/** How many pages of existing bookings `decideResourceBooking()` reads before declining as unverifiable. */
+const RESOURCE_BOOKING_MAX_PAGES = 20;
 
 /** An attachment already persisted to the `BlobStore`, ready to be attached to one or more `Message` rows. */
 interface StoredAttachment {
@@ -207,6 +217,19 @@ export abstract class ScanQueueJob<
     @Config("mail:jobs:scan_queue:batch_size", 25)
     private batchSize: number = 25;
 
+    /** How many times an entry is attempted before it stays `FAILED` for good. */
+    @Config("mail:jobs:scan_queue:max_attempts", 5)
+    private maxAttempts: number = 5;
+
+    /** The delay before the first retry of a failed entry; each later retry waits twice as long as the last. */
+    @Config("mail:jobs:scan_queue:retry_backoff_seconds", 60)
+    private retryBackoffSeconds: number = 60;
+
+    /** How long a worker's claim on an entry lasts. A `SCANNING` entry past its lease is assumed abandoned (its
+     * worker died) and is claimed again - keep this well above the slowest realistic scan. */
+    @Config("mail:jobs:scan_queue:lease_seconds", 600)
+    private leaseSeconds: number = 600;
+
     @Config("mail:oof:resuppress_after_hours", 24)
     private resuppressAfterHours: number = 24;
 
@@ -302,44 +325,133 @@ export abstract class ScanQueueJob<
         // Do nothing
     }
 
+    /**
+     * Processes up to `batchSize` entries that are due: new (`PENDING`) entries, `FAILED` entries whose retry time
+     * has come, and `SCANNING` entries whose worker's lease has expired (the worker died mid-scan). Each is
+     * claimed with a version-checked update first - a replica that loses that race just skips the entry.
+     *
+     * A processing failure schedules a retry with exponential backoff (`retry_backoff_seconds` × 2^(attempts-1))
+     * until `max_attempts`, after which the entry stays `FAILED` with its last error for an operator. Delivery is
+     * idempotent across retries and takeovers (see `processEntry()`), so a retry never files a second copy.
+     */
     public async run(): Promise<void> {
-        // `limit` must be passed both via `options` (used by the Mongo backend) *and* baked into the query
-        // object itself (all `ModelUtils.buildSearchQuerySQL` reads - it ignores `options.limit` entirely and
-        // falls back to its own default of 100 otherwise). Confirmed by real-database testing: on the SQL
-        // backend, `options.limit` alone silently caps at 100 regardless of the configured batch size.
-        const pending: Q[] = await this.ingestQueueRepo!.find(
-            { status: IngestStatus.PENDING, limit: this.batchSize } as any,
-            { ignoreACL: true, limit: this.batchSize },
-        );
+        const now: Date = new Date();
+        const candidates: Q[] = await this.findDueEntries(now);
 
-        for (const entry of pending) {
+        for (const entry of candidates) {
+            let scanning: Q;
             try {
-                await this.processEntry(entry);
+                scanning = await this.claimEntry(entry, now);
+            } catch (err: any) {
+                // Another replica claimed (or finished) it first - not an error, and nothing to record.
+                this.logger?.debug(`ScanQueueJob: skipped ingest entry ${entry.uid}, claimed elsewhere: ${err.message}`);
+                continue;
+            }
+            try {
+                await this.processEntry(scanning);
             } catch (err: any) {
                 this.logger?.error(`ScanQueueJob: failed to process ingest entry ${entry.uid}: ${err.message}`);
-                // `entry` may be stale: `processEntry()` may have already bumped this row to SCANNING (and thus
-                // its persisted version) before failing partway through. Updating against that stale version
-                // would optimistically-lock-mismatch and silently affect zero rows on some backends, leaving
-                // the entry stuck at SCANNING forever instead of FAILED - re-fetch the current row first.
-                const current: Q = (await this.ingestQueueRepo!.findOne(entry.uid, { ignoreACL: true })) ?? entry;
-                await this.ingestQueueRepo!.update(
-                    { uid: entry.uid, version: (current as any).version, status: IngestStatus.FAILED, errorMessage: err.message } as any,
-                    current,
-                    { ignoreACL: true },
-                );
+                await this.recordFailure(entry, err);
             }
         }
     }
 
-    private async processEntry(entry: Q): Promise<void> {
+    /** The due entries, oldest first - see `run()`. `limit` must be passed both via `options` (the Mongo backend)
+     * *and* in the query object itself (all `ModelUtils.buildSearchQuerySQL` reads). */
+    private async findDueEntries(now: Date): Promise<Q[]> {
+        const leaseMs: number = this.leaseSeconds * 1000;
+        const queries: Record<string, any>[] = [
+            { status: IngestStatus.PENDING },
+            { status: IngestStatus.FAILED, nextAttemptAt: `lte(${now.toISOString()})` },
+            { status: IngestStatus.SCANNING, scanLeaseExpiresAt: `lt(${now.toISOString()})` },
+            // Claimed before leases existed (or by a worker that crashed before writing one).
+            {
+                status: IngestStatus.SCANNING,
+                scanLeaseExpiresAt: "exists(false)",
+                dateModified: `lt(${new Date(now.getTime() - leaseMs).toISOString()})`,
+            },
+        ];
+        const seen: Set<string> = new Set();
+        const due: Q[] = [];
+        for (const query of queries) {
+            const rows: Q[] = await this.ingestQueueRepo!.find(
+                { ...query, sort: { dateCreated: "ASC", uid: "ASC" }, limit: this.batchSize } as any,
+                { ignoreACL: true, limit: this.batchSize, skipCache: true },
+            );
+            for (const row of rows) {
+                if (!seen.has(row.uid)) {
+                    seen.add(row.uid);
+                    due.push(row);
+                }
+            }
+        }
+        due.sort((a, b) => new Date(a.dateCreated).getTime() - new Date(b.dateCreated).getTime());
+        return due.slice(0, this.batchSize);
+    }
+
+    /** Claims `entry` for this worker (version-checked, so it throws when another worker got there first) and
+     * returns the claimed row. */
+    private async claimEntry(entry: Q, now: Date): Promise<Q> {
         await this.ingestQueueRepo!.update(
-            { uid: entry.uid, version: (entry as any).version, status: IngestStatus.SCANNING } as any,
-            entry,
+            {
+                uid: entry.uid,
+                version: (entry as any).version,
+                status: IngestStatus.SCANNING,
+                scanLeaseExpiresAt: new Date(now.getTime() + this.leaseSeconds * 1000),
+            } as any,
+            asEntity(this.ingestQueueRepo!, entry),
             { ignoreACL: true },
         );
         // `entry` is now stale (its `version` no longer matches the persisted row) — re-fetch before the next
         // optimistic-locked update rather than reusing the pre-update snapshot.
-        const scanning: Q = (await this.ingestQueueRepo!.findOne(entry.uid, { ignoreACL: true }))!;
+        return (await this.ingestQueueRepo!.findOne(entry.uid, { ignoreACL: true }))!;
+    }
+
+    /** Records a processing failure: schedules the next retry, or leaves the entry `FAILED` for good once
+     * `max_attempts` is reached. Re-fetches first, since processing may have bumped the row's version; an entry
+     * another worker has since delivered is left alone. */
+    private async recordFailure(entry: Q, err: any): Promise<void> {
+        try {
+            const current: Q = (await this.ingestQueueRepo!.findOne(entry.uid, { ignoreACL: true })) ?? entry;
+            if (current.status === IngestStatus.DELIVERED) {
+                return;
+            }
+            const attempts: number = (current.attempts ?? 0) + 1;
+            const exhausted: boolean = attempts >= this.maxAttempts;
+            const nextAttemptAt: Date | null = exhausted
+                ? null
+                : new Date(Date.now() + this.retryBackoffSeconds * 1000 * Math.pow(2, attempts - 1));
+            await this.ingestQueueRepo!.update(
+                {
+                    uid: entry.uid,
+                    version: (current as any).version,
+                    status: IngestStatus.FAILED,
+                    errorMessage: String(err?.message ?? err).slice(0, 4000),
+                    attempts,
+                    nextAttemptAt,
+                    scanLeaseExpiresAt: null,
+                } as any,
+                asEntity(this.ingestQueueRepo!, current),
+                { ignoreACL: true },
+            );
+            if (exhausted) {
+                this.logger?.error(`ScanQueueJob: giving up on ingest entry ${entry.uid} after ${attempts} attempts.`);
+            }
+        } catch (updateErr: any) {
+            this.logger?.warn(`ScanQueueJob: failed to record the failure of ingest entry ${entry.uid}: ${updateErr.message}`);
+        }
+    }
+
+    /**
+     * Scans and files one claimed entry. Every row it creates has a uid derived from the entry's own uid
+     * (`nameBasedUuid()`), and each is looked up before being created, so re-processing an entry - a retry after a
+     * failure part-way through, or a takeover of an expired lease while the first worker was still running - never
+     * files a second copy, quarantines twice or records a second `ScanResult`. Side effects that follow delivery
+     * (automatic replies, iTIP) only run when this attempt actually filed the message, so a retry doesn't repeat
+     * them either.
+     */
+    private async processEntry(scanning: Q): Promise<void> {
+        const entry: Q = scanning;
 
         const raw: Buffer = await this.blobStore!.get(entry.rawBlobKey);
         const result: ScanPipelineResult = await this.scanPipeline!.run(raw, {
@@ -355,65 +467,81 @@ export abstract class ScanQueueJob<
         // needs to reference it - pre-generating the target's uid here (rather than letting `create()` mint
         // one) breaks that chicken-and-egg ordering: the target entity is then created *with* this exact uid
         // (BaseEntity's constructor honors an explicitly supplied `uid`), so both records can reference each
-        // other correctly regardless of which is actually persisted first.
-        const targetUid: string = crypto.randomUUID();
-        const scanResult: SR = await this.scanResultRepo!.create(
-            new this.scanResultClass({
-                targetType: ScanTargetType.MESSAGE,
-                targetUid,
-                spamScore: result.spam.score,
-                spamVerdict: result.spam.verdict,
-                spamSymbols: result.spam.symbols,
-                avVerdict: result.av.verdict,
-                avSignatureName: result.av.signatureName,
-                scannedAt: new Date(),
-                providerVersions: {},
-            }),
-            { ignoreACL: true },
-        );
-
-        if (verdict === "quarantine") {
-            await this.quarantineEntryRepo!.create(
-                new this.quarantineEntryClass({
-                    uid: targetUid,
-                    mailboxUid: entry.mailboxUid,
-                    reason:
-                        result.av.verdict === AvVerdict.INFECTED
-                            ? QuarantineReason.INFECTED
-                            : (entry.quarantineReason ?? QuarantineReason.OTHER),
-                    scanResultUid: scanResult.uid,
-                    rawBlobKey: entry.rawBlobKey,
+        // other correctly regardless of which is actually persisted first. Both uids are derived from the entry's
+        // uid, so a re-processed entry finds (and reuses) what an earlier attempt already created.
+        const targetUid: string = nameBasedUuid(`ingest:${entry.uid}:target`);
+        const scanResultUid: string = nameBasedUuid(`ingest:${entry.uid}:scan`);
+        const scanResult: SR =
+            (await this.scanResultRepo!.findOne(scanResultUid, { ignoreACL: true })) ??
+            (await this.scanResultRepo!.create(
+                new this.scanResultClass({
+                    uid: scanResultUid,
+                    targetType: ScanTargetType.MESSAGE,
+                    targetUid,
+                    spamScore: result.spam.score,
+                    spamVerdict: result.spam.verdict,
+                    spamSymbols: result.spam.symbols,
+                    avVerdict: result.av.verdict,
+                    avSignatureName: result.av.signatureName,
+                    scannedAt: new Date(),
+                    providerVersions: {},
                 }),
                 { ignoreACL: true },
-            );
-        } else if (verdict === "deliver" && result.recallOfMessageId) {
+            ));
+
+        // The recall header is only ever honored from the original message's own, DKIM-verified sender - see
+        // `isVerifiedSender()` and `processRecall()`. From anyone else it's ordinary mail.
+        const recallOfMessageId: string | undefined =
+            result.recallOfMessageId && this.verifiedFromAddress(raw, result) ? result.recallOfMessageId : undefined;
+
+        if (verdict === "quarantine") {
+            if (!(await this.quarantineEntryRepo!.findOne(targetUid, { ignoreACL: true }))) {
+                await this.quarantineEntryRepo!.create(
+                    new this.quarantineEntryClass({
+                        uid: targetUid,
+                        mailboxUid: entry.mailboxUid,
+                        reason:
+                            result.av.verdict === AvVerdict.INFECTED
+                                ? QuarantineReason.INFECTED
+                                : (entry.quarantineReason ?? QuarantineReason.OTHER),
+                        scanResultUid: scanResult.uid,
+                        rawBlobKey: entry.rawBlobKey,
+                    }),
+                    { ignoreACL: true },
+                );
+            }
+        } else if (verdict === "deliver" && recallOfMessageId) {
             // A recall control message is never filed to the Inbox - matching real Outlook hiding these from
             // the reading pane - only the mutation it triggers (if any) and the report back to the sender.
-            await this.processRecall(entry, result.recallOfMessageId);
+            await this.processRecall(entry, raw, result, recallOfMessageId);
         } else if (verdict === "deliver" && result.dispositionNotificationPart) {
             // An inbound MDN receipt is never filed either - only the indicator it stamps onto the original
             // sent message, if any is found - see processReceipt()'s own doc comment.
             await this.processReceipt(entry, raw, result.dispositionNotificationPart);
-        } else if (verdict === "deliver" && (await this.tryCorrelateAcmeChallenge(entry, result))) {
+        } else if (verdict === "deliver" && (await this.tryCorrelateAcmeChallenge(entry, raw, result))) {
             // A real RFC 8823 challenge email is CA-internal plumbing, never filed either - same treatment
             // recall control messages and inbound MDNs already get. Unlike those two, correlation here can
             // genuinely fail (a spoofed or stale lookalike, or no outstanding enrollment at all) - in that
             // case `tryCorrelateAcmeChallenge()` itself returns `false` and this branch is never taken, so
             // the message falls through to ordinary delivery below rather than being silently dropped.
         } else {
-            await this.deliverMessage(entry, raw, targetUid, scanResult, result, verdict === "junk");
+            const filed: boolean = await this.deliverMessage(entry, raw, targetUid, scanResult, result, verdict === "junk");
 
             // Mail filter rules, automatic replies, and iTIP processing only apply to mail actually delivered
-            // to the Inbox - matching Exchange's own behavior, junk-routed mail never runs any of them.
+            // to the Inbox - matching Exchange's own behavior, junk-routed mail never runs any of them. An
+            // automatic reply is only sent by the attempt that filed the message (a retry doesn't reply twice);
+            // iTIP processing is idempotent (sequence/state checks), so a retry re-applies it safely.
             if (verdict === "deliver") {
-                await this.maybeSendAutoReply(entry, raw, result);
-                await this.maybeProcessItipMessage(entry, result);
+                if (filed) {
+                    await this.maybeSendAutoReply(entry, raw, result);
+                }
+                await this.maybeProcessItipMessage(entry, raw, result);
             }
         }
 
         await this.ingestQueueRepo!.update(
-            { uid: scanning.uid, version: (scanning as any).version, status: IngestStatus.DELIVERED } as any,
-            scanning,
+            { uid: scanning.uid, version: (scanning as any).version, status: IngestStatus.DELIVERED, scanLeaseExpiresAt: null } as any,
+            asEntity(this.ingestQueueRepo!, scanning),
             { ignoreACL: true },
         );
     }
@@ -433,15 +561,19 @@ export abstract class ScanQueueJob<
         scanResult: SR,
         result: ScanPipelineResult,
         isJunk: boolean,
-    ): Promise<void> {
+    ): Promise<boolean> {
         // Independent of everything below (filtering, filing, junk classification) - `specs/
         // end-to-end_encryption.md`'s "Only inbound messages are processed, keyed on the From address" rule
         // applies to every delivered message regardless of which folder (or none) it ends up filed into.
         await this.processInboundRapidMxKeyHeader(entry, raw, result);
 
+        // An earlier attempt at this same entry already filed the primary message (see `processEntry()`): this
+        // attempt completes whatever that one didn't (attachments, rule copies) but sends nothing again.
+        const alreadyFiled: boolean = !!(await this.messageRepo!.findOne(targetUid, { ignoreACL: true }));
+
         let sanitizedHtmlBlobKey: string | undefined;
         if (result.sanitizedHtml !== undefined) {
-            sanitizedHtmlBlobKey = `sanitized/${crypto.randomUUID()}`;
+            sanitizedHtmlBlobKey = `sanitized/${targetUid}`;
             await this.blobStore!.put(sanitizedHtmlBlobKey, Buffer.from(result.sanitizedHtml, "utf-8"), {
                 contentType: "text/html",
             });
@@ -472,13 +604,19 @@ export abstract class ScanQueueJob<
 
         if (filterResult.deleted && filterResult.copyToFolderUids.length === 0) {
             // The message is discarded outright and no rule asked for a copy anywhere - nothing further to file.
-            return;
+            return true;
         }
 
-        const storedAttachments: StoredAttachment[] = await this.storeAttachmentBlobs(result.attachments);
+        const storedAttachments: StoredAttachment[] = await this.storeAttachmentBlobs(result.attachments, targetUid);
         const flags: MessageFlags = { read: filterResult.markRead, flagged: false, answered: false, forwarded: false };
 
-        if (!filterResult.deleted) {
+        if (!filterResult.deleted && alreadyFiled) {
+            const existing: M = (await this.messageRepo!.findOne(targetUid, { ignoreACL: true }))!;
+            const existingFolder: F | undefined = await this.folderRepo!.findOne(existing.folderUid, { ignoreACL: true });
+            if (existingFolder) {
+                await this.attachRows(storedAttachments, existing, existingFolder, entry.mailboxUid);
+            }
+        } else if (!filterResult.deleted) {
             const defaultFolderType = isJunk ? FolderType.JUNK : FolderType.INBOX;
             const folder: F = await this.resolveTargetFolder(entry.mailboxUid, filterResult.moveToFolderUid, defaultFolderType);
 
@@ -568,7 +706,15 @@ export abstract class ScanQueueJob<
 
         for (const copyFolderUid of filterResult.copyToFolderUids) {
             const copyFolder: F | undefined = await this.folderRepo!.findOne(copyFolderUid, { ignoreACL: true });
-            if (!copyFolder) {
+            // A rule may only file into its own mailbox's folders - a rule naming another mailbox's folder (the
+            // route checks this when the rule is saved, but the folder or rule may have changed since) is ignored.
+            if (!copyFolder || copyFolder.deleted || copyFolder.mailboxUid !== entry.mailboxUid) {
+                continue;
+            }
+            const copyUid: string = nameBasedUuid(`${targetUid}:copy:${copyFolder.uid}`);
+            const existingCopy: M | undefined = await this.messageRepo!.findOne(copyUid, { ignoreACL: true });
+            if (existingCopy) {
+                await this.attachRows(storedAttachments, existingCopy, copyFolder, entry.mailboxUid);
                 continue;
             }
             const copyMessageId = result.messageIdHeader ?? crypto.randomUUID();
@@ -589,6 +735,7 @@ export abstract class ScanQueueJob<
             );
             const copyMessage: M = await this.messageRepo!.create(
                 new this.messageClass({
+                    uid: copyUid,
                     folderUid: copyFolder.uid,
                     mailboxUid: entry.mailboxUid,
                     messageId: copyMessageId,
@@ -618,13 +765,47 @@ export abstract class ScanQueueJob<
             await this.bumpFolderCounters(copyFolder, filterResult.markRead ? 0 : 1);
         }
 
-        for (const forwardTo of filterResult.forwardTo) {
+        if (!alreadyFiled && filterResult.forwardTo.length > 0) {
+            await this.forwardByRule(entry, raw, result, filterResult.forwardTo);
+        }
+        return !alreadyFiled;
+    }
+
+    /**
+     * Relays `raw` to each of a mail filter rule's forward addresses. The message already passed the scan
+     * pipeline this same run, so it's relayed as-is (no re-scan), with three guards a rule-driven forward needs:
+     *
+     * - **No automatic mail** (`Auto-Submitted` other than `no`, RFC 3834) - an auto-reply or bounce is never
+     * forwarded, which is what stops two mailboxes forwarding to each other from bouncing mail back and forth.
+     * - **Loop detection** - each forward adds an `X-RapidMX-Loop: <mailbox address>` header; a message already
+     * carrying this mailbox's own marker, or `MAX_FORWARD_HOPS` markers in total, isn't forwarded again.
+     * - **Envelope sender rewrite** - the forward is sent from this mailbox's own address (the original sender
+     * stays in the headers), so SPF/DMARC evaluate against a domain this server may send for and bounces come
+     * back here instead of to a third party (a minimal form of SRS).
+     *
+     * A transport rejection is logged per address, like a thrown error.
+     */
+    private async forwardByRule(entry: Q, raw: Buffer, result: ScanPipelineResult, forwardTo: string[]): Promise<void> {
+        if (result.autoSubmittedHeader && result.autoSubmittedHeader.trim().toLowerCase() !== "no") {
+            this.logger?.info(`ScanQueueJob: not forwarding automatically submitted mail for mailbox ${entry.mailboxUid}.`);
+            return;
+        }
+        const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            return;
+        }
+        const ownAddress: string = normalizeAddress(mailbox.primarySmtpAddress);
+        const loopMarkers: string[] = extractHeaders(raw, FORWARD_LOOP_HEADER).map((value) => normalizeAddress(value));
+        if (loopMarkers.includes(ownAddress) || loopMarkers.length >= MAX_FORWARD_HOPS) {
+            this.logger?.warn(`ScanQueueJob: not forwarding message for mailbox ${entry.mailboxUid} - forwarding loop detected.`);
+            return;
+        }
+        const forwardRaw: Buffer = prependHeaders(raw, [{ name: FORWARD_LOOP_HEADER, value: mailbox.primarySmtpAddress }]);
+        for (const address of forwardTo) {
             try {
-                // The message already passed the scan pipeline this same run, so it's relayed as-is (no
-                // re-scan) - a straight envelope-only forward.
-                await this.mailTransport!.send({ raw, envelopeFrom: entry.envelopeFrom, envelopeTo: [forwardTo] });
+                await sendOrThrow(this.mailTransport, { raw: forwardRaw, envelopeFrom: mailbox.primarySmtpAddress, envelopeTo: [address] });
             } catch (err: any) {
-                this.logger?.warn(`ScanQueueJob: failed to forward message to ${forwardTo}: ${err.message}`);
+                this.logger?.warn(`ScanQueueJob: failed to forward message to ${address}: ${err.message}`);
             }
         }
     }
@@ -636,7 +817,8 @@ export abstract class ScanQueueJob<
     ): Promise<F> {
         if (moveToFolderUid) {
             const moved: F | undefined = await this.folderRepo!.findOne(moveToFolderUid, { ignoreACL: true });
-            if (moved) {
+            // Only a folder of this same mailbox - see the identical check on rule copies in `deliverMessage()`.
+            if (moved && !moved.deleted && moved.mailboxUid === mailboxUid) {
                 return moved;
             }
             // The rule's target folder no longer exists (e.g. deleted after the rule was created) - fall back
@@ -744,7 +926,7 @@ export abstract class ScanQueueJob<
         if (existingContact) {
             await this.contactRepo!.update(
                 { uid: existingContact.uid, version: (existingContact as any).version, ...update, lastMessageSeen: now } as any,
-                existingContact,
+                asEntity(this.ingestQueueRepo!, existingContact),
                 { ignoreACL: true },
             );
             return;
@@ -878,10 +1060,12 @@ export abstract class ScanQueueJob<
         return contacts.length > 0;
     }
 
-    private async storeAttachmentBlobs(attachments: ScanPipelineAttachmentResult[]): Promise<StoredAttachment[]> {
+    /** Stores each attachment under a key derived from the target message's uid and its position, so a
+     * re-processed entry overwrites the same blobs instead of leaving orphaned copies behind. */
+    private async storeAttachmentBlobs(attachments: ScanPipelineAttachmentResult[], targetUid: string): Promise<StoredAttachment[]> {
         const stored: StoredAttachment[] = [];
-        for (const attachment of attachments) {
-            const blobKey = `attachments/${crypto.randomUUID()}`;
+        for (const [index, attachment] of attachments.entries()) {
+            const blobKey = `attachments/${targetUid}-${index}`;
             await this.blobStore!.put(blobKey, attachment.content, { contentType: attachment.contentType });
             stored.push({
                 filename: attachment.filename ?? "attachment",
@@ -895,10 +1079,17 @@ export abstract class ScanQueueJob<
         return stored;
     }
 
+    /** Creates the `Attachment` rows for `message`, each under a uid derived from the message's uid and the
+     * attachment's position; rows an earlier attempt already created are left as they are. */
     private async attachRows(stored: StoredAttachment[], message: M, folder: F, mailboxUid: string): Promise<void> {
-        for (const attachment of stored) {
+        for (const [index, attachment] of stored.entries()) {
+            const uid: string = nameBasedUuid(`${message.uid}:attachment:${index}`);
+            if (await this.attachmentRepo!.findOne(uid, { ignoreACL: true })) {
+                continue;
+            }
             await this.attachmentRepo!.create(
                 new this.attachmentClass({
+                    uid,
                     messageUid: message.uid,
                     folderUid: folder.uid,
                     mailboxUid,
@@ -914,18 +1105,32 @@ export abstract class ScanQueueJob<
         }
     }
 
+    /** Increments `folder`'s counters with a version-checked update, re-reading and retrying when another delivery
+     * into the same folder updated it first (so concurrent deliveries don't lose increments or fail each other). */
     private async bumpFolderCounters(folder: F, unreadIncrement: number): Promise<void> {
-        await this.folderRepo!.update(
-            {
-                uid: folder.uid,
-                version: (folder as any).version,
-                unreadCount: folder.unreadCount + unreadIncrement,
-                totalCount: folder.totalCount + 1,
-                syncKeyVersion: folder.syncKeyVersion + 1,
-            } as any,
-            folder,
-            { ignoreACL: true },
-        );
+        let current: F = folder;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                await this.folderRepo!.update(
+                    {
+                        uid: current.uid,
+                        version: (current as any).version,
+                        unreadCount: current.unreadCount + unreadIncrement,
+                        totalCount: current.totalCount + 1,
+                        syncKeyVersion: current.syncKeyVersion + 1,
+                    } as any,
+                    asEntity(this.folderRepo!, current),
+                    { ignoreACL: true },
+                );
+                return;
+            } catch (err: any) {
+                const refetched: F | undefined = attempt < FOLDER_COUNTER_ATTEMPTS ? await this.folderRepo!.findOne(folder.uid, { ignoreACL: true }) : undefined;
+                if (!refetched || (refetched as any).version === (current as any).version) {
+                    throw err;
+                }
+                current = refetched;
+            }
+        }
     }
 
     /**
@@ -991,7 +1196,8 @@ export abstract class ScanQueueJob<
                 .compile()
                 .build();
 
-            await this.mailTransport!.send({
+            // Throws when the transport accepted nothing, so a reply that was never sent isn't recorded as sent.
+            await sendOrThrow(this.mailTransport, {
                 raw: composed,
                 envelopeFrom: mailbox.primarySmtpAddress,
                 envelopeTo: [entry.envelopeFrom],
@@ -1000,7 +1206,7 @@ export abstract class ScanQueueJob<
             if (suppression) {
                 await this.oofReplySuppressionRepo!.update(
                     { uid: suppression.uid, version: (suppression as any).version, lastRepliedAt: now } as any,
-                    suppression,
+                    asEntity(this.oofReplySuppressionRepo!, suppression),
                     { ignoreACL: true },
                 );
             } else {
@@ -1015,18 +1221,40 @@ export abstract class ScanQueueJob<
     }
 
     /**
+     * The message's `From` address when it's authenticated - a passing DKIM result aligned with the `From`
+     * domain, stamped by this deployment's trusted MTA hop (`hasAlignedPassingDkim()`) - otherwise `undefined`.
+     * Mail this server's own mailboxes send (recall notices, iTIP invitations and replies) is DKIM-signed on the
+     * way out and arrives back through the same MTA, so it passes this check exactly like external mail does.
+     */
+    private verifiedFromAddress(raw: Buffer, result: ScanPipelineResult): string | undefined {
+        const fromAddress: string | undefined = result.fromAddress ? normalizeAddress(result.fromAddress) : undefined;
+        const domain: string | undefined = fromAddress?.split("@")[1];
+        if (!fromAddress || !domain) {
+            return undefined;
+        }
+        return hasAlignedPassingDkim(extractHeaders(raw, "Authentication-Results"), domain, this.trustedAuthservId) ? fromAddress : undefined;
+    }
+
+    /**
      * Applies a `BaseMessageRoute.recall()` control message's effect in this mailbox (`entry.mailboxUid`):
      * finds the target `Message` by `messageId` - matching regardless of which folder it's since been moved
      * to, mirroring how `findCalendarEventRow()` matches an iTIP message by `icalUid` rather than a foreign
      * key - and deletes it only if still unread, matching real Exchange/Outlook's "Recall This Message"
      * behavior exactly. Either way, reports the outcome back to the original sender - see
      * `sendRecallReport()`.
+     *
+     * Only reached for a recall whose `From` is DKIM-verified (`processEntry()`), and only a message that same
+     * address sent can be recalled: a message from anyone else with that `Message-ID` is treated as not found, so a
+     * recall can neither delete another sender's mail nor learn whether it was read.
      */
-    private async processRecall(entry: Q, recallOfMessageId: string): Promise<void> {
-        const matches: M[] = await this.messageRepo!.find(
-            { mailboxUid: entry.mailboxUid, messageId: recallOfMessageId, limit: 5 } as any,
-            { ignoreACL: true, limit: 5 },
-        );
+    private async processRecall(entry: Q, raw: Buffer, result: ScanPipelineResult, recallOfMessageId: string): Promise<void> {
+        const sender: string = this.verifiedFromAddress(raw, result)!;
+        const matches: M[] = (
+            await this.messageRepo!.find(
+                { mailboxUid: entry.mailboxUid, messageId: recallOfMessageId, limit: 5 } as any,
+                { ignoreACL: true, limit: 5 },
+            )
+        ).filter((message) => normalizeAddress(message.from?.address ?? "") === sender);
         const target: M | undefined = matches.find((message) => !message.flags.read);
 
         let outcome: "succeeded" | "already_read" | "not_found";
@@ -1037,16 +1265,16 @@ export abstract class ScanQueueJob<
             outcome = matches.length > 0 ? "already_read" : "not_found";
         }
 
-        await this.sendRecallReport(entry, outcome);
+        await this.sendRecallReport(entry, sender, outcome);
     }
 
     /**
-     * Sends a plain, visible report email back to `entry.envelopeFrom` (the mailbox that requested the
+     * Sends a plain, visible report email back to `sender` (the verified address that requested the
      * recall) describing what happened in *this* mailbox - mirrors real Outlook's own recall-report
      * behavior (a normal email in the sender's Inbox, not a synced status flag). Best-effort, same as every
      * other cross-mailbox notification in this codebase.
      */
-    private async sendRecallReport(entry: Q, outcome: "succeeded" | "already_read" | "not_found"): Promise<void> {
+    private async sendRecallReport(entry: Q, sender: string, outcome: "succeeded" | "already_read" | "not_found"): Promise<void> {
         const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
             return;
@@ -1065,13 +1293,13 @@ export abstract class ScanQueueJob<
         try {
             const composed: Buffer = await new MailComposer({
                 from: { name: mailbox.displayName, address: mailbox.primarySmtpAddress },
-                to: entry.envelopeFrom,
+                to: sender,
                 subject: "Recall report",
                 text,
             })
                 .compile()
                 .build();
-            await this.mailTransport!.send({ raw: composed, envelopeFrom: mailbox.primarySmtpAddress, envelopeTo: [entry.envelopeFrom] });
+            await sendOrThrow(this.mailTransport, { raw: composed, envelopeFrom: mailbox.primarySmtpAddress, envelopeTo: [sender] });
         } catch (err: any) {
             this.logger?.warn(`ScanQueueJob: failed to send recall report for mailbox ${entry.mailboxUid}: ${err.message}`);
         }
@@ -1088,12 +1316,17 @@ export abstract class ScanQueueJob<
      * enrollment service or performing its lookup - the overwhelming majority of inbound mail never
      * has this header at all.
      */
-    private async tryCorrelateAcmeChallenge(entry: Q, result: ScanPipelineResult): Promise<boolean> {
+    private async tryCorrelateAcmeChallenge(entry: Q, raw: Buffer, result: ScanPipelineResult): Promise<boolean> {
         if (result.autoSubmittedHeader !== "auto-generated; type=acme") {
             return false;
         }
         const subjectMatch: RegExpMatchArray | null = result.subject ? ACME_CHALLENGE_SUBJECT.exec(result.subject) : null;
         if (!subjectMatch || !result.fromAddress || !result.messageIdHeader) {
+            return false;
+        }
+        // The challenge must really come from the CA: a `From` with aligned, passing DKIM. Anyone can send mail
+        // that merely looks like a challenge, and recording a forged token would have this server answer it.
+        if (!this.verifiedFromAddress(raw, result)) {
             return false;
         }
         if (
@@ -1120,13 +1353,20 @@ export abstract class ScanQueueJob<
             return false;
         }
 
-        await this.signingCertificateEnrollment.recordChallengeToken(
-            enrollmentId,
-            subjectMatch[1],
-            result.replyToAddress ?? result.fromAddress,
-            result.messageIdHeader,
-            result.subject!,
-        );
+        try {
+            // Refuses (throws) a Reply-To outside the CA's own domain - the reply carries the token, so it must not
+            // be redirectable to an address of the sender's choosing.
+            await this.signingCertificateEnrollment.recordChallengeToken(
+                enrollmentId,
+                subjectMatch[1],
+                result.replyToAddress ?? result.fromAddress,
+                result.messageIdHeader,
+                result.subject!,
+            );
+        } catch (err: any) {
+            this.logger?.warn(`ScanQueueJob: not recording ACME challenge for enrollment ${enrollmentId}: ${err.message}`);
+            return false;
+        }
         return true;
     }
 
@@ -1206,7 +1446,7 @@ export abstract class ScanQueueJob<
                 reportingUa: `${this.mxHostname}; RapidMX`,
                 rotatedKeyFingerprint: activeEncryptKey?.fingerprint,
             });
-            await this.mailTransport!.send({
+            await sendOrThrow(this.mailTransport, {
                 raw: composed,
                 envelopeFrom: mailbox.primarySmtpAddress,
                 envelopeTo: [dispositionNotificationTo],
@@ -1320,7 +1560,7 @@ export abstract class ScanQueueJob<
 
         await this.messageRepo!.update(
             { uid: target.uid, version: (target as any).version, receiptStatus: updatedRoster } as any,
-            target,
+            asEntity(this.messageRepo!, target),
             { ignoreACL: true },
         );
     }
@@ -1336,7 +1576,7 @@ export abstract class ScanQueueJob<
      * means it's about the master/whole-series row - see `IcsUtils.ts`'s own doc comment on the master/
      * override `CalendarEvent` row model this relies on.
      */
-    private async maybeProcessItipMessage(entry: Q, result: ScanPipelineResult): Promise<void> {
+    private async maybeProcessItipMessage(entry: Q, raw: Buffer, result: ScanPipelineResult): Promise<void> {
         if (!result.icsPart) {
             return;
         }
@@ -1344,17 +1584,24 @@ export abstract class ScanQueueJob<
         if (!parsed) {
             return;
         }
+        // RFC 5546 §6.1: an iTIP message changes a calendar only when it comes from the party entitled to send it.
+        // Without an authenticated sender anyone could move, rewrite or cancel meetings, or forge attendee replies.
+        const sender: string | undefined = this.verifiedFromAddress(raw, result);
+        if (!sender) {
+            this.logger?.warn(`ScanQueueJob: ignoring iTIP ${parsed.method} for event ${parsed.uid} - its sender isn't DKIM-verified.`);
+            return;
+        }
 
         try {
             switch (parsed.method) {
                 case "REQUEST":
-                    await this.processItipRequest(entry.mailboxUid, parsed, result.encrypted);
+                    await this.processItipRequest(entry.mailboxUid, parsed, result.encrypted, sender);
                     break;
                 case "REPLY":
-                    await this.processItipReply(entry.mailboxUid, parsed);
+                    await this.processItipReply(entry.mailboxUid, parsed, sender);
                     break;
                 case "CANCEL":
-                    await this.processItipCancel(entry.mailboxUid, parsed);
+                    await this.processItipCancel(entry.mailboxUid, parsed, sender);
                     break;
                 default:
                     break;
@@ -1364,13 +1611,20 @@ export abstract class ScanQueueJob<
         }
     }
 
+    /** Every `CalendarEvent` row in `mailboxUid` sharing `icalUid` (a master and its override rows). */
+    private async findCalendarEventRows(mailboxUid: string, icalUid: string): Promise<CE[]> {
+        return await this.calendarEventRepo!.find({ mailboxUid, icalUid, limit: 50 } as any, { ignoreACL: true, limit: 50 });
+    }
+
     /** Finds the `CalendarEvent` row in `mailboxUid` matching `(icalUid, recurrenceId)` together, if any. */
     private async findCalendarEventRow(mailboxUid: string, icalUid: string, recurrenceId: Date | undefined): Promise<CE | undefined> {
-        const rows: CE[] = await this.calendarEventRepo!.find(
-            { mailboxUid, icalUid, limit: 50 } as any,
-            { ignoreACL: true, limit: 50 },
-        );
+        const rows: CE[] = await this.findCalendarEventRows(mailboxUid, icalUid);
         return rows.find((row) => recurrenceIdsMatch(row.recurrenceId, recurrenceId));
+    }
+
+    /** `true` if `sender` is the organizer of the series `rows` belong to (every row of one `icalUid` shares it). */
+    private isOrganizerOf(rows: CE[], sender: string): boolean {
+        return rows.length > 0 && rows.every((row) => normalizeAddress(row.organizer?.address ?? "") === sender);
     }
 
     /** `encrypted` is only ever consulted on the create branch below - an existing row's own
@@ -1379,8 +1633,20 @@ export abstract class ScanQueueJob<
      * (`CalendarEvent.encryptionOrigin`'s own doc comment). This inbound iTIP pipeline only ever produces
      * `"derived"` or `"none"` - `"originated"` is set by a client explicitly creating/marking its own
      * outbound invite as encrypted, a different code path entirely (see `MeetingSchedulingJob`). */
-    private async processItipRequest(mailboxUid: string, parsed: ParsedIcsEvent, encrypted: boolean): Promise<void> {
-        const existing = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
+    private async processItipRequest(mailboxUid: string, parsed: ParsedIcsEvent, encrypted: boolean, sender: string): Promise<void> {
+        const seriesRows: CE[] = await this.findCalendarEventRows(mailboxUid, parsed.uid);
+        const existing: CE | undefined = seriesRows.find((row) => recurrenceIdsMatch(row.recurrenceId, parsed.recurrenceId));
+        // Only the organizer may create or update a meeting: the sender must be the organizer the REQUEST names,
+        // and - for a meeting this mailbox already has - the organizer on record, so a REQUEST can't take over
+        // someone else's meeting by naming itself the organizer.
+        if (!parsed.organizer || normalizeAddress(parsed.organizer.address) !== sender) {
+            this.logger?.warn(`ScanQueueJob: ignoring iTIP REQUEST for event ${parsed.uid} - its sender isn't the organizer it names.`);
+            return;
+        }
+        if (seriesRows.length > 0 && !this.isOrganizerOf(seriesRows, sender)) {
+            this.logger?.warn(`ScanQueueJob: ignoring iTIP REQUEST for event ${parsed.uid} - its sender isn't the event's organizer.`);
+            return;
+        }
         if (existing && parsed.sequence <= existing.sequence) {
             // Stale/duplicate resend - already have this revision (or a newer one).
             return;
@@ -1419,7 +1685,8 @@ export abstract class ScanQueueJob<
                     startDate: parsed.startDate ?? new Date(),
                     endDate: parsed.endDate ?? new Date(),
                     allDay: false,
-                    timezone: "UTC",
+                    // The organizer's TZID (IANA-resolved), so a recurring meeting expands in its own zone across DST.
+                    timezone: parsed.timezone ?? "UTC",
                     organizer: parsed.organizer
                         ? { address: parsed.organizer.address, displayName: parsed.organizer.displayName, type: RecipientType.TO }
                         : { address: "", type: RecipientType.TO },
@@ -1431,6 +1698,9 @@ export abstract class ScanQueueJob<
                     icalUid: parsed.uid,
                     sequence: parsed.sequence,
                     encryptionOrigin: (encrypted ? "derived" : "none") as EncryptionOrigin,
+                    // This is an attendee's copy of someone else's invitation - marked as already sent so
+                    // `MeetingSchedulingJob` never re-sends it as if this mailbox were the organizer.
+                    inviteSequenceSent: parsed.sequence,
                 }),
                 { ignoreACL: true },
             );
@@ -1446,8 +1716,9 @@ export abstract class ScanQueueJob<
                     attendees,
                     recurrenceRule: parsed.recurrenceRule ?? existing.recurrenceRule,
                     sequence: parsed.sequence,
+                    inviteSequenceSent: parsed.sequence,
                 } as any,
-                existing,
+                asEntity(this.calendarEventRepo!, existing),
                 { ignoreACL: true },
             );
         }
@@ -1491,16 +1762,37 @@ export abstract class ScanQueueJob<
 
         const horizonEnd = new Date(startDate.getTime() + RESOURCE_BOOKING_HORIZON_MS);
         const requestedOccurrences: OccurrenceWindow[] = expandOccurrences(
-            { startDate, endDate, recurrenceRule: parsed.recurrenceRule },
+            { startDate, endDate, recurrenceRule: parsed.recurrenceRule, timezone: parsed.timezone },
             startDate,
             horizonEnd,
             parsed.recurrenceRule?.exceptions,
         );
 
-        const existingRows: CE[] = await this.calendarEventRepo!.find(
-            { mailboxUid: mailbox.uid, limit: RESOURCE_BOOKING_EXISTING_ROWS_LIMIT } as any,
-            { ignoreACL: true, limit: RESOURCE_BOOKING_EXISTING_ROWS_LIMIT },
-        );
+        // Every booking that could overlap: rows starting before the horizon ends (a recurring master that started
+        // long ago can still recur into the requested window, so there's no lower bound), read page by page in a
+        // stable order rather than the first N rows the database happens to return. A calendar too large to read
+        // completely declines, rather than risking a double booking on the rows it didn't read.
+        const existingRows: CE[] = [];
+        for (let page = 0; ; page++) {
+            if (page >= RESOURCE_BOOKING_MAX_PAGES) {
+                this.logger?.warn(`ScanQueueJob: declining booking request ${parsed.uid} for resource ${mailbox.uid} - too many existing bookings to check for conflicts.`);
+                return AttendeeResponseStatus.DECLINED;
+            }
+            const rows: CE[] = await this.calendarEventRepo!.find(
+                {
+                    mailboxUid: mailbox.uid,
+                    startDate: `lt(${horizonEnd.toISOString()})`,
+                    sort: { startDate: "ASC", uid: "ASC" },
+                    limit: RESOURCE_BOOKING_EXISTING_ROWS_LIMIT,
+                    page,
+                } as any,
+                { ignoreACL: true, limit: RESOURCE_BOOKING_EXISTING_ROWS_LIMIT, page, skipCache: true },
+            );
+            existingRows.push(...rows.filter((row) => !!row.recurrenceRule || new Date(row.endDate).getTime() > startDate.getTime()));
+            if (rows.length < RESOURCE_BOOKING_EXISTING_ROWS_LIMIT) {
+                break;
+            }
+        }
 
         for (const candidateRow of existingRows) {
             if (candidateRow.icalUid === parsed.uid) {
@@ -1517,7 +1809,13 @@ export abstract class ScanQueueJob<
                   ]
                 : undefined;
             const existingOccurrences = expandOccurrences(
-                { startDate: candidateRow.startDate, endDate: candidateRow.endDate, recurrenceRule: candidateRow.recurrenceRule },
+                {
+                    startDate: candidateRow.startDate,
+                    endDate: candidateRow.endDate,
+                    recurrenceRule: candidateRow.recurrenceRule,
+                    timezone: candidateRow.timezone,
+                    allDay: candidateRow.allDay,
+                },
                 startDate,
                 horizonEnd,
                 excludeDates,
@@ -1547,7 +1845,7 @@ export abstract class ScanQueueJob<
      */
     private async finalizeResourceDecision(mailbox: X, row: CE, decision: AttendeeResponseStatus): Promise<void> {
         if (decision === AttendeeResponseStatus.DECLINED) {
-            await this.calendarEventRepo!.delete(row.uid, { ignoreACL: true });
+            await this.deleteReceivedEventCopy(row);
         }
 
         const mailboxAddresses = [mailbox.primarySmtpAddress, ...mailbox.aliasAddresses].map((a) => a.toLowerCase());
@@ -1568,47 +1866,77 @@ export abstract class ScanQueueJob<
             })
                 .compile()
                 .build();
-            await this.mailTransport!.send({ raw: composed, envelopeFrom: mailbox.primarySmtpAddress, envelopeTo: [row.organizer.address] });
+            await sendOrThrow(this.mailTransport, { raw: composed, envelopeFrom: mailbox.primarySmtpAddress, envelopeTo: [row.organizer.address] });
         } catch (err: any) {
             this.logger?.warn(`ScanQueueJob: failed to send resource auto-response for event ${row.uid}: ${err.message}`);
         }
     }
 
-    private async processItipReply(mailboxUid: string, parsed: ParsedIcsEvent): Promise<void> {
+    /**
+     * Soft-deletes this mailbox's copy of someone else's meeting (declined by a resource, or cancelled by its
+     * organizer). `cancelNoticeSentAt` is stamped first: `MeetingSchedulingJob` sends cancellations for deleted
+     * events it hasn't stamped, and this mailbox isn't the organizer, so it has nothing to send.
+     */
+    private async deleteReceivedEventCopy(row: CE): Promise<void> {
+        const current: CE | undefined = await this.calendarEventRepo!.findOne(row.uid, { ignoreACL: true });
+        if (current && !current.cancelNoticeSentAt) {
+            await this.calendarEventRepo!.update(
+                { uid: current.uid, version: (current as any).version, cancelNoticeSentAt: new Date() } as any,
+                asEntity(this.calendarEventRepo!, current),
+                { ignoreACL: true, skipPush: true },
+            );
+        }
+        await this.calendarEventRepo!.delete(row.uid, { ignoreACL: true });
+    }
+
+    /** Applies an attendee's REPLY - only from that attendee themselves, and only to an attendee the event lists. */
+    private async processItipReply(mailboxUid: string, parsed: ParsedIcsEvent, sender: string): Promise<void> {
         const existing = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
         const replyingAttendee = parsed.attendees[0];
         if (!existing || !replyingAttendee?.partstat) {
             return;
         }
+        if (normalizeAddress(replyingAttendee.address) !== sender) {
+            this.logger?.warn(`ScanQueueJob: ignoring iTIP REPLY for event ${parsed.uid} - its sender isn't the attendee replying.`);
+            return;
+        }
 
         const attendees = existing.attendees.map((attendee) =>
-            attendee.address.toLowerCase() === replyingAttendee.address.toLowerCase()
-                ? { ...attendee, responseStatus: replyingAttendee.partstat! }
-                : attendee,
+            normalizeAddress(attendee.address) === sender ? { ...attendee, responseStatus: replyingAttendee.partstat! } : attendee,
         );
         await this.calendarEventRepo!.update(
             { uid: existing.uid, version: (existing as any).version, attendees } as any,
-            existing,
+            asEntity(this.calendarEventRepo!, existing),
             { ignoreACL: true },
         );
     }
 
-    private async processItipCancel(mailboxUid: string, parsed: ParsedIcsEvent): Promise<void> {
+    /** Applies the organizer's CANCEL - only from the organizer on record for this mailbox's copy of the event. */
+    private async processItipCancel(mailboxUid: string, parsed: ParsedIcsEvent, sender: string): Promise<void> {
+        const rows: CE[] = await this.findCalendarEventRows(mailboxUid, parsed.uid);
+        if (rows.length === 0) {
+            return;
+        }
+        if (!this.isOrganizerOf(rows, sender)) {
+            this.logger?.warn(`ScanQueueJob: ignoring iTIP CANCEL for event ${parsed.uid} - its sender isn't the event's organizer.`);
+            return;
+        }
+
         if (parsed.recurrenceId) {
-            const override = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
+            const override: CE | undefined = rows.find((row) => recurrenceIdsMatch(row.recurrenceId, parsed.recurrenceId));
             if (override) {
-                await this.calendarEventRepo!.delete(override.uid, { ignoreACL: true });
+                await this.deleteReceivedEventCopy(override);
                 return;
             }
             // No override row exists for this occurrence yet - drop it from the master's own recurrence
             // definition instead, the standard RFC 5545 way to exclude one occurrence from an otherwise-
             // unmodified series.
-            const master = await this.findCalendarEventRow(mailboxUid, parsed.uid, undefined);
+            const master: CE | undefined = rows.find((row) => !row.recurrenceId);
             if (master?.recurrenceRule) {
                 const exceptions = [...(master.recurrenceRule.exceptions ?? []), parsed.recurrenceId];
                 await this.calendarEventRepo!.update(
                     { uid: master.uid, version: (master as any).version, recurrenceRule: { ...master.recurrenceRule, exceptions } } as any,
-                    master,
+                    asEntity(this.calendarEventRepo!, master),
                     { ignoreACL: true },
                 );
             }
@@ -1617,12 +1945,8 @@ export abstract class ScanQueueJob<
 
         // No `recurrenceId` - cancelling the whole series: remove the master and every override row sharing
         // its `icalUid`.
-        const rows: CE[] = await this.calendarEventRepo!.find(
-            { mailboxUid, icalUid: parsed.uid, limit: 50 } as any,
-            { ignoreACL: true, limit: 50 },
-        );
         for (const row of rows) {
-            await this.calendarEventRepo!.delete(row.uid, { ignoreACL: true });
+            await this.deleteReceivedEventCopy(row);
         }
     }
 }

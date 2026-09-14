@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
-import { ApiErrorMessages, ApiErrors, DocDecorators, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
+import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, DocDecorators, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { CandidateResultPage, SearchEntityType, SearchProvider, SearchResultPage } from "../search/SearchProvider.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { Mailbox } from "../models/types.js";
@@ -26,9 +26,10 @@ function parseDateParam(value: string | undefined): Date | undefined {
  * other route in this library, this is NOT a `ModelRoute`/`CRUDRoute` subclass — `RepoUtils.find()` has no
  * full-text query capability, so this route calls the injected `SearchProvider` directly instead.
  *
- * `mailboxClass` is supplied by the Mongo/SQL concrete subclasses. Search is always scoped to a mailbox the
- * requesting user owns (`ownerUserUid === user.uid`) — a client-supplied `mailboxUid` is deliberately not
- * accepted, so this endpoint can never be used to search another user's mailbox.
+ * `mailboxClass` is supplied by the Mongo/SQL concrete subclasses. Search is scoped to exactly one mailbox: by
+ * default the one the requesting user owns (`ownerUserUid === user.uid`); with `?mailboxUid=`, that mailbox, provided
+ * the caller has `READ` on it (its owner, a delegate it's shared with, or a trusted caller) - otherwise 404, the same
+ * answer as a mailbox that doesn't exist. That's how a shared mailbox is searched.
  *
  * The structured filter query params below (`from`/`to`/`cc`/`subject`/`hasAttachment`/`before`/`after`/`in`/
  * `is`) are `specs/search.md` §14's operator grammar — `from:bob has:attachment` — already parsed into
@@ -51,6 +52,9 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
     @Inject("SearchProvider")
     private searchProvider?: SearchProvider;
 
+    @Inject(ACLUtils)
+    private aclUtils?: ACLUtils;
+
     @Logger
     private logger: any;
 
@@ -64,11 +68,23 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
         return this.mailboxRepo;
     }
 
-    private async requireCallerMailboxUid(user: JWTUser | undefined): Promise<string> {
+    /** The mailbox to search: `requestedMailboxUid` if given and readable by `user` (else 404), otherwise the caller's
+     * own. */
+    private async requireCallerMailboxUid(user: JWTUser | undefined, requestedMailboxUid?: unknown): Promise<string> {
         if (!user) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
         const mailboxRepo: RepoUtils<M> = await this.getMailboxRepo();
+        if (requestedMailboxUid !== undefined) {
+            if (typeof requestedMailboxUid !== "string" || requestedMailboxUid.length === 0) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+            }
+            const mailbox: M | undefined = await mailboxRepo.findOne(requestedMailboxUid, { ignoreACL: true });
+            if (!mailbox || !this.aclUtils || !(await this.aclUtils.hasPermission(user, mailbox.uid, ACLAction.READ))) {
+                throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+            }
+            return mailbox.uid;
+        }
         const mailboxUid: string | undefined = await resolveCallerMailboxUid(mailboxRepo, user);
         if (!mailboxUid) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -97,6 +113,7 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
         @Query("is") isParam: string | undefined,
         @Query("label") labelParam: string | undefined,
         @AuthUser user?: JWTUser,
+        @Query("mailboxUid") mailboxUidParam?: string,
     ): Promise<SearchResultPage> {
         if (!this.searchProvider) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
@@ -110,12 +127,14 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
             beforeParam !== undefined ||
             afterParam !== undefined ||
             folderUid !== undefined ||
-            isParam !== undefined;
+            isParam !== undefined ||
+            labelParam !== undefined ||
+            typesParam !== undefined;
         if (!text && !hasStructuredFilter) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
 
-        const mailboxUid: string = await this.requireCallerMailboxUid(user);
+        const mailboxUid: string = await this.requireCallerMailboxUid(user, mailboxUidParam);
 
         const entityTypes: SearchEntityType[] | undefined = typesParam
             ? (typesParam.split(",") as SearchEntityType[])
@@ -165,12 +184,13 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
         @Query("cursor") cursor: string | undefined,
         @Query("limit") limitParam: string | undefined,
         @AuthUser user?: JWTUser,
+        @Query("mailboxUid") mailboxUidParam?: string,
     ): Promise<CandidateResultPage> {
         if (!this.searchProvider) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
 
-        const mailboxUid: string = await this.requireCallerMailboxUid(user);
+        const mailboxUid: string = await this.requireCallerMailboxUid(user, mailboxUidParam);
 
         const entityTypes: SearchEntityType[] | undefined = typesParam
             ? (typesParam.split(",") as SearchEntityType[])

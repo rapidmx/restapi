@@ -165,6 +165,36 @@ describe("ManualSigningCertificateEnrollment Tests", () => {
         await expect(fs.access(nestedPath)).resolves.toBeUndefined();
     });
 
+    it("Concurrent mutations (including across instances sharing the store) never lose an update.", async () => {
+        const other = new ManualSigningCertificateEnrollment();
+        (other as any).storePath = (enrollment as any).storePath;
+        const csrs: string[] = await Promise.all(Array.from({ length: 8 }, (_, i) => generateCsr(`concurrent${i}@example.com`)));
+        const seeded = await enrollment.startEnrollment("seeded@example.com", await generateCsr("seeded@example.com"));
+
+        const [results] = await Promise.all([
+            Promise.all(csrs.map((csr, i) => (i % 2 ? other : enrollment).startEnrollment(`concurrent${i}@example.com`, csr))),
+            enrollment.markFailed(seeded.enrollmentId, "abandoned"),
+        ]);
+
+        for (const result of results) {
+            await expect(enrollment.checkStatus(result.enrollmentId)).resolves.toEqual({ status: "pending", certificate: undefined, error: undefined });
+        }
+        await expect(enrollment.checkStatus(seeded.enrollmentId)).resolves.toEqual({ status: "failed", certificate: undefined, error: "abandoned" });
+        expect(await fs.readdir(tmpDir)).not.toContainEqual(expect.stringMatching(/\.tmp$/));
+    });
+
+    it("A rejected uploadCertificate() leaves the persisted store untouched.", async () => {
+        const csr: string = await generateCsr("untouched@example.com");
+        const { enrollmentId } = await enrollment.startEnrollment("untouched@example.com", csr);
+        const before: string = await fs.readFile((enrollment as any).storePath, "utf-8");
+
+        await expect(enrollment.uploadCertificate(enrollmentId, await signCertForCsr(await generateCsr("other@example.com")))).rejects.toThrow(
+            /does not match/,
+        );
+
+        expect(await fs.readFile((enrollment as any).storePath, "utf-8")).toBe(before);
+    });
+
     it("Rethrows a filesystem error other than ENOENT while reading the store.", async () => {
         const dirAsFile: string = path.join(tmpDir, "a-directory-not-a-file.json");
         await fs.mkdir(dirAsFile, { recursive: true });

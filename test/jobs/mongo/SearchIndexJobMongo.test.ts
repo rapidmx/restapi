@@ -323,4 +323,174 @@ describe("SearchIndexJobMongo Tests (real DB + DI)", () => {
         const updatedGood = await messageRepo.findOne({ uid: goodMessage.uid } as any);
         expect(updatedGood!.searchIndexedAt).toBeInstanceOf(Date);
     });
+
+    describe("retry bookkeeping (stuck-message isolation)", () => {
+        const realBatchSize = () => (job as any).batchSize;
+        let savedBatchSize: number;
+        let savedMaxAttempts: number;
+
+        beforeEach(() => {
+            savedBatchSize = realBatchSize();
+            savedMaxAttempts = (job as any).maxAttempts;
+        });
+
+        afterEach(() => {
+            (job as any).batchSize = savedBatchSize;
+            (job as any).maxAttempts = savedMaxAttempts;
+            vi.restoreAllMocks();
+        });
+
+        const findMessage = async (uid: string) => await messageRepo.findOne({ uid } as any);
+        const setMessage = async (uid: string, fields: any) => await messageRepo.updateOne({ uid } as any, { $set: fields });
+
+        it("Records searchIndexAttempts/searchIndexNextAttemptAt/searchIndexError on failure, honors the backoff, and clears them once a retry succeeds.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            const message = await createMessage({ bodyBlobKey: blobKey });
+
+            const before = Date.now();
+            await job.run();
+
+            let updated = await findMessage(message.uid);
+            expect(updated!.searchIndexedAt).toBeFalsy();
+            expect(updated!.searchIndexAttempts).toBe(1);
+            expect(new Date(updated!.searchIndexNextAttemptAt!).getTime()).toBeGreaterThan(before);
+            expect(updated!.searchIndexError).toContain("no blob");
+
+            // The underlying problem is fixed, but the backoff hasn't elapsed - not retried yet.
+            await blobStore.put(blobKey, Buffer.from("Subject: Hello\r\n\r\nBody text."));
+            await job.run();
+            updated = await findMessage(message.uid);
+            expect(updated!.searchIndexedAt).toBeFalsy();
+            expect(updated!.searchIndexAttempts).toBe(1);
+
+            // Backoff elapsed - retried, indexed, and the failure bookkeeping cleared.
+            await setMessage(message.uid, { searchIndexNextAttemptAt: new Date(Date.now() - 1000) });
+            await job.run();
+            updated = await findMessage(message.uid);
+            expect(updated!.searchIndexedAt).toBeInstanceOf(Date);
+            expect(updated!.searchIndexAttempts ?? null).toBeNull();
+            expect(updated!.searchIndexNextAttemptAt ?? null).toBeNull();
+            expect(updated!.searchIndexError ?? null).toBeNull();
+        });
+
+        it("Never lets a permanently failing message block newer ones (batch size 1), and stops selecting it at max_attempts.", async () => {
+            (job as any).batchSize = 1;
+            (job as any).maxAttempts = 2;
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            // Created (inserted) first but dated newer, so the job's dateCreated ordering - not insertion order -
+            // is what puts the bad message at the head of the queue.
+            const goodBlobKey = `body/${uuid.v4()}`;
+            await blobStore.put(goodBlobKey, Buffer.from("Subject: Hello\r\n\r\nGood body."));
+            const goodMessage = await createMessage({ bodyBlobKey: goodBlobKey });
+            const badMessage = await createMessage({
+                bodyBlobKey: `body/${uuid.v4()}`,
+                dateCreated: new Date(Date.now() - 60_000),
+            });
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+
+            // Oldest first: the bad message is selected and fails.
+            await job.run();
+            expect((await findMessage(badMessage.uid))!.searchIndexAttempts).toBe(1);
+            expect(searchProvider.indexed.has(`message:${goodMessage.uid}`)).toBe(false);
+
+            // Bad message is backing off - the good one gets its turn.
+            await job.run();
+            expect(searchProvider.indexed.has(`message:${goodMessage.uid}`)).toBe(true);
+
+            // Second (final) attempt exhausts it: no next attempt is scheduled.
+            await setMessage(badMessage.uid, { searchIndexNextAttemptAt: new Date(Date.now() - 1000) });
+            await job.run();
+            let bad = await findMessage(badMessage.uid);
+            expect(bad!.searchIndexAttempts).toBe(2);
+            expect(bad!.searchIndexNextAttemptAt ?? null).toBeNull();
+            expect(bad!.searchIndexError).toContain("no blob");
+
+            // Even with an elapsed next-attempt time, a message at max_attempts is no longer selected.
+            await setMessage(badMessage.uid, { searchIndexNextAttemptAt: new Date(Date.now() - 1000) });
+            await job.run();
+            bad = await findMessage(badMessage.uid);
+            expect(bad!.searchIndexAttempts).toBe(2);
+            expect(bad!.searchIndexedAt).toBeFalsy();
+        });
+
+        it("Does not stamp searchIndexedAt on a document the provider did not report as indexed, recording a failure instead.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const keyA = `body/${uuid.v4()}`;
+            const keyB = `body/${uuid.v4()}`;
+            await blobStore.put(keyA, Buffer.from("Subject: A\r\n\r\nA body."));
+            await blobStore.put(keyB, Buffer.from("Subject: B\r\n\r\nB body."));
+            const messageA = await createMessage({ bodyBlobKey: keyA });
+            const messageB = await createMessage({ bodyBlobKey: keyB });
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            vi.spyOn(searchProvider, "bulkIndex").mockResolvedValueOnce([messageA.uid]);
+
+            await job.run();
+
+            const updatedA = await findMessage(messageA.uid);
+            expect(updatedA!.searchIndexedAt).toBeInstanceOf(Date);
+            const updatedB = await findMessage(messageB.uid);
+            expect(updatedB!.searchIndexedAt).toBeFalsy();
+            expect(updatedB!.searchIndexAttempts).toBe(1);
+            expect(updatedB!.searchIndexError).toContain("did not index");
+        });
+
+        it("Records a failure on every built message when bulkIndex() rejects for the whole batch.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey });
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            vi.spyOn(searchProvider, "bulkIndex").mockRejectedValueOnce(new Error("provider unreachable"));
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            const updated = await findMessage(message.uid);
+            expect(updated!.searchIndexedAt).toBeFalsy();
+            expect(updated!.searchIndexAttempts).toBe(1);
+            expect(updated!.searchIndexError).toContain("provider unreachable");
+        });
+
+        it("Treats a provider that returns a non-array from bulkIndex() as having indexed the whole batch.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey });
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            vi.spyOn(searchProvider, "bulkIndex").mockResolvedValueOnce(undefined as any);
+
+            await job.run();
+
+            const updated = await findMessage(message.uid);
+            expect(updated!.searchIndexedAt).toBeInstanceOf(Date);
+        });
+
+        it("Logs a warning (no throw) when stamping searchIndexedAt fails, leaving the message for a later run.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `body/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("Subject: A\r\n\r\nA body."));
+            const message = await createMessage({ bodyBlobKey: blobKey });
+            vi.spyOn((job as any).messageRepo, "update").mockRejectedValueOnce(new Error("simulated stamp conflict"));
+            const warnSpy = vi.spyOn((job as any).logger, "warn");
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated stamp conflict"));
+            const updated = await findMessage(message.uid);
+            expect(updated!.searchIndexedAt).toBeFalsy();
+        });
+
+        it("Logs a warning (no throw) when recording an indexing failure itself fails.", async () => {
+            // No blob at this key, so building the document fails and a failure is recorded - which is made to fail.
+            const message = await createMessage({ bodyBlobKey: `body/${uuid.v4()}` });
+            vi.spyOn((job as any).messageRepo, "update").mockRejectedValueOnce(new Error("simulated bookkeeping failure"));
+            const warnSpy = vi.spyOn((job as any).logger, "warn");
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated bookkeeping failure"));
+            const updated = await findMessage(message.uid);
+            expect(updated!.searchIndexAttempts ?? null).toBeNull();
+        });
+    });
 });

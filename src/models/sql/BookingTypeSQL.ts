@@ -48,7 +48,7 @@ export class BookingTypeSQL extends BaseEntity implements BookingType {
     @Description("The public-facing name of the offering.")
     public name: string = "";
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("A longer public-facing description of the offering.")
     @Nullable
     public description?: string;

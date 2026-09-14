@@ -8,11 +8,14 @@ import { ConnectionManager } from "@rapidrest/service-core";
 import {
     CandidateQuery,
     CandidateResultPage,
+    nextSearchCursor,
+    resolveSearchPaging,
     SearchDocument,
     SearchEntityType,
     SearchProvider,
     SearchQuery,
     SearchResultPage,
+    truncateSearchDocumentText,
 } from "./SearchProvider.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
@@ -27,7 +30,10 @@ interface StoredDoc {
     subject?: string;
     body?: string;
     attachmentText?: string;
-    participants?: string;
+    /** Stored as an array of addresses. Documents indexed by an earlier version of this provider hold a
+     * space-joined string instead - `candidates()` matches both shapes, and such a document is rewritten in
+     * the array shape the next time it's re-indexed. */
+    participants?: string[] | string;
     from?: string;
     to?: string[];
     cc?: string[];
@@ -85,7 +91,8 @@ export class MongoTextSearchProvider implements SearchProvider {
         return `${entityType}:${entityUid}`;
     }
 
-    private toStoredDoc(doc: SearchDocument): StoredDoc {
+    private toStoredDoc(input: SearchDocument): StoredDoc {
+        const doc: SearchDocument = truncateSearchDocumentText(input);
         return {
             _id: this.docId(doc.entityType, doc.entityUid),
             entityType: doc.entityType,
@@ -94,7 +101,7 @@ export class MongoTextSearchProvider implements SearchProvider {
             subject: doc.subject,
             body: doc.body,
             attachmentText: doc.attachmentText?.join("\n"),
-            participants: doc.participants?.join(" "),
+            participants: doc.participants,
             from: doc.from,
             to: doc.to,
             cc: doc.cc,
@@ -111,19 +118,44 @@ export class MongoTextSearchProvider implements SearchProvider {
         await this.bulkIndex([doc]);
     }
 
-    public async bulkIndex(docs: SearchDocument[]): Promise<void> {
+    public async bulkIndex(docs: SearchDocument[]): Promise<string[]> {
         if (!this.collection || docs.length === 0) {
-            return;
+            return [];
         }
-        await this.collection.bulkWrite(
-            docs.map((doc) => ({
-                replaceOne: {
-                    filter: { _id: this.docId(doc.entityType, doc.entityUid) },
-                    replacement: this.toStoredDoc(doc),
-                    upsert: true,
-                },
-            })),
-        );
+        try {
+            // `ordered: false` so one rejected document (e.g. one exceeding the BSON size limit) doesn't stop
+            // the server from applying every later operation in the batch.
+            await this.collection.bulkWrite(
+                docs.map((doc) => ({
+                    replaceOne: {
+                        filter: { _id: this.docId(doc.entityType, doc.entityUid) },
+                        replacement: this.toStoredDoc(doc),
+                        upsert: true,
+                    },
+                })),
+                { ordered: false },
+            );
+            return docs.map((doc) => doc.entityUid);
+        } catch (err: any) {
+            // A `MongoBulkWriteError` reports exactly which operations failed (by their index in the request);
+            // every other operation was applied. Anything else (e.g. a connection failure) affects the whole
+            // batch and is rethrown.
+            const writeErrors: any[] | undefined =
+                err?.writeErrors === undefined ? undefined : Array.isArray(err.writeErrors) ? err.writeErrors : [err.writeErrors];
+            if (!writeErrors) {
+                throw err;
+            }
+            const failed: Set<number> = new Set();
+            for (const writeError of writeErrors) {
+                const index: number = writeError?.index ?? writeError?.err?.index;
+                failed.add(index);
+                const doc: SearchDocument | undefined = docs[index];
+                this.logger?.warn(
+                    `MongoTextSearchProvider: failed to index ${doc?.entityType} ${doc?.entityUid}: ${writeError?.errmsg ?? writeError?.message ?? "unknown error"}`,
+                );
+            }
+            return docs.filter((_doc, i) => !failed.has(i)).map((doc) => doc.entityUid);
+        }
     }
 
     public async remove(entityType: SearchEntityType, entityUid: string): Promise<void> {
@@ -171,8 +203,7 @@ export class MongoTextSearchProvider implements SearchProvider {
             return { results: [] };
         }
 
-        const limit: number = Math.min(query.limit ?? 25, 200);
-        const skip: number = query.cursor ? Math.max(0, parseInt(query.cursor, 10) || 0) : 0;
+        const { limit, offset: skip } = resolveSearchPaging(query.limit, query.cursor);
 
         const filter: any = {
             mailboxUid: query.mailboxUid,
@@ -228,7 +259,7 @@ export class MongoTextSearchProvider implements SearchProvider {
                 score: row.score ?? 0,
                 metadataOnly: row.metadataOnly,
             })),
-            nextCursor: hasMore ? String(skip + limit) : undefined,
+            nextCursor: nextSearchCursor(hasMore, skip, limit),
         };
     }
 
@@ -237,8 +268,7 @@ export class MongoTextSearchProvider implements SearchProvider {
             return { candidates: [] };
         }
 
-        const limit: number = Math.min(query.limit ?? 25, 200);
-        const skip: number = query.cursor ? Math.max(0, parseInt(query.cursor, 10) || 0) : 0;
+        const { limit, offset: skip } = resolveSearchPaging(query.limit, query.cursor);
 
         const filter: any = {
             mailboxUid: query.mailboxUid,
@@ -252,7 +282,14 @@ export class MongoTextSearchProvider implements SearchProvider {
             ),
         };
         if (query.participants && query.participants.length > 0) {
-            filter.participants = { $in: query.participants };
+            // Matches a whole participant address, case-insensitively, against either stored shape: an array
+            // element (current) or a space-delimited token inside the legacy joined string - a plain `$in` of
+            // the raw terms would never match the legacy shape at all. Escaped, so a term is always literal.
+            filter.participants = {
+                $in: query.participants.map(
+                    (term) => new RegExp(`(^|\\s)${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s|$)`, "i"),
+                ),
+            };
         }
 
         const rows: StoredDoc[] = await this.collection
@@ -267,7 +304,7 @@ export class MongoTextSearchProvider implements SearchProvider {
 
         return {
             candidates: page.map((row) => ({ entityType: row.entityType, entityUid: row.entityUid })),
-            nextCursor: hasMore ? String(skip + limit) : undefined,
+            nextCursor: nextSearchCursor(hasMore, skip, limit),
         };
     }
 }

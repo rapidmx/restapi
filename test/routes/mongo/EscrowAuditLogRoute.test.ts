@@ -11,7 +11,7 @@ import { EscrowAuditLogEntryMongo } from "../../../src/models/mongo/EscrowAuditL
 import { EscrowScopeMongo } from "../../../src/models/mongo/EscrowScopeMongo.js";
 import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { EscrowAuditAction } from "../../../src/models/types.js";
-import { recordEscrowAuditEntry } from "../../../src/util/EscrowAuditUtils.js";
+import { recordEscrowAuditEntry, verifyEscrowAuditChain } from "../../../src/util/EscrowAuditUtils.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
 
@@ -30,6 +30,7 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
     let escrowScopeRepo: MongoRepository<EscrowScopeMongo>;
     let matterRepo: MongoRepository<MatterMongo>;
     let auditRepo: MongoRepository<EscrowAuditLogEntryMongo>;
+    let auditHeadRepo: MongoRepository<any>;
 
     const holderA: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const holderAToken = JWTUtils.createTokenSync(config.get("auth"), holderA);
@@ -69,6 +70,7 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
             escrowScopeRepo = conn.getMongoRepository("EscrowScopeMongo");
             matterRepo = conn.getMongoRepository("MatterMongo");
             auditRepo = conn.getMongoRepository("EscrowAuditLogEntryMongo");
+            auditHeadRepo = conn.getMongoRepository("EscrowAuditHeadMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -81,7 +83,7 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const r of [auditRepo, matterRepo, escrowScopeRepo]) {
+        for (const r of [auditRepo, auditHeadRepo, matterRepo, escrowScopeRepo]) {
             try {
                 await r.clear();
             } catch (err: any) {
@@ -319,5 +321,31 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
         expect(tamperedResult.status).toBe(200);
         expect(tamperedResult.body.valid).toBe(false);
         expect(tamperedResult.body.brokenAtSequence).toBe(entries[1].sequence);
+    });
+
+    it("Persists HMAC-keyed entries and the head record, and detects tail truncation via the head.", async () => {
+        const hmacKey = "escrow-audit-test-key";
+        for (const action of [EscrowAuditAction.REQUEST_CREATED, EscrowAuditAction.REQUEST_APPROVED, EscrowAuditAction.MATERIAL_READ]) {
+            await recordEscrowAuditEntry(
+                objectFactory,
+                EscrowAuditLogEntryMongo,
+                { action, holderUserUid: holderA.uid, matterId: uuid.v4(), mailboxUid: uuid.v4(), requestId: uuid.v4() },
+                { hmacKey },
+            );
+        }
+        expect(await verifyEscrowAuditChain(objectFactory, EscrowAuditLogEntryMongo, { hmacKey })).toEqual({ valid: true });
+
+        const [head] = await auditHeadRepo.find({}).toArray();
+        expect(head.sequence).toBe(2);
+        expect(head.hashAlgorithm).toBe("hmac-sha256");
+        expect(typeof head.mac).toBe("string");
+
+        await auditRepo.deleteOne({ sequence: 2 });
+
+        expect(await verifyEscrowAuditChain(objectFactory, EscrowAuditLogEntryMongo, { hmacKey })).toEqual({
+            valid: false,
+            brokenAtSequence: 2,
+            reason: "truncated",
+        });
     });
 });

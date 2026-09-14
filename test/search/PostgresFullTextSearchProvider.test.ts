@@ -5,7 +5,7 @@
 // Isolated unit tests for PostgresFullTextSearchProvider - the injected ConnectionManager and the TypeORM
 // `DataSource`-shaped connection it resolves are both hand-built mocks; no real Postgres connection is made.
 import { PostgresFullTextSearchProvider } from "../../src/search/PostgresFullTextSearchProvider.js";
-import type { SearchDocument } from "../../src/search/SearchProvider.js";
+import { MAX_SEARCH_DOCUMENT_TEXT_CHARS, type SearchDocument } from "../../src/search/SearchProvider.js";
 
 function makeDoc(overrides: Partial<SearchDocument> = {}): SearchDocument {
     return {
@@ -124,9 +124,10 @@ describe("PostgresFullTextSearchProvider Tests", () => {
             mockConnection.query.mockClear();
             const docs = [makeDoc({ entityUid: "msg-1" }), makeDoc({ entityUid: "msg-2" })];
 
-            await provider.bulkIndex(docs);
+            const result = await provider.bulkIndex(docs);
 
             expect(mockConnection.query).toHaveBeenCalledTimes(2);
+            expect(result).toEqual(["msg-1", "msg-2"]);
         });
 
         it("bulkIndex() is a no-op when given an empty array.", async () => {
@@ -140,7 +141,39 @@ describe("PostgresFullTextSearchProvider Tests", () => {
         });
 
         it("bulkIndex() is a no-op when no dataSource has been initialized.", async () => {
-            await expect(provider.bulkIndex([makeDoc()])).resolves.toBeUndefined();
+            await expect(provider.bulkIndex([makeDoc()])).resolves.toEqual([]);
+        });
+
+        it("bulkIndex() isolates a failing INSERT, still indexing the rest of the batch and returning only the indexed entityUids.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockConnection.query.mockClear();
+            mockConnection.query
+                .mockResolvedValueOnce([])
+                .mockRejectedValueOnce(new Error("string is too long for tsvector"))
+                .mockResolvedValueOnce([]);
+
+            const result = await provider.bulkIndex([
+                makeDoc({ entityUid: "msg-1" }),
+                makeDoc({ entityUid: "msg-2" }),
+                makeDoc({ entityUid: "msg-3" }),
+            ]);
+
+            expect(mockConnection.query).toHaveBeenCalledTimes(3);
+            expect(result).toEqual(["msg-1", "msg-3"]);
+        });
+
+        it("bulkIndex() truncates text to a quarter of MAX_SEARCH_DOCUMENT_TEXT_CHARS (tsvector's 1MB cap) before inserting.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockConnection.query.mockClear();
+            const budget = Math.floor(MAX_SEARCH_DOCUMENT_TEXT_CHARS / 4);
+
+            await provider.bulkIndex([makeDoc({ subject: "", body: "a".repeat(budget - 5), attachmentText: ["0123456789", "dropped"] })]);
+
+            const [, params] = mockConnection.query.mock.calls[0];
+            expect(params[4]).toHaveLength(budget - 5);
+            expect(params[5]).toBe("01234");
         });
     });
 
@@ -242,7 +275,7 @@ describe("PostgresFullTextSearchProvider Tests", () => {
             expect(result.nextCursor).toBe("2");
         });
 
-        it("Caps the effective limit at 200.", async () => {
+        it("Caps the effective limit at 100.", async () => {
             wireConnection();
             await (provider as any).init();
             mockConnection.query.mockClear();
@@ -251,7 +284,22 @@ describe("PostgresFullTextSearchProvider Tests", () => {
             await provider.search({ mailboxUid: "mbx-1", text: "hello", limit: 10_000 });
 
             const [, params] = mockConnection.query.mock.calls[0];
-            expect(params[2]).toBe(201);
+            expect(params[2]).toBe(101);
+        });
+
+        it("Clamps limit to at least 1 and the cursor offset to 0..10000.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockConnection.query.mockClear();
+            mockConnection.query.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+
+            await provider.search({ mailboxUid: "mbx-1", text: "hello", limit: 0, cursor: "123456" });
+            await provider.candidates({ mailboxUid: "mbx-1", limit: -1, cursor: "-9" });
+
+            const [, searchParams] = mockConnection.query.mock.calls[0];
+            expect(searchParams.slice(-2)).toEqual([2, 10_000]);
+            const [, candidateParams] = mockConnection.query.mock.calls[1];
+            expect(candidateParams.slice(-2)).toEqual([2, 0]);
         });
 
         it("Uses websearch_to_tsquery, not plainto_tsquery, for the free-text match.", async () => {

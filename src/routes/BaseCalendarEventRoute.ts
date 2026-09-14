@@ -14,6 +14,7 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
+import { coerceCalendarEventDates } from "../util/DateCoercionUtils.js";
 import { getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { buildEventIcs } from "../util/IcsUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
@@ -81,10 +82,21 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid);
     }
 
+    /** Coerces every date field to a real `Date` (a `400` for an unparseable one) before anything is saved - see
+     * `util/DateCoercionUtils.ts` for why MongoDB would otherwise store the client's ISO strings as strings. */
+    public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
+        for (const single of Array.isArray(obj) ? obj : [obj]) {
+            coerceCalendarEventDates(single);
+        }
+        return await super.create(obj, req, user);
+    }
+
+    /** Also serves `updateBulk()`/`updateProperty()`, which `BaseScopedChildRoute` routes through `update()`. */
     public async update(id: string, obj: UpdateObject<T>, req?: HttpRequest, user?: JWTUser): Promise<T> {
         if (!this.repoUtils) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
+        coerceCalendarEventDates(obj);
         const existing: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
         if (existing && this.isSchedulingRelevantChange(existing, obj)) {
             (obj as any).sequence = existing.sequence + 1;
@@ -97,10 +109,11 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * this route family's ordinary partial-update semantics. */
     private isSchedulingRelevantChange(existing: T, obj: UpdateObject<T>): boolean {
         const incoming: any = obj;
-        if (incoming.startDate !== undefined && new Date(incoming.startDate).getTime() !== existing.startDate.getTime()) {
+        // `new Date()` on the stored side too - a row saved before dates were coerced on write can hold a string.
+        if (incoming.startDate !== undefined && new Date(incoming.startDate).getTime() !== new Date(existing.startDate).getTime()) {
             return true;
         }
-        if (incoming.endDate !== undefined && new Date(incoming.endDate).getTime() !== existing.endDate.getTime()) {
+        if (incoming.endDate !== undefined && new Date(incoming.endDate).getTime() !== new Date(existing.endDate).getTime()) {
             return true;
         }
         const fields: (keyof CalendarEvent)[] = ["location", "attendees", "status", "recurrenceRule"];

@@ -246,8 +246,10 @@ describe("Route:AttachmentSQL Tests", () => {
             .set("Authorization", "jwt " + ownerToken);
 
         expect(result.status).toBe(200);
-        expect(result.text).toBe("attachment content");
-        expect(result.headers["content-type"]).toBe("text/plain");
+        // Served as a download whatever its stored type (only raster images keep theirs) - see `BaseAttachmentRoute.download()`.
+        expect(result.text ?? Buffer.from(result.body).toString("utf-8")).toBe("attachment content");
+        expect(result.headers["content-type"]).toBe("application/octet-stream");
+        expect(result.headers["x-content-type-options"]).toBe("nosniff");
     });
 
     it("Escapes an embedded double-quote in a stored filename when building Content-Disposition (400/spoofed-name hardening) - previously let it break out of the quoted value and inject a second filename= parameter.", async () => {

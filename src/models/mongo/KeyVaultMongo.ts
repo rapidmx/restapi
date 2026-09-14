@@ -2,8 +2,10 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { ObjectDecorators } from "@rapidrest/core";
 import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
 import { KeyVault, MasterKeyWrap, WrappedPrivateKey } from "../types.js";
+const { Nullable } = ObjectDecorators;
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity, Index } = PersistenceDecorators;
@@ -44,6 +46,11 @@ export class KeyVaultMongo extends BaseMongoEntity implements KeyVault {
     @Description("Wrapped copies of this mailbox's master key, one per unlock method.")
     public masterKeyWraps: MasterKeyWrap[] = [];
 
+    @Column()
+    @Description("Fingerprint of the signing certificate an expiry warning was last audited for (server-managed).")
+    @Nullable
+    public expiryAuditedFingerprint?: string;
+
     constructor(other?: Partial<KeyVaultMongo>) {
         super(other);
 
@@ -51,6 +58,7 @@ export class KeyVaultMongo extends BaseMongoEntity implements KeyVault {
             this.mailboxUid = other.mailboxUid !== undefined ? other.mailboxUid : this.mailboxUid;
             this.wrappedKeys = other.wrappedKeys !== undefined ? other.wrappedKeys : this.wrappedKeys;
             this.masterKeyWraps = other.masterKeyWraps !== undefined ? other.masterKeyWraps : this.masterKeyWraps;
+            this.expiryAuditedFingerprint = "expiryAuditedFingerprint" in other ? other.expiryAuditedFingerprint : this.expiryAuditedFingerprint;
         }
     }
 }

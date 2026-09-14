@@ -242,13 +242,13 @@ describe("MailboxQuotaRecalcJobSQL Tests (real DB + DI)", () => {
         pageSizeSpy.mockRestore();
     });
 
-    it("Bounds how many mailboxes are processed per run to the configured batch size.", async () => {
+    it.each([5, 4])("Pages through every mailbox, batchSize at a time, not just the first page (%i mailboxes, batch size 2).", async (mailboxCount) => {
         (job as any).batchSize = 2;
         const bodyKey = `body/${uuid.v4()}`;
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         await blobStore.put(bodyKey, Buffer.alloc(42));
         const mailboxes = [];
-        for (let i = 0; i < 3; i++) {
+        for (let i = 0; i < mailboxCount; i++) {
             const mailbox = await createMailbox({ usedBytes: 0 });
             await createMessage(mailbox.uid, { bodyBlobKey: bodyKey, hasAttachments: false });
             mailboxes.push(mailbox);
@@ -258,7 +258,7 @@ describe("MailboxQuotaRecalcJobSQL Tests (real DB + DI)", () => {
 
         const updatedMailboxes = await mailboxRepo.find({ where: { uid: In(mailboxes.map((m) => m.uid)) } });
         const processedCount = updatedMailboxes.filter((m) => m.usedBytes === 42).length;
-        expect(processedCount).toBe(2);
+        expect(processedCount).toBe(mailboxCount);
     });
 
     it("Logs an error and continues with the next mailbox when recalculating one mailbox throws.", async () => {

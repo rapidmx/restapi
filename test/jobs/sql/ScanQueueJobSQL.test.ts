@@ -77,12 +77,14 @@ function makeIcsEventFixture(overrides: Partial<CalendarEvent> = {}): CalendarEv
 
 /** Builds a raw multipart RFC 5322 message carrying `ics` as its `text/calendar` part - the inbound iTIP shape
  * `ScanPipeline`/`ScanQueueJob.maybeProcessItipMessage()` detect and process. */
-function makeItipRawMessage(ics: string, opts: { from?: string; to?: string } = {}): Buffer {
+function makeItipRawMessage(ics: string, opts: { from?: string; to?: string; dkim?: boolean } = {}): Buffer {
     const from = opts.from ?? "organizer@example.com";
     const to = opts.to ?? "recipient@example.com";
     const raw = [
         `From: ${from}`,
         `To: ${to}`,
+        // iTIP is only applied from a DKIM-verified sender - see ScanQueueJob.maybeProcessItipMessage().
+        ...(opts.dkim === false ? [] : [`Authentication-Results: mx.example.com; dkim=pass header.d=${from.split("@")[1]}`]),
         "Subject: Meeting invite",
         "MIME-Version: 1.0",
         'Content-Type: multipart/mixed; boundary="BOUNDARY"',
@@ -714,6 +716,8 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         const updated = await ingestQueueRepo.findOne({ where: { uid: entry.uid } });
         expect(updated!.status).toBe(IngestStatus.FAILED);
         expect(updated!.errorMessage).toBeTruthy();
+        expect(updated!.attempts).toBe(1);
+        expect(new Date(updated!.nextAttemptAt!).getTime()).toBeGreaterThan(Date.now());
     });
 
     it("Bounds how many pending entries are processed per run to the configured batch size.", async () => {
@@ -891,6 +895,7 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
     });
 
     it("Applies a FORWARD rule, relaying the original raw message to the forward address via MailTransport.", async () => {
+        await createMailbox();
         await mailFilterRuleRepo.save(
             new MailFilterRuleSQL({
                 mailboxUid,
@@ -913,7 +918,10 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
         const forwarded = transport.sent.find((m) => m.envelopeTo.includes("assistant@example.com"));
         expect(forwarded).toBeDefined();
-        expect(forwarded!.envelopeFrom).toBe("sender@example.com");
+        // Sent from the forwarding mailbox (a minimal SRS), marked against forwarding loops.
+        expect(forwarded!.envelopeFrom).toBe("recipient@example.com");
+        expect(forwarded!.raw.toString()).toContain("X-RapidMX-Loop: recipient@example.com");
+        expect(forwarded!.raw.toString()).toContain("From: sender@example.com");
     });
 
     it("Does not evaluate mail filter rules against junk-verdict mail.", async () => {
@@ -1628,7 +1636,10 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
     });
 
     describe("Message recall", () => {
-        const makeRecallRaw = (targetMessageId: string): Buffer => makePlainRawMessage(`X-RapidMX-Recall-Of: ${targetMessageId}`);
+        const makeRecallRaw = (targetMessageId: string, dkim: boolean = true): Buffer =>
+            makePlainRawMessage(
+                `X-RapidMX-Recall-Of: ${targetMessageId}${dkim ? "\r\nAuthentication-Results: mx.example.com; dkim=pass header.d=example.com" : ""}`,
+            );
 
         it("Deletes the target message and reports success when it's still unread.", async () => {
             await createMailbox();
@@ -1638,7 +1649,7 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
                     mailboxUid,
                     folderUid: "inbox-folder",
                     messageId: targetMessageId,
-                    from: { address: "someone@example.com", type: RecipientType.TO },
+                    from: { address: "sender@example.com", type: RecipientType.TO },
                     recipients: [{ address: "recipient@example.com", type: RecipientType.TO }],
                     bodyBlobKey: `bodies/${uuid.v4()}`,
                 }),
@@ -1673,7 +1684,7 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
                     mailboxUid,
                     folderUid: "inbox-folder",
                     messageId: targetMessageId,
-                    from: { address: "someone@example.com", type: RecipientType.TO },
+                    from: { address: "sender@example.com", type: RecipientType.TO },
                     recipients: [{ address: "recipient@example.com", type: RecipientType.TO }],
                     bodyBlobKey: `bodies/${uuid.v4()}`,
                     flags: { read: true, flagged: false, answered: false, forwarded: false },
@@ -2544,6 +2555,380 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             expect(mockFetch).not.toHaveBeenCalled();
             const contacts = await contactRepo.find({ where: { mailboxUid } });
             expect(contacts[0].keys![0].fingerprint).toBe("pinned-fp");
+        });
+    });
+
+    describe("Queue recovery and idempotent delivery", () => {
+        it("Retries a failed entry once its backoff has passed, delivering it exactly once.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            const entry = await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+            expect((await ingestQueueRepo.findOne({ where: { uid: entry.uid } }))!.status).toBe(IngestStatus.FAILED);
+
+            // Not due yet: nothing happens.
+            await blobStore.put(rawBlobKey, makeRawMessage());
+            await job.run();
+            expect((await ingestQueueRepo.findOne({ where: { uid: entry.uid } }))!.status).toBe(IngestStatus.FAILED);
+
+            await ingestQueueRepo.update({ uid: entry.uid }, { nextAttemptAt: new Date(Date.now() - 1000) });
+            await job.run();
+
+            const delivered = await ingestQueueRepo.findOne({ where: { uid: entry.uid } });
+            expect(delivered!.status).toBe(IngestStatus.DELIVERED);
+            expect((await messageRepo.find({ where: { mailboxUid } })).length).toBe(1);
+        });
+
+        it("Leaves an entry FAILED with no further retry once max_attempts is reached.", async () => {
+            const maxAttempts: number = (job as any).maxAttempts;
+            const entry = await createIngestEntry({
+                rawBlobKey: `raw/${uuid.v4()}`,
+                status: IngestStatus.FAILED,
+                attempts: maxAttempts - 1,
+                nextAttemptAt: new Date(Date.now() - 1000),
+            });
+
+            await job.run();
+
+            const updated = await ingestQueueRepo.findOne({ where: { uid: entry.uid } });
+            expect(updated!.status).toBe(IngestStatus.FAILED);
+            expect(updated!.attempts).toBe(maxAttempts);
+            expect(updated!.nextAttemptAt ?? null).toBeNull();
+        });
+
+        it("Takes over a SCANNING entry whose lease has expired, and leaves one with a live lease alone.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const expiredKey = `raw/${uuid.v4()}`;
+            const liveKey = `raw/${uuid.v4()}`;
+            await blobStore.put(expiredKey, makePlainRawMessage());
+            await blobStore.put(liveKey, makePlainRawMessage());
+            const expired = await createIngestEntry({ rawBlobKey: expiredKey, status: IngestStatus.SCANNING, scanLeaseExpiresAt: new Date(Date.now() - 1000) });
+            const live = await createIngestEntry({ rawBlobKey: liveKey, status: IngestStatus.SCANNING, scanLeaseExpiresAt: new Date(Date.now() + 600_000) });
+
+            await job.run();
+
+            expect((await ingestQueueRepo.findOne({ where: { uid: expired.uid } }))!.status).toBe(IngestStatus.DELIVERED);
+            expect((await ingestQueueRepo.findOne({ where: { uid: live.uid } }))!.status).toBe(IngestStatus.SCANNING);
+        });
+
+        it("Skips an entry another worker claimed first, without marking it failed.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage());
+            const entry = await createIngestEntry({ rawBlobKey });
+            // Another worker bumps the row's version between this worker's read and its claim.
+            const repo = (job as any).ingestQueueRepo;
+            const originalFind = repo.find.bind(repo);
+            vi.spyOn(repo, "find").mockImplementationOnce(async (...args: any[]) => {
+                const found = await originalFind(...args);
+                await ingestQueueRepo.update({ uid: entry.uid }, { version: 7 });
+                return found;
+            });
+
+            await job.run();
+
+            const after = await ingestQueueRepo.findOne({ where: { uid: entry.uid } });
+            expect(after!.status).toBe(IngestStatus.PENDING);
+            expect(after!.attempts ?? null).toBeNull();
+            expect((await messageRepo.find({ where: { mailboxUid } })).length).toBe(0);
+        });
+
+        it("Re-processing an entry whose message was already filed doesn't file a second copy, attachment or ScanResult.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeRawMessage());
+            const entry = await createIngestEntry({ rawBlobKey });
+            await job.run();
+
+            // Simulates a worker that filed the message but died before marking the entry DELIVERED.
+            await ingestQueueRepo.update({ uid: entry.uid }, { status: IngestStatus.PENDING });
+            await job.run();
+
+            const messages = await messageRepo.find({ where: { mailboxUid } });
+            expect(messages.length).toBe(1);
+            expect((await attachmentRepo.find({ where: { messageUid: messages[0].uid } })).length).toBe(1);
+            expect((await scanResultRepo.find({ where: { targetUid: messages[0].uid } })).length).toBe(1);
+            expect((await ingestQueueRepo.findOne({ where: { uid: entry.uid } }))!.status).toBe(IngestStatus.DELIVERED);
+        });
+    });
+
+    describe("Mail filter rule safety", () => {
+        it("Ignores MOVE_TO_FOLDER/COPY_TO_FOLDER targets that belong to another mailbox.", async () => {
+            const foreignFolder = await folderRepo.save(
+                new FolderSQL({ mailboxUid: uuid.v4(), name: "Theirs", type: FolderType.USER, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+            );
+            await mailFilterRuleRepo.save(
+                new MailFilterRuleSQL({
+                    mailboxUid,
+                    name: "Exfiltrate",
+                    enabled: true,
+                    sequence: 0,
+                    stopProcessingRules: false,
+                    conditions: { subjectContains: ["Test message"] },
+                    actions: [
+                        { type: MailFilterActionType.MOVE_TO_FOLDER, folderUid: foreignFolder.uid },
+                        { type: MailFilterActionType.COPY_TO_FOLDER, folderUid: foreignFolder.uid },
+                    ],
+                }),
+            );
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeRawMessage());
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            expect((await messageRepo.find({ where: { folderUid: foreignFolder.uid } })).length).toBe(0);
+            const inbox = await folderRepo.findOne({ where: { mailboxUid, type: FolderType.INBOX } });
+            expect((await messageRepo.find({ where: { folderUid: inbox!.uid } })).length).toBe(1);
+        });
+
+        const forwardRule = async (): Promise<void> => {
+            await createMailbox();
+            await mailFilterRuleRepo.save(
+                new MailFilterRuleSQL({
+                    mailboxUid,
+                    name: "Forward",
+                    enabled: true,
+                    sequence: 0,
+                    stopProcessingRules: false,
+                    conditions: {},
+                    actions: [{ type: MailFilterActionType.FORWARD, forwardTo: "assistant@example.com" }],
+                }),
+            );
+        };
+
+        it("Doesn't forward automatically submitted mail.", async () => {
+            await forwardRule();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage("Auto-Submitted: auto-replied"));
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.find((m) => m.envelopeTo.includes("assistant@example.com"))).toBeUndefined();
+        });
+
+        it("Doesn't forward a message this mailbox already forwarded once (loop detection).", async () => {
+            await forwardRule();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage("X-RapidMX-Loop: recipient@example.com"));
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.find((m) => m.envelopeTo.includes("assistant@example.com"))).toBeUndefined();
+        });
+
+        it("Logs a transport rejection of a forward instead of treating it as sent.", async () => {
+            await createMailbox();
+            await mailFilterRuleRepo.save(
+                new MailFilterRuleSQL({
+                    mailboxUid,
+                    name: "Forward",
+                    enabled: true,
+                    sequence: 0,
+                    stopProcessingRules: false,
+                    conditions: {},
+                    actions: [{ type: MailFilterActionType.FORWARD, forwardTo: "reject@example.com" }],
+                }),
+            );
+            const warn = vi.spyOn((job as any).logger, "warn");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage());
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("failed to forward message to reject@example.com"));
+        });
+
+        it("Doesn't record an out-of-office reply the transport rejected as sent.", async () => {
+            await createMailbox({ oofEnabled: true, oofMessage: "Away." });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage());
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "reject@example.com" });
+
+            await job.run();
+
+            expect((await oofReplySuppressionRepo.find({ where: { mailboxUid } })).length).toBe(0);
+        });
+    });
+
+    describe("iTIP sender verification", () => {
+        const deliverItip = async (ics: string, opts: { from?: string; dkim?: boolean } = {}): Promise<void> => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(ics, opts));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: opts.from ?? "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            await job.run();
+        };
+        const saveEvent = async (icalUid: string, organizer: string = "organizer@example.com"): Promise<any> =>
+            await calendarEventRepo.save(
+                new CalendarEventSQL({
+                    folderUid: "calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync",
+                    timezone: "UTC",
+                    organizer: { address: organizer, type: RecipientType.TO },
+                    attendees: [{ address: "attendee@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    sequence: 0,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+        it("Ignores a REQUEST whose sender isn't DKIM-verified.", async () => {
+            const icalUid = uuid.v4();
+            await deliverItip(buildEventIcs(makeIcsEventFixture({ icalUid }), "REQUEST"), { dkim: false });
+            expect((await calendarEventRepo.find({ where: { mailboxUid, icalUid } })).length).toBe(0);
+        });
+
+        it("Ignores a REQUEST whose verified sender isn't the organizer it names.", async () => {
+            const icalUid = uuid.v4();
+            await deliverItip(buildEventIcs(makeIcsEventFixture({ icalUid }), "REQUEST"), { from: "mallory@example.com" });
+            expect((await calendarEventRepo.find({ where: { mailboxUid, icalUid } })).length).toBe(0);
+        });
+
+        it("Ignores a REQUEST that would take over an existing event with a different organizer.", async () => {
+            const icalUid = uuid.v4();
+            const existing = await saveEvent(icalUid);
+            const hijack = makeIcsEventFixture({
+                icalUid,
+                sequence: 5,
+                title: "Hijacked",
+                organizer: { address: "mallory@example.com", type: RecipientType.TO },
+            });
+            await deliverItip(buildEventIcs(hijack, "REQUEST"), { from: "mallory@example.com" });
+            const after = await calendarEventRepo.findOne({ where: { uid: existing.uid } });
+            expect(after!.title).toBe("Team Sync");
+        });
+
+        it("Marks the attendee copy a REQUEST creates as already sent, so MeetingSchedulingJob never re-sends it.", async () => {
+            const icalUid = uuid.v4();
+            await deliverItip(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 2 }), "REQUEST"));
+            const events = await calendarEventRepo.find({ where: { mailboxUid, icalUid } });
+            expect(events.length).toBe(1);
+            expect(events[0].inviteSequenceSent).toBe(2);
+        });
+
+        it("Ignores a REPLY whose sender isn't the attendee replying.", async () => {
+            const icalUid = uuid.v4();
+            const existing = await saveEvent(icalUid);
+            const replyIcs = buildEventIcs(makeIcsEventFixture({ icalUid }), "REPLY", {
+                onlyAttendee: { address: "attendee@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.ACCEPTED, isOrganizer: false },
+            });
+            await deliverItip(replyIcs, { from: "mallory@example.com" });
+            const after = await calendarEventRepo.findOne({ where: { uid: existing.uid } });
+            expect(after!.attendees[0].responseStatus).toBe(AttendeeResponseStatus.NEEDS_ACTION);
+        });
+
+        it("Ignores a CANCEL from anyone but the organizer, and stamps cancelNoticeSentAt on a copy the organizer cancels.", async () => {
+            const icalUid = uuid.v4();
+            const existing = await saveEvent(icalUid);
+            const cancelIcs = buildEventIcs(makeIcsEventFixture({ icalUid }), "CANCEL");
+
+            await deliverItip(cancelIcs, { from: "mallory@example.com" });
+            expect((await calendarEventRepo.findOne({ where: { uid: existing.uid } }))!.deleted).toBe(false);
+
+            await deliverItip(cancelIcs);
+            const cancelled = await calendarEventRepo.findOne({ where: { uid: existing.uid } });
+            expect(cancelled!.deleted).toBe(true);
+            expect(cancelled!.cancelNoticeSentAt).toBeTruthy();
+        });
+
+        it("Reads every existing booking when checking a resource request for conflicts, not just the first page.", async () => {
+            await createMailbox({ isResource: true, autoAcceptBookings: true });
+            const startDate = new Date(Date.now() + 60 * 60 * 1000);
+            const endDate = new Date(startDate.getTime() + 60 * 60 * 1000);
+            const past = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+            const filler: any[] = [];
+            for (let i = 0; i < 500; i++) {
+                filler.push(
+                    new CalendarEventSQL({
+                        folderUid: "calendar-folder",
+                        mailboxUid,
+                        title: `Old ${i}`,
+                        timezone: "UTC",
+                        organizer: { address: "other@example.com", type: RecipientType.TO },
+                        attendees: [],
+                        status: CalendarEventStatus.CONFIRMED,
+                        busyStatus: BusyStatus.BUSY,
+                        icalUid: uuid.v4(),
+                        startDate: past,
+                        endDate: new Date(past.getTime() + 60_000),
+                    }),
+                );
+            }
+            await calendarEventRepo.save(filler);
+            await saveEvent(uuid.v4(), "other@example.com").then(async (conflict) => {
+                await calendarEventRepo.update({ uid: conflict.uid }, { startDate, endDate });
+            });
+
+            const icalUid = uuid.v4();
+            await deliverItip(buildEventIcs(makeIcsEventFixture({ icalUid, startDate, endDate }), "REQUEST"));
+
+            const events = await calendarEventRepo.find({ where: { mailboxUid, icalUid } });
+            expect(events.length).toBe(1);
+            expect(events[0].deleted).toBe(true);
+        });
+    });
+
+    describe("Recall sender verification", () => {
+        const saveTarget = async (messageId: string, from: string): Promise<any> =>
+            await messageRepo.save(
+                new MessageSQL({
+                    mailboxUid,
+                    folderUid: "inbox-folder",
+                    messageId,
+                    from: { address: from, type: RecipientType.TO },
+                    recipients: [{ address: "recipient@example.com", type: RecipientType.TO }],
+                    bodyBlobKey: `bodies/${uuid.v4()}`,
+                }),
+            );
+
+        it("Treats an unverified recall as ordinary mail: nothing is deleted and no read status is reported.", async () => {
+            await createMailbox();
+            const target = await saveTarget("unverified-target@example.com", "sender@example.com");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage("X-RapidMX-Recall-Of: unverified-target@example.com"));
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            expect((await messageRepo.findOne({ where: { uid: target.uid } }))!.deleted).toBe(false);
+            expect((await messageRepo.find({ where: { mailboxUid } })).length).toBe(2);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.some((m) => m.raw.toString().includes("Recall report"))).toBe(false);
+        });
+
+        it("Doesn't let a verified sender recall someone else's message.", async () => {
+            await createMailbox();
+            const target = await saveTarget("someone-elses@example.com", "victim@example.com");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                makePlainRawMessage("X-RapidMX-Recall-Of: someone-elses@example.com\r\nAuthentication-Results: mx.example.com; dkim=pass header.d=example.com"),
+            );
+            await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            expect((await messageRepo.findOne({ where: { uid: target.uid } }))!.deleted).toBe(false);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent[0].raw.toString()).toContain("not found");
         });
     });
 });

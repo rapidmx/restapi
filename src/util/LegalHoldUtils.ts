@@ -19,7 +19,7 @@ function getMatterRepo(objectFactory: ObjectFactory, matterClass: any): Promise<
     return cached;
 }
 
-/** Fetches every page of `repo.find()` results - see `DataExportJob.findAllPages()`'s identical rationale
+/** Fetches every page of `repo.find()` results - see `MailboxContentUtils`' identical rationale
  * (a bare, unpaginated `find()` silently truncates at 100 rows). Unlike `EscrowScope` (admin-only,
  * `@RequiresTrustedRole()`-gated creation, so genuinely a handful of rows in practice - see
  * `EscrowUtils.findHeldScopeIds()`), `Matter` is holder-gated CRUD, not admin-gated: any holder can create
@@ -36,6 +36,49 @@ async function findAllMatters(repo: RepoUtils<Matter>, pageSize: number = 500): 
         }
     }
     return all;
+}
+
+/**
+ * A snapshot of every open `Matter`, loaded once, for a job that has to check many records against legal holds -
+ * `findActiveHoldsFor()` reads every `Matter` on each call, which is far too costly per message in a batch.
+ * A hold placed after the snapshot was taken isn't seen; callers reload between batches to keep that window short.
+ */
+export interface LegalHoldIndex {
+    /** Every mailbox uid named as a custodian by at least one open `Matter`, regardless of date range. */
+    heldMailboxUids: Set<string>;
+    /** `true` if an open `Matter` holds `mailboxUid` (at `referenceDate`, when given - see `findActiveHoldsFor()`). */
+    isHeld(mailboxUid: string, referenceDate?: Date): boolean;
+}
+
+/** Loads a `LegalHoldIndex` - see its doc comment. */
+export async function loadLegalHoldIndex(objectFactory: ObjectFactory, matterClass: any): Promise<LegalHoldIndex> {
+    const repo: RepoUtils<Matter> = await getMatterRepo(objectFactory, matterClass);
+    const open: Matter[] = (await findAllMatters(repo)).filter((matter) => !matter.closedAt);
+    const byMailbox: Map<string, Matter[]> = new Map();
+    for (const matter of open) {
+        for (const mailboxUid of matter.custodianMailboxUids ?? []) {
+            const list: Matter[] = byMailbox.get(mailboxUid) ?? [];
+            list.push(matter);
+            byMailbox.set(mailboxUid, list);
+        }
+    }
+    return {
+        heldMailboxUids: new Set(byMailbox.keys()),
+        isHeld(mailboxUid: string, referenceDate?: Date): boolean {
+            const matters: Matter[] = byMailbox.get(mailboxUid) ?? [];
+            if (!referenceDate) {
+                return matters.length > 0;
+            }
+            return matters.some((matter) => matterCovers(matter, referenceDate));
+        },
+    };
+}
+
+function matterCovers(matter: Matter, referenceDate: Date): boolean {
+    return (
+        referenceDate.getTime() >= new Date(matter.dateRangeStart).getTime() &&
+        referenceDate.getTime() <= new Date(matter.dateRangeEnd).getTime()
+    );
 }
 
 /**

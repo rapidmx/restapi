@@ -26,6 +26,7 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Entity()
 @Description("Defines a single free-form note stored in a `Folder` of type `NOTES`.")
 @Index("note_folder", ["folderUid"])
+@Index("note_mailbox", ["mailboxUid"])
 @Protect(
     {
         uid: "Note",

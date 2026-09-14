@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, type JWTUser } from "@rapidrest/core";
+import { ApiError, UserUtils, type JWTUser } from "@rapidrest/core";
 import {
     ACLAction,
     ApiErrorMessages,
@@ -10,23 +10,31 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    RepoUtils,
     RouteDecorators,
+    type UpdateObject,
 } from "@rapidrest/service-core";
-import { Folder } from "../models/types.js";
+import type { CalendarShareLink, Folder } from "../models/types.js";
 const { Get, Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
-/**
- * See the identical helper (and its rationale for being duplicated rather than shared via a `util/` module)
- * on `BaseScopedChildRoute.ts`.
- */
-function resolveEffectiveUser(user: JWTUser | undefined, query: any): JWTUser | undefined {
-    if (user) {
-        return user;
+/** See the identical constants (and why they're duplicated rather than shared) on `BaseScopedChildRoute.ts`. */
+const SHARE_TOKEN_UID_PREFIX = "share:";
+const SHARE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+/** `Folder` fields only server-side code maintains (counters and the EAS sync key), plus `mailboxUid`, which is the
+ * folder's ACL parent and so can't be moved to another mailbox by a client. */
+const SERVER_MANAGED_FOLDER_FIELDS = ["unreadCount", "totalCount", "syncKeyVersion", "mailboxUid"] as const;
+
+/** See `stripUnsafeQueryKeys()` on `BaseScopedChildRoute.ts`. */
+function stripUnsafeQueryKeys(query: any): Record<string, any> {
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(query ?? {})) {
+        if (key === "shareToken" || key.split(".").some((segment) => segment.startsWith("$"))) {
+            continue;
+        }
+        result[key] = value;
     }
-    const shareToken: unknown = query?.shareToken;
-    return typeof shareToken === "string" && shareToken.length > 0
-        ? ({ uid: shareToken, roles: [], scopes: [] })
-        : undefined;
+    return result;
 }
 
 /**
@@ -59,9 +67,12 @@ function resolveEffectiveUser(user: JWTUser | undefined, query: any): JWTUser | 
  * notification (see `push/MailPushRoute.ts`) to the owning mailbox's channel, so a webmail client subscribed
  * to a mailbox sees new folders appear without polling.
  *
- * `find`/`count`/`exists` also resolve an unauthenticated caller's `?shareToken=` query param via the local
- * `resolveEffectiveUser()` helper below (see `BaseScopedChildRoute`'s doc comment for the full explanation of
- * the mechanism this is one half of).
+ * `exists` also resolves an unauthenticated caller's `?shareToken=` query param via `resolveEffectiveUser()` below,
+ * when `shareLinkClass` is set (see `BaseScopedChildRoute`'s doc comment for the full mechanism). `find`/`count`
+ * check the owning mailbox, which a folder-scoped link never grants, so they don't consult it.
+ *
+ * `create` always has the server mint `uid` and zero the counters; a non-trusted caller's update can't set the
+ * `SERVER_MANAGED_FOLDER_FIELDS`.
  *
  * KNOWN LIMITATIONS:
  * - `update`/`delete` (folder rename/move/removal) do NOT publish a live-update notification, unlike every
@@ -79,6 +90,67 @@ function resolveEffectiveUser(user: JWTUser | undefined, query: any): JWTUser | 
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
+    /** The concrete `CalendarShareLink` model class, so `exists()` can resolve `?shareToken=`. Unset: tokens are ignored. */
+    protected shareLinkClass?: any;
+
+    private shareLinkRepo?: RepoUtils<CalendarShareLink>;
+
+    /** See `BaseScopedChildRoute.resolveEffectiveUser()` - identical, for a link whose `folderUid` is `folderUid`. */
+    private async resolveEffectiveUser(user: JWTUser | undefined, query: any, folderUid: string): Promise<JWTUser | undefined> {
+        if (user) {
+            return user;
+        }
+        const token: unknown = query?.shareToken;
+        if (!this.shareLinkClass || typeof token !== "string" || !SHARE_TOKEN_PATTERN.test(token)) {
+            return undefined;
+        }
+        if (!this.shareLinkRepo) {
+            this.shareLinkRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.shareLinkClass.name,
+                args: [this.shareLinkClass],
+            });
+        }
+        const links: CalendarShareLink[] = await this.shareLinkRepo.find({ token: `eq(${token})`, limit: 1 } as any, {
+            ignoreACL: true,
+            limit: 1,
+        });
+        const link: CalendarShareLink | undefined = links[0];
+        if (!link || link.token !== token || link.folderUid !== folderUid) {
+            return undefined;
+        }
+        if (link.expiresAt && !(new Date(link.expiresAt).getTime() > Date.now())) {
+            return undefined;
+        }
+        return { uid: `${SHARE_TOKEN_UID_PREFIX}${token}`, roles: [], scopes: [] };
+    }
+
+    /** Drops `SERVER_MANAGED_FOLDER_FIELDS` from a non-trusted caller's update patch. */
+    private stripServerManagedFields(obj: Record<string, any>, user: JWTUser | undefined): void {
+        if (user && UserUtils.hasRoles(user, this.trustedRoles)) {
+            return;
+        }
+        for (const field of SERVER_MANAGED_FOLDER_FIELDS) {
+            delete obj[field];
+        }
+    }
+
+    /** Runs for `update()` (via its `@Validate`) and each element of `updateBulk()` - the patch is persisted by reference. */
+    protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser): Promise<void> {
+        this.stripServerManagedFields(obj as Record<string, any>, user);
+        return super.validateUpdate(id, obj, user);
+    }
+
+    /** `CRUDRoute.updateProperty()` validates a throwaway wrapper and persists the raw value, so the field check is
+     * repeated here against the property itself. */
+    public async updateProperty(id: string, propertyName: string, obj: any, user?: JWTUser): Promise<T> {
+        const patch: Record<string, any> = { [propertyName]: obj };
+        this.stripServerManagedFields(patch, user);
+        if (!(propertyName in patch)) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, `'${propertyName}' is managed by the server.`);
+        }
+        return super.updateProperty(id, propertyName, obj, user);
+    }
+
     @Head()
     public async count(
         @Param() params: any,
@@ -93,15 +165,11 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         if (!mailboxUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        if (!(await this.aclUtils!.hasPermission(resolveEffectiveUser(user, query), mailboxUid, ACLAction.COUNT))) {
+        if (typeof mailboxUid !== "string" || !(await this.aclUtils!.hasPermission(user, mailboxUid, ACLAction.COUNT))) {
             return res.status(200).setHeader("content-length", 0);
         }
-        // `shareToken` is consumed above by `resolveEffectiveUser()` for permission resolution only - it names
-        // no field on `T`, so it must not be forwarded into the data filter below (SQL: an unknown-column
-        // error; Mongo: a `$match` no real document ever satisfies, silently returning zero results either way).
-        const { shareToken: _shareToken, ...filterQuery } = query ?? {};
         const result: number = await this.repoUtils.count(
-            { ...filterQuery, ...params },
+            { ...stripUnsafeQueryKeys(query), ...params, mailboxUid: `eq(${mailboxUid})` },
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
         return res.status(200).setHeader("content-length", result);
@@ -123,7 +191,15 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
             if (!mailboxUid || !(await this.aclUtils!.hasPermission(user, mailboxUid, ACLAction.CREATE))) {
                 throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
             }
-            const instance: T = this.repoUtils.instantiateObject(raw);
+            if (typeof mailboxUid !== "string") {
+                throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+            }
+            // The uid is always server-minted: `RepoUtils.create()` reuses an existing `AccessControlList` whose uid
+            // equals the new record's and adds the creator to it with full rights, so a client-chosen uid naming
+            // another mailbox (uid = its address), a class ACL (`Mailbox`, `Domain`, ...) or an orphaned folder ACL
+            // would hand the caller that ACL. The counters start at zero whatever the body says.
+            const { uid: _uid, ...fields } = raw as any;
+            const instance: T = this.repoUtils.instantiateObject({ ...fields, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 });
             const created: T = await this.repoUtils.create(instance, {
                 user,
                 ignoreACL: true,
@@ -144,13 +220,12 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         if (!mailboxUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        if (!(await this.aclUtils!.hasPermission(resolveEffectiveUser(user, query), mailboxUid, ACLAction.LIST))) {
+        if (typeof mailboxUid !== "string" || !(await this.aclUtils!.hasPermission(user, mailboxUid, ACLAction.LIST))) {
             return [];
         }
-        // See the identical `shareToken` exclusion (and its rationale) in `count()` above.
-        const { shareToken: _shareToken, ...filterQuery } = query ?? {};
+        // The client query can't widen the checked mailbox - see `stripUnsafeQueryKeys()`.
         return await this.repoUtils.find(
-            { ...filterQuery, ...params },
+            { ...stripUnsafeQueryKeys(query), ...params, mailboxUid: `eq(${mailboxUid})` },
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
     }
@@ -171,7 +246,7 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
             ignoreACL: true,
         });
         const permitted: boolean = existing
-            ? await this.aclUtils!.hasPermission(resolveEffectiveUser(user, query), existing.uid, ACLAction.EXISTS)
+            ? await this.aclUtils!.hasPermission(await this.resolveEffectiveUser(user, query, existing.uid), existing.uid, ACLAction.EXISTS)
             : false;
         return permitted
             ? res.status(200).setHeader("content-length", 1)

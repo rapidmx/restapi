@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, type JWTUser } from "@rapidrest/core";
+import { ApiError, UserUtils, type JWTUser } from "@rapidrest/core";
 import {
     ACLAction,
     ApiErrorMessages,
@@ -11,32 +11,46 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    RepoUtils,
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
+import type { CalendarShareLink } from "../models/types.js";
 const { Delete, Get, Head, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /**
- * Resolves an unauthenticated caller's `?shareToken=` query parameter into a synthetic, ACL-checkable identity
- * (`uid` = the token itself) when no real authenticated `user` is present — see `BaseScopedChildRoute`'s own
- * doc comment for the full explanation of the mechanism this is one half of. Kept as a small private function
- * duplicated in `BaseScopedChildRoute.ts`/`BaseFolderRoute.ts` (identical in both), rather than a shared
- * `util/` module, deliberately: `ClassLoader` (see `@rapidrest/core`) scans and dynamically `import()`s an
- * entire test-fixture directory's files concurrently via `Promise.all`, and a brand-new leaf module reached
- * for the very first time by *several* of those concurrent imports at once triggered a real, repeatable
- * `"Class extends value undefined"` failure under Vitest's module transform — the same class of "concurrent
- * first dynamic import of the same module can resolve inconsistently" issue already documented on
- * `ConnectionManager.connect()`'s sequential-redis-connection comment. Duplicating these few lines avoids ever
- * introducing that new shared module into the concurrently-scanned graph.
+ * The `userOrRoleId` prefix of the `ACLRecord` a `CalendarShareLink` grants on its folder's ACL, and so the uid of the
+ * synthetic identity a `?shareToken=` caller resolves to. Nothing else mints uids in this form (user uids are UUIDs,
+ * roles are plain names), so a token can never be presented as - or collide with - a real user or role.
+ *
+ * Duplicated (with `SHARE_TOKEN_PATTERN` and the token resolution below) in `BaseFolderRoute.ts`,
+ * `BaseCalendarShareLinkRoute.ts` and `ExternalShareExpirationJob.ts` rather than shared from a `util/` module,
+ * deliberately: `ClassLoader` (see `@rapidrest/core`) scans and dynamically `import()`s an entire test-fixture
+ * directory's files concurrently via `Promise.all`, and a brand-new leaf module reached for the very first time by
+ * *several* of those concurrent imports at once triggered a real, repeatable `"Class extends value undefined"`
+ * failure under Vitest's module transform.
  */
-function resolveEffectiveUser(user: JWTUser | undefined, query: any): JWTUser | undefined {
-    if (user) {
-        return user;
+const SHARE_TOKEN_UID_PREFIX = "share:";
+
+/** Every token `BaseCalendarShareLinkRoute` mints is 32 random bytes, base64url. Checked before any lookup, so the
+ * value is always a plain literal by the time it reaches a query. */
+const SHARE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+/**
+ * Returns a client-supplied list query without any key that could widen it past the scope the route forces:
+ * `$`-prefixed keys (`$or`/`$and`/...) and dotted paths with a `$` segment - on SQL, service-core's
+ * `buildSearchQuerySQL` merges each `$or` branch OVER the other keys, so a branch naming the scope field replaced the
+ * permission-checked value - plus the `shareToken` credential, which names no field.
+ */
+function stripUnsafeQueryKeys(query: any): Record<string, any> {
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(query ?? {})) {
+        if (key === "shareToken" || key.split(".").some((segment) => segment.startsWith("$"))) {
+            continue;
+        }
+        result[key] = value;
     }
-    const shareToken: unknown = query?.shareToken;
-    return typeof shareToken === "string" && shareToken.length > 0
-        ? ({ uid: shareToken, roles: [], scopes: [] })
-        : undefined;
+    return result;
 }
 
 /**
@@ -64,13 +78,19 @@ function resolveEffectiveUser(user: JWTUser | undefined, query: any): JWTUser | 
  * "nothing matches". Write-shaped denials (`create`/`update`/`delete`/`truncate`/`updateProperty`) return
  * `403`, since the caller already knows the target scope/record they were trying to act on.
  *
- * Read-shaped methods also resolve an unauthenticated caller's `?shareToken=` query param via the local
- * `resolveEffectiveUser()` helper below before checking permission — this, together with
- * `BaseCalendarShareLinkRoute` keeping a real `ACLRecord` for each link's token in sync on the shared folder's
- * `AccessControlList`, is the entire mechanism behind anonymous `CalendarShareLink` consumption. There is no
- * separate route or lookup for it: a share link's token is checked by `ACLUtils.hasPermission()` exactly the
- * same way any other uid is, through these same `find`/`count`/`exists`/`findById` methods every other caller
- * already uses.
+ * Read-shaped methods also resolve an unauthenticated caller's `?shareToken=` query param via
+ * `resolveEffectiveUser()` below before checking permission, on a route that sets `shareLinkClass` only. The token
+ * must belong to a real, unexpired `CalendarShareLink` for the very folder being read, and resolves to the synthetic
+ * identity `share:<token>` - which `BaseCalendarShareLinkRoute` keeps a real `ACLRecord` for on the shared folder's
+ * `AccessControlList`, so `ACLUtils.hasPermission()` checks it exactly like any other uid.
+ *
+ * List-shaped methods (`find`/`count`/`truncate`) never let the client query widen the scope: see
+ * `stripUnsafeQueryKeys()` and `scopedFilter()`.
+ *
+ * Writes: `create()` always has the server mint `uid` (a client-chosen uid could name an existing
+ * `AccessControlList` - which `RepoUtils.create()` reuses, adding the creator with full rights - or carry the `,()`
+ * characters the search-query parser treats as syntax); `serverManagedFields` are dropped from a non-trusted caller's
+ * create/update body; `trustedOnlyWrites` restricts every write to trusted callers.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -78,8 +98,97 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
     /** The property name on `T` (and on incoming create bodies / list query params) to check permission by. */
     protected abstract readonly scopeProperty: string;
 
+    /** The concrete `CalendarShareLink` model class, on routes whose records an anonymous share-link holder may read
+     * (`CalendarEvent`). Unset everywhere else, where `?shareToken=` is ignored. */
+    protected shareLinkClass?: any;
+
+    /** When `true`, create/update/updateBulk/updateProperty/delete/truncate are refused (403) to any caller without a
+     * trusted role - for records only the server itself produces (`IngestQueueEntry`, `QuarantineEntry`). Reads are
+     * scoped as usual. */
+    protected readonly trustedOnlyWrites: boolean = false;
+
+    /** Fields only server-side code sets. Dropped from a non-trusted caller's create/update body, so a full object
+     * round-tripped back keeps the stored values. */
+    protected readonly serverManagedFields: readonly string[] = [];
+
+    private shareLinkRepo?: RepoUtils<CalendarShareLink>;
+
     private scopeUidOf(obj: any): string | undefined {
-        return obj?.[this.scopeProperty];
+        const value: unknown = obj?.[this.scopeProperty];
+        // Anything but one plain string (e.g. a repeated `?folderUid=a&folderUid=b`) names no single scope.
+        return typeof value === "string" && value.length > 0 ? value : undefined;
+    }
+
+    protected isTrusted(user: JWTUser | undefined): boolean {
+        return !!user && UserUtils.hasRoles(user, this.trustedRoles);
+    }
+
+    private requireTrustedWrite(user: JWTUser | undefined): void {
+        if (this.trustedOnlyWrites && !this.isTrusted(user)) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+    }
+
+    /** Drops `serverManagedFields` from a non-trusted caller's body. */
+    protected stripServerManagedFields(obj: any, user: JWTUser | undefined): void {
+        if (this.isTrusted(user)) {
+            return;
+        }
+        for (const field of this.serverManagedFields) {
+            delete obj[field];
+        }
+    }
+
+    /** Runs on each create body after its permission check and `mailboxUid` enforcement, before persisting. The
+     * default strips `serverManagedFields`; overrides call `super`. */
+    protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
+        this.stripServerManagedFields(obj, user);
+    }
+
+    /** Runs on each update body after its permission checks, before validation and persisting. The default strips
+     * `serverManagedFields`; overrides call `super`. */
+    protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
+        this.stripServerManagedFields(obj, user);
+    }
+
+    /**
+     * The identity a read is checked as: the authenticated `user` if any; otherwise, on a route with `shareLinkClass`,
+     * `share:<token>` for a `?shareToken=` naming a real, unexpired `CalendarShareLink` whose `folderUid` is exactly
+     * `scopeUid`. Any other token (malformed, unknown, expired, or another folder's) resolves to no identity.
+     */
+    private async resolveEffectiveUser(user: JWTUser | undefined, query: any, scopeUid: string | undefined): Promise<JWTUser | undefined> {
+        if (user) {
+            return user;
+        }
+        const token: unknown = query?.shareToken;
+        if (!this.shareLinkClass || !scopeUid || typeof token !== "string" || !SHARE_TOKEN_PATTERN.test(token)) {
+            return undefined;
+        }
+        if (!this.shareLinkRepo) {
+            this.shareLinkRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.shareLinkClass.name,
+                args: [this.shareLinkClass],
+            });
+        }
+        const links: CalendarShareLink[] = await this.shareLinkRepo.find({ token: `eq(${token})`, limit: 1 } as any, {
+            ignoreACL: true,
+            limit: 1,
+        });
+        const link: CalendarShareLink | undefined = links[0];
+        if (!link || link.token !== token || link.folderUid !== scopeUid) {
+            return undefined;
+        }
+        if (link.expiresAt && !(new Date(link.expiresAt).getTime() > Date.now())) {
+            return undefined;
+        }
+        return { uid: `${SHARE_TOKEN_UID_PREFIX}${token}`, roles: [], scopes: [] };
+    }
+
+    /** The data filter for a list-shaped request: the client query minus anything that could widen it
+     * (`stripUnsafeQueryKeys()`), with the permission-checked scope forced last as a literal `eq(...)`, so the value is
+     * never parsed as an operator. */
+    private scopedFilter(params: any, query: any, scopeUid: string): any {
+        return { ...stripUnsafeQueryKeys(query), ...params, [this.scopeProperty]: `eq(${scopeUid})` };
     }
 
     private async requirePermission(scopeUid: string | undefined, user: JWTUser | undefined, action: string): Promise<void> {
@@ -172,15 +281,11 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!scopeUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        if (!(await this.aclUtils!.hasPermission(resolveEffectiveUser(user, query), scopeUid, ACLAction.COUNT))) {
+        if (!(await this.aclUtils!.hasPermission(await this.resolveEffectiveUser(user, query, scopeUid), scopeUid, ACLAction.COUNT))) {
             return res.status(200).setHeader("content-length", 0);
         }
-        // `shareToken` is consumed above by `resolveEffectiveUser()` for permission resolution only - it names
-        // no field on `T`, so it must not be forwarded into the data filter below (SQL: an unknown-column
-        // error; Mongo: a `$match` no real document ever satisfies, silently returning zero results either way).
-        const { shareToken: _shareToken, ...filterQuery } = query ?? {};
         const result: number = await this.repoUtils.count(
-            { ...filterQuery, ...params },
+            this.scopedFilter(params, query, scopeUid),
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
         return res.status(200).setHeader("content-length", result);
@@ -188,10 +293,14 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
 
     @Post()
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
+        this.requireTrustedWrite(user);
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
         for (const single of objs) {
             await this.requirePermission(this.scopeUidOf(single), user, ACLAction.CREATE);
             await this.enforceMailboxUid(single, this.scopeUidOf(single));
+            // Always a server-minted uid - see this class's doc comment.
+            delete (single as any).uid;
+            await this.prepareCreate(single, user);
         }
         if (Array.isArray(obj)) {
             const created: T[] = await this.doBulkCreate(obj, { req, user, ignoreACL: true });
@@ -216,6 +325,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!this.repoUtils) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
+        this.requireTrustedWrite(user);
         const existing: T | undefined = await this.repoUtils.findOne(id, { version, ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -246,7 +356,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         });
         const scopeUid: string | undefined = existing ? this.scopeUidOf(existing) : undefined;
         const permitted: boolean = scopeUid
-            ? await this.aclUtils!.hasPermission(resolveEffectiveUser(user, query), scopeUid, ACLAction.EXISTS)
+            ? await this.aclUtils!.hasPermission(await this.resolveEffectiveUser(user, query, scopeUid), scopeUid, ACLAction.EXISTS)
             : false;
         return permitted
             ? res.status(200).setHeader("content-length", 1)
@@ -262,13 +372,11 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!scopeUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        if (!(await this.aclUtils!.hasPermission(resolveEffectiveUser(user, query), scopeUid, ACLAction.LIST))) {
+        if (!(await this.aclUtils!.hasPermission(await this.resolveEffectiveUser(user, query, scopeUid), scopeUid, ACLAction.LIST))) {
             return [];
         }
-        // See the identical `shareToken` exclusion (and its rationale) in `count()` above.
-        const { shareToken: _shareToken, ...filterQuery } = query ?? {};
         return await this.repoUtils.find(
-            { ...filterQuery, ...params },
+            this.scopedFilter(params, query, scopeUid),
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
     }
@@ -284,7 +392,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             ignoreACL: true,
         });
         const scopeUid: string | undefined = existing ? this.scopeUidOf(existing) : undefined;
-        if (!scopeUid || !(await this.aclUtils!.hasPermission(resolveEffectiveUser(user, query), scopeUid, ACLAction.READ))) {
+        if (!scopeUid || !(await this.aclUtils!.hasPermission(await this.resolveEffectiveUser(user, query, scopeUid), scopeUid, ACLAction.READ))) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
         return existing!;
@@ -316,13 +424,14 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!this.repoUtils) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
-        await this.requirePermission(this.scopeUidOf(query), user, ACLAction.TRUNCATE);
+        this.requireTrustedWrite(user);
+        const scopeUid: string | undefined = this.scopeUidOf(query);
+        await this.requirePermission(scopeUid, user, ACLAction.TRUNCATE);
         // `truncate()` is ALWAYS a hard, permanent delete (unlike singular `delete()`, which only purges
         // under `purge: true`) - see `checkLegalHold()`'s own doc comment. Every matched record must be
         // checked, the same protection a caller can't route around by simply preferring this bulk endpoint
         // over the equivalent one-at-a-time `delete(..., { purge: true })` calls.
-        const { shareToken: _shareToken, ...filterQuery } = query ?? {};
-        const matched: T[] = await this.findAllForTruncate({ ...filterQuery, ...params }, user);
+        const matched: T[] = await this.findAllForTruncate(this.scopedFilter(params, query, scopeUid!), user);
         if (matched.length === 0) {
             return;
         }
@@ -337,10 +446,12 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         // been through `checkLegalHold()` at all - the exact protection this override exists to add. A
         // record that only starts matching after this snapshot is simply left for a later truncate() call
         // to pick up (and check), rather than being deleted unchecked by this one.
-        await this.repoUtils.truncate(
-            { uid: `in(${matched.map((existing) => existing.uid).join(",")})` } as any,
-            { user, ignoreACL: true },
-        );
+        //
+        // One literal `eq(uid)` per record rather than one `in(a,b,...)`: the query parser splits `in(...)` on commas,
+        // so a (legacy, client-chosen) uid containing one widened the delete to records outside this scope.
+        for (const existing of matched) {
+            await this.repoUtils.truncate({ uid: `eq(${existing.uid})` } as any, { user, ignoreACL: true });
+        }
     }
 
     @Put("/:id")
@@ -353,6 +464,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!this.repoUtils) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
+        this.requireTrustedWrite(user);
         const existing: T | undefined = await this.repoUtils.findOne(id, { skipCache: true, ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -369,6 +481,10 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         // the scope-based permission model this route family exists to enforce - equivalent to planting
         // attacker-controlled content directly into a victim's mailbox, bypassing ingestion/scanning entirely
         // for entities like `Message`/`Attachment`.
+        const rawNewScope: unknown = (obj as any)?.[this.scopeProperty];
+        if (rawNewScope !== undefined && (typeof rawNewScope !== "string" || rawNewScope.length === 0)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
         const newScopeUid: string | undefined = this.scopeUidOf(obj);
         if (newScopeUid !== undefined && newScopeUid !== this.scopeUidOf(existing)) {
             await this.requirePermission(newScopeUid, user, ACLAction.CREATE);
@@ -383,6 +499,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             await this.enforceMailboxUid(obj, newScopeUid !== undefined ? newScopeUid : this.scopeUidOf(existing));
         }
 
+        await this.prepareUpdate(obj, existing, user);
         await this.validate(obj, { user });
         const updated: T = await this.repoUtils.update(obj, existing, { user, ignoreACL: true });
 
@@ -401,6 +518,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
 
     @Put()
     public async updateBulk(obj: UpdateObject<T>[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
+        this.requireTrustedWrite(user);
         const results: T[] = [];
         for (const single of obj) {
             results.push(await this.update(single.uid, single, req, user));
@@ -418,6 +536,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!this.repoUtils) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
+        this.requireTrustedWrite(user);
         const existing: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);

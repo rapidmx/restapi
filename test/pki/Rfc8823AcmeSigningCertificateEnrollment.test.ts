@@ -14,6 +14,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import * as x509 from "@peculiar/x509";
+import * as FileStoreUtils from "../../src/pki/FileStoreUtils.js";
 import { Rfc8823AcmeSigningCertificateEnrollment } from "../../src/pki/Rfc8823AcmeSigningCertificateEnrollment.js";
 import { EnrollmentResult } from "../../src/pki/SigningCertificateEnrollment.js";
 import { ScanPipeline } from "../../src/scan/ScanPipeline.js";
@@ -243,9 +244,15 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
             await expect(enrollment.findPendingEnrollmentId("mismatched-from@example.com", "someone-else@acme.test")).resolves.toBeUndefined();
         });
 
-        it("Returns undefined once the enrollment has already recorded its token-part1.", async () => {
+        it("Still matches after a token-part1 was recorded, until the reply has actually been sent.", async () => {
             const { enrollmentId } = await enrollment.startEnrollment("already-tokened@example.com", await generateCsr("already-tokened@example.com"));
             await enrollment.recordChallengeToken(enrollmentId, "token-part-1", "reply@acme.test", "<id@acme.test>", "ACME: token-part-1");
+
+            await expect(
+                enrollment.findPendingEnrollmentId("already-tokened@example.com", "acme-challenge+abc123@acme.test"),
+            ).resolves.toBe(enrollmentId);
+
+            await enrollment.advanceEnrollment(enrollmentId);
 
             await expect(
                 enrollment.findPendingEnrollmentId("already-tokened@example.com", "acme-challenge+abc123@acme.test"),
@@ -278,17 +285,77 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
             expect(store[enrollmentId].challengeSubject).toBe("ACME: token-part-1-value");
         });
 
-        it("Is idempotent - a second call with a different token-part1 leaves the first recorded value untouched.", async () => {
-            const csr: string = await generateCsr("idempotent@example.com");
-            const { enrollmentId } = await enrollment.startEnrollment("idempotent@example.com", csr);
+        it("A later call before the reply is sent replaces an earlier (e.g. spoofed) recording, digest included.", async () => {
+            const csr: string = await generateCsr("rerecord@example.com");
+            const { enrollmentId } = await enrollment.startEnrollment("rerecord@example.com", csr);
 
-            await enrollment.recordChallengeToken(enrollmentId, "first-token", "reply@acme.test", "<id1@acme.test>", "ACME: first-token");
-            await enrollment.recordChallengeToken(enrollmentId, "second-token", "other@acme.test", "<id2@acme.test>", "ACME: second-token");
+            await enrollment.recordChallengeToken(enrollmentId, "spoofed-token", "reply@acme.test", "<id1@acme.test>", "ACME: spoofed-token");
+            await enrollment.recordChallengeToken(enrollmentId, "genuine-token", "other@acme.test", "<id2@acme.test>", "ACME: genuine-token");
 
             const storePath: string = path.join((enrollment as any).storeDir, "enrollments.json");
             const store = JSON.parse(await fs.readFile(storePath, "utf-8"));
+            expect(store[enrollmentId].tokenPart1).toBe("genuine-token");
+            expect(store[enrollmentId].replyTo).toBe("other@acme.test");
+            expect(store[enrollmentId].challengeMessageId).toBe("<id2@acme.test>");
+            expect(store[enrollmentId].digest).toBe(
+                nodeCrypto.createHash("sha256").update("genuine-tokentoken-part-2-value.test-account-thumbprint").digest("base64url"),
+            );
+        });
+
+        it("Is a silent no-op once the reply has been sent - a late duplicate can't change the digest the CA is validating.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("after-send@example.com", await generateCsr("after-send@example.com"));
+            await enrollment.recordChallengeToken(enrollmentId, "first-token", "reply@acme.test", "<id1@acme.test>", "ACME: first-token");
+            await enrollment.advanceEnrollment(enrollmentId);
+
+            await expect(
+                enrollment.recordChallengeToken(enrollmentId, "late-token", "reply@acme.test", "<id2@acme.test>", "ACME: late-token"),
+            ).resolves.toBeUndefined();
+
+            const store = JSON.parse(await fs.readFile(path.join((enrollment as any).storeDir, "enrollments.json"), "utf-8"));
             expect(store[enrollmentId].tokenPart1).toBe("first-token");
-            expect(store[enrollmentId].replyTo).toBe("reply@acme.test");
+        });
+
+        it("Is a silent no-op for an enrollment that is no longer pending.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("not-pending@example.com", await generateCsr("not-pending@example.com"));
+            const storePath = path.join((enrollment as any).storeDir, "enrollments.json");
+            const store = JSON.parse(await fs.readFile(storePath, "utf-8"));
+            store[enrollmentId].status = "failed";
+            await fs.writeFile(storePath, JSON.stringify(store));
+
+            await enrollment.recordChallengeToken(enrollmentId, "t", "reply@acme.test", "<id@acme.test>", "ACME: t");
+
+            expect(JSON.parse(await fs.readFile(storePath, "utf-8"))[enrollmentId].tokenPart1).toBeUndefined();
+        });
+
+        it.each([
+            ["the CA's exact domain", "reply@acme.test"],
+            ["a subdomain of the CA's domain", "replies@mx.acme.test"],
+            ["a display-name form, case-insensitively", "ACME Replies <Reply@ACME.TEST>"],
+        ])("Accepts a reply-to within %s.", async (_label, replyTo) => {
+            const { enrollmentId } = await enrollment.startEnrollment("reply-ok@example.com", await generateCsr("reply-ok@example.com"));
+
+            await enrollment.recordChallengeToken(enrollmentId, "t", replyTo, "<id@acme.test>", "ACME: t");
+
+            const store = JSON.parse(await fs.readFile(path.join((enrollment as any).storeDir, "enrollments.json"), "utf-8"));
+            expect(store[enrollmentId].replyTo).toBe(replyTo);
+        });
+
+        it.each([
+            ["an unrelated domain", "attacker@evil.example"],
+            ["a lookalike suffix domain", "attacker@evilacme.test"],
+            ["a parent-domain suffix trick", "attacker@acme.test.evil.example"],
+            ["something that isn't a single address", "a@acme.test, b@evil.example"],
+            ["an address with no domain", "reply@"],
+        ])("Throws and records nothing for a reply-to that is %s.", async (_label, replyTo) => {
+            const { enrollmentId } = await enrollment.startEnrollment("reply-bad@example.com", await generateCsr("reply-bad@example.com"));
+
+            await expect(enrollment.recordChallengeToken(enrollmentId, "t", replyTo, "<id@acme.test>", "ACME: t")).rejects.toThrow(
+                /not within the certificate authority's domain/,
+            );
+
+            const store = JSON.parse(await fs.readFile(path.join((enrollment as any).storeDir, "enrollments.json"), "utf-8"));
+            expect(store[enrollmentId].tokenPart1).toBeUndefined();
+            expect(store[enrollmentId].digest).toBeUndefined();
         });
 
         it("Throws 404 for an unknown enrollment id.", async () => {
@@ -376,6 +443,117 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
         expect(resultB.enrollmentId).toBeTruthy();
         await expect(fs.access(path.join((enrollment as any).storeDir, "account.key.pem"))).resolves.toBeUndefined();
         await expect(fs.access(path.join((enrollment as any).storeDir, "account.url"))).resolves.toBeUndefined();
+    });
+
+    describe("ACME account first-run recovery and store concurrency", () => {
+        afterEach(() => {
+            vi.restoreAllMocks();
+        });
+
+        it("Recovers 'key present, account URL missing' by re-registering with the SAME key (never a new one).", async () => {
+            const storeDir: string = (enrollment as any).storeDir;
+            await enrollment.startEnrollment("seed@example.com", await generateCsr("seed@example.com"));
+            const keyBefore: string = await fs.readFile(path.join(storeDir, "account.key.pem"), "utf-8");
+            // Simulate a crash between persisting the key and persisting the account URL.
+            await fs.rm(path.join(storeDir, "account.url"));
+
+            const seenKeys: string[] = [];
+            class KeyCapturingEnrollment extends TestEnrollment {
+                protected createClient(opts: any): any {
+                    seenKeys.push(String(opts.accountKey));
+                    return super.createClient(opts);
+                }
+            }
+            const recovering = new KeyCapturingEnrollment();
+            (recovering as any).storeDir = storeDir;
+            await recovering.startEnrollment("after@example.com", await generateCsr("after@example.com"));
+
+            expect(FakeAcmeClient.createAccountCallCount).toBe(2);
+            expect(seenKeys).toEqual([keyBefore]);
+            expect(await fs.readFile(path.join(storeDir, "account.key.pem"), "utf-8")).toBe(keyBefore);
+            expect(await fs.readFile(path.join(storeDir, "account.url"), "utf-8")).toBe("https://acme.test/acct/1");
+        });
+
+        it("A failed first account registration keeps the persisted key, and the retry reuses it.", async () => {
+            const storeDir: string = (enrollment as any).storeDir;
+            const seenKeys: string[] = [];
+            let failNext = true;
+            class FlakyClient extends FakeAcmeClient {
+                public async createAccount(data?: any): Promise<any> {
+                    if (failNext) {
+                        failNext = false;
+                        throw new Error("CA unreachable");
+                    }
+                    return super.createAccount(data);
+                }
+            }
+            class FlakyEnrollment extends Rfc8823AcmeSigningCertificateEnrollment {
+                protected createClient(opts: any): any {
+                    seenKeys.push(String(opts.accountKey));
+                    return new FlakyClient(opts);
+                }
+            }
+            const flaky = new FlakyEnrollment();
+            (flaky as any).storeDir = storeDir;
+
+            await expect(flaky.startEnrollment("flaky@example.com", await generateCsr("flaky@example.com"))).rejects.toThrow("CA unreachable");
+            await expect(fs.access(path.join(storeDir, "account.url"))).rejects.toThrow();
+            await flaky.startEnrollment("flaky@example.com", await generateCsr("flaky@example.com"));
+
+            expect(seenKeys).toHaveLength(2);
+            expect(seenKeys[1]).toBe(seenKeys[0]);
+            expect(await fs.readFile(path.join(storeDir, "account.key.pem"), "utf-8")).toBe(seenKeys[0]);
+        });
+
+        it("Replaces a blank (torn, pre-atomic-write) account URL file after re-registering with the existing key.", async () => {
+            const storeDir: string = (enrollment as any).storeDir;
+            await enrollment.startEnrollment("blank@example.com", await generateCsr("blank@example.com"));
+            await fs.writeFile(path.join(storeDir, "account.url"), "");
+
+            await enrollment.startEnrollment("blank2@example.com", await generateCsr("blank2@example.com"));
+
+            expect(await fs.readFile(path.join(storeDir, "account.url"), "utf-8")).toBe("https://acme.test/acct/1");
+        });
+
+        it("Gives up with an error after a bounded number of lost initialization races instead of looping forever.", async () => {
+            const spy = vi.spyOn(FileStoreUtils, "createFileExclusive").mockResolvedValue(false);
+
+            await expect(enrollment.startEnrollment("loop@example.com", await generateCsr("loop@example.com"))).rejects.toThrow(
+                /could not initialize the ACME account .* after 5 attempts/,
+            );
+            expect(spy).toHaveBeenCalledTimes(5);
+            expect(FakeAcmeClient.createAccountCallCount).toBe(0);
+        });
+
+        it("Concurrent startEnrollment() calls across instances register the account once and persist every enrollment.", async () => {
+            const other = new TestEnrollment();
+            (other as any).storeDir = (enrollment as any).storeDir;
+            const csrs: string[] = await Promise.all(Array.from({ length: 8 }, (_, i) => generateCsr(`many${i}@example.com`)));
+
+            const results = await Promise.all(csrs.map((csr, i) => (i % 2 ? other : enrollment).startEnrollment(`many${i}@example.com`, csr)));
+
+            expect(FakeAcmeClient.createAccountCallCount).toBe(1);
+            const store = JSON.parse(await fs.readFile(path.join((enrollment as any).storeDir, "enrollments.json"), "utf-8"));
+            expect(Object.keys(store).sort()).toEqual(results.map((r) => r.enrollmentId).sort());
+        });
+
+        it("Overlapping advanceEnrollment() calls send the reply exactly once, and a concurrent attachWrappedKey() isn't lost.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("overlap@example.com", await generateCsr("overlap@example.com"));
+            await enrollment.recordChallengeToken(enrollmentId, "t", "reply@acme.test", "<id@acme.test>", "ACME: t");
+            const wrappedKey = { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" };
+
+            await Promise.all([
+                enrollment.advanceEnrollment(enrollmentId),
+                enrollment.advanceEnrollment(enrollmentId),
+                enrollment.attachWrappedKey(enrollmentId, wrappedKey),
+            ]);
+
+            expect((enrollment as any).mailTransport.send).toHaveBeenCalledTimes(1);
+            expect(FakeAcmeClient.completeChallengeCallCount).toBe(1);
+            const store = JSON.parse(await fs.readFile(path.join((enrollment as any).storeDir, "enrollments.json"), "utf-8"));
+            expect(store[enrollmentId].replySentAt).toBeTruthy();
+            expect(store[enrollmentId].wrappedKey).toEqual(wrappedKey);
+        });
     });
 
     describe("attachWrappedKey()/listPendingEnrollments()/getIssuedMaterial()/markInstalled()", () => {

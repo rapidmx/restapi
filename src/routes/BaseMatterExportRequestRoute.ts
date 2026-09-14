@@ -14,9 +14,13 @@ import { ApiErrorMessages, ApiErrors, HttpResponse, ObjectFactory, RepoUtils, Ro
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
 import { requireEscrowHolder, findHeldScopeIds } from "../util/EscrowUtils.js";
+import { parseListPaging } from "../util/RequestListUtils.js";
 import { EscrowAuditAction, Mailbox, Matter, MatterExportRequest } from "../models/types.js";
 const { Inject, Logger } = ObjectDecorators;
-const { Get, Param, Post, Response, User: AuthUser } = RouteDecorators;
+const { Get, Param, Post, Query, Response, User: AuthUser } = RouteDecorators;
+
+/** Page size for reading every matter under the caller's held scopes - see `find()`. */
+const MATTER_PAGE_SIZE = 500;
 
 /**
  * A holder-invoked eDiscovery export spanning a `Matter`'s full custodian set - see
@@ -95,6 +99,10 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
         await this.init();
         const matter: M = await this.requireMatter(body?.matterId);
         await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        // A closed matter is over - same rule as `BaseEscrowAccessRequestRoute.create()`.
+        if (matter.closedAt) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This matter is closed.");
+        }
 
         const created: T = await this.requestRepo!.create(
             new this.matterExportRequestClass({ matterId: matter.uid, requestedByUserUid: user!.uid, status: "pending" }),
@@ -122,19 +130,45 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
         return created;
     }
 
+    /** Lists export requests for matters under scopes the caller holds, newest first. `?limit=` (default 100, at
+     * most 500) and `?page=` (0-based) page through them; `?matterId=` narrows to one matter (an empty list for a
+     * matter the caller can't see). */
     @Get()
-    public async find(@AuthUser user?: JWTUser): Promise<T[]> {
+    public async find(
+        @Query("limit") limitParam: unknown,
+        @Query("page") pageParam: unknown,
+        @Query("matterId") matterIdParam: unknown,
+        @AuthUser user?: JWTUser,
+    ): Promise<T[]> {
         await this.init();
+        const { limit, page } = parseListPaging({ limit: limitParam, page: pageParam });
         const heldScopeIds: string[] = await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user);
         if (heldScopeIds.length === 0) {
             return [];
         }
-        const matters: M[] = await this.matterRepo!.find({ escrowScopeId: `in(${heldScopeIds.join(",")})` } as any, { ignoreACL: true });
-        if (matters.length === 0) {
+        let matterIds: string[] = [];
+        for (let matterPage = 0; ; matterPage++) {
+            // Every page - a single `find()` stops at 100 rows, hiding the requests of every later matter.
+            const batch: M[] = await this.matterRepo!.find(
+                { escrowScopeId: `in(${heldScopeIds.join(",")})`, sort: "uid", limit: MATTER_PAGE_SIZE, page: matterPage } as any,
+                { ignoreACL: true, limit: MATTER_PAGE_SIZE, page: matterPage },
+            );
+            matterIds.push(...batch.map((m) => m.uid));
+            if (batch.length < MATTER_PAGE_SIZE) {
+                break;
+            }
+        }
+        if (matterIdParam !== undefined) {
+            matterIds = matterIds.filter((uid) => uid === matterIdParam);
+        }
+        if (matterIds.length === 0) {
             return [];
         }
-        const matterIds: string[] = matters.map((m) => m.uid);
-        return await this.requestRepo!.find({ matterId: `in(${matterIds.join(",")})` } as any, { ignoreACL: true });
+        return await this.requestRepo!.find({ matterId: `in(${matterIds.join(",")})`, sort: "-dateCreated", limit, page } as any, {
+            ignoreACL: true,
+            limit,
+            page,
+        });
     }
 
     @Get("/:id")

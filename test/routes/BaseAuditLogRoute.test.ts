@@ -49,4 +49,16 @@ describe("BaseAuditLogRoute Tests (rejectWrite()-guarded method bodies only)", (
             "AuditLogEntry records cannot be created, updated, or deleted through this API.",
         );
     });
+
+    it("updateBulk() throws AUTH_PERMISSION_FAILURE.", async () => {
+        const route = objectFactory.newInstance<TestAuditLogRoute>(TestAuditLogRoute, { initialize: false });
+
+        await expect(route.updateBulk([], {} as any)).rejects.toThrow("AuditLogEntry records cannot be created, updated, or deleted through this API.");
+    });
+
+    it("updateProperty() throws AUTH_PERMISSION_FAILURE.", async () => {
+        const route = objectFactory.newInstance<TestAuditLogRoute>(TestAuditLogRoute, { initialize: false });
+
+        await expect(route.updateProperty("id-1", "targetUid", "x")).rejects.toThrow("AuditLogEntry records cannot be created, updated, or deleted through this API.");
+    });
 });

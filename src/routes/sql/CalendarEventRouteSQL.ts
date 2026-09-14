@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
-import { CalendarEventSQL, FolderSQL, MailboxSQL } from "../../sql.js";
+import { CalendarEventSQL, CalendarShareLinkSQL, FolderSQL, MailboxSQL } from "../../sql.js";
 import { BaseCalendarEventRoute } from "../BaseCalendarEventRoute.js";
 import { RecoverableRepoUtils } from "../../util/RecoverableRepoUtils.js";
 const { Model } = RouteDecorators;
@@ -13,4 +13,5 @@ export class CalendarEventRouteSQL extends BaseCalendarEventRoute<CalendarEventS
     protected readonly repoUtilsClass: any = RecoverableRepoUtils;
     protected mailboxClass: any = MailboxSQL;
     protected folderClass: any = FolderSQL;
+    protected shareLinkClass: any = CalendarShareLinkSQL;
 }

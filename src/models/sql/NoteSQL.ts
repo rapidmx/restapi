@@ -20,6 +20,7 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Entity()
 @Description("Defines a single free-form note stored in a `Folder` of type `NOTES`.")
 @Index("note_folder", ["folderUid"])
+@Index("note_mailbox", ["mailboxUid"])
 @Protect(
     {
         uid: "Note",
@@ -43,7 +44,7 @@ export class NoteSQL extends BaseEntity implements Note {
     @Description("The title of the note.")
     public title: string = "";
 
-    @Column()
+    @Column({ type: "text" })
     @Description("The body content of the note.")
     public body: string = "";
 

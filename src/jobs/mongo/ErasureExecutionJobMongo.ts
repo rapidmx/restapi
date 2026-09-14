@@ -8,6 +8,7 @@ import {
     AuditLogEntryMongo,
     BookingMongo,
     BookingTypeMongo,
+    CalendarShareLinkMongo,
     CalendarEventMongo,
     ContactListMongo,
     ContactMongo,
@@ -16,6 +17,7 @@ import {
     FocusedInboxOverrideMongo,
     FolderMongo,
     IngestQueueEntryMongo,
+    KeyVaultMongo,
     LabelMongo,
     MailboxImportRequestMongo,
     MailboxMongo,
@@ -54,6 +56,8 @@ export class ErasureExecutionJobMongo extends ErasureExecutionJob<DataSubjectEra
     protected ingestQueueEntryClass: any = IngestQueueEntryMongo;
     protected dataExportRequestClass: any = DataExportRequestMongo;
     protected mailboxImportRequestClass: any = MailboxImportRequestMongo;
+    protected keyVaultClass: any = KeyVaultMongo;
+    protected calendarShareLinkClass: any = CalendarShareLinkMongo;
     protected pluginClass: any = PluginMongo;
     protected matterClass: any = MatterMongo;
     protected auditLogClass: any = AuditLogEntryMongo;

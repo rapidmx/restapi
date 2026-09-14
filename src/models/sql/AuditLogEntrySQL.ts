@@ -22,6 +22,7 @@ const { Nullable } = ObjectDecorators;
 @Index("audit_log_mailbox", ["mailboxUid"])
 @Index("audit_log_actor", ["actorUserUid"])
 @Index("audit_log_action", ["action"])
+@Index("audit_log_date_created", ["dateCreated"])
 @Protect(
     {
         uid: "AuditLogEntry",

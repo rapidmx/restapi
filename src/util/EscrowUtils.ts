@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, type JWTUser, type ObjectFactory } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, RepoUtils } from "@rapidrest/service-core";
-import { EscrowScope } from "../models/types.js";
+import { EscrowAccessRequest, EscrowScope } from "../models/types.js";
 
 /** Caches one `RepoUtils` per concrete `EscrowScope` class (Mongo vs SQL) - shared across every calling
  * route rather than each maintaining its own lazy-repo field/getter, mirroring `AuditLogUtils.ts`'s
@@ -69,4 +69,60 @@ export async function findHeldScopeIds(
     const repo: RepoUtils<EscrowScope> = await getEscrowScopeRepo(objectFactory, escrowScopeClass);
     const scopes: EscrowScope[] = await repo.find({}, { ignoreACL: true });
     return scopes.filter((s) => s.holderUserUids.includes(user.uid)).map((s) => s.uid);
+}
+
+/** How long an `EscrowAccessRequest` stays usable after reaching its approval threshold when
+ * `mail:escrow:approval_ttl_hours` isn't configured. */
+export const DEFAULT_ESCROW_APPROVAL_TTL_HOURS = 72;
+
+/** Reads `mail:escrow:approval_ttl_hours` from a route's whole-config object, falling back to
+ * `DEFAULT_ESCROW_APPROVAL_TTL_HOURS` for an unset, non-numeric or non-positive value. */
+export function resolveEscrowApprovalTtlHours(config: any): number {
+    const raw: unknown = typeof config?.get === "function" ? config.get("mail:escrow:approval_ttl_hours") : undefined;
+    const hours: number = typeof raw === "string" ? Number(raw) : (raw as number);
+    return typeof hours === "number" && Number.isFinite(hours) && hours > 0 ? hours : DEFAULT_ESCROW_APPROVAL_TTL_HOURS;
+}
+
+export interface EscrowApprovalState {
+    /** Approvals that still count: one per holder, only from users who are holders of the scope right now. */
+    validApprovalCount: number;
+    /** `true` when `validApprovalCount` reaches the request's `requiredHoldersAtCreation`. */
+    thresholdMet: boolean;
+    /** When the approval that met the threshold was given - `undefined` while `thresholdMet` is `false`. */
+    thresholdMetAt?: Date;
+    /** `thresholdMetAt` plus the approval TTL. */
+    expiresAt?: Date;
+    /** `true` once `expiresAt` has passed. */
+    expired: boolean;
+}
+
+/**
+ * Evaluates `request`'s approvals against `scope` as it is NOW, not as it was when they were given: an approval
+ * from a user who has since been removed from `scope.holderUserUids` no longer counts, and a met threshold only
+ * authorizes access for `ttlHours` from the moment it was met. `requiredHoldersAtCreation` stays the bar (see
+ * `EscrowAccessRequest`'s doc comment), so lowering a scope's `requiredHolders` never loosens a request.
+ */
+export function evaluateEscrowApprovals(
+    request: EscrowAccessRequest,
+    scope: EscrowScope,
+    ttlHours: number,
+    now: Date = new Date(),
+): EscrowApprovalState {
+    const holders: Set<string> = new Set(scope.holderUserUids ?? []);
+    const seen: Set<string> = new Set();
+    const valid: Date[] = [];
+    for (const approval of request.approvals ?? []) {
+        if (holders.has(approval.holderUserUid) && !seen.has(approval.holderUserUid)) {
+            seen.add(approval.holderUserUid);
+            valid.push(new Date(approval.approvedAt));
+        }
+    }
+    valid.sort((a, b) => a.getTime() - b.getTime());
+    const required: number = Math.max(1, request.requiredHoldersAtCreation);
+    if (valid.length < required) {
+        return { validApprovalCount: valid.length, thresholdMet: false, expired: false };
+    }
+    const thresholdMetAt: Date = valid[required - 1];
+    const expiresAt: Date = new Date(thresholdMetAt.getTime() + ttlHours * 60 * 60 * 1000);
+    return { validApprovalCount: valid.length, thresholdMet: true, thresholdMetAt, expiresAt, expired: now.getTime() > expiresAt.getTime() };
 }

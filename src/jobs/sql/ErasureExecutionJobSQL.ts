@@ -8,6 +8,7 @@ import {
     AuditLogEntrySQL,
     BookingSQL,
     BookingTypeSQL,
+    CalendarShareLinkSQL,
     CalendarEventSQL,
     ContactListSQL,
     ContactSQL,
@@ -16,6 +17,7 @@ import {
     FocusedInboxOverrideSQL,
     FolderSQL,
     IngestQueueEntrySQL,
+    KeyVaultSQL,
     LabelSQL,
     MailboxImportRequestSQL,
     MailboxSQL,
@@ -54,6 +56,8 @@ export class ErasureExecutionJobSQL extends ErasureExecutionJob<DataSubjectErasu
     protected ingestQueueEntryClass: any = IngestQueueEntrySQL;
     protected dataExportRequestClass: any = DataExportRequestSQL;
     protected mailboxImportRequestClass: any = MailboxImportRequestSQL;
+    protected keyVaultClass: any = KeyVaultSQL;
+    protected calendarShareLinkClass: any = CalendarShareLinkSQL;
     protected pluginClass: any = PluginSQL;
     protected matterClass: any = MatterSQL;
     protected auditLogClass: any = AuditLogEntrySQL;

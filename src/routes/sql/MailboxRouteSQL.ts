@@ -29,6 +29,12 @@ export class MailboxRouteSQL extends BaseMailboxRoute<MailboxSQL> {
     @Repository(AccessControlListSQL)
     private aclRepo?: TypeOrmRepository<AccessControlListSQL>;
 
+    /** `aliasAddresses` is a serialized `simple-json` column here - see `MailIngestRouteSQL.aliasQueryValue()`. */
+    protected aliasQueryValue(address: string): any {
+        const escaped: string = address.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+        return Raw((alias) => `${alias} LIKE :pattern ESCAPE '\\'`, { pattern: `%"${escaped}"%` });
+    }
+
     /**
      * `AccessControlListSQL.records` is a `simple-json` column (serialized as a single JSON string), the same
      * shape as `MailboxSQL.aliasAddresses` — see `MailIngestRouteSQL.aliasQueryValue()` for the identical

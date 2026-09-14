@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Isolated unit tests for findOrCreateWellKnownFolder() - a hand-built RepoUtils-shaped mock and a fake
 // folder class stand in for the real Mongo/SQL repository/entity.
-import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../../src/util/FolderUtils.js";
+import { findOrCreateWellKnownFolder, getMailboxUidForFolder, wellKnownFolderUid } from "../../src/util/FolderUtils.js";
 import { FolderType } from "../../src/models/types.js";
 
 /** A fake Folder entity class that just captures the data it was constructed with. */
@@ -34,9 +34,10 @@ describe("findOrCreateWellKnownFolder() Tests", () => {
 
         expect(result).toBe(existingFolder);
         expect(repo.create).not.toHaveBeenCalled();
+        // Sorted oldest-first so every caller settles on the same folder when duplicates already exist.
         expect(repo.find).toHaveBeenCalledWith(
-            { mailboxUid: "mbx-1", type: FolderType.INBOX },
-            { ignoreACL: true, limit: 1 },
+            { mailboxUid: "mbx-1", type: FolderType.INBOX, sort: { dateCreated: "ASC", uid: "ASC" }, limit: 1 },
+            { ignoreACL: true, limit: 1, skipCache: true },
         );
     });
 
@@ -49,6 +50,7 @@ describe("findOrCreateWellKnownFolder() Tests", () => {
         const [createdInstance] = repo.create.mock.calls[0];
         expect(createdInstance).toBeInstanceOf(FakeFolder);
         expect(createdInstance.data).toEqual({
+            uid: wellKnownFolderUid("mbx-1", FolderType.JUNK),
             mailboxUid: "mbx-1",
             name: "Junk Email",
             type: FolderType.JUNK,
@@ -90,6 +92,52 @@ describe("findOrCreateWellKnownFolder() Tests", () => {
 
         const [createdInstance] = repo.create.mock.calls[0];
         expect(createdInstance.data.name).toBe("Contacts");
+    });
+
+    it("Derives a stable, per-mailbox-and-type RFC 4122 version 5 uid.", () => {
+        const uid = wellKnownFolderUid("mbx-1", FolderType.INBOX);
+        expect(uid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+        expect(wellKnownFolderUid("mbx-1", FolderType.INBOX)).toBe(uid);
+        expect(wellKnownFolderUid("mbx-2", FolderType.INBOX)).not.toBe(uid);
+        expect(wellKnownFolderUid("mbx-1", FolderType.JUNK)).not.toBe(uid);
+    });
+
+    it("Returns the concurrently created folder when its own create() loses the race on the deterministic uid.", async () => {
+        const winner = { uid: wellKnownFolderUid("mbx-1", FolderType.INBOX), type: FolderType.INBOX };
+        const repo = makeRepo({
+            find: vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([winner]),
+            create: vi.fn().mockRejectedValue(new Error("duplicate key")),
+        });
+
+        const result = await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
+
+        expect(result).toBe(winner);
+        expect(repo.create).toHaveBeenCalledTimes(1);
+    });
+
+    it("Falls back to a random uid when a soft-deleted folder already holds the deterministic uid.", async () => {
+        const repo = makeRepo({
+            create: vi
+                .fn()
+                .mockRejectedValueOnce(new Error("duplicate key"))
+                .mockImplementation(async (instance: any) => instance),
+            findOne: vi.fn().mockResolvedValue({ uid: wellKnownFolderUid("mbx-1", FolderType.INBOX), deleted: true }),
+        });
+
+        const result: any = await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
+
+        expect(repo.create).toHaveBeenCalledTimes(2);
+        expect(repo.findOne).toHaveBeenCalledWith(wellKnownFolderUid("mbx-1", FolderType.INBOX), { ignoreACL: true, includeDeleted: true });
+        expect(result.data.uid).toBeUndefined();
+    });
+
+    it("Rethrows a create() failure that isn't a lost race.", async () => {
+        const repo = makeRepo({
+            create: vi.fn().mockRejectedValue(new Error("connection lost")),
+            findOne: vi.fn().mockResolvedValue(undefined),
+        });
+
+        await expect(findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX)).rejects.toThrow("connection lost");
     });
 
     it("Uses 'Archive' as the default name for FolderType.ARCHIVE.", async () => {

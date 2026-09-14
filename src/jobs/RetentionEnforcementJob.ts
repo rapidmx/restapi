@@ -5,7 +5,8 @@
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
-import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
+import { BlobReferenceSource, deleteBlobsIfUnreferenced, messageBlobReferenceSources } from "../util/BlobReferenceUtils.js";
+import { LegalHoldIndex, loadLegalHoldIndex } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { Attachment, AuditAction, AuditLogEntry, Message, RetentionPolicy } from "../models/types.js";
@@ -41,6 +42,12 @@ const RETENTION_POLICY_UID = "retention-policy";
  * deployment's own compliance policy asserts is gone after N days would in fact remain fully stored and
  * independently downloadable via `BaseAttachmentRoute` indefinitely.
  *
+ * Message content blobs are shared between recipient mailboxes (and mail-filter copies), so a blob is only
+ * deleted once no remaining row references it - see `util/BlobReferenceUtils.ts`. Each run reads expired rows
+ * oldest first in a stable order and pages past rows it skipped (held, or failed to purge), so a stuck row
+ * never blocks the rows behind it; mailboxes under any open hold are left out of the message query altogether
+ * (holds are loaded once per page via `loadLegalHoldIndex()`, not re-read per record).
+ *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`RetentionEnforcementJobMongo`/
  * `RetentionEnforcementJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob`/
  * `MailboxQuotaRecalcJob` use.
@@ -52,6 +59,10 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
     protected abstract messageClass: any;
     protected abstract auditLogClass: any;
     protected abstract attachmentClass: any;
+    /** Counted as references when deciding whether a purged message's shared content blobs can be deleted - see
+     * `util/BlobReferenceUtils.ts`. */
+    protected abstract quarantineEntryClass: any;
+    protected abstract ingestQueueEntryClass: any;
 
     /** Supplied by the Mongo/SQL concrete subclasses so a `Message` purge candidate's legal-hold status
      * can be resolved without depending on either backend directly - see `util/LegalHoldUtils.ts`. */
@@ -133,41 +144,37 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
 
     private async purgeExpiredMessages(maxAgeDays: number): Promise<void> {
         const cutoff: Date = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000);
+        const blobSources: BlobReferenceSource[] = messageBlobReferenceSources({
+            messageClass: this.messageClass,
+            attachmentClass: this.attachmentClass,
+            quarantineEntryClass: this.quarantineEntryClass,
+            ingestQueueEntryClass: this.ingestQueueEntryClass,
+        });
 
-        // See `QuarantineRetentionJob.run()`'s identical comment on `lt(...)` and the `limit` double-pass -
-        // both apply verbatim here.
-        const expired: M[] = await this.messageRepo!.find(
-            { sentDate: `lt(${cutoff.toISOString()})`, limit: this.batchSize } as any,
-            { ignoreACL: true, limit: this.batchSize },
-        );
-
-        let purgedCount = 0;
-        for (const message of expired) {
-            try {
-                await assertNotOnLegalHold(this._objectFactory!, this.matterClass, message.mailboxUid, message.sentDate);
-            } catch {
-                // Under an active hold - skip, don't error. Retried automatically on a later run once the
-                // matter closes.
-                continue;
-            }
-            try {
-                // Every `Attachment` referencing this message first - `Message` deletion has no
-                // database-level cascade onto them (see this class's own doc comment), and each one's own
-                // `blobKey`/`extractedTextBlobKey` content must be explicitly removed the same way
-                // `ErasureExecutionJob` already does for its own cascade. Best-effort per attachment - one
-                // failing here shouldn't block the parent message's own purge below, matching this job's
-                // existing per-record tolerance elsewhere.
+        const purgedCount: number = await this.purgeSortedBatches<M>(
+            this.messageRepo!,
+            "sentDate",
+            cutoff,
+            // A mailbox under any open hold is left out of the query altogether, so a held custodian's (possibly
+            // huge) expired mail never fills the batch ahead of purgeable mail. That is deliberately conservative:
+            // its expired mail outside the hold's date range also waits until the hold closes.
+            (holds) => (holds.heldMailboxUids.size > 0 ? { mailboxUid: `nin(${[...holds.heldMailboxUids].join(",")})` } : {}),
+            (holds, message) => holds.isHeld(message.mailboxUid, message.sentDate),
+            async (message) => {
+                // Every `Attachment` referencing this message first - `Message` deletion has no database-level
+                // cascade onto them (see this class's own doc comment). Best-effort per attachment - one failing
+                // here shouldn't block the parent message's own purge below.
                 const attachments: AT[] = await this.attachmentRepo!.find({ messageUid: message.uid, limit: 1000 } as any, {
                     ignoreACL: true,
                     limit: 1000,
                 });
                 for (const attachment of attachments) {
                     try {
-                        await this.blobStore!.delete((attachment as any).blobKey);
-                        if ((attachment as any).extractedTextBlobKey) {
-                            await this.blobStore!.delete((attachment as any).extractedTextBlobKey);
-                        }
                         await this.attachmentRepo!.delete(attachment.uid, { ignoreACL: true, purge: true });
+                        await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, [
+                            (attachment as any).blobKey,
+                            (attachment as any).extractedTextBlobKey,
+                        ]);
                     } catch (err: any) {
                         this.logger?.warn(
                             `RetentionEnforcementJob: failed to purge attachment ${attachment.uid} for expired message ${message.uid}: ${err.message}`,
@@ -175,16 +182,17 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
                     }
                 }
 
-                await this.blobStore!.delete((message as any).bodyBlobKey);
-                if ((message as any).sanitizedHtmlBlobKey) {
-                    await this.blobStore!.delete((message as any).sanitizedHtmlBlobKey);
-                }
+                // The row goes first, then its content only if no other row still references it: inbound mail
+                // and filter-rule copies share one raw blob across every recipient mailbox (see
+                // `util/BlobReferenceUtils.ts`), including mailboxes this policy isn't purging yet or that are held.
                 await this.messageRepo!.delete(message.uid, { ignoreACL: true, purge: true });
-                purgedCount++;
-            } catch (err: any) {
-                this.logger?.warn(`RetentionEnforcementJob: failed to purge expired message ${message.uid}: ${err.message}`);
-            }
-        }
+                await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, [
+                    (message as any).bodyBlobKey,
+                    (message as any).sanitizedHtmlBlobKey,
+                ]);
+            },
+            (message, err) => this.logger?.warn(`RetentionEnforcementJob: failed to purge expired message ${message.uid}: ${err.message}`),
+        );
 
         if (purgedCount > 0) {
             await this.recordPurge("Message", purgedCount, maxAgeDays);
@@ -194,36 +202,93 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
     private async purgeExpiredAuditLogEntries(maxAgeDays: number): Promise<void> {
         const cutoff: Date = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000);
 
-        const expired: AL[] = await this.auditLogRepo!.find(
-            { dateCreated: `lt(${cutoff.toISOString()})`, limit: this.batchSize } as any,
-            { ignoreACL: true, limit: this.batchSize },
-        );
-
-        let purgedCount = 0;
-        for (const entry of expired) {
-            if (entry.mailboxUid) {
-                try {
-                    await assertNotOnLegalHold(this._objectFactory!, this.matterClass, entry.mailboxUid, entry.dateCreated);
-                } catch {
-                    // Under an active hold - skip, don't error. Retried automatically on a later run once
-                    // the matter closes. Without this check, a `Matter`'s own date range predating this
-                    // policy's enforced minimum (`MIN_AUDIT_LOG_RETENTION_DAYS`) could have its audit
-                    // trail purged out from under it - the exact record the hold exists to preserve -
-                    // while that same mailbox's `Message`s stay correctly protected above.
-                    continue;
-                }
-            }
-            try {
+        const purgedCount: number = await this.purgeSortedBatches<AL>(
+            this.auditLogRepo!,
+            "dateCreated",
+            cutoff,
+            // No query-side exclusion: `mailboxUid NOT IN (...)` would also drop org-wide entries (a NULL
+            // `mailboxUid`) on SQL. Held entries are skipped past instead.
+            () => ({}),
+            // Without this check, a `Matter`'s own date range predating this policy's enforced minimum
+            // (`MIN_AUDIT_LOG_RETENTION_DAYS`) could have its audit trail purged out from under it. An entry with
+            // no `mailboxUid` (an org-wide action) has nothing to check a hold against.
+            (holds, entry) => !!entry.mailboxUid && holds.isHeld(entry.mailboxUid, entry.dateCreated),
+            async (entry) => {
                 await this.auditLogRepo!.delete(entry.uid, { ignoreACL: true, purge: true });
-                purgedCount++;
-            } catch (err: any) {
-                this.logger?.warn(`RetentionEnforcementJob: failed to purge expired audit log entry ${entry.uid}: ${err.message}`);
-            }
-        }
+            },
+            (entry, err) => this.logger?.warn(`RetentionEnforcementJob: failed to purge expired audit log entry ${entry.uid}: ${err.message}`),
+        );
 
         if (purgedCount > 0) {
             await this.recordPurge("AuditLogEntry", purgedCount, maxAgeDays);
         }
+    }
+
+    /**
+     * Purges up to `batchSize` rows whose `dateField` is before `cutoff`, oldest first. Rows that are skipped
+     * (under a legal hold) or fail to purge stay in place and keep their position in the stable
+     * `(dateField, uid)` order, so the remaining result set is always "every row skipped so far, then rows not
+     * yet looked at" - each next page is read past the skipped count instead of re-reading the same stuck rows
+     * forever. Holds are reloaded once per page (one `Matter` read per page rather than per record). Returns
+     * how many rows were purged.
+     */
+    private async purgeSortedBatches<T extends { uid: string }>(
+        repo: RepoUtils<T>,
+        dateField: string,
+        cutoff: Date,
+        queryExclusions: (holds: LegalHoldIndex) => Record<string, any>,
+        isHeld: (holds: LegalHoldIndex, row: T) => boolean,
+        purge: (row: T) => Promise<void>,
+        onError: (row: T, err: any) => void,
+    ): Promise<number> {
+        const pageSize: number = Math.max(1, Math.min(this.batchSize, 1000));
+        // Bounds a run that finds nothing but skipped rows, so a large held backlog can't make one run unbounded.
+        const maxExamined: number = pageSize * 20;
+        let purged = 0;
+        let skipped = 0;
+        let examined = 0;
+        while (purged < this.batchSize && examined < maxExamined) {
+            const holds: LegalHoldIndex = await loadLegalHoldIndex(this._objectFactory!, this.matterClass);
+            const page: number = Math.floor(skipped / pageSize);
+            const rows: T[] = await repo.find(
+                {
+                    ...queryExclusions(holds),
+                    [dateField]: `lt(${cutoff.toISOString()})`,
+                    sort: { [dateField]: "ASC", uid: "ASC" },
+                    limit: pageSize,
+                    page,
+                } as any,
+                { ignoreACL: true, limit: pageSize, page, skipCache: true },
+            );
+            // The first `skipped % pageSize` rows of this page are rows already skipped on an earlier page.
+            const fresh: T[] = rows.slice(skipped % pageSize);
+            if (fresh.length === 0) {
+                break;
+            }
+            for (const row of fresh) {
+                if (purged >= this.batchSize) {
+                    break;
+                }
+                examined++;
+                if (isHeld(holds, row)) {
+                    // Under an active hold - skip, don't error. Retried automatically on a later run once the
+                    // matter closes.
+                    skipped++;
+                    continue;
+                }
+                try {
+                    await purge(row);
+                    purged++;
+                } catch (err: any) {
+                    onError(row, err);
+                    skipped++;
+                }
+            }
+            if (rows.length < pageSize) {
+                break;
+            }
+        }
+        return purged;
     }
 
     /** One audit entry per entity type per run, not one per record - a routine background job purging

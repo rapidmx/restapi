@@ -36,6 +36,10 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Description("Defines a single calendar event/meeting stored in a `Folder` of type `CALENDAR`.")
 @Index("calevent_folder", ["folderUid"])
 @Index("calevent_ical_uid", ["icalUid"])
+@Index("calevent_mailbox", ["mailboxUid"])
+@Index("calevent_start_date", ["startDate"])
+@Index("calevent_status", ["status"])
+@Index("calevent_cancel_notice_sent_at", ["cancelNoticeSentAt"])
 @Protect(
     {
         uid: "CalendarEvent",
@@ -150,6 +154,11 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
     public cancelNoticeSentAt?: Date;
 
     @Column()
+    @Description("The start of the latest occurrence whose reminder has been sent (system-managed).")
+    @Nullable
+    public reminderSentFor?: Date;
+
+    @Column()
     @Description("Provenance for this event's encryption state - see EncryptionOrigin's own doc comment.")
     public encryptionOrigin: EncryptionOrigin = "none";
 
@@ -181,6 +190,7 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
             this.autoReplyMessage = "autoReplyMessage" in other ? other.autoReplyMessage : this.autoReplyMessage;
             this.inviteSequenceSent = "inviteSequenceSent" in other ? other.inviteSequenceSent : this.inviteSequenceSent;
             this.cancelNoticeSentAt = "cancelNoticeSentAt" in other ? other.cancelNoticeSentAt : this.cancelNoticeSentAt;
+            this.reminderSentFor = "reminderSentFor" in other ? other.reminderSentFor : this.reminderSentFor;
             this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
         }
     }

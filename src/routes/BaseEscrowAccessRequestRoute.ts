@@ -17,11 +17,13 @@ import {
 } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
-import { findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
+import { evaluateEscrowApprovals, findHeldScopeIds, requireEscrowHolder, resolveEscrowApprovalTtlHours } from "../util/EscrowUtils.js";
+import { parseListPaging } from "../util/RequestListUtils.js";
 import {
     AuditAction,
     EscrowAccessRequest,
     EscrowAuditAction,
+    EscrowScope,
     KeyVault,
     Mailbox,
     Matter,
@@ -30,6 +32,12 @@ import {
 const { Config, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
 const { Get, Param, Post, Query, Request, User: AuthUser } = RouteDecorators;
+
+/** How many times a `persist*()` call is attempted in total - see `retryOnAuditConflict()`. */
+const MAX_PERSIST_ATTEMPTS = 3;
+
+/** Page size for reading every matter under the caller's held scopes - see `findAllMatterIds()`. */
+const MATTER_PAGE_SIZE = 500;
 
 
 /** The wire shape `GET /:id/material` returns - only ever the escrow-method wraps, scoped to the
@@ -115,8 +123,29 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         }
     }
 
-    private async requireRequest(id: string): Promise<R> {
-        const request: R | undefined = await this.requestRepo!.findOne(id, { ignoreACL: true });
+    /**
+     * Runs one of the `@Transactional()` `persist*()` methods, retrying the WHOLE call (a fresh transaction each
+     * time) when it fails with anything but an `ApiError`. `recordEscrowAuditEntry()` already retries a
+     * `sequence` collision with a concurrent append on its own, but inside a transaction that can't work: on
+     * PostgreSQL the failed insert aborts the transaction, so every retry within it fails too. `attempt` lets the
+     * caller re-read state a previous, non-transactional attempt (a MongoDB deployment without transactions) may
+     * already have written. An `ApiError` (a version conflict, a validation failure) is a real answer, not a race.
+     */
+    private async retryOnAuditConflict<X>(fn: (attempt: number) => Promise<X>): Promise<X> {
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return await fn(attempt);
+            } catch (err) {
+                if (err instanceof ApiError || attempt + 1 >= MAX_PERSIST_ATTEMPTS) {
+                    throw err;
+                }
+                this.logger?.warn(`EscrowAccessRequestRoute: retrying after a failed escrow audit append: ${(err as any)?.message}`);
+            }
+        }
+    }
+
+    private async requireRequest(id: string, skipCache: boolean = false): Promise<R> {
+        const request: R | undefined = await this.requestRepo!.findOne(id, { ignoreACL: true, skipCache });
         if (!request) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
@@ -176,12 +205,16 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
             status: approvals.length >= scope.requiredHolders ? "approved" : "pending",
         });
 
-        return await this.persistCreate(instance);
+        return await this.retryOnAuditConflict(() => this.persistCreate(instance));
     }
 
     @Transactional()
     protected async persistCreate(instance: R): Promise<R> {
-        const created: R = await this.requestRepo!.create(instance, { ignoreACL: true });
+        // A retry (see `retryOnAuditConflict()`) reuses `instance` and its uid - without a transaction the first
+        // attempt's row can already exist.
+        const created: R =
+            (await this.requestRepo!.findOne(instance.uid, { ignoreACL: true, skipCache: true })) ??
+            (await this.requestRepo!.create(instance, { ignoreACL: true }));
         await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: created.requestedByUserUid,
@@ -201,22 +234,33 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         }
         const matter: M = await this.requireMatter(request.matterId);
         await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        if (matter.closedAt) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This matter is closed.");
+        }
         if (request.approvals.some((a) => a.holderUserUid === user!.uid)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "You have already approved this request.");
         }
 
-        return await this.persistApprove(request, user!.uid);
+        return await this.retryOnAuditConflict(async (attempt) =>
+            this.persistApprove(attempt === 0 ? request : await this.requireRequest(id, true), user!.uid),
+        );
     }
 
     @Transactional()
     protected async persistApprove(request: R, holderUserUid: string): Promise<R> {
-        const approvals = [...request.approvals, { holderUserUid, approvedAt: new Date() }];
-        const status = approvals.length >= request.requiredHoldersAtCreation ? "approved" : "pending";
-        const updated: R = await this.requestRepo!.update(
-            { uid: request.uid, version: (request as any).version, approvals, status } as any,
-            request,
-            { ignoreACL: true },
-        );
+        // Only on a retry without a transaction (see `retryOnAuditConflict()`) can the approval already be saved.
+        const updated: R = request.approvals.some((a) => a.holderUserUid === holderUserUid)
+            ? request
+            : await this.requestRepo!.update(
+                  {
+                      uid: request.uid,
+                      version: (request as any).version,
+                      approvals: [...request.approvals, { holderUserUid, approvedAt: new Date() }],
+                      status: request.approvals.length + 1 >= request.requiredHoldersAtCreation ? "approved" : "pending",
+                  } as any,
+                  request,
+                  { ignoreACL: true },
+              );
         await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
             action: EscrowAuditAction.REQUEST_APPROVED,
             holderUserUid,
@@ -259,6 +303,17 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         return updated;
     }
 
+    /**
+     * Releases the mailbox's escrow wraps for an approved request - re-checking, at read time, everything its
+     * approval depended on rather than trusting a status set earlier:
+     *
+     * - the matter is still open, and the mailbox is still one of its custodians and still assigned to its scope
+     * (`409` otherwise);
+     * - enough of the approvals come from users who are STILL holders of the scope - an approval from a holder
+     * who has since been removed doesn't count (`403`);
+     * - the threshold was met no more than `mail:escrow:approval_ttl_hours` (default 72) ago (`403`) - a new
+     * request must be approved for access after that.
+     */
     @Get("/:id/material")
     public async material(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<EscrowAccessMaterial> {
         await this.init();
@@ -267,16 +322,40 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Dual control threshold not yet met.");
         }
         const matter: M = await this.requireMatter(request.matterId);
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        const scope: EscrowScope = await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        if (matter.closedAt) {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This matter is closed.");
+        }
 
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(request.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
+        if (!(matter.custodianMailboxUids ?? []).includes(request.mailboxUid) || (mailbox as any).escrowScopeId !== matter.escrowScopeId) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                "This mailbox is no longer a custodian of this matter or no longer assigned to its escrow scope.",
+            );
+        }
+        const approvalState = evaluateEscrowApprovals(request, scope, resolveEscrowApprovalTtlHours(this.config));
+        if (!approvalState.thresholdMet) {
+            throw new ApiError(
+                ApiErrors.AUTH_PERMISSION_FAILURE,
+                403,
+                "Dual control threshold is no longer met - approvals from users who are no longer holders don't count.",
+            );
+        }
+        if (approvalState.expired) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "This request's approval has expired - open a new access request.");
+        }
+
         const keyVault: KeyVault | undefined = await this.findKeyVault(request.mailboxUid);
         const masterKeyWraps: MasterKeyWrap[] = keyVault?.masterKeyWraps ?? [];
 
-        await this.persistMaterialRead(request, user!.uid, matter.escrowScopeId);
+        await this.retryOnAuditConflict(async (attempt) =>
+            this.persistMaterialRead(attempt === 0 ? request : await this.requireRequest(id, true), user!.uid, matter.escrowScopeId),
+        );
 
         return {
             masterKeyWraps: masterKeyWraps.filter((w) => w.method === "escrow" && w.escrowScopeId === matter.escrowScopeId),
@@ -303,25 +382,53 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         }
     }
 
+    /**
+     * Lists the requests for matters under scopes the caller holds, newest first (`dateCreated` descending).
+     * `?limit=` (default 100, at most 500) and `?page=` (0-based) page through them; `?matterId=` narrows to one
+     * matter (an empty list for a matter the caller can't see). Other plain field filters (e.g. `?status=`) still
+     * apply; `$`-prefixed keys are dropped - the SQL backend composes a `$or` branch over the forced `matterId`
+     * restriction, which would otherwise let a holder list requests of matters they don't hold.
+     */
     @Get()
     public async find(@Query() query: any, @AuthUser user?: JWTUser): Promise<R[]> {
         await this.init();
+        const { limit, page } = parseListPaging(query);
         const heldScopeIds: string[] = await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user);
         if (heldScopeIds.length === 0) {
             return [];
         }
-        const matters: M[] = await this.matterRepo!.find(
-            { escrowScopeId: `in(${heldScopeIds.join(",")})` } as any,
-            { ignoreACL: true },
-        );
-        if (matters.length === 0) {
+        let matterIds: string[] = await this.findAllMatterIds(heldScopeIds);
+        if (query?.matterId !== undefined) {
+            matterIds = matterIds.filter((uid) => uid === query.matterId);
+        }
+        if (matterIds.length === 0) {
             return [];
         }
-        const matterIds: string[] = matters.map((m) => m.uid);
+        const filter: Record<string, any> = {};
+        for (const [key, value] of Object.entries(query ?? {})) {
+            if (!key.startsWith("$") && !["matterId", "limit", "page", "sort"].includes(key)) {
+                filter[key] = value;
+            }
+        }
         return await this.requestRepo!.find(
-            { ...query, matterId: `in(${matterIds.join(",")})` },
-            { limit: query?.limit, page: query?.page, ignoreACL: true },
+            { ...filter, matterId: `in(${matterIds.join(",")})`, sort: "-dateCreated", limit, page } as any,
+            { limit, page, ignoreACL: true },
         );
+    }
+
+    /** The uid of every matter under `scopeIds` - every page, since a single `find()` stops at 100 rows. */
+    private async findAllMatterIds(scopeIds: string[]): Promise<string[]> {
+        const matterIds: string[] = [];
+        for (let page = 0; ; page++) {
+            const batch: M[] = await this.matterRepo!.find(
+                { escrowScopeId: `in(${scopeIds.join(",")})`, sort: "uid", limit: MATTER_PAGE_SIZE, page } as any,
+                { ignoreACL: true, limit: MATTER_PAGE_SIZE, page },
+            );
+            matterIds.push(...batch.map((m) => m.uid));
+            if (batch.length < MATTER_PAGE_SIZE) {
+                return matterIds;
+            }
+        }
     }
 
     @Get("/:id")

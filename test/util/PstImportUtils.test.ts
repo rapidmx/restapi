@@ -11,7 +11,15 @@
 import * as fs from "fs";
 import * as path from "path";
 import { PSTFile, PSTFolder, PSTMessage } from "pst-extractor";
-import { buildRawMimeFromPstMessage, collectMailItems, extractPstMessages, readAttachmentContent } from "../../src/util/PstImportUtils.js";
+import {
+    buildRawMimeFromPstMessage,
+    collectMailItems,
+    DEFAULT_PST_MAX_TOTAL_BYTES,
+    defaultPstExtractionBudget,
+    extractPstMessages,
+    PstAllocationBudget,
+    readAttachmentContent,
+} from "../../src/util/PstImportUtils.js";
 
 const FIXTURE_PATH = path.join(process.cwd(), "node_modules/pst-extractor/example/testdata/enron.pst");
 
@@ -293,6 +301,73 @@ describe("PstImportUtils Tests", () => {
             const text = raw.toString("latin1");
             expect(text).toContain("multipart/mixed");
             expect(text).not.toContain("huge.bin");
+        });
+
+        it("Fails once many individually-allowed attachments exhaust the cumulative allocation budget.", async () => {
+            const readSpy = vi.fn((buf: Buffer) => buf.fill(1));
+            const message = fakeMessage({
+                body: "hi",
+                hasAttachments: true,
+                numberOfAttachments: 50,
+                getAttachment: () => ({
+                    fileInputStream: { readCompletely: readSpy },
+                    filesize: 100,
+                    filename: "a.bin",
+                    longFilename: "a.bin",
+                    mimeTag: "",
+                }),
+            });
+            // Every attachment passes the per-attachment bound (100 <= 1000), but 50 of them don't fit in 1000 total.
+            await expect(buildRawMimeFromPstMessage(message, 1_000, new PstAllocationBudget(1_000))).rejects.toThrow(
+                "PST import exceeds the maximum total extracted size of 1000 bytes.",
+            );
+            // Stopped before allocating past the budget - not after reading all 50.
+            expect(readSpy.mock.calls.length).toBeLessThan(10);
+        });
+
+        it("Accumulates the budget across messages, crediting a message's already-counted attachment bytes against its own output.", async () => {
+            const budget = new PstAllocationBudget(1_000_000);
+            const message = fakeMessage({
+                body: "hi",
+                hasAttachments: true,
+                numberOfAttachments: 1,
+                getAttachment: () => ({ fileInputStream: { readCompletely: (buf: Buffer) => buf.fill(1) }, filesize: 300, filename: "a", longFilename: "a", mimeTag: "" }),
+            });
+            const first = await buildRawMimeFromPstMessage(message, Infinity, budget);
+            expect(budget.usedBytes).toBe(first.length);
+            const second = await buildRawMimeFromPstMessage(message, Infinity, budget);
+            expect(budget.usedBytes).toBe(first.length + second.length);
+        });
+    });
+
+    describe("PST cumulative allocation budget", () => {
+        it("PstAllocationBudget throws rather than exceeding its limit, and leaves usage unchanged when it does.", () => {
+            const budget = new PstAllocationBudget(10);
+            budget.consume(6);
+            expect(() => budget.consume(5)).toThrow("maximum total extracted size of 10 bytes");
+            expect(budget.usedBytes).toBe(6);
+            budget.consume(4);
+            expect(budget.usedBytes).toBe(10);
+        });
+
+        it("readAttachmentContent() charges the budget before allocating.", () => {
+            const budget = new PstAllocationBudget(5);
+            const attachment = { fileInputStream: { readCompletely: (buf: Buffer) => buf.fill(7) }, filesize: 4 } as any;
+            expect(readAttachmentContent(attachment, 1_000, budget)).toEqual(Buffer.alloc(4, 7));
+            expect(() => readAttachmentContent(attachment, 1_000, budget)).toThrow("PST import exceeds");
+        });
+
+        it("defaultPstExtractionBudget() scales with file size, floored at 64 MiB and capped at 4 GiB.", () => {
+            expect(defaultPstExtractionBudget(1_000)).toBe(64 * 1024 * 1024);
+            expect(defaultPstExtractionBudget(100 * 1024 * 1024)).toBe(400 * 1024 * 1024);
+            expect(defaultPstExtractionBudget(10 * 1024 * 1024 * 1024)).toBe(DEFAULT_PST_MAX_TOTAL_BYTES);
+        });
+
+        it("extractPstMessages() fails the real fixture when given a total budget too small for its content, and succeeds with the default.", async () => {
+            const buffer = fs.readFileSync(FIXTURE_PATH);
+            await expect(extractPstMessages(buffer, 1_000_000)).rejects.toThrow("PST import exceeds the maximum total extracted size of 1000000 bytes.");
+            // The default (4x file size, >= 64 MiB) comfortably fits a genuine PST - the 71-message test above.
+            expect(defaultPstExtractionBudget(buffer.length)).toBeGreaterThanOrEqual(buffer.length * 4);
         });
     });
 });

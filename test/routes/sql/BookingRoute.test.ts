@@ -30,6 +30,7 @@ import {
     RecurrenceFrequency,
 } from "../../../src/models/types.js";
 import { RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
+import { bookingSecuritySuite } from "../bookingSecuritySuite.js";
 
 // Every slot below sits on one fixed, far-future date so that it is always in the future no matter when the
 // suite runs, WITHOUT freezing the clock. Freezing it with `vi.useFakeTimers({ toFake: ["Date"] })` is
@@ -677,5 +678,23 @@ describe("Route:BookingSQL Tests (anonymous)", () => {
         // the mail is attempted, so there is nothing a thrown error could usefully undo.
         expect(result.status).toBe(200);
         expect(mailTransport.sent).toHaveLength(0);
+    });
+    bookingSecuritySuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        mailboxUid: () => mailbox.uid,
+        calendarFolderUid: () => calendarFolder.uid,
+        createBookingType,
+        createEvent,
+        createEvents: async (data: any[]) => {
+            for (let i = 0; i < data.length; i += 50) {
+                await Promise.all(data.slice(i, i + 50).map((d) => createEvent(d)));
+            }
+        },
+        createFolder: async (data: any) =>
+            await folderRepo.save(new FolderSQL({ unreadCount: 0, totalCount: 0, syncKeyVersion: 0, ...data })),
+        findEvents: async () => await calendarEventRepo.find(),
+        findBookings: async () => await bookingRepo.find(),
+        rateLimiter: () => objectFactory.getInstance(RateLimiter),
     });
 });

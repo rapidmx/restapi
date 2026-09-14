@@ -11,6 +11,7 @@ import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, Rou
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
+import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, Folder, Mailbox, MailboxImportFormat, MailboxImportRequest } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Query, Request, User: AuthUser } = RouteDecorators;
@@ -168,35 +169,33 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         return created;
     }
 
+    /** Newest first; `?limit=` (default 100, at most 500) and `?page=` (0-based) page through the list - see
+     * `util/RequestListUtils.ts`. */
     @Get()
-    public async find(@AuthUser user?: JWTUser): Promise<T[]> {
+    public async find(@Query("limit") limitParam: unknown, @Query("page") pageParam: unknown, @AuthUser user?: JWTUser): Promise<T[]> {
         await this.init();
+        const { limit, page } = parseListPaging({ limit: limitParam, page: pageParam });
         if (!user) {
             return [];
         }
+        const paging = { sort: "-dateCreated", limit, page };
         if (UserUtils.hasRoles(user, this.trustedRoles)) {
-            return await this.requestRepo!.find({}, { ignoreACL: true });
+            return await this.requestRepo!.find(paging as any, { ignoreACL: true, limit, page });
         }
         // A non-trusted caller sees every request they see under `canView()`'s own broader definition
         // (they made it, OR it's for a mailbox they own) - not just ones `requestedByUserUid` names, the
         // same gap `BaseDataExportRoute.find()`'s identical fix documents in full: an admin-mediated
         // request's `requestedByUserUid` is the ADMIN's uid, never the owner's, so filtering by that field
         // alone would leave it invisible to the very owner `findById()` already lets view.
-        const ownRequests: T[] = await this.requestRepo!.find({ requestedByUserUid: user.uid } as any, { ignoreACL: true });
-        const ownedMailboxes: MB[] = await this.mailboxRepo!.find({ ownerUserUid: user.uid } as any, { ignoreACL: true });
-        if (ownedMailboxes.length === 0) {
-            return ownRequests;
-        }
-        const ownedMailboxUids: string[] = ownedMailboxes.map((m) => m.uid);
-        const requestsForOwnedMailboxes: T[] = await this.requestRepo!.find(
-            { mailboxUid: `in(${ownedMailboxUids.join(",")})` } as any,
-            { ignoreACL: true },
+        // One query (`$or`) rather than two merged lists, so a page is a real page of the combined set.
+        const ownedMailboxUids: string[] = (await this.mailboxRepo!.find({ ownerUserUid: `eq(${user.uid})` } as any, { ignoreACL: true })).map(
+            (m) => m.uid,
         );
-        const byUid = new Map<string, T>();
-        for (const request of [...ownRequests, ...requestsForOwnedMailboxes]) {
-            byUid.set(request.uid, request);
+        const visible: any[] = [{ requestedByUserUid: `eq(${user.uid})` }];
+        if (ownedMailboxUids.length > 0) {
+            visible.push({ mailboxUid: `in(${ownedMailboxUids.join(",")})` });
         }
-        return Array.from(byUid.values());
+        return await this.requestRepo!.find({ $or: visible, ...paging } as any, { ignoreACL: true, limit, page });
     }
 
     @Get("/:id")

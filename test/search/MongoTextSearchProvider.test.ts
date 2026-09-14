@@ -5,7 +5,7 @@
 // Isolated unit tests for MongoTextSearchProvider - the injected ConnectionManager and the Mongo `Collection`
 // it resolves are both hand-built mocks; no real MongoDB connection is made.
 import { MongoTextSearchProvider } from "../../src/search/MongoTextSearchProvider.js";
-import type { SearchDocument } from "../../src/search/SearchProvider.js";
+import { MAX_SEARCH_DOCUMENT_TEXT_CHARS, type SearchDocument } from "../../src/search/SearchProvider.js";
 
 /** Builds a chainable cursor mock matching the subset of the Mongo `find()` cursor API this provider uses. */
 function makeCursor(rows: any[]) {
@@ -105,10 +105,10 @@ describe("MongoTextSearchProvider Tests", () => {
                         upsert: true,
                     },
                 },
-            ]);
+            ], { ordered: false });
         });
 
-        it("Flattens attachmentText and participants arrays into joined strings.", async () => {
+        it("Flattens attachmentText into a joined string and stores participants as an array.", async () => {
             wireConnection();
             await (provider as any).init();
             const doc = makeDoc({ attachmentText: ["page one", "page two"], participants: ["a@x.com", "b@x.com"] });
@@ -117,7 +117,69 @@ describe("MongoTextSearchProvider Tests", () => {
 
             const call = mockCollection.bulkWrite.mock.calls[0][0][0];
             expect(call.replaceOne.replacement.attachmentText).toBe("page one\npage two");
-            expect(call.replaceOne.replacement.participants).toBe("a@x.com b@x.com");
+            expect(call.replaceOne.replacement.participants).toEqual(["a@x.com", "b@x.com"]);
+        });
+
+        it("Truncates subject/body/attachmentText to MAX_SEARCH_DOCUMENT_TEXT_CHARS in total before storing.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const doc = makeDoc({
+                subject: "s",
+                body: "b".repeat(MAX_SEARCH_DOCUMENT_TEXT_CHARS),
+                attachmentText: ["dropped"],
+            });
+
+            await provider.index(doc);
+
+            const replacement = mockCollection.bulkWrite.mock.calls[0][0][0].replaceOne.replacement;
+            expect(replacement.subject).toBe("s");
+            expect(replacement.body).toHaveLength(MAX_SEARCH_DOCUMENT_TEXT_CHARS - 1);
+            expect(replacement.attachmentText).toBe("");
+        });
+
+        it("bulkIndex() returns every entityUid when the bulk write succeeds.", async () => {
+            wireConnection();
+            await (provider as any).init();
+
+            const result = await provider.bulkIndex([makeDoc({ entityUid: "msg-1" }), makeDoc({ entityUid: "msg-2" })]);
+
+            expect(result).toEqual(["msg-1", "msg-2"]);
+        });
+
+        it("bulkIndex() isolates per-document write errors, returning only the entityUids that were written.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const bulkError: any = new Error("bulk write failed");
+            bulkError.writeErrors = [{ index: 1, errmsg: "document too large" }];
+            mockCollection.bulkWrite.mockRejectedValue(bulkError);
+
+            const result = await provider.bulkIndex([
+                makeDoc({ entityUid: "msg-1" }),
+                makeDoc({ entityUid: "msg-2" }),
+                makeDoc({ entityUid: "msg-3" }),
+            ]);
+
+            expect(result).toEqual(["msg-1", "msg-3"]);
+        });
+
+        it("bulkIndex() accepts a single (non-array) writeErrors entry.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const bulkError: any = new Error("bulk write failed");
+            bulkError.writeErrors = { index: 0, errmsg: "bad" };
+            mockCollection.bulkWrite.mockRejectedValue(bulkError);
+
+            const result = await provider.bulkIndex([makeDoc({ entityUid: "msg-1" }), makeDoc({ entityUid: "msg-2" })]);
+
+            expect(result).toEqual(["msg-2"]);
+        });
+
+        it("bulkIndex() rethrows a whole-batch failure that isn't a bulk write error.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockCollection.bulkWrite.mockRejectedValue(new Error("connection closed"));
+
+            await expect(provider.bulkIndex([makeDoc()])).rejects.toThrow("connection closed");
         });
 
         it("bulkIndex() is a no-op when given an empty array.", async () => {
@@ -130,7 +192,7 @@ describe("MongoTextSearchProvider Tests", () => {
         });
 
         it("bulkIndex() is a no-op when no collection has been initialized.", async () => {
-            await provider.bulkIndex([makeDoc()]);
+            await expect(provider.bulkIndex([makeDoc()])).resolves.toEqual([]);
             // No throw, and nothing to assert against since no collection was ever wired.
         });
 
@@ -244,7 +306,7 @@ describe("MongoTextSearchProvider Tests", () => {
             expect(cursor.skip).toHaveBeenCalledWith(0);
         });
 
-        it("Caps the effective limit at 200.", async () => {
+        it("Caps the effective limit at 100.", async () => {
             wireConnection();
             await (provider as any).init();
             const cursor = makeCursor([]);
@@ -252,7 +314,34 @@ describe("MongoTextSearchProvider Tests", () => {
 
             await provider.search({ mailboxUid: "mbx-1", text: "hello", limit: 10_000 });
 
-            expect(cursor.limit).toHaveBeenCalledWith(201);
+            expect(cursor.limit).toHaveBeenCalledWith(101);
+        });
+
+        it("Clamps a limit below 1 up to 1, and a cursor beyond 10000 down to 10000 with no further nextCursor.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const rows = Array.from({ length: 2 }, (_, i) => ({ _id: `message:m${i}`, entityType: "message", entityUid: `m${i}` }));
+            const cursor = makeCursor(rows);
+            mockCollection.find.mockReturnValue(cursor);
+
+            const result = await provider.search({ mailboxUid: "mbx-1", text: "hello", limit: -5, cursor: "999999" });
+
+            expect(cursor.limit).toHaveBeenCalledWith(2);
+            expect(cursor.skip).toHaveBeenCalledWith(10_000);
+            expect(result.results).toHaveLength(1);
+            expect(result.nextCursor).toBeUndefined();
+        });
+
+        it("Clamps a negative cursor to offset 0.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            const cursor = makeCursor([]);
+            mockCollection.find.mockReturnValue(cursor);
+
+            await provider.candidates({ mailboxUid: "mbx-1", cursor: "-50", limit: 500 });
+
+            expect(cursor.skip).toHaveBeenCalledWith(0);
+            expect(cursor.limit).toHaveBeenCalledWith(101);
         });
 
         it("Defaults missing row score to 0.", async () => {
@@ -368,12 +457,33 @@ describe("MongoTextSearchProvider Tests", () => {
                     mailboxUid: "mbx-1",
                     entityType: { $in: ["message"] },
                     folderUid: "folder-1",
-                    participants: { $in: ["bob@example.com"] },
+                    participants: { $in: [expect.any(RegExp)] },
                 },
                 { projection: { entityType: 1, entityUid: 1 } },
             );
             expect(cursor.sort).toHaveBeenCalledWith({ dateForSort: -1 });
             expect(result).toEqual({ candidates: [{ entityType: "message", entityUid: "msg-1" }], nextCursor: undefined });
+        });
+
+        it("Matches a participant term as a whole address against both the array shape and the legacy space-joined string shape.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockCollection.find.mockReturnValue(makeCursor([]));
+
+            await provider.candidates({ mailboxUid: "mbx-1", participants: ["Bob@Example.com", "a.b+c@x.com"] });
+
+            const [filter] = mockCollection.find.mock.calls[0];
+            const [bob, special]: RegExp[] = filter.participants.$in;
+            // Array element (current shape).
+            expect(bob.test("bob@example.com")).toBe(true);
+            // Token inside the legacy joined string.
+            expect(bob.test("alice@example.com bob@example.com carol@example.com")).toBe(true);
+            // Not a substring of a different address.
+            expect(bob.test("notbob@example.com")).toBe(false);
+            expect(bob.test("bob@example.com.evil")).toBe(false);
+            // Regex metacharacters in the term are literal.
+            expect(special.test("a.b+c@x.com")).toBe(true);
+            expect(special.test("aXb+c@x.com")).toBe(false);
         });
 
         it("Never includes score/content - only entityType/entityUid.", async () => {

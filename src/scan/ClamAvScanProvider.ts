@@ -87,14 +87,23 @@ export class ClamAvScanProvider implements AvScanProvider {
     }
 }
 
-/** Parses a clamd INSTREAM reply, e.g. `"stream: OK"` or `"stream: Eicar-Test-Signature FOUND"`. */
-function parseReply(reply: string): AvScanResult {
+/**
+ * Parses a clamd INSTREAM reply, e.g. `"stream: OK"` or `"stream: Eicar-Test-Signature FOUND"`.
+ *
+ * Fails closed: only a reply that positively ends in `": OK"` is `CLEAN`, and only one ending in `"<sig> FOUND"`
+ * is `INFECTED`. Anything else - an explicit `"... ERROR"`, `"INSTREAM size limit exceeded"`, an empty reply
+ * (connection closed without an answer), or garbage - is `ERROR`, so the caller quarantines rather than
+ * delivering content clamd never actually vouched for.
+ */
+function parseReply(rawReply: string): AvScanResult {
+    // Trailing NULs (z-prefixed commands are NUL-terminated) and newlines (non-z commands) are stripped first.
+    const reply: string = rawReply.replace(/[\0\s]+$/, "");
     const match = reply.match(/:\s*(.+?)\s+FOUND$/);
     if (match) {
         return { verdict: AvVerdict.INFECTED, signatureName: match[1] };
     }
-    if (reply.includes("ERROR")) {
-        return { verdict: AvVerdict.ERROR };
+    if (/:\s*OK$/.test(reply)) {
+        return { verdict: AvVerdict.CLEAN };
     }
-    return { verdict: AvVerdict.CLEAN };
+    return { verdict: AvVerdict.ERROR };
 }

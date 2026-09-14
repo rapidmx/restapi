@@ -208,4 +208,24 @@ describe("ExternalShareExpirationJobMongo Tests (real DB + DI)", () => {
         expect(badFound).not.toBeNull();
         expect(goodFound).toBeNull();
     });
+
+    it("Revokes the ACL grant before deleting the row, keeping the row for retry when revocation fails.", async () => {
+        const aclUtils: ACLUtils = objectFactory.getInstance(ACLUtils)!;
+        const folderUid = uuid.v4();
+        const expired = await createShareLink({ expiresAt: new Date(Date.now() - HOUR_MS), folderUid });
+        await aclUtils.saveACL({ uid: folderUid, records: [{ userOrRoleId: expired.token, actions: ["freebusy"] }] });
+
+        const saveSpy = vi.spyOn(aclUtils, "saveACL").mockRejectedValueOnce(new Error("simulated ACL store failure"));
+        await expect(job.run()).resolves.toBeUndefined();
+
+        // The row must survive so the next run can retry the revocation.
+        expect(await calendarShareLinkRepo.findOne({ uid: expired.uid } as any)).not.toBeNull();
+
+        saveSpy.mockRestore();
+        await job.run();
+
+        expect(await calendarShareLinkRepo.findOne({ uid: expired.uid } as any)).toBeNull();
+        const acl = await aclUtils.findACL(folderUid, [], { skipCache: true });
+        expect(acl?.records.find((r) => r.userOrRoleId === expired.token)).toBeUndefined();
+    });
 });

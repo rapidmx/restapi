@@ -10,7 +10,6 @@ import "reflect-metadata";
 // import since Node 19), which is typed against `lib.dom` and subtly incompatible with `node:crypto`'s
 // own `webcrypto` export - see `LocalX509CertificateAuthority.ts`'s identical note.
 import * as nodeCrypto from "crypto";
-import * as fs from "fs/promises";
 import * as path from "path";
 import * as x509 from "@peculiar/x509";
 import * as acme from "acme-client";
@@ -21,13 +20,29 @@ import { BlobStore } from "../blob/BlobStore.js";
 import { WrappedPrivateKey } from "../models/types.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
+import { createFileExclusive, lockKeyForPath, readFileIfExists, updateJsonFile, withLock, writeFileAtomic } from "./FileStoreUtils.js";
 import { EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 
 x509.cryptoProvider.set(crypto);
 
+/** Upper bound on `ensureAccount()`'s lost-race re-read loop - see its doc comment. */
+const MAX_INIT_ATTEMPTS = 5;
+
+/** The lowercased domain part of an email address (bare `local@domain`, or a trailing `<local@domain>`), or
+ * `undefined` if `address` doesn't look like a single address at all. */
+function addressDomain(address: string): string | undefined {
+    const angle: RegExpExecArray | null = /<([^<>]*)>\s*$/.exec(address);
+    const bare: string = (angle ? angle[1] : address).trim();
+    const at: number = bare.lastIndexOf("@");
+    if (at <= 0 || at === bare.length - 1 || /[\s<>,]/.test(bare)) {
+        return undefined;
+    }
+    return bare.slice(at + 1).toLowerCase().replace(/\.$/, "");
+}
+
 /** One in-progress RFC 8823 enrollment, from `startEnrollment()` through to a downloaded certificate.
- * Everything needed to resume across a process restart lives here - see `loadStore()`/`saveStore()`. */
+ * Everything needed to resume across a process restart lives here - see `loadStore()`/`updateStore()`. */
 interface PendingEnrollment {
     identity: string;
     csr: string;
@@ -59,7 +74,7 @@ interface PendingEnrollment {
     challengeMessageId?: string;
     challengeSubject?: string;
     /** base64url(SHA-256(keyAuthorization)) - the exact value RFC 8823's reply email body carries.
-     * Computed once by `recordChallengeToken()`; a later piece of this feature sends the reply email
+     * Computed by `recordChallengeToken()` (recomputed if it is re-recorded before the reply is sent); a later piece of this feature sends the reply email
      * and drives `completeChallenge()`/finalize once this is set. */
     digest?: string;
     /** Set once the reply email has actually been sent and `completeChallenge()` called - `advanceEnrollment()`'s
@@ -156,67 +171,82 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
         return new acme.Client(opts);
     }
 
-    /** Loads this deployment's one persisted ACME account (key + account URL), registering a new one
-     * on first use. Idempotent and safe to call before every operation - once minted, the account is
-     * stable for the deployment's lifetime, the same reasoning `LocalX509CertificateAuthority.
-     * ensureCa()` already documents for its own root key. */
+    /** Loads this deployment's one persisted ACME account (key + account URL), registering it on first use.
+     * Idempotent and safe to call before every operation - once minted, the account key is stable for the
+     * deployment's lifetime, the same reasoning `LocalX509CertificateAuthority.ensureCa()` already documents
+     * for its own root key.
+     *
+     * First-run initialization is crash- and race-safe, mirroring `ensureCa()`:
+     * - Serialized within this process (`withLock()` on the key path).
+     * - The account key is persisted crash-atomically and create-only (`createFileExclusive()`) *before* the
+     * account is registered, so every later attempt - after a crash, a failed `newAccount` request, or a lost
+     * race with another process - reuses that same key rather than minting another.
+     * - "Key present, account URL missing" is recovered by calling `createAccount()` again with the existing
+     * key: RFC 8555 §7.3.1 makes `newAccount` idempotent per key (the CA returns the already-registered
+     * account with HTTP 200, which `acme-client` handles), so this never creates a second account.
+     * - Bounded: gives up with an error after `MAX_INIT_ATTEMPTS` lost races rather than looping forever; a
+     * network failure from `createAccount()` propagates to the caller (the next call simply retries). */
     private async ensureAccount(): Promise<acme.Client> {
-        try {
-            const [accountKey, accountUrl] = await Promise.all([
-                fs.readFile(this.accountKeyPath(), "utf-8"),
-                fs.readFile(this.accountUrlPath(), "utf-8"),
-            ]);
-            return this.createClient({ directoryUrl: this.directoryUrl, accountKey, accountUrl: accountUrl.trim() });
-        } catch (err: any) {
-            if (err.code !== "ENOENT") {
-                throw err;
-            }
-        }
+        return withLock(lockKeyForPath(this.accountKeyPath()), async () => {
+            for (let attempt = 0; attempt < MAX_INIT_ATTEMPTS; attempt++) {
+                const accountKey: string | undefined = await readFileIfExists(this.accountKeyPath());
+                if (accountKey === undefined) {
+                    const newKey: Buffer = await acme.crypto.createPrivateEcdsaKey("P-256");
+                    await createFileExclusive(this.accountKeyPath(), newKey, 0o600, 0o700);
+                    // Either way, loop back and read whichever key is now on disk (ours, or a concurrent winner's).
+                    continue;
+                }
 
-        const accountKey: Buffer = await acme.crypto.createPrivateEcdsaKey("P-256");
-        const client: acme.Client = this.createClient({ directoryUrl: this.directoryUrl, accountKey });
-        await client.createAccount({
-            termsOfServiceAgreed: true,
-            contact: this.contactEmail ? [`mailto:${this.contactEmail}`] : undefined,
+                const accountUrl: string | undefined = (await readFileIfExists(this.accountUrlPath()))?.trim();
+                if (accountUrl) {
+                    return this.createClient({ directoryUrl: this.directoryUrl, accountKey, accountUrl });
+                }
+
+                const client: acme.Client = this.createClient({ directoryUrl: this.directoryUrl, accountKey });
+                await client.createAccount({
+                    termsOfServiceAgreed: true,
+                    contact: this.contactEmail ? [`mailto:${this.contactEmail}`] : undefined,
+                });
+                // A present-but-blank URL file can only be a torn write from before these writes were atomic - safe
+                // to replace outright, since the account URL is fully determined by the key.
+                let persisted: boolean = true;
+                if (accountUrl === undefined) {
+                    persisted = await createFileExclusive(this.accountUrlPath(), client.getAccountUrl(), 0o600, 0o700);
+                } else {
+                    await writeFileAtomic(this.accountUrlPath(), client.getAccountUrl(), 0o600, 0o700);
+                }
+                if (persisted) {
+                    this.logger?.info(`Rfc8823AcmeSigningCertificateEnrollment: registered ACME account at '${this.directoryUrl}'.`);
+                    return client;
+                }
+                // Another process persisted the account URL first - loop back and use theirs.
+            }
+            throw new Error(
+                `Rfc8823AcmeSigningCertificateEnrollment: could not initialize the ACME account in '${this.storeDir}' after ${MAX_INIT_ATTEMPTS} attempts.`,
+            );
         });
-
-        await fs.mkdir(this.storeDir, { recursive: true, mode: 0o700 });
-        try {
-            // Atomic create-or-fail, same TOCTOU-tolerant reasoning as `LocalX509CertificateAuthority.
-            // ensureCa()` - two concurrent first-ever calls can both observe `ENOENT` above; the loser
-            // re-reads the winner's already-registered account instead of orphaning a second one.
-            await fs.writeFile(this.accountKeyPath(), accountKey, { mode: 0o600, flag: "wx" });
-        } catch (err: any) {
-            if (err.code === "EEXIST") {
-                return this.ensureAccount();
-            }
-            // A real filesystem error other than the expected concurrent-loser EEXIST above (e.g. a
-            // permissions failure) - see LocalX509CertificateAuthority.ensureCa()'s identical rethrow for
-            // why this can't be reproduced deterministically without mocking, which this file's own test
-            // convention (real fs, no mocking) deliberately avoids.
-            /* v8 ignore next */
-            throw err;
-        }
-        await fs.writeFile(this.accountUrlPath(), client.getAccountUrl(), { mode: 0o600, flag: "wx" });
-        this.logger?.info(`Rfc8823AcmeSigningCertificateEnrollment: registered new ACME account at '${this.directoryUrl}'.`);
-
-        return client;
     }
 
     private async loadStore(): Promise<Record<string, PendingEnrollment>> {
-        try {
-            return JSON.parse(await fs.readFile(this.enrollmentsPath(), "utf-8"));
-        } catch (err: any) {
-            if (err.code !== "ENOENT") {
-                throw err;
-            }
-            return {};
-        }
+        const raw: string | undefined = await readFileIfExists(this.enrollmentsPath());
+        return raw === undefined ? {} : JSON.parse(raw);
     }
 
-    private async saveStore(store: Record<string, PendingEnrollment>): Promise<void> {
-        await fs.mkdir(this.storeDir, { recursive: true, mode: 0o700 });
-        await fs.writeFile(this.enrollmentsPath(), JSON.stringify(store), { mode: 0o600 });
+    /** Locked re-read -> modify -> atomic write of the enrollment store (`FileStoreUtils.updateJsonFile()`), so
+     * concurrent mutations in this process never drop one another's update and a crash mid-write never
+     * truncates the store. Keep `mutate` short - it runs while holding the store-wide lock; slow network work
+     * belongs outside it (see `withEnrollmentLock()`). */
+    private async updateStore<T>(mutate: (store: Record<string, PendingEnrollment>) => Promise<T> | T): Promise<T> {
+        return updateJsonFile(this.enrollmentsPath(), 0o600, mutate, 0o700);
+    }
+
+    /** Serializes the multi-step, network-bound operations on one enrollment (`recordChallengeToken()`,
+     * `advanceEnrollment()`) within this process - so a challenge token can't be replaced while its reply is
+     * mid-send, and two overlapping driver ticks can't both send the reply - without holding the store-wide
+     * lock across network calls. Lock ordering: this lock may be held while taking the store lock (via
+     * `updateStore()`) or the account lock (`ensureAccount()`), never the reverse. */
+    private async withEnrollmentLock<T>(enrollmentId: string, fn: () => Promise<T>): Promise<T> {
+        return withLock(`${lockKeyForPath(this.enrollmentsPath())}#enrollment:${enrollmentId}`, fn);
     }
 
     private async requireEnrollment(store: Record<string, PendingEnrollment>, enrollmentId: string): Promise<PendingEnrollment> {
@@ -252,27 +282,28 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
         }
 
         const enrollmentId: string = crypto.randomUUID();
-        const store: Record<string, PendingEnrollment> = await this.loadStore();
-        store[enrollmentId] = {
-            identity,
-            csr,
-            orderUrl: order.url,
-            orderFinalizeUrl: order.finalize,
-            authorizationUrl: authorization.url,
-            challengeUrl: challenge.url,
-            challengeFrom: challenge.from,
-            tokenPart2: challenge.token,
-            status: "pending",
-            createdAt: new Date().toISOString(),
-        };
-        await this.saveStore(store);
+        const { from: challengeFrom, token: tokenPart2 } = challenge;
+        await this.updateStore((store) => {
+            store[enrollmentId] = {
+                identity,
+                csr,
+                orderUrl: order.url,
+                orderFinalizeUrl: order.finalize,
+                authorizationUrl: authorization.url,
+                challengeUrl: challenge.url,
+                challengeFrom,
+                tokenPart2,
+                status: "pending",
+                createdAt: new Date().toISOString(),
+            };
+        });
 
         this.logger?.info(`Rfc8823AcmeSigningCertificateEnrollment: started enrollment '${enrollmentId}' for '${identity}'.`);
         return { enrollmentId };
     }
 
     /**
-     * Finds the pending enrollment (if any) still awaiting its RFC 8823 challenge email for
+     * Finds the pending enrollment (if any) whose RFC 8823 challenge reply hasn't been sent yet for
      * `identity`, whose challenge is expected to arrive `from` that exact address - the inbound
      * mail-ingest pipeline's own correlator (`ScanQueueJob`) calls this for every candidate message
      * (one whose `Auto-Submitted`/`Subject` shape already looks like an ACME challenge) before ever
@@ -281,6 +312,10 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * pair should ever be matched. Comparison is case-insensitive (email addresses' domain part is
      * always case-insensitive, and the local part is, in practice, treated the same way by virtually
      * every real mailbox).
+     *
+     * An enrollment that has already recorded a token-part1 keeps matching until its reply has actually
+     * been sent (`replySentAt`) - so a spoofed early lookalike can't permanently claim the enrollment; the
+     * genuine challenge email arriving later replaces it (see `recordChallengeToken()`).
      *
      * Returns `undefined` - never throws - when nothing matches, so a spoofed or stale
      * lookalike message safely falls through to normal delivery instead of being silently dropped.
@@ -292,7 +327,7 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
         for (const [enrollmentId, enrollment] of Object.entries(store)) {
             if (
                 enrollment.status === "pending" &&
-                enrollment.tokenPart1 === undefined &&
+                enrollment.replySentAt === undefined &&
                 enrollment.identity.toLowerCase() === normalizedIdentity &&
                 enrollment.challengeFrom.toLowerCase() === normalizedFrom
             ) {
@@ -317,12 +352,21 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * a dependency that has no native notion of this RFC's own challenge type, without reaching into
      * its private internals.
      *
-     * Idempotent - a duplicate delivery of the same challenge email (or a retry) leaves an
-     * already-recorded token-part1 untouched rather than recomputing (and potentially invalidating,
-     * were the two deliveries to ever differ) the digest.
+     * **Re-recordable until the reply is sent**: a later call replaces an earlier recorded token-part1/
+     * headers/digest as long as the reply email hasn't been sent yet - so a spoofed early challenge email
+     * (which can never yield a digest the CA accepts) can't permanently poison the enrollment; the genuine
+     * one arriving afterward simply wins. Once `replySentAt` is set (or the enrollment is no longer
+     * `"pending"`) this is a silent no-op, so a late duplicate can't change the digest the CA is already
+     * validating.
+     *
+     * **Reply-To must be within the CA's domain**: `replyTo`'s domain must equal the domain of the
+     * enrollment's expected challenge `from` address, or be a subdomain of it - otherwise the reply (whose
+     * digest proves control of `identity`) could be redirected to a mailbox of the sender's choosing.
      *
      * @param enrollmentId An identifier previously returned by `startEnrollment()`.
-     * @throws If `enrollmentId` is not recognized.
+     * @param replyTo A single address (`local@domain`, or `Name <local@domain>`).
+     * @throws If `enrollmentId` is not recognized, or `replyTo` is not a single address within the CA's
+     * domain - nothing is recorded in either case.
      */
     public async recordChallengeToken(
         enrollmentId: string,
@@ -331,34 +375,47 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
         messageId: string,
         subject: string,
     ): Promise<void> {
-        const store: Record<string, PendingEnrollment> = await this.loadStore();
-        const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
-        if (enrollment.tokenPart1 !== undefined) {
-            return;
-        }
+        await this.withEnrollmentLock(enrollmentId, async () => {
+            const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
 
-        const client: acme.Client = await this.ensureAccount();
-        // `acme-client`'s own `rfc8555.Challenge` type (not part of this package's public exports,
-        // hence the local `FakeHttpChallenge` shape rather than importing it) only models
-        // `http-01`/`dns-01`/`tls-alpn-01` - see this method's own doc comment on why `type` is
-        // deliberately spoofed as `"http-01"` so `getChallengeKeyAuthorization()` applies that case's
-        // un-hashed `token + "." + thumbprint` formula, exactly what RFC 8823 needs, rather than
-        // throwing on an `email-reply-00` type it has no case for.
-        const fakeHttpChallenge = {
-            type: "http-01" as const,
-            url: enrollment.challengeUrl,
-            status: "pending" as const,
-            token: tokenPart1 + enrollment.tokenPart2,
-        };
-        const keyAuthorization: string = await client.getChallengeKeyAuthorization(fakeHttpChallenge);
-        const digest: string = nodeCrypto.createHash("sha256").update(keyAuthorization).digest("base64url");
+            const caDomain: string | undefined = addressDomain(enrollment.challengeFrom);
+            const replyToDomain: string | undefined = addressDomain(replyTo);
+            if (!caDomain || !replyToDomain || (replyToDomain !== caDomain && !replyToDomain.endsWith(`.${caDomain}`))) {
+                throw new ApiError(
+                    ApiErrors.INVALID_REQUEST,
+                    400,
+                    `The challenge email's reply-to address is not within the certificate authority's domain '${caDomain ?? ""}'.`,
+                );
+            }
+            if (enrollment.status !== "pending" || enrollment.replySentAt !== undefined) {
+                return;
+            }
 
-        enrollment.tokenPart1 = tokenPart1;
-        enrollment.replyTo = replyTo;
-        enrollment.challengeMessageId = messageId;
-        enrollment.challengeSubject = subject;
-        enrollment.digest = digest;
-        await this.saveStore(store);
+            const client: acme.Client = await this.ensureAccount();
+            // `acme-client`'s own `rfc8555.Challenge` type (not part of this package's public exports,
+            // hence the local `FakeHttpChallenge` shape rather than importing it) only models
+            // `http-01`/`dns-01`/`tls-alpn-01` - see this method's own doc comment on why `type` is
+            // deliberately spoofed as `"http-01"` so `getChallengeKeyAuthorization()` applies that case's
+            // un-hashed `token + "." + thumbprint` formula, exactly what RFC 8823 needs, rather than
+            // throwing on an `email-reply-00` type it has no case for.
+            const fakeHttpChallenge = {
+                type: "http-01" as const,
+                url: enrollment.challengeUrl,
+                status: "pending" as const,
+                token: tokenPart1 + enrollment.tokenPart2,
+            };
+            const keyAuthorization: string = await client.getChallengeKeyAuthorization(fakeHttpChallenge);
+            const digest: string = nodeCrypto.createHash("sha256").update(keyAuthorization).digest("base64url");
+
+            await this.updateStore(async (store) => {
+                const current: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+                current.tokenPart1 = tokenPart1;
+                current.replyTo = replyTo;
+                current.challengeMessageId = messageId;
+                current.challengeSubject = subject;
+                current.digest = digest;
+            });
+        });
     }
 
     public async checkStatus(enrollmentId: string): Promise<EnrollmentResult> {
@@ -378,10 +435,9 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * @throws If `enrollmentId` is not recognized.
      */
     public async attachWrappedKey(enrollmentId: string, wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">): Promise<void> {
-        const store: Record<string, PendingEnrollment> = await this.loadStore();
-        const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
-        enrollment.wrappedKey = wrappedKey;
-        await this.saveStore(store);
+        await this.updateStore(async (store) => {
+            (await this.requireEnrollment(store, enrollmentId)).wrappedKey = wrappedKey;
+        });
     }
 
     /**
@@ -406,10 +462,9 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * @throws If `enrollmentId` is not recognized.
      */
     public async markInstalled(enrollmentId: string): Promise<void> {
-        const store: Record<string, PendingEnrollment> = await this.loadStore();
-        const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
-        enrollment.installedAt = new Date().toISOString();
-        await this.saveStore(store);
+        await this.updateStore(async (store) => {
+            (await this.requireEnrollment(store, enrollmentId)).installedAt = new Date().toISOString();
+        });
     }
 
     /**
@@ -452,38 +507,44 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * downloads the certificate and marks this enrollment `"issued"`.
      */
     public async advanceEnrollment(enrollmentId: string): Promise<void> {
-        const store: Record<string, PendingEnrollment> = await this.loadStore();
-        const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
-        if (enrollment.status !== "pending" || enrollment.digest === undefined) {
-            return;
-        }
+        await this.withEnrollmentLock(enrollmentId, async () => {
+            const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
+            if (enrollment.status !== "pending" || enrollment.digest === undefined) {
+                return;
+            }
 
-        const client: acme.Client = await this.ensureAccount();
+            const client: acme.Client = await this.ensureAccount();
 
-        if (enrollment.replySentAt === undefined) {
-            await this.sendChallengeReply(enrollment);
-            await client.completeChallenge({ url: enrollment.challengeUrl, status: "pending" } as any);
-            enrollment.replySentAt = new Date().toISOString();
-            await this.saveStore(store);
-            return;
-        }
+            if (enrollment.replySentAt === undefined) {
+                await this.sendChallengeReply(enrollment);
+                await client.completeChallenge({ url: enrollment.challengeUrl, status: "pending" } as any);
+                await this.updateStore(async (store) => {
+                    (await this.requireEnrollment(store, enrollmentId)).replySentAt = new Date().toISOString();
+                });
+                return;
+            }
 
-        const order: acme.Order = await client.getOrder({ url: enrollment.orderUrl } as any);
-        if (order.status === "invalid") {
-            enrollment.status = "failed";
-            enrollment.error = order.error ? JSON.stringify(order.error) : "The certificate authority marked this order invalid.";
-            await this.saveStore(store);
-        } else if (order.status === "ready") {
-            await client.finalizeOrder({ url: enrollment.orderUrl, finalize: enrollment.orderFinalizeUrl } as any, enrollment.csr);
-            // Finalizing transitions the order to "processing" server-side - the next call to this method
-            // re-fetches and observes that, no local state to persist here.
-        } else if (order.status === "valid") {
-            const certificate: string = await client.getCertificate({ url: enrollment.orderUrl, status: "valid" } as any);
-            enrollment.status = "issued";
-            enrollment.certificate = certificate;
-            await this.saveStore(store);
-        }
-        // "pending"/"processing": still waiting on the CA - nothing to do until the next call.
+            const order: acme.Order = await client.getOrder({ url: enrollment.orderUrl } as any);
+            if (order.status === "invalid") {
+                await this.updateStore(async (store) => {
+                    const current: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+                    current.status = "failed";
+                    current.error = order.error ? JSON.stringify(order.error) : "The certificate authority marked this order invalid.";
+                });
+            } else if (order.status === "ready") {
+                await client.finalizeOrder({ url: enrollment.orderUrl, finalize: enrollment.orderFinalizeUrl } as any, enrollment.csr);
+                // Finalizing transitions the order to "processing" server-side - the next call to this method
+                // re-fetches and observes that, no local state to persist here.
+            } else if (order.status === "valid") {
+                const certificate: string = await client.getCertificate({ url: enrollment.orderUrl, status: "valid" } as any);
+                await this.updateStore(async (store) => {
+                    const current: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+                    current.status = "issued";
+                    current.certificate = certificate;
+                });
+            }
+            // "pending"/"processing": still waiting on the CA - nothing to do until the next call.
+        });
     }
 
     /**

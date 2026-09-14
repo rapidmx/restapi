@@ -20,6 +20,7 @@ const { Nullable } = ObjectDecorators;
 @Entity()
 @Description("A request to import historical mail from an uploaded Mbox or PST file into a mailbox.")
 @Index("mailbox_import_request_mailbox", ["mailboxUid"])
+@Index("mailbox_import_request_status", ["status"])
 @Protect(
     {
         uid: "MailboxImportRequest",
@@ -67,6 +68,11 @@ export class MailboxImportRequestMongo extends BaseMongoEntity implements Mailbo
     @Nullable
     public errorMessage?: string;
 
+    @Column()
+    @Description("How many times MailboxImportJob has claimed this request for processing (lease/retry counter).")
+    @Nullable
+    public processingAttempts?: number;
+
     constructor(other?: Partial<MailboxImportRequestMongo>) {
         super(other);
 
@@ -80,6 +86,7 @@ export class MailboxImportRequestMongo extends BaseMongoEntity implements Mailbo
             this.importedCount = "importedCount" in other ? other.importedCount : this.importedCount;
             this.failedCount = "failedCount" in other ? other.failedCount : this.failedCount;
             this.errorMessage = "errorMessage" in other ? other.errorMessage : this.errorMessage;
+            this.processingAttempts = "processingAttempts" in other ? other.processingAttempts : this.processingAttempts;
         }
     }
 }

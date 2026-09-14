@@ -6,12 +6,12 @@
 // internally) - already a transitive dependency of `@rapidrest/core`, which every route in this codebase
 // already pulls in, but this module doesn't rely on import order elsewhere providing it.
 import "reflect-metadata";
-import * as fs from "fs/promises";
 import * as path from "path";
 import * as x509 from "@peculiar/x509";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { EncryptionCertificateAuthority, IssuedCertificate } from "./EncryptionCertificateAuthority.js";
+import { createFileExclusive, lockKeyForPath, readFileIfExists, withLock } from "./FileStoreUtils.js";
 const { Config, Logger } = ObjectDecorators;
 
 // The global `crypto` (WebCrypto, available with no import since Node 19) is typed against `lib.dom`'s
@@ -23,6 +23,22 @@ x509.cryptoProvider.set(crypto);
 const SIGNING_ALGORITHM = { name: "ECDSA", hash: "SHA-256" };
 const CA_KEY_ALGORITHM = { name: "ECDSA", namedCurve: "P-256" };
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+/** Upper bound on `ensureCa()`'s lost-race re-read loop - see its doc comment. */
+const MAX_INIT_ATTEMPTS = 5;
+
+/** Derives the (extractable) public half of a PKCS#8 ECDSA P-256 private key - needed to self-sign a CA
+ * certificate for an already-persisted key without ever re-generating that key. */
+async function derivePublicKey(privateKeyPem: string): Promise<CryptoKey> {
+    const extractable: CryptoKey = await crypto.subtle.importKey(
+        "pkcs8",
+        x509.PemConverter.decodeFirst(privateKeyPem),
+        CA_KEY_ALGORITHM,
+        true,
+        ["sign"],
+    );
+    const { d: _d, key_ops: _keyOps, ...publicJwk } = await crypto.subtle.exportKey("jwk", extractable);
+    return crypto.subtle.importKey("jwk", publicJwk, CA_KEY_ALGORITHM, true, ["verify"]);
+}
 
 /**
  * The zero-external-infrastructure `EncryptionCertificateAuthority` - a self-signed, single-tier CA whose
@@ -64,71 +80,70 @@ export class LocalX509CertificateAuthority implements EncryptionCertificateAutho
 
     /** Loads the CA's key pair + self-signed certificate from disk, generating and persisting a new one on
      * first use. Idempotent and safe to call before every `issue()`/`revoke()` - the CA key, once minted, is
-     * stable for the deployment's lifetime; rotation is a deliberately separate, not-yet-built operation. */
+     * stable for the deployment's lifetime; rotation is a deliberately separate, not-yet-built operation.
+     *
+     * First-run initialization is crash- and race-safe:
+     * - Serialized within this process (`withLock()` on the key path), so concurrent first-ever `issue()` calls
+     * never generate competing roots.
+     * - The key and the certificate are each written crash-atomically *and* create-only
+     * (`createFileExclusive()`: temp file + `link()`), so a crash mid-write never leaves a torn PEM behind, and
+     * a concurrent writer in another process never has its already-minted key/cert overwritten - on losing that
+     * race this method simply re-reads the winner's file.
+     * - The two files are independent steps: a crash (or failure) after the key is persisted but before the
+     * certificate is leaves "key present, cert missing", which the next call recovers from by self-signing a
+     * new CA certificate for the *existing* key - it never mints a replacement key, so certificates already
+     * issued under that key keep chaining to the CA's key.
+     * - Bounded: gives up with an error after `MAX_INIT_ATTEMPTS` lost races rather than looping forever. */
     private async ensureCa(): Promise<{ certificate: x509.X509Certificate; privateKey: CryptoKey }> {
-        try {
-            const [keyPem, certPem] = await Promise.all([
-                fs.readFile(this.caKeyPath(), "utf-8"),
-                fs.readFile(this.caCertPath(), "utf-8"),
-            ]);
-            const privateKey: CryptoKey = await crypto.subtle.importKey(
-                "pkcs8",
-                x509.PemConverter.decodeFirst(keyPem),
-                CA_KEY_ALGORITHM,
-                false,
-                ["sign"],
+        return withLock(lockKeyForPath(this.caKeyPath()), async () => {
+            for (let attempt = 0; attempt < MAX_INIT_ATTEMPTS; attempt++) {
+                const keyPem: string | undefined = await readFileIfExists(this.caKeyPath());
+                if (keyPem === undefined) {
+                    const keys: CryptoKeyPair = await crypto.subtle.generateKey(CA_KEY_ALGORITHM, true, ["sign", "verify"]);
+                    const newKeyPem: string = x509.PemConverter.encode(await crypto.subtle.exportKey("pkcs8", keys.privateKey), "PRIVATE KEY");
+                    // 0o700 directory mode: only matters on first creation - `mkdir` never tightens an existing one.
+                    if (await createFileExclusive(this.caKeyPath(), newKeyPem, 0o600, 0o700)) {
+                        this.logger?.info(`LocalX509CertificateAuthority: generated new local CA key at '${this.caDir}'.`);
+                    }
+                    // Either way, loop back and read whichever key is now on disk (ours, or a concurrent winner's).
+                    continue;
+                }
+
+                const privateKey: CryptoKey = await crypto.subtle.importKey(
+                    "pkcs8",
+                    x509.PemConverter.decodeFirst(keyPem),
+                    CA_KEY_ALGORITHM,
+                    false,
+                    ["sign"],
+                );
+                const certPem: string | undefined = await readFileIfExists(this.caCertPath());
+                if (certPem !== undefined) {
+                    return { certificate: new x509.X509Certificate(certPem), privateKey };
+                }
+
+                // Key present, certificate missing (first run, or a crash between the two writes): self-sign a
+                // CA certificate for the existing key.
+                const certificate: x509.X509Certificate = await x509.X509CertificateGenerator.createSelfSigned({
+                    name: this.caSubject,
+                    notBefore: new Date(),
+                    notAfter: new Date(Date.now() + 10 * 365 * MS_PER_DAY),
+                    keys: { privateKey, publicKey: await derivePublicKey(keyPem) },
+                    signingAlgorithm: SIGNING_ALGORITHM,
+                    extensions: [
+                        new x509.BasicConstraintsExtension(true, undefined, true),
+                        new x509.KeyUsagesExtension(x509.KeyUsageFlags.keyCertSign | x509.KeyUsageFlags.cRLSign, true),
+                    ],
+                });
+                if (await createFileExclusive(this.caCertPath(), certificate.toString("pem"), 0o644, 0o700)) {
+                    this.logger?.info(`LocalX509CertificateAuthority: generated new local CA certificate at '${this.caDir}'.`);
+                    return { certificate, privateKey };
+                }
+                // Another process persisted a certificate first - loop back and use theirs.
+            }
+            throw new Error(
+                `LocalX509CertificateAuthority: could not initialize the local CA at '${this.caDir}' after ${MAX_INIT_ATTEMPTS} attempts.`,
             );
-            return { certificate: new x509.X509Certificate(certPem), privateKey };
-        } catch (err: any) {
-            if (err.code !== "ENOENT") {
-                throw err;
-            }
-        }
-
-        const keys: CryptoKeyPair = await crypto.subtle.generateKey(CA_KEY_ALGORITHM, true, ["sign", "verify"]);
-        const certificate: x509.X509Certificate = await x509.X509CertificateGenerator.createSelfSigned({
-            name: this.caSubject,
-            notBefore: new Date(),
-            notAfter: new Date(Date.now() + 10 * 365 * MS_PER_DAY),
-            keys,
-            signingAlgorithm: SIGNING_ALGORITHM,
-            extensions: [
-                new x509.BasicConstraintsExtension(true, undefined, true),
-                new x509.KeyUsagesExtension(x509.KeyUsageFlags.keyCertSign | x509.KeyUsageFlags.cRLSign, true),
-            ],
         });
-
-        const keyPem: string = x509.PemConverter.encode(
-            await crypto.subtle.exportKey("pkcs8", keys.privateKey),
-            "PRIVATE KEY",
-        );
-        // `mode: 0o700`: only matters on first creation (like the file `mode`s below) - `mkdir`/`writeFile`
-        // never tighten permissions on a directory/file that already exists.
-        await fs.mkdir(this.caDir, { recursive: true, mode: 0o700 });
-        try {
-            // Atomic create-or-fail (`flag: "wx"`), not a plain `writeFile`: two concurrent first-ever
-            // `issue()` calls can both reach this point having both observed `ENOENT` above. Without this,
-            // the loser's `writeFile` would silently overwrite the winner's already-generated CA key - and
-            // any certificate issued against the winner's CA in between (already returned to a caller,
-            // already persisted onto a `Mailbox`) would no longer chain to the CA now on disk, permanently
-            // and silently unverifiable. On `EEXIST`, some other call already won - re-run this method to
-            // read and return *its* result instead of generating a second, orphaned root.
-            await fs.writeFile(this.caKeyPath(), keyPem, { mode: 0o600, flag: "wx" });
-            /* v8 ignore start -- the concurrent-loser retry (and the "some other real fs error" rethrow)
-               described above can't be reproduced deterministically against a real filesystem without
-               fabricating exact concurrent timing, and this class's own test file deliberately uses no
-               mocking (see its doc comment) - both a genuinely untestable branch pair. */
-        } catch (err: any) {
-            if (err.code === "EEXIST") {
-                return this.ensureCa();
-            }
-            throw err;
-        }
-        /* v8 ignore stop */
-        await fs.writeFile(this.caCertPath(), certificate.toString("pem"), { mode: 0o644, flag: "wx" });
-        this.logger?.info(`LocalX509CertificateAuthority: generated new local CA root at '${this.caDir}'.`);
-
-        return { certificate, privateKey: keys.privateKey };
     }
 
     public async issue(identity: string, csr: string): Promise<IssuedCertificate> {

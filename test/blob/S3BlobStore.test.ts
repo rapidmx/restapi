@@ -22,6 +22,18 @@ vi.mock("@aws-sdk/client-s3", () => ({
     DeleteObjectCommand: vi.fn().mockImplementation(function (input: any) {
         return { input };
     }),
+    CreateMultipartUploadCommand: vi.fn().mockImplementation(function (input: any) {
+        return { name: "CreateMultipartUploadCommand", input };
+    }),
+    UploadPartCommand: vi.fn().mockImplementation(function (input: any) {
+        return { name: "UploadPartCommand", input };
+    }),
+    CompleteMultipartUploadCommand: vi.fn().mockImplementation(function (input: any) {
+        return { name: "CompleteMultipartUploadCommand", input };
+    }),
+    AbortMultipartUploadCommand: vi.fn().mockImplementation(function (input: any) {
+        return { name: "AbortMultipartUploadCommand", input };
+    }),
 }));
 
 import { Readable } from "stream";
@@ -61,13 +73,80 @@ describe("S3BlobStore Tests", () => {
         );
     });
 
-    it("Passes a Readable stream through unbuffered as Body.", async () => {
-        const stream = Readable.from(Buffer.from("streamed"));
+    it("Stores a stream shorter than one part with a single PutObject (a stream has no length PutObject could use).", async () => {
+        const stream = Readable.from([Buffer.from("stream"), "ed"]);
         mockSend.mockResolvedValueOnce(undefined);
 
         await store.put("key-2", stream);
 
-        expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({ input: expect.objectContaining({ Body: stream }) }));
+        expect(mockSend).toHaveBeenCalledTimes(1);
+        expect(mockSend.mock.calls[0][0].input.Body.toString()).toBe("streamed");
+    });
+
+    it("Stores a longer stream as a multipart upload of fixed-size parts plus the remainder.", async () => {
+        const MiB = 1024 * 1024;
+        (store as any).multipartPartSizeBytes = 5 * MiB;
+        const stream = Readable.from([Buffer.alloc(3 * MiB, 1), Buffer.alloc(4 * MiB, 2), Buffer.alloc(4 * MiB, 3)]);
+        mockSend.mockImplementation(async (command: any) => {
+            if (command.name === "CreateMultipartUploadCommand") {
+                return { UploadId: "upload-1" };
+            }
+            if (command.name === "UploadPartCommand") {
+                return { ETag: `etag-${command.input.PartNumber}` };
+            }
+            return undefined;
+        });
+
+        await store.put("big", stream, { contentType: "application/mbox" });
+
+        const names = mockSend.mock.calls.map((call: any[]) => call[0].name);
+        expect(names).toEqual(["CreateMultipartUploadCommand", "UploadPartCommand", "UploadPartCommand", "UploadPartCommand", "CompleteMultipartUploadCommand"]);
+        const sizes = mockSend.mock.calls.filter((call: any[]) => call[0].name === "UploadPartCommand").map((call: any[]) => call[0].input.Body.length);
+        expect(sizes).toEqual([5 * MiB, 5 * MiB, 1 * MiB]);
+        expect(mockSend.mock.calls[0][0].input.ContentType).toBe("application/mbox");
+        expect(mockSend.mock.calls[4][0].input.MultipartUpload.Parts).toEqual([
+            { ETag: "etag-1", PartNumber: 1 },
+            { ETag: "etag-2", PartNumber: 2 },
+            { ETag: "etag-3", PartNumber: 3 },
+        ]);
+    });
+
+    it("Aborts the multipart upload when the stream fails part-way, and rethrows.", async () => {
+        const MiB = 1024 * 1024;
+        (store as any).multipartPartSizeBytes = 5 * MiB;
+        async function* failing(): AsyncGenerator<Buffer> {
+            yield Buffer.alloc(6 * MiB, 1);
+            throw new Error("source failed");
+        }
+        mockSend.mockImplementation(async (command: any) => (command.name === "CreateMultipartUploadCommand" ? { UploadId: "upload-2" } : { ETag: "e" }));
+
+        await expect(store.put("big", Readable.from(failing()))).rejects.toThrow("source failed");
+
+        const abort = mockSend.mock.calls.find((call: any[]) => call[0].name === "AbortMultipartUploadCommand");
+        expect(abort![0].input).toEqual({ Bucket: "test-bucket", Key: "big", UploadId: "upload-2" });
+        expect(mockSend.mock.calls.some((call: any[]) => call[0].name === "CompleteMultipartUploadCommand")).toBe(false);
+    });
+
+    it("Still rethrows the original error when aborting the multipart upload itself fails.", async () => {
+        const MiB = 1024 * 1024;
+        (store as any).multipartPartSizeBytes = 5 * MiB;
+        async function* failing(): AsyncGenerator<Buffer> {
+            yield Buffer.alloc(5 * MiB, 1);
+            throw new Error("source failed");
+        }
+        mockSend.mockImplementation(async (command: any) => {
+            if (command.name === "CreateMultipartUploadCommand") {
+                return { UploadId: "upload-3" };
+            }
+            if (command.name === "AbortMultipartUploadCommand") {
+                throw new Error("abort failed");
+            }
+            return { ETag: "e" };
+        });
+
+        await expect(store.put("big", Readable.from(failing()))).rejects.toThrow("source failed");
+
+        expect(mockSend.mock.calls.some((call: any[]) => call[0].name === "AbortMultipartUploadCommand")).toBe(true);
     });
 
     it("Passes contentType as ContentType when given, and undefined when omitted.", async () => {

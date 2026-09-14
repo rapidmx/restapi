@@ -83,27 +83,32 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
             return;
         }
 
-        // No obvious "least-recently-recalculated" field exists on `Mailbox` to sort by, so this simply
-        // processes the first page each run - acceptable since this is cheap, idempotent drift-correction, not
-        // correctness-critical delivery.
+        // Pages through every mailbox, `batchSize` at a time, sorted by `uid` so page boundaries are stable -
+        // previously only the first page was ever processed, so any mailbox past the first `batchSize` (sorted
+        // arbitrarily) never had its drift corrected at all.
         //
-        // `limit` is passed both via `options` (which is all the Mongo backend of `RepoUtils.find()` actually
-        // reads) *and* baked into the query object itself (which is all `ModelUtils.buildSearchQuerySQL` reads
-        // - it ignores `options.limit` entirely and falls back to its own default of 100 otherwise). Confirmed
-        // by real-database testing: on the SQL backend, `options.limit` alone silently caps at 100 regardless
-        // of the configured batch size, rather than the requested value.
-        const mailboxes: MB[] = await this.mailboxRepo.find(
-            { limit: this.batchSize } as any,
-            { ignoreACL: true, limit: this.batchSize },
-        );
+        // `limit`/`page` are passed both via `options` (which is all the Mongo backend of `RepoUtils.find()`
+        // actually reads) *and* baked into the query object itself (which is all `ModelUtils.buildSearchQuerySQL`
+        // reads - it ignores `options.limit` entirely and falls back to its own default of 100 otherwise).
+        // Confirmed by real-database testing: on the SQL backend, `options.limit` alone silently caps at 100
+        // regardless of the configured batch size, rather than the requested value.
+        for (let page = 0; ; page++) {
+            const mailboxes: MB[] = await this.mailboxRepo.find(
+                { sort: "uid", limit: this.batchSize, page } as any,
+                { ignoreACL: true, limit: this.batchSize, page },
+            );
 
-        for (const mailbox of mailboxes) {
-            try {
-                await this.recalcMailbox(mailbox);
-            } catch (err: any) {
-                this.logger?.error(
-                    `MailboxQuotaRecalcJob: failed to recalculate usedBytes for mailbox ${mailbox.uid}: ${err.message}`,
-                );
+            for (const mailbox of mailboxes) {
+                try {
+                    await this.recalcMailbox(mailbox);
+                } catch (err: any) {
+                    this.logger?.error(
+                        `MailboxQuotaRecalcJob: failed to recalculate usedBytes for mailbox ${mailbox.uid}: ${err.message}`,
+                    );
+                }
+            }
+            if (mailboxes.length < this.batchSize) {
+                break;
             }
         }
     }

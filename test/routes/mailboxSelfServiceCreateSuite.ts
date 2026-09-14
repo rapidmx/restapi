@@ -87,6 +87,21 @@ export function mailboxSelfServiceCreateSuite(ctx: MailboxSelfServiceCreateSuite
             expect(admin.body.quotaBytes).toBe(1_000);
         });
 
+        it("lets the owner add an alias at one of their own usernames (matched case-insensitively), but not someone else's", async () => {
+            ctx.mockAliases(["JSteinmetz", "JP"]);
+            const created = await post(ctx.userToken, mailbox());
+            expect(created.status).toBe(200);
+            const put = (body: unknown) => ctx.withAuth(request(ctx.app()).put(`${ctx.baseUrl}/${created.body.uid}`), ctx.userToken).send(body);
+
+            const unowned = await put({ uid: created.body.uid, version: created.body.version, aliasAddresses: ["ceo@example.org"] });
+            expect(unowned.status).toBe(403);
+            expect(unowned.body.message).toBe("You can only add an alias at one of your own usernames on this server's domains.");
+
+            const own = await put({ uid: created.body.uid, version: created.body.version, aliasAddresses: ["jp@example.org"] });
+            expect(own.status).toBe(200);
+            expect(own.body.aliasAddresses).toEqual(["jp@example.org"]);
+        });
+
         it("checks a trusted caller's owner uid: a user uid (stored lowercase), their own uid, or none", async () => {
             const upper: string = uuid.v4().toUpperCase();
             const owned = await post(ctx.adminToken, mailbox({ primarySmtpAddress: "a@example.com", ownerUserUid: upper }));

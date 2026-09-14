@@ -157,9 +157,10 @@ export interface RekeyRequest {
  * usual trusted/admin bypass** (`ACLUtils.hasPermission()`'s built-in "trusted users always have permission"
  * short-circuit - confirmed by reading `ACLUtils.js` - is never called here): a system admin gets a `403`
  * unless they are literally the mailbox's `ownerUserUid` or hold an explicit delegate `ACLRecord` on it,
- * `getRecord()` (which has no such bypass) is used instead. Every mutating action here is audit-logged
- * regardless of caller, so any admin access that *does* occur through a genuine delegate grant is still
- * visible after the fact.
+ * `getRecord()` (which has no such bypass) is used instead - and that delegate path only covers reads: every
+ * write is owner-only (`requireMailboxOwner()`). Every mutating action here is audit-logged regardless of
+ * caller, so any admin access that *does* occur through a genuine delegate grant is still visible after the
+ * fact.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -269,10 +270,12 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     }
 
     /** Stricter than `requireMailboxAccess()`: only the mailbox's actual `ownerUserUid` may proceed, not a
-     * delegate holding an ordinary `UPDATE` grant. `rekey()` is the one operation here that can permanently
-     * destroy the owner's own access to their encrypted mail history (a full, atomic replacement of
-     * `wrappedKeys`/`masterKeyWraps`) - an `UPDATE` grant on a shared mailbox is meant for managing its
-     * content/settings, not for a delegate to be able to do that. */
+     * delegate holding an ordinary `UPDATE` grant (nor a trusted admin). Every key-vault WRITE requires it:
+     * `rekey()`/`removeMasterKeyWrap()` can permanently destroy the owner's own access to their encrypted mail
+     * history, and `enrollKey()`/`startSignEnrollment()`/`addMasterKeyWrap()` would let a delegate publish a key
+     * of their own for the owner's address or add an unlock method they control to the owner's master key - an
+     * `UPDATE` grant on a shared mailbox is meant for managing its content/settings, not its keys. Reads
+     * (`get()`/`checkSignEnrollmentStatus()`) still accept a delegate `READ` grant. */
     private requireMailboxOwner(mailbox: M, user: JWTUser | undefined): void {
         if (!user || mailbox.ownerUserUid !== user.uid) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
@@ -348,7 +351,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     ): Promise<PublicKeyVault> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
-        await this.requireMailboxAccess(mailbox, user, ACLAction.UPDATE);
+        this.requireMailboxOwner(mailbox, user);
 
         if (!body?.wrappedKey) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "wrappedKey is required.");
@@ -476,7 +479,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     ): Promise<{ enrollmentId: string }> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
-        await this.requireMailboxAccess(mailbox, user, ACLAction.UPDATE);
+        this.requireMailboxOwner(mailbox, user);
 
         if (!body?.csr) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "csr is required.");
@@ -522,7 +525,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     ): Promise<PublicKeyVault> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
-        await this.requireMailboxAccess(mailbox, user, ACLAction.UPDATE);
+        this.requireMailboxOwner(mailbox, user);
         validateMasterKeyWrap(body, { allowEscrow: await this.resolveAllowEscrow(mailbox, body) });
 
         const keyVault: K | undefined = await this.findKeyVault(mailboxId);
@@ -577,7 +580,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     ): Promise<PublicKeyVault> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
-        await this.requireMailboxAccess(mailbox, user, ACLAction.UPDATE);
+        this.requireMailboxOwner(mailbox, user);
         // See `validateMasterKeyWrap()`'s doc comment - the mailbox owner/delegate path must never be able to
         // remove a compliance-installed escrow wrap themselves.
         if (method === "escrow") {
@@ -610,6 +613,15 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             );
         }
         const remaining: MasterKeyWrap[] = keyVault.masterKeyWraps.filter((w) => !matching.includes(w));
+        // The owner's own unlock methods are every non-escrow wrap - removing the last one would leave the master
+        // key recoverable only through escrow (or not at all), locking the owner out of their encrypted mail.
+        if (!remaining.some((w) => w.method !== "escrow")) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                "This is the mailbox's last master key wrap - add another unlock method before removing it.",
+            );
+        }
 
         const updated: K = await this.keyVaultRepo!.update(
             { uid: keyVault.uid, version: (keyVault as any).version, masterKeyWraps: remaining } as any,

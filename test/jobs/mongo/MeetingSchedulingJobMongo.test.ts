@@ -16,6 +16,7 @@ import config from "../../config.js";
 import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
 import { MeetingSchedulingJobMongo } from "../../../src/jobs/mongo/MeetingSchedulingJobMongo.js";
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
+import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import {
     AttendeeResponseStatus,
     AttendeeRole,
@@ -34,8 +35,11 @@ describe("MeetingSchedulingJobMongo Tests (real DB + DI)", () => {
     let connectionManager: ConnectionManager;
     let job: MeetingSchedulingJobMongo;
     let calendarEventRepo: MongoRepository<CalendarEventMongo>;
+    let mailboxRepo: MongoRepository<MailboxMongo>;
 
     const mailboxUid = uuid.v4();
+    /** A second mailbox whose organizer identity is one of its alias addresses, not its primary one. */
+    const aliasMailboxUid = uuid.v4();
     const folderUid = uuid.v4();
 
     const createEvent = async (data?: Partial<CalendarEventMongo>): Promise<CalendarEventMongo> => {
@@ -64,6 +68,11 @@ describe("MeetingSchedulingJobMongo Tests (real DB + DI)", () => {
         return await calendarEventRepo.save(obj);
     };
 
+    const reload = async (uid: string): Promise<CalendarEventMongo | null> => await calendarEventRepo.findOne({ uid } as any);
+    const bumpVersion = async (uid: string): Promise<void> => {
+        await calendarEventRepo.updateOne({ uid } as any, { $inc: { version: 1 } } as any);
+    };
+
     beforeAll(async () => {
         await mongod.start();
         objectFactory = new ObjectFactory(config, logger);
@@ -75,6 +84,7 @@ describe("MeetingSchedulingJobMongo Tests (real DB + DI)", () => {
         connectionManager = await objectFactory.newInstance(ConnectionManager, { name: "default" });
         const models = new Map<string, any>();
         models.set("CalendarEventMongo", CalendarEventMongo);
+        models.set("MailboxMongo", MailboxMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("mongo");
@@ -82,6 +92,33 @@ describe("MeetingSchedulingJobMongo Tests (real DB + DI)", () => {
             throw new Error("Could not find mongo connection");
         }
         calendarEventRepo = conn.getMongoRepository("CalendarEventMongo");
+        mailboxRepo = conn.getMongoRepository("MailboxMongo");
+        await mailboxRepo.clear().catch(() => undefined);
+
+        // The organizer's own mailbox (primary address = the default test organizer), and one whose organizer
+        // identity is an alias. Rows in any other mailbox are attendee copies this job must never send for.
+        await mailboxRepo.save(
+            new MailboxMongo({
+                uid: mailboxUid,
+                primarySmtpAddress: "organizer@example.com",
+                aliasAddresses: [],
+                displayName: "Organizer",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+            }),
+        );
+        await mailboxRepo.save(
+            new MailboxMongo({
+                uid: aliasMailboxUid,
+                primarySmtpAddress: "other@example.com",
+                aliasAddresses: ["boss@example.com"],
+                displayName: "Boss",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+            }),
+        );
 
         // Constructed once via real ObjectFactory DI: `@Init` builds its real `RepoUtils` against the live
         // connection above, and `@Inject("MailTransport")` resolves to the registered test double.
@@ -428,5 +465,137 @@ describe("MeetingSchedulingJobMongo Tests (real DB + DI)", () => {
         const updated = await calendarEventRepo.findOne({ uid: event.uid } as any);
         expect(updated!.inviteSequenceSent).toBe(0);
         sendSpy.mockRestore();
+    });
+
+    describe("Organizer ownership and claim-then-send", () => {
+        const remoteOrganizer = { address: "someone@remote.example", displayName: "Remote", type: RecipientType.TO };
+
+        it("Never sends an invite for an attendee's copy of someone else's meeting, but stamps inviteSequenceSent so it drops out.", async () => {
+            const event = await createEvent({ organizer: remoteOrganizer, sequence: 2 });
+
+            await job.run();
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(0);
+            const updated: any = await reload(event.uid);
+            expect(updated.inviteSequenceSent).toBe(2);
+        });
+
+        it("Never sends a CANCEL for an attendee's copy of someone else's meeting, but stamps cancelNoticeSentAt.", async () => {
+            const event = await createEvent({ organizer: remoteOrganizer, status: CalendarEventStatus.CANCELLED });
+
+            await job.run();
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(0);
+            const updated: any = await reload(event.uid);
+            expect(updated.cancelNoticeSentAt).toBeTruthy();
+        });
+
+        it("Treats an organizer matching one of the mailbox's alias addresses (case-insensitively) as the organizer's own copy.", async () => {
+            await createEvent({
+                mailboxUid: aliasMailboxUid,
+                organizer: { address: "Boss@EXAMPLE.com", displayName: "Boss", type: RecipientType.TO },
+            });
+
+            await job.run();
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(1);
+            expect(transport.sent[0].envelopeFrom).toBe("Boss@EXAMPLE.com");
+        });
+
+        it("Sends nothing when the owning mailbox no longer exists, but still stamps the row.", async () => {
+            const event = await createEvent({ mailboxUid: uuid.v4() });
+
+            await job.run();
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(0);
+            const updated: any = await reload(event.uid);
+            expect(updated.inviteSequenceSent).toBe(0);
+        });
+
+        it("Sends nothing when another replica claims the row between this replica's read and its claim (version conflict).", async () => {
+            const event = await createEvent();
+            const repo: any = (job as any).calendarEventRepo;
+            const realFind = repo.find.bind(repo);
+            let bumped = false;
+            const findSpy = vi.spyOn(repo, "find").mockImplementation(async (...args: any[]) => {
+                const rows = await realFind(...args);
+                if (!bumped) {
+                    bumped = true;
+                    // Another replica's claim lands after this replica read the row.
+                    await bumpVersion(event.uid);
+                }
+                return rows;
+            });
+
+            try {
+                await job.run();
+            } finally {
+                findSpy.mockRestore();
+            }
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(0);
+        });
+
+        it("Sends nothing for an event with no organizer address (never the organizer's own copy), but still stamps the row.", async () => {
+            const event = await createEvent({ organizer: { address: "", displayName: "Nobody", type: RecipientType.TO }, sequence: 1 });
+
+            await job.run();
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(0);
+            const updated: any = await reload(event.uid);
+            expect(updated.inviteSequenceSent).toBe(1);
+        });
+
+        it("Sends no CANCEL when another replica claims the cancelled row between this replica's read and its claim (version conflict).", async () => {
+            const event = await createEvent({ status: CalendarEventStatus.CANCELLED });
+            const repo: any = (job as any).calendarEventRepo;
+            const realFind = repo.find.bind(repo);
+            let bumped = false;
+            const findSpy = vi.spyOn(repo, "find").mockImplementation(async (...args: any[]) => {
+                const rows = await realFind(...args);
+                if (!bumped && args[0]?.status === CalendarEventStatus.CANCELLED) {
+                    bumped = true;
+                    await bumpVersion(event.uid);
+                }
+                return rows;
+            });
+
+            try {
+                await job.run();
+            } finally {
+                findSpy.mockRestore();
+            }
+
+            expect(bumped).toBe(true);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(0);
+            const updated: any = await reload(event.uid);
+            expect(updated.cancelNoticeSentAt ?? null).toBeNull();
+        });
+
+        it("Treats a transport-reported recipient rejection as a failed send (logged), still sending to the other attendees and keeping the row claimed.", async () => {
+            const event = await createEvent({
+                attendees: [
+                    { address: "reject@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+                    { address: "good@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+                ],
+            });
+            const warnSpy = vi.spyOn((job as any).logger, "warn");
+
+            await job.run();
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.map((m) => m.envelopeTo)).toEqual([["good@example.com"]]);
+            expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("reject@example.com"))).toBe(true);
+            warnSpy.mockRestore();
+            const updated: any = await reload(event.uid);
+            expect(updated.inviteSequenceSent).toBe(0);
+        });
     });
 });

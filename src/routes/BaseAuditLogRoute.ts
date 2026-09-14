@@ -20,7 +20,7 @@ const { Before, Delete, Param, Post, Put, Query, Request, RequiresTrustedRole, R
  * access - `find`/`count`/`findById` are overridden below, each `@RequiresTrustedRole()`-gated, mirroring
  * `BaseTransportRuleRoute`'s exact admin-only pattern.
  *
- * `create`/`update`/`delete`/`truncate` are overridden to unconditionally reject *every* caller, trusted
+ * `create`/`update`/`updateBulk`/`updateProperty`/`delete`/`truncate` are overridden to unconditionally reject *every* caller, trusted
  * included - unlike `BaseDistributionListRoute`/`BaseTransportRuleRoute`'s deny-all class ACL (which
  * blocks non-trusted callers but does NOT block a trusted one: `ACLUtils.hasPermission()` grants a
  * trusted caller access before ever consulting the record's own ACL grants - "Trusted users always have
@@ -89,6 +89,26 @@ export abstract class BaseAuditLogRoute<T extends AuditLogEntry> extends CRUDRou
         @Param("id") id: string,
         obj: UpdateObject<T>,
         @Request req: HttpRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<T> {
+        return this.rejectWrite();
+    }
+
+    /** `CRUDRoute`'s own `PUT /` would otherwise reach `doBulkUpdate()` directly, where a trusted admin passes the
+     * class ACL and could rewrite audit entries without ever going through `update()` above. */
+    @Put()
+    @Before("rejectWrite")
+    public async updateBulk(obj: UpdateObject<T>[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
+        return this.rejectWrite();
+    }
+
+    /** Same as `updateBulk()`, for `CRUDRoute`'s `PUT /:id/:property`. */
+    @Put(":id/:property")
+    @Before("rejectWrite")
+    public async updateProperty(
+        @Param("id") id: string,
+        @Param("property") propertyName: string,
+        obj: any,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
         return this.rejectWrite();

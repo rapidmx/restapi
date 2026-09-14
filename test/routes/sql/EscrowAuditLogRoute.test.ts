@@ -8,11 +8,12 @@ import { Server, ObjectFactory, ConnectionManager, isSqlDataSource } from "@rapi
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
+import { EscrowAuditHeadSQL } from "../../../src/models/sql/EscrowAuditHeadSQL.js";
 import { EscrowAuditLogEntrySQL } from "../../../src/models/sql/EscrowAuditLogEntrySQL.js";
 import { EscrowScopeSQL } from "../../../src/models/sql/EscrowScopeSQL.js";
 import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { EscrowAuditAction } from "../../../src/models/types.js";
-import { recordEscrowAuditEntry } from "../../../src/util/EscrowAuditUtils.js";
+import { recordEscrowAuditEntry, verifyEscrowAuditChain } from "../../../src/util/EscrowAuditUtils.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
 describe("Route:EscrowAuditLogSQL Tests", () => {
@@ -23,6 +24,7 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
     let escrowScopeRepo: Repository<EscrowScopeSQL>;
     let matterRepo: Repository<MatterSQL>;
     let auditRepo: Repository<EscrowAuditLogEntrySQL>;
+    let auditHeadRepo: Repository<EscrowAuditHeadSQL>;
 
     const holderA: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const holderAToken = JWTUtils.createTokenSync(config.get("auth"), holderA);
@@ -61,6 +63,7 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
             escrowScopeRepo = conn.getRepository(EscrowScopeSQL);
             matterRepo = conn.getRepository(MatterSQL);
             auditRepo = conn.getRepository(EscrowAuditLogEntrySQL);
+            auditHeadRepo = conn.getRepository(EscrowAuditHeadSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -73,6 +76,7 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
 
     beforeEach(async () => {
         await auditRepo.clear();
+        await auditHeadRepo.clear();
         await matterRepo.clear();
         await escrowScopeRepo.clear();
     });
@@ -304,5 +308,31 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
         expect(tamperedResult.status).toBe(200);
         expect(tamperedResult.body.valid).toBe(false);
         expect(tamperedResult.body.brokenAtSequence).toBe(entries[1].sequence);
+    });
+
+    it("Persists HMAC-keyed entries and the head record, and detects tail truncation via the head.", async () => {
+        const hmacKey = "escrow-audit-test-key";
+        for (const action of [EscrowAuditAction.REQUEST_CREATED, EscrowAuditAction.REQUEST_APPROVED, EscrowAuditAction.MATERIAL_READ]) {
+            await recordEscrowAuditEntry(
+                objectFactory,
+                EscrowAuditLogEntrySQL,
+                { action, holderUserUid: holderA.uid, matterId: uuid.v4(), mailboxUid: uuid.v4(), requestId: uuid.v4() },
+                { hmacKey },
+            );
+        }
+        expect(await verifyEscrowAuditChain(objectFactory, EscrowAuditLogEntrySQL, { hmacKey })).toEqual({ valid: true });
+
+        const [head] = await auditHeadRepo.find();
+        expect(head.sequence).toBe(2);
+        expect(head.hashAlgorithm).toBe("hmac-sha256");
+        expect(typeof head.mac).toBe("string");
+
+        await auditRepo.delete({ sequence: 2 });
+
+        expect(await verifyEscrowAuditChain(objectFactory, EscrowAuditLogEntrySQL, { hmacKey })).toEqual({
+            valid: false,
+            brokenAtSequence: 2,
+            reason: "truncated",
+        });
     });
 });

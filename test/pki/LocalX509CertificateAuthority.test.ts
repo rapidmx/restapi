@@ -11,6 +11,7 @@ import * as path from "path";
 import * as x509 from "@peculiar/x509";
 import { LocalX509CertificateAuthority } from "../../src/pki/LocalX509CertificateAuthority.js";
 import { IssuedCertificate } from "../../src/pki/EncryptionCertificateAuthority.js";
+import * as FileStoreUtils from "../../src/pki/FileStoreUtils.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -123,6 +124,76 @@ describe("LocalX509CertificateAuthority Tests", () => {
         await nested.issue("nested@example.com", await generateCsr("nested@example.com"));
 
         await expect(fs.access(path.join(nestedDir, "ca.cert.pem"))).resolves.toBeUndefined();
+    });
+
+    describe("First-run initialization", () => {
+        function freshAuthority(dir: string): LocalX509CertificateAuthority {
+            const ca = new LocalX509CertificateAuthority();
+            (ca as any).caDir = dir;
+            (ca as any).caSubject = "CN=Test Local CA";
+            return ca;
+        }
+
+        afterEach(() => {
+            vi.restoreAllMocks();
+        });
+
+        it("Recovers 'key present, cert missing' by self-signing a new CA cert for the existing key (never a new key).", async () => {
+            const dir: string = path.join(tmpDir, `recover-${Math.random()}`);
+            await freshAuthority(dir).issue("before@example.com", await generateCsr("before@example.com"));
+            const keyBefore: string = await fs.readFile(path.join(dir, "ca.key.pem"), "utf-8");
+            const oldCaCert = new x509.X509Certificate(await fs.readFile(path.join(dir, "ca.cert.pem"), "utf-8"));
+            // Simulate a crash between the key write and the cert write.
+            await fs.rm(path.join(dir, "ca.cert.pem"));
+
+            const result: IssuedCertificate = await freshAuthority(dir).issue("after@example.com", await generateCsr("after@example.com"));
+
+            expect(await fs.readFile(path.join(dir, "ca.key.pem"), "utf-8")).toBe(keyBefore);
+            const newCaCert = new x509.X509Certificate(await fs.readFile(path.join(dir, "ca.cert.pem"), "utf-8"));
+            // Same key pair underneath the regenerated CA certificate...
+            expect(Buffer.from(await newCaCert.publicKey.getThumbprint("SHA-256"))).toEqual(
+                Buffer.from(await oldCaCert.publicKey.getThumbprint("SHA-256")),
+            );
+            // ...so new leaves verify against it, and so do leaves issued before the crash.
+            expect(await new x509.X509Certificate(result.certificate).verify({ publicKey: newCaCert.publicKey })).toBe(true);
+            expect(await newCaCert.verify({ publicKey: newCaCert.publicKey })).toBe(true);
+            expect(await fs.readdir(dir)).toEqual(["ca.cert.pem", "ca.key.pem"]);
+        });
+
+        it("Concurrent first-ever issue() calls across instances share exactly one CA root.", async () => {
+            const dir: string = path.join(tmpDir, `concurrent-${Math.random()}`);
+            const results: IssuedCertificate[] = await Promise.all(
+                Array.from({ length: 4 }, async (_, i) => freshAuthority(dir).issue(`c${i}@example.com`, await generateCsr(`c${i}@example.com`))),
+            );
+
+            const caCert = new x509.X509Certificate(await fs.readFile(path.join(dir, "ca.cert.pem"), "utf-8"));
+            for (const result of results) {
+                expect(await new x509.X509Certificate(result.certificate).verify({ publicKey: caCert.publicKey })).toBe(true);
+            }
+            expect(await fs.readdir(dir)).toEqual(["ca.cert.pem", "ca.key.pem"]);
+        });
+
+        it("Gives up with an error after a bounded number of lost initialization races instead of looping forever.", async () => {
+            const dir: string = path.join(tmpDir, `bounded-${Math.random()}`);
+            // Every create reports "someone else already created it", but nothing ever appears on disk.
+            const spy = vi.spyOn(FileStoreUtils, "createFileExclusive").mockResolvedValue(false);
+
+            await expect(freshAuthority(dir).issue("loop@example.com", await generateCsr("loop@example.com"))).rejects.toThrow(
+                /could not initialize the local CA .* after 5 attempts/,
+            );
+            expect(spy).toHaveBeenCalledTimes(5);
+        });
+
+        it("Also bounds the 'cert keeps losing the race' path.", async () => {
+            const dir: string = path.join(tmpDir, `bounded-cert-${Math.random()}`);
+            await freshAuthority(dir).issue("seed@example.com", await generateCsr("seed@example.com"));
+            await fs.rm(path.join(dir, "ca.cert.pem"));
+            vi.spyOn(FileStoreUtils, "createFileExclusive").mockResolvedValue(false);
+
+            await expect(freshAuthority(dir).issue("loop2@example.com", await generateCsr("loop2@example.com"))).rejects.toThrow(
+                /after 5 attempts/,
+            );
+        });
     });
 
     it("Rethrows a filesystem error other than ENOENT while reading an existing CA key.", async () => {

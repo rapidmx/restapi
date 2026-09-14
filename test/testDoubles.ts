@@ -94,10 +94,11 @@ export class NoopSearchProvider implements SearchProvider {
         this.indexed.set(this.key(doc.entityType, doc.entityUid), doc);
     }
 
-    public async bulkIndex(docs: SearchDocument[]): Promise<void> {
+    public async bulkIndex(docs: SearchDocument[]): Promise<string[]> {
         for (const doc of docs) {
             await this.index(doc);
         }
+        return docs.map((doc) => doc.entityUid);
     }
 
     public async remove(entityType: SearchEntityType, entityUid: string): Promise<void> {

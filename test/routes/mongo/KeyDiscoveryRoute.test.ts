@@ -185,6 +185,43 @@ describe("Route:KeyDiscoveryMongo Tests", () => {
         expect(result.body).toEqual({ encryptPreference: { preferEncrypt: "nopreference" }, keys: [], escrow: false });
     });
 
+    it("Rejects a :hash that isn't exactly 52 z-base32 characters with a 400.", async () => {
+        const hash = computeKeyDiscoveryHash("alice");
+        for (const bad of [hash.slice(0, 51), `${hash}y`, `l${hash.slice(1)}`, "in(abc)"]) {
+            const result = await request(server.getApplication()).get(`${baseUrl}/${encodeURIComponent(bad)}`);
+            expect(result.status).toBe(400);
+        }
+    });
+
+    it("Scopes the lookup by the ?domain= query parameter, so two domains sharing a local part never get each other's keys.", async () => {
+        const localPart = `ceo-${uuid.v4()}`;
+        const keyFor = (fp: string) => ({ publicKey: "b64", type: "x509", useType: "encrypt" as const, fingerprint: fp, notBefore: 0, notAfter: 1 });
+        const hash = computeKeyDiscoveryHash(localPart);
+        await createMailbox({ primarySmtpAddress: `${localPart}@acme.example`, keyDiscoveryHash: hash, keys: [keyFor("acme-fp")] });
+        await createMailbox({ primarySmtpAddress: `${localPart}@contoso.example`, keyDiscoveryHash: hash, keys: [keyFor("contoso-fp")] });
+
+        // `Host` is the shared discovery server's own name - it names neither domain.
+        const acme = await request(server.getApplication()).get(`${baseUrl}/${hash}?domain=ACME.example`).set("Host", "mail.shared.example");
+        const contoso = await request(server.getApplication()).get(`${baseUrl}/${hash}?domain=contoso.example`).set("Host", "mail.shared.example");
+        const other = await request(server.getApplication()).get(`${baseUrl}/${hash}?domain=fabrikam.example`).set("Host", "acme.example");
+
+        expect(acme.body.keys).toEqual([keyFor("acme-fp")]);
+        expect(contoso.body.keys).toEqual([keyFor("contoso-fp")]);
+        // `domain` takes precedence over `Host` when both are present.
+        expect(other.body).toEqual({ encryptPreference: { preferEncrypt: "nopreference" }, keys: [], escrow: false });
+    });
+
+    it("Falls back to the Host header (port stripped, lowercased) when ?domain= is absent.", async () => {
+        const localPart = `ceo-${uuid.v4()}`;
+        const hash = computeKeyDiscoveryHash(localPart);
+        const key = { publicKey: "b64", type: "x509", useType: "encrypt" as const, fingerprint: "host-fp", notBefore: 0, notAfter: 1 };
+        await createMailbox({ primarySmtpAddress: `${localPart}@acme.example`, keyDiscoveryHash: hash, keys: [key] });
+
+        const result = await request(server.getApplication()).get(`${baseUrl}/${hash}`).set("Host", "ACME.example:8443");
+
+        expect(result.body.keys).toEqual([key]);
+    });
+
     it("Rate limits repeated requests for the same hash (429).", async () => {
         const rateLimiter: any = objectFactory.getInstance(RateLimiter);
         const original = rateLimiter.config;

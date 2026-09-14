@@ -202,6 +202,24 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
                 hasAttachments: false,
             }),
         );
+        // Out-of-range message for mailboxA (after the matter's own dateRangeEnd) - the upper bound is part of
+        // the query itself (range(...)), not an in-memory filter.
+        await messageRepo.save(
+            new MessageMongo({
+                mailboxUid: mailboxA.uid,
+                folderUid: uuid.v4(),
+                messageId: `${uuid.v4()}@example.com`,
+                subject: "After range",
+                from: { address: "alice@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date("2026-04-15"),
+                receivedDate: new Date("2026-04-15"),
+                bodyBlobKey: `bodies/${uuid.v4()}`,
+                flags: { read: false, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: false,
+            }),
+        );
         // Out-of-range message for mailboxA (before the matter's own dateRangeStart).
         await messageRepo.save(
             new MessageMongo({

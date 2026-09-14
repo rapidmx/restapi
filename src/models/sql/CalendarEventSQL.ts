@@ -36,6 +36,10 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Description("Defines a single calendar event/meeting stored in a `Folder` of type `CALENDAR`.")
 @Index("calevent_folder", ["folderUid"])
 @Index("calevent_ical_uid", ["icalUid"])
+@Index("calevent_mailbox", ["mailboxUid"])
+@Index("calevent_start_date", ["startDate"])
+@Index("calevent_status", ["status"])
+@Index("calevent_cancel_notice_sent_at", ["cancelNoticeSentAt"])
 @Protect(
     {
         uid: "CalendarEvent",
@@ -55,11 +59,11 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
     @Description("The unique identifier of the `Mailbox` this event belongs to.")
     public mailboxUid: string = "";
 
-    @Column()
+    @Column({ type: "text" })
     @Description("The title of the event.")
     public title: string = "";
 
-    @Column({ nullable: true })
+    @Column({ type: "text", nullable: true })
     @Description("The location of the event.")
     @Nullable
     public location?: string;
@@ -153,6 +157,11 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
     @Nullable
     public cancelNoticeSentAt?: Date;
 
+    @Column({ nullable: true })
+    @Description("The start of the latest occurrence whose reminder has been sent (system-managed).")
+    @Nullable
+    public reminderSentFor?: Date;
+
     // `nullable: true`: added after the table already existed in deployed installations, and this framework's
     // `@Column` decorator has no SQL-level `DEFAULT` option (see `ColumnOptions`) - without `nullable: true`,
     // `synchronize: true`'s `ALTER TABLE ... ADD COLUMN ... NOT NULL` fails outright against a populated table
@@ -191,6 +200,7 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
             this.autoReplyMessage = "autoReplyMessage" in other ? other.autoReplyMessage : this.autoReplyMessage;
             this.inviteSequenceSent = "inviteSequenceSent" in other ? other.inviteSequenceSent : this.inviteSequenceSent;
             this.cancelNoticeSentAt = "cancelNoticeSentAt" in other ? other.cancelNoticeSentAt : this.cancelNoticeSentAt;
+            this.reminderSentFor = "reminderSentFor" in other ? other.reminderSentFor : this.reminderSentFor;
             this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
         }
     }

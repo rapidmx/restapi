@@ -10,6 +10,9 @@ import { BlobPutOptions, BlobRange, BlobStore } from "./BlobStore.js";
 import { toBuffer } from "./LocalFsBlobStore.js";
 const { Config } = ObjectDecorators;
 
+/** S3's minimum size for every part of a multipart upload except the last. */
+const S3_MIN_PART_SIZE_BYTES = 5 * 1024 * 1024;
+
 /**
  * A `BlobStore` implementation backed by Amazon S3 or any S3-compatible object store (MinIO, Cloudflare
  * R2, DigitalOcean Spaces, etc.) — the recommended `BlobStore` for a multi-instance deployment, where
@@ -61,6 +64,10 @@ export class S3BlobStore implements BlobStore {
     @Config("mail:blob:s3:secret_access_key")
     private secretAccessKey?: string;
 
+    /** Part size for a streamed `put()` - see its doc comment. S3 requires at least 5 MiB for every part but the last. */
+    @Config("mail:blob:s3:multipart_part_size_bytes", 8 * 1024 * 1024)
+    private multipartPartSizeBytes: number = 8 * 1024 * 1024;
+
     private client?: S3Client;
 
     private resolveKey(key: string): string {
@@ -105,17 +112,63 @@ export class S3BlobStore implements BlobStore {
         return this.client as any;
     }
 
+    /**
+     * Stores `data`. A `Buffer` is one `PutObject`. A stream has no known length, which `PutObject` needs, so it is
+     * read in `multipart_part_size_bytes` parts: a stream that ends within the first part is still one `PutObject`,
+     * anything longer is a multipart upload (aborted if the stream or an upload fails, so no partial object is
+     * left behind). Only about one part is held in memory at a time.
+     */
     public async put(key: string, data: Buffer | NodeJS.ReadableStream, options?: BlobPutOptions): Promise<void> {
         const sdk = await importAwsClientS3();
         const client = await this.getClient(sdk);
-        await client.send(
-            new sdk.PutObjectCommand({
-                Bucket: this.bucket,
-                Key: this.resolveKey(key),
-                Body: data,
-                ContentType: options?.contentType,
-            }),
-        );
+        const Bucket: string = this.bucket;
+        const Key: string = this.resolveKey(key);
+        if (Buffer.isBuffer(data)) {
+            await client.send(new sdk.PutObjectCommand({ Bucket, Key, Body: data, ContentType: options?.contentType }));
+            return;
+        }
+
+        const partSize: number = Math.max(S3_MIN_PART_SIZE_BYTES, this.multipartPartSizeBytes);
+        let pending: Buffer[] = [];
+        let pendingBytes = 0;
+        let uploadId: string | undefined;
+        const parts: { ETag?: string; PartNumber: number }[] = [];
+        const uploadPart = async (body: Buffer): Promise<void> => {
+            if (!uploadId) {
+                const created: any = await client.send(new sdk.CreateMultipartUploadCommand({ Bucket, Key, ContentType: options?.contentType }));
+                uploadId = created.UploadId;
+            }
+            const PartNumber: number = parts.length + 1;
+            const uploaded: any = await client.send(new sdk.UploadPartCommand({ Bucket, Key, UploadId: uploadId, PartNumber, Body: body }));
+            parts.push({ ETag: uploaded.ETag, PartNumber });
+        };
+        try {
+            for await (const chunk of data as AsyncIterable<Buffer | string>) {
+                const buffer: Buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                pending.push(buffer);
+                pendingBytes += buffer.length;
+                while (pendingBytes >= partSize) {
+                    const joined: Buffer = Buffer.concat(pending);
+                    await uploadPart(joined.subarray(0, partSize));
+                    pending = [joined.subarray(partSize)];
+                    pendingBytes = joined.length - partSize;
+                }
+            }
+            const rest: Buffer = Buffer.concat(pending);
+            if (!uploadId) {
+                await client.send(new sdk.PutObjectCommand({ Bucket, Key, Body: rest, ContentType: options?.contentType }));
+                return;
+            }
+            if (rest.length > 0) {
+                await uploadPart(rest);
+            }
+            await client.send(new sdk.CompleteMultipartUploadCommand({ Bucket, Key, UploadId: uploadId, MultipartUpload: { Parts: parts } }));
+        } catch (err) {
+            if (uploadId) {
+                await client.send(new sdk.AbortMultipartUploadCommand({ Bucket, Key, UploadId: uploadId })).catch(() => undefined);
+            }
+            throw err;
+        }
     }
 
     public async get(key: string): Promise<Buffer> {
