@@ -1,5 +1,50 @@
 # Release Notes
 
+## Unreleased
+
+### Breaking changes
+
+- **ActiveSync device state moved to `@rapidmx/activesync`**: `DeviceSyncState` (interface and Mongo/SQL models) and
+  `EasDeviceStateCleanupJob` are no longer part of this library. Entity names and config keys are unchanged, so existing
+  device state carries over once the ActiveSync plugin is installed.
+- **`ErasureExecutionJob` no longer has `deviceSyncStateClass`**: it now erases every loaded model decorated
+  `@MailboxScopedData()` in its own datastore, so plugin data is still removed with an erased mailbox. Subclasses that
+  set `deviceSyncStateClass` should drop it.
+- **`BaseMailboxRoute` requires `mailboxPolicyClass`**: custom subclasses must supply the `MailboxPolicy` model (the
+  bundled `MailboxRouteMongo`/`MailboxRouteSQL` already do).
+
+### Plugins
+
+- **Plugin contract** (`src/plugins`): a plugin is an npm package with a `rapidmx.plugin` manifest (display name,
+  description, `apiVersion`, and admin-editable settings mapped to config keys) whose `./mongo` and `./sql` exports
+  contain its ready-to-mount routes, models and jobs. Includes manifest parsing and validation (`PLUGIN_API_VERSION` 1),
+  settings validation, a package allow-list matcher, and a state hash for comparing installed plugin sets.
+- **Plugin administration** (`BasePluginRoute`, trusted roles only): preview a package from the npm registry; add,
+  upgrade, configure, enable, disable and remove plugins; and read each server's reported load status. Every change is
+  audit-logged and announced on the `plugins` Redis channel. Removed plugins keep their row (marked removed) so a
+  server's default plugin list never re-adds one an administrator removed.
+- **`NpmRegistryClient`** reads package versions and manifests from a configurable, optionally authenticated registry
+  (`system:plugins:registry`, `system:plugins:registry_token`); `system:plugins:allowed_packages` limits which packages
+  may be added (default `@rapidmx/*`).
+- **`PluginRegistry`** lets a server record which plugins it loaded and plugins check for each other.
+
+### Shared mailboxes
+
+- **Mailbox access management** (`BaseMailboxAccessRoute`): list, grant and revoke a delegate's access to a mailbox as
+  viewer or manager. A grant covers every folder and item in the mailbox, and managers can manage access themselves.
+- **`GET /mailboxes/lookup-by-email`** resolves an email address (primary or alias) to the person who owns that
+  mailbox, for sharing UIs. Shared mailboxes never match.
+
+### First-run setup and mailbox policy
+
+- **Mailbox policy** (`BaseMailboxPolicyRoute`): an admin-editable default mailbox quota and self-service mailbox
+  creation setting. It's seeded from `mail:default_quota_bytes` and `mail:auto_provision:*` on first use, and those
+  config values remain the fallback for anything unset or if the policy can't be read. `autoProvision()` now reads it.
+- **Setup state** (`BaseSetupRoute`, trusted roles only) tracks the admin console's first-run setup wizard: whether setup
+  is required (a server with no domains, or a wizard that was started and not finished), the current step, completion
+  and reopening. Servers that already have domains are never pulled into setup by upgrading.
+- **`findOrCreateSingleton()`** for create-or-fetch of singleton settings rows.
+
 ## v0.8.0
 
 * Fixed a critical send-after-cancel race in ScheduledSendJob: relayDueMessage() now claims the message via a version-checked clear of scheduledSendTime before calling scanAndRelay(), the same claim-first-work-second discipline DataExportJob/MailboxImportJob already use
