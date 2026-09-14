@@ -7,6 +7,9 @@ import { PluginManifest } from "../../src/models/types.js";
 import {
     computePluginStateHash,
     defaultPluginSettings,
+    findPluginNamespace,
+    isNewerVersion,
+    normalizePluginNamespaces,
     matchesAllowedPackage,
     parsePluginManifest,
     PLUGIN_API_VERSION,
@@ -139,5 +142,57 @@ describe("PluginRegistry", () => {
         expect(isMailboxScopedData(Marked)).toBe(true);
         expect(isMailboxScopedData(Unmarked)).toBe(false);
         expect(isMailboxScopedData({})).toBe(false);
+    });
+});
+
+describe("plugin namespaces", () => {
+    it("normalizes strings and objects, dropping invalid entries and duplicates", () => {
+        expect(
+            normalizePluginNamespaces([
+                "@rapidmx",
+                "other",
+                { name: "@acme", registry: "https://npm.acme.test", token: "t" },
+                { name: "@rapidmx", registry: "https://ignored.test" },
+                { name: "Bad Scope" },
+                { registry: "https://no-name.test" },
+                { name: "@empty", registry: "", token: "" },
+                5,
+                null,
+            ]),
+        ).toEqual([
+            { name: "@rapidmx", registry: undefined, token: undefined },
+            { name: "@other", registry: undefined, token: undefined },
+            { name: "@acme", registry: "https://npm.acme.test", token: "t" },
+            { name: "@empty", registry: undefined, token: undefined },
+        ]);
+        expect(normalizePluginNamespaces("@rapidmx")).toEqual([]);
+    });
+
+    it("finds the namespace a package belongs to", () => {
+        const namespaces = normalizePluginNamespaces(["@rapidmx", "@acme"]);
+        expect(findPluginNamespace("@acme/crm-plugin", namespaces)?.name).toBe("@acme");
+        expect(findPluginNamespace("@acmeish/crm-plugin", namespaces)).toBeUndefined();
+    });
+});
+
+describe("isNewerVersion", () => {
+    it.each([
+        ["1.0.1", "1.0.0", true],
+        ["1.1.0", "1.0.9", true],
+        ["2.0.0", "1.99.99", true],
+        ["1.0.0", "1.0.0", false],
+        ["1.0.0", "1.0.1", false],
+        ["1.0.0", "1.0.0-beta.3", true],
+        ["1.0.0-beta.3", "1.0.0", false],
+        ["1.0.0-beta.10", "1.0.0-beta.9", true],
+        ["1.0.0-beta.2", "1.0.0-beta.2", false],
+        ["1.0.0-beta.2.1", "1.0.0-beta.2", true],
+        ["1.0.0-beta.2", "1.0.0-beta.2.1", false],
+        ["1.0.0-rc", "1.0.0-beta", true],
+        ["v1.2.0+build", "1.1.0", true],
+        ["latest", "1.0.0", false],
+        ["1.0.0", "nope", false],
+    ])("%s newer than %s: %s", (candidate, current, expected) => {
+        expect(isNewerVersion(candidate, current)).toBe(expected);
     });
 });

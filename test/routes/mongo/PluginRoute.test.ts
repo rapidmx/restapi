@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import config from "../../config.js";
+
+// Two namespaces: the default one and a company one on its own registry.
+config.set("system:plugins:namespaces", ["@rapidmx", { name: "@acme", registry: "https://npm.acme.test", token: "secret" }]);
 import { ConnectionManager, MongoConnection, MongoRepository, ObjectFactory, Server } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { MongoMemoryServer } from "mongodb-memory-server";

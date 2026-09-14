@@ -13,10 +13,16 @@ import {
     RegistryPackage,
     RegistryPackageVersion,
     RegistryRequestError,
+    RegistrySearchResult,
 } from "../plugins/NpmRegistryClient.js";
 import {
     computePluginStateHash,
     DEFAULT_ALLOWED_PLUGIN_PACKAGES,
+    DEFAULT_PLUGIN_NAMESPACES,
+    findPluginNamespace,
+    isNewerVersion,
+    normalizePluginNamespaces,
+    PluginNamespace,
     defaultPluginSettings,
     matchesAllowedPackage,
     PLUGIN_CHANGED_EVENT,
@@ -47,6 +53,30 @@ export interface UpdatePluginRequest {
 export interface PluginRegistryLookup {
     package: RegistryPackage;
     selected: RegistryPackageVersion;
+}
+
+/** One result of `GET /search`. `version` is the latest published version. */
+export interface PluginSearchResult extends RegistrySearchResult {
+    /** Whether `system:plugins:allowed_packages` lets an administrator add this package. */
+    allowed: boolean;
+    /** The installed row's uid, when this package is already installed. */
+    installedUid?: string;
+    /** The installed version, when this package is already installed. */
+    installedVersion?: string;
+    /** Whether a newer version than the installed one is published. */
+    updateAvailable: boolean;
+}
+
+/** One entry of `GET /updates`. */
+export interface PluginUpdateInfo {
+    uid: string;
+    name: string;
+    installedVersion: string;
+    /** The registry's `latest` version, or `undefined` if the registry doesn't know the package. */
+    latestVersion?: string;
+    updateAvailable: boolean;
+    /** Why the registry couldn't be checked for this plugin, if it couldn't. */
+    error?: string;
 }
 
 /** `GET /status` - the hash every server copy should reach, and what each copy last reported. */
@@ -85,7 +115,10 @@ export abstract class BasePluginRoute<T extends Plugin> {
     private registryToken: string = "";
 
     @Config("system:plugins:allowed_packages", DEFAULT_ALLOWED_PLUGIN_PACKAGES)
-    private allowedPackages: string[] = DEFAULT_ALLOWED_PLUGIN_PACKAGES;
+    private allowedPackagesConfig: string[] = DEFAULT_ALLOWED_PLUGIN_PACKAGES;
+
+    @Config("system:plugins:namespaces", DEFAULT_PLUGIN_NAMESPACES)
+    private namespacesConfig: unknown = DEFAULT_PLUGIN_NAMESPACES;
 
     @Config("datastores:events", null)
     private eventsConfig: any;
@@ -105,9 +138,44 @@ export abstract class BasePluginRoute<T extends Plugin> {
         }
     }
 
-    /** The registry client - overridable so tests can answer without a network. */
-    protected createRegistryClient(): NpmRegistryClient {
-        return new NpmRegistryClient(this.registryUrl, this.registryToken || undefined);
+    /** The configured plugin namespaces (`system:plugins:namespaces`). */
+    protected get namespaces(): PluginNamespace[] {
+        return normalizePluginNamespaces(this.namespacesConfig);
+    }
+
+    /** `system:plugins:allowed_packages` plus every package in a configured namespace. */
+    protected get allowedPackages(): string[] {
+        return [...this.allowedPackagesConfig, ...this.namespaces.map((namespace) => `${namespace.name}/*`)];
+    }
+
+    /**
+     * The registry client for a package or namespace: the registry configured for its namespace, else the default
+     * registry. Overridable so tests can answer without a network.
+     */
+    protected createRegistryClient(packageOrNamespace?: string): NpmRegistryClient {
+        const namespace: PluginNamespace | undefined = packageOrNamespace
+            ? this.namespaces.find((ns) => ns.name === packageOrNamespace) ?? findPluginNamespace(packageOrNamespace, this.namespaces)
+            : undefined;
+        return namespace?.registry
+            ? new NpmRegistryClient(namespace.registry, namespace.token)
+            : new NpmRegistryClient(this.registryUrl, this.registryToken || undefined);
+    }
+
+    /** Runs a registry call, turning a registry failure into a `502`. */
+    private async registryCall<R>(call: () => Promise<R>): Promise<R> {
+        try {
+            return await call();
+        } catch (err: any) {
+            if (err instanceof RegistryRequestError) {
+                throw new ApiError(ApiErrors.INTERNAL_ERROR, 502, err.message);
+            }
+            throw err;
+        }
+    }
+
+    private async installedPlugins(): Promise<T[]> {
+        await this.init();
+        return (await this.pluginRepo!.find({} as any, { ignoreACL: true })).filter((plugin) => !plugin.removed);
     }
 
     /** Announces a change to every server copy. A deployment without `datastores:events` has a single copy
@@ -166,15 +234,9 @@ export abstract class BasePluginRoute<T extends Plugin> {
 
     /** Resolves a package version from the registry, turning its failure modes into API errors. */
     private async lookupVersion(name: string, packageVersion?: string): Promise<RegistryPackageVersion & { manifest: PluginManifest }> {
-        let found: RegistryPackageVersion | undefined;
-        try {
-            found = await this.createRegistryClient().getVersion(name, packageVersion || "latest");
-        } catch (err: any) {
-            if (err instanceof RegistryRequestError) {
-                throw new ApiError(ApiErrors.INTERNAL_ERROR, 502, err.message);
-            }
-            throw err;
-        }
+        const found: RegistryPackageVersion | undefined = await this.registryCall(() =>
+            this.createRegistryClient(name).getVersion(name, packageVersion || "latest"),
+        );
         if (!found) {
             throw new ApiError(
                 ApiErrors.NOT_FOUND,
@@ -223,12 +285,70 @@ export abstract class BasePluginRoute<T extends Plugin> {
         return { hash: computePluginStateHash(plugins), instances };
     }
 
+    /** The configured plugin namespaces, without their registry tokens. */
+    @RequiresTrustedRole()
+    @Get("/namespaces")
+    public listNamespaces(): { name: string; registry?: string }[] {
+        return this.namespaces.map(({ name, registry }) => ({ name, registry }));
+    }
+
+    /** Plugin packages (names ending in `-plugin`) published under `namespace`, e.g. `@rapidmx`, each with its latest
+     * version and marked with whether it may be added, whether it's installed, and whether that install is outdated. */
+    @RequiresTrustedRole()
+    @Get("/search")
+    public async search(@Query("namespace") namespace?: string): Promise<PluginSearchResult[]> {
+        let scopes: string[];
+        if (namespace === undefined || namespace.trim() === "") {
+            scopes = this.namespaces.map((ns) => ns.name);
+        } else {
+            const [requested] = normalizePluginNamespaces([namespace]);
+            if (!requested) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'namespace' must be an npm scope, for example @rapidmx.");
+            }
+            scopes = [requested.name];
+        }
+        const pages: RegistrySearchResult[][] = await this.registryCall(() =>
+            Promise.all(scopes.map((scope) => this.createRegistryClient(scope).searchPlugins(scope))),
+        );
+        const found: RegistrySearchResult[] = pages.flat().sort((a, b) => a.name.localeCompare(b.name));
+        const installed: Map<string, T> = new Map((await this.installedPlugins()).map((plugin) => [plugin.name, plugin]));
+        return found.map((result) => {
+            const plugin: T | undefined = installed.get(result.name);
+            return {
+                ...result,
+                allowed: matchesAllowedPackage(result.name, this.allowedPackages),
+                installedUid: plugin?.uid,
+                installedVersion: plugin?.packageVersion,
+                updateAvailable: !!plugin && isNewerVersion(result.version, plugin.packageVersion),
+            };
+        });
+    }
+
+    /** For each installed plugin, the registry's latest version and whether it's newer than the installed one. A plugin
+     * the registry can't be checked for reports an `error` rather than failing the whole request. */
+    @RequiresTrustedRole()
+    @Get("/updates")
+    public async updates(): Promise<PluginUpdateInfo[]> {
+        const plugins: T[] = (await this.installedPlugins()).sort((a, b) => a.name.localeCompare(b.name));
+        return Promise.all(
+            plugins.map(async (plugin): Promise<PluginUpdateInfo> => {
+                const base = { uid: plugin.uid, name: plugin.name, installedVersion: plugin.packageVersion };
+                try {
+                    const latestVersion: string | undefined = (await this.createRegistryClient(plugin.name).getPackage(plugin.name))?.latest;
+                    return { ...base, latestVersion, updateAvailable: !!latestVersion && isNewerVersion(latestVersion, plugin.packageVersion) };
+                } catch (err: any) {
+                    return { ...base, updateAvailable: false, error: err.message };
+                }
+            }),
+        );
+    }
+
     @RequiresTrustedRole()
     @Get("/registry/:name")
     public async lookup(@Param("name") name: string, @Query("packageVersion") packageVersion?: string): Promise<PluginRegistryLookup> {
         this.assertAllowed(name);
         const selected = await this.lookupVersion(name, packageVersion);
-        const pkg: RegistryPackage | undefined = await this.createRegistryClient().getPackage(name);
+        const pkg: RegistryPackage | undefined = await this.createRegistryClient(name).getPackage(name);
         return { package: pkg!, selected };
     }
 

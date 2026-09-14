@@ -83,3 +83,22 @@ describe("BasePluginRoute (Redis and registry wiring)", () => {
         expect(await (await newRoute({ cacheConfig: { url: "redis://cache" } })).readInstanceStatuses()).toEqual([]);
     });
 });
+
+describe("BasePluginRoute namespaces", () => {
+    it("routes registry requests to a namespace's own registry, else the default", async () => {
+        const route = await newRoute({
+            registryUrl: "https://registry.default.test",
+            registryToken: "",
+            namespacesConfig: ["@rapidmx", { name: "@acme", registry: "https://npm.acme.test", token: "secret" }],
+            allowedPackagesConfig: ["left-pad"],
+        });
+        const acme: any = route.createRegistryClient("@acme/crm-plugin");
+        expect([acme.registryUrl, acme.authToken]).toEqual(["https://npm.acme.test", "secret"]);
+        const acmeScope: any = route.createRegistryClient("@acme");
+        expect(acmeScope.registryUrl).toBe("https://npm.acme.test");
+        const rapidmx: any = route.createRegistryClient("@rapidmx/mapi-plugin");
+        expect([rapidmx.registryUrl, rapidmx.authToken]).toEqual(["https://registry.default.test", undefined]);
+        expect(route.allowedPackages).toEqual(["left-pad", "@rapidmx/*", "@acme/*"]);
+        expect(route.listNamespaces()).toEqual([{ name: "@rapidmx", registry: undefined }, { name: "@acme", registry: "https://npm.acme.test" }]);
+    });
+});

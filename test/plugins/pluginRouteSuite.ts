@@ -10,7 +10,15 @@ import * as uuid from "uuid";
 import { AuditAction } from "../../src/models/types.js";
 import { computePluginStateHash, PLUGIN_API_VERSION } from "../../src/plugins/PluginUtils.js";
 import { RegistryRequestError } from "../../src/plugins/NpmRegistryClient.js";
-import { instanceStatuses, publishedHashes, publishFakePackage, resetPluginTestDoubles } from "./pluginTestDoubles.js";
+import {
+    brokenPackages,
+    failingSearchNamespaces,
+    instanceStatuses,
+    publishedHashes,
+    publishFakePackage,
+    registryClientRequests,
+    resetPluginTestDoubles,
+} from "./pluginTestDoubles.js";
 
 export interface PluginRouteSuiteContext {
     config: any;
@@ -52,6 +60,13 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
 
     const asAdmin = (req: any) => req.set("Authorization", "jwt " + adminToken);
 
+    async function addEasLike(name: string): Promise<any> {
+        publishFakePackage(name, "1.0.0", { plugin: EAS_MANIFEST });
+        const result = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name });
+        expect(result.status).toBe(200);
+        return result.body;
+    }
+
     async function addEas(packageVersion?: string): Promise<any> {
         const result = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/activesync", packageVersion });
         expect(result.status).toBe(200);
@@ -68,6 +83,86 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect((await auth(request(app).post(ctx.baseUrl)).send({ name: "@rapidmx/activesync" })).status).toBe(403);
             expect((await auth(request(app).put(`${ctx.baseUrl}/x`)).send({ enabled: false })).status).toBe(403);
             expect((await auth(request(app).delete(`${ctx.baseUrl}/x`))).status).toBe(403);
+        });
+    });
+
+    describe("GET /namespaces and GET /search", () => {
+        beforeEach(() => {
+            publishFakePackage("@rapidmx/mapi-plugin", "1.0.0", { plugin: EAS_MANIFEST }, { description: "MAPI" });
+            publishFakePackage("@rapidmx/mapi-plugin", "1.2.0", { plugin: EAS_MANIFEST }, { description: "MAPI" });
+            publishFakePackage("@acme/crm-plugin", "0.1.0", { plugin: EAS_MANIFEST });
+            publishFakePackage("@other/thing-plugin", "3.0.0", { plugin: EAS_MANIFEST });
+        });
+
+        it("lists the configured namespaces without their tokens", async () => {
+            const result = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/namespaces`));
+            expect(result.status).toBe(200);
+            expect(result.body).toEqual([{ name: "@rapidmx" }, { name: "@acme", registry: "https://npm.acme.test" }]);
+        });
+
+        it("searches every configured namespace, showing each plugin's latest version and install state", async () => {
+            publishFakePackage("@rapidmx/activesync-plugin", "1.0.0", { plugin: EAS_MANIFEST });
+            publishFakePackage("@rapidmx/activesync-plugin", "2.0.0", { plugin: EAS_MANIFEST });
+            const installed = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/activesync-plugin", packageVersion: "1.0.0" });
+            expect(installed.status).toBe(200);
+
+            const result = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/search`));
+            expect(result.status).toBe(200);
+            expect(result.body).toEqual([
+                { name: "@acme/crm-plugin", version: "0.1.0", allowed: true, updateAvailable: false },
+                {
+                    name: "@rapidmx/activesync-plugin",
+                    version: "2.0.0",
+                    allowed: true,
+                    installedUid: installed.body.uid,
+                    installedVersion: "1.0.0",
+                    updateAvailable: true,
+                },
+                { name: "@rapidmx/mapi-plugin", version: "1.2.0", description: "MAPI", allowed: true, updateAvailable: false },
+            ]);
+            expect(registryClientRequests).toEqual(expect.arrayContaining(["@rapidmx", "@acme"]));
+        });
+
+        it("searches one namespace, including an unconfigured one whose packages aren't allowed", async () => {
+            const result = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/search?namespace=other`));
+            expect(result.status).toBe(200);
+            expect(result.body).toEqual([{ name: "@other/thing-plugin", version: "3.0.0", allowed: false, updateAvailable: false }]);
+        });
+
+        it("rejects an invalid namespace and reports a registry failure", async () => {
+            expect((await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/search?namespace=Not%20A%20Scope`))).status).toBe(400);
+            failingSearchNamespaces.add("@acme");
+            const failed = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/search`));
+            expect(failed.status).toBe(502);
+        });
+
+        it("allows adding a package from a configured namespace even when allowed_packages doesn't list it", async () => {
+            const result = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@acme/crm-plugin" });
+            expect(result.status).toBe(200);
+            expect(registryClientRequests).toContain("@acme/crm-plugin");
+        });
+    });
+
+    describe("GET /updates", () => {
+        it("reports each installed plugin's latest version and whether it's newer", async () => {
+            const current = await addEas("1.1.0");
+            publishFakePackage("@rapidmx/old-plugin", "1.0.0", { plugin: EAS_MANIFEST });
+            const old = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/old-plugin" });
+            publishFakePackage("@rapidmx/old-plugin", "1.0.1", { plugin: EAS_MANIFEST });
+            publishFakePackage("@rapidmx/flaky-plugin", "1.0.0", { plugin: EAS_MANIFEST });
+            const flaky = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/flaky-plugin" });
+
+            const removed = await addEasLike("@rapidmx/gone-plugin");
+            await asAdmin(request(ctx.app()).delete(`${ctx.baseUrl}/${removed.uid}`));
+
+            brokenPackages.add("@rapidmx/flaky-plugin");
+            const result = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/updates`));
+            expect(result.status).toBe(200);
+            expect(result.body).toEqual([
+                { uid: current.uid, name: "@rapidmx/activesync", installedVersion: "1.1.0", latestVersion: "1.1.0", updateAvailable: false },
+                { uid: flaky.body.uid, name: "@rapidmx/flaky-plugin", installedVersion: "1.0.0", updateAvailable: false, error: "registry offline" },
+                { uid: old.body.uid, name: "@rapidmx/old-plugin", installedVersion: "1.0.0", latestVersion: "1.0.1", updateAvailable: true },
+            ]);
         });
     });
 

@@ -27,6 +27,25 @@ export interface RegistryPackage {
     versions: string[];
 }
 
+/** A package found by `NpmRegistryClient.searchPlugins()`. */
+export interface RegistrySearchResult {
+    name: string;
+    /** The latest published version. */
+    version: string;
+    description?: string;
+    /** When `version` was published (ISO 8601), if the registry reports it. */
+    date?: string;
+}
+
+/** The naming convention a plugin package follows, which registry search relies on. */
+export const PLUGIN_PACKAGE_SUFFIX = "-plugin";
+
+/** Registry search pages this many results at a time (npm's own maximum). */
+const SEARCH_PAGE_SIZE = 250;
+
+/** Stops paging after this many results, so a misbehaving registry can't make a search run forever. */
+const SEARCH_MAX_RESULTS = 1000;
+
 /** Thrown when the registry can't answer - `status` is the HTTP status, or `undefined` for a network error. */
 export class RegistryRequestError extends Error {
     constructor(
@@ -83,9 +102,39 @@ export class NpmRegistryClient {
         };
     }
 
+    /**
+     * Every package in `namespace` (an npm scope such as `@rapidmx`) whose name ends in `-plugin`, sorted by name.
+     * Uses the registry's search API (`/-/v1/search`, which npm and Verdaccio both serve); a name match only - whether a
+     * package really is a plugin is still checked from its manifest when it's added.
+     */
+    public async searchPlugins(namespace: string): Promise<RegistrySearchResult[]> {
+        const scope: string = namespace.replace(/^@/, "");
+        const results: Map<string, RegistrySearchResult> = new Map();
+        for (let from = 0; from < SEARCH_MAX_RESULTS; from += SEARCH_PAGE_SIZE) {
+            const query = new URLSearchParams({ text: `scope:${scope}`, size: String(SEARCH_PAGE_SIZE), from: String(from) });
+            const page: any = await this.request(`/-/v1/search?${query.toString()}`);
+            const objects: any[] = Array.isArray(page?.objects) ? page.objects : [];
+            for (const object of objects) {
+                const pkg: any = object?.package;
+                if (typeof pkg?.name === "string" && pkg.name.startsWith(`@${scope}/`) && pkg.name.endsWith(PLUGIN_PACKAGE_SUFFIX)) {
+                    results.set(pkg.name, { name: pkg.name, version: pkg.version, description: pkg.description, date: pkg.date });
+                }
+            }
+            if (objects.length < SEARCH_PAGE_SIZE) {
+                break;
+            }
+        }
+        return [...results.values()].sort((a, b) => a.name.localeCompare(b.name));
+    }
+
     private async fetchPackument(name: string): Promise<any | undefined> {
         // Scoped names keep their `@` but encode the `/`, per the registry API.
-        const url: string = `${this.registryUrl.replace(/\/+$/, "")}/${name.replace("/", "%2f")}`;
+        return this.request(`/${name.replace("/", "%2f")}`);
+    }
+
+    /** GETs `path` from the registry as JSON. Resolves `undefined` for a 404. */
+    private async request(path: string): Promise<any | undefined> {
+        const url: string = `${this.registryUrl.replace(/\/+$/, "")}${path}`;
         const headers: Record<string, string> = { Accept: "application/json" };
         if (this.authToken) {
             headers.Authorization = `Bearer ${this.authToken}`;

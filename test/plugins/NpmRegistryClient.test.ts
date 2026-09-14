@@ -108,3 +108,55 @@ describe("NpmRegistryClient", () => {
         expect(networkError.status).toBeUndefined();
     });
 });
+
+describe("NpmRegistryClient.searchPlugins", () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    function page(names: string[], extra: Record<string, unknown> = {}) {
+        return { objects: names.map((name) => ({ package: { name, version: "1.0.0", description: `${name} desc`, date: "2026-09-01T00:00:00.000Z", ...extra } })) };
+    }
+
+    it("keeps only packages in the scope whose names end in -plugin, sorted by name", async () => {
+        const fetchMock = vi.fn(async () => ({
+            status: 200,
+            ok: true,
+            json: async () => ({
+                objects: [
+                    ...page(["@rapidmx/mapi-plugin", "@rapidmx/restapi", "@other/x-plugin", "@rapidmx/activesync-plugin"]).objects,
+                    { package: { version: "1.0.0" } },
+                    {},
+                ],
+            }),
+        }));
+        vi.stubGlobal("fetch", fetchMock);
+        const results = await new NpmRegistryClient("https://npm.example.com/", "tok").searchPlugins("rapidmx");
+        expect(results.map((r) => r.name)).toEqual(["@rapidmx/activesync-plugin", "@rapidmx/mapi-plugin"]);
+        expect(results[0]).toEqual({ name: "@rapidmx/activesync-plugin", version: "1.0.0", description: "@rapidmx/activesync-plugin desc", date: "2026-09-01T00:00:00.000Z" });
+        expect(fetchMock).toHaveBeenCalledWith("https://npm.example.com/-/v1/search?text=scope%3Arapidmx&size=250&from=0", {
+            headers: { Accept: "application/json", Authorization: "Bearer tok" },
+        });
+    });
+
+    it("pages through full result pages, stops at a short one, and treats a missing body as no results", async () => {
+        const full = page(Array.from({ length: 250 }, (_, i) => `@acme/p${String(i).padStart(3, "0")}-plugin`));
+        const fetchMock = vi
+            .fn()
+            .mockResolvedValueOnce({ status: 200, ok: true, json: async () => full })
+            .mockResolvedValueOnce({ status: 200, ok: true, json: async () => page(["@acme/zz-plugin"]) });
+        vi.stubGlobal("fetch", fetchMock);
+        expect(await new NpmRegistryClient().searchPlugins("@acme")).toHaveLength(251);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect((fetchMock.mock.calls[1] as any[])[0]).toContain("from=250");
+
+        vi.stubGlobal("fetch", vi.fn(async () => ({ status: 404, ok: false })));
+        expect(await new NpmRegistryClient().searchPlugins("@acme")).toEqual([]);
+    });
+
+    it("stops paging at the result cap even if the registry keeps returning full pages", async () => {
+        const full = page(Array.from({ length: 250 }, (_, i) => `@acme/p${i}-plugin`));
+        const fetchMock = vi.fn(async () => ({ status: 200, ok: true, json: async () => full }));
+        vi.stubGlobal("fetch", fetchMock);
+        await new NpmRegistryClient().searchPlugins("@acme");
+        expect(fetchMock).toHaveBeenCalledTimes(4);
+    });
+});
