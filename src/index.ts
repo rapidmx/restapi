@@ -13,3 +13,4 @@ export * from "./pki/index.js";
 export * from "./push/index.js";
 export * from "./shared.js";
 export * from "./util/index.js";
+export * from "./plugins/index.js";

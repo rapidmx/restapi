@@ -152,7 +152,7 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
  * shape, just under the `acl` key with a distinct `database` file).
  *
  * `invalidWhereValuesBehavior: { null: "sql-null" }`: several jobs (e.g. AttachmentExtractionJob,
- * SearchIndexJob, EasDeviceStateCleanupJob) query a nullable "not yet processed" marker column via a literal
+ * SearchIndexJob) query a nullable "not yet processed" marker column via a literal
  * `{ field: null }` value, which is the correct/only way to express that against MongoDB (a missing/null field
  * matches `{field: null}` there) but which TypeORM's `SelectQueryBuilder` rejects by default for SQL - it
  * throws ("Null value encountered ... the IsNull() operator must be used") rather than silently treating it as

@@ -32,7 +32,6 @@ import { CalendarEventSQL } from "../../src/models/sql/CalendarEventSQL.js";
 import { CalendarShareLinkSQL } from "../../src/models/sql/CalendarShareLinkSQL.js";
 import { ContactSQL } from "../../src/models/sql/ContactSQL.js";
 import { ContactListSQL } from "../../src/models/sql/ContactListSQL.js";
-import { DeviceSyncStateSQL } from "../../src/models/sql/DeviceSyncStateSQL.js";
 import { DistributionListSQL } from "../../src/models/sql/DistributionListSQL.js";
 import { DomainSQL } from "../../src/models/sql/DomainSQL.js";
 import { EscrowAccessRequestSQL } from "../../src/models/sql/EscrowAccessRequestSQL.js";
@@ -1197,67 +1196,5 @@ describe("SQL model default construction", () => {
         expect(obj.action).toBe(AuditAction.MAILBOX_CREATE);
         expect(obj.targetType).toBe("");
         expect(obj.targetUid).toBe("");
-    });
-
-    it("DeviceSyncStateSQL falls back to class defaults when constructed with no data.", () => {
-        const obj = new DeviceSyncStateSQL();
-
-        expect(obj.mailboxUid).toBe("");
-        expect(obj.deviceId).toBe("");
-        expect(obj.deviceType).toBe("");
-        expect(obj.policyKey).toBeUndefined();
-        expect(obj.folderSyncKeys).toEqual({});
-        expect(obj.folderCollectionClasses).toEqual({});
-        expect(obj.lastSyncAt).toBeUndefined();
-        expect(obj.provisioned).toBe(false);
-        expect(obj.remoteWipeRequested).toBeUndefined();
-        expect(obj.remoteWipeAccountOnly).toBeUndefined();
-        expect(obj.remoteWipeAcknowledgedAt).toBeUndefined();
-    });
-
-    it("DeviceSyncStateSQL applies provided overrides when constructed with data.", () => {
-        const lastSyncAt = new Date("2026-01-20T00:00:00Z");
-        const remoteWipeAcknowledgedAt = new Date("2026-01-21T00:00:00Z");
-        const obj = new DeviceSyncStateSQL({
-            mailboxUid: "mailbox-1",
-            deviceId: "device-1",
-            deviceType: "iPhone",
-            policyKey: "policy-1",
-            folderSyncKeys: { "folder-1": "synckey-1" },
-            folderCollectionClasses: { "folder-1": "Email" },
-            lastSyncAt,
-            provisioned: true,
-            remoteWipeRequested: true,
-            remoteWipeAccountOnly: true,
-            remoteWipeAcknowledgedAt,
-        });
-
-        expect(obj.mailboxUid).toBe("mailbox-1");
-        expect(obj.deviceId).toBe("device-1");
-        expect(obj.deviceType).toBe("iPhone");
-        expect(obj.policyKey).toBe("policy-1");
-        expect(obj.folderSyncKeys).toEqual({ "folder-1": "synckey-1" });
-        expect(obj.folderCollectionClasses).toEqual({ "folder-1": "Email" });
-        expect(obj.lastSyncAt).toBe(lastSyncAt);
-        expect(obj.provisioned).toBe(true);
-        expect(obj.remoteWipeRequested).toBe(true);
-        expect(obj.remoteWipeAccountOnly).toBe(true);
-        expect(obj.remoteWipeAcknowledgedAt).toBe(remoteWipeAcknowledgedAt);
-    });
-
-    it("DeviceSyncStateSQL preserves class defaults for fields omitted from a partial override object.", () => {
-        const obj = new DeviceSyncStateSQL({});
-
-        expect(obj.mailboxUid).toBe("");
-        expect(obj.deviceId).toBe("");
-        expect(obj.deviceType).toBe("");
-        expect(obj.policyKey).toBeUndefined();
-        expect(obj.folderSyncKeys).toEqual({});
-        expect(obj.folderCollectionClasses).toEqual({});
-        expect(obj.lastSyncAt).toBeUndefined();
-        expect(obj.provisioned).toBe(false);
-        expect(obj.remoteWipeRequested).toBeUndefined();
-        expect(obj.remoteWipeAccountOnly).toBeUndefined();
-        expect(obj.remoteWipeAcknowledgedAt).toBeUndefined();
     });
 });

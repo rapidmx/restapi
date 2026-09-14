@@ -8,6 +8,7 @@ import { BlobStore } from "../blob/BlobStore.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { AuditAction, DataSubjectErasureRequest, Mailbox } from "../models/types.js";
+import { isMailboxScopedData } from "../plugins/PluginRegistry.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /**
@@ -36,7 +37,7 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * an orphaned folder after its owning mailbox is gone would be a real data-hygiene gap for a feature whose
  * whole point is leaving no trace). Verified against every interface in `models/types.ts` that declares a
  * `mailboxUid` field, this also purges `FocusedInboxOverride`/`TaskList`/`Label`/`MailFilterRule`/
- * `MailSignature`/`BookingType`/`Booking`/`OofReplySuppression`/`DeviceSyncState`/`QuarantineEntry`/
+ * `MailSignature`/`BookingType`/`Booking`/`OofReplySuppression`/plugin `@MailboxScopedData()` models/`QuarantineEntry`/
  * `IngestQueueEntry` (each carries real personal data - sender addresses, a signature's name/contact
  * details, booking attendee details, filter-rule conditions naming other people - that would otherwise
  * silently survive an "erasure" that reports itself complete), and `DataExportRequest`/
@@ -78,7 +79,6 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     protected abstract bookingTypeClass: any;
     protected abstract bookingClass: any;
     protected abstract oofReplySuppressionClass: any;
-    protected abstract deviceSyncStateClass: any;
     protected abstract quarantineEntryClass: any;
     protected abstract ingestQueueEntryClass: any;
     protected abstract dataExportRequestClass: any;
@@ -203,7 +203,10 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         purgedCount += await this.purgeEntityType(this.bookingTypeClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.bookingClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.oofReplySuppressionClass, request.mailboxUid);
-        purgedCount += await this.purgeEntityType(this.deviceSyncStateClass, request.mailboxUid);
+        // Plugin models marked `@MailboxScopedData()` (e.g. ActiveSync device state) hold this mailbox's data too.
+        for (const entityClass of this.pluginMailboxScopedClasses()) {
+            purgedCount += await this.purgeEntityType(entityClass, request.mailboxUid);
+        }
         // `rawBlobKey` is required (non-optional) on both `QuarantineEntry` and `IngestQueueEntry` -
         // deleted unconditionally, same reasoning as `Attachment.blobKey`/`Message.bodyBlobKey` above.
         purgedCount += await this.purgeEntityType(this.quarantineEntryClass, request.mailboxUid, async (row: any) => {
@@ -273,6 +276,19 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             }
         }
         return purgedCount;
+    }
+
+    /** Every loaded model marked `@MailboxScopedData()` that lives in the same datastore as this job's own
+     * `Mailbox` model. The loader registers each class under more than one name, hence the de-duplication. */
+    private pluginMailboxScopedClasses(): any[] {
+        const datastore: unknown = Reflect.getMetadata("rrst:datasource", this.mailboxClass);
+        const classes: Set<any> = new Set();
+        for (const clazz of this._objectFactory!.classes.values()) {
+            if (isMailboxScopedData(clazz) && Reflect.getMetadata("rrst:datasource", clazz) === datastore) {
+                classes.add(clazz);
+            }
+        }
+        return [...classes];
     }
 
     private async getRepo(entityClass: any): Promise<RepoUtils<any>> {

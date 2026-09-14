@@ -631,7 +631,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
      * Full, atomic replacement of a mailbox's `wrappedKeys`/`masterKeyWraps` (and published `keys`), following
      * the client's own re-key operation - the only real revocation mechanism for a captured wrap (see
      * `MasterKeyWrap`'s doc comment). Purely client-initiated: this repo has no session/device-revocation
-     * concept today (`DeviceSyncState` is EAS sync-cursor state, not session revocation), so this is scoped as
+     * concept today (the ActiveSync plugin's `DeviceSyncState` is EAS sync-cursor state, not session revocation), so this is scoped as
      * "the client calls this after doing its own re-key," not tied to a revocation feature that doesn't exist
      * yet. Requires an already-initialized vault (`404` otherwise) - there is nothing to re-key for a mailbox
      * that has never enrolled a key.

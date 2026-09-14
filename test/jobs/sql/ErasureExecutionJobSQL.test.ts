@@ -20,7 +20,7 @@ import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
 import { ContactListSQL } from "../../../src/models/sql/ContactListSQL.js";
 import { DataExportRequestSQL } from "../../../src/models/sql/DataExportRequestSQL.js";
 import { DataSubjectErasureRequestSQL } from "../../../src/models/sql/DataSubjectErasureRequestSQL.js";
-import { DeviceSyncStateSQL } from "../../../src/models/sql/DeviceSyncStateSQL.js";
+import { PluginMailboxDataMongo, PluginMailboxDataSQL } from "../fixtures/PluginMailboxData.js";
 import { FocusedInboxOverrideSQL } from "../../../src/models/sql/FocusedInboxOverrideSQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
@@ -62,7 +62,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
     let bookingTypeRepo: Repository<BookingTypeSQL>;
     let bookingRepo: Repository<BookingSQL>;
     let oofReplySuppressionRepo: Repository<OofReplySuppressionSQL>;
-    let deviceSyncStateRepo: Repository<DeviceSyncStateSQL>;
+    let pluginMailboxDataRepo: Repository<PluginMailboxDataSQL>;
     let quarantineEntryRepo: Repository<QuarantineEntrySQL>;
     let ingestQueueEntryRepo: Repository<IngestQueueEntrySQL>;
     let dataExportRequestRepo: Repository<DataExportRequestSQL>;
@@ -112,7 +112,10 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         models.set("BookingTypeSQL", BookingTypeSQL);
         models.set("BookingSQL", BookingSQL);
         models.set("OofReplySuppressionSQL", OofReplySuppressionSQL);
-        models.set("DeviceSyncStateSQL", DeviceSyncStateSQL);
+        models.set("PluginMailboxDataSQL", PluginMailboxDataSQL);
+        objectFactory.register(PluginMailboxDataSQL);
+        // The other backend's marked model must be ignored, not purged against this datastore.
+        objectFactory.register(PluginMailboxDataMongo);
         models.set("QuarantineEntrySQL", QuarantineEntrySQL);
         models.set("IngestQueueEntrySQL", IngestQueueEntrySQL);
         models.set("DataExportRequestSQL", DataExportRequestSQL);
@@ -143,7 +146,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         bookingTypeRepo = conn.getRepository(BookingTypeSQL);
         bookingRepo = conn.getRepository(BookingSQL);
         oofReplySuppressionRepo = conn.getRepository(OofReplySuppressionSQL);
-        deviceSyncStateRepo = conn.getRepository(DeviceSyncStateSQL);
+        pluginMailboxDataRepo = conn.getRepository(PluginMailboxDataSQL);
         quarantineEntryRepo = conn.getRepository(QuarantineEntrySQL);
         ingestQueueEntryRepo = conn.getRepository(IngestQueueEntrySQL);
         dataExportRequestRepo = conn.getRepository(DataExportRequestSQL);
@@ -178,7 +181,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
             bookingTypeRepo,
             bookingRepo,
             oofReplySuppressionRepo,
-            deviceSyncStateRepo,
+            pluginMailboxDataRepo,
             quarantineEntryRepo,
             ingestQueueEntryRepo,
             dataExportRequestRepo,
@@ -322,8 +325,8 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
             }),
         );
         await oofReplySuppressionRepo.save(new OofReplySuppressionSQL({ mailboxUid: mailbox.uid, senderAddress: "sender@example.com", lastRepliedAt: new Date() }));
-        await deviceSyncStateRepo.save(
-            new DeviceSyncStateSQL({ mailboxUid: mailbox.uid, deviceId: uuid.v4(), deviceType: "iPhone", folderSyncKeys: {}, folderCollectionClasses: {}, provisioned: true }),
+        await pluginMailboxDataRepo.save(
+            new PluginMailboxDataSQL({ mailboxUid: mailbox.uid }),
         );
 
         const quarantineRawBlobKey = `quarantine/${uuid.v4()}`;
@@ -371,7 +374,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect(updated!.status).toBe("completed");
         // folder, message, attachment, contact, contactList, calendarEvent, task, note,
         // focusedInboxOverride, taskList, label, mailFilterRule, mailSignature, bookingType, booking,
-        // oofReplySuppression, deviceSyncState, quarantineEntry, ingestQueueEntry, dataExportRequest,
+        // oofReplySuppression, plugin mailbox data, quarantineEntry, ingestQueueEntry, dataExportRequest,
         // mailboxImportRequest, mailbox = 22
         expect(updated!.purgedCount).toBe(22);
 
@@ -392,7 +395,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect((await bookingTypeRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await bookingRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await oofReplySuppressionRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
-        expect((await deviceSyncStateRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await pluginMailboxDataRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await quarantineEntryRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await ingestQueueEntryRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await dataExportRequestRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);

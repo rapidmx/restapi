@@ -25,6 +25,7 @@ export * from "./BaseMailIngestRoute.js";
 export * from "./BaseMatterExportRequestRoute.js";
 export * from "./BaseMatterSearchRoute.js";
 export * from "./BaseMessageRoute.js";
+export * from "./BasePluginRoute.js";
 export * from "./BaseRetentionPolicyRoute.js";
 export * from "./BaseScopedChildRoute.js";
 export * from "./BaseSearchRoute.js";

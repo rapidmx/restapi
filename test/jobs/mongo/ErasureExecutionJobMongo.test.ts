@@ -20,7 +20,7 @@ import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
 import { ContactListMongo } from "../../../src/models/mongo/ContactListMongo.js";
 import { DataExportRequestMongo } from "../../../src/models/mongo/DataExportRequestMongo.js";
 import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSubjectErasureRequestMongo.js";
-import { DeviceSyncStateMongo } from "../../../src/models/mongo/DeviceSyncStateMongo.js";
+import { PluginMailboxDataMongo, PluginMailboxDataSQL } from "../fixtures/PluginMailboxData.js";
 import { FocusedInboxOverrideMongo } from "../../../src/models/mongo/FocusedInboxOverrideMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { IngestQueueEntryMongo } from "../../../src/models/mongo/IngestQueueEntryMongo.js";
@@ -66,7 +66,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
     let bookingTypeRepo: MongoRepository<BookingTypeMongo>;
     let bookingRepo: MongoRepository<BookingMongo>;
     let oofReplySuppressionRepo: MongoRepository<OofReplySuppressionMongo>;
-    let deviceSyncStateRepo: MongoRepository<DeviceSyncStateMongo>;
+    let pluginMailboxDataRepo: MongoRepository<PluginMailboxDataMongo>;
     let quarantineEntryRepo: MongoRepository<QuarantineEntryMongo>;
     let ingestQueueEntryRepo: MongoRepository<IngestQueueEntryMongo>;
     let dataExportRequestRepo: MongoRepository<DataExportRequestMongo>;
@@ -116,7 +116,10 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         models.set("BookingTypeMongo", BookingTypeMongo);
         models.set("BookingMongo", BookingMongo);
         models.set("OofReplySuppressionMongo", OofReplySuppressionMongo);
-        models.set("DeviceSyncStateMongo", DeviceSyncStateMongo);
+        models.set("PluginMailboxDataMongo", PluginMailboxDataMongo);
+        objectFactory.register(PluginMailboxDataMongo);
+        // The other backend's marked model must be ignored, not purged against this datastore.
+        objectFactory.register(PluginMailboxDataSQL);
         models.set("QuarantineEntryMongo", QuarantineEntryMongo);
         models.set("IngestQueueEntryMongo", IngestQueueEntryMongo);
         models.set("DataExportRequestMongo", DataExportRequestMongo);
@@ -147,7 +150,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         bookingTypeRepo = conn.getMongoRepository("BookingTypeMongo");
         bookingRepo = conn.getMongoRepository("BookingMongo");
         oofReplySuppressionRepo = conn.getMongoRepository("OofReplySuppressionMongo");
-        deviceSyncStateRepo = conn.getMongoRepository("DeviceSyncStateMongo");
+        pluginMailboxDataRepo = conn.getMongoRepository("PluginMailboxDataMongo");
         quarantineEntryRepo = conn.getMongoRepository("QuarantineEntryMongo");
         ingestQueueEntryRepo = conn.getMongoRepository("IngestQueueEntryMongo");
         dataExportRequestRepo = conn.getMongoRepository("DataExportRequestMongo");
@@ -183,7 +186,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
             bookingTypeRepo,
             bookingRepo,
             oofReplySuppressionRepo,
-            deviceSyncStateRepo,
+            pluginMailboxDataRepo,
             quarantineEntryRepo,
             ingestQueueEntryRepo,
             dataExportRequestRepo,
@@ -327,8 +330,8 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
             }),
         );
         await oofReplySuppressionRepo.save(new OofReplySuppressionMongo({ mailboxUid: mailbox.uid, senderAddress: "sender@example.com", lastRepliedAt: new Date() }));
-        await deviceSyncStateRepo.save(
-            new DeviceSyncStateMongo({ mailboxUid: mailbox.uid, deviceId: uuid.v4(), deviceType: "iPhone", folderSyncKeys: {}, folderCollectionClasses: {}, provisioned: true }),
+        await pluginMailboxDataRepo.save(
+            new PluginMailboxDataMongo({ mailboxUid: mailbox.uid }),
         );
 
         const quarantineRawBlobKey = `quarantine/${uuid.v4()}`;
@@ -376,7 +379,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         expect(updated!.status).toBe("completed");
         // folder, message, attachment, contact, contactList, calendarEvent, task, note,
         // focusedInboxOverride, taskList, label, mailFilterRule, mailSignature, bookingType, booking,
-        // oofReplySuppression, deviceSyncState, quarantineEntry, ingestQueueEntry, dataExportRequest,
+        // oofReplySuppression, plugin mailbox data, quarantineEntry, ingestQueueEntry, dataExportRequest,
         // mailboxImportRequest, mailbox = 22
         expect(updated!.purgedCount).toBe(22);
 
@@ -397,7 +400,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         expect((await bookingTypeRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await bookingRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await oofReplySuppressionRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
-        expect((await deviceSyncStateRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
+        expect((await pluginMailboxDataRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await quarantineEntryRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await ingestQueueEntryRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await dataExportRequestRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);

@@ -34,6 +34,7 @@ export * from "./MatterSearchRouteSQL.js";
 export * from "./MessageRouteSQL.js";
 export * from "./NoteRouteSQL.js";
 export * from "./QuarantineRouteSQL.js";
+export * from "./PluginRouteSQL.js";
 export * from "./RetentionPolicyRouteSQL.js";
 export * from "./SearchRouteSQL.js";
 export * from "./TaskListRouteSQL.js";

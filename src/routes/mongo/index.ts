@@ -34,6 +34,7 @@ export * from "./MatterSearchRouteMongo.js";
 export * from "./MessageRouteMongo.js";
 export * from "./NoteRouteMongo.js";
 export * from "./QuarantineRouteMongo.js";
+export * from "./PluginRouteMongo.js";
 export * from "./RetentionPolicyRouteMongo.js";
 export * from "./SearchRouteMongo.js";
 export * from "./TaskListRouteMongo.js";

@@ -9,6 +9,7 @@ import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { MailboxAccessRouteSQL } from "../../../src/routes/sql/MailboxAccessRouteSQL.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
 describe("Route:MailboxAccessSQL Tests", () => {
@@ -219,6 +220,47 @@ describe("Route:MailboxAccessSQL Tests", () => {
                 .delete(`${baseUrl}/${mailbox.uid}/access/${owner.uid}`)
                 .set("Authorization", "jwt " + ownerToken);
             expect(result.status).toBe(400);
+        });
+    });
+
+    describe("error paths", () => {
+        it("404s for a mailbox that doesn't exist.", async () => {
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/${uuid.v4()}/access`)
+                .set("Authorization", "jwt " + ownerToken);
+            expect(result.status).toBe(404);
+        });
+
+        it("500s for a mailbox with no ACL document, which every mailbox is seeded with on creation.", async () => {
+            const mailbox = await mailboxRepo.save(
+                new MailboxSQL({
+                    ownerUserUid: owner.uid,
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "No ACL",
+                    timezone: "UTC",
+                    quotaBytes: 1,
+                    usedBytes: 0,
+                }),
+            );
+            const admin = JWTUtils.createTokenSync(config.get("auth"), { uid: uuid.v4(), roles: ["admin"], elevated: Date.now() });
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/${mailbox.uid}/access`)
+                .set("Authorization", "jwt " + admin);
+            expect(result.status).toBe(500);
+        });
+
+        it("400s an email lookup without an email.", async () => {
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/lookup-by-email`)
+                .set("Authorization", "jwt " + strangerToken);
+            expect(result.status).toBe(400);
+        });
+
+        it("Matches an alias as a whole JSON string element, with LIKE wildcards escaped.", () => {
+            const raw: any = (new MailboxAccessRouteSQL() as any).aliasQueryValue("a_b%c@example.com");
+            expect(raw.getSql("aliases")).toBe("aliases LIKE :pattern ESCAPE '\\'");
+            expect(raw.objectLiteralParameters).toEqual({ pattern: '%"a\\_b\\%c@example.com"%' });
         });
     });
 

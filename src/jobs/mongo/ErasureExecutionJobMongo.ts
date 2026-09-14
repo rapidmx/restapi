@@ -13,7 +13,6 @@ import {
     ContactMongo,
     DataExportRequestMongo,
     DataSubjectErasureRequestMongo,
-    DeviceSyncStateMongo,
     FocusedInboxOverrideMongo,
     FolderMongo,
     IngestQueueEntryMongo,
@@ -50,7 +49,6 @@ export class ErasureExecutionJobMongo extends ErasureExecutionJob<DataSubjectEra
     protected bookingTypeClass: any = BookingTypeMongo;
     protected bookingClass: any = BookingMongo;
     protected oofReplySuppressionClass: any = OofReplySuppressionMongo;
-    protected deviceSyncStateClass: any = DeviceSyncStateMongo;
     protected quarantineEntryClass: any = QuarantineEntryMongo;
     protected ingestQueueEntryClass: any = IngestQueueEntryMongo;
     protected dataExportRequestClass: any = DataExportRequestMongo;

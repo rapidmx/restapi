@@ -1433,6 +1433,9 @@ export enum AuditAction {
     /** Recorded on `GET /mailboxes/:id` ONLY when the caller isn't the mailbox's own owner - same
      * reasoning as `MESSAGE_CONTENT_ACCESSED` above, applied to viewing a mailbox's own profile. */
     MAILBOX_ACCESSED = "mailbox.accessed",
+    PLUGIN_INSTALL = "plugin.install",
+    PLUGIN_UPDATE = "plugin.update",
+    PLUGIN_REMOVE = "plugin.remove",
     RETENTION_POLICY_UPDATE = "retention_policy.update",
     /** Recorded once per `RetentionEnforcementJob` run per entity type actually purged (a count, not one
      * entry per record - a routine background job purging thousands of expired rows would otherwise
@@ -2226,46 +2229,6 @@ export interface IngestQueueEntry extends BaseEntity {
 }
 
 /**
- * Tracks the EAS sync state of a single paired mobile device against a `Mailbox`.
- *
- * @author Jean-Philippe Steinmetz
- */
-export interface DeviceSyncState extends BaseEntity {
-    mailboxUid: string;
-
-    deviceId: string;
-
-    deviceType: string;
-
-    /** The EAS provisioning policy key most recently acknowledged by the device. */
-    policyKey?: string;
-
-    /** The per-folder EAS `SyncKey` cursor, keyed by `Folder.uid`. */
-    folderSyncKeys: Record<string, string>;
-
-    /** The EAS `Class` (`"Email"`, `"Contacts"`, ...) most recently synced for a folder, keyed by `Folder.uid` -
-     * lets a `Sync` request omit `Class` after its first request for a collection, per [MS-ASCMD], without the
-     * server losing track of which entity type that collection holds. */
-    folderCollectionClasses: Record<string, string>;
-
-    lastSyncAt?: Date;
-
-    provisioned: boolean;
-
-    /** `true` once an administrator has requested this device be remotely wiped (MS-ASPROV `RemoteWipe`). Set
-     * back to `false` once the device acknowledges the wipe. */
-    remoteWipeRequested?: boolean;
-
-    /** `true` if the pending/most recent remote wipe request was scoped to this account only (vs. a full device
-     * wipe) - recorded for administrative record-keeping; the wire directive sent to the device is the same
-     * either way in this library's pragmatic subset. */
-    remoteWipeAccountOnly?: boolean;
-
-    /** When the device most recently acknowledged a remote wipe request. */
-    remoteWipeAcknowledgedAt?: Date;
-}
-
-/**
  * Internal bookkeeping row (not client-manageable - no CRUD route exists for this entity) used by
  * `ScanQueueJob` to throttle automatic (out-of-office) replies: at most one reply is sent to a given sender per
  * `mailboxUid` within a rolling `mail:oof:resuppress_after_hours` window, to avoid a reply storm against a busy
@@ -2281,4 +2244,70 @@ export interface OofReplySuppression extends BaseEntity {
     senderAddress: string;
 
     lastRepliedAt: Date;
+}
+
+/** The kinds of value a plugin setting can hold - see `PluginSettingDefinition`. */
+export type PluginSettingType = "string" | "number" | "boolean" | "select";
+
+/**
+ * One admin-editable setting a plugin declares in its manifest. `key` is the nconf config key the plugin
+ * already reads through `@Config(...)`; the host merges the saved value into config before the plugin's
+ * classes are instantiated, so the plugin needs no plugin-specific settings code of its own.
+ */
+export interface PluginSettingDefinition {
+    key: string;
+    label: string;
+    type: PluginSettingType;
+    help?: string;
+    default?: string | number | boolean;
+    required?: boolean;
+    /** Inclusive bounds for `number` settings. */
+    min?: number;
+    max?: number;
+    /** The allowed values for `select` settings. */
+    options?: { value: string; label: string }[];
+}
+
+/**
+ * The `rapidmx.plugin` block of a plugin package's `package.json`. A package without one is not a plugin.
+ * A plugin's `./mongo` and `./sql` package exports are its entry points: each exports only that datastore's
+ * ready-to-mount classes (decorated routes, `@DataStore` models and concrete `BackgroundService` jobs).
+ */
+export interface PluginManifest {
+    /** Must equal `PLUGIN_API_VERSION` for the host to load the plugin. */
+    apiVersion: number;
+    displayName: string;
+    description?: string;
+    settings?: PluginSettingDefinition[];
+}
+
+/**
+ * A plugin an administrator has added to this deployment. Every server copy installs and loads each enabled
+ * row at startup, and restarts (one copy at a time) when the set changes. Removing a row does not remove any
+ * data the plugin stored.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface Plugin extends BaseEntity {
+    /** The npm package name, e.g. `@rapidmx/activesync`. */
+    name: string;
+
+    /** The exact npm version to install. (`version` is the entity's own optimistic-lock counter.) */
+    packageVersion: string;
+
+    /** The registry's `dist.integrity` (SRI) for `packageVersion`, checked against what each server copy installs. */
+    integrity?: string;
+
+    enabled: boolean;
+
+    /** `true` once an administrator removed the plugin. The row is kept (disabled) rather than deleted so a
+     * server's default plugin list never re-adds a plugin an administrator deliberately removed; adding the
+     * package again revives it. */
+    removed?: boolean;
+
+    /** Saved setting values, keyed by `PluginSettingDefinition.key`. */
+    settings: Record<string, string | number | boolean>;
+
+    /** A snapshot of the package's `rapidmx.plugin` block for `version`. */
+    manifest: PluginManifest;
 }

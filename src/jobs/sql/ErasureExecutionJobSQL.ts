@@ -13,7 +13,6 @@ import {
     ContactSQL,
     DataExportRequestSQL,
     DataSubjectErasureRequestSQL,
-    DeviceSyncStateSQL,
     FocusedInboxOverrideSQL,
     FolderSQL,
     IngestQueueEntrySQL,
@@ -50,7 +49,6 @@ export class ErasureExecutionJobSQL extends ErasureExecutionJob<DataSubjectErasu
     protected bookingTypeClass: any = BookingTypeSQL;
     protected bookingClass: any = BookingSQL;
     protected oofReplySuppressionClass: any = OofReplySuppressionSQL;
-    protected deviceSyncStateClass: any = DeviceSyncStateSQL;
     protected quarantineEntryClass: any = QuarantineEntrySQL;
     protected ingestQueueEntryClass: any = IngestQueueEntrySQL;
     protected dataExportRequestClass: any = DataExportRequestSQL;
