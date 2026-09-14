@@ -101,4 +101,31 @@ describe("BasePluginRoute namespaces", () => {
         expect(route.allowedPackages).toEqual(["left-pad", "@rapidmx/*", "@acme/*"]);
         expect(route.listNamespaces()).toEqual([{ name: "@rapidmx", registry: undefined }, { name: "@acme", registry: "https://npm.acme.test" }]);
     });
+
+    it("reads string config (as an environment variable sets it) as a list, warning once about entries it drops", async () => {
+        const logger = { warn: vi.fn() };
+        const route = await newRoute({ namespacesConfig: "@rapidmx, Bad Scope", allowedPackagesConfig: "@acme/*, *", logger });
+        expect(route.allowedPackages).toEqual(["@acme/*", "@rapidmx/*"]);
+        expect(route.allowedPackages).toEqual(["@acme/*", "@rapidmx/*"]);
+        expect(logger.warn).toHaveBeenCalledTimes(2);
+    });
+});
+
+describe("BasePluginRoute rollback", () => {
+    it("tries every undo step, newest first, logging the ones that fail", async () => {
+        const logger = { error: vi.fn() };
+        const route = await newRoute({ logger });
+        const order: string[] = [];
+        await route.rollback([
+            async () => {
+                order.push("first");
+            },
+            async () => {
+                order.push("second");
+                throw new Error("row gone");
+            },
+        ]);
+        expect(order).toEqual(["second", "first"]);
+        expect(logger.error).toHaveBeenCalledWith("Could not undo part of a failed plugin change: row gone");
+    });
 });

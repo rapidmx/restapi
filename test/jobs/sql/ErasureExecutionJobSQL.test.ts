@@ -33,6 +33,8 @@ import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
 import { NoteSQL } from "../../../src/models/sql/NoteSQL.js";
 import { OofReplySuppressionSQL } from "../../../src/models/sql/OofReplySuppressionSQL.js";
+import { PluginSQL } from "../../../src/models/sql/PluginSQL.js";
+import { PluginRegistry } from "../../../src/plugins/PluginRegistry.js";
 import { QuarantineEntrySQL } from "../../../src/models/sql/QuarantineEntrySQL.js";
 import { TaskListSQL } from "../../../src/models/sql/TaskListSQL.js";
 import { TaskSQL } from "../../../src/models/sql/TaskSQL.js";
@@ -63,6 +65,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
     let bookingRepo: Repository<BookingSQL>;
     let oofReplySuppressionRepo: Repository<OofReplySuppressionSQL>;
     let pluginMailboxDataRepo: Repository<PluginMailboxDataSQL>;
+    let pluginRepo: Repository<PluginSQL>;
     let quarantineEntryRepo: Repository<QuarantineEntrySQL>;
     let ingestQueueEntryRepo: Repository<IngestQueueEntrySQL>;
     let dataExportRequestRepo: Repository<DataExportRequestSQL>;
@@ -113,6 +116,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         models.set("BookingSQL", BookingSQL);
         models.set("OofReplySuppressionSQL", OofReplySuppressionSQL);
         models.set("PluginMailboxDataSQL", PluginMailboxDataSQL);
+        models.set("PluginSQL", PluginSQL);
         objectFactory.register(PluginMailboxDataSQL);
         // The other backend's marked model must be ignored, not purged against this datastore.
         objectFactory.register(PluginMailboxDataMongo);
@@ -147,6 +151,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         bookingRepo = conn.getRepository(BookingSQL);
         oofReplySuppressionRepo = conn.getRepository(OofReplySuppressionSQL);
         pluginMailboxDataRepo = conn.getRepository(PluginMailboxDataSQL);
+        pluginRepo = conn.getRepository(PluginSQL);
         quarantineEntryRepo = conn.getRepository(QuarantineEntrySQL);
         ingestQueueEntryRepo = conn.getRepository(IngestQueueEntrySQL);
         dataExportRequestRepo = conn.getRepository(DataExportRequestSQL);
@@ -182,6 +187,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
             bookingRepo,
             oofReplySuppressionRepo,
             pluginMailboxDataRepo,
+            pluginRepo,
             quarantineEntryRepo,
             ingestQueueEntryRepo,
             dataExportRequestRepo,
@@ -491,6 +497,28 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
 
         const updated = await requestRepo.findOne({ where: { uid: request.uid } });
         expect(updated!.status).toBe("completed");
+    });
+
+    it("Leaves the request 'approved' while an installed plugin isn't loaded, completing once it is - its data couldn't be purged.", async () => {
+        const mailbox = await createMailbox();
+        const plugin = { packageVersion: "1.0.0", enabled: false, settings: {}, manifest: { apiVersion: 1, displayName: "X", settings: [] } };
+        await pluginRepo.save(new PluginSQL({ ...plugin, name: "@rapidmx/activesync-plugin", removed: false }));
+        await pluginRepo.save(new PluginSQL({ ...plugin, name: "@rapidmx/gone-plugin", removed: true }));
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+        const logger = (job as any).logger;
+        const error = vi.spyOn(logger, "error");
+
+        try {
+            await job.run();
+            expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("approved");
+            expect(error).toHaveBeenCalledWith(expect.stringMatching(/aren't loaded \(@rapidmx\/activesync-plugin\)/));
+
+            PluginRegistry.setLoaded([{ name: "@rapidmx/activesync-plugin", version: "1.0.0" }]);
+            await job.run();
+            expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("completed");
+        } finally {
+            PluginRegistry.setLoaded([]);
+        }
     });
 
     it("Does not touch another mailbox's content.", async () => {

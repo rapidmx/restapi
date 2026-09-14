@@ -10,6 +10,7 @@ import * as uuid from "uuid";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { mailboxAccessSecuritySuite } from "../mailboxAccessSecuritySuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
@@ -22,6 +23,7 @@ describe("Route:MailboxAccessMongo Tests", () => {
     const baseUrl = "/mongo/mailboxes";
     let mailboxRepo: MongoRepository<MailboxMongo>;
     let aclRepo: MongoRepository<any>;
+    let auditLogRepo: MongoRepository<any>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -30,7 +32,7 @@ describe("Route:MailboxAccessMongo Tests", () => {
     const strangerUser: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const strangerToken = JWTUtils.createTokenSync(config.get("auth"), strangerUser);
 
-    const createMailbox = async function (overrides: Partial<MailboxMongo> = {}): Promise<MailboxMongo> {
+    const createMailbox = async function (overrides: Partial<MailboxMongo> = {}, records: ACLRecord[] = []): Promise<MailboxMongo> {
         const obj = new MailboxMongo({
             ownerUserUid: owner.uid,
             primarySmtpAddress: `${uuid.v4()}@example.com`,
@@ -47,7 +49,7 @@ describe("Route:MailboxAccessMongo Tests", () => {
             dateCreated: new Date(),
             dateModified: new Date(),
             version: 0,
-            records: [{ userOrRoleId: owner.uid, actions: [ACLAction.FULL] }] as ACLRecord[],
+            records: [{ userOrRoleId: owner.uid, actions: [ACLAction.FULL] }, ...records] as ACLRecord[],
             parentUid: "Mailbox",
         });
         return result;
@@ -66,6 +68,7 @@ describe("Route:MailboxAccessMongo Tests", () => {
         conn = connMgr?.connections.get("mongo");
         if (conn instanceof MongoConnection) {
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
+            auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -117,7 +120,7 @@ describe("Route:MailboxAccessMongo Tests", () => {
                 .get(`${baseUrl}/${mailbox.uid}/access`)
                 .set("Authorization", "jwt " + ownerToken);
             expect(result.status).toBe(200);
-            expect(result.body).toEqual([{ userOrRoleId: otherUser.uid, role: "viewer" }]);
+            expect(result.body).toEqual([{ userOrRoleId: otherUser.uid, role: "viewer", actions: ["read", "list", "count", "exists"] }]);
         });
 
         it("403s for a caller with no access to the mailbox at all.", async () => {
@@ -174,7 +177,7 @@ describe("Route:MailboxAccessMongo Tests", () => {
             const result = await request(server.getApplication())
                 .get(`${baseUrl}/${mailbox.uid}/access`)
                 .set("Authorization", "jwt " + ownerToken);
-            expect(result.body).toEqual([{ userOrRoleId: otherUser.uid, role: "manager" }]);
+            expect(result.body).toEqual([{ userOrRoleId: otherUser.uid, role: "manager", actions: ["*"] }]);
         });
 
         it("Rejects targeting the mailbox owner's own record.", async () => {
@@ -239,6 +242,16 @@ describe("Route:MailboxAccessMongo Tests", () => {
                 .set("Authorization", "jwt " + ownerToken);
             expect(result.status).toBe(400);
         });
+    });
+
+    mailboxAccessSecuritySuite({
+        config,
+        app: () => server.getApplication(),
+        baseUrl,
+        ownerUid: owner.uid,
+        ownerToken,
+        createMailbox: (records = [], overrides = {}) => createMailbox(overrides, records),
+        auditEntries: async () => await auditLogRepo.find({}).toArray(),
     });
 
     describe("lookupOwnerByEmail", () => {

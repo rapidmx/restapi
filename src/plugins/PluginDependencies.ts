@@ -66,6 +66,13 @@ function requiresOf(manifest: PluginManifest | undefined): [string, string][] {
     return Object.entries(manifest?.requires ?? {});
 }
 
+/** The range `manifest` requires of `name`, if it requires it. Only the map's own keys count, so a plugin named after an
+ * `Object.prototype` member (such as `constructor`) isn't mistaken for a requirement. */
+function requiredRange(manifest: PluginManifest | undefined, name: string): string | undefined {
+    const requires: Record<string, string> | undefined = manifest?.requires;
+    return requires && Object.prototype.hasOwnProperty.call(requires, name) ? requires[name] : undefined;
+}
+
 function satisfies(version: string, range: string): boolean {
     return semver.valid(version) !== null && semver.satisfies(version, range);
 }
@@ -93,7 +100,7 @@ export async function planPluginChange(
     const label = (name: string, manifest?: PluginManifest): string => manifest?.displayName ?? rows.get(name)?.manifest?.displayName ?? name;
 
     for (const row of rows.values()) {
-        const range: string | undefined = row.manifest?.requires?.[change.name];
+        const range: string | undefined = requiredRange(row.manifest, change.name);
         if (row.name !== change.name && row.enabled && range !== undefined && !satisfies(change.version, range)) {
             plan.conflicts.push(`${label(row.name)} requires ${change.name} ${range}, which ${change.version} doesn't satisfy.`);
         }
@@ -154,7 +161,7 @@ export async function planPluginChange(
 
 /** The enabled plugins that require `name`. */
 export function findDependents<P extends PlannerInstalledPlugin>(installed: P[], name: string): P[] {
-    return installed.filter((row) => row.enabled && !row.removed && row.name !== name && row.manifest?.requires?.[name] !== undefined);
+    return installed.filter((row) => row.enabled && !row.removed && row.name !== name && requiredRange(row.manifest, name) !== undefined);
 }
 
 /** `plugins` reordered so each comes after the plugins it requires, otherwise keeping their order. Requirements outside

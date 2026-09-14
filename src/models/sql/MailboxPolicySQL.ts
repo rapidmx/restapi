@@ -29,7 +29,9 @@ const { Nullable } = ObjectDecorators;
     false,
 )
 export class MailboxPolicySQL extends BaseEntity implements MailboxPolicy {
-    @Column({ nullable: true })
+    // `type: "double"` for both quotas, for the same reason as `ContactSQL.keysFirstSeen`: an untyped `number` column
+    // is a 32-bit integer on Postgres/MySQL (max ~2.1 GB), below the 5 GB default quota.
+    @Column({ type: "double", nullable: true })
     @Description("The quota a newly created mailbox starts with, in bytes.")
     @Nullable
     public defaultQuotaBytes?: number;
@@ -39,7 +41,7 @@ export class MailboxPolicySQL extends BaseEntity implements MailboxPolicy {
     @Nullable
     public autoProvisionEnabled?: boolean;
 
-    @Column({ nullable: true })
+    @Column({ type: "double", nullable: true })
     @Description("The quota of a mailbox a user creates for themselves, in bytes.")
     @Nullable
     public autoProvisionQuotaBytes?: number;

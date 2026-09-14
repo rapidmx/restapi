@@ -40,11 +40,19 @@ describe("findOrSeedMailboxPolicy", () => {
         expect(await findOrSeedMailboxPolicy(objectFactory, Row, seed)).toEqual({ defaultQuotaBytes: 10, autoProvisionEnabled: false, autoProvisionQuotaBytes: 20 });
     });
 
-    it("falls back to config, with a warning, when the policy can't be read", async () => {
+    it("falls back to config, logging an error, when the policy can't be read", async () => {
         const objectFactory: any = { newInstance: vi.fn().mockRejectedValue(new Error("datastore offline")) };
-        const logger = { warn: vi.fn() };
+        const logger = { error: vi.fn() };
         expect(await findOrSeedMailboxPolicy(objectFactory, Row, seed, logger)).toEqual(seed);
-        expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/datastore offline/));
+        expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/datastore offline/));
         expect(await findOrSeedMailboxPolicy(objectFactory, Row, seed)).toEqual(seed);
+    });
+
+    it("fails closed with a 503, rather than falling back to config, for a caller that acts on the policy", async () => {
+        const objectFactory: any = { newInstance: vi.fn().mockRejectedValue(new Error("datastore offline")) };
+        const logger = { error: vi.fn() };
+        await expect(findOrSeedMailboxPolicy(objectFactory, Row, seed, logger, true)).rejects.toMatchObject({ status: 503 });
+        expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/datastore offline/));
+        await expect(findOrSeedMailboxPolicy(objectFactory, Row, seed, undefined, true)).rejects.toMatchObject({ status: 503 });
     });
 });

@@ -46,5 +46,12 @@ describe("Route:PluginSQL Tests", () => {
             await auditLogRepo.clear();
         },
         auditActions: async () => (await auditLogRepo.find()).map((entry) => entry.action),
+        insertPlugin: async (fields) => {
+            await pluginRepo.save(new PluginSQL(fields as any));
+        },
+        rows: async () => (await pluginRepo.find()).sort((a, b) => a.name.localeCompare(b.name)),
+        bumpVersion: async (uid) => {
+            await pluginRepo.increment({ uid }, "version", 1);
+        },
     });
 });

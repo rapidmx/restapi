@@ -9,6 +9,8 @@ import {
     defaultPluginSettings,
     findPluginNamespace,
     isNewerVersion,
+    isValidPackageName,
+    normalizeAllowedPackages,
     normalizePluginNamespaces,
     matchesAllowedPackage,
     parsePluginManifest,
@@ -65,6 +67,17 @@ describe("parsePluginManifest", () => {
         [{ name: "@rapidmx/x", rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: { "@rapidmx/x": "^1.0.0" } } } }, /requires itself/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: { "@rapidmx/a": "not a range!" } } } }, /@rapidmx\/a with an invalid version range/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: { "@rapidmx/a": 1 } } } }, /invalid version range/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: { "@rapidmx/a?x": "1" } } } }, /requires "@rapidmx\/a\?x", which isn't a valid package name/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: { constructor: "1" } } } }, /requires "constructor", which isn't a valid/],
+        [JSON.parse('{"rapidmx": {"plugin": {"apiVersion": 1, "displayName": "X", "requires": {"__proto__": "1"}}}}'), /requires "__proto__"/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "string" }, { key: "k", label: "M", type: "number" }] } } }, /'k' is declared more than once/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "prototype", label: "L", type: "string" }] } } }, /'prototype' is a reserved key/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "select", options: [null] }] } } }, /option without a value and a label/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "select", options: [{ value: 1, label: "One" }] }] } } }, /option without a value/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "number", default: "5" }] } } }, /'k' has an invalid default: 'L' must be a number/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "number", default: 50, max: 10 }] } } }, /invalid default: 'L' must be at most 10/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "boolean", default: "true" }] } } }, /invalid default/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "select", options: [{ value: "a", label: "A" }], default: "b" }] } } }, /invalid default: 'L' must be one of: a/],
     ])("rejects %j", (pkg, message) => {
         expect(parsePluginManifest(pkg)).toMatch(message);
     });
@@ -78,6 +91,60 @@ describe("matchesAllowedPackage", () => {
         expect(matchesAllowedPackage("left-pad", ["@rapidmx/*", "left-pad"])).toBe(true);
         expect(matchesAllowedPackage("left-pad2", ["left-pad"])).toBe(false);
         expect(matchesAllowedPackage("anything", [])).toBe(false);
+    });
+
+    it("never matches a name that isn't a valid package name", () => {
+        expect(matchesAllowedPackage("@rapidmx/activesync-plugin?x", ["@rapidmx/*"])).toBe(false);
+        expect(matchesAllowedPackage("@rapidmx/a#b", ["@rapidmx/*"])).toBe(false);
+    });
+});
+
+describe("isValidPackageName", () => {
+    it.each([
+        ["@rapidmx/activesync-plugin", true],
+        ["left-pad", true],
+        ["a.b_c~d", true],
+        ["constructor", true],
+        ["@rapidmx/activesync-plugin?x", false],
+        ["@rapidmx/a#b", false],
+        ["@rapidmx/a\tb", false],
+        ["@rapidmx/a\nb", false],
+        ["Upper", false],
+        ["_private", false],
+        ["@scope/", false],
+        ["a/b", false],
+        ["", false],
+        ["a".repeat(215), false],
+        [5, false],
+    ])("%j valid: %s", (name, expected) => {
+        expect(isValidPackageName(name)).toBe(expected);
+    });
+});
+
+describe("normalizeAllowedPackages", () => {
+    it("keeps package names and scoped wildcards from a list, de-duplicated", () => {
+        const logger = { warn: vi.fn() };
+        expect(normalizeAllowedPackages(["@rapidmx/*", " left-pad ", "@acme/crm-*", "@rapidmx/*"], logger)).toEqual(["@rapidmx/*", "left-pad", "@acme/crm-*"]);
+        expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("reads a comma-separated or JSON string rather than spreading it into characters", () => {
+        expect(normalizeAllowedPackages("@acme/*")).toEqual(["@acme/*"]);
+        expect(normalizeAllowedPackages("@acme/*, left-pad")).toEqual(["@acme/*", "left-pad"]);
+        expect(normalizeAllowedPackages('["@acme/*"]')).toEqual(["@acme/*"]);
+        expect(normalizeAllowedPackages('{"not": "a list"}')).toEqual([]);
+    });
+
+    it("drops, with a warning, wildcards that aren't inside one scope and anything that isn't a package name", () => {
+        const logger = { warn: vi.fn() };
+        const value = ["*", "left-*", "@*/x", "@acme*/x", "@acme/*/x", "Bad Name", 7, null, "[not json", "@ok/*"];
+        expect(normalizeAllowedPackages(value, logger)).toEqual(["@ok/*"]);
+        expect(logger.warn).toHaveBeenCalledTimes(9);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/allowed_packages entry "\*"/));
+        expect(normalizeAllowedPackages("[not json, *", logger)).toEqual([]);
+        expect(normalizeAllowedPackages({ a: 1 }, logger)).toEqual([]);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Ignoring system:plugins:allowed_packages: it must be a list/));
+        expect(normalizeAllowedPackages(undefined)).toEqual([]);
     });
 });
 
@@ -177,7 +244,22 @@ describe("plugin namespaces", () => {
             { name: "@acme", registry: "https://npm.acme.test", token: "t" },
             { name: "@empty", registry: undefined, token: undefined },
         ]);
-        expect(normalizePluginNamespaces("@rapidmx")).toEqual([]);
+    });
+
+    it("reads a comma-separated or JSON string, as an environment variable gives it, and warns about what it drops", () => {
+        const logger = { warn: vi.fn() };
+        expect(normalizePluginNamespaces("@rapidmx, acme,,", logger).map((ns) => ns.name)).toEqual(["@rapidmx", "@acme"]);
+        expect(normalizePluginNamespaces('["@one", {"name": "@two", "registry": "https://two.test"}]', logger)).toEqual([
+            { name: "@one", registry: undefined, token: undefined },
+            { name: "@two", registry: "https://two.test", token: undefined },
+        ]);
+        expect(logger.warn).not.toHaveBeenCalled();
+        expect(normalizePluginNamespaces("@ok, Bad Scope", logger).map((ns) => ns.name)).toEqual(["@ok"]);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/namespaces entry "Bad Scope"/));
+        expect(normalizePluginNamespaces(42, logger)).toEqual([]);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Ignoring system:plugins:namespaces: it must be a list/));
+        expect(normalizePluginNamespaces(undefined)).toEqual([]);
+        expect(normalizePluginNamespaces(null)).toEqual([]);
     });
 
     it("finds the namespace a package belongs to", () => {
@@ -204,6 +286,7 @@ describe("isNewerVersion", () => {
         ["v1.2.0+build", "1.1.0", true],
         ["latest", "1.0.0", false],
         ["1.0.0", "nope", false],
+        [undefined as any, "1.0.0", false],
     ])("%s newer than %s: %s", (candidate, current, expected) => {
         expect(isNewerVersion(candidate, current)).toBe(expected);
     });

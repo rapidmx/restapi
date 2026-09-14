@@ -31,6 +31,15 @@ export const publishedHashes: string[] = [];
 /** What `GET /status` reads back. */
 export const instanceStatuses: PluginInstanceStatus[] = [];
 
+/** Every `getPackage(name)`/`getVersion(name, version)` call, as `package:<name>`/`version:<name>@<version>`. */
+export const registryReads: string[] = [];
+
+/** Runs when `getVersion()` resolves `<name>@<version>` - lets a test change the database mid-request. */
+export const registryHooks: Map<string, () => Promise<void>> = new Map();
+
+/** Extra (possibly malformed) results `searchPlugins()` returns. */
+export const extraSearchResults: any[] = [];
+
 export function resetPluginTestDoubles(): void {
     fakeRegistryPackages.clear();
     publishedHashes.length = 0;
@@ -38,6 +47,9 @@ export function resetPluginTestDoubles(): void {
     failingSearchNamespaces.clear();
     brokenPackages.clear();
     instanceStatuses.length = 0;
+    registryReads.length = 0;
+    registryHooks.clear();
+    extraSearchResults.length = 0;
 }
 
 /** Publishes a package version to the fake registry. */
@@ -55,13 +67,15 @@ export class FakeRegistryClient extends NpmRegistryClient {
         }
         return [...fakeRegistryPackages.entries()]
             .filter(([name]) => name.startsWith(`${scope}/`) && name.endsWith("-plugin"))
-            .map(([name, versions]) => {
+            .map(([name, versions]): RegistrySearchResult => {
                 const version: string = [...versions.keys()].pop()!;
                 return { name, version, description: versions.get(version).description };
-            });
+            })
+            .concat(extraSearchResults.filter((result) => String(result?.name).startsWith(`${scope}/`)));
     }
 
     public async getPackage(name: string): Promise<RegistryPackage | undefined> {
+        registryReads.push(`package:${name}`);
         if (brokenPackages.has(name)) {
             throw new RegistryRequestError("registry offline");
         }
@@ -74,6 +88,7 @@ export class FakeRegistryClient extends NpmRegistryClient {
     }
 
     public async getVersion(name: string, version: string = "latest"): Promise<RegistryPackageVersion | undefined> {
+        registryReads.push(`version:${name}@${version}`);
         const versions = fakeRegistryPackages.get(name);
         if (!versions) {
             return undefined;
@@ -83,6 +98,7 @@ export class FakeRegistryClient extends NpmRegistryClient {
         if (!pkg) {
             return undefined;
         }
+        await registryHooks.get(`${name}@${resolved}`)?.();
         if (pkg.fail) {
             throw pkg.fail;
         }

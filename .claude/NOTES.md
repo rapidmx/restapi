@@ -569,3 +569,80 @@ gap, and this repo's own lint gate - all three found and validated by an adversa
 - Route: new `GET /plan?name=&packageVersion=`; `POST /` now returns `{ plugin, dependencies }` (breaking shape change,
   react-shared updated); `PUT` plans on version change or enable; stale-lock check happens before dependencies are
   touched. 409s use `ApiErrors.IDENTIFIER_EXISTS` like the rest of the codebase.
+
+## 2026-09-14 — Review fixes: plugin system, mailbox access/policy, setup
+
+Fixes for a verified review round (every finding was confirmed in code first; none skipped). Not committed.
+
+Plugins
+- `ErasureExecutionJob` now has an abstract `pluginClass` (set on the Mongo/SQL subclasses). After the cascade, if any
+  non-removed `Plugin` row isn't in `PluginRegistry` (disabled, failed, safe mode) it logs an error and leaves the
+  request `"approved"` - the same skip-and-retry shape as the legal-hold checks - instead of completing. Chosen over
+  purging collections by name (the job can't know a plugin's collections without its classes). Known costs: a plugin
+  left disabled blocks completion indefinitely, and since `run()` takes the first `approved` request(s), a stuck
+  request also delays later ones (the legal-hold skip already had this head-of-line problem); `purgedCount` only
+  reflects the final run. The server runs jobs in `worker.*`, which calls `PluginHost.prepare()` first, so the
+  registry is populated there.
+- `normalizeAllowedPackages()` (new) and `normalizePluginNamespaces()` accept a list, a JSON-list string or a
+  comma-separated string (nconf env values), drop malformed entries with a `logger.warn`, and a `*` pattern must be
+  `@scope/...`. The route memoizes both so the warning is logged once.
+- `isValidPackageName()` (npm's rule, max 214) gates `assertAllowed` and `matchesAllowedPackage`, and `requires` keys
+  in `parsePluginManifest`. `NpmRegistryClient` encodes each name part (`@scope%2fname`) and refuses a packument whose
+  `name` differs from the requested one (including a missing name) as a `RegistryRequestError` (502).
+- `NpmRegistryClient` takes a third `options` arg (`timeoutMs` default 15s via `AbortSignal.timeout`, `maxBodyBytes`
+  default 10 MB, checked against `content-length` and while streaming) and caches each packument for the client's
+  lifetime (failures evicted) - so create a client per operation. The route adds a per-request `RegistrySession`
+  that reuses one client per package, so `getPackage` then `getVersion` (planning, `lookup`) is one fetch. A read-level
+  memo was tried and dropped: planning never repeats the same read (its `planned` map prevents revisits), so it was
+  dead code. The test double records reads in `registryReads`.
+- Partial application: `applyChange()` records an undo per write (created row -> soft-remove; revived row -> previous
+  version/settings/manifest and `removed: true`; enabled row -> `enabled: false`), rolls back newest-first
+  best-effort (errors logged) on failure, and announces whenever anything was written. Audit entries for rolled-back
+  installs are kept (they record what was attempted).
+- `installRow` refuses (409 "changed while this change was being planned") to overwrite a non-removed row found by
+  name, instead of resetting someone else's version/settings.
+- `update()` calls `assertAllowed` when enabling or changing version; `GET /updates` entries gain `allowed` and never
+  report `updateAvailable` for a plugin outside the allow-list (additive field).
+- A resolved version that isn't `semver.valid` (dist-tag -> `github:`/`file:`) is a 400. Search drops results without a
+  string name/version (client and route). `lookup` reads the package first through `registryCall` (502) and 404s.
+- Manifest validation: duplicate/reserved (`__proto__`/`constructor`/`prototype`) setting keys, option entries
+  without string value+label, and defaults that `checkSettingValue` rejects (type, min/max, select options); reserved
+  or invalid `requires` names. `PluginDependencies` looks requirements up with `hasOwnProperty` (`requiredRange`).
+- New contract (web-client implements it): optional `expectedPlan: { install: {name, version}[]; enable: string[] }`
+  on `POST /` and `PUT /:id`. Compared order-insensitively against the fresh plan (for `PUT` with no plan computed,
+  against empty lists) before anything is written; mismatch -> 409 "The plugins this change needs have changed since
+  it was previewed. Review the change again."; malformed -> 400.
+
+Mailbox access / policy / setup
+- `GET lookup-by-email`: `@Auth(["jwt"])` (anonymous -> 401) and `@RateLimit({ perUser: true })` (rate limiter runs
+  after the auth middleware, so per-user keys work). `email` must be a string matching one plain address (single `@`,
+  no whitespace/parens/commas, <= 320) and is queried as `eq(<address>)` - `RepoUtils.find` runs every value through
+  `ModelUtils.buildSearchQuery`, where `eq(...)` is the documented literal escape. The Mongo `aliasQueryValue` also
+  wraps in `eq(...)`; SQL's `Raw` is unaffected. Route order vs `/:id`: both uWS and Bun routers match static segments
+  by specificity (see service-core `uWS/Router.js`, `bun/BunRouter.js`), so no change.
+- `setMember` only grants to a UUID-shaped user uid (the platform's uid format) that isn't a trusted role - rejects
+  `anonymous`, `.*`, `*` and role names. Mailbox-owner existence was considered but rejected: a delegate with no mailbox
+  of their own (e.g. a support agent) is legitimate. `removeMember` can still remove any existing record.
+- Granting `manager`, or changing/removing a record that has `FULL`, requires the caller to have `FULL` (owner/trusted
+  pass); nobody but a trusted role can change or remove their own record.
+- ACL read-modify-write reads with `findACL(uid, [], { skipCache: true })`; `saveACL`'s plain "must be of the same
+  version" Error maps to 409. `saveACL` refreshes its own cache fire-and-forget; there's no API to await it.
+- Audit: `AuditAction.MAILBOX_ACCESS_GRANT`/`MAILBOX_ACCESS_REVOKE` with `details { userOrRoleId, previousRole?, role? }`.
+  `auditLogClass` is optional on the base (skipped when unset) and set on `MailboxAccessRouteMongo/SQL`, which the
+  server's concrete routes extend - so the server needs no change.
+- Roles: `roleFromActions` returns `"custom"` for anything but `FULL` or exactly the viewer set; `listMembers` returns
+  `actions` too and omits empty-action records. `"custom"` isn't settable (400).
+- `MailboxPolicySQL` quotas and `MailboxSQL.quotaBytes`/`usedBytes` are `type: "double"` (the `ContactSQL` pattern);
+  policy quotas are validated with `Number.isSafeInteger`. `AttachmentSQL.sizeBytes` has the same 32-bit shape but
+  attachments over 2 GB aren't realistic, so it was left.
+- `findOrSeedMailboxPolicy(..., failClosed)`: `autoProvision()` passes `true` and gets a 503 on a read failure; the
+  display-only `GET` keeps the config fallback. Both log at error level. Policy `GET` is now `@Auth(["jwt"])` (401).
+- Setup `saveStep` only sets `startedAt` while setup is currently `required`, so a step save on a completed or
+  healthy (has domains, never started) deployment can't lock admins into the wizard. Step saves retry up to 5 times on
+  a 409 and on `INTERNAL_ERROR`: found while testing concurrent saves that service-core `RepoUtils.update()` (Mongo,
+  non-trackChanges) returns a 500 when its own `updateOne` landed but a concurrent update bumped the version before
+  its `findOne(version + 1)` read-back. That's a service-core bug (not fixed here); retrying is safe only because a
+  step save is idempotent.
+- Verification: `yarn lint` and `tsc` clean; full `yarn vitest run --coverage` 218 files / 3648 tests passing, 100%
+  statements/functions/lines, 96.7% branches (every changed file fully covered; the remaining branch gaps are the
+  pre-existing ones, e.g. `ErasureExecutionJob.findAllPages`, `BaseMailboxPolicyRoute.toPublic`). `dist/` rebuilt.

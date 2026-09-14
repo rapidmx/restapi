@@ -559,7 +559,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             defaultQuotaBytes: this.defaultQuotaBytes,
             autoProvisionEnabled: this.autoProvisionEnabled,
             autoProvisionQuotaBytes: this.autoProvisionQuotaBytes,
-        }, this.logger);
+        }, this.logger, true);
         if (!policy.autoProvisionEnabled || domains.length === 0 || !hasAliasSource) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "Automatic mailbox provisioning is not enabled.");
         }

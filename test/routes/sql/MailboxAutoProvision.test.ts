@@ -118,6 +118,21 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
         expect(mockFetch).not.toHaveBeenCalled();
     });
 
+    it("Returns 503, creating nothing, when the mailbox policy can't be read - never falling back to config's 'enabled'.", async () => {
+        const newInstance = objectFactory.newInstance.bind(objectFactory);
+        const spy = vi.spyOn(objectFactory, "newInstance").mockImplementation((...args: any[]) =>
+            args[1]?.name === "MailboxPolicySQL" ? Promise.reject(new Error("datastore offline")) : (newInstance as any)(...args),
+        );
+        try {
+            const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
+            expect(result.status).toBe(503);
+        } finally {
+            spy.mockRestore();
+        }
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(await repo.count()).toBe(0);
+    });
+
     it("Returns 404 when auth-server reports no registered name aliases for the caller.", async () => {
         mockFetch.mockResolvedValue(aliasResponse([]));
 

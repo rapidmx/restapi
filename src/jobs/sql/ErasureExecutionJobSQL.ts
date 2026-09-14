@@ -25,6 +25,7 @@ import {
     MessageSQL,
     NoteSQL,
     OofReplySuppressionSQL,
+    PluginSQL,
     QuarantineEntrySQL,
     TaskListSQL,
     TaskSQL,
@@ -53,6 +54,7 @@ export class ErasureExecutionJobSQL extends ErasureExecutionJob<DataSubjectErasu
     protected ingestQueueEntryClass: any = IngestQueueEntrySQL;
     protected dataExportRequestClass: any = DataExportRequestSQL;
     protected mailboxImportRequestClass: any = MailboxImportRequestSQL;
+    protected pluginClass: any = PluginSQL;
     protected matterClass: any = MatterSQL;
     protected auditLogClass: any = AuditLogEntrySQL;
 }

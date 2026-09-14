@@ -13,6 +13,9 @@ const { Get, Post, Put, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
 /** The fixed identifier of the one `SetupState` row. */
 const SETUP_STATE_UID = "setup-state";
 
+/** How many times a step save that lost a concurrent save's optimistic-lock race is re-read and retried. */
+const SAVE_STEP_ATTEMPTS = 5;
+
 /** The wire shape of `GET /setup`. */
 export interface SetupStatus {
     /** Whether an administrator should be taken to the setup wizard. */
@@ -108,7 +111,12 @@ export abstract class BaseSetupRoute<T extends SetupState> {
         return this.toStatus(await this.findState());
     }
 
-    /** Records the step the administrator is on, marking setup as started. */
+    /**
+     * Records the step the administrator is on, marking setup as started - but only while setup is `required`. A step
+     * saved on a deployment that doesn't need setup (completed, or with domains and never started) is recorded without
+     * starting it, so it can't send every administrator back into the wizard; only `POST /reopen` does that. Two
+     * administrators saving at once both succeed: a save that loses the optimistic-lock race re-reads and tries again.
+     */
     @RequiresTrustedRole()
     @Put()
     public async saveStep(obj: { currentStep?: string } | undefined, @AuthUser user?: JWTUser): Promise<SetupStatus> {
@@ -117,12 +125,25 @@ export abstract class BaseSetupRoute<T extends SetupState> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'currentStep' must be a step name.");
         }
         await this.init();
-        const existing: T = await this.findOrCreate();
-        const patch: Partial<SetupState> = { currentStep: step };
-        if (!existing.startedAt) {
-            patch.startedAt = new Date();
+        for (let attempt = 1; ; attempt++) {
+            const existing: T = await this.findOrCreate();
+            const patch: Partial<SetupState> = { currentStep: step };
+            if (!existing.startedAt && (await this.toStatus(existing)).required) {
+                patch.startedAt = new Date();
+            }
+            let saved: T;
+            try {
+                saved = await this.save(existing, patch, user);
+            } catch (err: any) {
+                // A lost race is a 409. `RepoUtils.update()` also reports a 500 when its own write landed but a concurrent
+                // write moved the row on before it read the result back. Saving a step is idempotent, so both are retried.
+                if (err instanceof ApiError && (err.status === 409 || err.code === ApiErrors.INTERNAL_ERROR) && attempt < SAVE_STEP_ATTEMPTS) {
+                    continue;
+                }
+                throw err;
+            }
+            return this.toStatus(saved);
         }
-        return this.toStatus(await this.save(existing, patch, user));
     }
 
     @RequiresTrustedRole()

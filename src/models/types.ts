@@ -1469,6 +1469,11 @@ export enum AuditAction {
     PLUGIN_REMOVE = "plugin.remove",
     RETENTION_POLICY_UPDATE = "retention_policy.update",
     MAILBOX_POLICY_UPDATE = "mailbox_policy.update",
+    /** A user was granted access to a mailbox, or had their role on it changed (`BaseMailboxAccessRoute.setMember()`).
+     * `details` carries the member's `userOrRoleId`, `previousRole` (absent for a new member) and new `role`. */
+    MAILBOX_ACCESS_GRANT = "mailbox_access.grant",
+    /** A member's access to a mailbox was revoked (`BaseMailboxAccessRoute.removeMember()`). */
+    MAILBOX_ACCESS_REVOKE = "mailbox_access.revoke",
     SETUP_COMPLETE = "setup.complete",
     SETUP_REOPEN = "setup.reopen",
     /** Recorded once per `RetentionEnforcementJob` run per entity type actually purged (a count, not one
@@ -2326,7 +2331,7 @@ export interface PluginManifest {
  * @author Jean-Philippe Steinmetz
  */
 export interface Plugin extends BaseEntity {
-    /** The npm package name, e.g. `@rapidmx/activesync`. */
+    /** The npm package name, e.g. `@rapidmx/activesync-plugin`. */
     name: string;
 
     /** The exact npm version to install. (`version` is the entity's own optimistic-lock counter.) */

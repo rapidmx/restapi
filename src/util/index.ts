@@ -5,7 +5,7 @@
 
 /**
  * Public, backend-agnostic REST-layer helpers shared across this library's own routes and useful to any
- * downstream protocol package (`@rapidmx/activesync`, `@rapidmx/mapi`, `@rapidmx/autodiscover`) that needs to
+ * downstream protocol package (`@rapidmx/activesync-plugin`, `@rapidmx/mapi-plugin`, `@rapidmx/autodiscover-plugin`) that needs to
  * resolve a caller's mailbox, walk a folder tree, send a composed message through the scan/relay pipeline,
  * evaluate mail filter rules or resolve a mailbox's default signature/OOF state, or soft-delete a
  * `RecoverableBaseEntity` with a correctly bumped watermark. `OptionalDeps.ts`'s `importOptional()` is

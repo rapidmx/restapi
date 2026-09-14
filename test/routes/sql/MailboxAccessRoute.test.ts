@@ -11,6 +11,8 @@ import { Repository } from "typeorm";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MailboxAccessRouteSQL } from "../../../src/routes/sql/MailboxAccessRouteSQL.js";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { mailboxAccessSecuritySuite } from "../mailboxAccessSecuritySuite.js";
+import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 
 describe("Route:MailboxAccessSQL Tests", () => {
     const logger = Logger();
@@ -19,6 +21,7 @@ describe("Route:MailboxAccessSQL Tests", () => {
     const baseUrl = "/sql/mailboxes";
     let mailboxRepo: Repository<MailboxSQL>;
     let aclRepo: Repository<AccessControlListSQL>;
+    let auditLogRepo: Repository<AuditLogEntrySQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -27,7 +30,7 @@ describe("Route:MailboxAccessSQL Tests", () => {
     const strangerUser: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const strangerToken = JWTUtils.createTokenSync(config.get("auth"), strangerUser);
 
-    const createMailbox = async function (overrides: Partial<MailboxSQL> = {}): Promise<MailboxSQL> {
+    const createMailbox = async function (overrides: Partial<MailboxSQL> = {}, records: ACLRecord[] = []): Promise<MailboxSQL> {
         const obj = new MailboxSQL({
             ownerUserUid: owner.uid,
             primarySmtpAddress: `${uuid.v4()}@example.com`,
@@ -44,7 +47,7 @@ describe("Route:MailboxAccessSQL Tests", () => {
             dateCreated: new Date(),
             dateModified: new Date(),
             version: 0,
-            records: [{ userOrRoleId: owner.uid, actions: [ACLAction.FULL] }] as ACLRecord[],
+            records: [{ userOrRoleId: owner.uid, actions: [ACLAction.FULL] }, ...records] as ACLRecord[],
             parentUid: "Mailbox",
         } as any);
         return result;
@@ -64,6 +67,7 @@ describe("Route:MailboxAccessSQL Tests", () => {
         conn = connMgr?.connections.get("sql");
         if (isSqlDataSource(conn)) {
             mailboxRepo = conn.getRepository(MailboxSQL);
+            auditLogRepo = conn.getRepository(AuditLogEntrySQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -100,7 +104,7 @@ describe("Route:MailboxAccessSQL Tests", () => {
                 .get(`${baseUrl}/${mailbox.uid}/access`)
                 .set("Authorization", "jwt " + ownerToken);
             expect(result.status).toBe(200);
-            expect(result.body).toEqual([{ userOrRoleId: otherUser.uid, role: "viewer" }]);
+            expect(result.body).toEqual([{ userOrRoleId: otherUser.uid, role: "viewer", actions: ["read", "list", "count", "exists"] }]);
         });
 
         it("403s for a caller with no access to the mailbox at all.", async () => {
@@ -156,7 +160,7 @@ describe("Route:MailboxAccessSQL Tests", () => {
             const result = await request(server.getApplication())
                 .get(`${baseUrl}/${mailbox.uid}/access`)
                 .set("Authorization", "jwt " + ownerToken);
-            expect(result.body).toEqual([{ userOrRoleId: otherUser.uid, role: "manager" }]);
+            expect(result.body).toEqual([{ userOrRoleId: otherUser.uid, role: "manager", actions: ["*"] }]);
         });
 
         it("Rejects targeting the mailbox owner's own record.", async () => {
@@ -262,6 +266,21 @@ describe("Route:MailboxAccessSQL Tests", () => {
             expect(raw.getSql("aliases")).toBe("aliases LIKE :pattern ESCAPE '\\'");
             expect(raw.objectLiteralParameters).toEqual({ pattern: '%"a\\_b\\%c@example.com"%' });
         });
+
+        it("Skips auditing, rather than failing, in a subclass that supplies no auditLogClass.", async () => {
+            const route: any = Object.assign(new MailboxAccessRouteSQL(), { auditLogClass: undefined });
+            await expect(route.audit(undefined, undefined, "mailbox_access.grant", { uid: "x" }, { userOrRoleId: "y" })).resolves.toBeUndefined();
+        });
+    });
+
+    mailboxAccessSecuritySuite({
+        config,
+        app: () => server.getApplication(),
+        baseUrl,
+        ownerUid: owner.uid,
+        ownerToken,
+        createMailbox: (records = [], overrides = {}) => createMailbox(overrides, records),
+        auditEntries: async () => await auditLogRepo.find(),
     });
 
     describe("lookupOwnerByEmail", () => {

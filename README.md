@@ -10,9 +10,9 @@ and pluggable SPAM/anti-virus scanning.
 
 Protocol compatibility for real mail clients lives in separate, independently-versioned packages that depend
 on this one:
-- [`@rapidmx/activesync`](https://github.com/RapidMX/activesync) — Exchange ActiveSync (mobile clients)
-- [`@rapidmx/mapi`](https://github.com/RapidMX/mapi) — MAPI over HTTP (Outlook desktop)
-- [`@rapidmx/autodiscover`](https://github.com/RapidMX/autodiscover) — Autodiscover (client server-location lookup)
+- [`@rapidmx/activesync-plugin`](https://github.com/RapidMX/activesync) — Exchange ActiveSync (mobile clients)
+- [`@rapidmx/mapi-plugin`](https://github.com/RapidMX/mapi) — MAPI over HTTP (Outlook desktop)
+- [`@rapidmx/autodiscover-plugin`](https://github.com/RapidMX/autodiscover) — Autodiscover (client server-location lookup)
 
 This split lets each protocol evolve and version independently, and lets a deployment that only needs one of
 them (e.g. just the REST API for a webmail client) skip the others' dependencies entirely.
@@ -37,7 +37,7 @@ and `src/transport/MailTransport.ts` for the interfaces and their default implem
 
 `@rapidmx/restapi` also exports a small set of REST-layer helpers (`resolveCallerMailboxUid`,
 `sendComposedMime`, folder-tree utilities, `RecoverableRepoUtils`) from its root import — these are the same
-helpers `@rapidmx/activesync`/`@rapidmx/mapi` build their own protocol layers on top of, and are useful to any
+helpers `@rapidmx/activesync-plugin`/`@rapidmx/mapi-plugin` build their own protocol layers on top of, and are useful to any
 other downstream consumer that needs to resolve a caller's mailbox or relay a composed message through the
 scan pipeline.
 

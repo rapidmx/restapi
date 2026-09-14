@@ -138,6 +138,14 @@ describe("findDependents", () => {
         expect(findDependents(installed, EAS).map((p) => p.name)).toEqual([AUTODISCOVER]);
         expect(findDependents(installed, AUTODISCOVER)).toEqual([]);
     });
+
+    it("only counts a manifest's own requirements, not Object.prototype members", async () => {
+        const installed = [row("constructor", "1.0.0", true), row("dependent", "1.0.0", true, manifest("Dependent", {})), row("bare", "1.0.0", true, manifest("Bare"))];
+        expect(findDependents(installed, "constructor")).toEqual([]);
+        expect(findDependents(installed, "toString")).toEqual([]);
+        const plan = await planPluginChange(installed, { name: "toString", version: "1.0.0", manifest: manifest("To String") }, REGISTRY);
+        expect(plan.conflicts).toEqual([]);
+    });
 });
 
 describe("orderByDependencies", () => {

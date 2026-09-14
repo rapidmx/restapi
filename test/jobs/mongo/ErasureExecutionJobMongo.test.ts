@@ -33,6 +33,8 @@ import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
 import { NoteMongo } from "../../../src/models/mongo/NoteMongo.js";
 import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySuppressionMongo.js";
+import { PluginMongo } from "../../../src/models/mongo/PluginMongo.js";
+import { PluginRegistry } from "../../../src/plugins/PluginRegistry.js";
 import { QuarantineEntryMongo } from "../../../src/models/mongo/QuarantineEntryMongo.js";
 import { TaskListMongo } from "../../../src/models/mongo/TaskListMongo.js";
 import { TaskMongo } from "../../../src/models/mongo/TaskMongo.js";
@@ -67,6 +69,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
     let bookingRepo: MongoRepository<BookingMongo>;
     let oofReplySuppressionRepo: MongoRepository<OofReplySuppressionMongo>;
     let pluginMailboxDataRepo: MongoRepository<PluginMailboxDataMongo>;
+    let pluginRepo: MongoRepository<PluginMongo>;
     let quarantineEntryRepo: MongoRepository<QuarantineEntryMongo>;
     let ingestQueueEntryRepo: MongoRepository<IngestQueueEntryMongo>;
     let dataExportRequestRepo: MongoRepository<DataExportRequestMongo>;
@@ -117,6 +120,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         models.set("BookingMongo", BookingMongo);
         models.set("OofReplySuppressionMongo", OofReplySuppressionMongo);
         models.set("PluginMailboxDataMongo", PluginMailboxDataMongo);
+        models.set("PluginMongo", PluginMongo);
         objectFactory.register(PluginMailboxDataMongo);
         // The other backend's marked model must be ignored, not purged against this datastore.
         objectFactory.register(PluginMailboxDataSQL);
@@ -151,6 +155,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         bookingRepo = conn.getMongoRepository("BookingMongo");
         oofReplySuppressionRepo = conn.getMongoRepository("OofReplySuppressionMongo");
         pluginMailboxDataRepo = conn.getMongoRepository("PluginMailboxDataMongo");
+        pluginRepo = conn.getMongoRepository("PluginMongo");
         quarantineEntryRepo = conn.getMongoRepository("QuarantineEntryMongo");
         ingestQueueEntryRepo = conn.getMongoRepository("IngestQueueEntryMongo");
         dataExportRequestRepo = conn.getMongoRepository("DataExportRequestMongo");
@@ -187,6 +192,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
             bookingRepo,
             oofReplySuppressionRepo,
             pluginMailboxDataRepo,
+            pluginRepo,
             quarantineEntryRepo,
             ingestQueueEntryRepo,
             dataExportRequestRepo,
@@ -496,6 +502,28 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
 
         const updated = await requestRepo.findOne({ uid: request.uid } as any);
         expect(updated!.status).toBe("completed");
+    });
+
+    it("Leaves the request 'approved' while an installed plugin isn't loaded, completing once it is - its data couldn't be purged.", async () => {
+        const mailbox = await createMailbox();
+        const plugin = { packageVersion: "1.0.0", enabled: false, settings: {}, manifest: { apiVersion: 1, displayName: "X", settings: [] } };
+        await pluginRepo.save(new PluginMongo({ ...plugin, name: "@rapidmx/activesync-plugin", removed: false }));
+        await pluginRepo.save(new PluginMongo({ ...plugin, name: "@rapidmx/gone-plugin", removed: true }));
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+        const logger = (job as any).logger;
+        const error = vi.spyOn(logger, "error");
+
+        try {
+            await job.run();
+            expect((await requestRepo.findOne({ uid: request.uid } as any))!.status).toBe("approved");
+            expect(error).toHaveBeenCalledWith(expect.stringMatching(/aren't loaded \(@rapidmx\/activesync-plugin\)/));
+
+            PluginRegistry.setLoaded([{ name: "@rapidmx/activesync-plugin", version: "1.0.0" }]);
+            await job.run();
+            expect((await requestRepo.findOne({ uid: request.uid } as any))!.status).toBe("completed");
+        } finally {
+            PluginRegistry.setLoaded([]);
+        }
     });
 
     it("Does not touch another mailbox's content.", async () => {

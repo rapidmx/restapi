@@ -14,7 +14,7 @@ import {
 } from "../util/MailboxPolicyUtils.js";
 import { AuditAction, MailboxPolicy } from "../models/types.js";
 const { Config, Logger } = ObjectDecorators;
-const { Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorators;
+const { Auth, Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorators;
 
 export { DEFAULT_MAILBOX_QUOTA_BYTES };
 
@@ -90,7 +90,8 @@ export abstract class BaseMailboxPolicyRoute<T extends MailboxPolicy> {
     protected validateUpdate(obj: Partial<PublicMailboxPolicy> | undefined): void {
         for (const field of ["defaultQuotaBytes", "autoProvisionQuotaBytes"] as const) {
             const value = obj?.[field];
-            if (value !== undefined && (typeof value !== "number" || !Number.isInteger(value) || value < 1)) {
+            // `Number.isSafeInteger`: larger values can't be stored or compared exactly.
+            if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1)) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${field}' must be a positive whole number of bytes.`);
             }
         }
@@ -99,11 +100,10 @@ export abstract class BaseMailboxPolicyRoute<T extends MailboxPolicy> {
         }
     }
 
+    /** Any signed-in user; an anonymous caller gets a `401`. Display-only, so a failed read falls back to config. */
+    @Auth(["jwt"])
     @Get()
-    public async get(@AuthUser user?: JWTUser): Promise<PublicMailboxPolicy> {
-        if (!user) {
-            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
-        }
+    public async get(): Promise<PublicMailboxPolicy> {
         return await findOrSeedMailboxPolicy(this._objectFactory!, this.mailboxPolicyClass, this.seed(), this.logger);
     }
 

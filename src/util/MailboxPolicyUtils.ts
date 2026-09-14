@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { type BaseEntity, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { ApiError } from "@rapidrest/core";
+import { ApiErrors, type BaseEntity, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { MailboxPolicy } from "../models/types.js";
 
 /** The fixed identifier of the one `MailboxPolicy` row - same singleton convention as `RETENTION_POLICY_UID`. */
@@ -47,14 +48,16 @@ export async function findOrCreateSingleton<T extends BaseEntity>(repo: RepoUtil
  * admin-editable setting, which the admin can then change.
  *
  * Live fallback: any field the row leaves unset takes its `seed` value, and if the row can't be read or created at
- * all (e.g. the datastore is briefly unavailable), the config values are returned as-is, so mailbox creation keeps
- * working rather than failing on a settings lookup.
+ * all (e.g. the datastore is briefly unavailable), the config values are returned as-is - but only for a caller that
+ * just displays the policy. A caller that acts on it passes `failClosed` and gets a `503` instead: falling back to
+ * config there could, say, re-enable self-service provisioning an administrator had turned off.
  */
 export async function findOrSeedMailboxPolicy(
     objectFactory: ObjectFactory,
     mailboxPolicyClass: any,
     seed: MailboxPolicySeed,
     logger?: any,
+    failClosed: boolean = false,
 ): Promise<MailboxPolicySeed> {
     try {
         const repo: RepoUtils<MailboxPolicy> = await objectFactory.newInstance(RepoUtils, {
@@ -68,7 +71,11 @@ export async function findOrSeedMailboxPolicy(
             autoProvisionQuotaBytes: policy.autoProvisionQuotaBytes ?? seed.autoProvisionQuotaBytes,
         };
     } catch (err: any) {
-        logger?.warn(`Could not read the mailbox policy; using server config instead: ${err.message}`);
+        if (failClosed) {
+            logger?.error(`Could not read the mailbox policy: ${err.message}`);
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 503, "The mailbox policy can't be read right now. Try again later.");
+        }
+        logger?.error(`Could not read the mailbox policy; using server config instead: ${err.message}`);
         return { ...seed };
     }
 }

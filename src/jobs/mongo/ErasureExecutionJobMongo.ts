@@ -25,6 +25,7 @@ import {
     MessageMongo,
     NoteMongo,
     OofReplySuppressionMongo,
+    PluginMongo,
     QuarantineEntryMongo,
     TaskListMongo,
     TaskMongo,
@@ -53,6 +54,7 @@ export class ErasureExecutionJobMongo extends ErasureExecutionJob<DataSubjectEra
     protected ingestQueueEntryClass: any = IngestQueueEntryMongo;
     protected dataExportRequestClass: any = DataExportRequestMongo;
     protected mailboxImportRequestClass: any = MailboxImportRequestMongo;
+    protected pluginClass: any = PluginMongo;
     protected matterClass: any = MatterMongo;
     protected auditLogClass: any = AuditLogEntryMongo;
 }

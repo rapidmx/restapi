@@ -7,8 +7,8 @@ import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-
 import { BlobStore } from "../blob/BlobStore.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { AuditAction, DataSubjectErasureRequest, Mailbox } from "../models/types.js";
-import { isMailboxScopedData } from "../plugins/PluginRegistry.js";
+import { AuditAction, DataSubjectErasureRequest, Mailbox, Plugin } from "../models/types.js";
+import { isMailboxScopedData, PluginRegistry } from "../plugins/PluginRegistry.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /**
@@ -83,6 +83,10 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     protected abstract ingestQueueEntryClass: any;
     protected abstract dataExportRequestClass: any;
     protected abstract mailboxImportRequestClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so this job can tell which installed plugins aren't loaded in
+     * this process - see `unloadedPluginNames()`. */
+    protected abstract pluginClass: any;
 
     /** Supplied by the Mongo/SQL concrete subclasses so this job's own hold re-check can resolve without
      * depending on either backend directly - see `util/LegalHoldUtils.ts`. */
@@ -252,7 +256,28 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             }
         }
 
+        // A plugin that's installed but not loaded here (disabled, failed to load, safe mode) registered no
+        // `@MailboxScopedData()` models, so its rows for this mailbox were never seen above. Completing now would
+        // report an erasure that left them behind. Instead `status` stays `"approved"` - the same retry shape as the
+        // hold check above - and a later run, once the plugin is loaded again (or removed), purges them and completes.
+        const unloaded: string[] = await this.unloadedPluginNames();
+        if (unloaded.length > 0) {
+            this.logger?.error(
+                `ErasureExecutionJob: erasure request ${request.uid} can't complete while installed plugins aren't loaded (${unloaded.join(", ")}) - their data for mailbox ${request.mailboxUid} can't be purged. Load or remove them; the request is retried on a later run.`,
+            );
+            return;
+        }
+
         await this.markCompleted(request, purgedCount);
+    }
+
+    /** The installed (not removed) plugins that aren't loaded in this process, per `PluginRegistry`. */
+    private async unloadedPluginNames(): Promise<string[]> {
+        const rows: Plugin[] = await this.findAllPages(await this.getRepo(this.pluginClass), {});
+        return rows
+            .filter((row) => !row.removed && !PluginRegistry.isActive(row.name))
+            .map((row) => row.name)
+            .sort();
     }
 
     /** Purges every `mailboxUid`-matching row of one entity type, best-effort per row (a single row's

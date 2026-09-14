@@ -43,15 +43,84 @@ export interface PluginNamespace {
     token?: string;
 }
 
-/** Normalizes the `system:plugins:namespaces` config (strings and/or objects) into `PluginNamespace`s, dropping
- * anything that isn't a usable scope and de-duplicating by name (the first entry wins). */
-export function normalizePluginNamespaces(value: unknown): PluginNamespace[] {
-    const entries: unknown[] = Array.isArray(value) ? value : [];
+/** Where a config normalizer reports the entries it ignores. */
+export interface PluginConfigLogger {
+    warn(message: string): void;
+}
+
+/** npm's naming rule for new packages: lowercase and URL-safe, optionally scoped. */
+const PACKAGE_NAME_PATTERN = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
+
+/** npm's maximum package name length. */
+const MAX_PACKAGE_NAME_LENGTH = 214;
+
+/** Keys that reach `Object.prototype` when used on a plain object, so a manifest may not declare them. */
+const RESERVED_KEYS: Set<string> = new Set(["__proto__", "constructor", "prototype"]);
+
+/** Whether `name` is a valid npm package name. Anything else (`?`, `#`, whitespace, uppercase...) could be read
+ * differently by the registry, npm and this server, so it's never looked up or stored. */
+export function isValidPackageName(name: unknown): name is string {
+    return typeof name === "string" && name.length <= MAX_PACKAGE_NAME_LENGTH && PACKAGE_NAME_PATTERN.test(name);
+}
+
+/** A list-valued config setting's entries. An environment variable arrives as a plain string, which is read as a
+ * JSON list when it looks like one and as a comma-separated list otherwise. */
+function configListEntries(value: unknown, key: string, logger?: PluginConfigLogger): unknown[] {
+    if (Array.isArray(value)) {
+        return value;
+    }
+    if (typeof value === "string") {
+        const text: string = value.trim();
+        if (text.startsWith("[")) {
+            try {
+                const parsed: unknown = JSON.parse(text);
+                if (Array.isArray(parsed)) {
+                    return parsed;
+                }
+            } catch {
+                // Not JSON after all - read it as a comma-separated list below.
+            }
+        }
+        return text
+            .split(",")
+            .map((entry) => entry.trim())
+            .filter((entry) => entry !== "");
+    }
+    if (value !== undefined && value !== null) {
+        logger?.warn(`Ignoring ${key}: it must be a list or a comma-separated string.`);
+    }
+    return [];
+}
+
+/**
+ * Normalizes the `system:plugins:allowed_packages` config into a list of patterns, dropping (with a warning) any entry
+ * that isn't a package name or a wildcard inside one scope. A `*` pattern must name its scope (`@acme/*`), so a bare
+ * `*` or an unscoped wildcard can't allow every package on the registry.
+ */
+export function normalizeAllowedPackages(value: unknown, logger?: PluginConfigLogger): string[] {
+    const result: string[] = [];
+    for (const entry of configListEntries(value, "system:plugins:allowed_packages", logger)) {
+        const pattern: string = typeof entry === "string" ? entry.trim() : "";
+        const valid: boolean = pattern.includes("*") ? /^@[a-z0-9-~][a-z0-9-._~]*\/[a-z0-9-._~*]+$/.test(pattern) : isValidPackageName(pattern);
+        if (!valid) {
+            logger?.warn(`Ignoring system:plugins:allowed_packages entry ${JSON.stringify(entry)}: it must be a package name or a scoped wildcard such as @acme/*.`);
+        } else if (!result.includes(pattern)) {
+            result.push(pattern);
+        }
+    }
+    return result;
+}
+
+/** Normalizes the `system:plugins:namespaces` config (strings and/or objects, or a comma-separated string) into
+ * `PluginNamespace`s, dropping anything that isn't a usable scope and de-duplicating by name (the first entry wins). */
+export function normalizePluginNamespaces(value: unknown, logger?: PluginConfigLogger): PluginNamespace[] {
+    const entries: unknown[] = configListEntries(value, "system:plugins:namespaces", logger);
     const result: Map<string, PluginNamespace> = new Map();
     for (const entry of entries) {
         const raw: any = typeof entry === "string" ? { name: entry } : entry;
         const scope: string = typeof raw?.name === "string" ? raw.name.trim() : "";
         if (!/^@?[a-z0-9][a-z0-9._~-]*$/.test(scope)) {
+            logger?.warn(`Ignoring system:plugins:namespaces entry ${JSON.stringify(entry)}: it must be an npm scope such as @acme.`);
             continue;
         }
         const name: string = scope.startsWith("@") ? scope : `@${scope}`;
@@ -77,8 +146,8 @@ export function findPluginNamespace(packageName: string, namespaces: PluginNames
  * where both are numbers. Anything that isn't a version compares as not newer.
  */
 export function isNewerVersion(candidate: string, current: string): boolean {
-    const parse = (version: string) => {
-        const match: RegExpMatchArray | null = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.*)?$/.exec(version.trim());
+    const parse = (version: unknown) => {
+        const match: RegExpMatchArray | null = typeof version === "string" ? /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.*)?$/.exec(version.trim()) : null;
         return match ? { core: [Number(match[1]), Number(match[2]), Number(match[3])], pre: match[4]?.split(".") ?? [] } : undefined;
     };
     const a = parse(candidate);
@@ -139,17 +208,22 @@ export function parsePluginManifest(pkg: any): PluginManifest | string {
     if (!Array.isArray(settings)) {
         return "This plugin's manifest settings must be a list.";
     }
+    const keys: Set<string> = new Set();
     for (const setting of settings) {
-        const problem: string | undefined = checkSettingDefinition(setting);
+        const problem: string | undefined = checkSettingDefinition(setting) ?? (keys.has(setting.key) ? `'${setting.key}' is declared more than once.` : undefined);
         if (problem) {
             return `This plugin's manifest has an invalid setting: ${problem}`;
         }
+        keys.add(setting.key);
     }
     const requires: unknown = manifest.requires ?? {};
     if (typeof requires !== "object" || requires === null || Array.isArray(requires)) {
         return "This plugin's manifest requires must map plugin package names to version ranges.";
     }
     for (const [name, range] of Object.entries(requires)) {
+        if (!isValidPackageName(name) || RESERVED_KEYS.has(name)) {
+            return `This plugin's manifest requires ${JSON.stringify(name)}, which isn't a valid package name.`;
+        }
         if (name === pkg.name) {
             return "This plugin's manifest requires itself.";
         }
@@ -170,19 +244,36 @@ function checkSettingDefinition(setting: any): string | undefined {
     if (!setting || typeof setting.key !== "string" || setting.key === "" || typeof setting.label !== "string") {
         return "every setting needs a key and a label.";
     }
+    if (RESERVED_KEYS.has(setting.key)) {
+        return `'${setting.key}' is a reserved key.`;
+    }
     if (!["string", "number", "boolean", "select"].includes(setting.type)) {
         return `'${setting.key}' has an unknown type '${setting.type}'.`;
     }
-    if (setting.type === "select" && (!Array.isArray(setting.options) || setting.options.length === 0)) {
-        return `'${setting.key}' is a select with no options.`;
+    if (setting.type === "select") {
+        if (!Array.isArray(setting.options) || setting.options.length === 0) {
+            return `'${setting.key}' is a select with no options.`;
+        }
+        if (!setting.options.every((option: any) => typeof option?.value === "string" && typeof option.label === "string")) {
+            return `'${setting.key}' has an option without a value and a label.`;
+        }
+    }
+    if (setting.default !== undefined) {
+        // A default has to be a value an administrator could have saved.
+        try {
+            checkSettingValue(setting, setting.default);
+        } catch (err: any) {
+            return `'${setting.key}' has an invalid default: ${err.message}`;
+        }
     }
     return undefined;
 }
 
 /** Whether `name` matches one of `patterns`. A `*` matches any run of characters except `/`, so `@rapidmx/*`
- * allows every package in the `@rapidmx` scope and nothing else. */
+ * allows every package in the `@rapidmx` scope and nothing else. A name that isn't a valid package name never
+ * matches. */
 export function matchesAllowedPackage(name: string, patterns: string[]): boolean {
-    return patterns.some((pattern) => {
+    return isValidPackageName(name) && patterns.some((pattern) => {
         const source: string = pattern
             .split("*")
             .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))

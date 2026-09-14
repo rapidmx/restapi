@@ -46,7 +46,15 @@ export function systemSettingsSuite(ctx: SystemSettingsSuiteContext): void {
                 autoProvisionEnabled: ctx.config.get("mail:auto_provision:enabled") ?? false,
                 autoProvisionQuotaBytes: ctx.config.get("mail:auto_provision:quota_bytes") ?? DEFAULT_MAILBOX_QUOTA_BYTES,
             });
-            expect((await request(ctx.app()).get(url())).status).toBe(403);
+            expect((await request(ctx.app()).get(url())).status).toBe(401);
+        });
+
+        it("stores quotas beyond 32 bits exactly, up to the largest safe integer", async () => {
+            const saved = await as(adminToken, request(ctx.app()).put(url())).send({ defaultQuotaBytes: 50_000_000_000, autoProvisionQuotaBytes: Number.MAX_SAFE_INTEGER });
+            expect(saved.status).toBe(200);
+            const read = await as(userToken, request(ctx.app()).get(url()));
+            expect(read.body).toEqual(expect.objectContaining({ defaultQuotaBytes: 50_000_000_000, autoProvisionQuotaBytes: Number.MAX_SAFE_INTEGER }));
+            expect((await as(adminToken, request(ctx.app()).put(url())).send({ defaultQuotaBytes: Number.MAX_SAFE_INTEGER + 2 })).status).toBe(400);
         });
 
         it("saves a partial patch for an admin and audits it", async () => {
@@ -112,6 +120,27 @@ export function systemSettingsSuite(ctx: SystemSettingsSuiteContext): void {
             expect(reopened.body.completedAt).toBeUndefined();
             expect(reopened.body.currentStep).toBeUndefined();
             expect(await ctx.auditActions()).toEqual(expect.arrayContaining([AuditAction.SETUP_COMPLETE, AuditAction.SETUP_REOPEN]));
+        });
+
+        it("never makes setup required again by saving a step on a deployment that doesn't need it", async () => {
+            await ctx.addDomain();
+            const healthy = await as(adminToken, request(ctx.app()).put(url())).send({ currentStep: "domain" });
+            expect(healthy.status).toBe(200);
+            expect(healthy.body).toEqual({ required: false, currentStep: "domain" });
+
+            await ctx.clear();
+            await as(adminToken, request(ctx.app()).post(url("/complete")));
+            const completed = await as(adminToken, request(ctx.app()).put(url())).send({ currentStep: "settings" });
+            expect(completed.body).toEqual(expect.objectContaining({ required: false, currentStep: "settings" }));
+            expect((await as(adminToken, request(ctx.app()).get(url()))).body.required).toBe(false);
+        });
+
+        it("saves concurrent steps without a version conflict", async () => {
+            const results = await Promise.all(
+                ["a", "b", "c"].map((currentStep) => as(adminToken, request(ctx.app()).put(url())).send({ currentStep })),
+            );
+            expect(results.map((result) => result.status)).toEqual([200, 200, 200]);
+            expect(["a", "b", "c"]).toContain((await as(adminToken, request(ctx.app()).get(url()))).body.currentStep);
         });
 
         it("completes setup that was never started", async () => {

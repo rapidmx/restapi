@@ -52,5 +52,12 @@ describe("Route:PluginMongo Tests", () => {
             await auditLogRepo.clear();
         },
         auditActions: async () => (await auditLogRepo.find({}).toArray()).map((entry) => entry.action),
+        insertPlugin: async (fields) => {
+            await pluginRepo.save(new PluginMongo(fields));
+        },
+        rows: async () => (await pluginRepo.find({}).toArray()).sort((a, b) => a.name.localeCompare(b.name)),
+        bumpVersion: async (uid) => {
+            await pluginRepo.updateOne({ uid }, { $inc: { version: 1 } });
+        },
     });
 });

@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { Raw } from "typeorm";
-import { MailboxSQL } from "../../sql.js";
+import { AuditLogEntrySQL, MailboxSQL } from "../../sql.js";
 import { BaseMailboxAccessRoute } from "../BaseMailboxAccessRoute.js";
 
 export class MailboxAccessRouteSQL extends BaseMailboxAccessRoute<MailboxSQL> {
     protected mailboxClass: any = MailboxSQL;
+    protected auditLogClass: any = AuditLogEntrySQL;
 
     /** `aliasAddresses` is stored as a serialized `simple-json` column on the SQL backend - a plain
      * equality filter compares against the whole serialized string and never matches a single element.
