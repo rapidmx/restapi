@@ -5,7 +5,7 @@
 import { PluginManifest } from "../models/types.js";
 import { parsePluginManifest } from "./PluginUtils.js";
 
-/** The npm registry used when `plugins:registry` isn't configured. */
+/** The npm registry used when `system:plugins:registry` isn't configured. */
 export const DEFAULT_PLUGIN_REGISTRY = "https://registry.npmjs.org";
 
 /** One published version of a package, as far as the plugin system cares. */

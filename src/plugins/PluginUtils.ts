@@ -23,7 +23,7 @@ export const PLUGIN_STATUS_KEY = "plugins:status";
 /** How old a `PluginInstanceStatus` may be before it's treated as a server copy that no longer exists. */
 export const PLUGIN_STATUS_MAX_AGE_MS = 2 * 60 * 1000;
 
-/** The package allow-list used when `plugins:allowed_packages` isn't configured. */
+/** The package allow-list used when `system:plugins:allowed_packages` isn't configured. */
 export const DEFAULT_ALLOWED_PLUGIN_PACKAGES = ["@rapidmx/*"];
 
 /** What one server copy reports about the plugins it loaded. */

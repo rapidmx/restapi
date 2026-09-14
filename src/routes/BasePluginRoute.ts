@@ -57,7 +57,7 @@ export interface PluginStatusResponse {
 
 /**
  * Administers the plugins this deployment runs. Every endpoint is trusted-role only: a plugin runs arbitrary
- * code inside every server copy. Which packages may be added at all is limited by `plugins:allowed_packages`,
+ * code inside every server copy. Which packages may be added at all is limited by `system:plugins:allowed_packages`,
  * which only the operator's configuration can widen.
  *
  * This route only records the desired plugin set and announces changes on the `plugins` channel; each server
@@ -78,13 +78,13 @@ export abstract class BasePluginRoute<T extends Plugin> {
     @Config()
     private config: any;
 
-    @Config("plugins:registry", DEFAULT_PLUGIN_REGISTRY)
+    @Config("system:plugins:registry", DEFAULT_PLUGIN_REGISTRY)
     private registryUrl: string = DEFAULT_PLUGIN_REGISTRY;
 
-    @Config("plugins:registry_token", "")
+    @Config("system:plugins:registry_token", "")
     private registryToken: string = "";
 
-    @Config("plugins:allowed_packages", DEFAULT_ALLOWED_PLUGIN_PACKAGES)
+    @Config("system:plugins:allowed_packages", DEFAULT_ALLOWED_PLUGIN_PACKAGES)
     private allowedPackages: string[] = DEFAULT_ALLOWED_PLUGIN_PACKAGES;
 
     @Config("datastores:events", null)
