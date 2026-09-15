@@ -9,6 +9,7 @@ import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { EscrowScopeMongo } from "../../../src/models/mongo/EscrowScopeMongo.js";
+import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
@@ -29,6 +30,7 @@ describe("Route:EscrowScopeMongo Tests", () => {
     let repo: MongoRepository<EscrowScopeMongo>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
     let matterRepo: MongoRepository<MatterMongo>;
+    let mailboxRepo: MongoRepository<MailboxMongo>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -60,6 +62,7 @@ describe("Route:EscrowScopeMongo Tests", () => {
             repo = conn.getMongoRepository("EscrowScopeMongo");
             auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
             matterRepo = conn.getMongoRepository("MatterMongo");
+            mailboxRepo = conn.getMongoRepository("MailboxMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -72,7 +75,7 @@ describe("Route:EscrowScopeMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const r of [repo, auditLogRepo, matterRepo]) {
+        for (const r of [repo, auditLogRepo, matterRepo, mailboxRepo]) {
             try {
                 await r.clear();
             } catch (err: any) {
@@ -294,6 +297,38 @@ describe("Route:EscrowScopeMongo Tests", () => {
             .set("Authorization", "jwt " + adminToken);
 
         expect(result.status).toBe(409);
+    });
+
+    it("Blocks deleting a scope while a mailbox is still assigned to it (409), leaving the assignment in place, until it is unassigned (round 6).", async () => {
+        const scope = await createEscrowScope();
+        const other = await createEscrowScope({ name: "other" });
+        const mailbox = await mailboxRepo.save(
+            new MailboxMongo({
+                ownerUserUid: uuid.v4(),
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Custodian",
+                timezone: "UTC",
+                quotaBytes: 1_000_000,
+                usedBytes: 0,
+                escrowScopeId: scope.uid,
+            }),
+        );
+
+        const refused = await request(server.getApplication()).delete(`${baseUrl}/${scope.uid}`).set("Authorization", "jwt " + adminToken);
+        expect(refused.status).toBe(409);
+        expect(refused.body.message).toMatch(/still assigned to 1 mailbox/);
+        expect(await repo.findOne({ uid: scope.uid } as any)).toBeTruthy();
+        expect((await mailboxRepo.findOne({ uid: mailbox.uid } as any))?.escrowScopeId).toBe(scope.uid);
+        expect(await auditLogRepo.find({ targetUid: scope.uid, action: AuditAction.ESCROW_SCOPE_DELETE }).toArray()).toHaveLength(0);
+
+        // A scope no mailbox is assigned to is unaffected by another scope's assignments.
+        expect((await request(server.getApplication()).delete(`${baseUrl}/${other.uid}`).set("Authorization", "jwt " + adminToken)).status).toBeLessThan(300);
+
+        await mailboxRepo.updateOne({ uid: mailbox.uid } as any, { $set: { escrowScopeId: null } });
+        const deleted = await request(server.getApplication()).delete(`${baseUrl}/${scope.uid}`).set("Authorization", "jwt " + adminToken);
+        expect(deleted.status).toBeGreaterThanOrEqual(200);
+        expect(deleted.status).toBeLessThan(300);
     });
 
     it("Allows deleting a scope once its referencing Matter is itself deleted.", async () => {

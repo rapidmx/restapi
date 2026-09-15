@@ -28,7 +28,7 @@ import { scanAndRelay } from "../util/MailSendUtils.js";
 import { coerceDateValue } from "../util/DateCoercionUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { boundIndexedValue } from "../util/ConversationUtils.js";
-import { checkOriginatorHeaders, extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
+import { checkOriginatorHeaders, extractHeader, prependHeaders, safeDisplayName } from "../util/MimeHeaderUtils.js";
 import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import { buildRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
@@ -102,6 +102,8 @@ const SERVER_MANAGED_MESSAGE_FIELDS = [
     "scheduledSendLeaseExpiresAt",
     // Derived from the message's `Attachment`s (`BaseAttachmentRoute`, ingest, import).
     "hasAttachments",
+    // Superseded draft bodies kept under legal hold (`DraftBodyRetentionUtils`), appended by the compose route only.
+    "retainedBodyBlobKeys",
 ] as const;
 
 /** Every top-level `Date` field of `Message` - coerced on create/update (see `BaseScopedChildRoute.dateFields`). */
@@ -349,8 +351,9 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * - can't move a message into Drafts unless it's already in Drafts or is in Outbox (403): a message in Drafts can be
      * re-assembled (body, subject, recipients rewritten) by the compose route, and a Sent Items copy carries nothing
      * that tells it apart from a real draft, so a sent or received message moved there could be rewritten and moved
-     * back, forging mail history (a held custodian's included). Outbox -> Drafts is how a scheduled send is cancelled.
-     * activesync's `MessageMoveRules` refuses the same moves;
+     * back, forging mail history (a held custodian's included). Outbox -> Drafts is how a scheduled send is cancelled;
+     * it's allowed for what `send()` queues (non-trusted callers can only send from Drafts), not for a delivered message
+     * (`scanResultUid`) a mail filter rule filed into Outbox. activesync's `MessageMoveRules` refuses the same moves;
      * - moving a message out of Outbox cancels its scheduled send (the server clears `scheduledSendTime` and the job's
      * retry state) - refused (409) once the message was already relayed and only its filing is pending, and (for any
      * caller, see `prepareUpdate()`) while a send of it is in flight.
@@ -373,7 +376,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw BaseMessageRoute.outboxRefusal();
         }
         const sourceType: FolderType | undefined = await this.folderTypeOf(existing.folderUid);
-        if (targetType === FolderType.DRAFTS && sourceType !== FolderType.DRAFTS && sourceType !== FolderType.OUTBOX) {
+        // Out of Outbox, only a message a send put there: `send()` only queues drafts (for non-trusted callers), while a
+        // delivered message (`scanResultUid`) can land in Outbox through a mail filter rule and must not reach Drafts.
+        const cancellingSend: boolean = sourceType === FolderType.OUTBOX && !(existing as any).scanResultUid;
+        if (targetType === FolderType.DRAFTS && sourceType !== FolderType.DRAFTS && !cancellingSend) {
             throw new ApiError(
                 ApiErrors.AUTH_PERMISSION_FAILURE,
                 403,
@@ -446,7 +452,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     ): Promise<boolean> {
         try {
             const composed: Buffer = await buildDispositionNotification({
-                from: { address: mailbox.primarySmtpAddress, displayName: mailbox.displayName },
+                from: { address: mailbox.primarySmtpAddress, displayName: safeDisplayName(mailbox.displayName) },
                 to: dispositionNotificationTo,
                 subject: `${dispositionType === "read" ? "Read" : "Delivered"}: ${originalSubject}`,
                 finalRecipient: mailbox.primarySmtpAddress,
@@ -576,6 +582,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 409,
                 "This message is already queued for sending. Move it back to Drafts to change or resend it.",
             );
+        }
+        // Only a draft is sent (scheduled or now). Otherwise a sent or received message moved out of Sent Items/Inbox could
+        // be "scheduled" into Outbox, taken back to Drafts (the scheduled-send cancel path), re-assembled by the compose
+        // route and moved back - rewriting mail history, a held custodian's included. Trusted callers are exempt, like
+        // the Drafts/Outbox move rules in `prepareScheduledSendUpdate()`.
+        if (!this.isTrusted(user) && currentFolderType !== FolderType.DRAFTS) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Only a message in Drafts can be sent.");
         }
 
         // Drafts may be saved with no recipients at all; sending one is refused here, before any claim, so it stays
@@ -800,6 +813,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 conversationId: boundIndexedValue(conversationId),
                 receiptStatus,
                 encrypted,
+                scheduledSendTime: null,
                 scheduledSendLeaseExpiresAt: null,
                 scheduledSendRelayedAt: null,
             } as any,
@@ -846,8 +860,15 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * version-checked write (re-read and retried when an unrelated write bumped the version first), so nothing else in a
      * later write (an over-long header value, a blob store failure) can keep the marker from landing. Best-effort
      * (logged); `markRelayed()` stamps it again if filing fails.
+     *
+     * The same write makes the message due for `ScheduledSendJob` once the claim's lease lapses (`scheduledSendTime` =
+     * the lease expiry, not now, so the job doesn't take over a filing this request is still doing): if the process
+     * dies before filing, the job finishes it instead of the message sitting relayed in Outbox forever. The re-read
+     * includes soft-deleted rows, so the marker still lands on a message deleted mid-relay (and it can't be sent again
+     * after a restore).
      */
     private async recordRelayed(claimed: T): Promise<void> {
+        const dueAt: Date = toValidDate((claimed as any).scheduledSendLeaseExpiresAt) ?? new Date();
         let current: T | undefined = claimed;
         for (let attempt = 1; current && attempt <= 3; attempt++) {
             /* v8 ignore next 3 -- only a concurrent writer that already stamped it */
@@ -856,14 +877,14 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             }
             try {
                 await this.repoUtils!.update(
-                    { uid: current.uid, version: (current as any).version, scheduledSendRelayedAt: new Date() } as any,
+                    { uid: current.uid, version: (current as any).version, scheduledSendRelayedAt: new Date(), scheduledSendTime: dueAt } as any,
                     current,
                     { ignoreACL: true },
                 );
                 return;
             } catch (err: any) {
                 this.logger?.warn(`BaseMessageRoute: failed to record the relay of message ${claimed.uid} (attempt ${attempt}): ${err.message}`);
-                current = attempt < 3 ? await this.repoUtils!.findOne(claimed.uid, { ignoreACL: true, skipCache: true }) : undefined;
+                current = attempt < 3 ? await this.repoUtils!.findOne(claimed.uid, { ignoreACL: true, skipCache: true, includeDeleted: true }) : undefined;
             }
         }
     }
@@ -897,7 +918,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const uid: string = claimed.uid;
         for (let attempt = 1; attempt <= 3; attempt++) {
             try {
-                const current: T | undefined = await this.repoUtils!.findOne(uid, { ignoreACL: true, skipCache: true });
+                const current: T | undefined = await this.repoUtils!.findOne(uid, { ignoreACL: true, skipCache: true, includeDeleted: true });
                 if (!current) {
                     return;
                 }
@@ -969,11 +990,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         this.assertSenderAllowed(await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true }), message);
 
         const envelopeTo: string[] = message.recipients.map((r) => r.address);
+        // `from.displayName` is ordinary client-writable data - an address-like one is left out (`safeDisplayName()`).
+        const fromName: string | undefined = safeDisplayName(message.from.displayName);
         const composed: Buffer = await new MailComposer({
-            from: { address: message.from.address, name: message.from.displayName },
+            from: { address: message.from.address, name: fromName },
             to: envelopeTo,
             subject: `Recall: ${message.subject}`,
-            text: `${message.from.displayName ?? message.from.address} is attempting to recall the message: "${message.subject}".`,
+            text: `${fromName ?? message.from.address} is attempting to recall the message: "${message.subject}".`,
             headers: { "X-RapidMX-Recall-Of": message.messageId },
         })
             .compile()
@@ -1419,6 +1442,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         @AuthUser user?: JWTUser,
     ): Promise<void> {
         const existing: T | undefined = this.repoUtils ? await this.repoUtils.findOne(id, { version, ignoreACL: true }) : undefined;
+
+        // Like a move out of Outbox, a delete is refused while a send of the message is in flight (for every caller): a
+        // soft-deleted message could otherwise miss its relay marker and be restored and sent a second time.
+        if (existing && (await this.aclUtils!.hasPermission(user, existing.folderUid, ACLAction.DELETE))) {
+            BaseMessageRoute.assertNotInFlight(existing);
+        }
 
         if (existing && purge === "true") {
             try {

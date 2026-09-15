@@ -10,6 +10,7 @@ import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { EscrowScopeSQL } from "../../../src/models/sql/EscrowScopeSQL.js";
+import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
@@ -22,6 +23,7 @@ describe("Route:EscrowScopeSQL Tests", () => {
     let repo: Repository<EscrowScopeSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
     let matterRepo: Repository<MatterSQL>;
+    let mailboxRepo: Repository<MailboxSQL>;
 
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const userToken = JWTUtils.createTokenSync(config.get("auth"), user);
@@ -52,6 +54,7 @@ describe("Route:EscrowScopeSQL Tests", () => {
             repo = conn.getRepository(EscrowScopeSQL);
             auditLogRepo = conn.getRepository(AuditLogEntrySQL);
             matterRepo = conn.getRepository(MatterSQL);
+            mailboxRepo = conn.getRepository(MailboxSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -66,6 +69,7 @@ describe("Route:EscrowScopeSQL Tests", () => {
         await repo.clear();
         await auditLogRepo.clear();
         await matterRepo.clear();
+        await mailboxRepo.clear();
     });
 
     it("A non-trusted caller cannot create/list/count/read/update/delete escrow scopes (403).", async () => {
@@ -279,6 +283,38 @@ describe("Route:EscrowScopeSQL Tests", () => {
             .set("Authorization", "jwt " + adminToken);
 
         expect(result.status).toBe(409);
+    });
+
+    it("Blocks deleting a scope while a mailbox is still assigned to it (409), leaving the assignment in place, until it is unassigned (round 6).", async () => {
+        const scope = await createEscrowScope();
+        const other = await createEscrowScope({ name: "other" });
+        const mailbox = await mailboxRepo.save(
+            new MailboxSQL({
+                ownerUserUid: uuid.v4(),
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Custodian",
+                timezone: "UTC",
+                quotaBytes: 1_000_000,
+                usedBytes: 0,
+                escrowScopeId: scope.uid,
+            }),
+        );
+
+        const refused = await request(server.getApplication()).delete(`${baseUrl}/${scope.uid}`).set("Authorization", "jwt " + adminToken);
+        expect(refused.status).toBe(409);
+        expect(refused.body.message).toMatch(/still assigned to 1 mailbox/);
+        expect(await repo.findOne({ where: { uid: scope.uid } })).toBeTruthy();
+        expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))?.escrowScopeId).toBe(scope.uid);
+        expect(await auditLogRepo.count({ where: { targetUid: scope.uid, action: AuditAction.ESCROW_SCOPE_DELETE } })).toBe(0);
+
+        // A scope no mailbox is assigned to is unaffected by another scope's assignments.
+        expect((await request(server.getApplication()).delete(`${baseUrl}/${other.uid}`).set("Authorization", "jwt " + adminToken)).status).toBeLessThan(300);
+
+        await mailboxRepo.update({ uid: mailbox.uid }, { escrowScopeId: null as any });
+        const deleted = await request(server.getApplication()).delete(`${baseUrl}/${scope.uid}`).set("Authorization", "jwt " + adminToken);
+        expect(deleted.status).toBeGreaterThanOrEqual(200);
+        expect(deleted.status).toBeLessThan(300);
     });
 
     it("Allows deleting a scope once its referencing Matter is itself deleted.", async () => {

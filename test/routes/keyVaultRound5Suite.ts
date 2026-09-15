@@ -281,4 +281,115 @@ export function keyVaultRound5Suite(ctx: KeyVaultRound5SuiteContext): void {
             expect(stored?.masterKeyWraps.map((w: any) => w.ciphertext)).toEqual([winner]);
         });
     });
+
+    describe("round 6 (part B): expectedMasterKeyGeneration", () => {
+        const vaultUrl = (mailbox: any, path: string = "") => `${ctx.baseUrl}/${mailbox.uid}/keyvault${path}`;
+
+        it("reports the generation, and refuses (409) sealed material from a client that missed a rotation on every write that takes it", async () => {
+            const mailbox = await ctx.createMailbox(owner.uid);
+            expect((await auth(request(ctx.app()).get(vaultUrl(mailbox)), owner)).body.masterKeyGeneration).toBe(0);
+            // A first-time setup may state generation 0.
+            const setUp = await auth(request(ctx.app()).post(vaultUrl(mailbox, "/keys")), owner).send({
+                useType: "sign",
+                certificate: await generateSelfSignedCert(mailbox.primarySmtpAddress),
+                wrappedKey,
+                masterKeyWraps: [wrap("password")],
+                expectedMasterKeyGeneration: 0,
+            });
+            expect(setUp.status).toBe(200);
+            expect(setUp.body.masterKeyGeneration).toBe(0);
+            const key = (await auth(request(ctx.app()).get(`${ctx.baseUrl}/${mailbox.uid}`), owner)).body.keys[0];
+
+            // Another device rotates: generation 1.
+            const rotated = await auth(request(ctx.app()).put(vaultUrl(mailbox, "/rekey")), owner).send({
+                keys: [key],
+                wrappedKeys: [{ ...wrappedKey, ciphertext: "under-mk1", fingerprint: key.fingerprint, useType: "sign" }],
+                masterKeyWraps: [wrap("password")],
+                expectedMasterKeyGeneration: 0,
+            });
+            expect(rotated.status).toBe(200);
+            expect(rotated.body.masterKeyGeneration).toBe(1);
+            const before = await ctx.findKeyVault(mailbox.uid);
+
+            // The stale device (still on generation 0) is refused everywhere, and nothing is written or started.
+            const staleEnroll = await auth(request(ctx.app()).post(vaultUrl(mailbox, "/keys")), owner).send({
+                useType: "sign",
+                certificate: await generateSelfSignedCert(mailbox.primarySmtpAddress),
+                wrappedKey: { ...wrappedKey, ciphertext: "under-mk0" },
+                expectedMasterKeyGeneration: 0,
+            });
+            expect(staleEnroll.status).toBe(409);
+            expect(staleEnroll.body.message).toMatch(/master key was rotated/);
+            const staleStart = await auth(request(ctx.app()).post(vaultUrl(mailbox, "/keys/sign-enrollment")), owner).send({
+                csr: await ctx.generateCsr(mailbox.primarySmtpAddress),
+                wrappedKey,
+                expectedMasterKeyGeneration: 0,
+            });
+            expect(staleStart.status).toBe(409);
+            expect(FakeAutomatedEnrollment.enrollments.size).toBe(0);
+            const staleWrap = await auth(request(ctx.app()).post(vaultUrl(mailbox, "/wraps")), owner).send({ ...wrap("passkey"), expectedMasterKeyGeneration: 0 });
+            expect(staleWrap.status).toBe(409);
+            const staleRekey = await auth(request(ctx.app()).put(vaultUrl(mailbox, "/rekey")), owner).send({
+                keys: [key],
+                wrappedKeys: [{ ...wrappedKey, ciphertext: "stale", fingerprint: key.fingerprint, useType: "sign" }],
+                masterKeyWraps: [wrap("password")],
+                expectedMasterKeyGeneration: 0,
+            });
+            expect(staleRekey.status).toBe(409);
+            const after = await ctx.findKeyVault(mailbox.uid);
+            expect(after?.version).toBe(before?.version);
+            expect(after?.wrappedKeys.map((k: any) => k.ciphertext)).toEqual(["under-mk1"]);
+            expect(after?.masterKeyGeneration).toBe(1);
+
+            // The current generation is accepted; the wrap is stored without the field; an enrollment records it.
+            const addedWrap = await auth(request(ctx.app()).post(vaultUrl(mailbox, "/wraps")), owner).send({ ...wrap("passkey", { methodId: "pk-1" }), expectedMasterKeyGeneration: 1 });
+            expect(addedWrap.status).toBe(200);
+            expect(addedWrap.body.masterKeyGeneration).toBe(1);
+            expect(addedWrap.body.masterKeyWraps[1]).not.toHaveProperty("expectedMasterKeyGeneration");
+            expect((await ctx.findKeyVault(mailbox.uid))?.masterKeyWraps[1]).not.toHaveProperty("expectedMasterKeyGeneration");
+            const started = await auth(request(ctx.app()).post(vaultUrl(mailbox, "/keys/sign-enrollment")), owner).send({
+                csr: await ctx.generateCsr(mailbox.primarySmtpAddress),
+                wrappedKey,
+                expectedMasterKeyGeneration: 1,
+            });
+            expect(started.status).toBe(200);
+            expect(FakeAutomatedEnrollment.enrollments.get(started.body.enrollmentId)?.binding).toEqual({ mailboxUid: mailbox.uid, masterKeyGeneration: 1 });
+            await auth(request(ctx.app()).delete(enrollmentUrl(mailbox, started.body.enrollmentId)), owner);
+            const enrolled = await auth(request(ctx.app()).post(vaultUrl(mailbox, "/keys")), owner).send({
+                useType: "sign",
+                certificate: await generateSelfSignedCert(mailbox.primarySmtpAddress),
+                wrappedKey: { ...wrappedKey, ciphertext: "also-under-mk1" },
+                expectedMasterKeyGeneration: 1,
+            });
+            expect(enrolled.status).toBe(200);
+            expect(enrolled.body.wrappedKeys.map((k: any) => k.ciphertext)).toEqual(["under-mk1", "also-under-mk1"]);
+
+            // Omitted, older clients keep working.
+            const legacy = await auth(request(ctx.app()).post(vaultUrl(mailbox, "/wraps")), owner).send(wrap("recovery"));
+            expect(legacy.status).toBe(200);
+        });
+
+        it("rejects a malformed expectedMasterKeyGeneration (400), and treats null as not given", async () => {
+            const mailbox = await ctx.createMailbox(owner.uid);
+            for (const bad of [-1, 1.5, "0", true]) {
+                const result = await auth(request(ctx.app()).post(vaultUrl(mailbox, "/keys/sign-enrollment")), owner).send({
+                    csr: await ctx.generateCsr(mailbox.primarySmtpAddress),
+                    wrappedKey,
+                    expectedMasterKeyGeneration: bad,
+                });
+                expect(result.status).toBe(400);
+                expect(result.body.message).toMatch(/expectedMasterKeyGeneration must be a non-negative integer/);
+            }
+            // `null` counts as not given.
+            expect(
+                (
+                    await auth(request(ctx.app()).post(vaultUrl(mailbox, "/keys/sign-enrollment")), owner).send({
+                        csr: await ctx.generateCsr(mailbox.primarySmtpAddress),
+                        wrappedKey,
+                        expectedMasterKeyGeneration: null,
+                    })
+                ).status,
+            ).toBe(200);
+        });
+    });
 }

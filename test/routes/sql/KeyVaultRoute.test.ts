@@ -142,7 +142,7 @@ describe("Route:KeyVaultSQL Tests", () => {
                 .set("Authorization", "jwt " + ownerToken);
 
             expect(result.status).toBe(200);
-            expect(result.body).toEqual({ wrappedKeys: [], masterKeyWraps: [] });
+            expect(result.body).toEqual({ wrappedKeys: [], masterKeyWraps: [], masterKeyGeneration: 0 });
         });
 
         it("A caller with a delegate READ grant (not owner) can read the vault.", async () => {

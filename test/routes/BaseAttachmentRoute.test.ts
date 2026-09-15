@@ -75,7 +75,37 @@ describe("BaseAttachmentRoute Tests (repoUtils/blobStore guard clauses only)", (
 
         find.mockReset().mockResolvedValueOnce([a1]).mockResolvedValueOnce([a2]).mockResolvedValue([]);
         await route.truncate({}, { folderUid: "f1" }, { uid: "user-1" } as any);
-        // Two full pages and a short one for the re-stamp scan, then the inherited truncate's own scan.
-        expect(find.mock.calls.filter(([criteria]) => criteria.folderUid instanceof QueryLiteral && criteria.folderUid.value === "f1" && criteria.sort === undefined).length).toBeGreaterThanOrEqual(3);
+        // Round 6: the re-stamp scan is keyset-paged on uid (two full pages, then an empty one past a2), then the inherited
+        // truncate's own scan.
+        const scans = find.mock.calls.filter(([criteria]) => criteria.folderUid instanceof QueryLiteral && criteria.folderUid.value === "f1" && criteria.sort?.uid === "ASC");
+        expect(scans.map(([criteria]) => criteria.uid)).toEqual([undefined, "gt(a1)", "gt(a2)"]);
+    });
+
+    it("truncate()'s re-stamp scan doesn't skip stale rows when re-stamping moves earlier rows out of the folder (round 6).", async () => {
+        const route = objectFactory.newInstance<TestAttachmentRoute>(TestAttachmentRoute, { initialize: false });
+        (route as any).folderScanPageSize = 2;
+        // Five attachments stamped f1 whose message has moved to f2. The fake repo answers the folder scan from live state,
+        // so every re-stamp removes a row from the result set, as a real backend does.
+        const rows = ["a1", "a2", "a3", "a4", "a5"].map((uid) => ({ uid, messageUid: "m1", folderUid: "f1", mailboxUid: "mb", version: 0 }));
+        const find = vi.fn().mockImplementation(async (criteria: any) => {
+            const after: string | undefined = typeof criteria.uid === "string" ? criteria.uid.slice(3, -1) : undefined;
+            const matching = rows.filter((row) => row.folderUid === criteria.folderUid.value && (after === undefined || row.uid > after));
+            const offset: number = (criteria.page ?? 0) * (criteria.limit ?? 100);
+            return matching.slice(offset, offset + (criteria.limit ?? 100)).map((row) => ({ ...row }));
+        });
+        const update = vi.fn().mockImplementation(async (patch: any) => {
+            const row = rows.find((candidate) => candidate.uid === patch.uid)!;
+            Object.assign(row, { folderUid: patch.folderUid, mailboxUid: patch.mailboxUid, version: row.version + 1 });
+            return { ...row };
+        });
+        (route as any).repoUtils = { find, update, truncate: vi.fn(), instantiateObject: (obj: any) => obj };
+        (route as any).aclUtils = { hasPermission: vi.fn().mockResolvedValue(true) };
+        (route as any).messageRepo = { findOne: vi.fn().mockResolvedValue({ uid: "m1", folderUid: "f2", mailboxUid: "mb" }) };
+        const superTruncate = vi.spyOn(Object.getPrototypeOf(BaseAttachmentRoute.prototype), "truncate").mockResolvedValue(undefined);
+
+        await route.truncate({}, { folderUid: "f1" }, { uid: "user-1" } as any);
+
+        expect(rows.map((row) => row.folderUid)).toEqual(["f2", "f2", "f2", "f2", "f2"]);
+        expect(superTruncate).toHaveBeenCalledTimes(1);
     });
 });

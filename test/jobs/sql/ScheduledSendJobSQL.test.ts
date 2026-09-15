@@ -662,4 +662,23 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
             expect(transport().sent.length).toBe(0);
         });
     });
+    describe("Round 6 (part A): relay marker on a message deleted mid-relay", () => {
+        const repoUtils = (): any => (job as any).messageRepo;
+
+        it("Still stamps the relayed marker when the message was soft-deleted while on the wire.", async () => {
+            const message = await createMessage({ bodyBlobKey: await putBody(), scheduledSendTime: new Date(Date.now() - 60 * 1000) });
+            const realSend = transport().send.bind(transport());
+            vi.spyOn(transport(), "send").mockImplementationOnce(async (outbound: any) => {
+                await repoUtils().delete(message.uid, { ignoreACL: true });
+                return realSend(outbound);
+            });
+
+            await job.run();
+
+            expect(transport().sent.length).toBe(1);
+            const after: any = await findMessage(message.uid);
+            expect(after.deleted).toBe(true);
+            expect(after.scheduledSendRelayedAt).toBeTruthy();
+        });
+    });
 });

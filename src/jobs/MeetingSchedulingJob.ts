@@ -5,12 +5,23 @@
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors, BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { BlobStore } from "../blob/BlobStore.js";
+import { ScanPipeline } from "../scan/ScanPipeline.js";
+import { normalizeAddress } from "../util/AddressUtils.js";
 import { buildEventIcs } from "../util/IcsUtils.js";
+import { scanAndRelay } from "../util/MailSendUtils.js";
+import { isPlainAddress, safeDisplayName } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { sendOrThrow } from "../transport/TransportResultUtils.js";
-import type { MailTransport } from "../transport/MailTransport.js";
-import { CalendarEvent, CalendarEventStatus, Mailbox } from "../models/types.js";
+import type { MailTransport, OutboundMessage, TransportResult } from "../transport/MailTransport.js";
+import { Attendee, CalendarEvent, CalendarEventStatus, Mailbox } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
+
+/** A mailbox's own identity, as this job sends for it: its (lowercased) addresses and its safe display name. */
+interface MailboxIdentity {
+    addresses: Set<string>;
+    displayName?: string;
+}
 
 /** A keyset position in `(dateModified, uid)` order. */
 interface InviteCursor {
@@ -22,9 +33,16 @@ interface InviteCursor {
  * Sends outbound iTIP meeting-request/cancellation emails on behalf of an organizer: an organizer creates/
  * updates a `CalendarEvent` with attendees, and this job sends each one an iTIP `REQUEST` (`.ics` invite);
  * cancelling a meeting (deleting it, or setting `status: CANCELLED`) sends each attendee an iTIP `CANCEL`.
- * Composed via `nodemailer`'s `MailComposer` and relayed directly through `MailTransport` - bypasses
- * `scanAndRelay()` (system-generated content, not user-composed `Message.bodyBlobKey` MIME, same bypass
- * `ScanQueueJob.maybeSendAutoReply()` already uses for the same reason).
+ * Composed via `nodemailer`'s `MailComposer` and sent through `scanAndRelay()`, the same scan gate user-composed mail
+ * passes - the title, location and attendee list are the organizer's (or a device's) input, not system text.
+ *
+ * **What is mailed.** The `From` (and the iCalendar `ORGANIZER;CN`) carries the organizer's mailbox's own display name,
+ * never the stored `organizer.displayName` (a REST client or ActiveSync device sets that), and no name at all when the
+ * mailbox's is address-like (`safeDisplayName()`); attendee `CN`s get the same rule. Attendees must be plain addresses
+ * (`isPlainAddress()`) - others are skipped, logged and left out of the iCalendar attendee list - and are
+ * deduplicated. An event with more than `mail:jobs:meeting_scheduling:max_attendees` (500, the compose cap of mapi and
+ * activesync) mailable attendees isn't mailed at all (logged as an error). One message is composed and scanned per event
+ * and relayed to each attendee on its own envelope.
  *
  * **Recurring meetings**: a master row (`recurrenceRule` set) and any single-occurrence override rows
  * sharing its `icalUid` (`recurrenceId` set) are each their own independent `CalendarEvent` row with their
@@ -45,11 +63,13 @@ interface InviteCursor {
  * **Claim, then send.** Each row is claimed by the optimistic-lock (versioned) update of `inviteSequenceSent`/
  * `cancelNoticeSentAt` *before* anything is sent, and only sent if that update succeeded - a version conflict means
  * another replica (or a concurrent edit) got there first, and the row is left for whoever holds the newer version.
- * Every send goes through `sendOrThrow()`, so a transport that reports a rejected recipient counts as a failure.
+ * Every per-attendee relay goes through `sendOrThrow()`, so a transport that reports a rejected recipient counts as a
+ * failure.
  *
  * **Known limitation**: no per-attendee send-retry tracking. A failed send to one attendee is logged and the rest
  * still go out; the row stays claimed (not rolled back), so that attendee isn't retried - un-claiming would resend
- * to every attendee that did succeed.
+ * to every attendee that did succeed. The same holds for a message the scan refuses, and for an event over the
+ * attendee cap.
  *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`MeetingSchedulingJobMongo`/
  * `MeetingSchedulingJobSQL`), following the same generic pattern `ScanQueueJob` uses.
@@ -69,6 +89,12 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
     @Inject("MailTransport")
     private mailTransport?: MailTransport;
 
+    @Inject(ScanPipeline)
+    private scanPipeline?: ScanPipeline;
+
+    @Inject("BlobStore")
+    private blobStore?: BlobStore;
+
     @Config("mail:jobs:meeting_scheduling:schedule", "0 */5 * * * *")
     private scheduleExpr: string = "0 */5 * * * *";
 
@@ -82,6 +108,10 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
     /** How far behind "now" the live invite walk rewinds once caught up (see `sendInvites()`). */
     @Config("mail:jobs:meeting_scheduling:rescan_lag_seconds", 600)
     private rescanLagSeconds: number = 600;
+
+    /** Most attendees one invite or cancellation is mailed to - see this class's doc comment. */
+    @Config("mail:jobs:meeting_scheduling:max_attendees", 500)
+    private maxAttendees: number = 500;
 
     private liveInviteCursor?: InviteCursor;
     private catchUpInviteCursor?: InviteCursor;
@@ -119,30 +149,33 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
             return;
         }
 
-        // Per-run cache of each mailbox's own (lowercased) addresses, keyed by mailbox uid.
-        const ownAddresses: Map<string, Set<string>> = new Map();
-        await this.sendInvites(ownAddresses);
-        await this.sendCancellations(ownAddresses);
+        // Per-run cache of each mailbox's own identity, keyed by mailbox uid.
+        const identities: Map<string, MailboxIdentity> = new Map();
+        await this.sendInvites(identities);
+        await this.sendCancellations(identities);
     }
 
-    /** `true` if `event`'s organizer is one of its owning mailbox's own addresses - i.e. this row is the organizer's
-     * copy, not an attendee copy received from someone else. */
-    private async isOrganizerCopy(event: CE, cache: Map<string, Set<string>>): Promise<boolean> {
+    /** The owning mailbox's identity when `event`'s organizer is one of that mailbox's own addresses - i.e. this row is
+     * the organizer's copy, not an attendee copy received from someone else; otherwise `undefined`. */
+    private async organizerIdentity(event: CE, cache: Map<string, MailboxIdentity>): Promise<MailboxIdentity | undefined> {
         const organizerAddress: string = (event.organizer?.address ?? "").trim().toLowerCase();
         if (!organizerAddress || !event.mailboxUid) {
-            return false;
+            return undefined;
         }
-        let addresses: Set<string> | undefined = cache.get(event.mailboxUid);
-        if (!addresses) {
+        let identity: MailboxIdentity | undefined = cache.get(event.mailboxUid);
+        if (!identity) {
             const mailbox: Mailbox | undefined = await this.mailboxRepo?.findOne(event.mailboxUid, { ignoreACL: true });
-            addresses = new Set(
-                (mailbox ? [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])] : [])
-                    .filter((address) => typeof address === "string")
-                    .map((address) => address.trim().toLowerCase()),
-            );
-            cache.set(event.mailboxUid, addresses);
+            identity = {
+                addresses: new Set(
+                    (mailbox ? [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])] : [])
+                        .filter((address) => typeof address === "string")
+                        .map((address) => address.trim().toLowerCase()),
+                ),
+                displayName: safeDisplayName(mailbox?.displayName),
+            };
+            cache.set(event.mailboxUid, identity);
         }
-        return addresses.has(organizerAddress);
+        return identity.addresses.has(organizerAddress) ? identity : undefined;
     }
 
     /** Applies `changes` with an optimistic-lock update. Returns `false` (instead of throwing) only for a version
@@ -201,7 +234,7 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
      * that needed an invite before this process started (e.g. edited during an outage) are still handled - with
      * its own page budget, after the live walk, so a large table never delays a new invite.
      */
-    private async sendInvites(ownAddresses: Map<string, Set<string>>): Promise<void> {
+    private async sendInvites(identities: Map<string, MailboxIdentity>): Promise<void> {
         const lagMs: number = Number(this.rescanLagSeconds) * 1000;
         if (!this.liveInviteCursor) {
             this.liveInviteCursor = { dateModified: new Date(Date.now() - lagMs), uid: "" };
@@ -209,7 +242,7 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
             this.catchUpInviteUntilMs = this.liveInviteCursor.dateModified.getTime();
         }
 
-        const live = await this.walkInvites(this.liveInviteCursor, ownAddresses);
+        const live = await this.walkInvites(this.liveInviteCursor, identities);
         this.liveInviteCursor = live.cursor;
         if (live.exhausted) {
             const rewindTo: Date = new Date(Date.now() - lagMs);
@@ -219,7 +252,7 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
         }
 
         if (this.catchUpInviteCursor) {
-            const catchUp = await this.walkInvites(this.catchUpInviteCursor, ownAddresses, this.catchUpInviteUntilMs);
+            const catchUp = await this.walkInvites(this.catchUpInviteCursor, identities, this.catchUpInviteUntilMs);
             this.catchUpInviteCursor = catchUp.exhausted ? undefined : catchUp.cursor;
         }
     }
@@ -228,7 +261,7 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
      * `untilMs`, when given). `exhausted` means the walk reached the end (or `untilMs`). */
     private async walkInvites(
         cursor: InviteCursor,
-        ownAddresses: Map<string, Set<string>>,
+        identities: Map<string, MailboxIdentity>,
         untilMs?: number,
     ): Promise<{ cursor: InviteCursor; exhausted: boolean }> {
         for (let page = 0; page < Math.max(1, Number(this.maxPages)); page++) {
@@ -242,7 +275,7 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                     pastUntil = true;
                 }
             }
-            await this.processInviteCandidates(candidates, ownAddresses);
+            await this.processInviteCandidates(candidates, identities);
             if (candidates.length > 0) {
                 const last: CE = candidates[candidates.length - 1];
                 cursor = { dateModified: new Date(last.dateModified), uid: last.uid };
@@ -254,7 +287,7 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
         return { cursor, exhausted: false };
     }
 
-    private async processInviteCandidates(candidates: CE[], ownAddresses: Map<string, Set<string>>): Promise<void> {
+    private async processInviteCandidates(candidates: CE[], identities: Map<string, MailboxIdentity>): Promise<void> {
         for (const event of candidates) {
             try {
                 if (!event.attendees || event.attendees.length === 0) {
@@ -273,7 +306,7 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                     continue;
                 }
 
-                const isOrganizerCopy: boolean = await this.isOrganizerCopy(event, ownAddresses);
+                const organizer: MailboxIdentity | undefined = await this.organizerIdentity(event, identities);
 
                 // Claim first: only the replica whose versioned update wins may send.
                 if (!(await this.claim(event, { inviteSequenceSent: event.sequence }))) {
@@ -286,19 +319,18 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                 // real sign/encrypt only ever happens client-side) - this job never composes a plaintext iTIP
                 // REQUEST for it. Both are the same "skip the send, still mark handled" shape
                 // `isRedundantOccurrenceCancel` below uses.
-                if (!isOrganizerCopy || event.encryptionOrigin === "originated") {
+                if (!organizer || event.encryptionOrigin === "originated") {
                     continue;
                 }
 
-                const ics = buildEventIcs(event, "REQUEST");
-                await this.sendToAttendees(event, ics, "request");
+                await this.sendToAttendees(event, organizer, "request");
             } catch (err: any) {
                 this.logger?.warn(`MeetingSchedulingJob: failed to process invites for event ${event.uid}: ${err.message}`);
             }
         }
     }
 
-    private async sendCancellations(ownAddresses: Map<string, Set<string>>): Promise<void> {
+    private async sendCancellations(identities: Map<string, MailboxIdentity>): Promise<void> {
         // `find()` has no `includeDeleted` option (unlike `findOne()`) - a soft-deleted row is only ever
         // returned by explicitly querying `{ deleted: true }`, which `ModelUtils.buildSearchQuery()` honors
         // as a literal filter value rather than "include deleted rows too." So this runs two separate
@@ -343,16 +375,15 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                 // Same "client's own responsibility" reasoning as `sendInvites()` above - an encrypted
                 // event's CANCEL is never composed/sent by this job either.
                 const isClientManagedEncrypted = event.encryptionOrigin === "originated";
-                const isOrganizerCopy: boolean = await this.isOrganizerCopy(event, ownAddresses);
+                const organizer: MailboxIdentity | undefined = await this.organizerIdentity(event, identities);
 
                 // Claim first, same as `sendInvites()`.
                 if (!(await this.claim(event, { cancelNoticeSentAt: new Date() }))) {
                     continue;
                 }
 
-                if (!isRedundantOccurrenceCancel && !isClientManagedEncrypted && isOrganizerCopy) {
-                    const ics = buildEventIcs(event, "CANCEL");
-                    await this.sendToAttendees(event, ics, "cancel");
+                if (!isRedundantOccurrenceCancel && !isClientManagedEncrypted && organizer) {
+                    await this.sendToAttendees(event, organizer, "cancel");
                 }
             } catch (err: any) {
                 this.logger?.warn(`MeetingSchedulingJob: failed to process cancellation for event ${event.uid}: ${err.message}`);
@@ -360,34 +391,70 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
         }
     }
 
-    /** Sends `ics` to every attendee except the organizer. A failure for one attendee is logged and the rest
-     * still go out (see this class's doc comment for why the row stays claimed). */
-    private async sendToAttendees(event: CE, ics: string, method: "request" | "cancel"): Promise<void> {
+    /**
+     * Mails the event's iTIP `method` to every mailable attendee except the organizer (see this class's doc comment): one
+     * message, composed as the organizer's mailbox identity and scanned once by `scanAndRelay()`, relayed to each
+     * attendee on its own envelope. A failure for one attendee is logged and the rest still go out (see this class's doc
+     * comment for why the row stays claimed); a refused scan, or no attendee accepting it, throws.
+     */
+    private async sendToAttendees(event: CE, organizer: MailboxIdentity, method: "request" | "cancel"): Promise<void> {
+        const what: string = method === "cancel" ? "cancellation" : "invite";
+        const seen: Set<string> = new Set([normalizeAddress(event.organizer.address)]);
+        const recipients: string[] = [];
+        const listed: Attendee[] = [];
         for (const attendee of event.attendees) {
-            if (!attendee?.address || attendee.address.toLowerCase() === event.organizer.address.toLowerCase()) {
+            if (!attendee?.address) {
                 continue;
             }
-            try {
-                await this.sendItipMail(event, ics, method, attendee.address);
-            } catch (err: any) {
-                const what = method === "cancel" ? "cancellation" : "invite";
-                this.logger?.warn(`MeetingSchedulingJob: failed to send ${what} for event ${event.uid} to ${attendee.address}: ${err.message}`);
+            if (!isPlainAddress(attendee.address)) {
+                this.logger?.warn(`MeetingSchedulingJob: skipping an attendee of event ${event.uid} that isn't a plain address: ${JSON.stringify(String(attendee.address).slice(0, 100))}`);
+                continue;
+            }
+            listed.push({ ...attendee, displayName: safeDisplayName(attendee.displayName) });
+            const normalized: string = normalizeAddress(attendee.address);
+            if (!seen.has(normalized)) {
+                seen.add(normalized);
+                recipients.push(attendee.address);
             }
         }
-    }
+        if (recipients.length === 0) {
+            return;
+        }
+        if (recipients.length > Number(this.maxAttendees)) {
+            this.logger?.error(
+                `MeetingSchedulingJob: not sending the ${what} for event ${event.uid} - it has ${recipients.length} attendees, more than the ${this.maxAttendees} allowed.`,
+            );
+            return;
+        }
 
-    private async sendItipMail(event: CE, ics: string, method: "request" | "cancel", to: string): Promise<void> {
-        const subject = method === "cancel" ? `Cancelled: ${event.title}` : `Invitation: ${event.title}`;
+        const mailed: CE = { ...event, organizer: { ...event.organizer, displayName: organizer.displayName }, attendees: listed };
+        const ics: string = buildEventIcs(mailed, method === "cancel" ? "CANCEL" : "REQUEST");
         const composed: Buffer = await new MailComposer({
-            from: { name: event.organizer.displayName, address: event.organizer.address },
-            to,
-            subject,
+            from: organizer.displayName ? { name: organizer.displayName, address: event.organizer.address } : event.organizer.address,
+            to: recipients,
+            subject: method === "cancel" ? `Cancelled: ${event.title}` : `Invitation: ${event.title}`,
             text: method === "cancel" ? `This meeting has been cancelled: ${event.title}` : `You have been invited to: ${event.title}`,
             icalEvent: { method, content: ics },
         })
             .compile()
             .build();
 
-        await sendOrThrow(this.mailTransport!, { raw: composed, envelopeFrom: event.organizer.address, envelopeTo: [to] });
+        // One relay per attendee, each through `sendOrThrow()`; `scanAndRelay()` sees the whole fan-out as one send.
+        const fanOut = {
+            send: async (outbound: OutboundMessage): Promise<TransportResult> => {
+                const result: TransportResult = { accepted: [], rejected: [] };
+                for (const to of outbound.envelopeTo) {
+                    try {
+                        await sendOrThrow(this.mailTransport!, { ...outbound, envelopeTo: [to] });
+                        result.accepted.push(to);
+                    } catch (err: any) {
+                        result.rejected.push(to);
+                        this.logger?.warn(`MeetingSchedulingJob: failed to send ${what} for event ${event.uid} to ${to}: ${err.message}`);
+                    }
+                }
+                return result;
+            },
+        };
+        await scanAndRelay(composed, event.organizer.address, recipients, this.scanPipeline!, fanOut, this.blobStore!);
     }
 }

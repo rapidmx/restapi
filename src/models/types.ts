@@ -1002,6 +1002,13 @@ export interface Message extends RecoverableBaseEntity {
      * Outbox carrying the exact value its claim wrote. */
     scheduledSendLeaseExpiresAt?: Date;
 
+    /** Server-managed: body blob keys (`bodies/...`) this draft's body replaced while its mailbox was under a legal hold,
+     * oldest first, kept so the superseded content stays discoverable. Appended by the compose path through
+     * `withRetainedBodyBlobKey()` (at most `MAX_RETAINED_BODY_BLOB_KEYS`), exported by `MatterExportJob`, and deleted
+     * (with the field cleared to `null`) by `RetentionEnforcementJob` once no open `Matter` holds the mailbox, or when the
+     * message itself is purged or erased. Absent or `null` when there are none. See `util/DraftBodyRetentionUtils.ts`. */
+    retainedBodyBlobKeys?: string[] | null;
+
     /** Set by `BaseMessageRoute.recall()` the moment a recall is requested — purely informational (lets a
      * client show "recall requested" immediately). The eventual outcome (each recipient's own `ScanQueueJob`
      * either deleting its still-unread copy or not) is reported back to the sender as an ordinary visible

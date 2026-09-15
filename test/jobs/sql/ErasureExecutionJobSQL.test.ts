@@ -630,6 +630,37 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect(await blobStore.exists(sanitizedHtmlBlobKey)).toBe(false);
     });
 
+    it("Deletes the draft bodies an erased message kept for a (released) legal hold, but never a non-body key listed there (round 6).", async () => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const mailbox = await createMailbox();
+        const [kept, notABody] = [`bodies/${uuid.v4()}`, `attachments/${uuid.v4()}`];
+        await blobStore.put(kept, Buffer.from("old draft"));
+        await blobStore.put(notABody, Buffer.from("someone else's"));
+        await messageRepo.save(
+            new MessageSQL({
+                mailboxUid: mailbox.uid,
+                folderUid: uuid.v4(),
+                messageId: `${uuid.v4()}@example.com`,
+                subject: "Draft",
+                from: { address: "alice@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date(),
+                receivedDate: new Date(),
+                bodyBlobKey: `bodies/${uuid.v4()}`,
+                flags: { read: false, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: false,
+                retainedBodyBlobKeys: [kept, notABody],
+            }),
+        );
+        await createRequest({ mailboxUid: mailbox.uid });
+
+        await job.run();
+
+        expect(await blobStore.exists(kept)).toBe(false);
+        expect(await blobStore.exists(notABody)).toBe(true);
+    });
+
     it("Does not touch another mailbox's content.", async () => {
         const mailbox = await createMailbox();
         const otherMailbox = await createMailbox();

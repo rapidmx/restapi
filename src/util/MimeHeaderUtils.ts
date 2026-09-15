@@ -261,6 +261,52 @@ export function hasAddressLikeDisplayName(value: string): boolean {
     return visit(addressparser(value));
 }
 
+/** One plain address: no display name, angle brackets, group, comment, list, quoting, control characters or whitespace. */
+const PLAIN_ADDRESS_PATTERN = /^[^\s()<>@,;:\\"[\]]+@[^\s()<>@,;:\\"[\]]+$/;
+
+/** RFC 5321's address length limit. */
+const MAX_PLAIN_ADDRESS_LENGTH = 320;
+
+/** Whether `value` holds a control character (C0 or DEL); a tab only counts when `tabCounts`. */
+function hasControlCharacter(value: string, tabCounts: boolean): boolean {
+    for (let i = 0; i < value.length; i++) {
+        const code: number = value.charCodeAt(i);
+        if ((code < 0x20 && (tabCounts || code !== 0x09)) || code === 0x7f) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Whether `address` is exactly one plain address (`local@domain`, nothing around it), at most 320 characters - safe to
+ * hand to a composer as one recipient, e.g. a meeting attendee or organizer. */
+export function isPlainAddress(address: unknown): address is string {
+    return (
+        typeof address === "string" &&
+        address.length <= MAX_PLAIN_ADDRESS_LENGTH &&
+        !hasControlCharacter(address, true) &&
+        PLAIN_ADDRESS_PATTERN.test(address)
+    );
+}
+
+/**
+ * `name` as a display name that's safe to put in front of one of our own addresses in a `From` (or an iCalendar `CN`)
+ * this server composes: trimmed, or `undefined` - so the caller omits the name - when it isn't a string, is blank,
+ * contains a line break or other control character, or shows an address-like `@` (look-alikes and RFC 2047 encoded
+ * words included, the same rule as `hasAddressLikeDisplayName()`). A display name like `ceo@example.com` in front of a
+ * real address shows the reader an address the sender doesn't own.
+ */
+export function safeDisplayName(name: unknown): string | undefined {
+    if (typeof name !== "string" || hasControlCharacter(name, false)) {
+        return undefined;
+    }
+    const clean: string = name.trim();
+    if (clean.length === 0 || AT_SIGN_LIKE.test(clean) || AT_SIGN_LIKE.test(decodeEncodedWords(clean))) {
+        return undefined;
+    }
+    return clean;
+}
+
 /** Options for `checkOriginatorHeaders()`. */
 export interface OriginatorHeaderCheckOptions {
     /**
@@ -471,7 +517,8 @@ export function prepareRelayCopy(raw: Buffer, options: RelayCopyOptions): Buffer
     const added: string[] = [];
     if (!fromVerified) {
         const address: string = singleLineHeaderValue(options.rewriteFrom.address).replace(/[<>\s]/g, "");
-        added.push(`From: ${options.rewriteFrom.name ? `${formatDisplayName(options.rewriteFrom.name)} ` : ""}<${address}>`);
+        const name: string | undefined = safeDisplayName(options.rewriteFrom.name);
+        added.push(`From: ${name ? `${formatDisplayName(name)} ` : ""}<${address}>`);
         if (originalFrom.length > 0) {
             const original: string = singleLineHeaderValue(originalFrom.join(", "));
             added.push(`X-Original-From: ${original}`);

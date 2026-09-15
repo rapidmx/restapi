@@ -370,7 +370,9 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 return;
             } catch (err: any) {
                 this.logger?.warn(`ScheduledSendJob: failed to record the relay of message ${claimed.uid} (attempt ${attempt}): ${err.message}`);
-                current = attempt < 3 ? await this.messageRepo!.findOne(claimed.uid, { ignoreACL: true }) : undefined;
+                // Soft-deleted rows included: a message deleted mid-relay still gets its marker, so a restore can't
+                // make it due for a second relay.
+                current = attempt < 3 ? await this.messageRepo!.findOne(claimed.uid, { ignoreACL: true, includeDeleted: true }) : undefined;
             }
         }
     }

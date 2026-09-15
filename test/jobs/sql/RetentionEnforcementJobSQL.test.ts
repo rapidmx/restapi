@@ -387,6 +387,74 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
         expect(await auditLogRepo.findOne({ where: { uid: orgWide.uid } })).toBeNull();
     });
 
+    describe("draft bodies kept for a legal hold (round 6)", () => {
+        const putBodies = async (...keys: string[]) => {
+            const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            for (const key of keys) {
+                await blobStore.put(key, Buffer.from(`content of ${key}`));
+            }
+            return blobStore;
+        };
+        const retained = async (uid: string): Promise<string[] | null> => (await messageRepo.findOne({ where: { uid } }))?.retainedBodyBlobKeys ?? null;
+
+        it("releases them once no open Matter holds the mailbox - with no retention policy at all - keeping shared, current and non-body blobs", async () => {
+            const [current, old1, shared, notABody] = [`bodies/${uuid.v4()}`, `bodies/${uuid.v4()}`, `bodies/${uuid.v4()}`, `attachments/${uuid.v4()}`];
+            const blobStore = await putBodies(current, old1, shared, notABody);
+            const draft = await createMessage({ bodyBlobKey: current, retainedBodyBlobKeys: [old1, shared, notABody, current] });
+            const softDeleted = await createMessage({ retainedBodyBlobKeys: [`bodies/${uuid.v4()}`] });
+            await messageRepo.update({ uid: softDeleted.uid }, { deleted: true });
+            // Another row still uses `shared` as its body.
+            await createMessage({ bodyBlobKey: shared });
+            const untouched = await createMessage();
+            const matter = await createMatter({ custodianMailboxUids: [draft.mailboxUid, softDeleted.mailboxUid] });
+
+            await job.run();
+            expect(await retained(draft.uid)).toEqual([old1, shared, notABody, current]);
+            expect(await blobStore.exists(old1)).toBe(true);
+
+            await matterRepo.update({ uid: matter.uid }, { closedAt: new Date() });
+            await job.run();
+
+            expect(await retained(draft.uid)).toBeNull();
+            expect((await messageRepo.findOne({ where: { uid: draft.uid } }))?.bodyBlobKey).toBe(current);
+            expect(await blobStore.exists(old1)).toBe(false);
+            expect(await blobStore.exists(shared)).toBe(true);
+            expect(await blobStore.exists(notABody)).toBe(true);
+            expect(await blobStore.exists(current)).toBe(true);
+            expect(await retained(softDeleted.uid)).toBeNull();
+            expect((await messageRepo.findOne({ where: { uid: untouched.uid } }))?.version).toBe(untouched.version);
+        });
+
+        it("deletes them with a purged message, releases at most batch_size messages per run, and keeps the field when releasing fails", async () => {
+            await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
+            const purgedBody = `bodies/${uuid.v4()}`;
+            const blobStore = await putBodies(purgedBody);
+            const expired = await createMessage({ sentDate: new Date(Date.now() - 35 * DAY_MS), retainedBodyBlobKeys: [purgedBody] });
+            await job.run();
+            expect(await messageRepo.findOne({ where: { uid: expired.uid } })).toBeNull();
+            expect(await blobStore.exists(purgedBody)).toBe(false);
+
+            await retentionPolicyRepo.clear();
+            const rows = [
+                await createMessage({ retainedBodyBlobKeys: [`bodies/${uuid.v4()}`] }),
+                await createMessage({ retainedBodyBlobKeys: [`bodies/${uuid.v4()}`] }),
+                await createMessage({ retainedBodyBlobKeys: [`bodies/${uuid.v4()}`] }),
+            ];
+            const stillRetained = async (): Promise<number> => (await Promise.all(rows.map((row) => retained(row.uid)))).filter((keys) => keys !== null).length;
+            (job as any).batchSize = 1;
+            const update = vi.spyOn((job as any).messageRepo, "update").mockRejectedValueOnce(new Error("simulated conflict"));
+            const warn = vi.spyOn((job as any).logger, "warn");
+            await job.run();
+            expect(warn).toHaveBeenCalledWith(expect.stringMatching(/failed to release retained draft bodies of message/));
+            update.mockRestore();
+            expect(await stillRetained()).toBe(2);
+            await job.run();
+            expect(await stillRetained()).toBe(1);
+            await job.run();
+            expect(await stillRetained()).toBe(0);
+        });
+    });
+
     it("Keeps a message within the retention window.", async () => {
         await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
         const recent = await createMessage({ sentDate: new Date(Date.now() - 5 * DAY_MS) });

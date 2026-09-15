@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { JWTUser, ObjectFactory } from "@rapidrest/core";
-import { type AccessControlList, type ACLUtils, RepoUtils } from "@rapidrest/service-core";
+import { type AccessControlList, type ACLRecord, type ACLUtils, RepoUtils } from "@rapidrest/service-core";
 import { Folder, FolderType } from "../models/types.js";
 import { nameBasedUuid } from "./UuidUtils.js";
 
@@ -96,17 +96,26 @@ export async function findOrCreateWellKnownFolder<F extends Folder>(
             })
         )[0];
 
+    const deterministicUid: string = wellKnownFolderUid(mailboxUid, type);
     const existing: F | undefined = await findExisting();
     if (existing) {
+        if (existing.uid === deterministicUid) {
+            // Repairs a folder a lost race left without an ACL when the repair below didn't get to run (cached read).
+            await ensureFolderACL(folderRepo, existing.uid, mailboxUid, true);
+        }
         return existing;
     }
 
-    const deterministicUid: string = wellKnownFolderUid(mailboxUid, type);
     try {
         return await createWellKnownFolder(folderRepo, folderClass, mailboxUid, type, deterministicUid, user);
     } catch (err) {
         const winner: F | undefined = await findExisting();
         if (winner) {
+            // This create's failed insert may have removed the ACL the winner's create reused (see `ensureFolderACL()`).
+            // `create()` finished that removal before throwing, so checking now is late enough.
+            if (winner.uid === deterministicUid) {
+                await ensureFolderACL(folderRepo, winner.uid, mailboxUid);
+            }
             return winner;
         }
         // No visible folder holds the uid, so this wasn't a lost race - unless a soft-deleted folder already has
@@ -152,18 +161,80 @@ async function createWellKnownFolder<F extends Folder>(
     // left behind by an earlier incarnation of this same folder (its row removed without its ACL). service-core
     // 2.1.0 refuses to reuse it unless told to (`allowExistingACL`). Reusing it keeps a lost race on the uid failing
     // on the unique index (the caller re-reads the winner) rather than at the ACL claim, before the winner's row is
-    // visible. The leftover ACL may carry stale grants or a different parent, so it is reset to the fresh shape once
-    // this create has won the uid.
+    // visible - where the losing caller would find no winner and fail. The leftover ACL may carry stale grants or a
+    // different parent, so once this create has won the uid its snapshot's records are removed and its parent reset
+    // (`resetLeftoverACL()`).
+    //
+    // Reusing is always allowed, not only when a leftover was seen: two creates that both saw none still race on the
+    // ACL claim, and the loser would fail instead of re-reading the winner. The cost is that the reused ACL can be one
+    // a concurrent create just claimed; if that create then loses on the unique index, `RepoUtils.create()` removes
+    // "its" ACL - the only one this folder has. `ensureFolderACL()` recreates it, here and in the loser's re-read.
     const aclUtils: ACLUtils | undefined = (folderRepo as any).aclUtils;
     const leftover: AccessControlList | undefined = await aclUtils?.findACL(uid, [], { skipCache: true, skipParents: true });
     const created: F = await folderRepo.create(instance, { user, ignoreACL: true, acl, allowExistingACL: true });
     if (leftover) {
-        const current: AccessControlList | undefined = await aclUtils!.findACL(uid, [], { skipCache: true, skipParents: true });
-        if (current) {
-            current.parentUid = mailboxUid;
-            current.records = [];
-            await aclUtils!.saveACL(current);
+        await resetLeftoverACL(aclUtils!, uid, mailboxUid, leftover);
+    }
+    await ensureFolderACL(folderRepo, uid, mailboxUid);
+    return created;
+}
+
+/** An order-independent key of one ACL record. */
+function recordKey(record: ACLRecord): string {
+    return JSON.stringify([record.userOrRoleId, [...record.actions].sort()]);
+}
+
+/**
+ * Removes the records of `leftover` (the ACL found at `uid` before the create) from the ACL now at `uid` and parents it
+ * to the mailbox. Only the snapshot's records go: a share granted on the new folder between its insert and this reset
+ * is kept. Version-checked (`saveACL()` refuses a stale version) and retried on a concurrent ACL write.
+ */
+async function resetLeftoverACL(aclUtils: ACLUtils, uid: string, mailboxUid: string, leftover: AccessControlList): Promise<void> {
+    const stale: Set<string> = new Set(leftover.records.map(recordKey));
+    for (let attempt = 1; ; attempt++) {
+        const current: AccessControlList | undefined = await aclUtils.findACL(uid, [], { skipCache: true, skipParents: true });
+        if (!current) {
+            return;
+        }
+        const records: ACLRecord[] = current.records.filter((record) => !stale.has(recordKey(record)));
+        if (current.parentUid === mailboxUid && records.length === current.records.length) {
+            return;
+        }
+        current.parentUid = mailboxUid;
+        current.records = records;
+        try {
+            await aclUtils.saveACL(current);
+            return;
+        } catch (err) {
+            if (attempt >= 3) {
+                throw err;
+            }
         }
     }
-    return created;
+}
+
+/**
+ * Recreates the folder ACL at `uid` (`{ uid, parentUid: mailboxUid, records: [] }`, the shape `createWellKnownFolder()`
+ * seeds) when it is missing. `RepoUtils.create()` removes the ACL it claimed when its insert fails, and a well-known
+ * folder create may have reused that very ACL (see `createWellKnownFolder()`), leaving the folder that won with no
+ * ACL at all - which `hasPermission()` then denies to everyone, the mailbox owner included, for good. Claimed with
+ * `createOnly`, so a concurrent repair of the same folder is harmless. `cached` allows a cached read first (the
+ * find-existing path runs on every delivery); a missing ACL is always confirmed uncached before it is recreated.
+ */
+async function ensureFolderACL(folderRepo: RepoUtils<any>, uid: string, mailboxUid: string, cached: boolean = false): Promise<void> {
+    const aclUtils: ACLUtils | undefined = (folderRepo as any).aclUtils;
+    if (!aclUtils) {
+        return;
+    }
+    const exists = async (skipCache: boolean): Promise<boolean> => !!(await aclUtils.findACL(uid, [], { skipCache, skipParents: true }));
+    if ((cached && (await exists(false))) || (await exists(true))) {
+        return;
+    }
+    try {
+        await aclUtils.saveACL({ uid, parentUid: mailboxUid, records: [] }, { createOnly: true });
+    } catch (err) {
+        if (!(await exists(true))) {
+            throw err;
+        }
+    }
 }

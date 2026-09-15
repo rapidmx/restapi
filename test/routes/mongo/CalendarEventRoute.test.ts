@@ -649,6 +649,90 @@ describe("Route:CalendarEventMongo Tests", () => {
             expect(result.body.attendees[0].responseStatus).toBe("accepted");
             sendSpy.mockRestore();
         });
+
+        it("Mails no REPLY to an organizer that isn't one plain address, and leaves an address-like mailbox name out of the From.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await mailboxRepo.updateOne({ uid: mailbox.uid } as any, { $set: { displayName: "ceo@bank.example" } } as any);
+            const folder = await createFolder(mailbox.uid);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+
+            const odd = await createInvitedEvent(mailbox.uid, folder.uid, mailbox.primarySmtpAddress);
+            await calendarEventRepo.updateOne({ uid: odd.uid } as any, { $set: { organizer: { address: "a@example.com, b@example.com", type: RecipientType.TO } } } as any);
+            const oddResult = await request(server.getApplication())
+                .post(`${baseUrl}/${odd.uid}/respond`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ responseStatus: "accepted" });
+            expect(oddResult.status).toBe(200);
+            expect(transport.sent).toHaveLength(0);
+
+            const event = await createInvitedEvent(mailbox.uid, folder.uid, mailbox.primarySmtpAddress);
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${event.uid}/respond`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ responseStatus: "accepted" });
+            expect(result.status).toBe(200);
+            const raw: string = transport.sent[0].raw.toString();
+            expect(raw).toMatch(new RegExp(`^From: <?${mailbox.primarySmtpAddress}>?\\r?$`, "m"));
+            expect(raw).not.toContain("bank.example");
+        });
+    });
+
+    describe("Organizer and attendee validation (round 6)", () => {
+        const attendee = (address: unknown): any => ({ address, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false });
+        const body = (folderUid: string, mailboxUid: string, data: any): any => ({
+            mailboxUid,
+            folderUid,
+            title: "New Event",
+            startDate: new Date(),
+            endDate: new Date(Date.now() + 60 * 60 * 1000),
+            allDay: false,
+            timezone: "UTC",
+            organizer: { address: "organizer@example.com", displayName: "ceo@bank.example", type: RecipientType.TO },
+            attendees: [attendee("a@example.com")],
+            status: CalendarEventStatus.CONFIRMED,
+            busyStatus: BusyStatus.BUSY,
+            icalUid: uuid.v4(),
+            sequence: 0,
+            ...data,
+        });
+
+        it("Refuses (400) a created or changed organizer or attendee that isn't one plain address, or more than 500 attendees.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const create = (data: any) => request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send(body(folder.uid, mailbox.uid, data));
+
+            for (const data of [
+                { organizer: { address: "Boss <boss@example.com>", type: RecipientType.TO } },
+                { organizer: "boss@example.com" },
+                { attendees: [attendee("a@example.com, b@example.com")] },
+                { attendees: [attendee("c@example.com\r\nBcc: d@evil.example")] },
+                { attendees: [attendee(undefined)] },
+                { attendees: { address: "a@example.com" } },
+                { attendees: Array.from({ length: 501 }, (_, i) => attendee(`a${i}@example.com`)) },
+            ]) {
+                const result = await create(data);
+                expect({ data: JSON.stringify(data).slice(0, 80), status: result.status }).toEqual({ data: JSON.stringify(data).slice(0, 80), status: 400 });
+            }
+            // Fine: plain addresses (an organizer's display name is kept, the job doesn't mail it), 500 attendees, none.
+            expect((await create({})).status).toBe(200);
+            expect((await create({ attendees: Array.from({ length: 500 }, (_, i) => attendee(`a${i}@example.com`)) })).status).toBe(200);
+            expect((await create({ organizer: { address: "", type: RecipientType.TO }, attendees: [] })).status).toBe(200);
+
+            // An update is only checked when it changes them, so a received event's list still round-trips.
+            const received = await createCalendarEvent(mailbox.uid, folder.uid, {
+                attendees: [attendee("x@example.com"), attendee("Odd <y@example.com>")],
+            });
+            const roundTrip = await request(server.getApplication())
+                .put(`${baseUrl}/${received.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: received.uid, version: received.version, title: "Renamed", attendees: received.attendees, organizer: received.organizer });
+            expect(roundTrip.status).toBe(200);
+            const changed = await request(server.getApplication())
+                .put(`${baseUrl}/${received.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: received.uid, version: roundTrip.body.version, attendees: [...received.attendees, attendee("z@example.com;w@example.com")] });
+            expect(changed.status).toBe(400);
+        });
     });
 
     // These tests exercise the ACL-native anonymous calendar-sharing mechanism end-to-end: a

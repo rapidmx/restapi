@@ -18,11 +18,16 @@ import { boundIndexedValue } from "../util/ConversationUtils.js";
 import { coerceCalendarEventDates } from "../util/DateCoercionUtils.js";
 import { getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { buildEventIcs } from "../util/IcsUtils.js";
+import { isPlainAddress, safeDisplayName } from "../util/MimeHeaderUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { Attendee, AttendeeResponseStatus, CalendarEvent, Mailbox } from "../models/types.js";
 const { Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Param, Post, Request, User: AuthUser } = RouteDecorators;
+
+/** Most attendees an event written through this route may list - the compose cap of mapi and activesync, and
+ * `MeetingSchedulingJob`'s default `max_attendees`. */
+export const MAX_EVENT_ATTENDEES = 500;
 
 const RESPOND_STATUS_MAP: Record<string, AttendeeResponseStatus> = {
     accepted: AttendeeResponseStatus.ACCEPTED,
@@ -77,8 +82,40 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * constructor that normally bounds it, and an over-long value would fail the write on MySQL/MariaDB `varchar(255)`. */
     protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
         await super.prepareUpdate(obj, existing, user);
+        BaseCalendarEventRoute.assertParticipants(obj, existing);
         if (typeof obj.icalUid === "string") {
             obj.icalUid = boundIndexedValue(obj.icalUid);
+        }
+    }
+
+    /** Refuses (400) an event whose organizer or attendees can't be mailed safely - see `assertParticipants()`. */
+    protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
+        await super.prepareCreate(obj, user);
+        BaseCalendarEventRoute.assertParticipants(obj);
+    }
+
+    /**
+     * For every caller: a written `organizer.address` must be empty or one plain address, and `attendees` an array of at
+     * most `MAX_EVENT_ATTENDEES` entries, each with one plain address (`isPlainAddress()`) - `MeetingSchedulingJob` mails
+     * them. On an update only a changed value is checked, so an event received with a larger or odder list (an attendee
+     * copy `ScanQueueJob` filed) still round-trips unchanged.
+     */
+    private static assertParticipants(obj: any, existing?: CalendarEvent): void {
+        const changed = (field: "organizer" | "attendees"): boolean =>
+            obj[field] !== undefined && obj[field] !== null && (!existing || JSON.stringify(obj[field]) !== JSON.stringify((existing as any)[field]));
+        if (changed("organizer")) {
+            const address: unknown = obj.organizer?.address;
+            if (typeof obj.organizer !== "object" || (address !== undefined && address !== "" && !isPlainAddress(address))) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The organizer's address must be one plain email address.");
+            }
+        }
+        if (changed("attendees")) {
+            if (!Array.isArray(obj.attendees) || obj.attendees.length > MAX_EVENT_ATTENDEES) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'attendees' must be a list of at most ${MAX_EVENT_ATTENDEES} attendees.`);
+            }
+            if (!obj.attendees.every((attendee: any) => isPlainAddress(attendee?.address))) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Every attendee's address must be one plain email address.");
+            }
         }
     }
 
@@ -198,8 +235,14 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         }
 
         try {
+            // The organizer comes from the event (an inbound invite, for an attendee copy): only one plain address is
+            // mailed. The mailbox's display name is left out when it's address-like.
+            if (!isPlainAddress(event.organizer?.address)) {
+                throw new Error("the organizer's address isn't one plain email address");
+            }
+            const fromName: string | undefined = safeDisplayName(mailbox?.displayName);
             const composed: Buffer = await new MailComposer({
-                from: { name: mailbox?.displayName, address: respondingAttendee.address },
+                from: fromName ? { name: fromName, address: respondingAttendee.address } : respondingAttendee.address,
                 to: event.organizer.address,
                 subject: `${body.responseStatus === "declined" ? "Declined" : body.responseStatus === "tentative" ? "Tentative" : "Accepted"}: ${event.title}`,
                 text: `${respondingAttendee.displayName ?? respondingAttendee.address} has responded ${body.responseStatus} to: ${event.title}`,

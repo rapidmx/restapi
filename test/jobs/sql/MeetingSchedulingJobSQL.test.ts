@@ -616,4 +616,100 @@ describe("MeetingSchedulingJobSQL Tests (real DB + DI)", () => {
             });
         });
     });
+
+    describe("Round 6 (part A): organizer display name, attendee cap and validation, scanning", () => {
+        const mail = (): RecordingMailTransport => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const attendee = (address: string, displayName?: string): any => ({
+            address,
+            displayName,
+            role: AttendeeRole.REQUIRED,
+            responseStatus: AttendeeResponseStatus.NEEDS_ACTION,
+            isOrganizer: false,
+        });
+
+        afterEach(() => {
+            vi.restoreAllMocks();
+        });
+
+        it("Sends as the mailbox's own display name, never the stored organizer display name, and omits an address-like one.", async () => {
+            await createEvent({
+                organizer: { address: "organizer@example.com", displayName: "ceo@bank.example", type: RecipientType.TO },
+                attendees: [attendee("attendee@example.com", "boss＠bank.example")],
+            });
+            await job.run();
+            const raw: string = mail().sent[0].raw.toString();
+            expect(raw).toMatch(/^From: "?Organizer"? <organizer@example\.com>/m);
+            expect(raw).toContain(`ORGANIZER;CN=3D"Organizer":mailto:organizer@example.com`);
+            expect(raw).not.toContain("bank.example");
+
+            const spoofyUid = uuid.v4();
+            await mailboxRepo.save(
+                new MailboxSQL({
+                    uid: spoofyUid,
+                    primarySmtpAddress: "spoofy@example.com",
+                    aliasAddresses: [],
+                    displayName: "ceo@bank.example",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                }),
+            );
+            mail().sent = [];
+            await createEvent({ mailboxUid: spoofyUid, organizer: { address: "spoofy@example.com", displayName: "Spoofy", type: RecipientType.TO } });
+            await job.run();
+            const spoofy: string = mail().sent[0].raw.toString();
+            expect(spoofy).toMatch(/^From: <?spoofy@example\.com>?\r?$/m);
+            expect(spoofy).toContain("ORGANIZER:mailto:spoofy@example.com");
+            expect(spoofy).not.toContain("bank.example");
+        });
+
+        it("Skips attendees that aren't plain addresses, and mails each remaining attendee once.", async () => {
+            const warnSpy = vi.spyOn((job as any).logger, "warn");
+            await createEvent({
+                attendees: [
+                    attendee("a@example.com, b@example.com"),
+                    attendee("Name <carol@example.com>"),
+                    attendee("d@example.com\r\nBcc: e@evil.example"),
+                    attendee("good@example.com"),
+                    attendee("GOOD@example.com"),
+                    attendee(""),
+                ],
+            });
+            await job.run();
+            expect(mail().sent.map((m) => m.envelopeTo)).toEqual([["good@example.com"]]);
+            const raw: string = mail().sent[0].raw.toString();
+            expect(raw).not.toContain("carol@");
+            expect(raw).not.toContain("evil.example");
+            expect(warnSpy.mock.calls.filter((call) => String(call[0]).includes("isn't a plain address"))).toHaveLength(3);
+        });
+
+        it("Mails no invite or cancellation for an event with more attendees than max_attendees, logging an error.", async () => {
+            const original = (job as any).maxAttendees;
+            (job as any).maxAttendees = 2;
+            const errorSpy = vi.spyOn((job as any).logger, "error");
+            try {
+                const tooMany = [attendee("x1@example.com"), attendee("x2@example.com"), attendee("x3@example.com")];
+                const invite = await createEvent({ attendees: tooMany });
+                await createEvent({ attendees: tooMany, status: CalendarEventStatus.CANCELLED, inviteSequenceSent: 0 });
+                await job.run();
+                expect(mail().sent).toHaveLength(0);
+                expect(errorSpy.mock.calls.filter((call) => String(call[0]).includes("more than the 2 allowed"))).toHaveLength(2);
+                expect((await reload(invite.uid))!.inviteSequenceSent).toBe(0);
+
+                await createEvent({ attendees: tooMany.slice(0, 2) });
+                await job.run();
+                expect(mail().sent.map((m) => m.envelopeTo[0]).sort()).toEqual(["x1@example.com", "x2@example.com"]);
+            } finally {
+                (job as any).maxAttendees = original;
+            }
+        });
+
+        it("Scans the invite first, and relays nothing the scan refuses.", async () => {
+            const warnSpy = vi.spyOn((job as any).logger, "warn");
+            await createEvent({ title: "X-Test-Force-Spam: true" });
+            await job.run();
+            expect(mail().sent).toHaveLength(0);
+            expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("failed to process invites"))).toBe(true);
+        });
+    });
 });

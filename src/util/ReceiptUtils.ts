@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import MimeNode from "nodemailer/lib/mime-node/index.js";
-import { extractHeader } from "./MimeHeaderUtils.js";
+import { extractHeader, safeDisplayName } from "./MimeHeaderUtils.js";
 
 /**
  * Generates and parses real RFC 3798 Message Disposition Notifications (MDNs) - the wire format behind both
@@ -162,7 +162,9 @@ export function buildDispositionNotification(params: DispositionNotificationPara
             : "automatic-action/MDN-sent-automatically; processed";
 
     const root = new MimeNode('multipart/report; report-type=disposition-notification');
-    root.setHeader("From", params.from.displayName ? `${params.from.displayName} <${params.from.address}>` : params.from.address);
+    // Never trust the caller to have sanitized the name: an address-like or multi-line display name is left out.
+    const fromName: string | undefined = safeDisplayName(params.from.displayName);
+    root.setHeader("From", fromName ? `${fromName} <${params.from.address}>` : params.from.address);
     root.setHeader("To", params.to);
     root.setHeader("Subject", params.subject);
     root.createChild("text/plain").setContent(humanText);

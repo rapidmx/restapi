@@ -408,6 +408,78 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
         expect(await auditLogRepo.findOne({ uid: orgWide.uid } as any)).toBeNull();
     });
 
+    describe("draft bodies kept for a legal hold (round 6)", () => {
+        const putBodies = async (...keys: string[]) => {
+            const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            for (const key of keys) {
+                await blobStore.put(key, Buffer.from(`content of ${key}`));
+            }
+            return blobStore;
+        };
+
+        it("releases them once no open Matter holds the mailbox - with no retention policy at all - keeping shared, current and non-body blobs", async () => {
+            const [current, old1, shared, notABody] = [`bodies/${uuid.v4()}`, `bodies/${uuid.v4()}`, `bodies/${uuid.v4()}`, `attachments/${uuid.v4()}`];
+            const blobStore = await putBodies(current, old1, shared, notABody);
+            const draft = await createMessage({ bodyBlobKey: current, retainedBodyBlobKeys: [old1, shared, notABody, current] });
+            const softDeleted = await createMessage({ retainedBodyBlobKeys: [] });
+            await messageRepo.updateOne({ uid: softDeleted.uid } as any, { $set: { deleted: true, retainedBodyBlobKeys: [`bodies/${uuid.v4()}`] } });
+            // Another row still uses `shared` as its body.
+            await createMessage({ bodyBlobKey: shared });
+            const untouched = await createMessage();
+            const matter = await createMatter({ custodianMailboxUids: [draft.mailboxUid, softDeleted.mailboxUid] });
+
+            await job.run();
+            expect((await messageRepo.findOne({ uid: draft.uid } as any))?.retainedBodyBlobKeys).toEqual([old1, shared, notABody, current]);
+            expect(await blobStore.exists(old1)).toBe(true);
+
+            await matterRepo.updateOne({ uid: matter.uid } as any, { $set: { closedAt: new Date() } } as any);
+            await job.run();
+
+            const released = await messageRepo.findOne({ uid: draft.uid } as any);
+            expect(released?.retainedBodyBlobKeys ?? null).toBeNull();
+            expect(released?.bodyBlobKey).toBe(current);
+            expect(await blobStore.exists(old1)).toBe(false);
+            expect(await blobStore.exists(shared)).toBe(true);
+            expect(await blobStore.exists(notABody)).toBe(true);
+            expect(await blobStore.exists(current)).toBe(true);
+            expect((await messageRepo.findOne({ uid: softDeleted.uid } as any))?.retainedBodyBlobKeys ?? null).toBeNull();
+            expect((await messageRepo.findOne({ uid: untouched.uid } as any))?.version).toBe(untouched.version);
+        });
+
+        it("deletes them with a purged message, releases at most batch_size messages per run, and keeps the field when releasing fails", async () => {
+            await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", messageRetentionDays: 30 }));
+            const [purgedBody, kept1, kept2] = [`bodies/${uuid.v4()}`, `bodies/${uuid.v4()}`, `bodies/${uuid.v4()}`];
+            const blobStore = await putBodies(purgedBody, kept1, kept2);
+            const expired = await createMessage({ sentDate: new Date(Date.now() - 35 * DAY_MS), retainedBodyBlobKeys: [purgedBody] });
+            await job.run();
+            expect(await messageRepo.findOne({ uid: expired.uid } as any)).toBeNull();
+            expect(await blobStore.exists(purgedBody)).toBe(false);
+
+            await retentionPolicyRepo.clear();
+            const rows = [
+                await createMessage({ retainedBodyBlobKeys: [kept1] }),
+                await createMessage({ retainedBodyBlobKeys: [kept2] }),
+                await createMessage({ retainedBodyBlobKeys: [`bodies/${uuid.v4()}`] }),
+            ];
+            const stillRetained = async (): Promise<number> =>
+                (await Promise.all(rows.map((row) => messageRepo.findOne({ uid: row.uid } as any)))).filter((row) => (row?.retainedBodyBlobKeys ?? null) !== null).length;
+            (job as any).batchSize = 1;
+            const repoUtils = (job as any).messageRepo;
+            const update = vi.spyOn(repoUtils, "update").mockRejectedValueOnce(new Error("simulated conflict"));
+            const warn = vi.spyOn((job as any).logger, "warn");
+            await job.run();
+            expect(warn).toHaveBeenCalledWith(expect.stringMatching(/failed to release retained draft bodies of message/));
+            update.mockRestore();
+            // The first row failed and keeps its field (its blob is already gone - harmless to delete again); one other was
+            // released, and the run stopped at its batch size.
+            expect(await stillRetained()).toBe(2);
+            await job.run();
+            expect(await stillRetained()).toBe(1);
+            await job.run();
+            expect(await stillRetained()).toBe(0);
+        });
+    });
+
     it("Keeps a message within the retention window.", async () => {
         await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", messageRetentionDays: 30 }));
         const recent = await createMessage({ sentDate: new Date(Date.now() - 5 * DAY_MS) });

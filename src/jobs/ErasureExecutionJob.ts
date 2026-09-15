@@ -10,6 +10,7 @@ import { BlobReferenceSource, deleteBlobsIfUnreferenced, messageBlobReferenceSou
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
+import { retainedBodyBlobKeysOf } from "../util/DraftBodyRetentionUtils.js";
 import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
 import type { SearchEntityType, SearchProvider } from "../search/SearchProvider.js";
 import { AuditAction, DataSubjectErasureRequest, Mailbox, Plugin } from "../models/types.js";
@@ -325,7 +326,8 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             };
         purgedCount += await this.purgeEntityType(this.messageClass, request.mailboxUid, undefined, async (row: any) => {
             await removeFromIndex("message")(row);
-            await deleteSharedBlobs(row.bodyBlobKey, row.sanitizedHtmlBlobKey);
+            // Including draft bodies kept for a (since released) legal hold - erasure never runs under a hold.
+            await deleteSharedBlobs(row.bodyBlobKey, row.sanitizedHtmlBlobKey, ...retainedBodyBlobKeysOf(row));
         });
         purgedCount += await this.purgeEntityType(
             this.contactClass,

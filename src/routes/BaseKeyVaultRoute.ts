@@ -31,9 +31,58 @@ const { Delete, Get, Param, Post, Put, Query, User: AuthUser } = RouteDecorators
 /** The wire shape `GET /mailbox/:id/keyvault` returns - identical to the `KeyVault` entity minus its own
  * bookkeeping fields (`uid`/`mailboxUid`/etc.), matching `specs/end-to-end_encryption.md`'s own `KeyVault`
  * type exactly. */
-export type PublicKeyVault = Pick<KeyVault, "wrappedKeys" | "masterKeyWraps">;
+export type PublicKeyVault = Pick<KeyVault, "wrappedKeys" | "masterKeyWraps"> & {
+    /** How many times the vault's master key has been rotated (`0` for never, and for no vault yet). A client sends it
+     * back as `expectedMasterKeyGeneration` on the writes that put material sealed under its master key into the vault
+     * (see `ExpectedMasterKeyGeneration`). */
+    masterKeyGeneration: number;
+};
 
-const EMPTY_KEY_VAULT: PublicKeyVault = { wrappedKeys: [], masterKeyWraps: [] };
+const EMPTY_KEY_VAULT: PublicKeyVault = { wrappedKeys: [], masterKeyWraps: [], masterKeyGeneration: 0 };
+
+/**
+ * Optional on `enrollKey()`, `startSignEnrollment()`, `addMasterKeyWrap()` and `rekey()`: the `masterKeyGeneration` the
+ * client read with the vault whose master key it sealed the request's key material under (a wrapped private key, or the
+ * master key itself in a new wrap). When given and the vault has moved on - another device rotated the master key
+ * since - the request is refused with `409` instead of installing material nobody can open with the current master key.
+ * Omitted, the request is accepted as before (older clients). Must be a non-negative integer (`400` otherwise).
+ */
+export interface ExpectedMasterKeyGeneration {
+    expectedMasterKeyGeneration?: number;
+}
+
+/** The vault's current master key generation (`0` for none recorded, or no vault). */
+function generationOf(keyVault: KeyVault | undefined): number {
+    return keyVault?.masterKeyGeneration ?? 0;
+}
+
+/** Validates an `expectedMasterKeyGeneration` from a request body (`400` unless absent or a non-negative integer). */
+function readExpectedGeneration(body: unknown): number | undefined {
+    const value: unknown = (body as ExpectedMasterKeyGeneration | undefined)?.expectedMasterKeyGeneration;
+    if (value === undefined || value === null) {
+        return undefined;
+    }
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "expectedMasterKeyGeneration must be a non-negative integer.");
+    }
+    return value;
+}
+
+/** Refuses (409) a request whose `expected` generation isn't the vault's current one - see `ExpectedMasterKeyGeneration`. */
+function assertMasterKeyGeneration(keyVault: KeyVault | undefined, expected: number | undefined): void {
+    if (expected !== undefined && expected !== generationOf(keyVault)) {
+        throw new ApiError(
+            ApiErrors.IDENTIFIER_EXISTS,
+            409,
+            "This mailbox's master key was rotated since this key material was sealed - reload the key vault, unlock it again and retry.",
+        );
+    }
+}
+
+/** The response shape of every key-vault endpoint. */
+function toPublicKeyVault(keyVault: KeyVault): PublicKeyVault {
+    return { wrappedKeys: keyVault.wrappedKeys, masterKeyWraps: keyVault.masterKeyWraps, masterKeyGeneration: generationOf(keyVault) };
+}
 
 /** Request body for `enrollKey()`. `wrappedKey`'s `fingerprint`/`useType` are deliberately omitted - the
  * server derives both from the actual issued/validated certificate, never trusting a client-asserted value
@@ -42,7 +91,7 @@ const EMPTY_KEY_VAULT: PublicKeyVault = { wrappedKeys: [], masterKeyWraps: [] };
  * wrapped keys it is a `409` (another enrollment - e.g. a second tab setting up at the same time - got there first,
  * with a different master key). Enrolling an additional key omits it; adding a master-key wrap independent of key
  * enrollment is `addMasterKeyWrap()`'s (D3's) job. */
-export interface EnrollKeyRequest {
+export interface EnrollKeyRequest extends ExpectedMasterKeyGeneration {
     useType: "sign" | "encrypt";
     /** A PEM-encoded PKCS#10 CSR - required, and only meaningful, when `useType` is `"encrypt"`: the server
      * calls the injected `EncryptionCertificateAuthority` itself to mint the certificate. */
@@ -56,8 +105,9 @@ export interface EnrollKeyRequest {
     masterKeyWraps?: MasterKeyWrap[];
 }
 
-/** Request body for `addMasterKeyWrap()`. */
-export type AddMasterKeyWrapRequest = MasterKeyWrap;
+/** Request body for `addMasterKeyWrap()`: the wrap itself, plus the optional `expectedMasterKeyGeneration` (never
+ * stored with the wrap). */
+export type AddMasterKeyWrapRequest = MasterKeyWrap & ExpectedMasterKeyGeneration;
 
 /** Request body for `startSignEnrollment()`. `wrappedKey` is submitted upfront, alongside the CSR, so a
  * driver job (a real `SigningCertificateEnrollment` implementation may support one - see that method's
@@ -66,7 +116,7 @@ export type AddMasterKeyWrapRequest = MasterKeyWrap;
  * sees an unwrapped private key). `fingerprint`/`useType` are omitted for the identical reason
  * `EnrollKeyRequest`'s own field omits them: the server derives both from the certificate once it exists,
  * never trusting a client-asserted value for either. */
-export interface SignEnrollmentRequest {
+export interface SignEnrollmentRequest extends ExpectedMasterKeyGeneration {
     /** A PEM-encoded PKCS#10 CSR for the signing key pair to enroll. */
     csr: string;
     wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">;
@@ -158,7 +208,7 @@ function assertMasterKeyWrapsAccepted(keyVault: KeyVault | undefined, masterKeyW
 /** Request body for `rekey()` - a full, atomic replacement of a mailbox's entire key-vault contents, following
  * the client's own re-key operation (see `MasterKeyWrap`'s doc comment on why removing a wrap alone never
  * revokes access). */
-export interface RekeyRequest {
+export interface RekeyRequest extends ExpectedMasterKeyGeneration {
     wrappedKeys: WrappedPrivateKey[];
     masterKeyWraps: MasterKeyWrap[];
     /** The mailbox's replacement `PublicKey` list, published alongside the re-keyed vault - a re-key is
@@ -349,7 +399,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { config: this.config, user, logger: this.logger },
             { action: AuditAction.KEY_VAULT_READ, targetType: "KeyVault", targetUid: existing?.uid ?? mailbox.uid, mailboxUid: mailbox.uid },
         );
-        return existing ? { wrappedKeys: existing.wrappedKeys, masterKeyWraps: existing.masterKeyWraps } : EMPTY_KEY_VAULT;
+        return existing ? toPublicKeyVault(existing) : { ...EMPTY_KEY_VAULT };
     }
 
     /**
@@ -380,6 +430,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "wrappedKey is required.");
         }
         validateWrappedPrivateKey(body.wrappedKey);
+        const expectedGeneration: number | undefined = readExpectedGeneration(body);
         const requestedMasterKeyWraps: MasterKeyWrap[] = body.masterKeyWraps ?? [];
         if (requestedMasterKeyWraps.length > MAX_MASTER_KEY_WRAPS) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `masterKeyWraps cannot exceed ${MAX_MASTER_KEY_WRAPS} entries.`);
@@ -427,9 +478,11 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         const wrappedKey: WrappedPrivateKey = { ...body.wrappedKey, fingerprint, useType: body.useType };
 
         // Checked here too (not only in `persistEnrollment()`), so a doomed request doesn't reach the writes.
-        assertMasterKeyWrapsAccepted(await this.findKeyVault(mailbox.uid), body.masterKeyWraps);
+        const currentVault: K | undefined = await this.findKeyVault(mailbox.uid);
+        assertMasterKeyWrapsAccepted(currentVault, body.masterKeyWraps);
+        assertMasterKeyGeneration(currentVault, expectedGeneration);
 
-        const persisted = await this.persistEnrollment(mailbox, publicKey, wrappedKey, body.masterKeyWraps);
+        const persisted = await this.persistEnrollment(mailbox, publicKey, wrappedKey, body.masterKeyWraps, expectedGeneration);
 
         await recordAuditLog(
             this._objectFactory!,
@@ -444,20 +497,24 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             },
         );
 
-        return { wrappedKeys: persisted.keyVault.wrappedKeys, masterKeyWraps: persisted.keyVault.masterKeyWraps };
+        return toPublicKeyVault(persisted.keyVault);
     }
 
+    /** `expectedGeneration`, when given, must still be the vault's master key generation (409 otherwise) - see
+     * `ExpectedMasterKeyGeneration`. */
     @Transactional()
     protected async persistEnrollment(
         mailbox: M,
         publicKey: PublicKey,
         wrappedKey: WrappedPrivateKey,
         initialMasterKeyWraps: MasterKeyWrap[] | undefined,
+        expectedGeneration?: number,
     ): Promise<{ mailbox: M; keyVault: K }> {
-        // The vault is read (and the bootstrap wraps checked against it) before anything is written; the vault update
-        // below is version-checked, so a concurrent enrollment that lands in between is a 409 too.
+        // The vault is read (and the bootstrap wraps and generation checked against it) before anything is written; the
+        // vault update below is version-checked, so a concurrent enrollment or rekey that lands in between is a 409 too.
         const keyVault: K = await this.findOrCreateKeyVault(mailbox.uid);
         assertMasterKeyWrapsAccepted(keyVault, initialMasterKeyWraps);
+        assertMasterKeyGeneration(keyVault, expectedGeneration);
 
         const updatedMailbox: M = await this.mailboxRepo!.update(
             { uid: mailbox.uid, version: (mailbox as any).version, keys: [...mailbox.keys, publicKey] } as any,
@@ -513,18 +570,23 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "csr is required.");
         }
         validateWrappedPrivateKey(body.wrappedKey);
+        const expectedGeneration: number | undefined = readExpectedGeneration(body);
+        // Checked before the CA is contacted: a key sealed under a master key another device has since rotated away
+        // would only ever be refused at install time.
+        const keyVault: K | undefined = await this.findKeyVault(mailbox.uid);
+        assertMasterKeyGeneration(keyVault, expectedGeneration);
 
         const { enrollmentId } = await this.signingCertificateEnrollment!.startEnrollment(mailbox.primarySmtpAddress, body.csr);
         const attachWrappedKey: ((enrollmentId: string, wrappedKey: unknown, binding: unknown) => Promise<void>) | undefined = (
             this.signingCertificateEnrollment as any
         ).attachWrappedKey;
         if (typeof attachWrappedKey === "function") {
-            // The wrapped key is sealed under the vault's current master key - recorded so the driver job never installs
-            // it after a rotation (see `KeyVault.masterKeyGeneration`).
-            const keyVault: K | undefined = await this.findKeyVault(mailbox.uid);
+            // The generation the wrapped key is sealed under - the client's own when it said which (checked equal to the
+            // vault's just above), else the vault's as read before the CA call - so the driver job never installs it
+            // after a rotation (see `KeyVault.masterKeyGeneration`), including one that lands during `startEnrollment()`.
             await attachWrappedKey.call(this.signingCertificateEnrollment, enrollmentId, body.wrappedKey, {
                 mailboxUid: mailbox.uid,
-                masterKeyGeneration: keyVault?.masterKeyGeneration ?? 0,
+                masterKeyGeneration: expectedGeneration ?? generationOf(keyVault),
             });
         }
 
@@ -641,11 +703,18 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         const mailbox: M = await this.requireMailbox(mailboxId);
         this.requireMailboxOwner(mailbox, user);
         validateMasterKeyWrap(body, { allowEscrow: await this.resolveAllowEscrow(mailbox, body) });
+        const expectedGeneration: number | undefined = readExpectedGeneration(body);
+        // Not part of the wrap - never stored with it.
+        const wrap: MasterKeyWrap & ExpectedMasterKeyGeneration = { ...body };
+        delete wrap.expectedMasterKeyGeneration;
 
         const keyVault: K | undefined = await this.findKeyVault(mailboxId);
         if (!keyVault) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "This mailbox has not enrolled a key yet.");
         }
+        // A new wrap of an old master key would unlock nothing the vault holds now. The update below is version-checked,
+        // so a rekey landing after this read is a 409 as well.
+        assertMasterKeyGeneration(keyVault, expectedGeneration);
         if (keyVault.masterKeyWraps.length >= MAX_MASTER_KEY_WRAPS) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A key vault cannot hold more than ${MAX_MASTER_KEY_WRAPS} master key wraps.`);
         }
@@ -654,7 +723,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             {
                 uid: keyVault.uid,
                 version: (keyVault as any).version,
-                masterKeyWraps: [...keyVault.masterKeyWraps, body],
+                masterKeyWraps: [...keyVault.masterKeyWraps, wrap],
             } as any,
             keyVault,
             { ignoreACL: true },
@@ -673,7 +742,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             },
         );
 
-        return { wrappedKeys: updated.wrappedKeys, masterKeyWraps: updated.masterKeyWraps };
+        return toPublicKeyVault(updated);
     }
 
     /**
@@ -750,7 +819,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { action: AuditAction.KEY_VAULT_WRAP_REMOVE, targetType: "KeyVault", targetUid: keyVault.uid, mailboxUid: mailbox.uid, details: { method, methodId } },
         );
 
-        return { wrappedKeys: updated.wrappedKeys, masterKeyWraps: updated.masterKeyWraps };
+        return toPublicKeyVault(updated);
     }
 
     /**
@@ -835,6 +904,10 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             validateWrappedPrivateKey(wrappedKey);
         }
 
+        // The generation of the vault the client re-keyed from: a device that missed another device's rotation would
+        // otherwise replace the newer vault (and any key enrolled under it) with its own.
+        assertMasterKeyGeneration(keyVault, readExpectedGeneration(body));
+
         await this.assertNoPendingSignEnrollment(mailbox);
 
         const updated: K = await this.persistRekey(mailbox, keyVault, body);
@@ -846,7 +919,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { action: AuditAction.KEY_VAULT_REKEY, targetType: "KeyVault", targetUid: keyVault.uid, mailboxUid: mailbox.uid },
         );
 
-        return { wrappedKeys: updated.wrappedKeys, masterKeyWraps: updated.masterKeyWraps };
+        return toPublicKeyVault(updated);
     }
 
     /**

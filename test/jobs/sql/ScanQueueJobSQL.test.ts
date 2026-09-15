@@ -587,7 +587,7 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             "--BOUNDARY--",
             "",
         ].join("\r\n");
-        await blobStore.put(rawBlobKey, Buffer.from(raw));
+        await blobStore.put(rawBlobKey, raw);
         await createIngestEntry({ rawBlobKey });
 
         await job.run();
@@ -2344,7 +2344,7 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             ].join("\r\n");
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
             const rawBlobKey = `raw/${uuid.v4()}`;
-            await blobStore.put(rawBlobKey, Buffer.from(raw));
+            await blobStore.put(rawBlobKey, raw);
             await createIngestEntry({ rawBlobKey, envelopeFrom: "bob@example.com" });
 
             await expect(job.run()).resolves.toBeUndefined();
@@ -4294,6 +4294,77 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
                 expect(rows[0].deleted).toBe(true);
                 expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("has too many occurrences to check for conflicts"));
             });
+        });
+    });
+
+    describe("Round 6 (part A): erasure with the mailbox gone, erasure checked before scanning", () => {
+        afterEach(() => {
+            vi.restoreAllMocks();
+        });
+
+        const putRaw = async (raw: Buffer): Promise<string> => {
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await objectFactory.getInstance<any>("BlobStore")!.put(rawBlobKey, raw);
+            return rawBlobKey;
+        };
+        const entryRow = async (uid: string): Promise<any> => (await ingestQueueRepo.find({ where: { uid } }))[0];
+        const messagesInMailbox = async (): Promise<any[]> => await messageRepo.find({ where: { mailboxUid } });
+        const saveErasure = async (status: string, fields: Record<string, any> = {}): Promise<any> => {
+            const saved: any = await erasureRequestRepo.save(new DataSubjectErasureRequestSQL({ mailboxUid, requestedByUserUid: uuid.v4(), status: status as any }));
+            if (Object.keys(fields).length > 0) {
+                await erasureRequestRepo.update({ uid: saved.uid }, fields);
+            }
+            return saved;
+        };
+
+        it("Drops, never defers or delivers, mail for a deleted mailbox with an approved or stale in-progress erasure, even past the deferral bound.", async () => {
+            const originalMax = (job as any).erasureDeferMaxSeconds;
+            (job as any).erasureDeferMaxSeconds = 0;
+            try {
+                for (const [status, fields] of [
+                    ["approved", {}],
+                    ["in_progress", { dateModified: new Date(Date.now() - 2 * 60 * 60 * 1000) }],
+                ] as const) {
+                    const request = await saveErasure(status, fields);
+                    const entry = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
+                    await job.run();
+                    const row = await entryRow(entry.uid);
+                    expect({ status, entry: row.status, note: row.errorMessage }).toEqual({ status, entry: IngestStatus.DELIVERED, note: expect.stringContaining("erased") });
+                    expect(await messagesInMailbox()).toHaveLength(0);
+                    expect(await folderRepo.find({ where: { mailboxUid } })).toHaveLength(0);
+                    await erasureRequestRepo.delete({ uid: request.uid });
+                }
+            } finally {
+                (job as any).erasureDeferMaxSeconds = originalMax;
+            }
+        });
+
+        it("Doesn't scan an entry it defers for a pending erasure.", async () => {
+            await createMailbox();
+            await saveErasure("approved");
+            const scan = vi.spyOn((job as any).scanPipeline, "run");
+            const entry = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
+
+            await job.run();
+
+            expect((await entryRow(entry.uid)).errorMessage).toContain("Deferred");
+            expect(scan).not.toHaveBeenCalled();
+        });
+
+        it("Drops an entry whose erasure cascade started while it was being scanned.", async () => {
+            await createMailbox();
+            const pipeline: any = (job as any).scanPipeline;
+            const realRun = pipeline.run.bind(pipeline);
+            vi.spyOn(pipeline, "run").mockImplementationOnce(async (...args: any[]) => {
+                await saveErasure("in_progress");
+                return realRun(...args);
+            });
+            const entry = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
+
+            await job.run();
+
+            expect((await entryRow(entry.uid)).errorMessage).toContain("erased");
+            expect(await messagesInMailbox()).toHaveLength(0);
         });
     });
 });

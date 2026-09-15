@@ -22,6 +22,7 @@ import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
 import { getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
+import { hasAddressLikeDisplayName } from "../util/MimeHeaderUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { DEFAULT_MAILBOX_QUOTA_BYTES, findOrSeedMailboxPolicy } from "../util/MailboxPolicyUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
@@ -35,6 +36,13 @@ interface OwnerChange {
     mailboxUid: string;
     previous: string | undefined;
     next: string | undefined;
+}
+
+/** An order-independent key of `records` (lowercased members, sorted actions), for comparing two record sets. */
+function recordsKey(records: ACLRecord[]): string {
+    return JSON.stringify(
+        records.map((record) => `${String(record.userOrRoleId).toLowerCase()}:${[...record.actions].sort().join(",")}`).sort(),
+    );
 }
 
 /** Whether two owner uids name the same owner (case-insensitively; `undefined` for none). */
@@ -102,17 +110,29 @@ function assertPlainAddresses(addresses: unknown[]): void {
     }
 }
 
+/** An `@` or a look-alike (fullwidth, small form), or a line break - the same `@` class as `MimeHeaderUtils`' own
+ * (module-private) `AT_SIGN_LIKE`. */
+const DISPLAY_NAME_REFUSED = /[@＠﹫\r\n]/;
+
+/** Whether `name`, put in a `From` display name as its UTF-8 bytes, would read as address-like to the send path's
+ * `hasAddressLikeDisplayName()` - which also decodes RFC 2047 encoded words (`=?utf-8?q?a=40b?=`). */
+function looksAddressLikeInFrom(name: string): boolean {
+    const quoted: string = Buffer.from(name.replace(/[\\"]/g, "\\$&"), "utf8").toString("binary");
+    return hasAddressLikeDisplayName(`"${quoted}" <sender@example.invalid>`);
+}
+
 /**
- * Refuses (400) a `displayName` that isn't a string, or that contains `@` or a line break. It becomes the display name
- * of the `From` header on every message the mailbox sends (server compose and the web client both build it from here),
- * and the send path rejects a `From` whose display name looks like an address - so a mailbox named
- * `support@example.com` could never send anything. `null`/`undefined` (no display name) is allowed.
+ * Refuses (400) a `displayName` that isn't a string, or that contains `@` (or a fullwidth/small look-alike, or an RFC
+ * 2047 encoded word decoding to one) or a line break. It becomes the display name of the `From` header on every message
+ * the mailbox sends (server compose and the web client both build it from here), and the send path rejects a `From`
+ * whose display name looks like an address (`hasAddressLikeDisplayName()`) - so a mailbox named `support@example.com`
+ * or `support＠example.com` could never send anything. `null`/`undefined` (no display name) is allowed.
  */
 function assertValidDisplayName(value: unknown): void {
     if (value === undefined || value === null) {
         return;
     }
-    if (typeof value !== "string" || /[@\r\n]/.test(value)) {
+    if (typeof value !== "string" || DISPLAY_NAME_REFUSED.test(value) || looksAddressLikeInFrom(value)) {
         throw new ApiError(
             ApiErrors.INVALID_REQUEST,
             400,
@@ -943,7 +963,9 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             }
             return await write();
         } catch (err) {
-            for (const { change, snapshot } of moved) {
+            // Newest move first: a later move's snapshot was taken on top of the earlier ones (e.g. a bulk update naming
+            // the same mailbox twice), so undoing them oldest first would put back records a later move had replaced.
+            for (const { change, snapshot } of [...moved].reverse()) {
                 try {
                     if (!sameOwner(await this.ownerOf(change.mailboxUid), change.next)) {
                         await this.restoreOwnerAcl(change, snapshot);
@@ -971,14 +993,28 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         );
     }
 
-    /** Puts back the records `moveOwnerAcl()` returned for `change`'s two members. */
+    /** Puts back the records `moveOwnerAcl()` returned for `change`'s two members - only while those members' records are
+     * still exactly what the move wrote. Anything else means another owner change (a concurrent request) has rewritten
+     * them since, and replaying this older snapshot over it would hand the mailbox to the wrong owner; that ACL is left
+     * as it is (logged). */
     private async restoreOwnerAcl(change: OwnerChange, snapshot: ACLRecord[]): Promise<void> {
-        await this.rewriteOwnerAcl(change, (others) => [...others, ...snapshot]);
+        const written: ACLRecord[] = change.next ? [{ userOrRoleId: change.next, actions: [ACLAction.FULL] }] : [];
+        const replaced: ACLRecord[] | undefined = await this.rewriteOwnerAcl(change, (others) => [...others, ...snapshot], written);
+        if (!replaced) {
+            this.logger?.warn(
+                `BaseMailboxRoute: not restoring the owner ACL of mailbox ${change.mailboxUid} - another owner change rewrote it after this one.`,
+            );
+        }
     }
 
     /** Replaces the records of `change`'s previous and next owner with `rebuild(everyone else's records)`, returning the
-     * records it replaced. */
-    private async rewriteOwnerAcl(change: OwnerChange, rebuild: (others: ACLRecord[]) => ACLRecord[]): Promise<ACLRecord[] | undefined> {
+     * records it replaced. With `expected`, does nothing (and returns `undefined`) unless those members' current records
+     * are exactly `expected` (compared by lowercased member and set of actions). */
+    private async rewriteOwnerAcl(
+        change: OwnerChange,
+        rebuild: (others: ACLRecord[]) => ACLRecord[],
+        expected?: ACLRecord[],
+    ): Promise<ACLRecord[] | undefined> {
         const members: Set<string> = new Set(
             [change.previous, change.next].filter((member): member is string => !!member).map((member) => member.toLowerCase()),
         );
@@ -992,6 +1028,9 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             const replaced: ACLRecord[] = acl.records
                 .filter(isMember)
                 .map((record) => ({ userOrRoleId: record.userOrRoleId, actions: [...record.actions] }));
+            if (expected && recordsKey(replaced) !== recordsKey(expected)) {
+                return undefined;
+            }
             acl.records = rebuild(acl.records.filter((record) => !isMember(record)));
             try {
                 await this.aclUtils!.saveACL(acl);

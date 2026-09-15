@@ -61,6 +61,15 @@ describe("buildDispositionNotification() / parseDispositionNotification() round-
         expect(raw.toString()).toContain("Bob <bob@example.com>");
     });
 
+    it("Leaves an address-like or multi-line display name out of the From header.", async () => {
+        for (const displayName of ["ceo@corp.example", "ceo\uFF20corp.example", "Bob\r\nBcc: x@y"]) {
+            const raw = (await buildDispositionNotification({ ...baseParams, from: { address: "bob@example.com", displayName } })).toString();
+            expect(raw).toContain("From: bob@example.com");
+            expect(raw).not.toContain("corp.example");
+            expect(raw).not.toContain("Bcc: x@y");
+        }
+    });
+
     it("Builds a From header with no display name.", async () => {
         const raw = await buildDispositionNotification({ ...baseParams, from: { address: "bob@example.com" } });
         expect(raw.toString()).toContain("From: bob@example.com");

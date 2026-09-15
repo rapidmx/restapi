@@ -500,9 +500,15 @@ export function mailAuthzRound4Suite(ctx: MailAuthzRound4SuiteContext): void {
             expect(repoint.body.extractionAttempts ?? undefined).toBeUndefined();
 
             const message = await ctx.findOne("Message", created.body.uid);
-            const flip = await auth(request(ctx.app()).put(url(`/messages/${message.uid}`)), owner).send({ uid: message.uid, version: message.version, hasAttachments: false });
+            const flip = await auth(request(ctx.app()).put(url(`/messages/${message.uid}`)), owner).send({
+                uid: message.uid,
+                version: message.version,
+                hasAttachments: false,
+                retainedBodyBlobKeys: ["bodies/forged"],
+            });
             expect(flip.status).toBe(200);
             expect(flip.body.hasAttachments).toBe(true);
+            expect(flip.body.retainedBodyBlobKeys ?? undefined).toBeUndefined();
 
             expect([200, 204]).toContain((await auth(request(ctx.app()).delete(url(`/attachments/${upload.body.uid}`)), owner)).status);
             expect((await ctx.findOne("Message", created.body.uid))?.hasAttachments).toBe(false);
@@ -912,6 +918,131 @@ export function mailAuthzRound4Suite(ctx: MailAuthzRound4SuiteContext): void {
             const inFlight = await createMessage(mailbox, outbox.uid, { scheduledSendLeaseExpiresAt: new Date(Date.now() + 600_000) });
             const blocked = await auth(request(ctx.app()).put(url(`/messages/${inFlight.uid}/folderUid`)), owner).send(drafts.uid);
             expect(blocked.status).toBe(409);
+        });
+    });
+
+    describe("round 6 (part A): only drafts are sent, relay marker and deletes during a send", () => {
+        afterEach(() => {
+            vi.restoreAllMocks();
+        });
+
+        it("a message outside Drafts can't be sent or scheduled, so sent mail can't be walked back into Drafts through Outbox", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid);
+            const archive = await createFolder(mailbox.uid, FolderType.ARCHIVE);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            await createFolder(mailbox.uid, FolderType.OUTBOX);
+            const future = new Date(Date.now() + 3_600_000).toISOString();
+            await ctx.save("Matter", {
+                name: "Hold",
+                escrowScopeId: uuid.v4(),
+                custodianMailboxUids: [mailbox.uid],
+                dateRangeStart: new Date("2000-01-01"),
+                dateRangeEnd: new Date("2100-01-01"),
+            });
+
+            for (const folder of [archive, inbox]) {
+                const message = await sendableDraft(mailbox, folder);
+                const later = await auth(request(ctx.app()).post(url(`/messages/${message.uid}/send`)), owner).send({ scheduledSendTime: future });
+                expect({ folder: folder.type, status: later.status }).toEqual({ folder: folder.type, status: 403 });
+                const now = await auth(request(ctx.app()).post(url(`/messages/${message.uid}/send`)), owner);
+                expect({ folder: folder.type, status: now.status }).toEqual({ folder: folder.type, status: 403 });
+                const stored = await ctx.findOne("Message", message.uid);
+                expect(stored.folderUid).toBe(folder.uid);
+                expect(stored.scheduledSendTime ?? null).toBeNull();
+            }
+            expect(ctx.transport().sent).toHaveLength(0);
+
+            // A draft is still scheduled and cancelled as before; a trusted caller may still send from elsewhere.
+            const draft = await sendableDraft(mailbox, drafts);
+            const scheduled = await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner).send({ scheduledSendTime: future });
+            expect(scheduled.status).toBe(200);
+            const cancelled = await auth(request(ctx.app()).put(url(`/messages/${draft.uid}/folderUid`)), owner).send(drafts.uid);
+            expect(cancelled.status).toBe(200);
+            const archived = await sendableDraft(mailbox, archive);
+            expect((await auth(request(ctx.app()).post(url(`/messages/${archived.uid}/send`)), admin)).status).toBe(200);
+        });
+
+        it("a delivered message a filter rule filed into Outbox can't be moved into Drafts", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const outbox = await createFolder(mailbox.uid, FolderType.OUTBOX);
+            const delivered = await createMessage(mailbox, outbox.uid, { scanResultUid: uuid.v4() });
+            const move = await auth(request(ctx.app()).put(url(`/messages/${delivered.uid}/folderUid`)), owner).send(drafts.uid);
+            expect(move.status).toBe(403);
+            expect((await ctx.findOne("Message", delivered.uid)).folderUid).toBe(outbox.uid);
+        });
+
+        it("the relay marker also makes the message due once the send's lease lapses, and filing clears it", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await ctx
+                .blobStore()
+                .put(bodyBlobKey, Buffer.from(`From: ${mailbox.primarySmtpAddress}\r\nTo: recipient@example.net\r\nContent-Type: text/html\r\n\r\n<p>hello</p>`));
+            const draft = await createMessage(mailbox, drafts.uid, { bodyBlobKey });
+            const store: any = ctx.blobStore();
+            const realPut = store.put.bind(store);
+            let afterRelay: any;
+            vi.spyOn(store, "put").mockImplementation(async (key: string, ...rest: any[]) => {
+                if (key.startsWith("sanitized/")) {
+                    // After the transport accepted, before filing - where a crash would leave the message.
+                    afterRelay = await ctx.findOne("Message", draft.uid);
+                }
+                return realPut(key, ...rest);
+            });
+
+            const sent = await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner);
+
+            expect(sent.status).toBe(200);
+            expect(afterRelay.scheduledSendRelayedAt).toBeTruthy();
+            expect(new Date(afterRelay.scheduledSendTime).getTime()).toBe(new Date(afterRelay.scheduledSendLeaseExpiresAt).getTime());
+            const filed = await ctx.findOne("Message", draft.uid);
+            expect(filed.scheduledSendTime ?? null).toBeNull();
+            expect(filed.scheduledSendRelayedAt ?? null).toBeNull();
+        });
+
+        it("a message whose send is in flight can't be deleted, by the owner or an admin, until its lease lapses", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const outbox = await createFolder(mailbox.uid, FolderType.OUTBOX);
+            const inFlight = await createMessage(mailbox, outbox.uid, { scheduledSendLeaseExpiresAt: new Date(Date.now() + 600_000) });
+            for (const user of [owner, admin]) {
+                const status = (await auth(request(ctx.app()).delete(url(`/messages/${inFlight.uid}`)), user)).status;
+                expect({ user: user.uid, status }).toEqual({ user: user.uid, status: 409 });
+            }
+            // No hint to a caller who can't delete it anyway.
+            expect((await auth(request(ctx.app()).delete(url(`/messages/${inFlight.uid}`)), other)).status).toBe(403);
+            expect((await ctx.findOne("Message", inFlight.uid)).deleted ?? false).toBe(false);
+
+            await ctx.update("Message", inFlight.uid, { scheduledSendLeaseExpiresAt: new Date(Date.now() - 1000) });
+            expect([200, 204]).toContain((await auth(request(ctx.app()).delete(url(`/messages/${inFlight.uid}`)), owner)).status);
+        });
+
+        it("a message soft-deleted during its relay still gets the relay marker, so it can't be sent again after a restore", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const draft = await sendableDraft(mailbox, drafts);
+            const transport = ctx.transport();
+            const realSend = transport.send.bind(transport);
+            let deleteStatus: number | undefined;
+            vi.spyOn(transport, "send").mockImplementationOnce(async (outbound: any) => {
+                deleteStatus = (await auth(request(ctx.app()).delete(url(`/messages/${draft.uid}`)), owner)).status;
+                // A delete that got past the route (e.g. server-side code): soft-deleted, version bumped.
+                const midFlight = await ctx.findOne("Message", draft.uid);
+                await ctx.update("Message", draft.uid, { deleted: true, version: midFlight.version + 1 });
+                return realSend(outbound);
+            });
+
+            await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner);
+
+            expect(deleteStatus).toBe(409);
+            expect(transport.sent).toHaveLength(1);
+            const stored = await ctx.findOne("Message", draft.uid);
+            expect(stored.scheduledSendRelayedAt).toBeTruthy();
+
+            await ctx.update("Message", draft.uid, { deleted: false });
+            expect((await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner)).status).toBe(409);
+            expect(transport.sent).toHaveLength(1);
         });
     });
 }

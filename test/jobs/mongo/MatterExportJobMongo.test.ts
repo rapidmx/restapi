@@ -259,6 +259,58 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
         expect(entries.map((e) => e.mailboxUid).sort()).toEqual([mailboxA.uid, mailboxB.uid].sort());
     });
 
+    it("Exports the draft bodies kept for a legal hold on the custodian's in-range messages, flagging an unreadable one (round 6).", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId });
+        const matter = await createMatter({
+            escrowScopeId,
+            custodianMailboxUids: [mailbox.uid],
+            dateRangeStart: new Date("2026-03-01"),
+            dateRangeEnd: new Date("2026-03-31"),
+        });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const [v1, v2, gone, outOfRange] = [`bodies/${uuid.v4()}`, `bodies/${uuid.v4()}`, `bodies/${uuid.v4()}`, `bodies/${uuid.v4()}`];
+        await blobStore.put(v1, Buffer.from("Subject: draft v1\r\n\r\nfirst"));
+        await blobStore.put(v2, Buffer.from("Subject: draft v2\r\n\r\nsecond"));
+        await blobStore.put(outOfRange, Buffer.from("not in scope"));
+        await blobStore.put("attachments/secret", Buffer.from("never exported"));
+        const draft = (sentDate: string, retainedBodyBlobKeys: string[]) =>
+            messageRepo.save(
+                new MessageMongo({
+                    mailboxUid: mailbox.uid,
+                    folderUid: uuid.v4(),
+                    messageId: `${uuid.v4()}@example.com`,
+                    subject: "Draft",
+                    from: { address: "alice@example.com", type: RecipientType.TO },
+                    recipients: [],
+                    sentDate: new Date(sentDate),
+                    receivedDate: new Date(sentDate),
+                    bodyBlobKey: `bodies/${uuid.v4()}`,
+                    flags: { read: false, flagged: false, answered: false, forwarded: false },
+                    references: [],
+                    hasAttachments: false,
+                    retainedBodyBlobKeys,
+                }),
+            );
+        const inRange = await draft("2026-03-10", [v1, v2, gone, "attachments/secret"]);
+        await draft("2026-04-10", [outOfRange]);
+        const request = await createRequest({ matterId: matter.uid });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.status).toBe("ready");
+        const lines = (await blobStore.get(updated!.blobKey!)).toString("utf-8").split("\n").map((line) => JSON.parse(line));
+        const bodies = lines.filter((l) => l.entityType === "retainedDraftBody");
+        expect(bodies.map((l) => l.blobKey)).toEqual([v1, v2, gone]);
+        expect(bodies.every((l) => l.messageUid === inRange.uid && l.mailboxUid === mailbox.uid)).toBe(true);
+        expect(Buffer.from(bodies[0].content, "base64").toString("utf-8")).toBe("Subject: draft v1\r\n\r\nfirst");
+        expect(bodies[1]).toEqual(expect.objectContaining({ contentType: "message/rfc822", encoding: "base64" }));
+        expect(bodies[2]).toEqual({ entityType: "retainedDraftBody", messageUid: inRange.uid, mailboxUid: mailbox.uid, blobKey: gone, missing: true });
+        // The retained keys are listed on the message line too.
+        expect(lines.find((l) => l.entityType === "message")?.retainedBodyBlobKeys).toEqual([v1, v2, gone, "attachments/secret"]);
+    });
+
     it("Skips a custodian mailbox that no longer exists, still exporting the rest.", async () => {
         const escrowScopeId = uuid.v4();
         const mailbox = await createMailbox({ escrowScopeId });

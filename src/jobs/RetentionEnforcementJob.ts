@@ -10,6 +10,8 @@ import { LegalHoldIndex, loadLegalHoldIndex } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
+import { retainedBodyBlobKeysOf } from "../util/DraftBodyRetentionUtils.js";
+import { asEntity } from "../util/EntityUtils.js";
 import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
 import type { SearchProvider } from "../search/SearchProvider.js";
 import { Attachment, AuditAction, AuditLogEntry, Message, RetentionPolicy } from "../models/types.js";
@@ -54,6 +56,9 @@ const RETENTION_POLICY_UID = "retention-policy";
  * oldest first in a stable order and pages past rows it skipped (held, or failed to purge), so a stuck row
  * never blocks the rows behind it; mailboxes under any open hold are left out of the message query altogether
  * (holds are loaded once per page via `loadLegalHoldIndex()`, not re-read per record).
+ *
+ * Every run, with or without a policy, also releases draft bodies kept for a legal hold (`Message.retainedBodyBlobKeys`)
+ * once no open `Matter` holds their mailbox - see `releaseRetainedDraftBodies()` and `util/DraftBodyRetentionUtils.ts`.
  *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`RetentionEnforcementJobMongo`/
  * `RetentionEnforcementJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob`/
@@ -141,15 +146,60 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
         }
 
         const policy: RP | undefined = await this.retentionPolicyRepo.findOne(RETENTION_POLICY_UID, { ignoreACL: true });
-        if (!policy) {
-            return;
-        }
-
-        if (policy.messageRetentionDays) {
+        if (policy?.messageRetentionDays) {
             await this.purgeExpiredMessages(policy.messageRetentionDays);
         }
-        if (policy.auditLogRetentionDays) {
+        if (policy?.auditLogRetentionDays) {
             await this.purgeExpiredAuditLogEntries(policy.auditLogRetentionDays);
+        }
+        // Not a retention policy matter: kept only for a hold, so released whether or not a policy is configured.
+        await this.releaseRetainedDraftBodies();
+    }
+
+    /**
+     * Deletes the draft bodies kept for a legal hold (`Message.retainedBodyBlobKeys`, see `util/DraftBodyRetentionUtils.ts`)
+     * of messages whose mailbox no open `Matter` holds any more, and clears the field. Up to `batchSize` messages per run
+     * (live, then soft-deleted), keyset-paged on `uid` so held or failing rows never block the rest; holds are reloaded
+     * per page. Each message's blobs are deleted first - only when no other row references them - then the field is
+     * cleared with a version-checked write, so a failure or a concurrent save (e.g. a new hold's compose appending a key)
+     * leaves the field in place for the next run; a key whose blob is already gone is harmless to delete again.
+     */
+    private async releaseRetainedDraftBodies(): Promise<void> {
+        const blobSources: BlobReferenceSource[] = messageBlobReferenceSources({
+            messageClass: this.messageClass,
+            attachmentClass: this.attachmentClass,
+            quarantineEntryClass: this.quarantineEntryClass,
+            ingestQueueEntryClass: this.ingestQueueEntryClass,
+        });
+        const pageSize: number = Math.max(1, Math.min(this.batchSize, 1000));
+        const maxExamined: number = pageSize * 20;
+        let released = 0;
+        let examined = 0;
+        for (const deletedCriteria of [{}, { deleted: true }]) {
+            for await (const page of findPagesByUid<M>(this.messageRepo!, { retainedBodyBlobKeys: "ne(null)", ...deletedCriteria }, pageSize)) {
+                const holds: LegalHoldIndex = await loadLegalHoldIndex(this._objectFactory!, this.matterClass);
+                for (const message of page) {
+                    if (released >= this.batchSize || examined >= maxExamined) {
+                        return;
+                    }
+                    examined++;
+                    if (holds.isHeld(message.mailboxUid)) {
+                        continue;
+                    }
+                    try {
+                        const keys: string[] = retainedBodyBlobKeysOf(message).filter((key) => key !== (message as any).bodyBlobKey);
+                        await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, keys);
+                        await this.messageRepo!.update(
+                            { uid: message.uid, version: (message as any).version, retainedBodyBlobKeys: null } as any,
+                            asEntity(this.messageRepo!, message),
+                            { ignoreACL: true },
+                        );
+                        released++;
+                    } catch (err: any) {
+                        this.logger?.warn(`RetentionEnforcementJob: failed to release retained draft bodies of message ${message.uid}: ${err.message}`);
+                    }
+                }
+            }
         }
     }
 
@@ -186,11 +236,12 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
                 }
             }
 
+            // Draft bodies superseded under a hold go with the message (the query below leaves held mailboxes out).
             await deleteBlobsIfUnreferenced(
                 this._objectFactory!,
                 this.blobStore!,
                 blobSources,
-                [(message as any).bodyBlobKey, (message as any).sanitizedHtmlBlobKey],
+                [(message as any).bodyBlobKey, (message as any).sanitizedHtmlBlobKey, ...retainedBodyBlobKeysOf(message)],
                 { entityClass: this.messageClass, uid: message.uid },
             );
             await this.messageRepo!.delete(message.uid, { ignoreACL: true, purge: true });

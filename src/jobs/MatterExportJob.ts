@@ -4,14 +4,15 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { Readable } from "stream";
 import { ObjectDecorators } from "@rapidrest/core";
-import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { BackgroundService, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
+import { retainedBodyBlobKeysOf } from "../util/DraftBodyRetentionUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { DEFAULT_MAX_EXPORT_BYTES } from "./DataExportJob.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
-import { collectMailboxContentLines, DEFAULT_MAX_MAILBOX_CONTENT_ROWS, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
-import { AuditAction, EscrowAuditAction, Mailbox, Matter, MatterExportRequest } from "../models/types.js";
+import { collectMailboxContentLines, DEFAULT_MAX_MAILBOX_CONTENT_ROWS, findPagesByUid, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
+import { AuditAction, EscrowAuditAction, Mailbox, Matter, MatterExportRequest, Message } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** The lease a running attempt holds on its request row - `held` is the row as of this run's last
@@ -368,17 +369,54 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
                 dateRange,
                 this.maxContentRows,
             );
-            for (let i = 0; i < lines.length; i++) {
-                const chunk: Buffer = Buffer.from(first ? lines[i] : `\n${lines[i]}`, "utf-8");
+            const emit = (line: string): Buffer => {
+                const chunk: Buffer = Buffer.from(first ? line : `\n${line}`, "utf-8");
                 first = false;
                 bytes += chunk.length;
                 if (bytes > this.maxBytes) {
                     throw new Error(`Export exceeds the maximum export size of ${this.maxBytes} bytes.`);
                 }
-                yield chunk;
+                return chunk;
+            };
+            for (let i = 0; i < lines.length; i++) {
+                yield emit(lines[i]);
+            }
+            for await (const line of this.retainedDraftBodyLines(mailboxUid, dateRange)) {
+                yield emit(line);
             }
             includedMailboxUids.push(mailboxUid);
             await this.renewLease(lease);
+        }
+    }
+
+    /**
+     * One `retainedDraftBody` line per draft body kept for a legal hold (`Message.retainedBodyBlobKeys`, see
+     * `util/DraftBodyRetentionUtils.ts`) on the custodian's messages in the matter's date range - the same messages the
+     * bundle's `message` lines cover. Nothing else references those blobs, so without this the superseded draft content
+     * a hold preserves could never be produced. Each line carries the raw RFC 5322 source base64-encoded (`content`), or
+     * `missing: true` when the blob can't be read. One message page and one body are held at a time.
+     */
+    private async *retainedDraftBodyLines(mailboxUid: string, dateRange: { start: Date; end: Date }): AsyncGenerator<string> {
+        const repo: RepoUtils<any> = await this._objectFactory!.newInstance(RepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
+        const criteria: Record<string, any> = {
+            mailboxUid: ModelUtils.literal(mailboxUid),
+            retainedBodyBlobKeys: "ne(null)",
+            sentDate: `range(${new Date(dateRange.start).toISOString()},${new Date(dateRange.end).toISOString()})`,
+        };
+        for await (const messages of findPagesByUid<Message>(repo, criteria)) {
+            for (const message of messages) {
+                for (const blobKey of retainedBodyBlobKeysOf(message)) {
+                    const line: Record<string, unknown> = { entityType: "retainedDraftBody", messageUid: message.uid, mailboxUid, blobKey };
+                    try {
+                        const content: Buffer = await this.blobStore!.get(blobKey);
+                        Object.assign(line, { contentType: "message/rfc822", encoding: "base64", content: content.toString("base64") });
+                    } catch (err: any) {
+                        this.logger?.warn(`MatterExportJob: retained draft body ${blobKey} of message ${message.uid} could not be read: ${err.message}`);
+                        line.missing = true;
+                    }
+                    yield JSON.stringify(line);
+                }
+            }
         }
     }
 

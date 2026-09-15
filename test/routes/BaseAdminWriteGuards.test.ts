@@ -21,6 +21,7 @@ class TestEscrowScopeRoute extends BaseEscrowScopeRoute<any> {
     protected auditLogClass: any = class {};
     protected matterClass: any = class {};
     protected escrowAccessRequestClass: any = class {};
+    protected mailboxClass: any = class {};
 }
 
 class TestMatterRoute extends BaseMatterRoute<any> {

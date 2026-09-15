@@ -17,6 +17,7 @@ import {
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { asEntity } from "../util/EntityUtils.js";
+import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { Attachment, Message } from "../models/types.js";
@@ -348,22 +349,18 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
     }
 
     /** As `BaseScopedChildRoute.truncate()`, after re-stamping the scope folder's stale attachments, so one whose
-     * message has moved out of the folder isn't deleted by a caller who may truncate only the old folder. */
+     * message has moved out of the folder isn't deleted by a caller who may truncate only the old folder.
+     *
+     * The re-stamp scan is keyset-paged on `uid` (`findPagesByUid()`): re-stamping moves rows OUT of the `folderUid`
+     * result set while it is being read, so offset paging would skip a page's worth of still-stale rows after every
+     * full page - and `super.truncate()` would then delete attachments of messages that left the folder. */
     @Delete()
     public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
         const folderUid: unknown = query?.folderUid;
         if (typeof folderUid === "string" && folderUid && (await this.aclUtils!.hasPermission(user, folderUid, ACLAction.TRUNCATE))) {
-            for (let page = 0; ; page++) {
-                const rows: T[] = await this.repoUtils!.find({ folderUid: ModelUtils.literal(folderUid), limit: this.folderScanPageSize, page } as any, {
-                    limit: this.folderScanPageSize,
-                    page,
-                    ignoreACL: true,
-                });
+            for await (const rows of findPagesByUid<T>(this.repoUtils!, { folderUid: ModelUtils.literal(folderUid) }, this.folderScanPageSize)) {
                 for (const row of rows) {
                     await this.realign(row);
-                }
-                if (rows.length < this.folderScanPageSize) {
-                    break;
                 }
             }
         }

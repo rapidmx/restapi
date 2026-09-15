@@ -9,6 +9,7 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    ModelUtils,
     RepoUtils,
     RouteDecorators,
     type UpdateObject,
@@ -16,7 +17,7 @@ import {
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { evaluateEscrowApprovals, exactInFilter, resolveEscrowApprovalTtlHours } from "../util/EscrowUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
-import { AuditAction, EscrowAccessRequest, EscrowScope, EscrowScopePublicKey, Matter } from "../models/types.js";
+import { AuditAction, EscrowAccessRequest, EscrowScope, EscrowScopePublicKey, Mailbox, Matter } from "../models/types.js";
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /** Page size for scanning a scope's matters and their access requests - see `hasActiveApprovals()`. */
@@ -138,6 +139,9 @@ function validateEscrowScope(o: Partial<EscrowScope>): void {
  * `evaluateEscrowApprovals()`), lowering `requiredHolders` or changing `holderUserUids`/`publicKey` is refused
  * with a `409` - wait for the approval to expire, or deny/let it lapse first.
  * 4. Every create/update/delete is audit-logged with the scope's security-relevant fields before and after.
+ * 5. A scope can't be deleted (`409`) while a `Matter` references it or any `Mailbox` is still assigned to it
+ * (`Mailbox.escrowScopeId`). Assignments are never cleared as a side effect: unassigning each mailbox is its own
+ * deliberate trusted update.
  *
  * `updateBulk`/`updateProperty` go through `update()`, and `truncate` is refused, so none of these can be skipped
  * through `CRUDRoute`'s generic endpoints.
@@ -157,7 +161,23 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
      * scope (dual-control rule 3 above). */
     protected abstract escrowAccessRequestClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so `delete()` can refuse while a `Mailbox` is still assigned to the
+     * scope. */
+    protected abstract mailboxClass: any;
+
     private matterRepo?: RepoUtils<Matter>;
+
+    private mailboxRepo?: RepoUtils<Mailbox>;
+
+    private async getMailboxRepo(): Promise<RepoUtils<Mailbox>> {
+        if (!this.mailboxRepo) {
+            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
+        return this.mailboxRepo;
+    }
 
     private accessRequestRepo?: RepoUtils<EscrowAccessRequest>;
 
@@ -374,7 +394,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         return await this.update(id, { uid: existing.uid, version: existing.version, [propertyName]: obj } as any, undefined as any, user);
     }
 
-    /** `CRUDRoute`'s own `DELETE /` would delete scopes without `delete()`'s referencing-matter check or an audit
+    /** `CRUDRoute`'s own `DELETE /` would delete scopes without `delete()`'s referencing-matter and assigned-mailbox checks or an audit
      * entry - refused; delete scopes one at a time. */
     @RequiresTrustedRole()
     public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
@@ -403,6 +423,22 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
                 ApiErrors.IDENTIFIER_EXISTS,
                 409,
                 "This escrow scope is referenced by an existing Matter and cannot be deleted.",
+            );
+        }
+        // Refused rather than clearing the assignments here: unassigning a mailbox is its own trusted action
+        // (`BaseMailboxRoute`), and a scope delete that silently unassigned every mailbox would let one administrator
+        // drop escrow coverage for all of them in a single step. Left dangling instead, `Mailbox.escrowScopeId` names a
+        // scope that no longer exists, which breaks the owner's key rotation (no escrow wrap can be made for it).
+        const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
+        const assignedMailboxes: number = await mailboxRepo.count({ escrowScopeId: ModelUtils.literal(existing.uid) } as any, {
+            ignoreACL: true,
+            includeDeleted: true,
+        });
+        if (assignedMailboxes > 0) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                `This escrow scope is still assigned to ${assignedMailboxes} mailbox(es) - unassign them (set escrowScopeId to null) before deleting it.`,
             );
         }
         await this.repoUtils!.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });

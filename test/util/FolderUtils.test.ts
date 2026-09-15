@@ -174,17 +174,129 @@ describe("findOrCreateWellKnownFolder() Tests", () => {
         expect(aclUtils.saveACL).toHaveBeenCalledWith({ uid, parentUid: "mbx-1", records: [], version: 3 });
     });
 
-    it("Leaves the ACL alone when none was at the deterministic uid before the create, or it is gone after.", async () => {
-        const aclUtils = { findACL: vi.fn().mockResolvedValue(undefined), saveACL: vi.fn() };
+    it("Doesn't reset anything when no ACL was at the deterministic uid before the create, and only recreates a missing one.", async () => {
+        const uid = wellKnownFolderUid("mbx-1", FolderType.INBOX);
+        const fresh = { uid, parentUid: "mbx-1", records: [], version: 0 };
+        // Before the create: none. After it: the ACL the create claimed is there - nothing to save.
+        const aclUtils = { findACL: vi.fn().mockResolvedValueOnce(undefined).mockResolvedValue(fresh), saveACL: vi.fn() };
         const repo: any = makeRepo();
         repo.aclUtils = aclUtils;
         await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
-        expect(aclUtils.findACL).toHaveBeenCalledTimes(1);
-
-        aclUtils.findACL.mockReset().mockResolvedValueOnce({ uid: "x", parentUid: "mbx-1", records: [] }).mockResolvedValueOnce(undefined);
-        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.DRAFTS);
         expect(aclUtils.findACL).toHaveBeenCalledTimes(2);
         expect(aclUtils.saveACL).not.toHaveBeenCalled();
+
+        // A leftover that is gone again by the reset: nothing to reset, but the folder's ACL is recreated.
+        aclUtils.findACL.mockReset().mockResolvedValueOnce({ uid, parentUid: "mbx-1", records: [] }).mockResolvedValue(undefined);
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.DRAFTS);
+        expect(aclUtils.saveACL).toHaveBeenCalledTimes(1);
+        expect(aclUtils.saveACL).toHaveBeenCalledWith({ uid: wellKnownFolderUid("mbx-1", FolderType.DRAFTS), parentUid: "mbx-1", records: [] }, { createOnly: true });
+    });
+
+    it("Removes only the leftover snapshot's records on reset, keeping a grant made after the insert (round 6).", async () => {
+        const uid = wellKnownFolderUid("mbx-1", FolderType.INBOX);
+        const leftover = { uid, parentUid: "old-parent", records: [{ userOrRoleId: "stale", actions: ["read", "list"] }], version: 3 };
+        const current = {
+            uid,
+            parentUid: "old-parent",
+            records: [
+                { userOrRoleId: "stale", actions: ["list", "read"] },
+                { userOrRoleId: "new-delegate", actions: ["read"] },
+            ],
+            version: 4,
+        };
+        const aclUtils = {
+            findACL: vi.fn().mockResolvedValueOnce(leftover).mockResolvedValueOnce(current).mockResolvedValue({ ...current }),
+            saveACL: vi.fn().mockResolvedValue(undefined),
+        };
+        const repo: any = makeRepo();
+        repo.aclUtils = aclUtils;
+
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
+
+        expect(aclUtils.saveACL).toHaveBeenCalledTimes(1);
+        expect(aclUtils.saveACL).toHaveBeenCalledWith({ uid, parentUid: "mbx-1", records: [{ userOrRoleId: "new-delegate", actions: ["read"] }], version: 4 });
+    });
+
+    it("Retries the reset on a concurrent ACL save, skips it when nothing is left to change, and gives up after three attempts.", async () => {
+        const uid = wellKnownFolderUid("mbx-1", FolderType.INBOX);
+        const leftover = { uid, parentUid: "mbx-1", records: [{ userOrRoleId: "stale", actions: ["read"] }], version: 1 };
+        const aclUtils = {
+            findACL: vi.fn().mockImplementation(async () => ({ ...leftover, records: [...leftover.records] })),
+            saveACL: vi.fn().mockRejectedValueOnce(new Error("The acl to save must be of the same version.")).mockResolvedValue(undefined),
+        };
+        const repo: any = makeRepo();
+        repo.aclUtils = aclUtils;
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
+        expect(aclUtils.saveACL).toHaveBeenCalledTimes(2);
+
+        // Already reset (parent is the mailbox, no stale records): no write.
+        aclUtils.saveACL.mockReset();
+        aclUtils.findACL.mockReset().mockResolvedValueOnce(leftover).mockResolvedValue({ uid, parentUid: "mbx-1", records: [], version: 2 });
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.JUNK);
+        expect(aclUtils.saveACL).not.toHaveBeenCalled();
+
+        // Every save conflicts: the create has succeeded, so the lost reset surfaces through the re-read path, which
+        // returns the (now visible) folder.
+        const created = { uid: wellKnownFolderUid("mbx-1", FolderType.TASKS), type: FolderType.TASKS };
+        repo.find = vi.fn().mockResolvedValueOnce([]).mockResolvedValue([created]);
+        aclUtils.findACL.mockReset().mockImplementation(async () => ({ ...leftover, records: [...leftover.records] }));
+        aclUtils.saveACL.mockReset().mockRejectedValue(new Error("conflict"));
+        await expect(findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.TASKS)).resolves.toBe(created);
+        expect(aclUtils.saveACL).toHaveBeenCalledTimes(3);
+    });
+
+    it("Recreates the winner's ACL when this create lost the race after the winner reused the ACL this create claimed (round 6).", async () => {
+        const uid = wellKnownFolderUid("mbx-1", FolderType.INBOX);
+        const winner = { uid, type: FolderType.INBOX };
+        const aclUtils = { findACL: vi.fn().mockResolvedValue(undefined), saveACL: vi.fn().mockResolvedValue(undefined) };
+        const repo: any = makeRepo({
+            find: vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([winner]),
+            create: vi.fn().mockRejectedValue(new Error("duplicate key")),
+        });
+        repo.aclUtils = aclUtils;
+
+        await expect(findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX)).resolves.toBe(winner);
+        expect(aclUtils.saveACL).toHaveBeenCalledWith({ uid, parentUid: "mbx-1", records: [] }, { createOnly: true });
+
+        // A concurrent repair got there first: its IDENTIFIER_EXISTS is fine. Any other failure with no ACL is thrown.
+        aclUtils.findACL.mockReset().mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined).mockResolvedValue({ uid, parentUid: "mbx-1", records: [] });
+        aclUtils.saveACL.mockReset().mockRejectedValue(new Error("exists"));
+        repo.find = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([winner]);
+        await expect(findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX)).resolves.toBe(winner);
+
+        aclUtils.findACL.mockReset().mockResolvedValue(undefined);
+        aclUtils.saveACL.mockReset().mockRejectedValue(new Error("acl store down"));
+        repo.find = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([winner]);
+        await expect(findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX)).rejects.toThrow("acl store down");
+
+        // A winner under another uid (an older duplicate) is returned as it is.
+        const older = { uid: "older-random-uid", type: FolderType.INBOX };
+        aclUtils.saveACL.mockReset();
+        repo.find = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([older]);
+        await expect(findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX)).resolves.toBe(older);
+        expect(aclUtils.saveACL).not.toHaveBeenCalled();
+    });
+
+    it("Repairs a missing ACL of an existing deterministic-uid folder, reading the cache first (round 6).", async () => {
+        const uid = wellKnownFolderUid("mbx-1", FolderType.INBOX);
+        const aclUtils = { findACL: vi.fn().mockResolvedValue({ uid, parentUid: "mbx-1", records: [] }), saveACL: vi.fn() };
+        const repo: any = makeRepo({ find: vi.fn().mockResolvedValue([{ uid, type: FolderType.INBOX }]) });
+        repo.aclUtils = aclUtils;
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
+        expect(aclUtils.findACL).toHaveBeenCalledTimes(1);
+        expect(aclUtils.findACL).toHaveBeenCalledWith(uid, [], { skipCache: false, skipParents: true });
+
+        // A cache miss is confirmed uncached, then recreated.
+        aclUtils.findACL.mockReset().mockResolvedValue(undefined);
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
+        expect(aclUtils.findACL).toHaveBeenCalledWith(uid, [], { skipCache: true, skipParents: true });
+        expect(aclUtils.saveACL).toHaveBeenCalledWith({ uid, parentUid: "mbx-1", records: [] }, { createOnly: true });
+
+        // A random-uid folder isn't touched.
+        aclUtils.findACL.mockReset();
+        repo.find = vi.fn().mockResolvedValue([{ uid: "random", type: FolderType.INBOX }]);
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
+        expect(aclUtils.findACL).not.toHaveBeenCalled();
     });
 
     it("Uses 'Archive' as the default name for FolderType.ARCHIVE.", async () => {

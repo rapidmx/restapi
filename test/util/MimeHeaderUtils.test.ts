@@ -9,8 +9,10 @@ import {
     extractHeaders,
     extractOriginatorHeaders,
     hasAddressLikeDisplayName,
+    isPlainAddress,
     prepareRelayCopy,
     prependHeaders,
+    safeDisplayName,
     singleFromAddress,
     verifiedFromAddress,
 } from "../../src/util/MimeHeaderUtils.js";
@@ -329,6 +331,68 @@ describe("MimeHeaderUtils Tests", () => {
         it("Treats a bare CR as a line break, so a trust header can't hide behind one.", () => {
             const copy = prepareRelayCopy(Buffer.from("From: m@evil.example\rRapidMX-Key: x\r\n\r\nBody"), { trustedAuthservId: TRUSTED, rewriteFrom })!.toString();
             expect(copy).not.toMatch(/rapidmx-key/i);
+        });
+
+        it("Omits an address-like list or mailbox name from the rewritten From.", () => {
+            const copy = prepareRelayCopy(Buffer.from("From: m@evil.example\r\n\r\nBody"), {
+                trustedAuthservId: TRUSTED,
+                rewriteFrom: { address: "me@ours.example", name: "ceo＠bank.example" },
+            })!.toString();
+            expect(copy).toContain("From: <me@ours.example>");
+        });
+    });
+
+    describe("isPlainAddress()", () => {
+        it("Accepts exactly one bare address and nothing else.", () => {
+            expect(isPlainAddress("jane.doe+tag@example.com")).toBe(true);
+            const refused: unknown[] = [
+                undefined,
+                42,
+                "",
+                "jane",
+                "@example.com",
+                "jane@",
+                "a@b@example.com",
+                "Jane <jane@example.com>",
+                "a@example.com, b@example.com",
+                "a@example.com;b@example.com",
+                "jane@example.com (comment)",
+                '"jane"@example.com',
+                "jane@example.com\r\nBcc: x@evil.example",
+                "jane @example.com",
+                `${"x".repeat(320)}@example.com`,
+            ];
+            for (const address of refused) {
+                expect({ address, plain: isPlainAddress(address) }).toEqual({ address, plain: false });
+            }
+        });
+    });
+
+    describe("safeDisplayName()", () => {
+        it("Keeps an ordinary name, trimmed.", () => {
+            expect(safeDisplayName("  Jane Doe ")).toBe("Jane Doe");
+            expect(safeDisplayName("Zoë\tSmith")).toBe("Zoë\tSmith");
+        });
+
+        it("Omits blank, non-string, multi-line and address-like names, look-alikes and encoded words included.", () => {
+            const names: unknown[] = [
+                undefined,
+                null,
+                42,
+                "",
+                "   ",
+                "ceo@bank.example",
+                "ceo＠bank.example",
+                "ceo﹫bank.example",
+                "Jane\r\nBcc: x",
+                "Jane\nDoe",
+                "a b",
+                "=?utf-8?q?ceo=40bank.example?=",
+                `=?utf-8?B?${Buffer.from("ceo@bank.example").toString("base64")}?=`,
+            ];
+            for (const name of names) {
+                expect({ name, safe: safeDisplayName(name) }).toEqual({ name, safe: undefined });
+            }
         });
     });
 });

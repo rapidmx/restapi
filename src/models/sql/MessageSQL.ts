@@ -211,6 +211,11 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
     @Nullable
     public scheduledSendLeaseExpiresAt?: Date;
 
+    @Column({ type: "simple-json", nullable: true })
+    @Description("Server-managed: body blob keys this draft's body replaced while its mailbox was under a legal hold.")
+    @Nullable
+    public retainedBodyBlobKeys?: string[] | null;
+
     @Column({ nullable: true })
     @Description(
         "Set by recall() the moment a recall is requested - purely informational, the eventual outcome is " +
@@ -327,6 +332,7 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
             this.scheduledSendRelayedAt = "scheduledSendRelayedAt" in other ? other.scheduledSendRelayedAt : this.scheduledSendRelayedAt;
             this.scheduledSendLeaseExpiresAt =
                 "scheduledSendLeaseExpiresAt" in other ? other.scheduledSendLeaseExpiresAt : this.scheduledSendLeaseExpiresAt;
+            this.retainedBodyBlobKeys = "retainedBodyBlobKeys" in other ? other.retainedBodyBlobKeys : this.retainedBodyBlobKeys;
             this.recallRequestedAt = "recallRequestedAt" in other ? other.recallRequestedAt : this.recallRequestedAt;
             this.conversationId = "conversationId" in other ? boundIndexedValue(other.conversationId) : this.conversationId;
             this.inferenceClassification =

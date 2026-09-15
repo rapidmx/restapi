@@ -25,6 +25,7 @@ import { asEntity } from "../util/EntityUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { computeBusyWindows } from "../util/FreeBusyUtils.js";
 import { buildEventIcs, convertLocalToUtc, type OccurrenceWindow } from "../util/IcsUtils.js";
+import { safeDisplayName } from "../util/MimeHeaderUtils.js";
 import {
     AttendeeRole,
     AttendeeResponseStatus,
@@ -584,10 +585,14 @@ export abstract class BaseBookingRoute<
     private async sendBookingMail(bookingType: BT, booking: B, event: CE, mailbox: M, cancelled: boolean): Promise<void> {
         try {
             const manageUrl: string | undefined = this.manageUrl(booking);
+            // `hostDisplayName` is the host's own input: an address-like (or multi-line) one is left out of the From and the
+            // invite's ORGANIZER name, and the body names the host by address instead (`safeDisplayName()`).
+            const hostName: string | undefined = safeDisplayName(bookingType.hostDisplayName);
+            const host: string = hostName ?? mailbox.primarySmtpAddress;
             const lines: string[] = [
                 cancelled
-                    ? `Your booking for '${bookingType.name}' with ${bookingType.hostDisplayName} has been cancelled.`
-                    : `Your booking for '${bookingType.name}' with ${bookingType.hostDisplayName} is confirmed.`,
+                    ? `Your booking for '${bookingType.name}' with ${host} has been cancelled.`
+                    : `Your booking for '${bookingType.name}' with ${host} is confirmed.`,
                 `When: ${booking.startDate.toISOString()} - ${booking.endDate.toISOString()} (UTC)`,
             ];
             if (!cancelled && bookingType.requiresApproval) {
@@ -598,11 +603,14 @@ export abstract class BaseBookingRoute<
             }
 
             const composed: Buffer = await new MailComposer({
-                from: { name: bookingType.hostDisplayName, address: mailbox.primarySmtpAddress },
+                from: hostName ? { name: hostName, address: mailbox.primarySmtpAddress } : mailbox.primarySmtpAddress,
                 to: booking.bookerEmail,
                 subject: `${cancelled ? "Cancelled" : "Confirmed"}: ${bookingType.name}`,
                 text: lines.join("\n"),
-                icalEvent: { method: cancelled ? "cancel" : "request", content: buildEventIcs(event, cancelled ? "CANCEL" : "REQUEST") },
+                icalEvent: {
+                    method: cancelled ? "cancel" : "request",
+                    content: buildEventIcs({ ...event, organizer: { ...event.organizer, displayName: hostName } }, cancelled ? "CANCEL" : "REQUEST"),
+                },
             })
                 .compile()
                 .build();

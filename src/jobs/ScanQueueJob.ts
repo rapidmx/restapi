@@ -26,7 +26,7 @@ import { DataSubjectErasureRequestSQL } from "../models/sql/DataSubjectErasureRe
 import { ERASURE_IN_PROGRESS } from "./ErasureExecutionJob.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
-import { extractHeader, extractHeaders, prepareRelayCopy, prependHeaders, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
+import { extractHeader, extractHeaders, prepareRelayCopy, prependHeaders, safeDisplayName, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
 import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification, parseDispositionNotification } from "../util/ReceiptUtils.js";
@@ -563,13 +563,15 @@ export abstract class ScanQueueJob<
     /**
      * What `processEntry()` does with an entry for a mailbox that may be under erasure (`DataSubjectErasureRequest`):
      *
-     * - Requests created before the mailbox row itself (`dateCreated`) are ignored: the mailbox uid is its address, so
-     * such a request belongs to an earlier, erased mailbox at the same address, not to its current owner.
-     * - `"drop"` while a request is `"in_progress"` (`ERASURE_IN_PROGRESS`) under a live claim (renewed within
-     * `mail:jobs:erasure_execution:claim_lease_seconds`) - the cascade is running - or when a request `"completed"` and
-     * the mailbox row is gone (nothing left to deliver into).
-     * - `"defer"` while a request is `"approved"` (queued, or handed back because a legal hold or an unloaded plugin
-     * blocks it) or `"in_progress"` under a stale claim - but only until the entry is
+     * - While the mailbox row exists, requests created before it (`dateCreated`) are ignored: the mailbox uid is its
+     * address, so such a request belongs to an earlier, erased mailbox at the same address, not to its current owner.
+     * - `"drop"` whenever the mailbox row is gone and any `"approved"`, `"in_progress"` or `"completed"` request exists
+     * for the address: delivering would re-create the erased subject's folders and messages from nothing (e.g. a request
+     * handed back to `"approved"` by a plugin after the cascade already deleted the mailbox, or the stale claim of a
+     * cascade that stopped after that point). Also `"drop"` while a request is `"in_progress"` (`ERASURE_IN_PROGRESS`)
+     * under a live claim (renewed within `mail:jobs:erasure_execution:claim_lease_seconds`) - the cascade is running.
+     * - `"defer"`, only while the mailbox row still exists, when a request is `"approved"` (queued, or handed back because
+     * a legal hold or an unloaded plugin blocks it) or `"in_progress"` under a stale claim - but only until the entry is
      * `mail:jobs:scan_queue:erasure_defer_max_seconds` old. After that it is delivered: a request can stay blocked for as
      * long as a hold lasts, and the custodian's mail must not be held back (let alone lost) for that long. The cascade
      * purges delivered content (and queued entries) when it does run.
@@ -597,12 +599,16 @@ export abstract class ScanQueueJob<
         }
         const time = (value: unknown): number => (value ? new Date(value as any).getTime() : NaN);
         const mailbox: X | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
-        const mailboxCreatedAt: number = mailbox ? time(mailbox.dateCreated) : NaN;
+        if (!mailbox) {
+            // Nothing to deliver into, and there's no mailbox row to date the requests by, so every one counts.
+            return "drop";
+        }
+        const mailboxCreatedAt: number = time(mailbox.dateCreated);
         // `!(a < b)` keeps a request whose dates can't be read - erring towards honoring it.
         const relevant: any[] = rows.filter((row) => Number.isNaN(mailboxCreatedAt) || !(time(row.dateCreated) < mailboxCreatedAt));
         const now: number = Date.now();
         const liveClaim = (row: any): boolean => row.status === ERASURE_IN_PROGRESS && time(row.dateModified) >= now - this.erasureClaimLeaseSeconds * 1000;
-        if (relevant.some(liveClaim) || (!mailbox && relevant.some((row) => row.status === "completed"))) {
+        if (relevant.some(liveClaim)) {
             return "drop";
         }
         if (relevant.some((row) => row.status === "approved" || row.status === ERASURE_IN_PROGRESS)) {
@@ -610,6 +616,24 @@ export abstract class ScanQueueJob<
             return age < this.erasureDeferMaxSeconds * 1000 ? "defer" : "deliver";
         }
         return "deliver";
+    }
+
+    /** Applies `erasureDisposition()` to a claimed entry: drops or defers it and returns `true`, or returns `false` when
+     * it should be delivered. */
+    private async stopForErasure(claim: EntryClaim<Q>): Promise<boolean> {
+        const entry: Q = claim.row;
+        const erasure = await this.erasureDisposition(entry);
+        if (erasure === "drop") {
+            this.logger?.warn(`ScanQueueJob: dropping ingest entry ${entry.uid} - mailbox ${entry.mailboxUid} is being erased.`);
+            await this.markDelivered(claim, "Dropped: the mailbox is being erased.");
+            return true;
+        }
+        if (erasure === "defer") {
+            this.logger?.info(`ScanQueueJob: deferring ingest entry ${entry.uid} - an erasure of mailbox ${entry.mailboxUid} is pending.`);
+            await this.deferEntry(claim, "Deferred: an erasure of the mailbox is pending.");
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -668,6 +692,11 @@ export abstract class ScanQueueJob<
     private async processEntry(claim: EntryClaim<Q>): Promise<void> {
         const entry: Q = claim.row;
 
+        // Checked before scanning, so an entry deferred for a pending erasure isn't re-scanned on every deferral, and again
+        // after it, since a cascade can start while the (slow) scan runs.
+        if (await this.stopForErasure(claim)) {
+            return;
+        }
         const raw: Buffer = await this.blobStore!.get(entry.rawBlobKey);
         const result: ScanPipelineResult = await this.scanPipeline!.run(raw, {
             from: entry.envelopeFrom,
@@ -675,16 +704,7 @@ export abstract class ScanQueueJob<
         });
         // Scanning is the slow part - make sure this worker still owns the entry before writing anything.
         await this.renewLeaseIfDue(claim);
-
-        const erasure = await this.erasureDisposition(entry);
-        if (erasure === "drop") {
-            this.logger?.warn(`ScanQueueJob: dropping ingest entry ${entry.uid} - mailbox ${entry.mailboxUid} is being erased.`);
-            await this.markDelivered(claim, "Dropped: the mailbox is being erased.");
-            return;
-        }
-        if (erasure === "defer") {
-            this.logger?.info(`ScanQueueJob: deferring ingest entry ${entry.uid} - an erasure of mailbox ${entry.mailboxUid} is pending.`);
-            await this.deferEntry(claim, "Deferred: an erasure of the mailbox is pending.");
+        if (await this.stopForErasure(claim)) {
             return;
         }
 
@@ -1600,7 +1620,7 @@ export abstract class ScanQueueJob<
         try {
             const subject = result.subject ? `Automatic reply: ${result.subject}` : "Automatic reply";
             const composed: Buffer = await new MailComposer({
-                from: { name: mailbox.displayName, address: mailbox.primarySmtpAddress },
+                from: { name: safeDisplayName(mailbox.displayName), address: mailbox.primarySmtpAddress },
                 to: entry.envelopeFrom,
                 subject,
                 html: activeOof.message,
@@ -1739,7 +1759,7 @@ export abstract class ScanQueueJob<
 
         try {
             const composed: Buffer = await new MailComposer({
-                from: { name: mailbox.displayName, address: mailbox.primarySmtpAddress },
+                from: { name: safeDisplayName(mailbox.displayName), address: mailbox.primarySmtpAddress },
                 to: sender,
                 subject: "Recall report",
                 text,
@@ -1838,7 +1858,7 @@ export abstract class ScanQueueJob<
                 (k) => k.useType === "encrypt" && !k.revokedAt && k.notAfter > Date.now(),
             );
             const composed: Buffer = await buildDispositionNotification({
-                from: { address: mailbox.primarySmtpAddress, displayName: mailbox.displayName },
+                from: { address: mailbox.primarySmtpAddress, displayName: safeDisplayName(mailbox.displayName) },
                 to: dispositionNotificationTo,
                 subject: `${dispositionType === "read" ? "Read" : "Delivered"}: ${originalSubject}`,
                 finalRecipient: mailbox.primarySmtpAddress,
@@ -2359,7 +2379,7 @@ export abstract class ScanQueueJob<
             const ics = buildEventIcs({ ...row, attendees: [resourceAttendee] }, "REPLY", { onlyAttendee: resourceAttendee });
             const verb = decision === AttendeeResponseStatus.DECLINED ? "declined" : "accepted";
             const composed: Buffer = await new MailComposer({
-                from: { name: mailbox.displayName, address: mailbox.primarySmtpAddress },
+                from: { name: safeDisplayName(mailbox.displayName), address: mailbox.primarySmtpAddress },
                 to: row.organizer.address,
                 subject: `${decision === AttendeeResponseStatus.DECLINED ? "Declined" : "Accepted"}: ${row.title}`,
                 text: `${mailbox.displayName || mailbox.primarySmtpAddress} has automatically ${verb}: ${row.title}`,

@@ -1537,3 +1537,169 @@ Verification: `node_modules/@rapidrest/service-core` is 2.1.0. First full run on
 in 8 files (ScanQueueJob mongo/sql + AcmeChallenge: leftover folder ACLs; MailboxAutoProvision: same; MailboxRoute:
 bulk status). Final: `npx tsc --noEmit` and `yarn lint` clean; `yarn vitest run --coverage` 243 files / 4814 tests
 passed, coverage 100 / 96.58 / 100 / 100 (statements / branches / functions / lines), gate met.
+
+## 2026-09-14 — Review fixes, round 6 (part A): mail flow and jobs (Drafts-only send, erasure, relay marker, invites)
+
+Uncommitted, no version bump. Concurrent with part B (FolderUtils, BaseAttachmentRoute, BaseMailboxRoute, BaseKeyVaultRoute,
+BaseEscrowScopeRoute, DateCoercionUtils, Message model, MatterExportJob). All six findings re-checked and confirmed; all
+fixed.
+
+1. MEDIUM, round-5 Drafts rule bypassed via scheduled send. `BaseMessageRoute.send()` (scheduled and immediate) now refuses
+   403 "Only a message in Drafts can be sent." for a non-trusted caller unless the message is in a Drafts folder (after
+   the existing 409s for relayed/Sent Items/Outbox; trusted callers exempt, like the move rules). So for non-trusted
+   callers Outbox only ever holds drafts, and Outbox -> Drafts (cancel) keeps working for them. Tightened too:
+   Outbox -> Drafts is refused (403) for a delivered message (`scanResultUid`), which a `MailFilterRule` MOVE_TO_FOLDER can
+   file into Outbox. Residual: a message a trusted caller sent from elsewhere (or one scheduled from a non-Drafts folder
+   before this fix) can still be cancelled into Drafts; an exact rule would need a model field recording where the send
+   came from (Message model is part B's - not added).
+2. MEDIUM, erasure could recreate erased data. `ScanQueueJob.erasureDisposition()` returns `drop` whenever the mailbox row
+   is gone and any approved/in_progress/completed request exists for the address (no mailbox row to date requests by, so
+   all count). Defer/deliver only happen while the mailbox exists; the "request older than the mailbox row is ignored"
+   rule is unchanged.
+3. LOW, re-scan per deferral. `processEntry()` calls `stopForErasure()` (drop/defer) before `scanPipeline.run()`, and again
+   after the scan (a cascade can start during a slow scan) - one extra erasure-request query per entry.
+4. LOW, immediate send stuck/unmarked.
+   (a) `recordRelayed()` also writes `scheduledSendTime` = the claim's lease expiry (not now: a due-now time would let
+   `ScheduledSendJob` take over, and re-lease, a filing this request is still doing, making the route skip filing). After
+   a crash the job picks it up once the lease lapses and only files it. `fileSentMessage()` now clears
+   `scheduledSendTime`.
+   (b) `recordRelayed()` retries (route and job) and `markRelayed()` re-read with `includeDeleted`, so the marker lands on a
+   message soft-deleted mid-relay. `BaseMessageRoute.delete()` refuses 409 "This message is being sent right now." while
+   the lease is live, for every caller with DELETE on the folder (checked after the permission, so no hint to others).
+   Not covered: `truncate()` (hard delete in `BaseScopedChildRoute` - the row is gone, so it can't be restored and re-sent).
+5. HIGH, invite spoofing/unbounded/unscanned. `MeetingSchedulingJob.sendToAttendees()`:
+   - From and ICS `ORGANIZER;CN` use the organizer mailbox's own `displayName` through `safeDisplayName()` (omitted when
+     address-like/multi-line); stored `organizer.displayName` is never mailed. Attendee `CN`s get the same rule.
+   - Attendees must be `isPlainAddress()` (others skipped with a warning and left out of the ICS), deduplicated; more than
+     `mail:jobs:meeting_scheduling:max_attendees` (500) -> nothing mailed, `logger.error`, row stays claimed.
+   - One message composed (To: all mailed attendees) and passed once through `scanAndRelay()` with a fan-out transport
+     that relays per attendee via `sendOrThrow()` (per-attendee envelopes and failure logging kept). A refused scan throws
+     422 -> logged "failed to process invites/cancellation". No blob is written (no HTML part).
+   - `BaseCalendarEventRoute`: create, and update when the value changes, refuse 400 an organizer that isn't an object or
+     whose non-empty address isn't plain, and `attendees` that aren't an array, exceed 500 (`MAX_EVENT_ATTENDEES`) or hold
+     a non-plain address; unchanged round-trips of received lists still save. `respond()` sends no REPLY to a non-plain
+     organizer address (logged) and drops an address-like mailbox name from its From.
+6. LOW, booking hostDisplayName. `BaseBookingRoute.sendBookingMail()` uses `safeDisplayName(hostDisplayName)` for the From
+   and ICS organizer CN; the body names the host by address when the name is dropped.
+
+New `MimeHeaderUtils` exports: `safeDisplayName(name)` (trimmed, or undefined when non-string/blank/control char/
+look-alike `@`, encoded words decoded) and `isPlainAddress(address)` (one bare `local@domain`, <= 320, no whitespace/
+control/specials). Also applied `safeDisplayName()` to mailbox display names in `prepareRelayCopy()` (rewritten From),
+`ScanQueueJob` auto-reply, recall report, MDN and resource-booking reply From lines, `BaseMessageRoute` MDNs, and `recall()` (client-writable
+`from.displayName`).
+
+Contract changes
+- web-client/react-shared: POST `/messages/:id/send` of a message outside Drafts is 403 (non-trusted); DELETE of a message
+  whose send is in flight is 409; moving a filter-filed (delivered) message from Outbox to Drafts is 403; calendar event
+  create/update with non-plain organizer/attendee addresses or > 500 attendees is 400.
+- activesync/mapi: device-set OrganizerName is no longer mailed (mailbox name instead); invites to > 500 attendees are not
+  sent; their own send paths should likewise only send drafts and use `safeDisplayName()`/`isPlainAddress()`; deletes
+  of in-flight messages should respect `scheduledSendLeaseExpiresAt`.
+- server: new config `mail:jobs:meeting_scheduling:max_attendees` (500). Invites now go through the scan pipeline (spam/AV
+  verdicts apply) and carry every mailed attendee in To. Display names in From change for address-like mailbox/host names.
+
+Tests (under `.vitest-lock`, `--coverage.enabled=false`, targeted): mailAuthzRound4Suite "round 6 (part A)" (mongo + sql:
+send/schedule from Archive/Inbox 403 under a hold, admin exempt, draft schedule+cancel; delivered Outbox -> Drafts 403;
+marker due at lease expiry mid-relay and cleared on filing; in-flight delete 409 owner/admin, 403 other, lapsed OK;
+soft-delete mid-relay still marked, restore -> send 409); ScanQueueJob mongo/sql "Round 6 (part A)" (gone mailbox +
+approved/stale in_progress drops past the defer bound, no folders; deferred entry not scanned; cascade starting mid-scan
+drops); ScheduledSendJob mongo/sql (marker on a message soft-deleted mid-relay); MeetingSchedulingJob mongo/sql (mailbox
+name vs stored organizer name, address-like name omitted, non-plain/duplicate/empty attendees, cap for invite and cancel,
+spam-refused invite); BookingRoute mongo/sql (address-like host name dropped); CalendarEventRoute mongo/sql (validation
+on create/changed update, round-trip, respond to non-plain organizer, address-like mailbox name); MimeHeaderUtils unit
+(`safeDisplayName`, `isPlainAddress`, relay rewrite name). Also ran MessageRoute, MailAuthzRound3, BookingTypeRoute,
+CalendarShareLinkRoute, FolderRoute, MailIngestRoute, RoutesKeysRound5, SecurityControls, DistributionListRoute,
+TransportRuleRoute, CalendarReminder/ErasureExecution/MailboxImport jobs, BaseCalendarEventRoute/BaseMessageRoute/
+BaseMailIngestRoute unit - all passing. `tsc` and eslint clean on touched files. Seen once: MailAuthzRound4 (mongo)
+"two concurrent sends" returned 500 instead of 409 for the losing send; passed 3/3 on rerun - likely the concurrent
+Outbox `findOrCreateWellKnownFolder()` race (FolderUtils, being changed by part B), not reproduced.
+
+## 2026-09-14 — Review fixes, round 6 (part B): folders, attachments, mailbox, key vault, escrow scopes, draft retention, dates
+
+Uncommitted, no version bump. Concurrent with part A (BaseMessageRoute, ScheduledSendJob, ScanQueueJob, MeetingSchedulingJob,
+BaseBookingRoute, MimeHeaderUtils, BaseCalendarEventRoute). All nine findings re-checked against the code and confirmed;
+all fixed.
+
+1. MEDIUM, well-known folder left with no ACL after a lost race. `FolderUtils`: `allowExistingACL` is still always passed
+   on the deterministic uid (passing it only when a leftover was seen would make the create that sees a racer's fresh
+   claim fail at the claim, with no winner visible yet). New `ensureFolderACL()` recreates `{ uid, parentUid: mailboxUid,
+   records: [] }` (`createOnly`; a concurrent repair's IDENTIFIER_EXISTS is tolerated) when missing: after a won create, in
+   the lost-race re-read (after `RepoUtils.create()` has finished removing the loser's claimed ACL), and on the
+   find-existing fast path for a deterministic-uid folder (cached read first, uncached confirm before recreating). A loser
+   crashing between its ACL removal and its re-read is repaired by the next lookup of that folder.
+2. LOW, leftover reset wiped fresh grants. `resetLeftoverACL()` removes only records equal (member + action set) to the
+   pre-create snapshot, re-parents to the mailbox, saves with the current version, retries x3 on a version conflict; no
+   write when nothing changes.
+3. MEDIUM, attachment truncate skipped stale rows. `BaseAttachmentRoute.truncate()`'s re-stamp scan uses `findPagesByUid()`
+   (keyset on uid, `folderScanPageSize`), so re-stamped rows leaving the result set don't shift later pages.
+4. LOW, overlapping owner-change rollbacks. `withOwnerAclMoved()` restores newest move first, and `restoreOwnerAcl()` only
+   writes while the two members' records are exactly what the move wrote (`[{ next, FULL }]`, or none); otherwise it logs a
+   warning and leaves the ACL alone.
+5. LOW, look-alike `@` display names. `assertValidDisplayName()` refuses `[@＠﹫\r\n]` (a copy of MimeHeaderUtils' private
+   `AT_SIGN_LIKE`, which isn't exported) and anything `hasAddressLikeDisplayName()` flags when the name is put quoted into a
+   From as UTF-8 bytes (so RFC 2047 encoded words decoding to an `@` are refused too). Part A's new `safeDisplayName()`
+   could replace the copy once it lands.
+6. LOW, enrollment generation not tied to the client. Every key-vault response (`PublicKeyVault`) carries
+   `masterKeyGeneration` (0 when none recorded or no vault). Optional `expectedMasterKeyGeneration` (non-negative integer,
+   else 400; `null` = absent) on `POST /:id/keyvault/keys` (checked before writes and again in `persistEnrollment()`),
+   `POST .../keys/sign-enrollment` (checked before the CA call; the attached binding records it), `POST .../wraps` (never
+   stored with the wrap) and `PUT .../rekey` -> 409 "This mailbox's master key was rotated since this key material was
+   sealed - reload the key vault, unlock it again and retry." Without it, sign enrollment records the generation read
+   before the CA call, as before.
+7. LOW, escrow scope deletable while assigned. `BaseEscrowScopeRoute.delete()` 409s "This escrow scope is still assigned to
+   N mailbox(es) - unassign them (set escrowScopeId to null) before deleting it." when any Mailbox has that
+   `escrowScopeId` (literal). Chosen over clearing the assignments: one admin must not drop escrow coverage for every
+   mailbox as a side effect (dual-control rule 5 in the class doc). New abstract `mailboxClass` (set by the Mongo/SQL
+   subclasses). An assignment landing between the count and the delete can still dangle.
+8. MEDIUM, legal-hold draft bodies unreachable. New server-managed `Message.retainedBodyBlobKeys?: string[] | null` (Mongo
+   `@Column`, SQL `simple-json` nullable, synchronize) and `util/DraftBodyRetentionUtils.ts` (exported from the util
+   barrel): `RETAINED_BODY_BLOB_KEY_PREFIX = "bodies/"`, `MAX_RETAINED_BODY_BLOB_KEYS = 500`, `retainedBodyBlobKeysOf()`
+   (distinct `bodies/` keys only) and `withRetainedBodyBlobKey(message, replacedKey)` (the new list; 409 at the bound).
+   - `MatterExportJob` streams one `{"entityType":"retainedDraftBody","messageUid","mailboxUid","blobKey",
+     "contentType":"message/rfc822","encoding":"base64","content"}` line per kept body (`"missing": true` instead when
+     unreadable) for the custodian's messages in the matter's sentDate range, counted against `max_bytes`.
+   - `RetentionEnforcementJob.run()` always (policy or not) runs `releaseRetainedDraftBodies()`: rows with
+     `retainedBodyBlobKeys ne(null)` (live, then soft-deleted; keyset paged; holds reloaded per page; at most `batch_size`
+     released and 20 pages examined per run) whose mailbox no open Matter holds get their keys deleted through
+     `deleteBlobsIfUnreferenced()` (current `bodyBlobKey` skipped), then a version-checked write sets the field to null (a
+     failure is logged and retried next run). Retention purges and `ErasureExecutionJob` delete them with the message.
+   - Only `bodies/` keys are ever exported or deleted. `BlobReferenceUtils` doesn't count the field as a reference:
+     `bodies/` keys are minted per save for one message and never shared (and SQL can't cheaply query inside the column).
+   - NOT done (part A's file): `"retainedBodyBlobKeys"` must be added to `SERVER_MANAGED_MESSAGE_FIELDS` in
+     `BaseMessageRoute.ts`. Until then a non-trusted client can write it (mitigated by the `bodies/` prefix rule).
+9. LOW, DateCoercionUtils too loose. The strict form of `coerceDateValue()` uses `parseClientDate()`, a copy of
+   service-core 2.1.0's `RepoUtils.parseDateInput()` rules: `YYYY-MM-DD` = UTC midnight; date-time with `T` or space,
+   optional seconds and fraction, zone `Z`/`±HH`/`±HHmm`/`±HH:mm`, none = UTC; impossible dates refused; numbers only as
+   epoch ms with magnitude >= 1e11 within years 1-9999; numeric strings refused. 400 message: "'<field>' must be a valid
+   ISO 8601 date/time (a missing zone means UTC) or a number of epoch milliseconds." `lenient` (stored-row reads,
+   BaseBookingRoute) tries the strict form, then `new Date()` for legacy values. A unit test compares against the
+   framework's private `parseDateInput` on a corpus to catch drift. web-client/react-shared send `toISOString()` (or echo
+   stored values) for matters, OOF, scheduled send and calendar/recurrence dates, so no client change is needed.
+
+Contract changes
+- react-shared key vault: read `masterKeyGeneration` from GET and every write response; send it back as
+  `expectedMasterKeyGeneration` on enrollKey, startSignEnrollment, addMasterKeyWrap and rekey (for rekey: the generation
+  of the vault being replaced). On that 409: reload the vault, unlock again, re-seal, retry. Optional field.
+- web-client/admin: DELETE `/escrow-scopes/:id` is 409 while any mailbox is assigned; unassign first (trusted
+  `PUT /mailboxes/:id` with `escrowScopeId: null`).
+- Mailbox displayName with `＠`/`﹫` or an encoded word showing `@` is 400.
+- Dates: numeric strings, epoch seconds and impossible dates are 400; a zoneless date-time is UTC.
+- server compose (`BaseMailComposeRoute.storeBody()`): when the replaced key starts with `bodies/` and the mailbox is held,
+  check the hold BEFORE the update and put `retainedBodyBlobKeys: withRetainedBodyBlobKey(message, previousKey)` into the
+  same version-checked update that sets the new `bodyBlobKey`; on the helper's 409, delete the new blob and surface it
+  ("send it or start a new draft"). Not held: unchanged. activesync/mapi replacing a draft body under a hold should do
+  the same.
+- server: new nullable SQL column `retainedBodyBlobKeys` on the message table (synchronize); matter export bundles gain
+  `retainedDraftBody` lines.
+
+Tests (under `.vitest-lock`, targeted): new `test/routes/routesKeysRound6Suite.ts` + `{mongo,sql}/RoutesKeysRound6.test.ts`
+(simulated lost race removing the reused ACL, fast-path repair, leftover reset keeping a grant made after the insert,
+9-row attachment truncate at page size 2, bulk rollback naming one mailbox twice, rollback skipped after a concurrent owner
+change, look-alike/encoded display names); `keyVaultRound5Suite` "round 6 (part B)" (both backends); EscrowScopeRoute
+mongo/sql (assigned mailbox 409); RetentionEnforcementJob mongo/sql (release after the hold closes with no policy;
+shared/current/non-body blobs kept; soft-deleted rows; purge deletes kept bodies; batch bound; failed release retried);
+MatterExportJob mongo/sql (lines, date range, missing blob); ErasureExecutionJob mongo/sql; unit FolderUtils,
+DateCoercionUtils, DraftBodyRetentionUtils, BaseAttachmentRoute (keyset scan against a mutating fake). Updated:
+KeyVaultRoute mongo/sql empty-vault body (`masterKeyGeneration: 0`), BaseAdminWriteGuards (`mailboxClass`). Also ran every
+`test/routes` file (132 files, 2539 tests) and the ScanQueueJob, AcmeEnrollmentDriver, CalendarReminder,
+MeetingScheduling and DataExport job suites - all passing. `tsc --noEmit` and eslint clean on touched files.

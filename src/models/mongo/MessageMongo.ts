@@ -196,6 +196,11 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     public scheduledSendLeaseExpiresAt?: Date;
 
     @Column()
+    @Description("Server-managed: body blob keys this draft's body replaced while its mailbox was under a legal hold.")
+    @Nullable
+    public retainedBodyBlobKeys?: string[] | null;
+
+    @Column()
     @Description(
         "Set by recall() the moment a recall is requested - purely informational, the eventual outcome is " +
             "reported back to the sender as an ordinary visible email instead of being synced onto this field.",
@@ -308,6 +313,7 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.scheduledSendRelayedAt = "scheduledSendRelayedAt" in other ? other.scheduledSendRelayedAt : this.scheduledSendRelayedAt;
             this.scheduledSendLeaseExpiresAt =
                 "scheduledSendLeaseExpiresAt" in other ? other.scheduledSendLeaseExpiresAt : this.scheduledSendLeaseExpiresAt;
+            this.retainedBodyBlobKeys = "retainedBodyBlobKeys" in other ? other.retainedBodyBlobKeys : this.retainedBodyBlobKeys;
             this.recallRequestedAt = "recallRequestedAt" in other ? other.recallRequestedAt : this.recallRequestedAt;
             this.conversationId = "conversationId" in other ? boundIndexedValue(other.conversationId) : this.conversationId;
             this.inferenceClassification =

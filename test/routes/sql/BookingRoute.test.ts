@@ -332,6 +332,20 @@ describe("Route:BookingSQL Tests (anonymous)", () => {
             expect(mailTransport.sent[0].envelopeTo).toEqual(["grace@example.com"]);
             const raw: string = mailTransport.sent[0].raw.toString();
             expect(raw).toContain(`/manage/${result.body.manageToken}`);
+            expect(raw).toMatch(/^From: "?Ada Lovelace"? </m);
+        });
+
+        it("Leaves an address-like host display name out of the booking mail's From, organizer name and text.", async () => {
+            const bookingType = await createBookingType({ hostDisplayName: "ceo＠bank.example" });
+
+            const result = await book(bookingType.slug, validBooking());
+
+            expect(result.status).toBe(200);
+            const raw: string = mailTransport.sent[0].raw.toString();
+            expect(raw).toMatch(new RegExp(`^From: <?${mailbox.primarySmtpAddress}>?\\r?$`, "m"));
+            expect(raw).toContain(`ORGANIZER:mailto:${mailbox.primarySmtpAddress}`);
+            expect(raw).not.toContain("bank.example");
+            expect(raw).not.toContain("=EF=BC=A0");
         });
 
         it("Leaves a booking pending and its event tentative when the booking type requires approval.", async () => {
