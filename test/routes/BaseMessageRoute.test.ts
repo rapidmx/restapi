@@ -56,6 +56,14 @@ describe("BaseMessageRoute Tests (dependency guard clause only)", () => {
         ).rejects.toThrow(/internal error/i);
     });
 
+    it("setVerificationSeal() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
+        const route = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
+
+        await expect(
+            route.setVerificationSeal("msg-1", { seal: "abc", masterKeyGeneration: 0 }, { uid: "user-1" } as any),
+        ).rejects.toThrow(/internal error/i);
+    });
+
     it("conversations() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
         const route = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
 

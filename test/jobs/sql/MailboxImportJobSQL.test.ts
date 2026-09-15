@@ -199,6 +199,8 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
         expect(messages.length).toBe(2);
         expect(messages.every((m) => m.mailboxUid === mailbox.uid)).toBe(true);
         expect(messages.every((m) => m.flags.read === true)).toBe(true);
+        // An mbox/PST import is never the user's own export, so it never carries a verification seal.
+        expect(messages.every((m) => m.verificationSeal == null && m.verificationSealGeneration == null)).toBe(true);
 
         const attachments = await attachmentRepo.find({ where: { folderUid: folder.uid } });
         expect(attachments.length).toBe(2);

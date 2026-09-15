@@ -1020,6 +1020,19 @@ export interface Message extends RecoverableBaseEntity {
      * message itself is purged or erased. Absent or `null` when there are none. See `util/DraftBodyRetentionUtils.ts`. */
     retainedBodyBlobKeys?: string[] | null;
 
+    /** Client-written, write-once seal of a client-side S/MIME signature verification: an opaque string (base64 or
+     * base64url, at most `MAX_VERIFICATION_SEAL_LENGTH` characters) the user's client derives with an HMAC keyed from the
+     * user's master key, so it can still show "verified when first opened" after the signer's key is replaced or revoked.
+     * The server never interprets it. Set only through `PUT /:id/verification-seal` (`BaseMessageRoute.setVerificationSeal()`),
+     * bound to `verificationSealGeneration`: a different seal only replaces one sealed under an older master key generation.
+     * Server-managed everywhere else, never copied to another message (rule copies, relays, imports), included as-is in data
+     * and matter exports, removed with the message. */
+    verificationSeal?: string | null;
+
+    /** The `KeyVault.masterKeyGeneration` `verificationSeal` was sealed under (set with it, by the same route only). A key
+     * vault rekey makes older seals unopenable, so a seal from an older generation may be replaced. Same lifecycle as the seal. */
+    verificationSealGeneration?: number | null;
+
     /** Set by `BaseMessageRoute.recall()` the moment a recall is requested — purely informational (lets a
      * client show "recall requested" immediately). The eventual outcome (each recipient's own `ScanQueueJob`
      * either deleting its still-unread copy or not) is reported back to the sender as an ordinary visible

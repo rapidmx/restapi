@@ -131,6 +131,36 @@ the user.
 - **`sanitizeDiscoveredKey()`** keeps `revocationReason` only when it's `"superseded"` or `"compromised"` on a key with
   `revokedAt`.
 
+### Breaking changes (verification seals)
+
+- **`BaseMessageRoute` has a new abstract `keyVaultClass`.** `MessageRouteMongo` and `MessageRouteSQL` set it
+  (`KeyVaultMongo`/`KeyVaultSQL`). A custom subclass of `BaseMessageRoute` must set it too.
+
+### Signature verification seals
+
+- **`Message.verificationSeal?: string`**: an opaque seal a client stores after it verifies a message's S/MIME signature
+  (an HMAC keyed from the user's master key), so it can still show "Verified when first opened on <date>" after the
+  signer's key is replaced or revoked. The server never interprets it.
+- **`Message.verificationSealGeneration?: number`**: the key vault `masterKeyGeneration` the seal was made under. SQL adds
+  two nullable columns (`verificationSeal` text, `verificationSealGeneration` integer), created by schema synchronization.
+- **`PUT /mail/messages/:id/verification-seal`** with `{ "seal": "<string>", "masterKeyGeneration": <number> }` returns
+  the message.
+  - **400** unless `seal` is a non-empty string of at most 2048 characters (`MAX_VERIFICATION_SEAL_LENGTH`) from
+    `[A-Za-z0-9+/=_.:-]` and `masterKeyGeneration` is a non-negative integer. **404** for an unknown message. **403**
+    without READ and UPDATE on the message's folder, so a delegate with both can set it and a read-only one can't.
+  - **409** when the mailbox has no key vault, or `masterKeyGeneration` isn't the vault's current generation (a vault
+    without one counts as 0). A client on a stale master key never writes.
+  - **Generation-bound replacement:** with no stored seal, both fields are set. The identical seal at the current
+    generation is 200 and writes nothing. A seal from an older generation (a rekey made it unopenable) is replaced. A
+    different seal at the same or a newer generation is 409. A stored seal without a generation counts as generation 0.
+  - The write is version-checked, so of two concurrent writers one wins and the other re-reads and gets the rules above
+    (409 for a different seal, 200 for the same one).
+  - Not blocked by a legal hold (a seal isn't content) and not audited (user-private metadata).
+- **Server-managed everywhere else:** create, update, bulk update and `PUT /:id/:property` drop both fields, for trusted
+  callers too. Rule copies, forwards, list relays, Sent Items filing, scheduled send and recall never copy them, and
+  mailbox import (mbox/PST) never sets them. The JSON data export and matter export include both as-is; erasure removes
+  them with the message.
+
 ## v0.10.0
 
 This release adds plugin search, updates and dependencies, and hardens almost every part of the library after six rounds

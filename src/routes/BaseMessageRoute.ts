@@ -38,6 +38,7 @@ import {
     AuditAction,
     FocusedInboxOverride,
     FolderType,
+    KeyVault,
     Mailbox,
     Message,
     MessageClassification,
@@ -104,7 +105,17 @@ const SERVER_MANAGED_MESSAGE_FIELDS = [
     "hasAttachments",
     // Superseded draft bodies kept under legal hold (`DraftBodyRetentionUtils`), appended by the compose route only.
     "retainedBodyBlobKeys",
+    // Client-written, but only through `setVerificationSeal()` (generation-bound) - stripped for trusted callers too (see
+    // `prepareCreate()`/`prepareUpdate()`).
+    "verificationSeal",
+    "verificationSealGeneration",
 ] as const;
+
+/** The longest `Message.verificationSeal` `setVerificationSeal()` accepts, in characters. */
+export const MAX_VERIFICATION_SEAL_LENGTH = 2048;
+
+/** The characters a `Message.verificationSeal` may use: base64 and base64url, plus `.`/`:` separators. */
+const VERIFICATION_SEAL_PATTERN = /^[A-Za-z0-9+/=_.:-]+$/;
 
 /** Every top-level `Date` field of `Message` - coerced on create/update (see `BaseScopedChildRoute.dateFields`). */
 const MESSAGE_DATE_FIELDS = [
@@ -205,6 +216,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * without depending on either backend directly - see `util/LegalHoldUtils.ts`. */
     protected abstract matterClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so `setVerificationSeal()` can read the mailbox's `KeyVault`
+     * master key generation without depending on either backend directly. */
+    protected abstract keyVaultClass: any;
+
+    private keyVaultRepo?: RepoUtils<KeyVault>;
+
     private folderRepo?: RecoverableRepoUtils<any>;
 
     private focusedInboxOverrideRepo?: RepoUtils<FocusedInboxOverride>;
@@ -295,6 +312,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      */
     protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
         await super.prepareCreate(obj, user);
+        // Never from a create or update body, trusted callers included: a seal is only ever written once, by
+        // `setVerificationSeal()`.
+        delete obj.verificationSeal;
+        delete obj.verificationSealGeneration;
         if (this.isTrusted(user)) {
             return;
         }
@@ -318,11 +339,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * in Drafts only.
      */
     //
-    // For every caller, trusted included: `messageId`/`conversationId` are bounded (`boundIndexedValue()`) - an update is
-    // written as a patch without the model constructor that normally bounds them, and an over-long value would fail the
+    // For every caller, trusted included: `verificationSeal`/`verificationSealGeneration` are dropped (see
+    // `setVerificationSeal()`), `messageId`/`conversationId` are bounded (`boundIndexedValue()`) - an update is written as a patch without the model constructor that normally bounds them, and an over-long value would fail the
     // write on MySQL/MariaDB - and a message whose send is in flight can't leave Outbox (`assertNotInFlight()`).
     protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
         await super.prepareUpdate(obj, existing, user);
+        delete obj.verificationSeal;
+        delete obj.verificationSealGeneration;
         for (const field of ["messageId", "conversationId"]) {
             if (typeof obj[field] === "string") {
                 obj[field] = boundIndexedValue(obj[field]);
@@ -1135,6 +1158,120 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             message,
             { user, ignoreACL: true },
         );
+    }
+
+    /**
+     * Stores the client's seal of a signature verification it performed (`Message.verificationSeal`), bound to the key vault
+     * master key generation it was sealed under (`verificationSealGeneration`). The server can't verify signatures (it can't
+     * decrypt, and isn't trusted to assert verification), so the seal is an opaque string it only stores.
+     *
+     * - 400 unless `seal` is a non-empty string of at most `MAX_VERIFICATION_SEAL_LENGTH` characters from
+     * `[A-Za-z0-9+/=_.:-]` and `masterKeyGeneration` is a non-negative integer; 404 for an unknown message; 403 without
+     * READ and UPDATE on the message's folder.
+     * - 409 when the mailbox has no `KeyVault` (nothing to seal against), or `masterKeyGeneration` isn't the vault's current
+     * generation (absent = 0): a stale client never writes.
+     * - No stored seal, or one from an older generation (a rekey made it unopenable): both fields are written, 200. The
+     * identical seal at the current generation: 200, no write. Anything else (a different seal at the same or a newer
+     * generation): 409.
+     *
+     * The write is version-checked, so of two concurrent writers only one lands; the other re-reads and gets the rules above
+     * again. Not blocked by a legal hold (a seal isn't message content) and not audited (user-private metadata).
+     */
+    @Summary("Set a message's verification seal")
+    @Description(
+        "Stores the client's opaque seal of a signature verification it performed on this message, bound to the key vault's " +
+            "current master key generation. The same seal again succeeds; a different seal only replaces one from an older generation.",
+    )
+    @Returns([Object])
+    @Put("/:id/verification-seal")
+    public async setVerificationSeal(
+        @Param("id") id: string,
+        body: { seal?: unknown; masterKeyGeneration?: unknown } | undefined,
+        @AuthUser user?: JWTUser,
+    ): Promise<T> {
+        if (!this.repoUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const seal: unknown = body?.seal;
+        if (typeof seal !== "string" || seal.length > MAX_VERIFICATION_SEAL_LENGTH || !VERIFICATION_SEAL_PATTERN.test(seal)) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                `seal must be a non-empty string of at most ${MAX_VERIFICATION_SEAL_LENGTH} base64 or base64url characters.`,
+            );
+        }
+        const generation: unknown = body?.masterKeyGeneration;
+        if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "masterKeyGeneration must be a non-negative integer.");
+        }
+        for (let attempt = 1; ; attempt++) {
+            const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true, skipCache: true });
+            if (!message) {
+                throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+            }
+            if (
+                !(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.READ)) ||
+                !(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))
+            ) {
+                throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+            }
+            const currentGeneration: number | undefined = await this.currentMasterKeyGeneration(message.mailboxUid);
+            if (currentGeneration === undefined) {
+                throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "This mailbox has no key vault to seal against.");
+            }
+            if (generation !== currentGeneration) {
+                throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "masterKeyGeneration isn't the key vault's current generation.");
+            }
+            const stored: unknown = message.verificationSeal;
+            if (typeof stored === "string" && stored.length > 0) {
+                const storedGeneration: number = BaseMessageRoute.generationOf(message.verificationSealGeneration);
+                if (storedGeneration === currentGeneration && stored === seal) {
+                    return message;
+                }
+                if (storedGeneration >= currentGeneration) {
+                    throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "This message already has a different verification seal.");
+                }
+            }
+            try {
+                const updated: T = await this.repoUtils.update(
+                    {
+                        uid: message.uid,
+                        version: (message as any).version,
+                        verificationSeal: seal,
+                        verificationSealGeneration: currentGeneration,
+                    } as any,
+                    asEntity(this.repoUtils, message),
+                    { user, ignoreACL: true },
+                );
+                this.notificationUtils?.sendMessage(updated.folderUid, this.modelClass.name, "update", updated);
+                return updated;
+            } catch (err: any) {
+                // Lost the optimistic lock: a concurrent seal (resolved on the re-read) or an unrelated write (retried).
+                /* v8 ignore next 3 -- only a database failure, or losing the lock to unrelated writes three times running */
+                if (err?.status !== 409 || attempt >= 3) {
+                    throw err;
+                }
+            }
+        }
+    }
+
+    /** A stored generation as a number: anything but a non-negative integer (absent, `null`, a legacy value) counts as 0. */
+    private static generationOf(value: unknown): number {
+        return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+    }
+
+    /** The mailbox's `KeyVault.masterKeyGeneration` (absent = 0), or `undefined` when the mailbox has no key vault. Read
+     * uncached, so a rekey is seen at once. */
+    private async currentMasterKeyGeneration(mailboxUid: string): Promise<number | undefined> {
+        if (!this.keyVaultRepo) {
+            this.keyVaultRepo = await this._objectFactory!.newInstance(RepoUtils, { name: this.keyVaultClass.name, args: [this.keyVaultClass] });
+        }
+        const vaults: KeyVault[] = await this.keyVaultRepo.find({ mailboxUid: ModelUtils.literal(mailboxUid), limit: 1 } as any, {
+            ignoreACL: true,
+            limit: 1,
+            skipCache: true,
+        });
+        return vaults[0] ? BaseMessageRoute.generationOf(vaults[0].masterKeyGeneration) : undefined;
     }
 
     /** Creates - or, when one already exists for this sender, updates - the mailbox's standing

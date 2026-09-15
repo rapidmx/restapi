@@ -1886,3 +1886,51 @@ refresh; failing refresh still delivers); keyTrustSuite, model and ContactRoute 
 
 Verification: `tsc --noEmit` and `yarn lint` clean. Full `yarn vitest run --coverage` (after part A's tree was idle):
 251 files / 5022 tests passed; coverage 100 / 96.72 / 100 / 100 (statements / branches / functions / lines).
+
+## 2026-09-15 — Message verification seal: `Message.verificationSeal`, `PUT /:id/verification-seal`
+
+Uncommitted, no version bump. react-shared and web-client build against this contract. Amended mid-task from strict write-once
+to generation-bound replacement (a key vault rekey makes older seals unopenable, so write-once would block re-sealing forever).
+
+Contract
+- `Message.verificationSeal?: string | null` (opaque; Mongo string, SQL `text` nullable) and
+  `Message.verificationSealGeneration?: number | null` (SQL `integer` nullable). Both in `SERVER_MANAGED_MESSAGE_FIELDS`.
+- `PUT /mail/messages/:id/verification-seal` (`BaseMessageRoute.setVerificationSeal()`), body `{ seal, masterKeyGeneration }`.
+  Order: 500 no repoUtils -> 400 seal (not a string, empty, > `MAX_VERIFICATION_SEAL_LENGTH` = 2048 (exported), outside
+  `[A-Za-z0-9+/=_.:-]`) -> 400 generation (not a non-negative safe integer) -> 404 -> 403 (READ and UPDATE on the message's
+  current folder; checked BEFORE the vault lookup so a stranger can't probe for a vault) -> 409 no KeyVault for
+  `message.mailboxUid` -> 409 generation != vault `masterKeyGeneration` (absent/invalid = 0) -> stored non-empty seal with
+  storedGeneration (absent/invalid = 0): equal gen + identical = 200 no write; storedGen >= current = 409 (a different seal at
+  the same gen, or anything at a newer gen); storedGen < current = replace (identical seal gets re-stamped too) -> no stored
+  seal = write. Write is version-checked (`asEntity()`); a lost lock (RepoUtils 409) re-runs the whole read/vault/rules, up to
+  3 attempts. Returns the message; publishes `update` on the folder channel. No legal-hold check, no audit.
+- Vault read per attempt is uncached (`skipCache`) with `ModelUtils.literal(mailboxUid)`. Not atomic with the message write: a
+  rekey landing between the vault read and the message write can still store a seal at the just-superseded generation - the
+  next write at the new generation replaces it, so it's self-healing.
+- `BaseMessageRoute` gained abstract `keyVaultClass` (breaking for custom subclasses; restapi's two concrete routes set it).
+- `prepareCreate()`/`prepareUpdate()` delete both fields for TRUSTED callers too (decided: the dedicated route is the only
+  writer). `:property` goes through `update()`, so it's dropped there too (200, unchanged).
+- Route order: `@Put("/:id/verification-seal")` wins over the inherited `@Put("/:id/:property")` on both test backends
+  (`getRouteMethods()` registers subclass members first).
+
+Copy paths audited (restapi only): every `Message` construction lists fields explicitly - `ScanQueueJob` primary + rule copies,
+`MailboxImportJob`. Forwards/list relays/recall/receipts relay MIME, not rows. `send()`/`ScheduledSendJob` file the SAME row into
+Sent Items (not a copy), so a seal on a draft stays on that row - not refused, the contract doesn't mention drafts. Import formats
+are only mbox/PST (no JSON import of the user's own export exists), so import never sets either field; if a JSON import is ever
+added, it may keep both only for the user's own export. JSON data export and matter export serialize whole rows
+(`collectMailboxContentLines()`), so both are included as-is; mbox can't carry them. Erasure purges rows. activesync/mapi sibling
+repos don't subclass BaseMessageRoute and weren't checked for copy paths.
+
+Tests: shared `test/routes/verificationSealSuite.ts` run from `test/routes/{mongo,sql}/MessageVerificationSeal.test.ts` (28 each:
+set, rekeyed-vault generation, max length, idempotent without version bump, 409 different at same gen, replace after rekey then
+hold, identical seal re-stamped, stored seal without generation = 0, stale/future client generation, vault without generation = 0,
+stored newer than vault 409, no vault 409, real concurrent races (first write; replacement), deterministic interleavings via a
+one-shot `RepoUtils.prototype.update` spy (different seal 409, replacement race 409, same seal 200, unrelated write retried), 400
+bodies incl. generation, 404, 403 other/READ-only/UPDATE-only + delegate 200, 403 before vault check, legal hold doesn't block,
+create/bulk create/update/bulk update/`:property` ignore both fields for owner and admin, sealed draft send keeps one row and
+relays no seal). `test/routes/BaseMessageRoute.test.ts` guard (500). ScanQueueJob mongo+sql: a retry after the primary was
+sealed files a rule copy without either field and forwards MIME without the seal. DataExport/MatterExport JSON include both;
+MailboxImport mbox leaves both unset.
+
+Verification: `tsc --noEmit` and `yarn lint` clean. Full `yarn vitest run --coverage`: 253 files / 5081 tests passed; coverage
+100 / 96.74 / 100 / 100 (statements / branches / functions / lines).

@@ -192,6 +192,8 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
                 folderUid: uuid.v4(),
                 messageId: `${uuid.v4()}@example.com`,
                 subject: "In range",
+                verificationSeal: "v1.matter-seal",
+                verificationSealGeneration: 1,
                 from: { address: "alice@example.com", type: RecipientType.TO },
                 recipients: [],
                 sentDate: new Date("2026-03-15"),
@@ -251,6 +253,8 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
         const messageLines = lines.filter((l) => l.entityType === "message");
         expect(messageLines.length).toBe(1);
         expect(messageLines[0].subject).toBe("In range");
+        expect(messageLines[0].verificationSeal).toBe("v1.matter-seal");
+        expect(messageLines[0].verificationSealGeneration).toBe(1);
         expect(lines.some((l) => l.entityType === "contact" && l.displayName === "A Contact")).toBe(true);
         expect(lines.filter((l) => l.entityType === "Mailbox").length).toBe(2);
 

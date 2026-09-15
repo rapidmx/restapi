@@ -201,6 +201,16 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     public retainedBodyBlobKeys?: string[] | null;
 
     @Column()
+    @Description("Client-written, write-once opaque seal of a client-side signature verification (PUT /:id/verification-seal).")
+    @Nullable
+    public verificationSeal?: string | null;
+
+    @Column()
+    @Description("The key vault master key generation verificationSeal was sealed under (set with it).")
+    @Nullable
+    public verificationSealGeneration?: number | null;
+
+    @Column()
     @Description(
         "Set by recall() the moment a recall is requested - purely informational, the eventual outcome is " +
             "reported back to the sender as an ordinary visible email instead of being synced onto this field.",
@@ -314,6 +324,9 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.scheduledSendLeaseExpiresAt =
                 "scheduledSendLeaseExpiresAt" in other ? other.scheduledSendLeaseExpiresAt : this.scheduledSendLeaseExpiresAt;
             this.retainedBodyBlobKeys = "retainedBodyBlobKeys" in other ? other.retainedBodyBlobKeys : this.retainedBodyBlobKeys;
+            this.verificationSeal = "verificationSeal" in other ? other.verificationSeal : this.verificationSeal;
+            this.verificationSealGeneration =
+                "verificationSealGeneration" in other ? other.verificationSealGeneration : this.verificationSealGeneration;
             this.recallRequestedAt = "recallRequestedAt" in other ? other.recallRequestedAt : this.recallRequestedAt;
             this.conversationId = "conversationId" in other ? boundIndexedValue(other.conversationId) : this.conversationId;
             this.inferenceClassification =

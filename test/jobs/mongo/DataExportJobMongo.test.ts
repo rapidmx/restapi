@@ -225,6 +225,8 @@ describe("DataExportJobMongo Tests (real DB + DI)", () => {
                 folderUid,
                 messageId: `${uuid.v4()}@example.com`,
                 subject: "A Message",
+                verificationSeal: "v1.opaque-seal_value:AB+/=",
+                verificationSealGeneration: 2,
                 from: { address: "alice@example.com", type: RecipientType.TO },
                 recipients: [{ address: "bob@example.com", type: RecipientType.TO }],
                 sentDate: new Date(),
@@ -258,6 +260,9 @@ describe("DataExportJobMongo Tests (real DB + DI)", () => {
         );
         expect(lines.find((line) => line.entityType === "Mailbox").uid).toBe(mailbox.uid);
         expect(lines.find((line) => line.entityType === "message").subject).toBe("A Message");
+        // The client's verification seal is exported as the opaque value it is.
+        expect(lines.find((line) => line.entityType === "message").verificationSeal).toBe("v1.opaque-seal_value:AB+/=");
+        expect(lines.find((line) => line.entityType === "message").verificationSealGeneration).toBe(2);
         expect(lines.find((line) => line.entityType === "contact").displayName).toBe("A Contact");
         expect(lines.find((line) => line.entityType === "note").title).toBe("A Note");
     });

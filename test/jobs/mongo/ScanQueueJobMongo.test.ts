@@ -2971,6 +2971,51 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             expect((await scanResultRepo.find({ targetUid: messages[0].uid }).toArray()).length).toBe(1);
             expect((await ingestQueueRepo.findOne({ uid: entry.uid } as any))!.status).toBe(IngestStatus.DELIVERED);
         });
+
+        it("A rule copy filed and a rule forward relayed while the primary message already carries a verification seal get none of it.", async () => {
+            await createMailbox();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeRawMessage());
+            const entry = await createIngestEntry({ rawBlobKey });
+            await job.run();
+
+            const seal = "v1.primary-seal_value";
+            const [primary] = await messageRepo.find({ mailboxUid }).toArray();
+            await messageRepo.updateOne({ uid: primary.uid }, { $set: { verificationSeal: seal, verificationSealGeneration: 1 }, $inc: { version: 1 } });
+            // The rules only exist for the retry, which files the copy and relays the forward from the sealed primary's entry.
+            const copyFolder = await folderRepo.save(
+                new FolderMongo({ mailboxUid, name: "Archive", type: FolderType.USER, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }),
+            );
+            await mailFilterRuleRepo.save(
+                new MailFilterRuleMongo({
+                    mailboxUid,
+                    name: "Copy and forward",
+                    enabled: true,
+                    sequence: 0,
+                    stopProcessingRules: false,
+                    conditions: { subjectContains: ["Test message"] },
+                    actions: [
+                        { type: MailFilterActionType.COPY_TO_FOLDER, folderUid: copyFolder.uid },
+                        { type: MailFilterActionType.FORWARD, forwardTo: "assistant@example.com" },
+                    ],
+                }),
+            );
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            transport.sent = [];
+            await ingestQueueRepo.updateOne({ uid: entry.uid }, { $set: { status: IngestStatus.PENDING } });
+            await job.run();
+
+            const copies = await messageRepo.find({ folderUid: copyFolder.uid }).toArray();
+            expect(copies).toHaveLength(1);
+            expect(copies[0].uid).not.toBe(primary.uid);
+            expect(copies[0].verificationSeal ?? undefined).toBeUndefined();
+            expect(copies[0].verificationSealGeneration ?? undefined).toBeUndefined();
+            expect((await messageRepo.findOne({ uid: primary.uid } as any))!.verificationSeal).toBe(seal);
+            const forwarded = transport.sent.find((m) => m.envelopeTo.includes("assistant@example.com"));
+            expect(forwarded).toBeDefined();
+            expect(forwarded!.raw.toString("utf-8")).not.toContain(seal);
+        });
     });
 
     describe("Mail filter rule safety", () => {
