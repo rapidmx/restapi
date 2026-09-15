@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-15
+
+### Added
+- Added an optional ui field to plugin manifests declaring pages on the public, www, admin or escrow hosts and navigation entries for settings, the admin console and the app rail, validated when a plugin is looked up
+
+### Changed
+- Refuse plugin pages at reserved core paths, and refuse plugin changes whose pages would share or nest under another enabled plugin's pages, including changes made at the same time
+- Export PluginUiUtils with the manifest ui parser, the reserved mount list and the mount conflict helpers for the server
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Export DateCoercionUtils from the package root for plugins
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+### Removed
+- Removed public booking pages, booking types and bookings from core, moving them to @rapidmx/booking-plugin; resource and room booking stay
+- Removed the booking class fields and purges from the erasure job, leaving bookings to the generic mailbox-scoped plugin data purge
+
 ## [0.11.0] - 2026-09-15
 
 ### Added
@@ -867,7 +883,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/RapidMX/restapi/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/RapidMX/restapi/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/RapidMX/restapi/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/RapidMX/restapi/compare/v0.8.0...v0.9.0

@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## v0.12.0
 
 ### Breaking changes
 
