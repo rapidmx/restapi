@@ -45,8 +45,19 @@ export interface PublicKey {
     notBefore: number;
     /** UTC timestamp (epoch ms) at which this key expires. */
     notAfter: number;
-    /** UTC timestamp (epoch ms) at which this key was revoked, if applicable. */
+    /** UTC timestamp (epoch ms) at which this key was revoked, if applicable. Also set, to the install time, on every
+     * older unrevoked key of the same `useType` when a new key becomes a mailbox's active key (a superseded key). */
     revokedAt?: number;
+    /** Why `revokedAt` is set: `"superseded"` when a newer key of the same `useType` replaced this one in a routine
+     * rotation (the key was not compromised, so signatures and mail made before `revokedAt` stay trustworthy), or
+     * `"compromised"` when the key must not be trusted at all. Absent alongside a `revokedAt` (rows from before this
+     * field existed) means `"compromised"`. Meaningless without `revokedAt`. */
+    revocationReason?: "superseded" | "compromised";
+    /** The base64 encoded DER X.509 certificate that directly issued `publicKey`, when known and verified (the leaf's
+     * issuer name equals its subject and the leaf's signature verifies against its key). At most 16 KB of base64.
+     * Lets a peer prove a rotated certificate came from the same issuing CA as the one it pinned. Published through
+     * discovery; never carried in the `RapidMX-Key` header. */
+    issuerCertificate?: string;
 }
 
 /**
@@ -1263,7 +1274,7 @@ export interface Contact extends RecoverableBaseEntity {
     keys?: PublicKey[];
 
     /** UTC timestamp (epoch ms) at which this contact's keys were first observed - the TOFU (trust-on-first-
-     * use) anchor referenced in `keyConflict`'s `observedAt` comparison and surfaced to the user so they can
+     * use) anchor compared against a `KeyConflict.observedAt` and surfaced to the user so they can
      * judge a key change's plausibility (e.g. "first seen 3 years ago" vs. "first seen yesterday"). */
     keysFirstSeen?: number;
 
@@ -1272,14 +1283,48 @@ export interface Contact extends RecoverableBaseEntity {
      * discoverable key must still update this field even though it must NOT touch `encryptPreference`/`keys`. */
     lastMessageSeen?: number;
 
-    /** Set when an observed key conflicts with the currently pinned key for this contact - blocks silent
-     * acceptance of the new key (`util/KeyringUtils.ts`'s Key Conflict Handling) until the user takes explicit
-     * action. The previously pinned key in `keys`/`encryptPreference` is retained unchanged while this is set. */
-    keyConflict?: {
-        observedFingerprint: string;
-        observedAt: number;
-        source: "header" | "discovery";
-    };
+    /** Observed keys that conflict with the pinned key of their `useType` and weren't replaced automatically
+     * (`util/KeyringUtils.ts`'s Key Conflict Handling) - at most one per `useType`, the latest observation wins. The
+     * pinned key in `keys` is retained unchanged until the user resolves the conflict (`POST /:id/keys/resolve`).
+     * Server-managed. Replaces the former single `keyConflict`, which is dropped on read (it carried no observed key,
+     * so it could never be accepted). */
+    keyConflicts?: KeyConflict[];
+
+    /** Keys that were pinned for this contact and have since been replaced, newest first, at most 5 per `useType` -
+     * kept so mail signed before a rotation still verifies. Server-managed. */
+    previousKeys?: PreviousKey[];
+
+    /** Observed keys the user rejected (`POST /:id/keys/resolve` with `action: "reject"`), newest first, at most 10 -
+     * a rejected key is not recorded as a conflict again. Server-managed. */
+    rejectedKeys?: RejectedKey[];
+}
+
+/** An observed key that differs from a contact's pinned key of the same `useType` (`Contact.keyConflicts`). */
+export interface KeyConflict {
+    useType: "sign" | "encrypt";
+    /** The observed key in full, so the user can accept it. */
+    observedKey: PublicKey;
+    /** UTC timestamp (epoch ms) of the observation. */
+    observedAt: number;
+    /** Whether the key came from an inbound `RapidMX-Key` header or a discovery fetch. */
+    source: "header" | "discovery";
+}
+
+/** A formerly pinned key of a contact (`Contact.previousKeys`). */
+export interface PreviousKey extends PublicKey {
+    /** UTC timestamp (epoch ms) at which it stopped being the pinned key. */
+    replacedAt: number;
+    /** `"automatic"` when replaced by a key from the same issuing CA after it expired or was revoked, `"user"` when
+     * the user accepted a new key. */
+    replacement: "automatic" | "user";
+}
+
+/** An observed key the user rejected (`Contact.rejectedKeys`). */
+export interface RejectedKey {
+    useType: "sign" | "encrypt";
+    fingerprint: string;
+    /** UTC timestamp (epoch ms) of the rejection. */
+    rejectedAt: number;
 }
 
 /**
@@ -1551,6 +1596,12 @@ export enum AuditAction {
     /** `POST /mailbox/:id/keys/trust` pinned a signer certificate on a contact by hand ("Trust this signer"). `details`
      * carries the `address` and the certificate `fingerprint`. See `BaseKeyLookupRoute.trust()`. */
     CONTACT_KEY_TRUSTED = "contact.key_trusted",
+    /** `POST /mailbox/:id/keys/resolve` with `action: "accept"` replaced a contact's pinned key. `details` carries the
+     * `address`, `useType`, and the `from`/`to` fingerprints. See `BaseKeyLookupRoute.resolve()`. */
+    CONTACT_KEY_REPLACED = "contact.key_replaced",
+    /** `POST /mailbox/:id/keys/resolve` with `action: "reject"` dismissed a contact's key conflict. `details` carries the
+     * `address`, `useType`, the rejected `fingerprint` and the `pinnedFingerprint` kept. */
+    CONTACT_KEY_CONFLICT_REJECTED = "contact.key_conflict_rejected",
     /** `AcmeEnrollmentDriverJob`'s own periodic flag for a mailbox's signing certificate nearing `notAfter`
      * with no newer non-revoked one already enrolled - detection only, this server can't originate a fresh
      * CSR itself (the signing key pair is always client-side). */

@@ -13,7 +13,8 @@ import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles, StaticDnsResolver } from "../../testDoubles.js";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
-import { keyTrustSuite } from "../keyTrustSuite.js";
+import { keyResolveSuite } from "../keyResolveSuite.js";
+import { keyTrustSuite, type KeyTrustSuiteContext } from "../keyTrustSuite.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -270,7 +271,7 @@ describe("Route:KeyLookupMongo Tests", () => {
         expect(result.status).toBe(403);
     });
 
-    keyTrustSuite({
+    const keySuiteContext: KeyTrustSuiteContext = {
         app: () => server.getApplication(),
         baseUrl,
         tokenFor: (user) => JWTUtils.createTokenSync(config.get("auth"), user),
@@ -295,5 +296,7 @@ describe("Route:KeyLookupMongo Tests", () => {
         findAuditEntries: async (mailboxUid) => await auditLogRepo.find({ mailboxUid }).toArray(),
         dnsResolver: () => objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!,
         mockFetch: () => mockFetch,
-    });
+    };
+    keyTrustSuite(keySuiteContext);
+    keyResolveSuite(keySuiteContext);
 });

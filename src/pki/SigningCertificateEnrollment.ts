@@ -6,7 +6,9 @@
 /** The current outcome of a signing-certificate enrollment started via `startEnrollment()`. */
 export interface EnrollmentResult {
     status: "pending" | "issued" | "failed";
-    /** The issued certificate, PEM-encoded - present only once `status` is `"issued"`. */
+    /** The issued certificate, PEM-encoded - present only once `status` is `"issued"`. May be a PEM chain (leaf first,
+     * then its issuer, ...): the installers (`publicKeyFromCertificatePem()`) install the first certificate and publish
+     * the second as `PublicKey.issuerCertificate` when it verifiably issued the first. */
     certificate?: string;
     /** A human-readable reason - present only once `status` is `"failed"`. */
     error?: string;

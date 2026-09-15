@@ -317,6 +317,38 @@ describe("parseKeyDiscoveryResponse() Tests", () => {
         });
     });
 
+    it("Keeps a well-formed issuerCertificate and revocationReason, and treats null ones as absent.", () => {
+        const issuerCertificate = "A".repeat(16384);
+        expect(
+            parseKeyDiscoveryResponse({
+                encryptPreference: { preferEncrypt: "mutual" },
+                keys: [
+                    { ...validKey, issuerCertificate, revokedAt: 3, revocationReason: "superseded" },
+                    { ...validKey, revokedAt: 4, revocationReason: "compromised" },
+                    { ...validKey, issuerCertificate: null, revocationReason: null },
+                    // A reason without revokedAt means nothing and isn't kept.
+                    { ...validKey, revocationReason: "superseded" },
+                ],
+                escrow: false,
+            })?.keys,
+        ).toEqual([
+            { ...validKey, issuerCertificate, revokedAt: 3, revocationReason: "superseded" },
+            { ...validKey, revokedAt: 4, revocationReason: "compromised" },
+            validKey,
+            validKey,
+        ]);
+    });
+
+    it.each([
+        ["a non-base64 issuerCertificate", { issuerCertificate: "not base64!" }],
+        ["an empty issuerCertificate", { issuerCertificate: "" }],
+        ["an issuerCertificate over 16 KB", { issuerCertificate: "A".repeat(16388) }],
+        ["a non-string issuerCertificate", { issuerCertificate: 5 }],
+        ["an unknown revocationReason", { revokedAt: 3, revocationReason: "lost" }],
+    ])("Rejects the whole response for a key with %s.", (_label, fields) => {
+        expect(parseKeyDiscoveryResponse({ encryptPreference: { preferEncrypt: "mutual" }, keys: [{ ...validKey, ...fields }], escrow: false })).toBeUndefined();
+    });
+
     it("Treats a null lastSeen/revokedAt as absent.", () => {
         const result = parseKeyDiscoveryResponse({
             encryptPreference: { preferEncrypt: "nopreference", lastSeen: null },

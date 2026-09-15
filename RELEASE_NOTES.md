@@ -14,10 +14,10 @@ no signing key pinned yet.
 
 - **`POST /mail/mailboxes/:id/keys/trust`** with `{ "address": "<address>", "certificate": "<base64 DER X.509>" }` pins
   the certificate as the address's signing key on the contact in the mailbox, creating the contact in Contacts if there
-  is none. It returns the same `{ keys, encryptPreference?, keyConflict? }` as `GET /:id/keys/lookup`.
+  is none. It returns the same `{ keys, encryptPreference?, keyConflicts?, previousKeys? }` as `GET /:id/keys/lookup`.
   - **Only the first signing key:** 409 when a different signing key is already pinned (replacing one is still
     discovery's Key Conflict Handling). The same certificate again is 200 and changes nothing.
-  - **Nothing else changes:** encrypt keys, `encryptPreference` and `keyConflict` stay as they are; `keysFirstSeen`
+  - **Nothing else changes:** encrypt keys, `encryptPreference` and `keyConflicts` stay as they are; `keysFirstSeen`
     is set if unset. Fingerprint and validity dates come from the certificate.
   - **400** for a body that isn't `{ address, certificate }`, an address that isn't one plain `local@domain`, and a
     certificate that doesn't parse, isn't currently valid, doesn't name the address (subjectAltName email, or subject
@@ -32,6 +32,104 @@ no signing key pinned yet.
   with two contacts or two signing keys. A lost version race is retried instead of returned as 409.
 - **Contacts folder access:** a Contacts folder created by a lookup or trust no longer gives the caller creator rights on
   it; it inherits the mailbox's access.
+
+### Key rotation continuity (publishing side)
+
+- **`PublicKey.issuerCertificate`** (base64 DER, at most 16 KB of base64): the certificate that directly issued the key's
+  certificate. It is stored only after checking that the leaf's issuer name equals its subject and the leaf's signature
+  verifies against its key. Otherwise it is dropped and the key still installs. Discovery (`/.well-known/rapidmx/keys/:hash`)
+  publishes it. The `RapidMX-Key` header doesn't carry it. Peers can use it to prove that a rotated certificate comes from
+  the same CA as the pinned one.
+  - Encryption keys: `EncryptionCertificateAuthority.issue()` results gain an optional `issuerCertificate` (PEM).
+    `LocalX509CertificateAuthority` returns its CA certificate. `OpenBaoPkiCertificateAuthority` returns `issuing_ca`, or
+    the first `ca_chain` entry when that is missing. A custom authority may leave it out.
+  - Signing keys: the certificate given to `POST /:id/keyvault/keys` (`useType: "sign"`), or issued to an automated
+    enrollment, may be a PEM chain. The first certificate is installed, and the second is used as its issuer. Before,
+    only the first certificate was read.
+- **Superseded keys are revoked.** When `enrollKey()` or the ACME driver job installs a key, every older unrevoked key of
+  the same `useType` gets `revokedAt` (the install time) and the new **`PublicKey.revocationReason: "superseded"`**. This
+  happens in the same mailbox write, so a failed install revokes nothing. Wrapped private keys stay in the vault. A
+  re-enrolled certificate replaces its earlier `Mailbox.keys` entry instead of adding a second one.
+  - `revocationReason` is `"superseded"` (routine rotation: signatures and mail from before `revokedAt` stay trustworthy)
+    or `"compromised"`. An absent reason on a revoked key means compromised. Discovery publishes it, and
+    `parseKeyDiscoveryResponse()` keeps it. An unknown value, or a malformed `issuerCertificate`, makes the response
+    malformed.
+- **`PUT /:id/keyvault/rekey` key rules** (the rest of the "identical fields" check is unchanged):
+  - `issuerCertificate` may be left out or null (the stored one is kept) or sent unchanged. Any other value is 400.
+  - A stored revocation is kept even when the request leaves out `revokedAt`, so revocations can't be withdrawn.
+  - A request may escalate `"superseded"` to `"compromised"`, but not the reverse.
+  - Newly setting `revokedAt` records the request's reason, or `"compromised"` when none is given.
+  - A non-numeric `revokedAt` or an unknown `revocationReason` is 400. Fields outside `PublicKey` are no longer stored.
+  - After a rekey, only each `useType`'s active key stays unrevoked: the unrevoked, unexpired key with the latest
+    `notBefore`. Any other unrevoked key is revoked as superseded, which cleans up mailboxes enrolled before this release.
+- **Client impact:** a mailbox's older keys now show as revoked after a rotation. Clients that ignore every revoked
+  signing key will stop trusting signatures made with the older key. They should keep trusting a `"superseded"` key for
+  signatures made before `revokedAt`. `BaseMessageRoute`'s `RapidMX-Key` header and `ScanQueueJob`'s MDN rotation hint use
+  the first unrevoked encryption key. They now announce the current key instead of the oldest.
+
+### Key rotation continuity (receiving side)
+
+A contact whose key changed used to be stuck: the change was recorded as a conflict and nothing could replace the pinned
+key. Now a routine rotation within the same CA is applied automatically, and anything else can be accepted or rejected by
+the user.
+
+- **Automatic replacement.** When discovery or an inbound `RapidMX-Key` header shows a different key for a `useType` that
+  has one pinned, the new key replaces the pinned one without prompting only when all of these hold:
+  - the new key carries `issuerCertificate`, that certificate may act as a CA (basicConstraints `cA`, when present, is
+    true), the new key's issuer name equals its subject, and the new key's signature verifies with its public key;
+  - the pinned key verifies against that same issuer, so both come from one CA key;
+  - the pinned key is expired, or revoked for either reason. A revocation counts when the pinned record has `revokedAt`,
+    or when the same discovery response lists the pinned key with `revokedAt`;
+  - the new key is currently valid, names the contact's address, and fits its `useType`. For `sign` that means keyUsage
+    (when present) with `digitalSignature`; for `encrypt`, keyUsage (when present) with `keyAgreement` or
+    `keyEncipherment`, the bits this library's CA issues. For both, extKeyUsage (when present) must include
+    `emailProtection`.
+
+  The old key moves to `previousKeys` with `replacement: "automatic"` and keeps its `revokedAt`/`revocationReason`. The
+  conflict for that `useType` is cleared. Otherwise the new key is recorded as a conflict, unless the user rejected it.
+- **Revocations in discovery responses.** A listed key with `revokedAt` is never pinned (not even on first use) and never
+  recorded as a conflict. When it matches a pinned or previous key, that key takes the listed revocation if it is stronger:
+  any revocation over none, `"compromised"` (or no reason) over `"superseded"`. A revocation is never weakened. A key
+  already in `previousKeys` is not recorded as a conflict again.
+- **Header conflicts refresh discovery.** The `RapidMX-Key` header carries no issuer, so a header conflict triggers a
+  discovery refresh for the sender, through the same contact write as the MDN rotation hint, so the automatic rule can
+  apply. It is bounded like that refresh (negative federation cache, per-address response cache, fetch timeout). A failed
+  refresh is logged and doesn't affect delivery.
+- **`POST /mail/mailboxes/:id/keys/resolve`** with
+  `{ address, useType: "sign" | "encrypt", action: "accept" | "reject", expectedPinnedFingerprint, certificate? }`:
+  - `accept` pins `certificate` (base64 DER) when given, otherwise the recorded conflict's key. Either is validated now:
+    it must parse, be currently valid, name the address and fit `useType`. The old key moves to `previousKeys` with
+    `replacement: "user"`, the conflict is cleared, and the key leaves `rejectedKeys`. It records a
+    `contact.key_replaced` audit entry (`AuditAction.CONTACT_KEY_REPLACED`) with `{ address, useType, from, to }`.
+  - `reject` clears the conflict and adds its fingerprint to `rejectedKeys`. It records a `contact.key_conflict_rejected`
+    audit entry (`AuditAction.CONTACT_KEY_CONFLICT_REJECTED`) with `{ address, useType, fingerprint, pinnedFingerprint }`.
+  - **200** with the lookup shape. An `accept` whose certificate is already the pinned key changes nothing.
+  - **400** for a malformed body (including `certificate` with `reject`), or a certificate (given or recorded) that fails
+    validation.
+  - **404** for a missing mailbox, no contact, no pinned key of `useType` (`accept`), or no conflict for `useType`
+    (`reject`, or `accept` without `certificate`).
+  - **409** when the pinned key isn't `expectedPinnedFingerprint`, so only the key the user saw is replaced.
+  - Access as for trust: UPDATE on the mailbox (403 otherwise) and UPDATE on the contact's folder. Rate limited. It uses
+    the same version-checked, race-retrying contact write as lookup, trust and the scan job.
+- **Contact fields**, all server-managed (the contact routes refuse them with 400, as they do the other key fields):
+  - `keyConflicts?: KeyConflict[]`, where `KeyConflict` is `{ useType, observedKey: PublicKey, observedAt, source }`.
+    There is at most one per `useType`, and the latest observation wins.
+  - `previousKeys?: PreviousKey[]`, where `PreviousKey` is a `PublicKey` plus `replacedAt` and
+    `replacement: "automatic" | "user"`. Newest first, at most 5 per `useType`. These are kept so mail signed before a
+    rotation still verifies. Clients should trust a previous signing key unless it is revoked as compromised.
+  - `rejectedKeys?: { useType, fingerprint, rejectedAt }[]`. Newest first, at most 10.
+
+### Breaking changes (key rotation continuity)
+
+- **`Contact.keyConflict` is replaced by `Contact.keyConflicts`.** The old single conflict held only a fingerprint, so it
+  can't be accepted. It is dropped on read: the model no longer has the field, and SQL schema synchronization drops the
+  column. The pinned key is unchanged, so the next observation of the differing key records a complete conflict.
+- **The lookup and trust response** is now `{ keys, encryptPreference?, keyConflicts?, previousKeys? }`. `keyConflict`
+  is gone, and `keyConflicts`/`previousKeys` are omitted when empty.
+- **`applyDiscoveredKeys()` takes the contact's address** as a new fifth argument. `ContactKeyState`/`KeyringUpdate`
+  carry `keyConflicts`, `previousKeys` and `rejectedKeys` instead of `keyConflict`.
+- **`sanitizeDiscoveredKey()`** keeps `revocationReason` only when it's `"superseded"` or `"compromised"` on a key with
+  `revokedAt`.
 
 ## v0.10.0
 

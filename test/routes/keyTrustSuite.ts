@@ -73,7 +73,8 @@ export function keyTrustSuite(ctx: KeyTrustSuiteContext): void {
             expect(res.status).toBe(200);
             expect(res.body.keys).toEqual([expect.objectContaining({ publicKey: certificate, type: "x509", useType: "sign", fingerprint })]);
             expect(res.body.encryptPreference).toBeUndefined();
-            expect(res.body.keyConflict).toBeUndefined();
+            expect(res.body.keyConflicts).toBeUndefined();
+            expect(res.body.previousKeys).toBeUndefined();
             const contacts = await ctx.findContacts(mailbox.uid);
             expect(contacts).toHaveLength(1);
             expect(contacts[0].emails).toEqual([{ address, type: "other" }]);
@@ -108,7 +109,7 @@ export function keyTrustSuite(ctx: KeyTrustSuiteContext): void {
                 keys: [encryptKey("enc-fp")],
                 encryptPreference: { preferEncrypt: "mutual", lastSeen: 7 },
                 keysFirstSeen: 1234,
-                keyConflict: { observedFingerprint: "other-enc", observedAt: 5, source: "discovery" },
+                keyConflicts: [{ useType: "encrypt", observedKey: encryptKey("other-enc"), observedAt: 5, source: "discovery" }],
             });
             await ctx.saveAcl({ uid: existing.folderUid, parentUid: mailbox.uid, records: [] });
             const { certificate, fingerprint } = await signer(address);
@@ -121,7 +122,9 @@ export function keyTrustSuite(ctx: KeyTrustSuiteContext): void {
                 ["sign", fingerprint],
             ]);
             expect(res.body.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 7 });
-            expect(res.body.keyConflict).toEqual({ observedFingerprint: "other-enc", observedAt: 5, source: "discovery" });
+            expect(res.body.keyConflicts).toEqual([
+                { useType: "encrypt", observedKey: expect.objectContaining({ fingerprint: "other-enc" }), observedAt: 5, source: "discovery" },
+            ]);
             const contacts = await ctx.findContacts(mailbox.uid);
             expect(contacts).toHaveLength(1);
             expect(contacts[0].uid).toBe(existing.uid);

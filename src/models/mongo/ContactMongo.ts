@@ -10,7 +10,7 @@ import {
     RecoverableBaseMongoEntity,
 } from "@rapidrest/service-core";
 import { ObjectDecorators } from "@rapidrest/core";
-import { Contact, ContactEmail, ContactPhone, ContactPostalAddress, EncryptionPreference, PublicKey } from "../types.js";
+import { Contact, ContactEmail, ContactPhone, ContactPostalAddress, EncryptionPreference, KeyConflict, PreviousKey, PublicKey, RejectedKey } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Nullable } = ObjectDecorators;
@@ -138,9 +138,19 @@ export class ContactMongo extends RecoverableBaseMongoEntity implements Contact 
     public lastMessageSeen?: number;
 
     @Column()
-    @Description("Set when an observed key conflicts with the currently pinned key for this contact.")
+    @Description("Observed keys that conflict with the pinned key of their useType, at most one per useType.")
     @Nullable
-    public keyConflict?: Contact["keyConflict"];
+    public keyConflicts?: KeyConflict[];
+
+    @Column()
+    @Description("Formerly pinned keys of this contact, newest first, at most 5 per useType.")
+    @Nullable
+    public previousKeys?: PreviousKey[];
+
+    @Column()
+    @Description("Observed keys the user rejected, newest first, at most 10.")
+    @Nullable
+    public rejectedKeys?: RejectedKey[];
 
     constructor(other?: Partial<ContactMongo>) {
         super(other);
@@ -166,7 +176,9 @@ export class ContactMongo extends RecoverableBaseMongoEntity implements Contact 
             this.keys = "keys" in other ? other.keys : this.keys;
             this.keysFirstSeen = "keysFirstSeen" in other ? other.keysFirstSeen : this.keysFirstSeen;
             this.lastMessageSeen = "lastMessageSeen" in other ? other.lastMessageSeen : this.lastMessageSeen;
-            this.keyConflict = "keyConflict" in other ? other.keyConflict : this.keyConflict;
+            this.keyConflicts = "keyConflicts" in other ? other.keyConflicts : this.keyConflicts;
+            this.previousKeys = "previousKeys" in other ? other.previousKeys : this.previousKeys;
+            this.rejectedKeys = "rejectedKeys" in other ? other.rejectedKeys : this.rejectedKeys;
         }
     }
 }

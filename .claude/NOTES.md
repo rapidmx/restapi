@@ -1760,3 +1760,129 @@ trust racing lookup); `test/util/ContactKeyUtils.test.ts` (race branches, soft-d
 can't re-parent an ACL through the raw repo and expect the next request to see it - use separate folders.
 Verification: `tsc --noEmit` and `yarn lint` clean; full `yarn vitest run --coverage` 248 files / 4927 tests passed,
 coverage 100 / 96.64 / 100 / 100 (statements / branches / functions / lines).
+
+## 2026-09-15 — Key rotation continuity, part A (publishing side): `issuerCertificate`, superseded-key revocation
+
+Uncommitted, no version bump. Concurrent with part B (receiving side: KeyringUtils merge, Contact model, resolve endpoint).
+Contract (react-shared/web-client/part B depend on it): `PublicKey.issuerCertificate?: string` (base64 DER of the direct
+issuer, present when known) and, per a mid-task amendment, `PublicKey.revocationReason?: "superseded" | "compromised"`
+(absent on a revoked key = compromised).
+
+- **Capture.** `IssuedCertificate.issuerCertificate?` is PEM (same encoding as `certificate`). Local CA returns its CA cert;
+  OpenBao returns `issuing_ca`, else `ca_chain[0]` (non-empty strings only). Signing certs (`enrollKey` sign path, ACME job)
+  go through `publicKeyFromCertificatePem()`, which now splits a PEM chain (`splitPemCertificates()`): block 0 is the leaf,
+  block 1 the candidate issuer, the rest ignored; no PEM blocks = parse the input as before.
+  `verifiedIssuerCertificate(leaf, pem)` keeps it only if `leaf.issuer === issuer.subject`, `leaf.checkIssued(issuer)` and
+  `leaf.verify(issuer.publicKey)` (checkIssued alone does NOT check the signature - verified with a same-name impostor CA)
+  and base64 DER <= 16384. Failure drops the issuer, never refuses the install. The encrypt path verifies the CA's issuer too.
+- **Publish.** Discovery returns `Mailbox.keys` as-is. `KeyDiscoveryClient.parsePublicKey()` (it rebuilds keys field by
+  field, so the fields were being DROPPED, not rejected) now keeps `issuerCertificate` (base64, 1..16384 chars,
+  `MAX_ISSUER_CERTIFICATE_BASE64_LENGTH`) and `revocationReason` (only alongside a numeric `revokedAt`); a malformed value
+  makes the whole response malformed like every other field; null = absent. `sanitizeDiscoveredKey()` spreads the key, so
+  both survive; it doesn't parse/verify the issuer - that's part B's call. Not in the `RapidMX-Key` header.
+- **Supersession.** `supersedeKeys(keys, installed, now)` (used in `persistEnrollment()` and the ACME job's mailbox write):
+  other unrevoked keys of the same `useType` get `revokedAt: now, revocationReason: "superseded"`; entries with the
+  installed fingerprint are replaced (re-enrolling a revoked/expired cert no longer leaves a duplicate). Same write as the
+  publish, so a failed install (CA error, 409 generation, collision, identity mismatch, mailbox write failure in the job)
+  revokes nothing. `persistEnrollment()` still writes mailbox then vault inside `@Transactional()` (unchanged order).
+  Wrapped private keys untouched (server never destroyed old signing private keys; still doesn't).
+- **Rekey (decided).** Keys are rebuilt from the stored entry (`rekeyedKey()`): `issuerCertificate` absent/null = keep stored,
+  equal = ok, else 400 (including adding one to a key stored without). Stored `revokedAt` is kept even if the request omits
+  it (a published revocation isn't withdrawable); a reason can escalate superseded -> compromised only; a new `revokedAt`
+  takes the request's reason or defaults to `"compromised"`; a reason without `revokedAt` is ignored; non-numeric
+  `revokedAt`/unknown reason = 400; extra fields are no longer stored. Then `revokeInactiveKeys()` revokes (superseded)
+  every unrevoked key that isn't its useType's active one (unrevoked, unexpired, latest `notBefore`, later index on tie -
+  react-shared `findActivePublicKey()`'s rule), normalizing pre-existing mailboxes. No-op for a useType with no active key.
+- **revokedAt consumers checked.** restapi: `BaseKeyVaultRoute` collision check (only blocks an active same fingerprint -
+  unaffected); `AcmeEnrollmentDriverJob.flagExpiringSigningCerts()` (newest unrevoked sign key - same answer);
+  `BaseMessageRoute` RapidMX-Key header and `ScanQueueJob` MDN rotation hint use `.find()` = FIRST unrevoked unexpired
+  encrypt key, which after a rotation was the OLD key - now the current one (a fix). `KeyringUtils` (part B) reads
+  `revokedAt` for conflict resolution. react-shared: `findActivePublicKey()` unchanged in effect (newest notBefore;
+  revocation only changes the pick when an installed key has an older notBefore); `signingKeyFingerprints()` drops revoked
+  keys -> own-mailbox and contact pins lose superseded signing keys, so old signed mail would show unverified until
+  react-shared keeps `revocationReason: "superseded"` keys (at least for signatures made before `revokedAt`). Decrypting
+  old mail: react-shared's unlock only opens the ACTIVE encryption key (pre-existing; revocation doesn't change it), and its
+  rekey rewrap (`rewrapPrivateKeysUnderNewMasterKey`) only re-seals the active keys, so a rekey already drops older wrapped
+  private keys from the vault (pre-existing spec gap, not changed here). web-client shows "(revoked)" on superseded keys.
+
+Tests (under `.vitest-lock`, targeted, `--coverage.enabled=false`): new `test/routes/keyRotationContinuitySuite.ts` +
+`{mongo,sql}/KeyRotationContinuity.test.ts` (controllable `ChainingTestCertificateAuthority`; issuer published through
+discovery; impostor/none dropped; encrypt rotation revokes superseded, sign untouched, vault keeps 3 wrapped keys; no revoke
+on CA failure/409/collision/identity; PEM chain sign install + revoke; bad chain issuers dropped; rekey issuer/revocation/
+reason rules; legacy normalization); new `test/util/CertificateInstallUtils.test.ts`; LocalX509 (issuer = CA PEM),
+OpenBao (issuing_ca / ca_chain / none / non-array), KeyDiscoveryClient (keep/null/reject), ACME job mongo+sql (chain
+issuer + superseded, impostor dropped, failed publish revokes nothing then revokes on the retry). Also ran KeyVaultRoute,
+KeyVaultRoute.SignEnrollmentAutomated, KeyDiscoveryRoute, RoutesKeysRound5 (both backends), BaseKeyVaultRoute unit, all of
+`test/pki`, RapidMxKeyHeaderUtils - all passing. `tsc` and eslint clean on touched files (tsc errors remaining at the time
+were part B's in-progress Contact changes). Pre-existing: `tsc -p tsconfig.test.json` reports errors in
+`test/routes/BaseKeyVaultRoute.test.ts` (missing abstract `escrowScopeClass` on its test subclass), untouched.
+
+## 2026-09-15 — Key rotation continuity, part B (receiving side): automatic replacement, `POST /:id/keys/resolve`
+
+Uncommitted, no version bump. Concurrent with part A (above). react-shared and web-client are built against this contract.
+
+Contract
+- Types (`src/models/types.ts`): `KeyConflict { useType; observedKey: PublicKey; observedAt; source: "header"|"discovery" }`,
+  `PreviousKey extends PublicKey { replacedAt; replacement: "automatic"|"user" }`, `RejectedKey { useType; fingerprint;
+  rejectedAt }`. `Contact.keyConflicts?` (one per useType, latest wins), `previousKeys?` (newest first, <= 5 per useType,
+  `MAX_PREVIOUS_KEYS_PER_USE_TYPE`), `rejectedKeys?` (newest first, <= 10, `MAX_REJECTED_KEYS`). `Contact.keyConflict` is
+  gone. All three new fields are in `BaseContactRoute`'s DISCOVERY_MANAGED_FIELDS (the old `keyConflict` name stays refused).
+  Mongo/SQL models: `simple-json` columns (SQL).
+- Lookup/trust/resolve response: `{ keys, encryptPreference?, keyConflicts?, previousKeys? }` (both omitted when empty;
+  conflicts normalized on output).
+- `applyDiscoveredKeys(existing, discovered, observedAt, source, address)` - new 5th arg. Order per call: sanitize keys;
+  copy listed revocations onto pinned/previous keys when stronger (`escalateRevocation()`: none < superseded < compromised
+  or no reason; never weakened); then per non-revoked listed key: skip if already in previousKeys (same useType+fp); TOFU if
+  nothing pinned (a revoked listed key is never TOFU-pinned any more - behaviour change); same fp = no-op;
+  `canReplaceAutomatically(pinned, observed, address, observedAt)` -> pin, old to previousKeys (`automatic`, keeps its
+  revokedAt/reason), drop that useType's conflict; else skip if in rejectedKeys; else set the useType's conflict.
+- `canReplaceAutomatically()`: (a) `issuerCertificate` parses (Node), basicConstraints (peculiar) absent or cA true, N
+  `issuer === I.subject && checkIssued(I) && verify(I.publicKey)` (same trio as part A's `verifiedIssuerCertificate`;
+  checkIssued also enforces keyCertSign when I has keyUsage); (b) same for P; (c) P expired at observedAt (from P's cert) or
+  `P.revokedAt` set (listing already escalated onto P); (d) `parseContactKey(N, address, useType, observedAt)`. One try block,
+  anything throwing = false.
+- `SignerCertificateUtils.parseContactKey(cert, address, useType, now)` generalizes `parseTrustedSignerKey` (now a wrapper).
+  Encrypt usage decided from `LocalX509CertificateAuthority`: keyUsage (if present) needs keyAgreement OR keyEncipherment;
+  EKU (if present) needs emailProtection for both use types.
+- `sanitizeDiscoveredKey()` keeps `revocationReason` only if superseded/compromised AND `revokedAt` present (amendment).
+- `POST /mail/mailboxes/:id/keys/resolve` (`BaseKeyLookupRoute.resolve()`, `@RateLimit()`), body `{ address, useType,
+  action, expectedPinnedFingerprint, certificate? }`. Validation order: body object -> address `isPlainAddress` -> useType ->
+  action -> fingerprint string 1..256 -> `certificate` with reject = 400 -> mailbox 404/403 (UPDATE) -> certificate
+  `parseContactKey` 400 -> inside the shared write merge: no contact 404 -> folder UPDATE 403 ->
+  - reject: no conflict 404; pinned fp != expected 409; clear conflict, `addRejectedKey`, audit
+    `contact.key_conflict_rejected` `{ address, useType, fingerprint, pinnedFingerprint }`.
+  - accept: no pinned useType key 404; given cert == pinned -> 200 no write (checked BEFORE 409 so a retried accept with a
+    certificate is idempotent); pinned != expected 409; no cert and no conflict 404; conflict key re-validated now (400 if
+    e.g. expired since; keeps its issuerCertificate); pin, previousKeys (`user`, new fp removed from previousKeys),
+    conflict cleared, fp removed from rejectedKeys; audit `contact.key_replaced` `{ address, useType, from, to }`.
+  A retried accept WITHOUT certificate after success gets 409 (conflict gone, pinned moved) - clients should treat 409 as
+  "reload". 409 uses `INVALID_OBJECT_VERSION`. Never creates a contact.
+- Clearing lists: `listField(next, stored)` writes `[]` when a stored list becomes empty (TypeORM `update` skips undefined, so
+  `undefined` wouldn't clear on SQL).
+
+Migration (decided): drop. The legacy `keyConflict` held only a fingerprint (not acceptable). It's no longer a model field, so
+the model constructors never copy it (Mongo docs keep the stale field unread; SQL synchronize drops the column).
+`normalizeKeyConflicts()` also drops malformed/legacy-shaped array entries and dedupes per useType. The pinned key is
+unchanged, so the next observation of the differing key records a full conflict.
+
+ScanQueueJob: `processInboundRapidMxKeyHeader()` notes whether the merge recorded a header conflict at `now`; after the write,
+`refreshKeysAfterHeaderConflict()` calls `maybeRefreshRotatedKey()` (same shared write as the MDN hint) and logs+swallows
+errors. Bounded by the federation negative cache, the key response cache and the fetch timeout. Awaited inline like the MDN
+refresh ("non-blocking" = never fails delivery). Spec tension noted in the spec: discovery is otherwise compose-time only;
+this fires at delivery for a DKIM-verified changed key header, revealing delivery time to the sender's server.
+
+Tests: `test/util/KeyringUtils.test.ts` (existing tests moved to keyConflicts/5-arg; new "Key rotation continuity" block with
+real CA-issued certs from new `makeTestIssuer()`/`issueCertificate()` in `test/util/signerCertificates.ts`: expired,
+revoked via record, via listing superseded and no-reason, listed revocation escalation on pinned/previous, no-BC issuer ok,
+encrypt usage ok; conflicts for different CA, same-name impostor CA, no issuer, pinned valid, issuer cA=false, issuer
+unparseable, N or P not verifying, N other address, usage mismatch; revoked never TOFU; previous key ignored; latest conflict
+wins; rejected not re-recorded; previousKeys/rejectedKeys bounds; legacy migration; sanitize reason); SignerCertificateUtils
+(encrypt usage); new `test/routes/keyResolveSuite.ts` run from `{mongo,sql}/KeyLookupRoute.test.ts` (accept from conflict
+with issuer, accept by certificate + idempotent retry, re-accepting a previous key, reject + later discovery not re-recording +
+accept lifts rejection, 409s, 404s incl. keyless contact, 400s incl. expired recorded conflict, authorization incl. folder
+not inheriting, resolve racing an auto-replacing discovery, lookup auto-replace with superseded listing); ScanQueueJob
+mongo+sql (header conflict -> refresh -> auto-replace; non-federated keeps full header conflict; matching header doesn't
+refresh; failing refresh still delivers); keyTrustSuite, model and ContactRoute tests updated from `keyConflict`.
+
+Verification: `tsc --noEmit` and `yarn lint` clean. Full `yarn vitest run --coverage` (after part A's tree was idle):
+251 files / 5022 tests passed; coverage 100 / 96.72 / 100 / 100 (statements / branches / functions / lines).

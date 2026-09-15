@@ -20,6 +20,7 @@ import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { EnrollmentResult, SigningCertificateEnrollment } from "../../../src/pki/SigningCertificateEnrollment.js";
 import { publicKeyFromCertificatePem } from "../../../src/util/CertificateInstallUtils.js";
+import { issueTestLeaf, makeTestCa } from "../../routes/keyRotationContinuitySuite.js";
 
 interface FakeEntry {
     identity: string;
@@ -376,6 +377,90 @@ describe("AcmeEnrollmentDriverJobSQL Tests (real DB + DI)", () => {
         expect(FakeDrivenEnrollment.entries.get("e-order")!.installed).toBe(true);
         expect((await keyVaultRepo.findOne({ where: { mailboxUid: mailbox.uid } }))?.wrappedKeys).toHaveLength(1);
         expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))?.keys).toHaveLength(1);
+    });
+
+    describe("key rotation continuity", () => {
+        const wrappedKey = { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" };
+        const existingKeys = (address: string) => [
+            { publicKey: "b2xk", type: "x509", useType: "sign" as const, fingerprint: `old-sign-${address}`, notBefore: 1, notAfter: Date.now() + 10_000_000 },
+            { publicKey: "ZW5j", type: "x509", useType: "encrypt" as const, fingerprint: `enc-${address}`, notBefore: 1, notAfter: Date.now() + 10_000_000 },
+        ];
+
+        it("installs an ACME PEM chain's leaf with its verified issuer and revokes the previous signing key as superseded (encryption key untouched).", async () => {
+            const address = `${uuid.v4()}@example.com`;
+            const mailbox = await createMailbox({ primarySmtpAddress: address, keys: existingKeys(address) });
+            const ca = await makeTestCa("CN=ACME Intermediate");
+            const leafPem = await issueTestLeaf(ca, address);
+            FakeDrivenEnrollment.entries.set("chain", {
+                identity: address,
+                status: "issued",
+                material: { certificate: `${leafPem}\n${ca.pem}\n${(await makeTestCa("CN=Root")).pem}`, wrappedKey },
+                advanceCallCount: 0,
+            });
+
+            const before = Date.now();
+            await job.run();
+
+            expect(FakeDrivenEnrollment.entries.get("chain")!.installed).toBe(true);
+            const keys: any[] = (await (async (uid: string) => await mailboxRepo.findOne({ where: { uid } }))(mailbox.uid))?.keys ?? [];
+            expect(keys.map((k) => k.fingerprint)).toEqual([`old-sign-${address}`, `enc-${address}`, publicKeyFromCertificatePem(leafPem, "sign", address).fingerprint]);
+            expect(keys[0].revokedAt).toBeGreaterThanOrEqual(before);
+            expect(keys[0].revocationReason).toBe("superseded");
+            expect(keys[1].revokedAt ?? undefined).toBeUndefined();
+            expect(keys[2].issuerCertificate).toBe(ca.der);
+            expect(keys[2].revokedAt ?? undefined).toBeUndefined();
+        });
+
+        it("drops an ACME chain issuer that didn't sign the leaf.", async () => {
+            const address = `${uuid.v4()}@example.com`;
+            const mailbox = await createMailbox({ primarySmtpAddress: address });
+            const ca = await makeTestCa("CN=ACME Intermediate");
+            const impostor = await makeTestCa("CN=ACME Intermediate");
+            FakeDrivenEnrollment.entries.set("impostor", {
+                identity: address,
+                status: "issued",
+                material: { certificate: `${await issueTestLeaf(ca, address)}${impostor.pem}`, wrappedKey },
+                advanceCallCount: 0,
+            });
+
+            await job.run();
+
+            const keys: any[] = (await (async (uid: string) => await mailboxRepo.findOne({ where: { uid } }))(mailbox.uid))?.keys ?? [];
+            expect(keys).toHaveLength(1);
+            expect(keys[0].issuerCertificate ?? undefined).toBeUndefined();
+        });
+
+        it("revokes nothing when publishing the certificate fails, and revokes on the run that publishes it.", async () => {
+            const address = `${uuid.v4()}@example.com`;
+            const mailbox = await createMailbox({ primarySmtpAddress: address, keys: existingKeys(address) });
+            const ca = await makeTestCa("CN=ACME Intermediate");
+            FakeDrivenEnrollment.entries.set("fails", {
+                identity: address,
+                status: "issued",
+                material: { certificate: `${await issueTestLeaf(ca, address)}${ca.pem}`, wrappedKey },
+                advanceCallCount: 0,
+            });
+            const mailboxRepoUtils: any = (job as any).mailboxRepo;
+            const originalUpdate = mailboxRepoUtils.update;
+            mailboxRepoUtils.update = async () => {
+                throw new Error("simulated mailbox write failure");
+            };
+            try {
+                await job.run();
+            } finally {
+                mailboxRepoUtils.update = originalUpdate;
+            }
+
+            let keys: any[] = (await (async (uid: string) => await mailboxRepo.findOne({ where: { uid } }))(mailbox.uid))?.keys ?? [];
+            expect(keys).toHaveLength(2);
+            expect(keys.every((k) => !k.revokedAt)).toBe(true);
+
+            await job.run();
+            keys = (await (async (uid: string) => await mailboxRepo.findOne({ where: { uid } }))(mailbox.uid))?.keys ?? [];
+            expect(keys).toHaveLength(3);
+            expect(keys[0].revocationReason).toBe("superseded");
+            expect(keys[1].revokedAt ?? undefined).toBeUndefined();
+        });
     });
 
     it("Installs onto a legacy mailbox row where keys reads back as null instead of an empty array.", async () => {

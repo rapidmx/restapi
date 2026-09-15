@@ -21,7 +21,13 @@ import { EncryptionCertificateAuthority } from "../pki/EncryptionCertificateAuth
 import { EnrollmentBinding, EnrollmentResult, SigningCertificateEnrollment } from "../pki/SigningCertificateEnrollment.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { publicKeyFromCertificatePem } from "../util/CertificateInstallUtils.js";
+import {
+    publicKeyFromCertificatePem,
+    REVOCATION_REASONS,
+    revokeInactiveKeys,
+    supersedeKeys,
+    verifiedIssuerCertificate,
+} from "../util/CertificateInstallUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { AuditAction, EscrowScope, KeyVault, Mailbox, MasterKeyWrap, PublicKey, WrappedPrivateKey } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
@@ -203,6 +209,31 @@ function assertMasterKeyWrapsAccepted(keyVault: KeyVault | undefined, masterKeyW
             "This mailbox's key vault is already set up - enroll additional keys without masterKeyWraps, under its existing master key.",
         );
     }
+}
+
+/**
+ * The key `rekey()` publishes for `existing` (the stored key a request entry matched): the stored fields, including
+ * `issuerCertificate`. Extra request fields are not stored.
+ *
+ * - A stored `revokedAt` is kept (a revocation peers may already have acted on is never withdrawn); otherwise the
+ * request's `revokedAt`, when it sets one, is applied.
+ * - `revocationReason` only matters on a revoked key. A key the request newly revokes takes the request's reason, or
+ * `"compromised"` when it gives none (an explicit revoke means "do not trust this key"). An already revoked key keeps
+ * its reason, except that the request may escalate `"superseded"` to `"compromised"` - never the other way.
+ */
+function rekeyedKey(existing: PublicKey, requested: { revokedAt?: number; revocationReason?: PublicKey["revocationReason"] }): PublicKey {
+    const key: PublicKey = { ...existing };
+    if (existing.revokedAt) {
+        if (existing.revocationReason === "superseded" && requested.revocationReason === "compromised") {
+            key.revocationReason = "compromised";
+        }
+    } else if (requested.revokedAt) {
+        key.revokedAt = requested.revokedAt;
+        key.revocationReason = requested.revocationReason ?? "compromised";
+    } else {
+        delete key.revocationReason;
+    }
+    return key;
 }
 
 /** Request body for `rekey()` - a full, atomic replacement of a mailbox's entire key-vault contents, following
@@ -412,6 +443,10 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
      * identity is left to the CA that issued it) and installs it, since re-litigating a public CA's own
      * issuance decision is not this server's job.
      *
+     * The new key becomes the mailbox's active key of its `useType`: every older unrevoked key of that `useType` gets
+     * `revokedAt` (the install time) in the same mailbox update (`supersedeKeys()`), so discovery shows it as retired.
+     * Its wrapped private key stays in the vault.
+     *
      * Atomic: the new `PublicKey` (appended to `Mailbox.keys`) and the `WrappedPrivateKey`/initial
      * `MasterKeyWrap`s (appended to `KeyVault`) are written in one transaction, so a failure partway through
      * can never leave a published public key with no corresponding vault entry, or vice versa.
@@ -449,20 +484,26 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "csr is required for useType 'encrypt'.");
             }
             const issued = await this.encryptionCa!.issue(mailbox.primarySmtpAddress, body.csr);
-            const der: Buffer = new crypto.X509Certificate(issued.certificate).raw;
+            const cert = new crypto.X509Certificate(issued.certificate);
             fingerprint = issued.fingerprint;
             publicKey = {
-                publicKey: der.toString("base64"),
+                publicKey: cert.raw.toString("base64"),
                 type: "x509",
                 useType: "encrypt",
                 fingerprint,
                 notBefore: issued.notBefore.getTime(),
                 notAfter: issued.notAfter.getTime(),
             };
+            // Published only when it provably issued the certificate (dropped otherwise, never refused).
+            const issuerCertificate: string | undefined = verifiedIssuerCertificate(cert, issued.issuerCertificate);
+            if (issuerCertificate) {
+                publicKey.issuerCertificate = issuerCertificate;
+            }
         } else if (body.useType === "sign") {
             if (!body.certificate) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "certificate is required for useType 'sign'.");
             }
+            // A PEM chain installs its first certificate and publishes the second as `issuerCertificate` when it verifies.
             const result = publicKeyFromCertificatePem(body.certificate, "sign", mailbox.primarySmtpAddress);
             publicKey = result.publicKey;
             fingerprint = result.fingerprint;
@@ -517,7 +558,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         assertMasterKeyGeneration(keyVault, expectedGeneration);
 
         const updatedMailbox: M = await this.mailboxRepo!.update(
-            { uid: mailbox.uid, version: (mailbox as any).version, keys: [...mailbox.keys, publicKey] } as any,
+            { uid: mailbox.uid, version: (mailbox as any).version, keys: supersedeKeys(mailbox.keys, publicKey, Date.now()) } as any,
             mailbox,
             { ignoreACL: true },
         );
@@ -846,6 +887,12 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
      * path to publish an arbitrary "certificate" at the public discovery endpoint, bypassing the CA entirely.
      * `rekey()`'s real purpose - re-wrapping the master key under new/changed unlock methods, and optionally
      * marking an existing key revoked - never requires introducing a fingerprint the CA hasn't already issued.
+     *
+     * Each published key is rebuilt from the stored one (`rekeyedKey()`): `issuerCertificate` may be omitted (the stored
+     * one is kept) or repeated unchanged, anything else is a `400`; `revokedAt`/`revocationReason` may differ: a stored
+     * revocation is kept (it can't be withdrawn, only escalated from `"superseded"` to `"compromised"`), and a request may
+     * revoke a key (reason `"compromised"` unless it says otherwise). Then every unrevoked key that isn't its `useType`'s active one is
+     * revoked (`revokeInactiveKeys()`), which normalizes mailboxes enrolled before superseded keys were revoked.
      */
     @Put("/:id/keyvault/rekey")
     public async rekey(@Param("id") mailboxId: string, body: RekeyRequest, @AuthUser user?: JWTUser): Promise<PublicKeyVault> {
@@ -872,7 +919,9 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "masterKeyWraps must include at least one non-escrow wrap.");
         }
 
+        const rekeyedAt: number = Date.now();
         const existingByFingerprint = new Map((mailbox.keys ?? []).map((k) => [k.fingerprint, k]));
+        const keys: PublicKey[] = [];
         for (const key of body.keys) {
             const existing: PublicKey | undefined = existingByFingerprint.get(key?.fingerprint);
             if (
@@ -881,7 +930,9 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                 existing.type !== key.type ||
                 existing.useType !== key.useType ||
                 existing.notBefore !== key.notBefore ||
-                existing.notAfter !== key.notAfter
+                existing.notAfter !== key.notAfter ||
+                // Absent (or null) keeps the stored one; anything else must match it exactly.
+                (key.issuerCertificate !== undefined && key.issuerCertificate !== null && key.issuerCertificate !== existing.issuerCertificate)
             ) {
                 throw new ApiError(
                     ApiErrors.INVALID_REQUEST,
@@ -889,6 +940,21 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                     "Every key in a rekey request must already be enrolled (via enrollKey) with identical fields aside from revokedAt.",
                 );
             }
+            const rawRevokedAt: unknown = key.revokedAt ?? undefined;
+            if (rawRevokedAt !== undefined && !(typeof rawRevokedAt === "number" && Number.isFinite(rawRevokedAt))) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "revokedAt must be a number of epoch milliseconds.");
+            }
+            const requestedRevokedAt: number | undefined = typeof rawRevokedAt === "number" ? rawRevokedAt : undefined;
+            const requestedReason: unknown = key.revocationReason ?? undefined;
+            if (requestedReason !== undefined && !REVOCATION_REASONS.includes(requestedReason as any)) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `revocationReason must be one of: ${REVOCATION_REASONS.join(", ")}.`);
+            }
+            keys.push(
+                rekeyedKey(existing, {
+                    revokedAt: requestedRevokedAt,
+                    revocationReason: requestedReason as PublicKey["revocationReason"],
+                }),
+            );
         }
         if ((body.masterKeyWraps ?? []).length > MAX_MASTER_KEY_WRAPS) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `masterKeyWraps cannot exceed ${MAX_MASTER_KEY_WRAPS} entries.`);
@@ -910,7 +976,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
 
         await this.assertNoPendingSignEnrollment(mailbox);
 
-        const updated: K = await this.persistRekey(mailbox, keyVault, body);
+        const updated: K = await this.persistRekey(mailbox, keyVault, { ...body, keys: revokeInactiveKeys(keys, rekeyedAt) });
 
         await recordAuditLog(
             this._objectFactory!,

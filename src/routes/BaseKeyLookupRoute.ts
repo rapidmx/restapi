@@ -18,18 +18,24 @@ import {
     RouteDecorators,
 } from "@rapidrest/service-core";
 import type { DnsResolver } from "../dns/DnsResolver.js";
-import { AuditAction, Contact, Folder, Mailbox, PublicKey } from "../models/types.js";
+import { AuditAction, Contact, EncryptionPreference, Folder, KeyConflict, Mailbox, PreviousKey, PublicKey } from "../models/types.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { ContactKeyMerge, ContactKeyWriteResult, ContactKeyWriteTarget, writeContactKeys } from "../util/ContactKeyUtils.js";
-import { discoverAndMergeKeys, KeyringUpdate } from "../util/KeyringUtils.js";
+import { addPreviousKey, addRejectedKey, discoverAndMergeKeys, listField, normalizeKeyConflicts, withoutKey } from "../util/KeyringUtils.js";
 import { isPlainAddress } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-import { parseTrustedSignerKey } from "../util/SignerCertificateUtils.js";
+import { parseContactKey, parseTrustedSignerKey } from "../util/SignerCertificateUtils.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Query, RateLimit, Request, User: AuthUser } = RouteDecorators;
 
-/** The wire shape `GET /mailbox/:id/keys/lookup` (and `POST /mailbox/:id/keys/trust`) returns. */
-export type PublicKeyLookupResult = KeyringUpdate;
+/** The wire shape `GET /mailbox/:id/keys/lookup`, `POST /mailbox/:id/keys/trust` and `POST /mailbox/:id/keys/resolve`
+ * return. `keyConflicts` and `previousKeys` are omitted when empty. */
+export interface PublicKeyLookupResult {
+    keys: PublicKey[];
+    encryptPreference?: EncryptionPreference;
+    keyConflicts?: KeyConflict[];
+    previousKeys?: PreviousKey[];
+}
 
 /** The body of `POST /mailbox/:id/keys/trust`. */
 export interface TrustSignerRequest {
@@ -37,6 +43,38 @@ export interface TrustSignerRequest {
     address: string;
     /** The signer's certificate, base64 DER X.509. */
     certificate: string;
+}
+
+/** The body of `POST /mailbox/:id/keys/resolve`. */
+export interface ResolveKeyConflictRequest {
+    /** The contact's address, one plain `local@domain`. */
+    address: string;
+    /** Which of the contact's pinned keys the decision is about. */
+    useType: "sign" | "encrypt";
+    /** `"accept"` replaces the pinned key, `"reject"` dismisses the conflict. */
+    action: "accept" | "reject";
+    /** The fingerprint of the pinned key the user saw; the request is refused with 409 when it's no longer pinned. */
+    expectedPinnedFingerprint: string;
+    /** For `"accept"` only: the new key's certificate, base64 DER X.509. Defaults to the recorded conflict's key. */
+    certificate?: string;
+}
+
+/** The longest `expectedPinnedFingerprint` accepted (a SHA-256 hex fingerprint is 64 characters). */
+const MAX_FINGERPRINT_LENGTH = 256;
+
+function pinnedKeyChanged(): ApiError {
+    return new ApiError(
+        ApiErrors.INVALID_OBJECT_VERSION,
+        409,
+        "The pinned key for this address is no longer the one expected. Review the current key and try again.",
+    );
+}
+
+/** A conflict's observed key, validated as a key of its `useType` for `address` at `now` (400 when it no longer is),
+ * keeping the `issuerCertificate` it was published with. */
+function revalidatedConflictKey(conflict: KeyConflict, address: string, now: number): PublicKey {
+    const key: PublicKey = parseContactKey(conflict.observedKey.publicKey, address, conflict.useType, now);
+    return conflict.observedKey.issuerCertificate ? { ...key, issuerCertificate: conflict.observedKey.issuerCertificate } : key;
 }
 
 /**
@@ -51,7 +89,8 @@ export interface TrustSignerRequest {
  * (create vs. update the `Contact`, what to return when nothing new could be discovered).
  *
  * `POST /mailbox/:id/keys/trust` lets the user pin a signer's certificate by hand ("Trust this signer") for an address
- * that has no signing key pinned yet - see `trust()`.
+ * that has no signing key pinned yet - see `trust()`. `POST /mailbox/:id/keys/resolve` accepts or rejects a changed key
+ * (`Contact.keyConflicts`) - see `resolve()`.
  *
  * Ordinary `ACLUtils.hasPermission()` (with its usual trusted-role bypass) is used here, deliberately unlike
  * `BaseKeyVaultRoute` - this endpoint only ever touches the mailbox's own address book, never private key
@@ -118,8 +157,14 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         return { "emails.address": ModelUtils.literal(address) };
     }
 
-    private toPublic(contact: Pick<C, "keys" | "encryptPreference" | "keyConflict">): PublicKeyLookupResult {
-        return { keys: contact.keys ?? [], encryptPreference: contact.encryptPreference, keyConflict: contact.keyConflict };
+    private toPublic(contact: C): PublicKeyLookupResult {
+        const keyConflicts: KeyConflict[] = normalizeKeyConflicts(contact.keyConflicts);
+        return {
+            keys: contact.keys ?? [],
+            encryptPreference: contact.encryptPreference,
+            keyConflicts: keyConflicts.length > 0 ? keyConflicts : undefined,
+            previousKeys: contact.previousKeys?.length ? contact.previousKeys : undefined,
+        };
     }
 
     /** The mailbox `mailboxId` names, which `user` must be able to UPDATE (404 when missing, 403 without UPDATE). */
@@ -207,9 +252,9 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
      * sender has no signing key pinned. Returns the same shape as `lookup()` for that address.
      *
      * Only ever adds the first signing key. A contact that already pins a signing key gets 409 when it's a different
-     * certificate (replacing a pinned key stays with discovery's Key Conflict Handling, so this can't be used to substitute
-     * a key) and 200 with nothing written when it's the same one. Existing encrypt keys, `encryptPreference` and
-     * `keyConflict` are left alone; `keysFirstSeen` is set when unset.
+     * certificate (replacing a pinned key is `resolve()`'s job, which needs the pinned fingerprint the user saw, so this
+     * can't be used to substitute a key) and 200 with nothing written when it's the same one. Existing encrypt keys, `encryptPreference` and
+     * `keyConflicts` are left alone; `keysFirstSeen` is set when unset.
      *
      * The certificate is validated by `util/SignerCertificateUtils.ts`'s `parseTrustedSignerKey()` (400: unparseable, not
      * currently valid, doesn't name `address`, not usable for signing mail); fingerprint and validity dates come from the
@@ -281,6 +326,150 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
                     mailboxUid: mailbox.uid,
                     details: { address, fingerprint: key.fingerprint },
                 },
+            );
+        }
+        return this.toPublic(contact!);
+    }
+
+    /**
+     * `POST /mailbox/:id/keys/resolve` with `{ address, useType, action, expectedPinnedFingerprint, certificate? }`: the
+     * user's explicit decision on a changed key (`specs/end-to-end_encryption.md`'s Key Conflict Handling, step 4).
+     * Returns the same shape as `lookup()` for that address.
+     *
+     * `accept` replaces the pinned `useType` key of `address`'s contact. The new key is `certificate` when given, else the
+     * key recorded in that `useType`'s conflict; either way it's validated by `parseContactKey()` at the time of the
+     * request (400: unparseable, not currently valid, doesn't name `address`, usage doesn't fit `useType`). Then:
+     * - 404 when there's no contact, no pinned `useType` key, or (without `certificate`) no conflict for `useType`;
+     * - 200 with nothing written when the given certificate is already the pinned key (checked before the fingerprint
+     * match, so a retried accept of the same certificate succeeds);
+     * - 409 when the pinned key isn't `expectedPinnedFingerprint` (it changed since the user looked);
+     * - otherwise the new key is pinned, the old one moves to `previousKeys` (`replacement: "user"`), the `useType`'s
+     * conflict is cleared, the new fingerprint leaves `previousKeys` and `rejectedKeys`, and
+     * `AuditAction.CONTACT_KEY_REPLACED` is recorded with `{ address, useType, from, to }`.
+     *
+     * `reject` dismisses the `useType`'s conflict: 404 without a contact or conflict, 409 when the pinned key isn't
+     * `expectedPinnedFingerprint`; otherwise the conflict is cleared, its fingerprint is added to `rejectedKeys` (so the
+     * same key isn't recorded as a conflict again), and `AuditAction.CONTACT_KEY_CONFLICT_REJECTED` is recorded with
+     * `{ address, useType, fingerprint, pinnedFingerprint }`. `certificate` is refused (400) with `reject`.
+     *
+     * Authorization is `trust()`'s: UPDATE on the mailbox (404 missing, 403 otherwise) and UPDATE on the contact's folder.
+     * No contact is ever created. Writes go through `writeContactKeys()`, so a resolve racing discovery, an inbound key
+     * header or another resolve is re-checked against the re-read contact (typically ending in 409 when the pinned key
+     * moved underneath it).
+     */
+    @RateLimit()
+    @Post("/:id/keys/resolve")
+    public async resolve(
+        @Param("id") mailboxId: string,
+        body: ResolveKeyConflictRequest,
+        @Request req?: HttpRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<PublicKeyLookupResult> {
+        await this.init();
+
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                "The request body must be an object with 'address', 'useType', 'action' and 'expectedPinnedFingerprint'.",
+            );
+        }
+        const { address, useType, action, expectedPinnedFingerprint, certificate } = body as Partial<ResolveKeyConflictRequest>;
+        if (!isPlainAddress(address)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'address' must be a single plain email address.");
+        }
+        if (useType !== "sign" && useType !== "encrypt") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'useType' must be 'sign' or 'encrypt'.");
+        }
+        if (action !== "accept" && action !== "reject") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'action' must be 'accept' or 'reject'.");
+        }
+        if (
+            typeof expectedPinnedFingerprint !== "string" ||
+            expectedPinnedFingerprint.length === 0 ||
+            expectedPinnedFingerprint.length > MAX_FINGERPRINT_LENGTH
+        ) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'expectedPinnedFingerprint' must be the fingerprint of the pinned key.");
+        }
+        if (certificate !== undefined && action === "reject") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'certificate' can only be given with 'accept'.");
+        }
+        const mailbox: M = await this.requireUpdatableMailbox(mailboxId, user);
+        const now: number = Date.now();
+        const givenKey: PublicKey | undefined = certificate === undefined ? undefined : parseContactKey(certificate, address, useType, now);
+
+        let audit: { action: AuditAction; details: Record<string, string> } | undefined;
+        const { contact } = await this.writeKeys(mailbox, address, user, async (existing) => {
+            audit = undefined;
+            if (!existing) {
+                throw new ApiError(ApiErrors.NOT_FOUND, 404, "There is no contact for this address.");
+            }
+            await this.requirePermission(user, existing.folderUid, ACLAction.UPDATE);
+            const keys: PublicKey[] = [...(existing.keys ?? [])];
+            const pinnedIndex: number = keys.findIndex((k) => k.useType === useType);
+            const pinned: PublicKey | undefined = keys[pinnedIndex];
+            const conflicts: KeyConflict[] = normalizeKeyConflicts(existing.keyConflicts);
+            const conflict: KeyConflict | undefined = conflicts.find((c) => c.useType === useType);
+            const remainingConflicts = listField(
+                conflicts.filter((c) => c.useType !== useType),
+                existing.keyConflicts,
+            );
+
+            if (action === "reject") {
+                if (!conflict) {
+                    throw new ApiError(ApiErrors.NOT_FOUND, 404, "There is no key conflict to reject for this address.");
+                }
+                if (pinned?.fingerprint !== expectedPinnedFingerprint) {
+                    throw pinnedKeyChanged();
+                }
+                const fingerprint: string = conflict.observedKey.fingerprint;
+                audit = {
+                    action: AuditAction.CONTACT_KEY_CONFLICT_REJECTED,
+                    details: { address, useType, fingerprint, pinnedFingerprint: pinned.fingerprint },
+                };
+                return {
+                    keyConflicts: remainingConflicts,
+                    rejectedKeys: addRejectedKey(existing.rejectedKeys, { useType, fingerprint, rejectedAt: now }),
+                } as Partial<C>;
+            }
+
+            if (!pinned) {
+                throw new ApiError(ApiErrors.NOT_FOUND, 404, "There is no pinned key of this type to replace for this address.");
+            }
+            if (givenKey?.fingerprint === pinned.fingerprint) {
+                return undefined;
+            }
+            if (pinned.fingerprint !== expectedPinnedFingerprint) {
+                throw pinnedKeyChanged();
+            }
+            if (!givenKey && !conflict) {
+                throw new ApiError(ApiErrors.NOT_FOUND, 404, "There is no key conflict to accept for this address.");
+            }
+            // Re-validated now: the conflict's key may have expired since it was observed.
+            const newKey: PublicKey = givenKey ?? revalidatedConflictKey(conflict!, address, now);
+            keys[pinnedIndex] = newKey;
+            audit = {
+                action: AuditAction.CONTACT_KEY_REPLACED,
+                details: { address, useType, from: pinned.fingerprint, to: newKey.fingerprint },
+            };
+            return {
+                keys,
+                keyConflicts: remainingConflicts,
+                previousKeys: addPreviousKey(withoutKey(existing.previousKeys, useType, newKey.fingerprint), {
+                    ...pinned,
+                    replacedAt: now,
+                    replacement: "user",
+                }),
+                rejectedKeys: listField(withoutKey(existing.rejectedKeys, useType, newKey.fingerprint), existing.rejectedKeys),
+            } as Partial<C>;
+        });
+
+        if (audit) {
+            await recordAuditLog(
+                this._objectFactory!,
+                this.auditLogClass,
+                { config: this.config, req, user, logger: this.logger },
+                { action: audit.action, targetType: "Contact", targetUid: contact!.uid, mailboxUid: mailbox.uid, details: audit.details },
             );
         }
         return this.toPublic(contact!);

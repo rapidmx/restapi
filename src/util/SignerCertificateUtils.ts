@@ -34,16 +34,31 @@ export function certificateEmailIdentities(cert: x509.X509Certificate): string[]
     return sanEmails.length > 0 ? sanEmails : cert.subjectName.getField(EMAIL_ADDRESS_OID);
 }
 
+/** The keyUsage bits that make a certificate usable for each `PublicKey.useType`, any one of which is enough. For `sign`,
+ * `digitalSignature`. For `encrypt`, `keyAgreement` (ECDH, the P-256 keys this deployment issues by default) or
+ * `keyEncipherment` (RSA): the two bits `pki/LocalX509CertificateAuthority.ts` sets on every encryption certificate. */
+const REQUIRED_KEY_USAGES: Record<PublicKey["useType"], number> = {
+    sign: x509.KeyUsageFlags.digitalSignature,
+    encrypt: x509.KeyUsageFlags.keyAgreement | x509.KeyUsageFlags.keyEncipherment,
+};
+
+const KEY_USAGE_MESSAGES: Record<PublicKey["useType"], string> = {
+    sign: "The provided certificate's key usage does not allow digital signatures.",
+    encrypt: "The provided certificate's key usage does not allow key agreement or key encipherment.",
+};
+
 /**
- * Validates a client-supplied base64 DER X.509 certificate for `POST /:id/keys/trust` and returns the signing
- * `PublicKey` to pin for `address`. Every stored field comes from the parsed certificate
- * (`KeyringUtils.sanitizeDiscoveredKey()`), with `publicKey` re-encoded from the DER.
+ * Validates a base64 DER X.509 certificate as a contact's `useType` key for `address` at `now`, and returns the
+ * `PublicKey` to pin. Every stored field comes from the parsed certificate (`KeyringUtils.sanitizeDiscoveredKey()`), with
+ * `publicKey` re-encoded from the DER. Used by `POST /:id/keys/trust` (`parseTrustedSignerKey()`), by
+ * `POST /:id/keys/resolve` for the key a user accepts, and by `KeyringUtils.applyDiscoveredKeys()` for a key it would
+ * replace a pinned one with automatically.
  *
  * @throws `ApiError` 400 when the certificate isn't base64 DER that parses, isn't valid at `now`, doesn't name `address`
- * (case-insensitively, `certificateEmailIdentities()`), or isn't usable for signing mail: a keyUsage extension without
- * `digitalSignature`, or an extKeyUsage extension without `emailProtection`.
+ * (case-insensitively, `certificateEmailIdentities()`), or its usage doesn't fit `useType`: a keyUsage extension without
+ * the bits in `REQUIRED_KEY_USAGES`, or an extKeyUsage extension without `emailProtection` (both use types).
  */
-export function parseTrustedSignerKey(certificate: unknown, address: string, now: number = Date.now()): PublicKey {
+export function parseContactKey(certificate: unknown, address: string, useType: PublicKey["useType"], now: number = Date.now()): PublicKey {
     if (typeof certificate !== "string" || certificate.length > MAX_TRUSTED_CERTIFICATE_LENGTH || !BASE64_PATTERN.test(certificate)) {
         throw invalid("'certificate' must be a base64 encoded DER X.509 certificate.");
     }
@@ -51,7 +66,7 @@ export function parseTrustedSignerKey(certificate: unknown, address: string, now
     const key: PublicKey | undefined = sanitizeDiscoveredKey({
         publicKey: der.toString("base64"),
         type: "x509",
-        useType: "sign",
+        useType,
         fingerprint: "",
         notBefore: 0,
         notAfter: 0,
@@ -78,11 +93,21 @@ export function parseTrustedSignerKey(certificate: unknown, address: string, now
     if (!identities.some((identity) => identity.toLowerCase() === wanted)) {
         throw invalid("The provided certificate does not identify this address.");
     }
-    if (keyUsage && (keyUsage.usages & x509.KeyUsageFlags.digitalSignature) === 0) {
-        throw invalid("The provided certificate's key usage does not allow digital signatures.");
+    if (keyUsage && (keyUsage.usages & REQUIRED_KEY_USAGES[useType]) === 0) {
+        throw invalid(KEY_USAGE_MESSAGES[useType]);
     }
     if (extKeyUsage && !extKeyUsage.usages.includes(x509.ExtendedKeyUsage.emailProtection)) {
         throw invalid("The provided certificate's extended key usage does not include email protection.");
     }
     return key;
+}
+
+/**
+ * Validates a client-supplied base64 DER X.509 certificate for `POST /:id/keys/trust` and returns the signing
+ * `PublicKey` to pin for `address`: `parseContactKey()` with `useType: "sign"`.
+ *
+ * @throws `ApiError` 400 as `parseContactKey()`.
+ */
+export function parseTrustedSignerKey(certificate: unknown, address: string, now: number = Date.now()): PublicKey {
+    return parseContactKey(certificate, address, "sign", now);
 }

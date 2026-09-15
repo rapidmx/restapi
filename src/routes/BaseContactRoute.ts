@@ -15,7 +15,16 @@ const { Param, Post, Put, Request, User: AuthUser } = RouteDecorators;
  * only by server-side pipeline code, never by a caller's own request body. Rejected outright (400) rather
  * than silently stripped - a caller whose request appeared to succeed but silently dropped part of it is a
  * worse outcome than a loud, immediate error. */
-const DISCOVERY_MANAGED_FIELDS = ["keys", "encryptPreference", "keysFirstSeen", "lastMessageSeen", "keyConflict"] as const;
+const DISCOVERY_MANAGED_FIELDS = [
+    "keys",
+    "encryptPreference",
+    "keysFirstSeen",
+    "lastMessageSeen",
+    "keyConflict",
+    "keyConflicts",
+    "previousKeys",
+    "rejectedKeys",
+] as const;
 
 function rejectDiscoveryManagedFields(obj: Partial<Contact>): void {
     for (const field of DISCOVERY_MANAGED_FIELDS) {

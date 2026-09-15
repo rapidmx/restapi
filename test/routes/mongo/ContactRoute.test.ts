@@ -425,13 +425,20 @@ describe("Route:ContactMongo Tests", () => {
             .send({
                 uid: contact.uid,
                 version: contact.version,
-                keyConflict: { observedFingerprint: "attacker-fp", observedAt: Date.now(), source: "header" },
+                keyConflicts: [{ useType: "sign", observedKey: { fingerprint: "attacker-fp" }, observedAt: Date.now(), source: "header" }],
             });
 
         expect(result.status).toBe(400);
+        for (const field of ["keyConflict", "previousKeys", "rejectedKeys"]) {
+            const refused = await request(server.getApplication())
+                .put(`${baseUrl}/${contact.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: contact.uid, version: contact.version, [field]: [] });
+            expect(refused.status, field).toBe(400);
+        }
 
         const existing = await contactRepo.findOne({ uid: contact.uid } as any);
-        expect(existing?.keyConflict).toBeUndefined();
+        expect(existing?.keyConflicts).toBeUndefined();
     });
 
     it("A different user cannot update a contact they don't have access to.", async () => {

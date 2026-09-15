@@ -366,7 +366,9 @@ describe("SQL model default construction", () => {
         expect(obj.keys).toBeUndefined();
         expect(obj.keysFirstSeen).toBeUndefined();
         expect(obj.lastMessageSeen).toBeUndefined();
-        expect(obj.keyConflict).toBeUndefined();
+        expect(obj.keyConflicts).toBeUndefined();
+        expect(obj.previousKeys).toBeUndefined();
+        expect(obj.rejectedKeys).toBeUndefined();
     });
 
     it("ContactSQL applies provided overrides when constructed with data.", () => {
@@ -389,7 +391,18 @@ describe("SQL model default construction", () => {
             keys: [{ publicKey: "abc", type: "x509", useType: "sign", fingerprint: "fp", notBefore: 0, notAfter: 1 }],
             keysFirstSeen: 50,
             lastMessageSeen: 200,
-            keyConflict: { observedFingerprint: "other-fp", observedAt: 150, source: "header" },
+            keyConflicts: [
+                {
+                    useType: "sign",
+                    observedKey: { publicKey: "def", type: "x509", useType: "sign", fingerprint: "other-fp", notBefore: 0, notAfter: 1 },
+                    observedAt: 150,
+                    source: "header",
+                },
+            ],
+            previousKeys: [
+                { publicKey: "old", type: "x509", useType: "sign", fingerprint: "old-fp", notBefore: 0, notAfter: 1, replacedAt: 120, replacement: "user" },
+            ],
+            rejectedKeys: [{ useType: "encrypt", fingerprint: "bad-fp", rejectedAt: 130 }],
         });
 
         expect(obj.mailboxUid).toBe("mailbox-1");
@@ -412,7 +425,9 @@ describe("SQL model default construction", () => {
         ]);
         expect(obj.keysFirstSeen).toBe(50);
         expect(obj.lastMessageSeen).toBe(200);
-        expect(obj.keyConflict).toEqual({ observedFingerprint: "other-fp", observedAt: 150, source: "header" });
+        expect(obj.keyConflicts).toEqual([expect.objectContaining({ useType: "sign", observedAt: 150, source: "header" })]);
+        expect(obj.previousKeys).toEqual([expect.objectContaining({ fingerprint: "old-fp", replacedAt: 120, replacement: "user" })]);
+        expect(obj.rejectedKeys).toEqual([{ useType: "encrypt", fingerprint: "bad-fp", rejectedAt: 130 }]);
     });
 
     it("ContactSQL preserves class defaults for the key-discovery fields omitted from a partial override object.", () => {
@@ -422,7 +437,9 @@ describe("SQL model default construction", () => {
         expect(obj.keys).toBeUndefined();
         expect(obj.keysFirstSeen).toBeUndefined();
         expect(obj.lastMessageSeen).toBeUndefined();
-        expect(obj.keyConflict).toBeUndefined();
+        expect(obj.keyConflicts).toBeUndefined();
+        expect(obj.previousKeys).toBeUndefined();
+        expect(obj.rejectedKeys).toBeUndefined();
     });
 
     it("KeyVaultSQL falls back to class defaults when constructed with no data.", () => {

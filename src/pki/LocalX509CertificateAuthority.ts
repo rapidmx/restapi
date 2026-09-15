@@ -194,7 +194,14 @@ export class LocalX509CertificateAuthority implements EncryptionCertificateAutho
         });
 
         const fingerprint: string = Buffer.from(await certificate.getThumbprint("SHA-256")).toString("hex");
-        return { certificate: certificate.toString("pem"), fingerprint, notBefore, notAfter, serialNumber: certificate.serialNumber };
+        return {
+            certificate: certificate.toString("pem"),
+            fingerprint,
+            notBefore,
+            notAfter,
+            serialNumber: certificate.serialNumber,
+            issuerCertificate: ca.certificate.toString("pem"),
+        };
     }
 
     /** No-op - see this class's own doc comment and `EncryptionCertificateAuthority.revoke()`'s: there is no

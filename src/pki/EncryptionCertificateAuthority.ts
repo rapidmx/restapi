@@ -20,6 +20,10 @@ export interface IssuedCertificate {
      * identify a certificate by serial number rather than fingerprint (`OpenBaoPkiCertificateAuthority`)
      * needs its caller to persist this alongside `fingerprint` for that later `revoke()` call to work. */
     serialNumber?: string;
+    /** The certificate that directly issued `certificate`, PEM-encoded (the same encoding as `certificate`), when the
+     * authority reports one. `BaseKeyVaultRoute.enrollKey()` publishes it, as base64 DER, on
+     * `PublicKey.issuerCertificate` only after verifying it signed `certificate`. */
+    issuerCertificate?: string;
 }
 
 /**

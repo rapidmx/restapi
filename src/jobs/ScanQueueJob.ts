@@ -1325,14 +1325,39 @@ export abstract class ScanQueueJob<
         }
 
         const now: number = Date.now();
+        let headerConflict = false;
         await this.persistContactKeyUpdate(entry.mailboxUid, fromAddress, now, (existingContact) => {
             if (!existingContact && !discovered) {
                 // Nothing on file, nothing discovered - recording lastMessageSeen alone isn't reason enough to
                 // create a Contact for every random inbound sender.
                 return undefined;
             }
-            return applyDiscoveredKeys(existingContact, discovered, now, "header");
+            const update: ContactKeyState = applyDiscoveredKeys(existingContact, discovered, now, "header", fromAddress);
+            headerConflict = !!update.keyConflicts?.some((conflict) => conflict.source === "header" && conflict.observedAt === now);
+            return update;
         });
+
+        // A `RapidMX-Key` header carries no issuer certificate, so a rotated key seen there can only be recorded as a
+        // conflict. The discovery endpoint publishes the issuer, so look again there: when the peer rotated within the
+        // same CA after retiring the old key, the automatic replacement applies and the conflict clears.
+        if (headerConflict) {
+            await this.refreshKeysAfterHeaderConflict(entry.mailboxUid, fromAddress);
+        }
+    }
+
+    /**
+     * Re-runs discovery for `address` after its `RapidMX-Key` header conflicted with the pinned key
+     * (`processInboundRapidMxKeyHeader()`), through the same shared contact write as `maybeRefreshRotatedKey()`. Bounded
+     * like that refresh: a domain that isn't a federated peer is negatively cached (`util/FederationUtils.ts`), a
+     * response is served from the per-address cache until its `max-age` (`util/KeyDiscoveryClient.ts`), and the fetch
+     * has a timeout. It never fails delivery: an error is logged and the header's conflict stays recorded.
+     */
+    private async refreshKeysAfterHeaderConflict(mailboxUid: string, address: string): Promise<void> {
+        try {
+            await this.maybeRefreshRotatedKey(mailboxUid, address);
+        } catch (err: any) {
+            this.logger?.warn(`ScanQueueJob: key discovery refresh for mailbox ${mailboxUid} after a key header conflict failed: ${err?.message ?? err}`);
+        }
     }
 
     /**

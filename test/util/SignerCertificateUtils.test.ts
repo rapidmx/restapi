@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { MAX_TRUSTED_CERTIFICATE_LENGTH, parseTrustedSignerKey } from "../../src/util/SignerCertificateUtils.js";
+import { MAX_TRUSTED_CERTIFICATE_LENGTH, parseContactKey, parseTrustedSignerKey } from "../../src/util/SignerCertificateUtils.js";
 import { makeSignerCertificate, x509 } from "./signerCertificates.js";
 
 const ADDRESS = "Alice@Example.net";
@@ -89,5 +89,22 @@ describe("SignerCertificateUtils Tests", () => {
         await expect400(keyUsage.certificate, "key usage");
         const eku = await makeSignerCertificate({ sanEmails: ["alice@example.net"], extKeyUsage: [x509.ExtendedKeyUsage.serverAuth] });
         await expect400(eku.certificate, "extended key usage");
+    });
+
+    it("parseContactKey() checks an encrypt key's usage for key agreement or key encipherment instead of signatures.", async () => {
+        const address = "alice@example.net";
+        const agreement = await makeSignerCertificate({ sanEmails: [address], keyUsage: x509.KeyUsageFlags.keyAgreement });
+        expect(parseContactKey(agreement.certificate, address, "encrypt")).toMatchObject({ useType: "encrypt", fingerprint: agreement.fingerprint });
+        const encipherment = await makeSignerCertificate({
+            sanEmails: [address],
+            keyUsage: x509.KeyUsageFlags.keyEncipherment,
+            extKeyUsage: [x509.ExtendedKeyUsage.emailProtection],
+        });
+        expect(parseContactKey(encipherment.certificate, address, "encrypt").fingerprint).toBe(encipherment.fingerprint);
+
+        const signatureOnly = await makeSignerCertificate({ sanEmails: [address], keyUsage: x509.KeyUsageFlags.digitalSignature });
+        expect(() => parseContactKey(signatureOnly.certificate, address, "encrypt")).toThrow("key agreement or key encipherment");
+        const eku = await makeSignerCertificate({ sanEmails: [address], keyUsage: x509.KeyUsageFlags.keyAgreement, extKeyUsage: [x509.ExtendedKeyUsage.clientAuth] });
+        expect(() => parseContactKey(eku.certificate, address, "encrypt")).toThrow("extended key usage");
     });
 });

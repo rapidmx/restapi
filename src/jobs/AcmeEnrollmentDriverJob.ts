@@ -6,7 +6,7 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { publicKeyFromCertificatePem } from "../util/CertificateInstallUtils.js";
+import { publicKeyFromCertificatePem, supersedeKeys } from "../util/CertificateInstallUtils.js";
 import { AuditAction, KeyVault, Mailbox, PublicKey, WrappedPrivateKey } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
@@ -179,6 +179,11 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
      * synchronous HTTP request, this is a scheduled, retriable background step, so a partial failure here
      * self-heals on the next tick rather than needing true atomicity.
      *
+     * **Chain and supersession**: the issued certificate may be a PEM chain (ACME downloads leaf + intermediates) -
+     * the leaf is installed and its issuer published as `PublicKey.issuerCertificate` when it verifies
+     * (`publicKeyFromCertificatePem()`). Publishing the leaf revokes (`revokedAt`, now) every older unrevoked signing key
+     * in the same mailbox update (`supersedeKeys()`), so a failed publish revokes nothing.
+     *
      * **Write order**: the `KeyVault` wrapped key is saved *before* the certificate is published on
      * `Mailbox.keys`. The reverse order could leave a published certificate whose private key the mailbox
      * doesn't hold (a crash between the two writes) - and since the retry guard previously skipped on
@@ -247,7 +252,7 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
         if (!mailboxHasKey) {
             const mailbox: MB = (await this.mailboxRepo!.findOne(found.uid, { ignoreACL: true })) ?? found;
             await this.mailboxRepo!.update(
-                { uid: mailbox.uid, version: (mailbox as any).version, keys: [...(mailbox.keys ?? []), publicKey] } as any,
+                { uid: mailbox.uid, version: (mailbox as any).version, keys: supersedeKeys(mailbox.keys, publicKey, Date.now()) } as any,
                 asEntity(this.mailboxRepo!, mailbox),
                 { ignoreACL: true },
             );

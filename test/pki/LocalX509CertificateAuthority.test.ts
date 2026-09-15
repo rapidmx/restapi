@@ -68,6 +68,10 @@ describe("LocalX509CertificateAuthority Tests", () => {
 
         const san = leafCert.getExtension<x509.SubjectAlternativeNameExtension>("2.5.29.17");
         expect(san?.names.items.map((n) => n.value)).toContain("alice@example.com");
+
+        // The issuer is the CA certificate itself, PEM like `certificate`.
+        expect(result.issuerCertificate).toBe(caCert.toString("pem"));
+        expect(leafCert.issuer).toBe(new x509.X509Certificate(result.issuerCertificate!).subject);
     });
 
     it("Persists the CA key pair to disk as 0600 and reuses it across instances (idempotent).", async () => {

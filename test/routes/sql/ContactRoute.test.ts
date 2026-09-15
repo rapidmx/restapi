@@ -309,15 +309,22 @@ describe("Route:ContactSQL Tests", () => {
             .send({
                 uid: contact.uid,
                 version: contact.version,
-                keyConflict: { observedFingerprint: "attacker-fp", observedAt: Date.now(), source: "header" },
+                keyConflicts: [{ useType: "sign", observedKey: { fingerprint: "attacker-fp" }, observedAt: Date.now(), source: "header" }],
             });
 
         expect(result.status).toBe(400);
+        for (const field of ["keyConflict", "previousKeys", "rejectedKeys"]) {
+            const refused = await request(server.getApplication())
+                .put(`${baseUrl}/${contact.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: contact.uid, version: contact.version, [field]: [] });
+            expect(refused.status, field).toBe(400);
+        }
 
         // SQL stores an unset nullable `simple-json` column as `null`, not `undefined` - see this codebase's
         // documented SQL null-vs-undefined gotcha (`resource_mailboxes_design` memory).
         const existing = await contactRepo.findOne({ where: { uid: contact.uid } });
-        expect(existing?.keyConflict).toBeFalsy();
+        expect(existing?.keyConflicts).toBeFalsy();
     });
 
     it("A different user cannot update a contact they don't have access to.", async () => {

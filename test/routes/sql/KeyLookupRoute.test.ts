@@ -13,7 +13,8 @@ import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { registerTestDoubles, StaticDnsResolver } from "../../testDoubles.js";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
-import { keyTrustSuite } from "../keyTrustSuite.js";
+import { keyResolveSuite } from "../keyResolveSuite.js";
+import { keyTrustSuite, type KeyTrustSuiteContext } from "../keyTrustSuite.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -287,7 +288,7 @@ describe("Route:KeyLookupSQL Tests", () => {
         expect(result.status).toBe(403);
     });
 
-    keyTrustSuite({
+    const keySuiteContext: KeyTrustSuiteContext = {
         app: () => server.getApplication(),
         baseUrl,
         tokenFor: (user) => JWTUtils.createTokenSync(config.get("auth"), user),
@@ -312,5 +313,7 @@ describe("Route:KeyLookupSQL Tests", () => {
         findAuditEntries: async (mailboxUid) => await auditLogRepo.find({ where: { mailboxUid } }),
         dnsResolver: () => objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!,
         mockFetch: () => mockFetch,
-    });
+    };
+    keyTrustSuite(keySuiteContext);
+    keyResolveSuite(keySuiteContext);
 });

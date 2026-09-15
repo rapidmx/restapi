@@ -16,7 +16,15 @@ interface SignResponse {
     data?: {
         certificate?: string;
         serial_number?: string;
+        /** The CA certificate that signed `certificate`, PEM. */
+        issuing_ca?: string;
+        /** The issuing CA's chain, issuing CA first, PEM each. */
+        ca_chain?: string[];
     };
+}
+
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+    return values.find((value): value is string => typeof value === "string" && value.trim().length > 0);
 }
 
 /**
@@ -25,7 +33,7 @@ interface SignResponse {
  * recommended production backend for this interface, the same way `PostfixSendmailTransport` is the
  * recommended real `MailTransport`. Genuinely free and self-hosted, deliberately steering clear of a paid
  * vendor-contract dependency: `issue()` posts the CSR straight through to `POST /v1/<mount>/sign/<role>`
- * (request takes `csr` + `common_name`, response returns `certificate`/`serial_number`, per Vault/OpenBao's
+ * (request takes `csr` + `common_name`, response returns `certificate`/`serial_number`/`issuing_ca`/`ca_chain`, per Vault/OpenBao's
  * public PKI API reference) and `revoke()` calls `POST /v1/<mount>/revoke` - the server's own CRL/OCSP
  * responder then reflects the revocation automatically, with no bespoke revocation-list code needed here.
  *
@@ -166,12 +174,20 @@ export class OpenBaoPkiCertificateAuthority implements EncryptionCertificateAuth
         const fingerprint: string = Buffer.from(await certificate.getThumbprint("SHA-256")).toString("hex");
         await this.recordSerial(fingerprint, serialNumber);
 
+        // The direct issuer: `issuing_ca`, else the first `ca_chain` entry (both PEM). Passed on unverified -
+        // `BaseKeyVaultRoute.enrollKey()` checks it actually signed the certificate before publishing it.
+        const issuerCertificate: string | undefined = firstNonEmptyString(
+            result.data?.issuing_ca,
+            Array.isArray(result.data?.ca_chain) ? result.data.ca_chain[0] : undefined,
+        );
+
         return {
             certificate: certificatePem,
             fingerprint,
             notBefore: certificate.notBefore,
             notAfter: certificate.notAfter,
             serialNumber,
+            ...(issuerCertificate ? { issuerCertificate } : {}),
         };
     }
 

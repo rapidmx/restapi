@@ -75,7 +75,17 @@ export function isValidKeyDiscoveryHash(hash: unknown): hash is string {
  * set, small enough to block a deliberately oversized blob. Same bound `RapidMxKeyHeaderUtils` applies. */
 export const MAX_PUBLIC_KEY_BASE64_LENGTH = 8192;
 
+/** Upper bound, in base64 characters, for a `PublicKey.issuerCertificate` (16 KB) - wider than a leaf's bound because an
+ * intermediate CA certificate can carry more extensions. A key carrying a longer one makes the response malformed. */
+export const MAX_ISSUER_CERTIFICATE_BASE64_LENGTH = 16384;
+
 const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/** A structurally valid `PublicKey.issuerCertificate`: non-empty base64 of at most `MAX_ISSUER_CERTIFICATE_BASE64_LENGTH`
+ * characters. Whether it parses, and actually issued the key's certificate, is for the consumer to check. */
+function isIssuerCertificate(value: unknown): value is string {
+    return typeof value === "string" && value.length > 0 && value.length <= MAX_ISSUER_CERTIFICATE_BASE64_LENGTH && BASE64_PATTERN.test(value);
+}
 
 function isFiniteNumber(value: unknown): value is number {
     return typeof value === "number" && Number.isFinite(value);
@@ -89,7 +99,7 @@ function parsePublicKey(raw: unknown): PublicKey | undefined {
     if (!isPlainObject(raw)) {
         return undefined;
     }
-    const { publicKey, type, useType, fingerprint, notBefore, notAfter, revokedAt } = raw;
+    const { publicKey, type, useType, fingerprint, notBefore, notAfter, revokedAt, revocationReason, issuerCertificate } = raw;
     if (
         typeof publicKey !== "string" ||
         publicKey.length === 0 ||
@@ -103,13 +113,22 @@ function parsePublicKey(raw: unknown): PublicKey | undefined {
         fingerprint.length > 256 ||
         !isFiniteNumber(notBefore) ||
         !isFiniteNumber(notAfter) ||
-        (revokedAt !== undefined && revokedAt !== null && !isFiniteNumber(revokedAt))
+        (revokedAt !== undefined && revokedAt !== null && !isFiniteNumber(revokedAt)) ||
+        (revocationReason !== undefined && revocationReason !== null && revocationReason !== "superseded" && revocationReason !== "compromised") ||
+        (issuerCertificate !== undefined && issuerCertificate !== null && !isIssuerCertificate(issuerCertificate))
     ) {
         return undefined;
     }
     const key: PublicKey = { publicKey, type, useType, fingerprint, notBefore, notAfter };
     if (isFiniteNumber(revokedAt)) {
         key.revokedAt = revokedAt;
+        // Only meaningful on a revoked key; consumers read an absent reason as "compromised".
+        if (revocationReason === "superseded" || revocationReason === "compromised") {
+            key.revocationReason = revocationReason;
+        }
+    }
+    if (typeof issuerCertificate === "string") {
+        key.issuerCertificate = issuerCertificate;
     }
     return key;
 }

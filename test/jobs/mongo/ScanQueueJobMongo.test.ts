@@ -38,6 +38,8 @@ import { FocusedInboxOverrideMongo } from "../../../src/models/mongo/FocusedInbo
 import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySuppressionMongo.js";
 import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSubjectErasureRequestMongo.js";
 import { buildEventIcs } from "../../../src/util/IcsUtils.js";
+import { sanitizeDiscoveredKey } from "../../../src/util/KeyringUtils.js";
+import { issueCertificate, makeTestIssuer } from "../../util/signerCertificates.js";
 import { buildDispositionNotification } from "../../../src/util/ReceiptUtils.js";
 import {
     AttendeeResponseStatus,
@@ -1197,6 +1199,132 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         const suppressions = await oofReplySuppressionRepo.find({ mailboxUid, senderAddress: "sender@example.com" }).toArray();
         expect(suppressions.length).toBe(0);
         sendSpy.mockRestore();
+    });
+
+    describe("Key rotation continuity for RapidMX-Key header conflicts", () => {
+        const DAY = 24 * 60 * 60 * 1000;
+        let mockFetch: ReturnType<typeof vi.fn>;
+
+        beforeEach(() => {
+            mockFetch = vi.fn();
+            vi.stubGlobal("fetch", mockFetch);
+        });
+
+        /** The stored/observed `PublicKey` for a base64 DER certificate, as `sanitizeDiscoveredKey()` builds it. */
+        const encryptKeyOf = (certificate: string, overrides: Record<string, any> = {}) => ({
+            ...sanitizeDiscoveredKey({ publicKey: certificate, type: "x509", useType: "encrypt", fingerprint: "", notBefore: 0, notAfter: 0 })!,
+            ...overrides,
+        });
+
+        /** Delivers a message from `address` carrying `keydata` in an aligned, oversigned `RapidMX-Key` header. */
+        async function deliverKeyHeader(address: string, keydata: string): Promise<void> {
+            const domain: string = address.split("@")[1];
+            const raw = Buffer.from(
+                [
+                    `From: ${address}`,
+                    "To: recipient@example.com",
+                    "Subject: Rotated",
+                    `RapidMX-Key: addr=${address}; prefer-encrypt=mutual; type=x509; keydata=${keydata}`,
+                    `Authentication-Results: mx.example.com; dkim=pass header.d=${domain}`,
+                    oversigningDkimSignature(domain, "RapidMX-Key"),
+                    "",
+                    "Hello.",
+                    "",
+                ].join("\r\n"),
+            );
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, raw);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: address });
+            await job.run();
+        }
+
+        async function saveKeyContact(address: string, fields: Record<string, any>): Promise<void> {
+            await contactRepo.save(
+                new ContactMongo({
+                    mailboxUid,
+                    folderUid: uuid.v4(),
+                    displayName: address,
+                    emails: [{ address, type: "other" as any }],
+                    phones: [],
+                    addresses: [],
+                    ...fields,
+                }),
+            );
+        }
+
+        it("A header conflict refreshes discovery, which replaces the expired pinned key with the same-CA key it publishes with its issuer.", async () => {
+            const domain = "rotating-header-mongo.example";
+            const address = `carol@${domain}`;
+            const issuer = await makeTestIssuer();
+            const pinned = encryptKeyOf(
+                (await issueCertificate(issuer, { sanEmails: [address], notBefore: new Date(Date.now() - 30 * DAY), notAfter: new Date(Date.now() - DAY) })).certificate,
+            );
+            const next = await issueCertificate(issuer, { sanEmails: [address], keyUsage: x509.KeyUsageFlags.keyAgreement });
+            await saveKeyContact(address, { keys: [pinned] });
+            const dnsResolver = objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!;
+            dnsResolver.records.set(`_rapidmx.${domain}`, [[`v=RMXv1; id=1; host=mail.${domain};`]]);
+            mockFetch.mockResolvedValue({
+                ok: true,
+                status: 200,
+                json: vi.fn().mockResolvedValue({
+                    encryptPreference: { preferEncrypt: "mutual", lastSeen: 100 },
+                    keys: [encryptKeyOf(next.certificate, { issuerCertificate: issuer.certificate })],
+                    escrow: false,
+                }),
+                headers: { get: () => null },
+            });
+
+            await deliverKeyHeader(address, next.certificate);
+
+            expect(mockFetch).toHaveBeenCalledTimes(1);
+            const [contact] = await contactRepo.find({ mailboxUid, "emails.address": address }).toArray();
+            expect(contact.keys.map((key: any) => key.fingerprint)).toEqual([next.fingerprint]);
+            expect(contact.keys[0].issuerCertificate).toBe(issuer.certificate);
+            expect(contact.previousKeys).toEqual([expect.objectContaining({ fingerprint: pinned.fingerprint, replacement: "automatic" })]);
+            expect(contact.keyConflicts ?? []).toEqual([]);
+        });
+
+        it("Keeps the header's conflict, with the full observed key, when the sender isn't a federated peer.", async () => {
+            const address = "dave@not-federated-header-mongo.example";
+            const pinned = encryptKeyOf(await makeCertBase64("pinned"));
+            const keydata = await makeCertBase64("observed");
+            await saveKeyContact(address, { keys: [pinned] });
+
+            await deliverKeyHeader(address, keydata);
+
+            expect(mockFetch).not.toHaveBeenCalled();
+            const [contact] = await contactRepo.find({ mailboxUid, "emails.address": address }).toArray();
+            expect(contact.keys.map((key: any) => key.fingerprint)).toEqual([pinned.fingerprint]);
+            expect(contact.keyConflicts).toEqual([
+                {
+                    useType: "encrypt",
+                    observedKey: expect.objectContaining({ publicKey: keydata, fingerprint: encryptKeyOf(keydata).fingerprint }),
+                    observedAt: expect.any(Number),
+                    source: "header",
+                },
+            ]);
+        });
+
+        it("Doesn't refresh for a key header matching the pinned key, and still delivers when a refresh fails.", async () => {
+            const address = "erin@refresh-fails-mongo.example";
+            const keydata = await makeCertBase64("pinned");
+            await saveKeyContact(address, { keys: [encryptKeyOf(keydata)] });
+            const refresh = vi.spyOn(job as any, "maybeRefreshRotatedKey");
+
+            await deliverKeyHeader(address, keydata);
+            expect(refresh).not.toHaveBeenCalled();
+
+            refresh.mockRejectedValueOnce(new Error("refresh failed"));
+            await deliverKeyHeader(address, await makeCertBase64("observed"));
+
+            expect(refresh).toHaveBeenCalledTimes(1);
+            refresh.mockRestore();
+            const [contact] = await contactRepo.find({ mailboxUid, "emails.address": address }).toArray();
+            expect(contact.keyConflicts).toHaveLength(1);
+            const delivered = await messageRepo.find({ mailboxUid, subject: "Rotated" }).toArray();
+            expect(delivered).toHaveLength(2);
+        });
     });
 
     describe("Inbound iTIP processing", () => {

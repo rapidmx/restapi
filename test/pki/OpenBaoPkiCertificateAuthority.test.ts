@@ -83,6 +83,28 @@ describe("OpenBaoPkiCertificateAuthority Tests", () => {
         expect(result.fingerprint).toMatch(/^[0-9a-f]{64}$/);
     });
 
+    it("issue() maps the issuing CA from issuing_ca, else the first ca_chain entry, and omits it when neither is present.", async () => {
+        const { pem, serialNumber } = await makeSignedCertPem("dave@example.com");
+        const { pem: issuingCa } = await makeSignedCertPem("Issuing CA");
+        const { pem: rootCa } = await makeSignedCertPem("Root CA");
+        const respond = (data: Record<string, unknown>) =>
+            mockFetch.mockResolvedValueOnce(makeFetchResponse({ json: vi.fn().mockResolvedValue({ data: { certificate: pem, serial_number: serialNumber, ...data } }) }));
+
+        respond({ issuing_ca: issuingCa, ca_chain: [rootCa] });
+        expect((await authority.issue("dave@example.com", "csr")).issuerCertificate).toBe(issuingCa);
+
+        respond({ ca_chain: [issuingCa, rootCa] });
+        expect((await authority.issue("dave@example.com", "csr")).issuerCertificate).toBe(issuingCa);
+
+        respond({ issuing_ca: "", ca_chain: [] });
+        const none: IssuedCertificate = await authority.issue("dave@example.com", "csr");
+        expect(none.issuerCertificate).toBeUndefined();
+        expect("issuerCertificate" in none).toBe(false);
+
+        respond({ ca_chain: "not-a-list" });
+        expect((await authority.issue("dave@example.com", "csr")).issuerCertificate).toBeUndefined();
+    });
+
     it("Strips a trailing slash from a configured address before building the request URL.", async () => {
         (authority as any).address = "https://vault.example.com:8200/";
         const { pem, serialNumber } = await makeSignedCertPem("bob@example.com");

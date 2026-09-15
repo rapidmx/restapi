@@ -190,6 +190,10 @@ export interface PublicKey {
     notAfter: number;
     /** UTC timestamp at which this key was revoked, if applicable. */
     revokedAt?: number;
+    /** Why the key was revoked: `superseded` by a newer key of the same use type (routine rotation), or `compromised`. Absent on a revoked key means `compromised`. */
+    revocationReason?: "superseded" | "compromised";
+    /** The base64 encoded DER X.509 certificate that directly issued `publicKey`, when known. At most 16 KB of base64. */
+    issuerCertificate?: string;
 }
 
 /**
@@ -277,12 +281,26 @@ export interface Contact extends RecoverableBaseEntity {
     keysFirstSeen?: number;
     /** UTC timestamp of the most recent message observed from this contact, with or without a key header. */
     lastMessageSeen?: number;
-    /** Set when an observed key conflicts with the stored key. Blocks silent acceptance. */
-    keyConflict?: {
-        observedFingerprint: string;
-        observedAt: number;
-        source: "header" | "discovery";
-    };
+    /** Observed keys that conflict with the pinned key of their useType. Blocks silent acceptance. At most one per useType. */
+    keyConflicts?: KeyConflict[];
+    /** Formerly pinned keys, newest first, at most 5 per useType. Kept so older signed mail still verifies. */
+    previousKeys?: PreviousKey[];
+    /** Observed keys the user rejected, newest first, at most 10. Not recorded as conflicts again. */
+    rejectedKeys?: { useType: "sign" | "encrypt"; fingerprint: string; rejectedAt: number }[];
+}
+
+export interface KeyConflict {
+    useType: "sign" | "encrypt";
+    /** The observed key in full, so the user can accept it. */
+    observedKey: PublicKey;
+    observedAt: number;
+    source: "header" | "discovery";
+}
+
+export interface PreviousKey extends PublicKey {
+    /** UTC timestamp at which it stopped being the pinned key. */
+    replacedAt: number;
+    replacement: "automatic" | "user";
 }
 ```
 
@@ -297,13 +315,35 @@ The client MUST surface certificate fingerprints in the contact UI so users can 
 When an observed key for a contact differs from the stored key, the client MUST NOT silently accept the new key and MUST NOT silently reject the message. It MUST:
 
 1. Retain the previously stored key.
-2. Record the conflict in `Contact.keyConflict`.
+2. Record the conflict in `Contact.keyConflicts`, with the full observed key. There is one entry per `useType`, and a later observation replaces an earlier one. A key whose fingerprint the user rejected for that `useType` (`Contact.rejectedKeys`) is not recorded again.
 3. Present the change to the user with both fingerprints and the date each was first seen.
 4. Require explicit user action to replace the pinned key.
 
 Key changes are routine (rotation, reinstall, new device) and are also exactly what an attack looks like. The distinction cannot be made automatically.
 
 A key MUST be replaced without prompting only when the new certificate is signed by the same issuing CA as the pinned certificate **and** the pinned certificate is expired or revoked.
+
+To make this provable, a server MUST publish each key's issuing CA certificate as `PublicKey.issuerCertificate`. It stores one only after checking that the leaf's issuer name equals the CA certificate's subject and that the leaf's signature verifies against the CA's public key. A peer MUST NOT trust a peer-asserted issuer name alone. A receiving server replaces an observed key N for the pinned key P of the same `useType` without prompting only when all of these hold:
+
+- (a) N carries `issuerCertificate` I. I parses and may act as a CA: a basicConstraints extension, when present, has `cA` true (a keyUsage extension, when present, must allow certificate signing). N's issuer name equals I's subject, and N's signature verifies with I's public key.
+- (b) P's certificate also verifies with I's public key, and P's issuer name equals I's subject. Both come from the same issuing CA key.
+- (c) P is expired at the time of the observation, or P is revoked. P is revoked when the pinned record has `revokedAt`, or when the same authenticated response lists P's fingerprint with `revokedAt`. Either `revocationReason` counts.
+- (d) N is currently valid, names the contact's address (subjectAltName `rfc822Name`, or the subject `emailAddress` when there is none), and its usage fits the `useType`. For `sign`, a keyUsage extension (when present) must include `digitalSignature`. For `encrypt`, it must include `keyAgreement` or `keyEncipherment`, the bits the reference encryption CA issues (ECDH and RSA keys respectively). For both, an extKeyUsage extension (when present) must include `emailProtection`.
+
+When all hold, N is pinned, P moves to `Contact.previousKeys` with `replacement: "automatic"`, and the conflict for that `useType` is cleared. Otherwise the conflict is recorded as above.
+
+Revocations in an authenticated response are applied to keys already on file. A listed key with `revokedAt` is never pinned, not even on first use, and never recorded as a conflict. When it matches a pinned or previous key, that key takes the listed `revokedAt`/`revocationReason` if the revocation is stronger: any revocation beats none, and `"compromised"` (or no reason) beats `"superseded"`. A stored revocation is never weakened. A key already in `previousKeys` is not recorded as a conflict again.
+
+The `RapidMX-Key` header never carries `issuerCertificate`, so a key change seen there can only be recorded as a conflict. The receiving server then refreshes Discovery for the sender (as for a Rotation Notification), so the automatic rule can apply. The refresh is bounded by the federation and key caches, and it never affects delivery. It is a narrow exception to lazy, compose-time Discovery: it runs only for a sender whose DKIM-verified header just announced a different key, and it happens at delivery, so it reveals when the message was delivered, not when it was read.
+
+The user resolves a conflict with `POST /mail/mailboxes/:id/keys/resolve`, body `{ address, useType, action: "accept" | "reject", expectedPinnedFingerprint, certificate? }`:
+
+- `accept` pins `certificate` when given, otherwise the recorded conflict's key. The key is validated at that moment as in (d). The old key moves to `previousKeys` with `replacement: "user"`, the conflict is cleared, and the fingerprint is removed from `rejectedKeys`.
+- `reject` clears the conflict and adds its fingerprint to `rejectedKeys`.
+- The request fails with 409 when the pinned key is no longer `expectedPinnedFingerprint`, so the user replaces only the key they saw. It fails with 404 when there is no contact, no pinned key of that `useType` (accept), or no conflict (reject, or accept without a certificate), and with 400 for a malformed body or an invalid certificate. An accept of the key already pinned succeeds without change.
+- Both actions are audited (`contact.key_replaced`, `contact.key_conflict_rejected`).
+
+Replaced keys are kept in `previousKeys` (at most 5 per `useType`) so a message signed before a rotation still verifies. A client SHOULD treat a previous signing key as trusted for that purpose unless it is revoked as compromised (`revokedAt` with `revocationReason` `"compromised"` or no reason).
 
 #### Anti-Downgrade
 
@@ -367,6 +407,8 @@ In the event that the mailbox queried does not exist on the server, the server M
     "escrow": false
 }
 ```
+
+Each `PublicKey` in the response carries `issuerCertificate` when the server knows it, and a superseded key carries `revokedAt` and `revocationReason: "superseded"` (see _Rotation Notification_). `issuerCertificate` MUST NOT be added to the `RapidMX-Key` header, which stays small.
 
 The response for a non-existent mailbox MUST be indistinguishable in status code, body shape and response time from a mailbox that exists but has no keys published. This endpoint is otherwise a directory-harvesting oracle.
 
@@ -438,6 +480,8 @@ This is a **cache invalidation hint only**. On receiving one, the peer MUST re-r
 The reason is trust asymmetry: MDN extension fields are hop-authenticated at best, whereas the discovery endpoint is authenticated by TLS. A push mechanism that installed keys directly would be a weaker path to the same outcome, and an attacker able to forge MDNs could force key changes. Treating it purely as an invalidation signal means a forged notification costs a wasted lookup and nothing more.
 
 Push is an optimisation over `ETag` polling, not a replacement. Peers MUST continue to honour `Cache-Control` expiry independently.
+
+**Superseded keys.** When a new key of a use type becomes a mailbox's active key, the server MUST set `revokedAt` (the install time) and `revocationReason: "superseded"` on every older unrevoked key of that use type, in the same write that publishes the new key. Discovery then shows the old key as retired, which, with a shared issuing CA, lets peers replace the pin without prompting. Only the public record changes: private keys follow the rotation table in _Keypair Generation & Storage_. A superseded key was not compromised. Signatures made and mail encrypted before its `revokedAt` MUST stay trusted, both in the owner's mailbox and at peers. A `compromised` revocation, or one with no reason, withdraws trust entirely. A revocation, once published, MUST NOT be withdrawn, and `superseded` MAY only be escalated to `compromised`.
 
 ### Digital Signatures
 
