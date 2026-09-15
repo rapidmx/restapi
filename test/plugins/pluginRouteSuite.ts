@@ -593,6 +593,36 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect((await installed())["@rapidmx/mapi-plugin"].enabled).toBe(true);
         });
 
+        it("refuses adding or enabling a plugin whose UI pages overlap an enabled plugin's, and keeps the ui in the stored manifest", async () => {
+            const ui = (mount: string) => ({ apps: [{ id: "book", host: "public", mount, dir: "apps/book" }], appRail: [{ id: "book", label: "Book", href: mount }] });
+            publishFakePackage("@rapidmx/booking-plugin", "1.0.0", { plugin: { ...MAPI_MANIFEST, displayName: "Booking", ui: ui("/book") } });
+            publishFakePackage("@rapidmx/other-booking-plugin", "1.0.0", { plugin: { ...MAPI_MANIFEST, displayName: "Other Booking", ui: ui("/book") } });
+            publishFakePackage("@rapidmx/bad-ui-plugin", "1.0.0", { plugin: { ...MAPI_MANIFEST, displayName: "Bad", ui: ui("/api") } });
+
+            const booking = await add("@rapidmx/booking-plugin");
+            expect(booking.status).toBe(200);
+            expect((await installed())["@rapidmx/booking-plugin"].manifest.ui).toEqual(ui("/book"));
+
+            const plan = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/plan?name=%40rapidmx%2Fother-booking-plugin`));
+            expect(plan.body.conflicts).toEqual(["Other Booking and Booking both serve pages at /book."]);
+            const refused = await add("@rapidmx/other-booking-plugin");
+            expect(refused.status).toBe(409);
+            expect(refused.body.message).toBe("Other Booking and Booking both serve pages at /book.");
+
+            const invalid = await add("@rapidmx/bad-ui-plugin");
+            expect(invalid.status).toBe(400);
+            expect(invalid.body.message).toMatch(/'book' mounts at \/api, which is reserved/);
+
+            // With Booking disabled the other plugin can be added, and then Booking can't be enabled again.
+            expect((await put(booking.body.plugin.uid, { enabled: false })).status).toBe(200);
+            expect((await add("@rapidmx/other-booking-plugin")).status).toBe(200);
+            const current = (await installed())["@rapidmx/booking-plugin"];
+            const enable = await put(current.uid, { enabled: true });
+            expect(enable.status).toBe(409);
+            expect(enable.body.message).toBe("Booking and Other Booking both serve pages at /book.");
+            expect((await installed())["@rapidmx/booking-plugin"].enabled).toBe(false);
+        });
+
         it("reads each package and version from the registry once per request", async () => {
             expect((await add("@rapidmx/autodiscover-plugin")).status).toBe(200);
             expect(registryReads.length).toBe(new Set(registryReads).size);
@@ -810,6 +840,31 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
                     audit.mockRestore();
                 }
                 expect((await installed())["@rapidmx/mapi-plugin"]).toEqual(expect.objectContaining({ enabled: true, removed: false }));
+            });
+
+            it("undoes an add whose UI pages overlap a plugin enabled while it was being applied, whichever sorts first", async () => {
+                const withBook = (displayName: string) => ({ ...MAPI_MANIFEST, displayName, ui: { apps: [{ id: "book", host: "public", mount: "/book", dir: "apps/book" }] } });
+                for (const [adding, racing] of [
+                    ["@rapidmx/zz-booking-plugin", "@rapidmx/aa-booking-plugin"],
+                    ["@rapidmx/aa-booking-plugin", "@rapidmx/zz-booking-plugin"],
+                ]) {
+                    await ctx.clear();
+                    publishFakePackage(adding, "1.0.0", { plugin: withBook("Adding") });
+                    registryHooks.set(`${adding}@1.0.0`, () => ctx.insertPlugin({ ...MAPI_ROW, name: racing, manifest: { ...withBook("Racing"), settings: [] } }));
+                    const result = await add(adding);
+                    expect(result.status).toBe(409);
+                    expect(result.body.message).toMatch(conflict);
+                    expect(result.body.message).toMatch(/(Adding and Racing|Racing and Adding) both serve pages at \/book\./);
+                    expect((await ctx.rows()).map((row) => row.name)).toEqual([racing]);
+                }
+            });
+
+            it("doesn't refuse a change over a UI overlap that already existed before it", async () => {
+                const ui = { apps: [{ id: "book", host: "public", mount: "/book", dir: "apps/book" }] };
+                await ctx.insertPlugin({ ...MAPI_ROW, name: "@rapidmx/a-plugin", manifest: { ...MAPI_ROW.manifest, displayName: "A", ui } });
+                await ctx.insertPlugin({ ...MAPI_ROW, name: "@rapidmx/b-plugin", manifest: { ...MAPI_ROW.manifest, displayName: "B", ui } });
+                const [a] = await ctx.rows();
+                expect((await put(a.uid, { settings: {} })).status).toBe(200);
             });
 
             it("doesn't refuse a change over a requirement that was already unmet before it", async () => {

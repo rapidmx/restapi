@@ -65,6 +65,37 @@ describe("parsePluginManifest", () => {
         expect(parsePluginManifest({ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X" } } })).not.toHaveProperty("mailboxScopedData");
     });
 
+    it("keeps a valid ui block at apiVersion 1, with only its known fields, and reads a null ui as none", () => {
+        const ui = {
+            apps: [
+                { id: "book", host: "public", mount: "/book", dir: "apps/book" },
+                { id: "booking-types", host: "www", mount: "/settings/booking-types", dir: "apps/settings-booking-types" },
+            ],
+            settingsSections: [{ id: "booking-types", label: "Booking Links", href: "/settings/booking-types" }],
+            adminNav: [],
+        };
+        expect(PLUGIN_API_VERSION).toBe(1);
+        expect(parsePluginManifest({ rapidmx: { plugin: { apiVersion: 1, displayName: "Booking", ui: { ...ui, extra: true } } } })).toEqual({
+            apiVersion: 1,
+            displayName: "Booking",
+            description: undefined,
+            settings: [],
+            ui,
+        });
+        for (const empty of [null, undefined]) {
+            expect(parsePluginManifest({ rapidmx: { plugin: { apiVersion: 1, displayName: "X", ui: empty } } })).not.toHaveProperty("ui");
+        }
+    });
+
+    it("rejects an invalid ui block with the reason", () => {
+        const parse = (ui: unknown) => parsePluginManifest({ rapidmx: { plugin: { apiVersion: 1, displayName: "X", ui } } });
+        expect(parse("apps")).toBe("This plugin's manifest ui must be an object.");
+        expect(parse({ apps: [{ id: "api", host: "public", mount: "/api", dir: "apps/api" }] })).toBe(
+            "This plugin's manifest has an invalid ui.apps app: 'api' mounts at /api, which is reserved for the server's own pages.",
+        );
+        expect(parse({ appRail: [{ id: "x", label: "X", href: "/admin/x" }] })).toMatch(/invalid ui\.appRail entry: 'x' links to "\/admin\/x"/);
+    });
+
     it.each([
         [undefined, /not a RapidMX plugin/],
         [{ rapidmx: { plugin: "nope" } }, /not a RapidMX plugin/],

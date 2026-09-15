@@ -1,5 +1,41 @@
 # Release Notes
 
+## Unreleased
+
+### Plugins
+
+- **Plugin manifests can declare UI.** `PluginManifest.ui` (types `PluginUi`, `PluginUiApp`, `PluginUiNavItem`,
+  `PluginUiHost`) lists the browser apps a plugin ships as TSX sources and the navigation entries that link to them.
+  `apiVersion` stays 1: the field is optional and older servers ignore it.
+  ```json
+  "ui": {
+    "apps": [{ "id": "book", "host": "public", "mount": "/book", "dir": "apps/book" }],
+    "settingsSections": [{ "id": "booking-types", "label": "Booking Links", "href": "/settings/booking-types" }],
+    "adminNav": [],
+    "appRail": []
+  }
+  ```
+- **`parsePluginManifest()` validates `ui`** (through the new `parsePluginUi()`) and keeps only its known fields. A
+  package with an invalid `ui` isn't a loadable plugin, so adding it is 400 as for other manifest errors.
+  - **Apps** (at most 16): `id` is a lowercase slug unique among the apps; `host` is `public`, `www`, `admin` or
+    `escrow`; `dir` is a relative POSIX path inside the package (no leading `/`, drive letter, backslash, empty segment,
+    or segment starting with a dot).
+  - **Mounts** are paths of lowercase slug segments matching the host, exactly one segment below its base: `/<name>`
+    (`public`), `/<name>` or `/settings/<name>` (`www`), `/admin/<name>` (`admin`), `/escrow/<name>` (`escrow`). A
+    mount can't be one of `RESERVED_PLUGIN_UI_MOUNTS` (`/api`, `/assets`, `/__rapidrest__`, the server's own routes and
+    static files, and every core www, admin and escrow page) or overlap another app of the same plugin.
+  - **Navigation** (`settingsSections`, `adminNav`, `appRail`, at most 8 each): `id` is a lowercase slug unique within
+    its list, `label` is 1 to 64 characters and not blank, and `href` is a path under `/settings/`, under `/admin/`, or
+    (app rail) outside `/admin` and `/escrow`. An optional `icon` names a `react-icons/hi2` icon.
+- **Mount conflicts between plugins.** `findPluginUiMountConflicts(plugins)` reports every pair of UI apps from
+  different plugins whose mounts are the same or nest, across hosts, naming the later plugin as `name` so a host can
+  keep the first. `planPluginChange()` adds a conflict (`"Other Booking and Booking both serve pages at /book."`) when
+  the plugin, or anything the change installs or enables, overlaps an enabled plugin. So `POST /`, `PUT /:id` enabling
+  or changing version, and `GET /plan` refuse or report it. Overlaps between enabled plugins the change doesn't touch
+  are ignored.
+- **Races:** a plugin change that ends up overlapping a plugin enabled at the same time is undone with a 409, like an
+  unmet requirement.
+
 ## v0.11.0
 
 This release adds "Trust this signer": a user can pin the signing certificate of a validly signed message whose sender has

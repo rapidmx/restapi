@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import semver from "semver";
 import { PluginManifest } from "../models/types.js";
+import { findPluginUiMountConflicts } from "./PluginUiUtils.js";
 import { isExactVersion, missingRequiredSettings } from "./PluginUtils.js";
 
 /** An installed plugin as the dependency planner sees it - a `Plugin` row satisfies this. */
@@ -95,7 +96,9 @@ function missingSettingsConflict(label: string, manifest: PluginManifest | undef
  * - to be installed or enabled, but not allowed or missing a required setting with no default or saved value: a conflict.
  *
  * Installed plugins are never upgraded or downgraded to make room. Changing a plugin's version is also a conflict when
- * the new version falls outside the range an enabled plugin requires of it.
+ * the new version falls outside the range an enabled plugin requires of it, and so is a UI app mount of the plugin or of
+ * anything the change installs or enables that overlaps another plugin's that would be enabled with it (see
+ * `findPluginUiMountConflicts()`).
  */
 export async function planPluginChange(
     installed: PlannerInstalledPlugin[],
@@ -180,6 +183,23 @@ export async function planPluginChange(
         }
     };
     await visit(change.name, change.manifest, [change.name]);
+
+    // What would be enabled afterwards: the enabled plugins the change leaves alone, then what it installs and enables,
+    // then the changed plugin itself (at its new version). Only overlaps involving something this change enables count,
+    // so an already-conflicting pair of enabled plugins doesn't block every change.
+    const changed: Set<string> = new Set([change.name, ...plan.install.map((install) => install.name), ...plan.enable]);
+    const after: { name: string; manifest?: PluginManifest }[] = [
+        ...[...rows.values()].filter((row) => row.enabled && !changed.has(row.name)),
+        ...plan.install,
+        ...plan.enable.map((name) => rows.get(name)!),
+        { name: change.name, manifest: change.manifest },
+    ];
+    for (const conflict of findPluginUiMountConflicts(after)) {
+        // The changed plugins are listed last, so a conflict involving one always names it as the later `name`.
+        if (changed.has(conflict.name)) {
+            plan.conflicts.push(conflict.message);
+        }
+    }
     return plan;
 }
 

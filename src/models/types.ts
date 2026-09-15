@@ -2499,6 +2499,54 @@ export interface PluginSettingDefinition {
     options?: { value: string; label: string }[];
 }
 
+/** Which of the server's base routes a plugin UI app is hosted by - it decides the app's authentication and the props
+ * every page gets:
+ * - `public`: unauthenticated pages (like the booking pages), mounted at one top-level segment (`/<name>`);
+ * - `www`: the signed-in mail client, mounted at `/<name>` or `/settings/<name>`;
+ * - `admin`: the admin console, mounted at `/admin/<name>`;
+ * - `escrow`: the escrow console, mounted at `/escrow/<name>`. */
+export type PluginUiHost = "public" | "www" | "admin" | "escrow";
+
+/**
+ * A browser app a plugin ships as TSX sources. The server builds it together with the core apps, and serves its pages
+ * under `mount` through `host`'s base route. See `parsePluginManifest()` for the validation rules.
+ */
+export interface PluginUiApp {
+    /** A lowercase slug (`booking-types`), unique among the plugin's apps. */
+    id: string;
+    host: PluginUiHost;
+    /** The URL path the app's pages are served under, e.g. `/book` or `/settings/booking-types`. */
+    mount: string;
+    /** The app's page directory inside the package, as a relative POSIX path (`apps/book`). The server builds it from
+     * this path and renders it server-side from `dist/<dir>`. */
+    dir: string;
+}
+
+/** A navigation entry a plugin adds to one of the shells. */
+export interface PluginUiNavItem {
+    /** A lowercase slug, unique within its list. */
+    id: string;
+    /** The entry's text, at most `MAX_PLUGIN_UI_LABEL_LENGTH` characters. */
+    label: string;
+    /** The page the entry links to. It must lie under its list's prefix (`/settings/`, `/admin/`, or any path outside
+     * `/admin` and `/escrow` for the app rail). */
+    href: string;
+    /** The name of a `react-icons/hi2` icon, e.g. `HiOutlineCalendarDays` - the same icon set the shells use. A shell
+     * that doesn't know the name shows a generic icon; the settings sidebar shows none. */
+    icon?: string;
+}
+
+/** The `ui` block of a plugin manifest: the browser apps a plugin ships and where the shells link to them. */
+export interface PluginUi {
+    apps?: PluginUiApp[];
+    /** Entries in the web client's Settings sidebar. */
+    settingsSections?: PluginUiNavItem[];
+    /** Entries in the admin console's navigation. */
+    adminNav?: PluginUiNavItem[];
+    /** Entries in the web client's app rail (next to Mail, Calendar, Contacts and Tasks). */
+    appRail?: PluginUiNavItem[];
+}
+
 /**
  * The `rapidmx.plugin` block of a plugin package's `package.json`. A package without one is not a plugin.
  * A plugin's `./mongo` and `./sql` package exports are its entry points: each exports only that datastore's
@@ -2516,6 +2564,8 @@ export interface PluginManifest {
     /** `true` when the plugin stores data belonging to a mailbox (models marked `@MailboxScopedData()`). A data-subject
      * erasure waits while such a plugin is installed but not loaded, since its rows can't be purged without its models. */
     mailboxScopedData?: boolean;
+    /** The browser apps and navigation entries the plugin contributes. Servers that predate it ignore it. */
+    ui?: PluginUi;
 }
 
 /**

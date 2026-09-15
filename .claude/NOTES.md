@@ -1934,3 +1934,49 @@ MailboxImport mbox leaves both unset.
 
 Verification: `tsc --noEmit` and `yarn lint` clean. Full `yarn vitest run --coverage`: 253 files / 5081 tests passed; coverage
 100 / 96.74 / 100 / 100 (statements / branches / functions / lines).
+
+## 2026-09-15 — Plugin UI contract: `PluginManifest.ui`, mount validation and conflicts
+
+Uncommitted, no version bump. Phase 2 of the booking-as-a-plugin plan (`~/.claude/plans/cheerful-giggling-pine.md`): the
+server's PluginHost/PluginUiBuilder and the booking plugin build on this.
+
+Contract
+- Types in `src/models/types.ts`: `PluginUiHost` (`public|www|admin|escrow`), `PluginUiApp { id, host, mount, dir }`,
+  `PluginUiNavItem { id, label, href, icon? }`, `PluginUi { apps?, settingsSections?, adminNav?, appRail? }`,
+  `PluginManifest.ui?`. `apiVersion` stays 1.
+- New `src/plugins/PluginUiUtils.ts` (exported from root): `parsePluginUi()`, `findPluginUiMountConflicts()`,
+  `pluginUiMountsOverlap()`, `RESERVED_PLUGIN_UI_MOUNTS`, `PLUGIN_UI_HOSTS`, `MAX_PLUGIN_UI_APPS` (16),
+  `MAX_PLUGIN_UI_NAV_ITEMS` (8), `MAX_PLUGIN_UI_LABEL_LENGTH` (64). `parsePluginManifest()` calls `parsePluginUi()` when
+  `ui` is neither undefined nor null; unknown fields inside `ui` and its entries are dropped.
+- Rules: ids are lowercase slugs (`[a-z0-9]+(-[a-z0-9]+)*`, <= 64) unique per list. `dir`: `/`-separated segments of
+  `[A-Za-z0-9_-][A-Za-z0-9._-]*`, <= 200 chars (so no leading `/`, drive letter, backslash, empty/`.`/`..`/hidden segment).
+  `mount`: slug-segment absolute path <= 200, exactly ONE segment below the host base (public `/<n>`, www `/<n>` or
+  `/settings/<n>`, admin `/admin/<n>`, escrow `/escrow/<n>`). Decision: no deeper mounts - an app's own file routing gives
+  nested pages, and one segment means an exact match against the reserved list is enough (nothing can sit beneath a
+  reserved path). Not in `RESERVED_PLUGIN_UI_MOUNTS`, no overlap between the plugin's own apps. Nav `href`: slug-segment
+  path; settingsSections `/settings/<...>` (>= 2 segments), adminNav `/admin/<...>`, appRail first segment not
+  admin/escrow. `label` non-blank <= 64. `icon` optional, `^Hi[A-Z][A-Za-z0-9]*$` <= 64 (react-icons/hi2 name, as the
+  shells use).
+- Reserved list (must track server core routes): `/api /assets /__rapidrest__ /.well-known /internal /push`, server/public
+  (`/favicon.ico /fonts /images /styles`), www pages (`/calendar /contacts /messages /tasks /settings` + the 9 core settings
+  sections), `/admin` + its 15 page dirs, `/escrow /escrow/audit-log /escrow/matters`. NOT `/book` or
+  `/settings/booking-types`.
+- `findPluginUiMountConflicts(plugins)`: pairs from different plugins with equal or nested mounts, across hosts (one URL
+  space), in list order; `name` = later plugin, `otherName` = earlier (a host keeping the first claimant drops `name`).
+  Message: `"A and B both serve pages at /x."` or `"A's pages at /x/y overlap B's pages at /x."`.
+
+Planner / route
+- `planPluginChange()` appends conflicts for overlaps in the post-change enabled set (untouched enabled rows, then installs,
+  enables, then the change at its new manifest) where the later plugin is one the change touches. Unrelated pre-existing
+  overlaps are ignored; a version change isn't compared with its own old version.
+- `BasePluginRoute.applyChange()` race recheck also compares mount conflicts (enabled rows sorted by name so messages are
+  order-independent) before vs after, refusing new ones with the existing "Another plugin change made at the same time" 409.
+
+Tests: `test/plugins/PluginUiUtils.test.ts` (every rule, reserved list, overlap and conflict helpers), PluginUtils (manifest
+keeps ui, null ui, errors), PluginDependencies (enabled/disabled/removed, installed/enabled dependency, own vs dependency,
+version change, unrelated pair), `pluginRouteSuite` mongo+sql (add/plan/enable 409, invalid ui 400, stored manifest keeps
+ui, race undo in both name orders, pre-existing overlap doesn't block a settings save).
+
+Verification: `tsc --noEmit` and `yarn lint` clean (`tsconfig.test.json` has pre-existing unrelated errors). Full
+`yarn vitest run --coverage`: 254 files / 5112 tests passed; coverage 100 / 96.78 / 100 / 100; PluginUiUtils,
+PluginUtils, PluginDependencies and BasePluginRoute at 100% on every metric.

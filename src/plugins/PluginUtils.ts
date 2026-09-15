@@ -4,7 +4,8 @@
 ///////////////////////////////////////////////////////////////////////////////
 import crypto from "crypto";
 import semver from "semver";
-import { Plugin, PluginManifest, PluginSettingDefinition } from "../models/types.js";
+import { Plugin, PluginManifest, PluginSettingDefinition, PluginUi } from "../models/types.js";
+import { parsePluginUi } from "./PluginUiUtils.js";
 
 /** The plugin contract version this library implements. A plugin whose manifest declares any other
  * `apiVersion` is refused, both when an administrator adds it and when a server copy loads it. */
@@ -192,7 +193,8 @@ export interface PluginInstanceStatus {
 }
 
 /** Extracts and validates the `rapidmx.plugin` block of a package's `package.json`. Returns an error message
- * instead of a manifest when the package isn't a loadable plugin. */
+ * instead of a manifest when the package isn't a loadable plugin. Unknown fields are dropped; an optional `ui` block is
+ * checked by `parsePluginUi()`, and `null` reads as no `ui`. */
 export function parsePluginManifest(pkg: any): PluginManifest | string {
     const manifest: any = pkg?.rapidmx?.plugin;
     if (!manifest || typeof manifest !== "object") {
@@ -234,6 +236,14 @@ export function parsePluginManifest(pkg: any): PluginManifest | string {
     if (manifest.mailboxScopedData !== undefined && typeof manifest.mailboxScopedData !== "boolean") {
         return "This plugin's manifest mailboxScopedData must be true or false.";
     }
+    let ui: PluginUi | undefined;
+    if (manifest.ui !== undefined && manifest.ui !== null) {
+        const parsed: PluginUi | string = parsePluginUi(manifest.ui);
+        if (typeof parsed === "string") {
+            return parsed;
+        }
+        ui = parsed;
+    }
     return {
         apiVersion: manifest.apiVersion,
         displayName: manifest.displayName,
@@ -241,6 +251,7 @@ export function parsePluginManifest(pkg: any): PluginManifest | string {
         settings: settings as PluginSettingDefinition[],
         ...(Object.keys(requires).length > 0 ? { requires: requires as Record<string, string> } : {}),
         ...(manifest.mailboxScopedData !== undefined ? { mailboxScopedData: manifest.mailboxScopedData } : {}),
+        ...(ui ? { ui } : {}),
     };
 }
 

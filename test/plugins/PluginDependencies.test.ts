@@ -162,6 +162,49 @@ describe("planPluginChange", () => {
         const configured = await planPluginChange([{ ...disabled, settings: { k: "saved", r: "eu" } }], { name: "x", version: "1.0.0", manifest: manifest("X", { [EAS]: "1" }) }, reg);
         expect(configured).toEqual({ install: [], enable: [EAS], conflicts: [] });
     });
+
+    describe("UI mount conflicts", () => {
+        const withUi = (displayName: string, mounts: string[], requires?: Record<string, string>): PluginManifest => ({
+            ...manifest(displayName, requires),
+            ui: { apps: mounts.map((mount, i) => ({ id: `app${i}`, host: "www", mount, dir: `apps/app${i}` })) },
+        });
+        const BOOKING = "@rapidmx/booking-plugin";
+
+        it("refuses a plugin that mounts pages where an enabled plugin already does, and only an enabled one", async () => {
+            const change = { name: "@rapidmx/other-booking-plugin", version: "1.0.0", manifest: withUi("Other Booking", ["/book", "/notes"]) };
+            const enabledRow = row(BOOKING, "1.0.0", true, withUi("Booking", ["/book"]));
+            expect(await planPluginChange([enabledRow], change, REGISTRY)).toEqual({ install: [], enable: [], conflicts: ["Other Booking and Booking both serve pages at /book."] });
+            expect((await planPluginChange([{ ...enabledRow, enabled: false }], change, REGISTRY)).conflicts).toEqual([]);
+            expect((await planPluginChange([{ ...enabledRow, removed: true }], change, REGISTRY)).conflicts).toEqual([]);
+            // A plugin with no UI, or with UI elsewhere, is fine.
+            expect((await planPluginChange([enabledRow, row(EAS, "1.0.0", true)], { ...change, manifest: withUi("Other Booking", ["/notes"]) }, REGISTRY)).conflicts).toEqual([]);
+        });
+
+        it("refuses a plan whose installed or enabled requirement overlaps an enabled plugin's pages", async () => {
+            const reg = registry({ [EAS]: { "1.0.0": withUi("EAS", ["/sync"]) } });
+            const syncRow = row("@rapidmx/sync-plugin", "1.0.0", true, withUi("Sync", ["/sync"]));
+            const install = await planPluginChange([syncRow], { name: "x", version: "1.0.0", manifest: manifest("X", { [EAS]: "1" }) }, reg);
+            expect(install.install.map((i) => i.name)).toEqual([EAS]);
+            expect(install.conflicts).toEqual(["EAS and Sync both serve pages at /sync."]);
+
+            const enable = await planPluginChange([syncRow, row(EAS, "1.0.0", false, withUi("EAS", ["/sync"]))], { name: "x", version: "1.0.0", manifest: manifest("X", { [EAS]: "1" }) }, reg);
+            expect(enable.enable).toEqual([EAS]);
+            expect(enable.conflicts).toEqual(["EAS and Sync both serve pages at /sync."]);
+
+            // The plugin itself against what it brings in.
+            const own = await planPluginChange([], { name: "x", version: "1.0.0", manifest: withUi("X", ["/sync"], { [EAS]: "1" }) }, reg);
+            expect(own.conflicts).toEqual(["X and EAS both serve pages at /sync."]);
+        });
+
+        it("compares a version change against the other plugins, not the version it replaces, and ignores unrelated overlaps", async () => {
+            const current = row(BOOKING, "1.0.0", true, withUi("Booking", ["/book"]));
+            const brokenPair = [row("@rapidmx/a-plugin", "1.0.0", true, withUi("A", ["/same"])), row("@rapidmx/b-plugin", "1.0.0", true, withUi("B", ["/same"]))];
+            const plan = await planPluginChange([current, ...brokenPair], { name: BOOKING, version: "2.0.0", manifest: withUi("Booking", ["/book"]) }, REGISTRY);
+            expect(plan.conflicts).toEqual([]);
+            const moved = await planPluginChange([current, ...brokenPair], { name: BOOKING, version: "2.0.0", manifest: withUi("Booking", ["/book", "/same"]) }, REGISTRY);
+            expect(moved.conflicts).toEqual(["Booking and A both serve pages at /same.", "Booking and B both serve pages at /same."]);
+        });
+    });
 });
 
 describe("findUnmetRequirements", () => {

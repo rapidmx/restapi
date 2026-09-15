@@ -25,6 +25,7 @@ import {
     PlannedPluginChange,
     PlannedPluginInstall,
 } from "../plugins/PluginDependencies.js";
+import { findPluginUiMountConflicts } from "../plugins/PluginUiUtils.js";
 import {
     computePluginStateHash,
     DEFAULT_ALLOWED_PLUGIN_PACKAGES,
@@ -388,7 +389,8 @@ export abstract class BasePluginRoute<T extends Plugin> {
      * Checks run before writing (dependents, requirements) read a snapshot that a concurrent change can invalidate - one
      * request disabling a plugin while another enables a plugin that requires it. So once written, the requirements
      * touching `involving` are checked again against a fresh read, and a change that left an enabled plugin without a
-     * requirement is undone with a `409`. A requirement that was already unmet in `before` (the snapshot the change was
+     * requirement is undone with a `409`, as is one that left two enabled plugins' UI apps mounted at overlapping paths.
+     * A requirement that was already unmet, or an overlap that already existed, in `before` (the snapshot the change was
      * checked against) isn't this change's doing, so it doesn't refuse it.
      */
     private async applyChange<R>(before: T[], involving: string[], change: (undo: PluginUndo[]) => Promise<R>): Promise<R> {
@@ -396,8 +398,11 @@ export abstract class BasePluginRoute<T extends Plugin> {
         let succeeded = false;
         try {
             const result: R = await change(undo);
+            const after: T[] = await this.installedPlugins();
             const existing: Set<string> = new Set(findUnmetRequirements(before, involving));
-            const problems: string[] = findUnmetRequirements(await this.installedPlugins(), involving).filter((problem) => !existing.has(problem));
+            const problems: string[] = findUnmetRequirements(after, involving).filter((problem) => !existing.has(problem));
+            const existingMounts: Set<string> = new Set(this.mountConflicts(before, involving));
+            problems.push(...this.mountConflicts(after, involving).filter((problem) => !existingMounts.has(problem)));
             if (problems.length > 0) {
                 throw new ApiError(
                     ApiErrors.IDENTIFIER_EXISTS,
@@ -415,6 +420,15 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 await this.announce();
             }
         }
+    }
+
+    /** The UI mount conflicts among the enabled plugins in `plugins` that involve one of `involving`. The plugins are
+     * compared in name order, so the messages don't depend on the order the rows were read in. */
+    private mountConflicts(plugins: T[], involving: string[]): string[] {
+        const enabled: T[] = plugins.filter((row) => row.enabled).sort((a, b) => a.name.localeCompare(b.name));
+        return findPluginUiMountConflicts(enabled)
+            .filter((conflict) => involving.includes(conflict.name) || involving.includes(conflict.otherName))
+            .map((conflict) => conflict.message);
     }
 
     private async rollback(undo: PluginUndo[]): Promise<void> {
