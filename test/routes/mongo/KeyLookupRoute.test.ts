@@ -12,6 +12,8 @@ import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles, StaticDnsResolver } from "../../testDoubles.js";
+import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
+import { keyTrustSuite } from "../keyTrustSuite.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -54,6 +56,7 @@ describe("Route:KeyLookupMongo Tests", () => {
     let contactRepo: MongoRepository<ContactMongo>;
     let aclRepo: MongoRepository<any>;
     let mockFetch: ReturnType<typeof vi.fn>;
+    let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -96,6 +99,7 @@ describe("Route:KeyLookupMongo Tests", () => {
         if (conn instanceof MongoConnection) {
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
             contactRepo = conn.getMongoRepository("ContactMongo");
+            auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -264,5 +268,32 @@ describe("Route:KeyLookupMongo Tests", () => {
             .set("Authorization", "jwt " + otherUserToken);
 
         expect(result.status).toBe(403);
+    });
+
+    keyTrustSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        tokenFor: (user) => JWTUtils.createTokenSync(config.get("auth"), user),
+        saveMailbox: async (ownerUid) =>
+            await mailboxRepo.save(
+                new MailboxMongo({
+                    ownerUserUid: ownerUid,
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Test Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                }),
+            ),
+        saveAcl: async (acl) => {
+            await aclRepo.deleteMany({ uid: acl.uid });
+            await aclRepo.save({ ...acl, dateCreated: new Date(), dateModified: new Date(), version: 0 });
+        },
+        saveContact: async (fields) => await contactRepo.save(new ContactMongo(fields as any)),
+        findContacts: async (mailboxUid) => await contactRepo.find({ mailboxUid }).toArray(),
+        findAuditEntries: async (mailboxUid) => await auditLogRepo.find({ mailboxUid }).toArray(),
+        dnsResolver: () => objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!,
+        mockFetch: () => mockFetch,
     });
 });

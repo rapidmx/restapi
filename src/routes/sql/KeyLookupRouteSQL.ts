@@ -3,13 +3,14 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { Raw } from "typeorm";
-import { ContactSQL, FolderSQL, MailboxSQL } from "../../sql.js";
+import { AuditLogEntrySQL, ContactSQL, FolderSQL, MailboxSQL } from "../../sql.js";
 import { BaseKeyLookupRoute } from "../BaseKeyLookupRoute.js";
 
 export class KeyLookupRouteSQL extends BaseKeyLookupRoute<MailboxSQL, ContactSQL, FolderSQL> {
     protected mailboxClass: any = MailboxSQL;
     protected contactClass: any = ContactSQL;
     protected folderClass: any = FolderSQL;
+    protected auditLogClass: any = AuditLogEntrySQL;
 
     /** See `ScanQueueJobSQL.contactEmailQuery()`'s identical doc comment - `emails` is a serialized
      * `simple-json` column on this backend, so a LIKE scan against its serialized form is the only way to

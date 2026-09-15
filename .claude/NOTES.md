@@ -1703,3 +1703,60 @@ DateCoercionUtils, DraftBodyRetentionUtils, BaseAttachmentRoute (keyset scan aga
 KeyVaultRoute mongo/sql empty-vault body (`masterKeyGeneration: 0`), BaseAdminWriteGuards (`mailboxClass`). Also ran every
 `test/routes` file (132 files, 2539 tests) and the ScanQueueJob, AcmeEnrollmentDriver, CalendarReminder,
 MeetingScheduling and DataExport job suites - all passing. `tsc --noEmit` and eslint clean on touched files.
+
+## 2026-09-14 — "Trust this signer": `POST /:id/keys/trust`
+
+Uncommitted, no version bump (on top of the published 0.10.0). Asked for by the web client's "signed, signer not verified"
+state; react-shared is built against this contract in parallel, so keep it exact.
+
+Contract
+- `POST /mail/mailboxes/:id/keys/trust`, body `{ address, certificate }` (base64 DER X.509), on `BaseKeyLookupRoute` next
+  to `GET /:id/keys/lookup`, `@RateLimit()` like lookup. 200 = the lookup shape (`{ keys, encryptPreference?, keyConflict? }`).
+- 400: body not an object; `address` not `isPlainAddress()`; certificate not base64 (strict pattern, <= 64 KB), not parseable
+  (Node `X509Certificate` via the now-exported `KeyringUtils.sanitizeDiscoveredKey()`, then `@peculiar/x509` for extensions,
+  so a malformed extension is 400 too), outside notBefore/notAfter, identities (SAN rfc822Name, else subject
+  emailAddress - the fallback Node's `checkEmail()` applies in `CertificateInstallUtils`) not containing the address
+  case-insensitively, keyUsage present without digitalSignature, extKeyUsage present without emailProtection (strict:
+  `anyExtendedKeyUsage` alone is refused). `util/SignerCertificateUtils.ts` `parseTrustedSignerKey()`.
+- 404 missing mailbox; 403 without mailbox UPDATE (as lookup).
+- Existing `useType: "sign"` key: same fingerprint -> 200, nothing written, no audit; different -> 409 `IDENTIFIER_EXISTS`.
+  Otherwise append the sign key (stored `publicKey` re-encoded from the DER; fingerprint/dates from the cert), keep other
+  keys, set `keysFirstSeen` only if unset, never touch `encryptPreference`/`keyConflict`.
+- Audit: `AuditAction.CONTACT_KEY_TRUSTED` ("contact.key_trusted"), targetType `Contact`, mailboxUid, details
+  `{ address, fingerprint }`, only when written. New abstract `auditLogClass` on `BaseKeyLookupRoute` (set by the
+  Mongo/SQL subclasses) - breaking for custom subclasses, in RELEASE_NOTES Unreleased.
+
+Authorization (decided)
+- Mailbox UPDATE, plus what `BaseContactRoute`/`BaseScopedChildRoute` require: UPDATE on the existing contact's `folderUid`
+  (checked inside the merge, so a re-read after a race is re-checked), or CREATE on the Contacts folder before a create
+  (`beforeCreate` hook). restapi has no impersonation concept; delegates go through the same ACLs (manager = FULL passes,
+  viewer 403, custom READ+UPDATE can pin on a contact whose folder inherits the mailbox but can't create one). Trusted roles
+  bypass as usual.
+- Found while testing: `findOrCreateWellKnownFolder(..., user)` makes `RepoUtils.create()` add creator actions for that
+  user on the new folder ACL, so a delegate whose lookup lazily created the Contacts folder got lasting rights on it (and
+  a CREATE check would pass by construction). The shared write now creates the folder without `user` (inherits the
+  mailbox ACL). This also changes lookup.
+
+Race handling: `util/ContactKeyUtils.ts` `writeContactKeys()` (not in the util barrel)
+- Shared by lookup, trust and ScanQueueJob (`RapidMX-Key` header and rotation-refresh paths, via
+  `persistContactKeyUpdate(mailboxUid, address, now, merge)`). Reads uncached, calls `merge(existing)`, then either a
+  version-checked update or a create at `keyContactUid()` = `nameBasedUuid("contact-keys:<mailboxUid>:<address>")` (exact
+  address, matching the exact-address contact query). A 409 version conflict, or a duplicate key on the create, re-reads
+  and re-merges (3 attempts, then 409). Mongo's only unique index is (uid, version), so two version-0 creates collide; the
+  create's `countById` catches the rest.
+- **Known gap:** if a soft-deleted contact holds the deterministic uid (the user deleted a server-created contact), the
+  create falls back to a random uid, and two writers racing that fallback can still create two contacts, each with its
+  own sign pin. Contacts created before this change (random uids) are found by address first, so they are only affected
+  if duplicates already exist. Case variants of one address are separate contacts (existing exact-match behaviour).
+- Lookup's Mongo `contactEmailQuery` now uses `ModelUtils.literal()` (it was the one raw client value left; ScanQueueJob
+  already did). Lookup retries a lost version race instead of returning 409.
+
+Tests: new shared `test/routes/keyTrustSuite.ts` run from `test/routes/{mongo,sql}/KeyLookupRoute.test.ts` (create +
+audit row, existing encrypt-only contact untouched fields, idempotent, 409 different key, 400 bodies/addresses, 400
+expired/SAN mismatch/no identity/keyUsage/EKU/malformed extension, subject-E fallback and mixed-case SAN, 404/403
+other/403 viewer/200 manager, folder CREATE/UPDATE rules, 3 concurrent same-cert trusts, 2 concurrent different certs,
+trust racing lookup); `test/util/ContactKeyUtils.test.ts` (race branches, soft-deleted fallback, exhaustion);
+`test/util/SignerCertificateUtils.test.ts`; generator `test/util/signerCertificates.ts`. Note: the ACL cache means a test
+can't re-parent an ACL through the raw repo and expect the next request to see it - use separate folders.
+Verification: `tsc --noEmit` and `yarn lint` clean; full `yarn vitest run --coverage` 248 files / 4927 tests passed,
+coverage 100 / 96.64 / 100 / 100 (statements / branches / functions / lines).

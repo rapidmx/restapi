@@ -37,9 +37,10 @@ const MAX_DISCOVERED_KEYS = 8;
  * - `notBefore`/`notAfter` - a peer-asserted `notAfter` far in the future would otherwise keep an expired
  * certificate looking valid (or a near-zero one make a valid pinned key look expired).
  *
- * Returns `undefined` (dropped, never pinned) for anything that doesn't parse as a real X.509 certificate.
+ * Returns `undefined` (dropped, never pinned) for anything that doesn't parse as a real X.509 certificate. Also used by
+ * `POST /:id/keys/trust` (`util/SignerCertificateUtils.ts`), which pins a client-supplied certificate the same way.
  */
-function sanitizeDiscoveredKey(key: PublicKey): PublicKey | undefined {
+export function sanitizeDiscoveredKey(key: PublicKey): PublicKey | undefined {
     try {
         const cert = new crypto.X509Certificate(Buffer.from(key.publicKey, "base64"));
         const notBefore: number = new Date(cert.validFrom).getTime();

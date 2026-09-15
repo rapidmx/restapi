@@ -24,6 +24,7 @@ import type { SearchProvider } from "../search/SearchProvider.js";
 import { DataSubjectErasureRequestMongo } from "../models/mongo/DataSubjectErasureRequestMongo.js";
 import { DataSubjectErasureRequestSQL } from "../models/sql/DataSubjectErasureRequestSQL.js";
 import { ERASURE_IN_PROGRESS } from "./ErasureExecutionJob.js";
+import { writeContactKeys } from "../util/ContactKeyUtils.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
 import { extractHeader, extractHeaders, prepareRelayCopy, prependHeaders, safeDisplayName, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
@@ -1323,58 +1324,52 @@ export abstract class ScanQueueJob<
             }
         }
 
-        const existingMatches: C[] = await this.contactRepo!.find(
-            { mailboxUid: entry.mailboxUid, limit: 1, ...this.contactEmailQuery(fromAddress) },
-            { ignoreACL: true, limit: 1 },
-        );
-        const existingContact: C | undefined = existingMatches[0];
-        if (!existingContact && !discovered) {
-            // Nothing on file, nothing discovered - recording lastMessageSeen alone isn't reason enough to
-            // create a Contact for every random inbound sender.
-            return;
-        }
-
         const now: number = Date.now();
-        const update: ContactKeyState = applyDiscoveredKeys(existingContact, discovered, now, "header");
-        await this.persistContactKeyUpdate(entry.mailboxUid, fromAddress, existingContact, update, now);
+        await this.persistContactKeyUpdate(entry.mailboxUid, fromAddress, now, (existingContact) => {
+            if (!existingContact && !discovered) {
+                // Nothing on file, nothing discovered - recording lastMessageSeen alone isn't reason enough to
+                // create a Contact for every random inbound sender.
+                return undefined;
+            }
+            return applyDiscoveredKeys(existingContact, discovered, now, "header");
+        });
     }
 
     /**
      * Shared persistence tail for both `processInboundRapidMxKeyHeader()` (Group E3) and
-     * `maybeRefreshRotatedKey()` (Group E5): stamps `update` (and `lastMessageSeen`) onto `existingContact` if
-     * one was found, or creates a brand-new `Contact` in the mailbox's Contacts folder otherwise. Callers are
-     * responsible for deciding whether creating a new `Contact` is warranted at all (see each caller's own
-     * doc comment) - by the time this runs, that decision has already been made.
+     * `maybeRefreshRotatedKey()` (Group E5): reads the Contact for `address`, asks `merge` for its new key state
+     * (`undefined` writes nothing) and stamps it (and `lastMessageSeen`) onto that Contact, or creates a brand-new
+     * `Contact` in the mailbox's Contacts folder when there is none. Callers decide in `merge` whether creating a new
+     * `Contact` is warranted at all (see each caller's own doc comment). Goes through `util/ContactKeyUtils.ts`'s
+     * `writeContactKeys()` - version-checked update, deterministic-uid create, re-read and re-merge after a lost race - so
+     * a concurrent key lookup or `POST /:id/keys/trust` for the same address can't end with two contacts or two pins.
      */
     private async persistContactKeyUpdate(
         mailboxUid: string,
         address: string,
-        existingContact: C | undefined,
-        update: ContactKeyState,
         now: number,
+        merge: (existingContact: C | undefined) => Promise<ContactKeyState | undefined> | ContactKeyState | undefined,
     ): Promise<void> {
-        if (existingContact) {
-            await this.contactRepo!.update(
-                { uid: existingContact.uid, version: (existingContact as any).version, ...update, lastMessageSeen: now } as any,
-                asEntity(this.contactRepo!, existingContact),
-                { ignoreACL: true },
-            );
-            return;
-        }
-
-        const folder: F = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, mailboxUid, FolderType.CONTACTS);
-        await this.contactRepo!.create(
-            new this.contactClass({
+        await writeContactKeys<C, F>(
+            {
+                contactRepo: this.contactRepo!,
+                folderRepo: this.folderRepo!,
+                contactClass: this.contactClass,
+                folderClass: this.folderClass,
                 mailboxUid,
-                folderUid: folder.uid,
-                displayName: address,
-                emails: [{ address, type: ContactAddressKind.OTHER }],
-                phones: [],
-                addresses: [],
-                ...update,
-                lastMessageSeen: now,
-            }),
-            { ignoreACL: true },
+                address,
+                findContact: async () =>
+                    (
+                        await this.contactRepo!.find(
+                            { mailboxUid, limit: 1, ...this.contactEmailQuery(address) },
+                            { ignoreACL: true, limit: 1, skipCache: true },
+                        )
+                    )[0],
+            },
+            async (existingContact) => {
+                const update: ContactKeyState | undefined = await merge(existingContact);
+                return update ? ({ ...update, lastMessageSeen: now } as Partial<C>) : undefined;
+            },
         );
     }
 
@@ -1396,18 +1391,10 @@ export abstract class ScanQueueJob<
      * change a `Contact` on its own.
      */
     private async maybeRefreshRotatedKey(mailboxUid: string, peerAddress: string): Promise<void> {
-        const existingMatches: C[] = await this.contactRepo!.find(
-            { mailboxUid, limit: 1, ...this.contactEmailQuery(peerAddress) },
-            { ignoreACL: true, limit: 1 },
-        );
-        const existingContact: C | undefined = existingMatches[0];
-
         const now: number = Date.now();
-        const update: ContactKeyState | undefined = await discoverAndMergeKeys(this.dnsResolver!, peerAddress, existingContact, now);
-        if (!update) {
-            return;
-        }
-        await this.persistContactKeyUpdate(mailboxUid, peerAddress, existingContact, update, now);
+        await this.persistContactKeyUpdate(mailboxUid, peerAddress, now, (existingContact) =>
+            discoverAndMergeKeys(this.dnsResolver!, peerAddress, existingContact, now),
+        );
     }
 
     /**

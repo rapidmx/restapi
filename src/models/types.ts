@@ -1548,6 +1548,9 @@ export enum AuditAction {
     /** `GET /mailbox/:id/keyvault` - the one key-vault operation that reads wrapped key material (including,
      * via `masterKeyWraps`, an escrow wrap) rather than writing it. See `BaseKeyVaultRoute.get()`. */
     KEY_VAULT_READ = "key_vault.read",
+    /** `POST /mailbox/:id/keys/trust` pinned a signer certificate on a contact by hand ("Trust this signer"). `details`
+     * carries the `address` and the certificate `fingerprint`. See `BaseKeyLookupRoute.trust()`. */
+    CONTACT_KEY_TRUSTED = "contact.key_trusted",
     /** `AcmeEnrollmentDriverJob`'s own periodic flag for a mailbox's signing certificate nearing `notAfter`
      * with no newer non-revoked one already enrolled - detection only, this server can't originate a fresh
      * CSR itself (the signing key pair is always client-side). */

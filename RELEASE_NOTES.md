@@ -1,5 +1,38 @@
 # Release Notes
 
+## Unreleased
+
+This release adds "Trust this signer": a user can pin the signing certificate of a validly signed message whose sender has
+no signing key pinned yet.
+
+### Breaking changes
+
+- **`BaseKeyLookupRoute` has a new abstract `auditLogClass`.** `KeyLookupRouteMongo` and `KeyLookupRouteSQL` set it
+  (`AuditLogEntryMongo`/`AuditLogEntrySQL`). A custom subclass of `BaseKeyLookupRoute` must set it too.
+
+### Key management
+
+- **`POST /mail/mailboxes/:id/keys/trust`** with `{ "address": "<address>", "certificate": "<base64 DER X.509>" }` pins
+  the certificate as the address's signing key on the contact in the mailbox, creating the contact in Contacts if there
+  is none. It returns the same `{ keys, encryptPreference?, keyConflict? }` as `GET /:id/keys/lookup`.
+  - **Only the first signing key:** 409 when a different signing key is already pinned (replacing one is still
+    discovery's Key Conflict Handling). The same certificate again is 200 and changes nothing.
+  - **Nothing else changes:** encrypt keys, `encryptPreference` and `keyConflict` stay as they are; `keysFirstSeen`
+    is set if unset. Fingerprint and validity dates come from the certificate.
+  - **400** for a body that isn't `{ address, certificate }`, an address that isn't one plain `local@domain`, and a
+    certificate that doesn't parse, isn't currently valid, doesn't name the address (subjectAltName email, or subject
+    emailAddress when it has none; case-insensitive), has keyUsage without `digitalSignature`, or has extKeyUsage without
+    `emailProtection`.
+  - **Access:** UPDATE on the mailbox (404 for a missing mailbox, 403 otherwise), plus UPDATE on the contact's folder
+    or CREATE on the Contacts folder, as for the contact routes. A read-only delegate gets 403.
+  - Rate limited like lookup. Each pin records a `contact.key_trusted` audit entry (`AuditAction.CONTACT_KEY_TRUSTED`)
+    with the address and fingerprint.
+- **One contact per address:** key lookup, the inbound `RapidMX-Key` header and trust create a server-made contact at
+  a uid derived from the mailbox and address. Concurrent writers re-read the winner and merge into it, so they don't end
+  with two contacts or two signing keys. A lost version race is retried instead of returned as 409.
+- **Contacts folder access:** a Contacts folder created by a lookup or trust no longer gives the caller creator rights on
+  it; it inherits the mailbox's access.
+
 ## v0.10.0
 
 This release adds plugin search, updates and dependencies, and hardens almost every part of the library after six rounds

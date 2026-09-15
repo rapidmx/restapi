@@ -12,6 +12,8 @@ import { Repository } from "typeorm";
 import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { registerTestDoubles, StaticDnsResolver } from "../../testDoubles.js";
+import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
+import { keyTrustSuite } from "../keyTrustSuite.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -50,6 +52,7 @@ describe("Route:KeyLookupSQL Tests", () => {
     let contactRepo: Repository<ContactSQL>;
     let aclRepo: Repository<AccessControlListSQL>;
     let mockFetch: ReturnType<typeof vi.fn>;
+    let auditLogRepo: Repository<AuditLogEntrySQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
@@ -93,6 +96,7 @@ describe("Route:KeyLookupSQL Tests", () => {
         if (isSqlDataSource(conn)) {
             mailboxRepo = conn.getRepository(MailboxSQL);
             contactRepo = conn.getRepository(ContactSQL);
+            auditLogRepo = conn.getRepository(AuditLogEntrySQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -281,5 +285,32 @@ describe("Route:KeyLookupSQL Tests", () => {
             .set("Authorization", "jwt " + otherUserToken);
 
         expect(result.status).toBe(403);
+    });
+
+    keyTrustSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        tokenFor: (user) => JWTUtils.createTokenSync(config.get("auth"), user),
+        saveMailbox: async (ownerUid) =>
+            await mailboxRepo.save(
+                new MailboxSQL({
+                    ownerUserUid: ownerUid,
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Test Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                }),
+            ),
+        saveAcl: async (acl) => {
+            await aclRepo.delete({ uid: acl.uid });
+            await aclRepo.save({ ...acl, dateCreated: new Date(), dateModified: new Date(), version: 0 } as any);
+        },
+        saveContact: async (fields) => await contactRepo.save(new ContactSQL(fields as any)),
+        findContacts: async (mailboxUid) => await contactRepo.find({ where: { mailboxUid } }),
+        findAuditEntries: async (mailboxUid) => await auditLogRepo.find({ where: { mailboxUid } }),
+        dnsResolver: () => objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!,
+        mockFetch: () => mockFetch,
     });
 });
