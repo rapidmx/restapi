@@ -16,7 +16,7 @@
 // `@Config`/`@Logger`/`@Inject` injection and `@Init` phase, which is exactly what leaves `repoUtils`/
 // `blobStore` genuinely `undefined` for these guard-clause tests to observe.
 import config from "../config.js";
-import { ObjectFactory } from "@rapidrest/service-core";
+import { ObjectFactory, QueryLiteral } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { BaseAttachmentRoute } from "../../src/routes/BaseAttachmentRoute.js";
 
@@ -76,6 +76,6 @@ describe("BaseAttachmentRoute Tests (repoUtils/blobStore guard clauses only)", (
         find.mockReset().mockResolvedValueOnce([a1]).mockResolvedValueOnce([a2]).mockResolvedValue([]);
         await route.truncate({}, { folderUid: "f1" }, { uid: "user-1" } as any);
         // Two full pages and a short one for the re-stamp scan, then the inherited truncate's own scan.
-        expect(find.mock.calls.filter(([criteria]) => criteria.folderUid === "eq(f1)" && criteria.sort === undefined).length).toBeGreaterThanOrEqual(3);
+        expect(find.mock.calls.filter(([criteria]) => criteria.folderUid instanceof QueryLiteral && criteria.folderUid.value === "f1" && criteria.sort === undefined).length).toBeGreaterThanOrEqual(3);
     });
 });

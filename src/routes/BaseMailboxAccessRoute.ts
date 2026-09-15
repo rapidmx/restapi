@@ -7,16 +7,17 @@
 // `GET /mail/mailboxes/:id/access`, sharing MailboxRoute's own base path.
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import {
+    type AccessControlList,
     ACLAction,
+    type ACLRecord,
     ACLUtils,
     ApiErrorMessages,
     ApiErrors,
     HttpRequest,
+    ModelUtils,
     ObjectFactory,
     RepoUtils,
     RouteDecorators,
-    type AccessControlList,
-    type ACLRecord,
 } from "@rapidrest/service-core";
 import { AuditAction, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
@@ -153,13 +154,13 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
      * `BaseMailIngestRoute.aliasQueryValue()`'s identical mongo/SQL split (MongoDB's implicit array-element
      * equality matches a plain value directly; the SQL backend stores `aliasAddresses` as a serialized
      * `simple-json` column, so `MailboxAccessRouteSQL` overrides this the same way `MailIngestRouteSQL`
-     * does). Wrapped in `eq(...)` so the search query parser takes it as a literal value, never an operator.
+     * does). A `ModelUtils.literal()`, so the search query parser takes it as a value, never an operator.
      * Not shared code with `BaseMailIngestRoute` - that class's own resolution also handles
      * `DistributionList`s and a plus-tag fallback tier, neither of which applies to "does this exact
      * address belong to a real person's mailbox," so duplicating this one small helper here is simpler and
      * lower-risk than threading a shared utility through mail delivery's own resolution path for this. */
     protected aliasQueryValue(address: string): any {
-        return `eq(${address})`;
+        return ModelUtils.literal(address);
     }
 
     private async requireMailbox(mailboxId: string): Promise<M> {
@@ -405,7 +406,7 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
             normalizeAddress(candidate.primarySmtpAddress) === address || candidate.aliasAddresses.some((alias) => normalizeAddress(alias) === address);
         const mailbox: M | undefined =
             (byUid && hasAddress(byUid) ? byUid : undefined) ??
-            (await this.mailboxRepo!.find({ primarySmtpAddress: `eq(${address})`, limit: 1 }, { ignoreACL: true, limit: 1 }))[0] ??
+            (await this.mailboxRepo!.find({ primarySmtpAddress: ModelUtils.literal(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }))[0] ??
             (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(address), limit: 1 }, { ignoreACL: true, limit: 1 }))[0];
         if (!mailbox || !mailbox.ownerUserUid) {
             return null;

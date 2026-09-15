@@ -11,6 +11,7 @@ import {
     DocDecorators,
     HttpRequest,
     HttpResponse,
+    ModelUtils,
     RepoUtils,
     RouteDecorators,
     type UpdateObject,
@@ -1127,7 +1128,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // applies this instruction to the row that won.
         for (let attempt = 1; ; attempt++) {
             const existing: FocusedInboxOverride[] = await repo.find(
-                { mailboxUid: `eq(${mailboxUid})`, senderAddress: `eq(${normalized})`, limit: 1 } as any,
+                { mailboxUid: ModelUtils.literal(mailboxUid), senderAddress: ModelUtils.literal(normalized), limit: 1 } as any,
                 { ignoreACL: true, limit: 1, skipCache: true },
             );
             try {

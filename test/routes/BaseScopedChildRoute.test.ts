@@ -23,7 +23,7 @@
 // `@Config`/`@Logger`/`@Inject` injection and `@Init` phase, which is exactly what leaves `repoUtils`
 // (and `aclUtils`) genuinely `undefined` for the guard-clause tests below to observe.
 import config from "../config.js";
-import { ObjectFactory } from "@rapidrest/service-core";
+import { ModelUtils, ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { BaseScopedChildRoute } from "../../src/routes/BaseScopedChildRoute.js";
 
@@ -145,13 +145,23 @@ describe("BaseScopedChildRoute Tests (truncate() TOCTOU-scoping fix only)", () =
         // that only starts existing AFTER this snapshot (e.g. mail delivered mid-request) is not in this
         // filter at all, so RepoUtils.truncate()'s own independent live re-query can't sweep it in
         // unchecked, unlike passing the original `{folderUid: "folder-1"}` filter straight through would.
-        // One literal `eq()` per uid, never a comma-split `in(...)`.
-        expect(truncateSpy.mock.calls).toEqual([
-            [{ uid: "eq(msg-1)" }, { user: { uid: "user-1" }, ignoreACL: true }],
-            [{ uid: "eq(msg-2)" }, { user: { uid: "user-1" }, ignoreACL: true }],
-        ]);
+        // One literal `in` list of exactly those uids, never a parsed (comma-split) `in(...)`.
+        expect(truncateSpy.mock.calls).toEqual([[{ uid: ModelUtils.literal(["msg-1", "msg-2"], "in") }, { user: { uid: "user-1" }, ignoreACL: true }]]);
         // The snapshot query itself is scoped by the permission-checked folder, as a literal.
-        expect((route as any).repoUtils.find.mock.calls[0][0].folderUid).toBe("eq(folder-1)");
+        expect((route as any).repoUtils.find.mock.calls[0][0].folderUid).toEqual(ModelUtils.literal("folder-1"));
+    });
+
+    it("Deletes a large snapshot in bounded literal `in` batches of 500.", async () => {
+        const route = objectFactory.newInstance<TestScopedRouteForTruncate>(TestScopedRouteForTruncate, { initialize: false });
+        const matched = Array.from({ length: 501 }, (_, i) => ({ uid: `msg-${i}`, folderUid: "folder-1" }));
+        const truncateSpy = vi.fn().mockResolvedValue(undefined);
+        (route as any).repoUtils = { find: vi.fn().mockResolvedValueOnce(matched).mockResolvedValue([]), truncate: truncateSpy };
+        (route as any).aclUtils = { hasPermission: vi.fn().mockResolvedValue(true) };
+
+        await route.truncate({}, { folderUid: "folder-1" }, { uid: "user-1" } as any);
+
+        expect(truncateSpy.mock.calls.map(([criteria]) => criteria.uid.value.length)).toEqual([500, 1]);
+        expect(truncateSpy.mock.calls[1][0].uid).toEqual(ModelUtils.literal(["msg-500"], "in"));
     });
 
     it("Never calls truncate() at all when nothing matches - nothing to check and nothing to delete.", async () => {

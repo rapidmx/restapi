@@ -79,10 +79,17 @@ export function stripClientId(obj: unknown): void {
     }
 }
 
-/** Whether `err` is a unique-index violation from MongoDB (`E11000`) or a SQL driver. */
+/**
+ * Whether `err` is a unique-index violation: a raw MongoDB (`E11000`) or SQL driver error, or the `IDENTIFIER_EXISTS`
+ * 400 that `RepoUtils.create()`/`update()` map one to since service-core 2.1.0 (a clash on a record's identity during
+ * an update is a 409 instead, which callers that retry already treat as a lost race).
+ */
 export function isDuplicateKeyError(err: any): boolean {
     if (!err) {
         return false;
+    }
+    if (err.code === ApiErrors.IDENTIFIER_EXISTS && err.status === 400) {
+        return true;
     }
     if (err.code === 11000 || err.code === "23505" || err.code === "ER_DUP_ENTRY" || err.code === "SQLITE_CONSTRAINT_UNIQUE") {
         return true;

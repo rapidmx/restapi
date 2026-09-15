@@ -10,6 +10,7 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    ModelUtils,
     RepoUtils,
     RouteDecorators,
     type UpdateObject,
@@ -111,7 +112,7 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
                 args: [this.shareLinkClass],
             });
         }
-        const links: CalendarShareLink[] = await this.shareLinkRepo.find({ token: `eq(${token})`, limit: 1 } as any, {
+        const links: CalendarShareLink[] = await this.shareLinkRepo.find({ token: ModelUtils.literal(token), limit: 1 } as any, {
             ignoreACL: true,
             limit: 1,
         });
@@ -137,7 +138,7 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
     /** The list filter for `find()`/`count()`: the client query can't widen the checked mailbox (see
      * `stripUnsafeQueryKeys()`), and a `deleted` filter is dropped unless `user` may view deleted folders. */
     private async listFilter(params: any, query: any, mailboxUid: string, user: JWTUser | undefined): Promise<any> {
-        const filter: any = { ...stripUnsafeQueryKeys(query), ...params, mailboxUid: `eq(${mailboxUid})` };
+        const filter: any = { ...stripUnsafeQueryKeys(query), ...params, mailboxUid: ModelUtils.literal(mailboxUid) };
         if ("deleted" in filter && !(await this.canViewDeleted(user, mailboxUid))) {
             delete filter.deleted;
         }

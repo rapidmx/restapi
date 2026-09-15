@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, type JWTUser } from "@rapidrest/core";
-import { ApiErrors, HttpRequest, RouteDecorators } from "@rapidrest/service-core";
+import { ApiErrors, HttpRequest, ModelUtils, RouteDecorators } from "@rapidrest/service-core";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import { FocusedInboxOverride } from "../models/types.js";
@@ -34,7 +34,7 @@ export abstract class BaseFocusedInboxOverrideRoute<T extends FocusedInboxOverri
 
     private async findForSender(mailboxUid: string, senderAddress: string): Promise<T | undefined> {
         const found: T[] = await this.repoUtils!.find(
-            { mailboxUid: `eq(${mailboxUid})`, senderAddress: `eq(${senderAddress})`, limit: 1 } as any,
+            { mailboxUid: ModelUtils.literal(mailboxUid), senderAddress: ModelUtils.literal(senderAddress), limit: 1 } as any,
             { ignoreACL: true, limit: 1 },
         );
         return found[0];

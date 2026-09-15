@@ -11,6 +11,7 @@ import {
     DocDecorators,
     HttpRequest,
     HttpResponse,
+    ModelUtils,
     ObjectFactory,
     RepoUtils,
     RouteDecorators,
@@ -120,7 +121,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
      * compares against the whole serialized string and never matches a single element.
      */
     protected aliasQueryValue(address: string): any {
-        return address;
+        return ModelUtils.literal(address);
     }
 
     private async init() {
@@ -177,7 +178,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
      * `DistributionList` match (`deliver()`, `expandDistributionList()`) can check this tier, then a
      * `DistributionList`, before ever falling back to a plus-stripped mailbox match. */
     private async findExactMailboxByAddress(address: string): Promise<M | undefined> {
-        const mailboxes: M[] = await this.mailboxRepo!.find({ primarySmtpAddress: address }, { ignoreACL: true, limit: 1 });
+        const mailboxes: M[] = await this.mailboxRepo!.find({ primarySmtpAddress: ModelUtils.literal(address) } as any, { ignoreACL: true, limit: 1 });
         return (
             mailboxes[0] ??
             (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(address) }, { ignoreACL: true, limit: 1 }))[0]
@@ -220,7 +221,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
 
     private async findDistributionListByAddress(address: string): Promise<DistributionList | undefined> {
         const lists: DistributionList[] = await this.distributionListRepo!.find(
-            { primarySmtpAddress: address },
+            { primarySmtpAddress: ModelUtils.literal(address) } as any,
             { ignoreACL: true, limit: 1 },
         );
         return (

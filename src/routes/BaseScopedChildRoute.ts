@@ -11,6 +11,7 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    ModelUtils,
     RepoUtils,
     RouteDecorators,
     type UpdateObject,
@@ -33,6 +34,8 @@ const { Delete, Get, Head, Param, Post, Put, Query, Request, Response, User: Aut
  * failure under Vitest's module transform.
  */
 const SHARE_TOKEN_UID_PREFIX = "share:";
+/** How many uids `truncate()` deletes per `RepoUtils.truncate()` call, keeping each SQL `IN` list bounded. */
+const TRUNCATE_BATCH_SIZE = 500;
 
 /** Every token `BaseCalendarShareLinkRoute` mints is 32 random bytes, base64url. Checked before any lookup, so the
  * value is always a plain literal by the time it reaches a query. */
@@ -180,7 +183,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
                 args: [this.shareLinkClass],
             });
         }
-        const links: CalendarShareLink[] = await this.shareLinkRepo.find({ token: `eq(${token})`, limit: 1 } as any, {
+        const links: CalendarShareLink[] = await this.shareLinkRepo.find({ token: ModelUtils.literal(token), limit: 1 } as any, {
             ignoreACL: true,
             limit: 1,
         });
@@ -195,10 +198,10 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
     }
 
     /** The data filter for a list-shaped request: the client query minus anything that could widen it
-     * (`stripUnsafeQueryKeys()`), with the permission-checked scope forced last as a literal `eq(...)`, so the value is
-     * never parsed as an operator. */
+     * (`stripUnsafeQueryKeys()`), with the permission-checked scope forced last as a `ModelUtils.literal()`, so the value
+     * is never parsed as an operator or substituted (`me`/`null`). */
     private scopedFilter(params: any, query: any, scopeUid: string): any {
-        return { ...stripUnsafeQueryKeys(query), ...params, [this.scopeProperty]: `eq(${scopeUid})` };
+        return { ...stripUnsafeQueryKeys(query), ...params, [this.scopeProperty]: ModelUtils.literal(scopeUid) };
     }
 
     /** Whether `user` may see soft-deleted records in `scopeUid`: DELETE and UPDATE there, the two actions a restore
@@ -496,10 +499,11 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         // record that only starts matching after this snapshot is simply left for a later truncate() call
         // to pick up (and check), rather than being deleted unchecked by this one.
         //
-        // One literal `eq(uid)` per record rather than one `in(a,b,...)`: the query parser splits `in(...)` on commas,
-        // so a (legacy, client-chosen) uid containing one widened the delete to records outside this scope.
-        for (const existing of matched) {
-            await this.repoUtils.truncate({ uid: `eq(${existing.uid})` } as any, { user, ignoreACL: true });
+        // A literal `in` list matches each uid exactly: a (legacy, client-chosen) uid holding `,` or `()` can't widen the
+        // delete to records outside this scope, as a parsed `in(a,b,...)` would. Batched to keep each SQL `IN` bounded.
+        for (let i = 0; i < matched.length; i += TRUNCATE_BATCH_SIZE) {
+            const uids: string[] = matched.slice(i, i + TRUNCATE_BATCH_SIZE).map((existing) => existing.uid);
+            await this.repoUtils.truncate({ uid: ModelUtils.literal(uids, "in") } as any, { user, ignoreACL: true });
         }
     }
 

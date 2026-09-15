@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { JWTUser, ObjectFactory } from "@rapidrest/core";
-import { RepoUtils } from "@rapidrest/service-core";
+import { type AccessControlList, type ACLUtils, RepoUtils } from "@rapidrest/service-core";
 import { Folder, FolderType } from "../models/types.js";
 import { nameBasedUuid } from "./UuidUtils.js";
 
@@ -141,9 +141,29 @@ async function createWellKnownFolder<F extends Folder>(
     // by anyone, including the mailbox's own owner, once a real per-record ACL exists for `Folder` (see the
     // architecture note on `Message.mailboxUid`). Matches `BaseFolderRoute.create()`'s same seeding for
     // client-initiated folder creation.
-    return await folderRepo.create(instance, {
-        user,
-        ignoreACL: true,
-        acl: { uid: instance.uid, parentUid: mailboxUid, records: [] },
-    });
+    const acl = { uid: instance.uid, parentUid: mailboxUid, records: [] };
+    if (!uid) {
+        // A random uid: no existing ACL can legitimately be there, so service-core's default refusal applies.
+        return await folderRepo.create(instance, { user, ignoreACL: true, acl });
+    }
+
+    // The deterministic uid is derived server-side from the mailbox uid and type and never taken from a client, and
+    // only trusted callers can write an ACL at an arbitrary uid (`BaseACLRoute`), so an ACL already at this uid was
+    // left behind by an earlier incarnation of this same folder (its row removed without its ACL). service-core
+    // 2.1.0 refuses to reuse it unless told to (`allowExistingACL`). Reusing it keeps a lost race on the uid failing
+    // on the unique index (the caller re-reads the winner) rather than at the ACL claim, before the winner's row is
+    // visible. The leftover ACL may carry stale grants or a different parent, so it is reset to the fresh shape once
+    // this create has won the uid.
+    const aclUtils: ACLUtils | undefined = (folderRepo as any).aclUtils;
+    const leftover: AccessControlList | undefined = await aclUtils?.findACL(uid, [], { skipCache: true, skipParents: true });
+    const created: F = await folderRepo.create(instance, { user, ignoreACL: true, acl, allowExistingACL: true });
+    if (leftover) {
+        const current: AccessControlList | undefined = await aclUtils!.findACL(uid, [], { skipCache: true, skipParents: true });
+        if (current) {
+            current.parentUid = mailboxUid;
+            current.records = [];
+            await aclUtils!.saveACL(current);
+        }
+    }
+    return created;
 }

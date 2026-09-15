@@ -5,7 +5,7 @@
 import * as crypto from "crypto";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ObjectDecorators } from "@rapidrest/core";
-import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { BackgroundService, ModelUtils, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
@@ -1241,7 +1241,7 @@ export abstract class ScanQueueJob<
      * `MailIngestRouteSQL.aliasQueryValue()` and `MailboxRouteSQL.findAccessibleMailboxUids()`.
      */
     protected contactEmailQuery(address: string): any {
-        return { "emails.address": address };
+        return { "emails.address": ModelUtils.literal(address) };
     }
 
     /**
@@ -1438,7 +1438,7 @@ export abstract class ScanQueueJob<
         senderAddress: string,
     ): Promise<MessageClassification | undefined> {
         const matches: FIO[] = await this.focusedInboxOverrideRepo!.find(
-            { mailboxUid, senderAddress, limit: 1 } as any,
+            { mailboxUid, senderAddress: ModelUtils.literal(senderAddress), limit: 1 } as any,
             { ignoreACL: true, limit: 1 },
         );
         return matches[0]?.classifyAs;
@@ -1456,7 +1456,7 @@ export abstract class ScanQueueJob<
     ): Promise<boolean> {
         if (conversationId) {
             const thread: M[] = await this.messageRepo!.find(
-                { mailboxUid, conversationId, limit: 1 } as any,
+                { mailboxUid, conversationId: ModelUtils.literal(conversationId), limit: 1 } as any,
                 { ignoreACL: true, limit: 1 },
             );
             if (thread.length > 0) {
@@ -1584,7 +1584,7 @@ export abstract class ScanQueueJob<
         // unchecked envelope sender could otherwise be read as a query operator (e.g. `ne(x)`).
         const senderKey: string = boundIndexedValue(entry.envelopeFrom);
         const existing: OS[] = (
-            await this.oofReplySuppressionRepo!.find({ mailboxUid: entry.mailboxUid, senderAddress: senderKey, limit: 1 } as any, {
+            await this.oofReplySuppressionRepo!.find({ mailboxUid: entry.mailboxUid, senderAddress: ModelUtils.literal(senderKey), limit: 1 } as any, {
                 ignoreACL: true,
                 limit: 1,
             })
@@ -1669,7 +1669,7 @@ export abstract class ScanQueueJob<
         const messageKey: string = boundIndexedValue(recallOfMessageId);
         const matches: M[] = (
             await this.messageRepo!.find(
-                { mailboxUid: entry.mailboxUid, messageId: messageKey, limit: 5 } as any,
+                { mailboxUid: entry.mailboxUid, messageId: ModelUtils.literal(messageKey), limit: 5 } as any,
                 { ignoreACL: true, limit: 5 },
             )
         ).filter((message) => message.messageId === messageKey && normalizeAddress(message.from?.address ?? "") === sender);
@@ -1937,7 +1937,7 @@ export abstract class ScanQueueJob<
         // Bounded and exact-matched for the same reasons as `processRecall()`'s lookup.
         const messageKey: string = boundIndexedValue(parsed.originalMessageId);
         const matches: M[] = (
-            await this.messageRepo!.find({ mailboxUid: entry.mailboxUid, messageId: messageKey, limit: 5 } as any, { ignoreACL: true, limit: 5 })
+            await this.messageRepo!.find({ mailboxUid: entry.mailboxUid, messageId: ModelUtils.literal(messageKey), limit: 5 } as any, { ignoreACL: true, limit: 5 })
         ).filter((message) => message.messageId === messageKey);
         const target: M | undefined = matches[0];
         if (!target) {
@@ -2018,7 +2018,7 @@ export abstract class ScanQueueJob<
      * UID like `ne(x)` would otherwise be parsed as a query operator and match (and let a CANCEL delete) other events. */
     private async findCalendarEventRows(mailboxUid: string, icalUid: string): Promise<CE[]> {
         const key: string = boundIndexedValue(icalUid);
-        const rows: CE[] = await this.calendarEventRepo!.find({ mailboxUid, icalUid: key, limit: 50 } as any, { ignoreACL: true, limit: 50 });
+        const rows: CE[] = await this.calendarEventRepo!.find({ mailboxUid, icalUid: ModelUtils.literal(key), limit: 50 } as any, { ignoreACL: true, limit: 50 });
         return rows.filter((row) => row.icalUid === key);
     }
 

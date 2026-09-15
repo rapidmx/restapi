@@ -11,6 +11,7 @@ import {
     DatabaseDecorators,
     DocDecorators,
     HttpRequest,
+    ModelUtils,
     ObjectFactory,
     RateLimiter,
     RepoUtils,
@@ -140,9 +141,9 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@.]+\.[^\s@]+$/;
  *
  * ## Rate limiting
  *
- * `cancel()`/`reschedule()` carry `@RateLimit()`, which keys its primary counter on `` `${method} ${path}` `` -
- * the path embeds the manage token, so that is a per-booking limit - plus an independent, more permissive
- * per-source-IP counter. `book()` does NOT use the decorator: keyed per booking type, one client could exhaust
+ * `cancel()`/`reschedule()` carry `@RateLimit()`, which keys its primary counter on the method and the route with its
+ * params (service-core 2.1.0: for an anonymous caller, also on the client IP) - the path embeds the manage token, so
+ * that is a per-booking, per-client limit - plus an independent, more permissive per-source-IP counter. `book()` does NOT use the decorator: keyed per booking type, one client could exhaust
  * a link's counter and lock every other booker out of it, so it checks the same limiter itself, keyed per source
  * IP *and* booking type (`checkBookingRateLimit()`), after the booking type is resolved so no counter exists for a
  * slug that names nothing. `slots()` - the one read that does real work per call - checks the same limiter on its
@@ -274,7 +275,7 @@ export abstract class BaseBookingRoute<
         if (typeof token !== "string" || !MANAGE_TOKEN_PATTERN.test(token)) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        const matches: B[] = await this.bookingRepo!.find({ manageToken: `eq(${token})` } as any, { ignoreACL: true, limit: 1, skipCache: true });
+        const matches: B[] = await this.bookingRepo!.find({ manageToken: ModelUtils.literal(token) } as any, { ignoreACL: true, limit: 1, skipCache: true });
         if (matches.length === 0) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
@@ -335,11 +336,11 @@ export abstract class BaseBookingRoute<
      * carries the volume. Results are de-duplicated by `uid`, since a row can legitimately match more than one.
      */
     private async findBusyEvents(folderUids: string[], windowStart: Date, windowEnd: Date): Promise<CE[]> {
-        // One query set per folder, each as a literal `eq()`, never `in(a,b)`: the query parser splits `in(...)` on
-        // commas, so a (legacy, client-chosen) folder uid holding one would publish another folder's busy time.
+        // One query set per folder, each an exact `ModelUtils.literal()` match (a legacy, client-chosen folder uid may hold
+        // `,()` or be `me`/`null`, none of which may widen the match to another folder's busy time).
         const perFolder: CE[][] = await Promise.all(
             folderUids.map(async (uid) => {
-                const folderUid: string = `eq(${uid})`;
+                const folderUid = ModelUtils.literal(uid);
                 const [overlapping, masters, overrides] = await Promise.all([
                     this.findAllEvents({
                         folderUid,
@@ -351,7 +352,7 @@ export abstract class BaseBookingRoute<
                     this.findAllEvents({ folderUid, recurrenceRule: "ne(null)" }),
                     this.findAllEvents({ folderUid, recurrenceId: "ne(null)" }),
                 ]);
-                // The query parser reads `eq(x)` loosely (`me`, `null`), so keep only rows really in this folder.
+                // Defense in depth: keep only rows really in this folder.
                 return [...overlapping, ...masters, ...overrides].filter((event) => event.folderUid === uid);
             }),
         );

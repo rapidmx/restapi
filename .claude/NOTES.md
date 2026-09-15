@@ -1444,3 +1444,96 @@ once), release leaving a changed claim alone, release failures logged; booking c
 split expansion; MimeHeaderUtils quoted-pairs in display names/comments; DkimOversignUtils non-string AR values.
 Removed dead code: `BaseAttachmentRoute.resolveMailboxUidFor()` and its `folderClass` (update() strips client
 folderUid/mailboxUid and create() is refused, so `BaseScopedChildRoute.enforceMailboxUid()` never runs for attachments).
+
+## 2026-09-14 — Migrated to `@rapidrest/service-core` 2.1.0
+
+Uncommitted, no version bump. `package.json`: devDependency `^2.1.0`, peerDependency `2.x` -> `^2.1.0` (restapi now
+relies on `RepoCreateOptions.allowExistingACL`, `ModelUtils.literal()` and 2.1.0's mapped duplicate-key errors).
+Read service-core's `RELEASE_NOTES.md` v2.1.0 and its 2026-09-14 NOTES entries (agents A/B, F1-F3) first.
+
+`allowExistingACL` (2.1.0 refuses a create at a uid that already has an ACL, even for a trusted caller)
+- Only `recordACL` models reach that check (`RepoUtils.claimRecordACL()`), and in restapi those are just `Folder` and
+  `Mailbox` (`@Protect(..., true)`); every other model's create is unaffected, deterministic uid or not (key vaults,
+  policies, branding, setup state, `nameBasedUuid()` rows in ScanQueueJob, ...).
+- **One site: `util/FolderUtils.ts` `createWellKnownFolder()`, deterministic uid only** (`wellKnownFolderUid()`,
+  `nameBasedUuid("folder:<mailbox>:<type>")`). Legitimate because the uid is derived server-side from the mailbox uid
+  and type and is never client input, and only a trusted caller can write an ACL at an arbitrary uid (`BaseACLRoute`
+  `POST` has no `:id`, so it's trusted-only). An ACL already there is a leftover of an earlier incarnation of the same
+  folder (row removed without its ACL - e.g. a failed `removeACL()` after a purge, or a test harness `repo.clear()`,
+  which is exactly how the whole ScanQueueJob/auto-provision suites failed with `IDENTIFIER_EXISTS` before this).
+  Reusing it also keeps a lost creation race failing on the uid's unique index (the caller re-reads the winner) instead
+  of at the ACL claim, where the winner's row may not be visible yet. Because the leftover may carry stale grants or a
+  different parent, it is looked up first (`findACL(uid, [], { skipCache, skipParents })`) and, once this create has
+  won the uid, reset to the fresh shape (`parentUid: mailboxUid`, `records: []`). The random-uid fallback (a
+  soft-deleted folder holds the deterministic uid) does not pass it. `ACLUtils` is read from the repo's protected
+  `aclUtils` (callers only hand over a `RepoUtils`).
+- Deliberately NOT passed: `BaseFolderRoute.create()` (random server-minted uid), `BaseMailboxRoute` create/
+  auto-provision (uid = client-chosen address; `assertNoLeftoverMailboxData()` already refuses 409 when an ACL exists).
+- Reserved uids (route/class/`default_*` ACLs): Folder uids are UUIDs and Mailbox uids are addresses (always contain
+  `@`), so neither can equal a class/route name. Non-recordACL singleton uids (`encryption-policy`, `retention-policy`,
+  `branding`, `setup-state`, `mailbox-policy`) are lowercase-hyphenated and never reach the check anyway.
+
+Code changes caused by 2.1.0 behaviour
+- Duplicate keys: `RepoUtils.create()` now throws `ApiError` 400 `IDENTIFIER_EXISTS` instead of the raw driver error, so
+  `RequestBodyUtils.isDuplicateKeyError()` also recognises that (400 only; restapi's own `IDENTIFIER_EXISTS` errors are
+  409 and stay unrecognised). Callers: `BaseFocusedInboxOverrideRoute.create()` lost-race path and
+  `BaseMessageRoute.upsertSenderOverride()` retry, which would otherwise have stopped retrying.
+- `BaseBookingRoute` doc comment: `@RateLimit()` on `cancel()`/`reschedule()` is now per (client IP, booking) for the
+  anonymous callers these routes serve, plus the independent per-IP counter.
+
+Test expectation changes (new, correct framework behaviour; no security assertion weakened)
+- `MailboxRoute.test.ts` (mongo + sql), bulk `PUT /` rename to a foreign address: 400 -> 403. `BulkError` now takes the
+  first failed element's status; the row-unchanged assertion is kept.
+- Test doubles/spies keyed on a raw query value now read `.value` of the literal: `BaseMailIngestRoute.DistributionLists`
+  address repo, ScanQueueJob (mongo + sql) recall race spy, `BaseAttachmentRoute`/`BaseScopedChildRoute` truncate
+  criteria. New tests: FolderUtils (allowExistingACL only on the deterministic uid, leftover ACL reset, no reset when
+  none/gone), RequestBodyUtils (`IDENTIFIER_EXISTS` 400 vs 409), BaseScopedChildRoute (truncate batches of 500).
+- No failures from dates, `$or`/`$and`/`$`-key 400s, truncate caps, cache keys, push payloads (restapi has no
+  `@RequiresScope` fields), metrics, Mongo `findOneAndUpdate`, SQL `insert()` (no TypeORM relations) or auth.
+
+`ModelUtils.literal()` replacements (sender/client-controlled values; in-memory exact-match post-filters kept)
+- Hand-built `eq(...)`: `BaseBookingRoute` manage token and busy-time folder uids; `BaseFolderRoute`/
+  `BaseScopedChildRoute` share-link token and forced scope (`listFilter`/`scopedFilter`); `BaseAttachmentRoute`
+  `messageFilter` and the truncate re-stamp scan's `folderUid`; `BaseFocusedInboxOverrideRoute.findForSender` and
+  `BaseMessageRoute.upsertSenderOverride` (mailbox + sender); `BaseMailboxRoute` `aliasQueryValue` (Mongo),
+  `assertAddressesAvailable` primary lookups and `assertNoLeftoverMailboxData` `mailboxUid`; `BaseMailboxAccessRoute`
+  `aliasQueryValue` (Mongo) and lookup-by-email primary lookup.
+- Previously raw (unescaped) sender-controlled values, which a value like `ne(x)` could have turned into an operator:
+  `BaseMailIngestRoute` mailbox/distribution-list primary lookups and Mongo `aliasQueryValue`; ScanQueueJob OOF
+  suppression sender, MDN and recall `messageId`, iTIP `icalUid`, focused-inbox override sender, `conversationId`,
+  Mongo `contactEmailQuery`; `MailboxImportJob.alreadyImported` `messageId` (had no post-filter).
+- `eq(uid)`-per-record truncates -> literal `in` lists: `BaseScopedChildRoute` and `BaseMailboxRoute` (batches of 500
+  so a SQL `IN` stays bounded; per-uid pushes are unchanged since `RepoUtils.truncate()` publishes per uid),
+  `BaseMatterRoute` (one call - `matched` is one page - which also drops the `isQuerySafeUid()`/`delete()` split for
+  legacy uids; `Matter` isn't recoverable, so both paths were already hard deletes).
+- Left alone: job keyset cursors (`gt(<date>)`/`eq(<date>)`, a literal would skip date coercion), server-held
+  `user.uid` filters, blob-key references, `in(...)` lists built by `EscrowUtils.exactInFilter()`.
+
+Workarounds now redundant with 2.1.0 (all kept as defence in depth)
+- `_id` stripping on create/update (`stripClientCreateFields`/`stripClientId`): create always inserts and drops `_id`;
+  update takes `_id` from `existing`. Also create's `version`/`dateCreated`/`dateModified` stripping.
+- Dotted/`$` key checks on update bodies (`assertNoPathKeys`/`assertPlainPropertyName`): framework returns 400 too.
+- `$`-key stripping from client queries and forcing the scope last (`stripUnsafeQueryKeys`, escrow `$or` overrides):
+  SQL `$or` no longer overrides a top-level key and `$` keys are 400 on both backends. restapi still strips silently.
+- `asEntity()` for optimistic locking: plain Mongo rows with a numeric `version` are now version-checked.
+- `BaseSetupRoute.saveStep` retry on `INTERNAL_ERROR`: the Mongo read-back race is now a 409 (`findOneAndUpdate`).
+- `EscrowUtils.isQuerySafeUid()`/`exactInFilter()` could become `ModelUtils.literal(values, "in")`.
+- Still needed: bounded indexed values (`boundIndexedValue`, a storage/index limit) and `DateCoercionUtils`.
+  `DateCoercionUtils` is laxer than 2.1.0 (it accepts numeric strings and epoch seconds via `new Date()`) for the
+  fields it covers; other `Date` columns now get the framework's strict ISO 8601 / epoch-ms rule.
+
+Consumer-visible behaviour (server, activesync, mapi, react-shared, web-client)
+- Plugins/server code creating `Folder` or `Mailbox` rows with their own deterministic uids must use
+  `findOrCreateWellKnownFolder()` or pass `allowExistingACL` themselves, or get 400 `IDENTIFIER_EXISTS` on a leftover ACL.
+- Bulk `PUT` errors carry the first failed element's status (e.g. 403) instead of a blanket 400.
+- `DELETE /folders?...` (inherited `CRUDRoute.truncate()` on a recordACL model with ACLs checked) removes at most one
+  page per request.
+- `Date` fields outside `DateCoercionUtils` reject numeric strings/epoch seconds with 400; an empty/malformed `$or`/
+  `$and` or `$` key in the `q` query is 400.
+- Anonymous callers of `@RateLimit()` routes (booking cancel/reschedule, public key discovery) are bucketed per client
+  IP; metrics are labelled by route pattern.
+
+Verification: `node_modules/@rapidrest/service-core` is 2.1.0. First full run on 2.1.0 before any change: 228 failures
+in 8 files (ScanQueueJob mongo/sql + AcmeChallenge: leftover folder ACLs; MailboxAutoProvision: same; MailboxRoute:
+bulk status). Final: `npx tsc --noEmit` and `yarn lint` clean; `yarn vitest run --coverage` 243 files / 4814 tests
+passed, coverage 100 / 96.58 / 100 / 100 (statements / branches / functions / lines), gate met.

@@ -11,6 +11,7 @@ import {
     DocDecorators,
     HttpRequest,
     HttpResponse,
+    ModelUtils,
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
@@ -168,7 +169,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
     /** The data filter for listing `message`'s attachments: the client query minus anything that could widen it, with
      * `messageUid` forced as a literal. Attachments aren't soft-deleted, so a `deleted` filter is dropped too. */
     private messageFilter(params: any, query: any, message: M): any {
-        const filter: any = { ...stripUnsafeQueryKeys(query), ...params, messageUid: `eq(${message.uid})` };
+        const filter: any = { ...stripUnsafeQueryKeys(query), ...params, messageUid: ModelUtils.literal(message.uid) };
         delete filter.folderUid;
         delete filter.mailboxUid;
         delete filter.deleted;
@@ -353,7 +354,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         const folderUid: unknown = query?.folderUid;
         if (typeof folderUid === "string" && folderUid && (await this.aclUtils!.hasPermission(user, folderUid, ACLAction.TRUNCATE))) {
             for (let page = 0; ; page++) {
-                const rows: T[] = await this.repoUtils!.find({ folderUid: `eq(${folderUid})`, limit: this.folderScanPageSize, page } as any, {
+                const rows: T[] = await this.repoUtils!.find({ folderUid: ModelUtils.literal(folderUid), limit: this.folderScanPageSize, page } as any, {
                     limit: this.folderScanPageSize,
                     page,
                     ignoreACL: true,

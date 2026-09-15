@@ -54,7 +54,8 @@ function makeReq(from: string, to: string, raw: string): any {
 function makeAddressRepo(byAddress: Record<string, any>): any {
     return {
         find: vi.fn(async (query: any) => {
-            const match = query?.primarySmtpAddress && byAddress[query.primarySmtpAddress];
+            // Addresses are queried as `ModelUtils.literal()` values.
+            const match = query?.primarySmtpAddress && byAddress[query.primarySmtpAddress.value];
             return match ? [match] : [];
         }),
         update: vi.fn(async (obj: any, existing: any) => ({ ...existing, ...obj })),

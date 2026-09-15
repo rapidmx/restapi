@@ -460,12 +460,13 @@ describe("Route:MailboxSQL Tests", () => {
             .send(newAddress);
         expect(property.status).toBe(403);
 
-        // `CRUDRoute`'s bulk validator reports any element's failure as a 400.
+        // `CRUDRoute`'s bulk validator reports a `BulkError` carrying the first failed element's own status
+        // (service-core 2.1.0; it was a blanket 400 before), with that element's reason kept.
         const bulk = await request(server.getApplication())
             .put(baseUrl)
             .set("Authorization", "jwt " + ownerToken)
             .send([{ uid: obj.uid, version: obj.version, primarySmtpAddress: newAddress }]);
-        expect(bulk.status).toBe(400);
+        expect(bulk.status).toBe(403);
 
         const unchanged = await repo.findOne({ where: { uid: obj.uid } });
         expect(unchanged?.primarySmtpAddress).toBe(obj.primarySmtpAddress);

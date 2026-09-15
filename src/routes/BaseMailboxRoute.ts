@@ -11,6 +11,7 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    ModelUtils,
     RepoUtils,
     RouteDecorators,
     type UpdateObject,
@@ -43,6 +44,8 @@ function sameOwner(a: string | undefined, b: string | undefined): boolean {
 
 /** Every top-level `Date` field of `Mailbox` a client writes - coerced on create/update (see `util/DateCoercionUtils.ts`). */
 const MAILBOX_DATE_FIELDS = ["oofStartTime", "oofEndTime"] as const;
+/** How many uids `truncate()` deletes per `RepoUtils.truncate()` call, keeping each SQL `IN` list bounded. */
+const TRUNCATE_BATCH_SIZE = 500;
 const { Config } = ObjectDecorators;
 
 /** `Mailbox` fields that only server-side code may set - the CA-issued `keys` (`BaseKeyVaultRoute.enrollKey()`/
@@ -289,7 +292,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     /** The query value matching one element of an `aliasAddresses` column - a literal on Mongo (array-element
      * equality); `MailboxRouteSQL` overrides it for the serialized `simple-json` column, like `MailIngestRouteSQL`. */
     protected aliasQueryValue(address: string): any {
-        return `eq(${address})`;
+        return ModelUtils.literal(address);
     }
 
     /**
@@ -303,9 +306,9 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             const [mailboxByUid, listByUid, mailboxesByPrimary, mailboxesByAlias, listsByPrimary, listsByAlias] = await Promise.all([
                 this.repoUtils!.findOne(address, { ignoreACL: true }),
                 distributionListRepo.findOne(address, { ignoreACL: true, includeDeleted: true }),
-                this.repoUtils!.find({ primarySmtpAddress: `eq(${address})`, limit: 2 } as any, { ignoreACL: true, limit: 2 }),
+                this.repoUtils!.find({ primarySmtpAddress: ModelUtils.literal(address), limit: 2 } as any, { ignoreACL: true, limit: 2 }),
                 this.repoUtils!.find({ aliasAddresses: this.aliasQueryValue(address), limit: 2 } as any, { ignoreACL: true, limit: 2 }),
-                distributionListRepo.find({ primarySmtpAddress: `eq(${address})`, limit: 1 } as any, { ignoreACL: true, limit: 1 }),
+                distributionListRepo.find({ primarySmtpAddress: ModelUtils.literal(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }),
                 distributionListRepo.find({ aliasAddresses: this.aliasQueryValue(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }),
             ]);
             const otherMailbox: boolean = [mailboxByUid, ...mailboxesByPrimary, ...mailboxesByAlias].some(
@@ -332,7 +335,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      */
     private async assertNoLeftoverMailboxData(uid: string): Promise<void> {
         const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
-        const folderCount: number = await folderRepo.count({ mailboxUid: `eq(${uid})` } as any, { ignoreACL: true, includeDeleted: true });
+        const folderCount: number = await folderRepo.count({ mailboxUid: ModelUtils.literal(uid) } as any, { ignoreACL: true, includeDeleted: true });
         const acl = await this.aclUtils?.findACL(uid, [], { skipCache: true });
         if (folderCount > 0 || acl) {
             throw new ApiError(
@@ -1343,10 +1346,11 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 throw err;
             }
         }
-        // One literal `eq(uid)` per mailbox: `in(a,b)` is split on commas by the query parser, so a uid containing one
-        // would have widened the delete.
-        for (const existing of matched) {
-            await this.repoUtils.truncate({ uid: `eq(${existing.uid})` } as any, { user, ignoreACL: true });
+        // A literal `in` list matches each uid exactly (a parsed `in(a,b)` splits on commas, so a uid containing one would
+        // widen the delete). Batched to keep each SQL `IN` bounded.
+        for (let i = 0; i < matched.length; i += TRUNCATE_BATCH_SIZE) {
+            const uids: string[] = matched.slice(i, i + TRUNCATE_BATCH_SIZE).map((existing) => existing.uid);
+            await this.repoUtils.truncate({ uid: ModelUtils.literal(uids, "in") } as any, { user, ignoreACL: true });
         }
     }
 }

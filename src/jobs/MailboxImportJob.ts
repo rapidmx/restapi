@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
 import { ObjectDecorators } from "@rapidrest/core";
-import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { BackgroundService, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline, ScanPipelineResult } from "../scan/ScanPipeline.js";
@@ -386,7 +386,7 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
         if (!messageId) {
             return false;
         }
-        const existing: M[] = await this.messageRepo!.find({ folderUid: folder.uid, messageId, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+        const existing: M[] = await this.messageRepo!.find({ folderUid: folder.uid, messageId: ModelUtils.literal(messageId), limit: 1 } as any, { ignoreACL: true, limit: 1 });
         return existing.length > 0;
     }
 

@@ -9,13 +9,14 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    ModelUtils,
     RepoUtils,
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { coerceDateFields, MATTER_DATE_FIELDS } from "../util/DateCoercionUtils.js";
-import { exactInFilter, findHeldScopeIds, isQuerySafeUid, requireEscrowHolder } from "../util/EscrowUtils.js";
+import { exactInFilter, findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
 import { AuditAction, Matter } from "../models/types.js";
 const { Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
@@ -298,15 +299,12 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             }
         }
 
-        // One exact delete per checked matter rather than one `in(a,b,...)`: the query parser splits `in(...)` on
-        // commas, so a (legacy, client-chosen) uid containing one would widen the delete to matters never checked.
-        for (const existing of matched) {
-            if (isQuerySafeUid(existing.uid)) {
-                await this.repoUtils!.truncate({ uid: `eq(${existing.uid})` } as any, { user, ignoreACL: true });
-            } else {
-                await this.repoUtils!.delete(existing.uid, { user, ignoreACL: true });
-            }
-        }
+        // A literal `in` list of exactly the checked matters: a (legacy, client-chosen) uid holding `,` or `()` can't widen
+        // the delete to matters never checked, as a parsed `in(a,b,...)` would. `matched` is one page (at most 1000).
+        await this.repoUtils!.truncate({ uid: ModelUtils.literal(matched.map((existing) => existing.uid), "in") } as any, {
+            user,
+            ignoreACL: true,
+        });
 
         for (const existing of matched) {
             await recordAuditLog(

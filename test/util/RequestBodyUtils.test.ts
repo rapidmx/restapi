@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { ApiError } from "@rapidrest/core";
+import { ApiErrors } from "@rapidrest/service-core";
 import {
     assertNoPathKeys,
     assertPlainPropertyName,
@@ -66,6 +68,9 @@ describe("RequestBodyUtils", () => {
         expect(isDuplicateKeyError(new Error("SQLITE_CONSTRAINT: UNIQUE constraint failed: t.a"))).toBe(true);
         expect(isDuplicateKeyError(new Error("E11000 duplicate key error collection"))).toBe(true);
         expect(isDuplicateKeyError({})).toBe(false);
+        // service-core 2.1.0 maps a duplicate key on create to a 400 IDENTIFIER_EXISTS; restapi's own 409s aren't one.
+        expect(isDuplicateKeyError(new ApiError(ApiErrors.IDENTIFIER_EXISTS, 400, "exists"))).toBe(true);
+        expect(isDuplicateKeyError(new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "in use"))).toBe(false);
         expect(isDuplicateKeyError(new Error("something else"))).toBe(false);
     });
 });

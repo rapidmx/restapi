@@ -3460,7 +3460,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 const realFind = repo.find.bind(repo);
                 vi.spyOn(repo, "find").mockImplementation(async (query: any, ...rest: any[]) => {
                     const found = await realFind(query, ...rest);
-                    if (query?.messageId === "racing-target@example.com") {
+                    if (query?.messageId?.value === "racing-target@example.com") {
                         await messageRepo.updateOne({ uid: target.uid }, { $set: { "flags.read": true }, $inc: { version: 1 } });
                     }
                     return found;

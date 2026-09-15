@@ -140,6 +140,53 @@ describe("findOrCreateWellKnownFolder() Tests", () => {
         await expect(findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX)).rejects.toThrow("connection lost");
     });
 
+    it("Lets only a deterministic-uid create reuse an existing ACL (service-core 2.1.0 allowExistingACL).", async () => {
+        const repo = makeRepo({
+            create: vi
+                .fn()
+                .mockRejectedValueOnce(new Error("duplicate key"))
+                .mockImplementation(async (instance: any) => instance),
+            findOne: vi.fn().mockResolvedValue({ uid: wellKnownFolderUid("mbx-1", FolderType.INBOX), deleted: true }),
+        });
+
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
+
+        expect(repo.create.mock.calls[0][1].allowExistingACL).toBe(true);
+        // The random-uid fallback keeps service-core's default refusal.
+        expect(repo.create.mock.calls[1][1].allowExistingACL).toBeUndefined();
+    });
+
+    it("Resets a leftover ACL at the deterministic uid to a fresh, mailbox-parented ACL once the create wins the uid.", async () => {
+        const uid = wellKnownFolderUid("mbx-1", FolderType.INBOX);
+        const leftover = { uid, parentUid: "someone-else", records: [{ userOrRoleId: "stale-token", actions: ["read"] }], version: 3 };
+        const current = { ...leftover, records: [...leftover.records] };
+        const aclUtils = {
+            findACL: vi.fn().mockResolvedValueOnce(leftover).mockResolvedValueOnce(current),
+            saveACL: vi.fn().mockResolvedValue(undefined),
+        };
+        const repo: any = makeRepo();
+        repo.aclUtils = aclUtils;
+
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
+
+        expect(aclUtils.findACL).toHaveBeenCalledWith(uid, [], { skipCache: true, skipParents: true });
+        expect(repo.create.mock.calls[0][1]).toEqual(expect.objectContaining({ allowExistingACL: true }));
+        expect(aclUtils.saveACL).toHaveBeenCalledWith({ uid, parentUid: "mbx-1", records: [], version: 3 });
+    });
+
+    it("Leaves the ACL alone when none was at the deterministic uid before the create, or it is gone after.", async () => {
+        const aclUtils = { findACL: vi.fn().mockResolvedValue(undefined), saveACL: vi.fn() };
+        const repo: any = makeRepo();
+        repo.aclUtils = aclUtils;
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
+        expect(aclUtils.findACL).toHaveBeenCalledTimes(1);
+
+        aclUtils.findACL.mockReset().mockResolvedValueOnce({ uid: "x", parentUid: "mbx-1", records: [] }).mockResolvedValueOnce(undefined);
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.DRAFTS);
+        expect(aclUtils.findACL).toHaveBeenCalledTimes(2);
+        expect(aclUtils.saveACL).not.toHaveBeenCalled();
+    });
+
     it("Uses 'Archive' as the default name for FolderType.ARCHIVE.", async () => {
         const repo = makeRepo();
 

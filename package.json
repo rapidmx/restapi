@@ -27,7 +27,7 @@
         "@aws-sdk/client-sesv2": "3.x",
         "@opensearch-project/opensearch": ">=3.0.0",
         "@rapidrest/core": "5.x",
-        "@rapidrest/service-core": "2.x",
+        "@rapidrest/service-core": "^2.1.0",
         "mammoth": ">=1.8.0",
         "pdf-parse": ">=1.1.1"
     },
@@ -67,7 +67,7 @@
         "@aws-sdk/client-sesv2": "^3.906.0",
         "@opensearch-project/opensearch": "^3.6.0",
         "@rapidrest/core": "^5.2.2",
-        "@rapidrest/service-core": "^2.0.0",
+        "@rapidrest/service-core": "^2.1.0",
         "@swc/core": "^1.16.2",
         "@types/html-to-text": "^9.0.4",
         "@types/mailparser": "^3.4.6",
