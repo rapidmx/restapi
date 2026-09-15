@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-15
+
+### Added
+- Added POST /mail/mailboxes/:id/keys/trust, which pins a validated signing certificate for a sender that has no pinned signing key, refusing a different pinned key with 409 and auditing each pin
+- Added POST /mail/mailboxes/:id/keys/resolve to accept or reject a key conflict against the pinned fingerprint the user saw, auditing each decision
+- Added PUT /mail/messages/:id/verification-seal for client-written verification seals, set once per master key generation and replaceable only after a rekey
+
+### Changed
+- Share one version-checked, race-retrying contact key write between key lookup, trust and ScanQueueJob so concurrent writers end with one contact and one signing key
+- Create the Contacts folder without granting the caller creator rights, and query contact emails literally
+- Require auditLogClass on BaseKeyLookupRoute subclasses, and note the endpoint and breaking change in the unreleased release notes
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Store and publish each key's verified issuer certificate from the local CA, OpenBao, ACME and manual certificate chains
+- Mark keys superseded by a newer key of the same use as revoked with revocationReason superseded, and keep rekey from clearing or weakening revocations
+- Replace a contact's pinned key automatically when the new and pinned certificates verify against the same issuer and the pinned key is expired or revoked, keeping the old key in previousKeys
+- Record one key conflict per use type with the full observed key, remember rejected keys, and refresh discovery when a key header conflicts
+- Replace Contact.keyConflict with keyConflicts, previousKeys and rejectedKeys, and document the rules in the spec and release notes
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Store verificationSeal and verificationSealGeneration as server-managed message fields that no other write or message copy sets, and include them in data and matter exports
+- Require keyVaultClass on BaseMessageRoute subclasses
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
 ## [0.10.0] - 2026-09-15
 
 ### Added
@@ -845,7 +867,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/RapidMX/restapi/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/RapidMX/restapi/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/RapidMX/restapi/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/RapidMX/restapi/compare/v0.7.0...v0.8.0

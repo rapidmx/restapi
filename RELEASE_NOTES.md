@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## v0.11.0
 
 This release adds "Trust this signer": a user can pin the signing certificate of a validly signed message whose sender has
 no signing key pinned yet.
