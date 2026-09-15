@@ -13,8 +13,6 @@ import config from "../../config.js";
 import { ErasureExecutionJobMongo } from "../../../src/jobs/mongo/ErasureExecutionJobMongo.js";
 import { AttachmentMongo } from "../../../src/models/mongo/AttachmentMongo.js";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
-import { BookingMongo } from "../../../src/models/mongo/BookingMongo.js";
-import { BookingTypeMongo } from "../../../src/models/mongo/BookingTypeMongo.js";
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
 import { CalendarShareLinkMongo } from "../../../src/models/mongo/CalendarShareLinkMongo.js";
 import { KeyVaultMongo } from "../../../src/models/mongo/KeyVaultMongo.js";
@@ -67,8 +65,6 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
     let labelRepo: MongoRepository<LabelMongo>;
     let mailFilterRuleRepo: MongoRepository<MailFilterRuleMongo>;
     let mailSignatureRepo: MongoRepository<MailSignatureMongo>;
-    let bookingTypeRepo: MongoRepository<BookingTypeMongo>;
-    let bookingRepo: MongoRepository<BookingMongo>;
     let oofReplySuppressionRepo: MongoRepository<OofReplySuppressionMongo>;
     let pluginMailboxDataRepo: MongoRepository<PluginMailboxDataMongo>;
     let pluginRepo: MongoRepository<PluginMongo>;
@@ -120,8 +116,6 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         models.set("LabelMongo", LabelMongo);
         models.set("MailFilterRuleMongo", MailFilterRuleMongo);
         models.set("MailSignatureMongo", MailSignatureMongo);
-        models.set("BookingTypeMongo", BookingTypeMongo);
-        models.set("BookingMongo", BookingMongo);
         models.set("OofReplySuppressionMongo", OofReplySuppressionMongo);
         models.set("PluginMailboxDataMongo", PluginMailboxDataMongo);
         models.set("PluginMongo", PluginMongo);
@@ -157,8 +151,6 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         labelRepo = conn.getMongoRepository("LabelMongo");
         mailFilterRuleRepo = conn.getMongoRepository("MailFilterRuleMongo");
         mailSignatureRepo = conn.getMongoRepository("MailSignatureMongo");
-        bookingTypeRepo = conn.getMongoRepository("BookingTypeMongo");
-        bookingRepo = conn.getMongoRepository("BookingMongo");
         oofReplySuppressionRepo = conn.getMongoRepository("OofReplySuppressionMongo");
         pluginMailboxDataRepo = conn.getMongoRepository("PluginMailboxDataMongo");
         pluginRepo = conn.getMongoRepository("PluginMongo");
@@ -196,8 +188,6 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
             labelRepo,
             mailFilterRuleRepo,
             mailSignatureRepo,
-            bookingTypeRepo,
-            bookingRepo,
             oofReplySuppressionRepo,
             pluginMailboxDataRepo,
             pluginRepo,
@@ -323,28 +313,6 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         await mailSignatureRepo.save(
             new MailSignatureMongo({ mailboxUid: mailbox.uid, name: "A Signature", contentHtml: "<p>Sig</p>", isDefaultForNewMessages: true, isDefaultForReplyForward: false }),
         );
-        const bookingType = await bookingTypeRepo.save(
-            new BookingTypeMongo({
-                mailboxUid: mailbox.uid,
-                calendarFolderUid: folder.uid,
-                slug: "intro-call",
-                name: "Intro Call",
-                hostDisplayName: "Host",
-            }),
-        );
-        await bookingRepo.save(
-            new BookingMongo({
-                bookingTypeUid: bookingType.uid,
-                mailboxUid: mailbox.uid,
-                folderUid: folder.uid,
-                calendarEventUid: uuid.v4(),
-                bookerName: "Booker",
-                bookerEmail: "booker@example.com",
-                startDate: new Date(),
-                endDate: new Date(),
-                manageToken: uuid.v4(),
-            }),
-        );
         await oofReplySuppressionRepo.save(new OofReplySuppressionMongo({ mailboxUid: mailbox.uid, senderAddress: "sender@example.com", lastRepliedAt: new Date() }));
         await pluginMailboxDataRepo.save(
             new PluginMailboxDataMongo({ mailboxUid: mailbox.uid }),
@@ -394,10 +362,10 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         const updated = await requestRepo.findOne({ uid: request.uid } as any);
         expect(updated!.status).toBe("completed");
         // folder, message, attachment, contact, contactList, calendarEvent, task, note,
-        // focusedInboxOverride, taskList, label, mailFilterRule, mailSignature, bookingType, booking,
+        // focusedInboxOverride, taskList, label, mailFilterRule, mailSignature,
         // oofReplySuppression, plugin mailbox data, quarantineEntry, ingestQueueEntry, dataExportRequest,
-        // mailboxImportRequest, mailbox = 22
-        expect(updated!.purgedCount).toBe(22);
+        // mailboxImportRequest, mailbox = 20
+        expect(updated!.purgedCount).toBe(20);
 
         expect(await mailboxRepo.findOne({ uid: mailbox.uid } as any)).toBeNull();
         expect(await folderRepo.findOne({ uid: folder.uid } as any)).toBeNull();
@@ -413,8 +381,6 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         expect((await labelRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await mailFilterRuleRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await mailSignatureRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
-        expect((await bookingTypeRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
-        expect((await bookingRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await oofReplySuppressionRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await pluginMailboxDataRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await quarantineEntryRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);

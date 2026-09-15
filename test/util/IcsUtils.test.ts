@@ -82,7 +82,7 @@ describe("buildEventIcs() / parseIcsEvent() Tests", () => {
     it("Builds a valid ICS payload when startDate/endDate/recurrenceId/until come back as plain strings, not Date objects.", () => {
         // `CalendarEventMongo` persists (and returns) `startDate`/`endDate`/`recurrenceId` as plain
         // strings despite being typed `Date` - every real caller of `buildEventIcs()` (`respond()`,
-        // `MeetingSchedulingJob`, `BaseBookingRoute`, `ScanQueueJob`) passes a value read straight off a
+        // `MeetingSchedulingJob`, `ScanQueueJob`) passes a value read straight off a
         // persisted `CalendarEvent`, so this is the shape that actually reaches `buildEventIcs()` in
         // production, not the always-a-real-`Date` shape every other test in this file constructs by hand.
         const event = makeEvent({

@@ -49,10 +49,9 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
             authRequired: false,
         },
         // Read by `RateLimiter` (see `@rapidrest/service-core`), which backs the `@RateLimit()` decorator on
-        // `BaseBookingRoute`'s three mutating endpoints. The framework's own defaults (5 attempts / 5 minutes)
-        // are tuned for credential endpoints and are far too tight for appointment booking - a single visitor
-        // correcting a typo would trip them. Raised here for the same reason a real deployment exposing those
-        // routes has to raise them, and deliberately not disabled outright so the decorator stays exercised.
+        // public endpoints such as key discovery. The framework's own defaults (5 attempts / 5 minutes)
+        // are tuned for credential endpoints and are far too tight for test suites that call those endpoints many
+        // times. Raised here, and deliberately not disabled outright so the decorator stays exercised.
         rateLimit: {
             enabled: true,
             maxAttempts: 1000,

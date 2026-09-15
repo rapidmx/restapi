@@ -107,8 +107,8 @@ note, DKIM key or error message. These columns are now `text`:
 | `contact_sql` | `notes` |
 | `domain_sql` | `dkimPublicKey` |
 | `branding_sql` | `logoUrl`, `iconUrl`, `stylesheetUrl`, `headerHtml`, `footerHtml` |
-| `booking_sql` | `bookerNotes` |
-| `booking_type_sql` | `description` |
+| `booking_sql` | `bookerNotes` (a `@rapidmx/booking-plugin` table since 0.12) |
+| `booking_type_sql` | `description` (a `@rapidmx/booking-plugin` table since 0.12) |
 | `matter_sql` | `description` |
 | `escrow_scope_sql` | `description` |
 | `data_export_request_sql` | `errorMessage` |

@@ -23,7 +23,7 @@ export const MAX_PLUGIN_UI_LABEL_LENGTH = 64;
  * This list must track the server's core routes: its `@Route` paths (`server/src/{mongo,sql}/routes`), the API prefix,
  * `@rapidrest/react`'s asset and dev paths, the files in `server/public`, and every top-level page directory of
  * `@rapidmx/web-client`'s `apps/www`, `apps/admin` and `apps/escrow`. Add an entry here whenever one of those gains a
- * path. (`/book` and `/settings/booking-types` are deliberately absent: booking is moving into a plugin.)
+ * path. (`/book` and `/settings/booking-types` are deliberately absent: booking is served by `@rapidmx/booking-plugin`.)
  *
  * The mount shapes (`/<name>`, `/settings/<name>`, `/admin/<name>`, `/escrow/<name>`) keep every mount one segment below
  * its base, so nothing can be mounted beneath an entry here and an exact match is enough.

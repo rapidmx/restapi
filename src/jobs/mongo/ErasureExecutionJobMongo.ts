@@ -6,8 +6,6 @@ import { ErasureExecutionJob } from "../ErasureExecutionJob.js";
 import {
     AttachmentMongo,
     AuditLogEntryMongo,
-    BookingMongo,
-    BookingTypeMongo,
     CalendarShareLinkMongo,
     CalendarEventMongo,
     ContactListMongo,
@@ -49,8 +47,6 @@ export class ErasureExecutionJobMongo extends ErasureExecutionJob<DataSubjectEra
     protected labelClass: any = LabelMongo;
     protected mailFilterRuleClass: any = MailFilterRuleMongo;
     protected mailSignatureClass: any = MailSignatureMongo;
-    protected bookingTypeClass: any = BookingTypeMongo;
-    protected bookingClass: any = BookingMongo;
     protected oofReplySuppressionClass: any = OofReplySuppressionMongo;
     protected quarantineEntryClass: any = QuarantineEntryMongo;
     protected ingestQueueEntryClass: any = IngestQueueEntryMongo;

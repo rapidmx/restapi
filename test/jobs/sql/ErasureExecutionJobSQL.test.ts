@@ -13,8 +13,6 @@ import config from "../../config.sql.js";
 import { ErasureExecutionJobSQL } from "../../../src/jobs/sql/ErasureExecutionJobSQL.js";
 import { AttachmentSQL } from "../../../src/models/sql/AttachmentSQL.js";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
-import { BookingSQL } from "../../../src/models/sql/BookingSQL.js";
-import { BookingTypeSQL } from "../../../src/models/sql/BookingTypeSQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
 import { CalendarShareLinkSQL } from "../../../src/models/sql/CalendarShareLinkSQL.js";
 import { KeyVaultSQL } from "../../../src/models/sql/KeyVaultSQL.js";
@@ -63,8 +61,6 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
     let labelRepo: Repository<LabelSQL>;
     let mailFilterRuleRepo: Repository<MailFilterRuleSQL>;
     let mailSignatureRepo: Repository<MailSignatureSQL>;
-    let bookingTypeRepo: Repository<BookingTypeSQL>;
-    let bookingRepo: Repository<BookingSQL>;
     let oofReplySuppressionRepo: Repository<OofReplySuppressionSQL>;
     let pluginMailboxDataRepo: Repository<PluginMailboxDataSQL>;
     let pluginRepo: Repository<PluginSQL>;
@@ -116,8 +112,6 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         models.set("LabelSQL", LabelSQL);
         models.set("MailFilterRuleSQL", MailFilterRuleSQL);
         models.set("MailSignatureSQL", MailSignatureSQL);
-        models.set("BookingTypeSQL", BookingTypeSQL);
-        models.set("BookingSQL", BookingSQL);
         models.set("OofReplySuppressionSQL", OofReplySuppressionSQL);
         models.set("PluginMailboxDataSQL", PluginMailboxDataSQL);
         models.set("PluginSQL", PluginSQL);
@@ -153,8 +147,6 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         labelRepo = conn.getRepository(LabelSQL);
         mailFilterRuleRepo = conn.getRepository(MailFilterRuleSQL);
         mailSignatureRepo = conn.getRepository(MailSignatureSQL);
-        bookingTypeRepo = conn.getRepository(BookingTypeSQL);
-        bookingRepo = conn.getRepository(BookingSQL);
         oofReplySuppressionRepo = conn.getRepository(OofReplySuppressionSQL);
         pluginMailboxDataRepo = conn.getRepository(PluginMailboxDataSQL);
         pluginRepo = conn.getRepository(PluginSQL);
@@ -191,8 +183,6 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
             labelRepo,
             mailFilterRuleRepo,
             mailSignatureRepo,
-            bookingTypeRepo,
-            bookingRepo,
             oofReplySuppressionRepo,
             pluginMailboxDataRepo,
             pluginRepo,
@@ -318,28 +308,6 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         await mailSignatureRepo.save(
             new MailSignatureSQL({ mailboxUid: mailbox.uid, name: "A Signature", contentHtml: "<p>Sig</p>", isDefaultForNewMessages: true, isDefaultForReplyForward: false }),
         );
-        const bookingType = await bookingTypeRepo.save(
-            new BookingTypeSQL({
-                mailboxUid: mailbox.uid,
-                calendarFolderUid: folder.uid,
-                slug: "intro-call",
-                name: "Intro Call",
-                hostDisplayName: "Host",
-            }),
-        );
-        await bookingRepo.save(
-            new BookingSQL({
-                bookingTypeUid: bookingType.uid,
-                mailboxUid: mailbox.uid,
-                folderUid: folder.uid,
-                calendarEventUid: uuid.v4(),
-                bookerName: "Booker",
-                bookerEmail: "booker@example.com",
-                startDate: new Date(),
-                endDate: new Date(),
-                manageToken: uuid.v4(),
-            }),
-        );
         await oofReplySuppressionRepo.save(new OofReplySuppressionSQL({ mailboxUid: mailbox.uid, senderAddress: "sender@example.com", lastRepliedAt: new Date() }));
         await pluginMailboxDataRepo.save(
             new PluginMailboxDataSQL({ mailboxUid: mailbox.uid }),
@@ -389,10 +357,10 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         const updated = await requestRepo.findOne({ where: { uid: request.uid } });
         expect(updated!.status).toBe("completed");
         // folder, message, attachment, contact, contactList, calendarEvent, task, note,
-        // focusedInboxOverride, taskList, label, mailFilterRule, mailSignature, bookingType, booking,
+        // focusedInboxOverride, taskList, label, mailFilterRule, mailSignature,
         // oofReplySuppression, plugin mailbox data, quarantineEntry, ingestQueueEntry, dataExportRequest,
-        // mailboxImportRequest, mailbox = 22
-        expect(updated!.purgedCount).toBe(22);
+        // mailboxImportRequest, mailbox = 20
+        expect(updated!.purgedCount).toBe(20);
 
         expect(await mailboxRepo.findOne({ where: { uid: mailbox.uid } })).toBeNull();
         expect(await folderRepo.findOne({ where: { uid: folder.uid } })).toBeNull();
@@ -408,8 +376,6 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect((await labelRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await mailFilterRuleRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await mailSignatureRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
-        expect((await bookingTypeRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
-        expect((await bookingRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await oofReplySuppressionRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await pluginMailboxDataRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await quarantineEntryRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);

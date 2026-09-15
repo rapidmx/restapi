@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- **Booking moved to `@rapidmx/booking-plugin`.** The Calendly-style booking feature (public booking pages, booking
+  types and bookings) is no longer part of this library. Install the plugin to keep `mail/booking-types` and
+  `mail/bookings`. Resource and room booking (`Mailbox.autoAcceptBookings`, the booking window settings and
+  `ScanQueueJob`'s auto-accept) stays here, unchanged.
+  - **Removed exports:** the `Booking`, `BookingType`, `BookingAvailabilityWindow` and `BookingDateOverride` types and
+    the `BookingStatus` enum; `BookingMongo`, `BookingTypeMongo`, `BookingSQL` and `BookingTypeSQL`;
+    `BaseBookingRoute`, `BaseBookingTypeRoute`, `BookingRouteMongo`, `BookingTypeRouteMongo`, `BookingRouteSQL` and
+    `BookingTypeRouteSQL`; and `BookingUtils` (`generateCandidateSlots`, `subtractBusy`, `normalizeSlug`,
+    `validateAvailability`).
+  - **`ErasureExecutionJob`** no longer has the abstract `bookingTypeClass` and `bookingClass`, and
+    `ErasureExecutionJobMongo`/`ErasureExecutionJobSQL` no longer set them. A custom subclass that sets them must drop
+    them. Bookings are erased through the plugin's `@MailboxScopedData()` models instead, so an erasure waits while the
+    plugin is installed but not loaded. A deployment with booking data and no plugin installed leaves those rows behind
+    on erasure.
+  - **Existing data carries over.** The plugin keeps the entity and class names (`BookingMongo`, `BookingTypeMongo`,
+    `BookingSQL`, `BookingTypeSQL`), so the same collections and tables (`booking_sql`, `booking_type_sql`), indexes
+    and class ACLs are used once it's installed.
+  - **Config:** `mail:booking:public_url` is now declared by the plugin.
+
+### Exports
+
+- **`DateCoercionUtils` is exported from the package root:** `parseClientDate()`, `coerceDateValue()`,
+  `coerceDateFields()`, `coerceCalendarEventDates()`, `MATTER_DATE_FIELDS` and the `DateCoercionOptions` type.
+
 ### Plugins
 
 - **Plugin manifests can declare UI.** `PluginManifest.ui` (types `PluginUi`, `PluginUiApp`, `PluginUiNavItem`,

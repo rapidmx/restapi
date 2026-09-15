@@ -18,8 +18,7 @@ const { Model } = RouteDecorators;
 /** `@Model(EscrowAccessRequestMongo)` is what lets `BaseEscrowAccessRequestRoute`'s `@Transactional()`
  * methods resolve which datasource to open a transaction against - see the `modelClass` getter there.
  * `@Transactional()` is a documented no-op on Mongo in this repo's test topology (standalone
- * `MongoMemoryServer`, no replica set) - same disclosure `BaseBookingRoute.persistBooking()` already
- * makes. */
+ * `MongoMemoryServer`, no replica set). */
 @Model(EscrowAccessRequestMongo)
 export class EscrowAccessRequestRouteMongo extends BaseEscrowAccessRequestRoute<EscrowAccessRequestMongo, MatterMongo, MailboxMongo> {
     protected escrowAccessRequestClass: any = EscrowAccessRequestMongo;

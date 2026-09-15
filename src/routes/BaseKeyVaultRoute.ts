@@ -250,7 +250,7 @@ export interface RekeyRequest extends ExpectedMasterKeyGeneration {
 /**
  * Implements `specs/end-to-end_encryption.md`'s key-vault endpoints (`GET`/enroll/wrap-CRUD/re-key under
  * `/mailbox/:id/keyvault`) - a bespoke class (own `init()`-built `RepoUtils`, no `@Model`-driven CRUD, same
- * shape as `BaseEncryptionPolicyRoute`/`BaseBookingRoute`), because this is private key material, not an
+ * shape as `BaseEncryptionPolicyRoute`), because this is private key material, not an
  * ordinary collection.
  *
  * **Access is checked directly against the owning mailbox's `AccessControlList` and deliberately excludes the
@@ -293,7 +293,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     private signingCertificateEnrollment?: SigningCertificateEnrollment;
 
     /** Exposes the `@Model(...)`-supplied entity class so `@Transactional()` on `enrollKey()`/`rekey()` can
-     * resolve which datasource to open a transaction against - identical reasoning to `BaseBookingRoute`'s own
+     * resolve which datasource to open a transaction against - identical reasoning to `BaseEscrowAccessRequestRoute`'s own
      * `modelClass` getter. */
     public get modelClass(): any {
         return (this.constructor as any).modelClass;

@@ -1980,3 +1980,42 @@ ui, race undo in both name orders, pre-existing overlap doesn't block a settings
 Verification: `tsc --noEmit` and `yarn lint` clean (`tsconfig.test.json` has pre-existing unrelated errors). Full
 `yarn vitest run --coverage`: 254 files / 5112 tests passed; coverage 100 / 96.78 / 100 / 100; PluginUiUtils,
 PluginUtils, PluginDependencies and BasePluginRoute at 100% on every metric.
+
+## 2026-09-15 — Booking removed from core (moving to `@rapidmx/booking-plugin`)
+
+Uncommitted, no version bump. Phase 6 (restapi part) of `~/.claude/plans/cheerful-giggling-pine.md`. Started from
+`319623229ade781575d83cb17a8561a3645f7a79`; the booking plugin copies the removed code from that commit.
+
+Removed
+- `src/models/types.ts`: `BookingAvailabilityWindow`, `BookingDateOverride`, `BookingType`, `BookingStatus`, `Booking`.
+- Models `BookingMongo`, `BookingTypeMongo`, `BookingSQL`, `BookingTypeSQL`; routes `BaseBookingRoute`,
+  `BaseBookingTypeRoute`, `Booking{,Type}Route{Mongo,SQL}`; `src/util/BookingUtils.ts`; their index re-exports.
+- `ErasureExecutionJob` abstract `bookingTypeClass`/`bookingClass` and the Mongo/SQL assignments; the explicit purge
+  calls. Erasure tests no longer seed bookings (purgedCount 22 -> 20); the generic `PluginMailboxData*` fixture still
+  covers plugin `@MailboxScopedData()` models.
+- Tests: `test/routes/booking{Security,TypeFolder}Suite.ts`, `test/routes/{mongo,sql}/Booking{,Type}Route.test.ts`,
+  `test/server-{mongo,sql}/routes/Booking{,Type}Route.ts`, `test/util/BookingUtils.test.ts`, the Booking model cases in
+  `test/models/{mongo,sql}.test.ts`.
+- Stale comment references to `BaseBookingRoute`/`BookingUtils` reworded (Branding, KeyDiscovery, KeyVault,
+  EscrowAccessRequestRouteMongo, IcsUtils, FreeBusyUtils, PluginUiUtils, test config-defaults, IcsUtils test).
+- Resource/room booking (`Mailbox.autoAcceptBookings`, booking window, `ScanQueueJob.decideResourceBooking`) untouched.
+
+Added: `export * from "./DateCoercionUtils.js"` in `src/util/index.ts` (no name collisions). Everything else the moved
+code imports was already on the root / `mongo` / `sql` entry points.
+
+Erasure / export findings
+- Erasure is generic: `ErasureExecutionJob.pluginMailboxScopedClasses()` purges by `mailboxUid` every ObjectFactory class
+  with `@MailboxScopedData()` whose `rrst:datasource` equals the job's Mailbox class (`"mongo"`/`"sql"`). Plugin needs
+  the decorator on all four models, `@DataStore("mongo"|"sql")` unchanged, and `rapidmx.plugin.mailboxScopedData: true`
+  so an erasure waits (not completes) while the plugin is installed but not loaded.
+- Gap: a deployment that upgrades restapi with booking data but never installs the plugin has no Plugin row declaring
+  mailbox data, so erasure completes and leaves `booking*` rows. Mitigated by the server adding the plugin to
+  `system:plugins:defaults`.
+- `DataExportJob`, `MatterExportJob` and mailbox deletion never included bookings, and have no plugin hook: no regression.
+- Keep class names (collection/table names `BookingMongo`/`booking_sql`...), index names and `@Protect` uids
+  (`Booking`, `BookingType`) so existing data and class ACLs carry over.
+- `mail:booking:public_url` was only a `@Config` default inside `BaseBookingRoute` (no restapi defaults file). Test
+  config's raised `rateLimit` block stays (key discovery uses `@RateLimit()`); the plugin tests need an equivalent.
+
+Verification: `tsc --noEmit`, `yarn lint`, `yarn build` clean. Full `yarn vitest run --coverage`: 249 files / 4897 tests
+passed; coverage 100 / 96.75 / 100 / 100.

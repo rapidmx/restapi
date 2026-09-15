@@ -162,8 +162,8 @@ function formatDateUtc(date: Date | string): string {
 /** Converts a local wall-clock date/time in IANA timezone `tzid` to its equivalent UTC instant using only
  * Node's built-in `Intl`/ICU timezone database. Returns `undefined` if `Intl` doesn't recognize `tzid`.
  *
- * Exported (rather than kept module-private like the other helpers here) because `util/BookingUtils.ts` needs
- * exactly this conversion to turn a `BookingType`'s local availability windows into real instants, and because
+ * Exported (rather than kept module-private like the other helpers here) because plugins (such as
+ * `@rapidmx/booking-plugin`) need exactly this conversion to turn local availability windows into real instants, and because
  * its `undefined` return doubles as the validation hook for a caller-supplied IANA timezone name. */
 export function convertLocalToUtc(y: number, mo: number, d: number, h: number, mi: number, s: number, tzid: string): Date | undefined {
     const formatter: Intl.DateTimeFormat | undefined = getZoneFormatter(tzid);

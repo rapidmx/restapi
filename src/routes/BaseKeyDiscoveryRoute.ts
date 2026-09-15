@@ -30,7 +30,7 @@ const NOT_PUBLISHED_RESPONSE = {
  * (`GET /.well-known/rapidmx/keys/:hash`, "Public Endpoint" section) - the server side of the protocol whose
  * client half is `util/KeyDiscoveryClient.ts`. Unauthenticated and `@RateLimit()`-decorated per the spec's
  * "rate-limit this endpoint per source IP" requirement (`@RateLimit()` already keys an independent per-source-
- * IP counter, confirmed in `BaseBookingRoute.ts` - no new infrastructure needed).
+ * IP counter - no new infrastructure needed).
  *
  * `:hash` is looked up against `Mailbox.keyDiscoveryHash` (`C2`'s indexed column) - an indexed lookup, not a
  * per-request hash-everything scan. A mailbox that predates that column (never backfilled, see its own doc

@@ -54,8 +54,7 @@ function sanitizeBrandingHtml(html: string): string {
 }
 
 /** The public projection of `Branding` - omits the upload bookkeeping fields (`*BlobKey`/`*ContentType`),
- * which are this route's own internal implementation detail, never something a client needs. Mirrors
- * `BaseBookingRoute.toPublicBookingType()`'s exact pattern. */
+ * which are this route's own internal implementation detail, never something a client needs. */
 export interface PublicBranding {
     companyName: string;
     title: string;
@@ -131,13 +130,13 @@ function firstHeader(req: HttpRequest, name: string): string | undefined {
 /**
  * Admin-managed, publicly-readable custom branding for downstream servers/web clients - logo, product
  * title/company name, stylesheet, and web-client UI chrome (`headerHtml`/`footerHtml`). A bespoke class, not
- * a `CRUDRoute`/`BaseScopedChildRoute` subclass - same shape as `BaseMailIngestRoute`/`BaseBookingRoute` (its
+ * a `CRUDRoute`/`BaseScopedChildRoute` subclass - same shape as `BaseMailIngestRoute` (its
  * own `init()`-built `RepoUtils<Branding>`, no `@Model` needed since nothing here uses `@Transactional()`) -
  * because there is exactly one row, never a real collection, and its read/write halves need entirely
  * different authorization (public read, trusted-role-only write) that no generic CRUD base class expresses.
  *
- * Mixes two patterns this library already has fully worked out: `BaseBookingRoute`'s unauthenticated public
- * reads, and `BaseDomainRoute`'s `@RequiresTrustedRole()` admin writes plus its `recordAuditLog()` usage.
+ * Mixes two patterns: unauthenticated public reads, and `BaseDomainRoute`'s `@RequiresTrustedRole()` admin writes plus
+ * its `recordAuditLog()` usage.
  *
  * `logoUrl`/`iconUrl`/`stylesheetUrl` each support two independent ways for an admin to set them - see
  * `Branding`'s own doc comment (`models/types.ts`) for the full rationale. Uploading
@@ -163,7 +162,7 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     private blobStore?: BlobStore;
 
     /** The externally reachable base URL this route is mounted at, used to build the logo/stylesheet URL
-     * handed back after an upload. Same single-value-config pattern as `mail:booking:public_url`. */
+     * handed back after an upload. Same single-value-config pattern as `mail:auth_server_url`. */
     @Config("mail:branding:public_url", "")
     private publicUrl: string = "";
 

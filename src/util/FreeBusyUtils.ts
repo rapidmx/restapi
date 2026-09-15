@@ -12,7 +12,8 @@ import { expandOccurrences, type OccurrenceWindow } from "./IcsUtils.js";
  * this library.
  *
  * This is the same conflict-detection core `ScanQueueJob.decideResourceBooking()` performs inline for resource
- * mailbox auto-accept, lifted out so anonymous appointment booking can reuse it. Two pieces of it are subtle
+ * mailbox auto-accept, lifted out so other callers (such as `@rapidmx/booking-plugin`'s anonymous appointment
+ * booking) can reuse it. Two pieces of it are subtle
  * and are preserved here deliberately:
  *
  * First, every row is run through `expandOccurrences()` individually, so a recurring series contributes every
