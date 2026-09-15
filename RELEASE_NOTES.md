@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## v0.10.0
 
 This release adds plugin search, updates and dependencies, and hardens almost every part of the library after six rounds
 of adversarial review. Many fixes tighten behaviour that clients relied on; read **Breaking changes** and **Upgrading**

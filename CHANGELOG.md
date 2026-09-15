@@ -7,6 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-15
+
+### Added
+- Added plugin registry search at GET /plugins/search, which finds packages named *-plugin in one or every configured namespace and reports each one's latest version, whether it's allowed, whether it's installed and whether an update is available
+- Added GET /plugins/updates, reporting each installed plugin's latest published version and whether it's newer than the installed one
+- Added system:plugins:namespaces, a list of npm scopes to search for plugins, each optionally with its own registry and token; packages in a configured namespace are allowed to be added, and are looked up on that namespace's registry
+- Added GET /plugins/namespaces, listing the configured namespaces without their tokens
+- Added NpmRegistryClient.searchPlugins(), normalizePluginNamespaces(), findPluginNamespace() and isNewerVersion()
+- Added requires to the plugin manifest, mapping other plugin packages to the semver ranges a plugin needs, validated by parsePluginManifest
+- Added PluginDependencies with planPluginChange(), which installs missing requirements at the highest version in range (dependencies first) and enables disabled ones, refusing out-of-range installs, missing versions, disallowed packages, cycles and version changes that break an enabled dependent
+- Added findDependents(), orderByDependencies() and pruneUnmetRequirements() for the server host's load order
+- Added GET /plugins/plan, previewing what adding or changing a plugin also installs and enables
+- Added semver as a dependency
+- Added timeouts, size limits and per-client caching to registry requests, reject non-semver resolved versions, and skip search results without a version
+- Added GET /mail/mailboxes/:id/access/me with the caller's effective read, create, update, delete and manage access
+- Added clearing a retention period with null
+- Added forwarding loop protection with envelope rewriting, per-occurrence reminder claims, HMAC escrow audit chaining with a head record, deterministic well-known folder ids, text SQL columns and missing indexes
+
+### Changed
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Install and enable requirements when adding a plugin, returning { plugin, dependencies } from POST /plugins
+- Plan requirements when enabling a plugin or changing its version, and block disabling or uninstalling a plugin that an enabled plugin requires, with a 409 naming the dependents
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Require authentication and a single plain address for mailbox lookup-by-email, querying it literally so search operators like like() or in() can't enumerate owners, and rate limit it
+- Only grant mailbox access to user uids, refusing anonymous, wildcard and role ids, and require full access to grant, change or remove a manager or to change your own access
+- Audit mailbox access grants and revocations, report other action sets as a custom role with their actions, read the ACL uncached before changing it, and return 409 on a concurrent change
+- Store mailbox and mailbox policy quotas as doubles so 5GB+ values fit on Postgres and MySQL, require safe-integer quotas, fail self-service mailbox creation closed when the policy can't be read, and require authentication to read the policy
+- Keep saving a setup step from making setup required again once it's complete, and retry concurrent step saves
+- Hold data-subject erasure while an installed plugin isn't loaded, so its mailbox-scoped data isn't skipped
+- Accept system:plugins:allowed_packages and namespaces as JSON or comma-separated strings, dropping unscoped wildcards and malformed entries
+- Validate plugin package names against npm's rules, encode them in registry requests and refuse a registry response for a different package
+- Undo a plugin change's dependency writes when it fails partway, refuse to overwrite a plugin row created while planning, check the allow-list when enabling or changing version, and report updates for disallowed plugins as unavailable
+- Accept expectedPlan on POST and PUT /system/plugins, refusing with 409 when the dependencies to install or enable differ from the previewed plan
+- Validate plugin setting defaults, select options, duplicate and reserved keys, and look up requirements by own keys only
+- Update package names in docs to the -plugin names
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Use double precision for SQL quota and timestamp columns, which Postgres rejected as double, and document the manual ALTER needed before upgrading existing Postgres and MySQL databases
+- Refuse changes to a mailbox's owner, quota or used bytes from non-trusted callers, require UUID owner uids, and lowercase mailbox addresses
+- Apply the mailbox policy to non-trusted POST /mailboxes: self-service must be enabled, addresses must be the caller's own on verified domains, and the quota is the policy's
+- Require full access when any other ACL record could give a member full access, check access against the same uncached ACL that is saved, store member uids lowercase, look up owners case-insensitively, and limit lookup-by-email to 30 per minute
+- Hold erasure only for unloaded plugins whose manifest declares mailboxScopedData, and log the data a removed plugin leaves behind
+- Check the allow-list for disabled dependencies being enabled, include the target version in expectedPlan, plan installed plugins from their stored manifest, and ignore expectedPlan when a change leaves a plugin disabled
+- Delete rows a failed plugin change created instead of soft-removing them, undo PUT and DELETE writes too, and refuse with 409 and undo when a concurrent change leaves an enabled plugin's requirement unmet
+- Treat dependencies with unset required settings as conflicts, reject empty or non-exact versions and repeated query values, and only report search updates for allowed packages
+- Use a namespace's own token on the default registry, send registry URL credentials as a Basic header without echoing them in errors, and keep announce failures from replacing a change's result
+- Include integrity in the plugin state hash
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Generate every create route's uid on the server so a client can't claim an existing ACL, strip $ keys and forced scope keys from client queries, and require real unexpired share links resolved as share:<token>
+- Block client writes to blob keys, server-controlled message, attachment and folder fields, ingest queue and quarantine rows, and dates on delivered mail, and send read receipts at most once
+- Validate alias changes, refuse re-creating addresses with leftover data, keep filter rule targets in the rule's mailbox, require From to be a mailbox address when sending or recalling, and serve attachments and message content with safe types, nosniff and CSP
+- Search a delegated mailbox by mailboxUid, count label and types as search filters, and normalize Focused Inbox overrides
+- Validate booking manage tokens, tie booking types to their mailbox's calendar folders, page busy time, and rate limit anonymous booking per IP and slug
+- Guard audit, escrow audit, escrow scope and domain rows against bulk and property updates, stop admins becoming escrow holders, expire approved escrow access and refuse it for closed matters or removed custodians
+- Make key vault writes owner-only and refuse removing the last unlock wrap, allow only raster branding uploads with sanitized header and footer HTML, coerce calendar and matter dates, and page request lists newest first
+- Count shared blob references before deleting, purge key vaults and share links on erasure, and retry inbound mail with leases, backoff and idempotent delivery ids
+- Only send invites from organizer mailboxes, require DKIM-aligned senders for iTIP, recall and ACME mail, stop scheduled sends resending after relay, and page past held or failing items in job queues
+- Isolate search indexing failures per document, fix Mongo participant search, write PKI files atomically, include the domain in key discovery, and stop auto-replacing pinned keys
+- Expand recurrences near the query window with ordinal BYDAY, DST-correct stepping and Windows zone names, stream mbox exports, budget PST imports, and skip scanner errors on import
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Strip client _id, version, dates and dotted or $ keys on create, and reject dotted or $ keys on update, bulk update and property routes
+- Check stored From/Sender headers before any send, schedule only through POST /:id/send, and claim immediate sends with a version-checked move into Outbox
+- Block moving legally held messages to another mailbox, keep the mailbox owner's ACL record in step with owner changes, and require delete and update rights for ?deleted=true
+- Recompute hasAttachments server-side, coerce date fields on create and update, and require aligned DKIM before honouring list unsubscribe
+- Generate Matter and EscrowScope uids server-side, version-check key vault, booking and plugin updates on Mongo, and validate rekey requests
+- Bound booking types, windows, overrides and slot generation, rate-limit slot lookups per client IP, and version-check cancel and reschedule
+- Return 409 for downloads from closed matters and compare escrow public keys by their fields
+- Trust RapidMX-Key and recall headers only when oversigned by aligned verified DKIM
+- Count ScanQueueJob attempts at claim, renew leases, park exhausted entries, and send delivery receipts exactly once after filing
+- Forward before forward-and-delete returns, drop mail for mailboxes under erasure, bound resource conflict checks, and ignore stale meeting replies
+- Claim and lease erasure, matter export and scheduled send jobs, page purges by keyset, and include soft-deleted mail in retention
+- Bound indexed string lookups with hashes, add compound indexes and SQL column types, and purge search index entries for deleted mail
+- Isolate content extraction in worker threads with zip bomb limits, chunk OpenSearch bulk requests by bytes, and write local blobs atomically
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Mark in-flight sends with a lease, refuse moving a message out of Outbox while its send is in flight, and file into Sent Items only while the claim still holds
+- Require at least one recipient to send, persist the relayed marker in its own write, and bound messageId, conversationId and icalUid on every patch write
+- Refuse non-trusted moves into Drafts except from Outbox or Drafts, so sent or received mail can't be rewritten through compose
+- Defer instead of dropping mail for approved or hold-blocked erasures, ignore erasure requests older than the mailbox, and bound the deferral
+- Rewrite unauthenticated From and strip trust headers and calendar parts when relaying through distribution lists or forward rules, and require DKIM-verified members for restricted lists
+- Apply the address-like display name rule to the lexer's parsed From and Sender, also at scheduled send time, and trust only the topmost Authentication-Results
+- Claim delivery receipts before sending and track auto-replies per ingest entry, and expand resource bookings in windows so long open-ended series aren't declined
+- Limit owner renames of the primary address to their own usernames, move owner ACL grants before the owner field, and reject display names containing @ or line breaks
+- Scope attachment listing and access by the owning message's current folder
+- Refuse rekey while a sign enrollment holds a wrapped key, let owners cancel enrollments, track master key generations, replace escrow wraps on rekey, and bind enrollment ids to their mailbox
+- Return 409 when first-time enrollment wraps are sent to an already initialized vault, key IPv6 booking rate limits by /64, and export asEntity, legal hold helpers and findPagesByUid
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Updated @rapidrest/service-core to ^2.1.0 as both the dev dependency and the peer range
+- Pass allowExistingACL when creating well-known folders at their deterministic uids, resetting any leftover ACL there to the mailbox with no records
+- Recognise service-core's IDENTIFIER_EXISTS 400 as a duplicate key so lost create races still re-read the winner
+- Use ModelUtils.literal() for sender- and client-controlled lookups, including values that were previously unescaped in mail ingest, ScanQueueJob and MailboxImportJob
+- Truncate scoped children, mailboxes and matters with literal in() lists in bounded batches instead of one eq() per uid
+- Document which framework workarounds service-core 2.1.0 makes redundant
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Require non-trusted sends to come from Drafts, refuse deleting a message whose send is in flight, and refuse moving delivered mail from Outbox to Drafts
+- Drop mail for erased mailboxes whose row is gone instead of eventually delivering it, and check erasure before scanning
+- Mark relayed immediate sends so ScheduledSendJob finishes filing after a crash, and re-read soft-deleted rows when recording the relay
+- Send meeting invites from the organizer mailbox's safe display name, skip non-plain attendees, refuse more than 500 and pass invites through the scan pipeline
+- Validate calendar organizer and attendee addresses on REST writes, and use safe display names in booking, receipt, recall and auto-reply mail
+- Keep well-known folders' ACLs after concurrent creation races, and reset leftover ACLs without wiping grants made meanwhile
+- Page attachment truncate realignment by uid so moved-message attachments aren't skipped and deleted
+- Undo overlapping owner ACL moves newest first and only when unchanged, and refuse look-alike @ in mailbox display names
+- Accept expectedMasterKeyGeneration on key vault writes with 409 on mismatch, and refuse deleting escrow scopes still assigned to mailboxes
+- Track superseded draft bodies kept under legal hold on the message, export them with matters and release them after the hold
+- Parse client dates as ISO 8601 with UTC default or epoch milliseconds only
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
 ## [0.9.0] - 2026-09-14
 
 ### Added
@@ -739,7 +845,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/RapidMX/restapi/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/RapidMX/restapi/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/RapidMX/restapi/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/RapidMX/restapi/compare/v0.6.0...v0.7.0
