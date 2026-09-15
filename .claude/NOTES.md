@@ -2019,3 +2019,52 @@ Erasure / export findings
 
 Verification: `tsc --noEmit`, `yarn lint`, `yarn build` clean. Full `yarn vitest run --coverage`: 249 files / 4897 tests
 passed; coverage 100 / 96.75 / 100 / 100.
+
+## 2026-09-15 — Recipient suggestions: `BaseDirectoryRoute` (`GET /mail/directory`, `GET /mail/directory/contacts`)
+
+Compose To/Cc/Bcc autocomplete (web-client `RecipientInput`, react-shared `mail/directoryApi.ts`). Server mounts
+`@ApiRoute("mail/directory")` on `DirectoryRouteMongo`/`DirectoryRouteSQL`.
+
+Contract
+- `GET /` (`search`): mailboxes + distribution lists. `GET /contacts` (`searchContacts`): caller's contacts. Both
+  `@Auth(["jwt"])`, `@RateLimit({ perUser, maxAttempts: 120, windowSeconds: 60 })` (separate buckets per path), return
+  `DirectoryEntry { displayName, address, kind }` only. kind: `user` (ownerUserUid), `shared` (no owner), `room`/`equipment`
+  (`isResource`; missing `resourceType` → room), `list`, `contact`.
+- `parseDirectoryQuery()`: q one string, trimmed+lowercased length 2..100 (400 otherwise, incl. repeated `q`), split on
+  whitespace, distinct, first 5 terms. limit `^\d{1,6}$` positive, default 8, capped 20.
+- Matching: every term is a prefix of a name word (split `[\s-]+`) or of the address (primary only - aliases neither
+  matched nor returned, so an alias can't be probed). Contacts: words from displayName + givenName + surname; one entry per
+  email that satisfies the terms (so a name match lists all addresses, an address match only that one); displayName falls
+  back to "given surname". `rankDirectoryEntries()`: entries whose name/address starts with the whole query first, then
+  name (base sensitivity), address; dedupe lowercase address, first wins.
+- Backend queries are precise, then re-checked in JS with `matchesDirectoryTerms()`, fetching `limit * 2` candidates.
+  Mongo: native `MongoRepository.find` with `$and` of `$or` per term, `$regex` `(?:^|[\s-])<escaped>` / `^<escaped>`,
+  `i`; projections limit fields. SQL: QueryBuilder `Brackets` per term, `LOWER(col) LIKE :p ESCAPE '\'` with `t%`,
+  `% t%`, `%-t%` for names and `t%` for addresses; contacts' `emails` simple-json matched as `%"address":"<json-escaped,
+  like-escaped term>%`. SQLite `LOWER()` is ASCII-only, so non-ASCII case variants can miss on SQLite (JS check is
+  Unicode-aware but can't add rows the DB didn't return). Boolean `deleted = :deleted` with `false` binds fine on
+  better-sqlite3 through TypeORM.
+
+Security/privacy decisions
+- Directory search needs a caller who owns a mailbox here (`ownerUserUid in [uid, uid.toLowerCase()]`) or a trusted role:
+  an identity from the shared auth service without a mailbox gets 403. Delegate-only users without their own mailbox are
+  refused too (auto-provisioning normally gives users one); revisit if that matters.
+- No "hidden from address lists" flag exists on Mailbox/DistributionList (searched types.ts), so every mailbox is listed
+  except those with a `DataSubjectErasureRequest` in `approved`/`in_progress` (filtered after the query). Soft-deleted lists
+  excluded; a completed erasure has already deleted the mailbox. Disabled domains are not considered.
+- `/contacts` never 403s: folders = `type contacts` folders (max 50) of owned mailboxes + `mailboxUid` if
+  `hasPermission(READ)` on it (else silently ignored), each kept only with READ on the folder (an explicit empty record
+  denies), soft-deleted folders skipped. Contacts query excludes soft-deleted.
+- Literal matching: user text only reaches regex/LIKE escaped (`escapeDirectoryRegExp`, `escapeDirectoryLike`), never
+  the search-query parser (`like()` passes `%`/`_` and globs through unescaped, so it wasn't used). Escaped regex has no
+  quantified groups, so no ReDoS. Tests send `.*`, `%%`, `__`, `like(*)`, `regex(.*)`, `(a+)+$`, `[a-z]*`, backslashes,
+  quotes, `$ne`.
+- Enumeration: 120/min × 20 per request is a GAL-like exposure for signed-in mailbox holders only; name/address/kind only.
+
+Tests: `test/routes/directorySuite.ts` via `test/routes/{mongo,sql}/DirectoryRoute.test.ts` (fixtures
+`test/server-{mongo,sql}/routes/DirectoryRoute.ts` at `/mongo|sql/directory`), `test/routes/BaseDirectoryRoute.test.ts`
+(helpers). Defensive `deleted`/`?? ""` checks in the base were removed (the abstract finders' contract excludes deleted
+rows) because they were unreachable and cost coverage.
+
+Verification: `tsc --noEmit`, `yarn lint`, `yarn build` clean. Full `yarn vitest run --coverage`: 252 files / 4928 tests
+passed; coverage 100 / 96.78 / 100 / 100; BaseDirectoryRoute and both concrete routes at 100% on every metric.

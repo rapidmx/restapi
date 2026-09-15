@@ -1,5 +1,27 @@
 # Release Notes
 
+## Unreleased
+
+### Routes
+
+- **Recipient suggestions: `BaseDirectoryRoute`** (`DirectoryRouteMongo`, `DirectoryRouteSQL`). Mount it with
+  `@ApiRoute("mail/directory")`:
+  - `GET /mail/directory?q=<text>&limit=<n>` searches the server's mailboxes (people, shared mailboxes, rooms and
+    equipment) and distribution lists. Mailboxes with an approved or running erasure and soft-deleted lists are left
+    out; aliases aren't matched. Only callers who own a mailbox on the server, or hold a trusted role, may search (403
+    otherwise).
+  - `GET /mail/directory/contacts?q=<text>&limit=<n>&mailboxUid=<uid>` searches the caller's contacts: the contacts
+    folders of the mailboxes they own, plus `mailboxUid`'s when they may read it, keeping only folders they may read.
+  - Both return `DirectoryEntry[]` (`{ displayName, address, kind }`, kind `user`, `shared`, `room`, `equipment`, `list`
+    or `contact`) and nothing else. Every word of `q` must match the start of a name word (split on spaces and hyphens;
+    contacts also match given name and surname) or the start of the address, case-insensitively. Entries starting with
+    the whole query come first, then by name; addresses are de-duplicated.
+  - `q` must be 2 to 100 characters (at most 5 words are used); `limit` defaults to 8 and is capped at 20. Each
+    endpoint allows 120 requests a minute per caller. Query text is always matched literally (escaped for a regular
+    expression on Mongo and for `LIKE` on SQL, never parsed as search operators).
+  - Exports `parseDirectoryQuery()`, `matchesDirectoryTerms()`, `directoryNameWords()`, `rankDirectoryEntries()`,
+    `escapeDirectoryRegExp()`, `escapeDirectoryLike()` and the `DIRECTORY_*` limits.
+
 ## v0.12.0
 
 ### Breaking changes
