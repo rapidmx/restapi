@@ -951,7 +951,29 @@ export interface Message extends RecoverableBaseEntity {
 
     flags: MessageFlags;
 
+    /**
+     * Server-managed mirror of `flags.read`, kept in lockstep with it by `util/MessageListUtils.ts` on every
+     * write. `flags` is one `simple-json` column on the SQL backend, so nothing can filter or index on the
+     * field inside it - this top-level copy is what makes "unread only" a real, indexed database predicate
+     * instead of a client-side pass over a page of already-fetched results. Never settable from a request body.
+     *
+     * Absent/`null` on a row last written before this field existed; such a row reads as unread, so an upgraded
+     * deployment should re-derive it (`deriveMessageListFields()`) for mail that was already read.
+     */
+    read?: boolean;
+
+    /** Server-managed mirror of `flags.flagged` - see `read`. */
+    flagged?: boolean;
+
+    /** Server-managed mirror of `from.address`, normalized and length-bounded (`boundIndexedValue()`) so it can
+     * be indexed - see `read`. Sorting on `from` itself would sort a JSON sub-document. */
+    fromAddress?: string;
+
     importance: MessageImportance;
+
+    /** Server-managed sortable rank of `importance` (low 0, normal 1, high 2) - the stored enum values are
+     * strings that sort alphabetically (`high`, `low`, `normal`), which is not a useful order. See `read`. */
+    importanceRank?: number;
 
     /** The RFC 5322 `In-Reply-To` header value, if this message is a reply. */
     inReplyTo?: string;

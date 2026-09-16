@@ -623,6 +623,9 @@ describe("Route:MessageSQL Tests", () => {
                 messageId: "root@example.com",
                 conversationId: "root@example.com",
                 subject: "Original subject",
+                // Explicitly older than the reply sent below, which is stamped `new Date()` - without it the two
+                // can share a millisecond and which one the summary calls "latest" comes down to uid ordering.
+                receivedDate: new Date(Date.now() - 60 * 60 * 1000),
             });
 
             const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;

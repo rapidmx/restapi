@@ -11,6 +11,7 @@ import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
+import { deriveMessageListFields } from "../util/MessageListUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { FolderType, Mailbox, Message } from "../models/types.js";
@@ -311,6 +312,9 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     version: (refetched as any).version,
                     folderUid: sentFolder.uid,
                     flags,
+                    // An update is a patch, not a constructed entity, so `flags`' denormalized list mirrors have
+                    // to be re-derived alongside it - see `util/MessageListUtils.ts`.
+                    ...deriveMessageListFields({ ...refetched, flags }),
                     sanitizedHtmlBlobKey: sanitizedHtmlBlobKey ?? null,
                     ...(messageId ? { messageId: boundIndexedValue(messageId) } : {}),
                     conversationId: boundIndexedValue(conversationId) ?? null,

@@ -37,6 +37,7 @@ export * from "./MailSignatureUtils.js";
 export * from "./MailboxScopeUtils.js";
 // Keyset paging by `uid` only - the rest of `MailboxContentUtils.ts` stays internal.
 export { findPagesByUid } from "./MailboxContentUtils.js";
+export * from "./MessageListUtils.js";
 export * from "./MimeHeaderUtils.js";
 export * from "./OofUtils.js";
 export * from "./RecipientUtils.js";

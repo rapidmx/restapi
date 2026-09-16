@@ -2,7 +2,58 @@
 
 ## Unreleased
 
+### Features
+
+- **Server-side sorting and filtering for the mail list.** `GET /mail/messages` (and `HEAD`, so a count matches the
+  list it labels) now take a named vocabulary on top of the generic query DSL:
+  - `?sortBy=` one of `date` (the default, `receivedDate`), `sentDate`, `from`, `subject`, `importance` or `flagged`,
+    with `?sortOrder=asc|desc`. Left off, `sortOrder` picks the direction that reads naturally for the key (newest,
+    highest or flagged first; A-Z for `from`/`subject`). `receivedDate` and `uid` are always appended as tiebreakers,
+    so `limit`/`page` can't show the same message twice or skip one. An unknown `sortBy`/`sortOrder` is a 400; an
+    explicit generic `?sort=` still wins when neither is named.
+  - `?filter=` one of `all` (the default), `unread`, `read`, `flagged`, `hasAttachments`, `focused` or `other`.
+    `focused` matches a message with no `inferenceClassification` at all, which is what absent means.
+  - Both are also accepted by `GET /mail/messages/conversations`, where the filter applies to the messages before
+    they are grouped.
+- **Four denormalized, indexed `Message` fields make that possible**: `read` and `flagged` (mirrors of
+  `flags.read`/`flags.flagged`), `fromAddress` (`from.address`, normalized and length-bounded) and `importanceRank`
+  (`importance` as 0/1/2, since the stored enum strings sort alphabetically). `flags` and `from` are a single
+  `simple-json` column on SQL, so nothing could filter or sort on a field inside them on both backends - which is why
+  "every flagged message" previously meant reading a mailbox's whole message list into the client. All four are
+  server-managed: derived by the model constructors and re-derived on every update, never accepted from a request
+  body. New `util/MessageListUtils.ts` (exported from the package root) carries the derivation
+  (`deriveMessageListFields()`, `syncMessageListFields()`) and the vocabulary (`MESSAGE_LIST_SORTS`,
+  `MESSAGE_LIST_FILTERS`, `buildMessageListSort()`, `buildMessageListFilter()`).
+- **Nested conversation view.** `GET /mail/messages/conversations` now takes `?folderUid=` (restricting both the scan
+  and the grouping to one folder), `?filter=` and `?limit=`/`?page=`, and its scan is ordered newest first so the
+  `mail:conversations:scan_limit` cap drops the oldest messages rather than an arbitrary slice. Each
+  `ConversationSummary` gains `flagged`, `latestMessageUid`, `latestFrom`, `latestPreview` and `latestFolderUid` - the
+  fields a collapsed parent row shows. New `GET /mail/messages/conversations/:conversationId?mailboxUid=` returns that
+  conversation's messages oldest first across every folder (the expanded child rows), paged with `?limit=` (default
+  100, capped at 500) and `?page=`; a `conversationId` that matches nothing falls back to a single-message lookup by
+  uid, which is how a message belonging to no thread is keyed.
+- **New indexes** on `Message`, both backends: `message_folder_received`, `message_folder_read_received`,
+  `message_folder_flagged_received` and `message_mailbox_conversation_received`.
+
 ### Fixes
+
+- **A bulk `PUT /mail/messages` (and every other `BaseScopedChildRoute` collection `PUT`) is now bounded** at
+  `MAX_BULK_UPDATE` (100) objects - it applies one full `update()` per element, so an unbounded array was an unbounded
+  write loop on one request. A longer body is a 400. The endpoint's semantics are unchanged otherwise, and they are
+  what a mail client's multi-select bulk actions (mark read/unread, flag, move, archive, report junk, relabel) should
+  use: sequential, fail-fast, not atomic, with the elements before a failure left applied.
+- **`ConversationSummary` now breaks a `receivedDate` tie by `uid`.** Two messages of one conversation can share a
+  millisecond (a reply filed into Sent Items in the tick its original was delivered, an mbox import), and which one
+  the summary called "latest" - and so its subject, sender and preview - depended on the order the database returned
+  them in.
+- **No migration** (pre-release): the four new `Message` fields are nullable and derived on write, so a row last
+  written before this change reads back with none of them - which the filters treat as unread, unflagged, no sender
+  and normal importance. Already-read or flagged mail delivered before upgrading therefore sorts and filters wrong
+  until it is next written. Re-derive it with `deriveMessageListFields()` over each mailbox's messages if that
+  matters; a plain re-delivery or any update to a message fixes that message.
+- **Protocol packages that write `Message.flags` themselves** (`@rapidmx/activesync-plugin`'s flag sync,
+  `@rapidmx/mapi-plugin`'s property writes) must call `syncMessageListFields()` on their update patch, or a message
+  marked read over EAS/MAPI will still show as unread in a webmail Unread filter.
 
 - **A delivered message now records everyone it was addressed to, not just the envelope recipient.** `ScanQueueJob`
   stored `Message.recipients` from the SMTP envelope, so each recipient's own copy listed only that one mailbox -

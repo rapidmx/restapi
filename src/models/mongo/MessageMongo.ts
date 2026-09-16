@@ -20,6 +20,7 @@ import {
     RecipientType,
 } from "../types.js";
 import { boundIndexedValue } from "../../util/ConversationUtils.js";
+import { deriveMessageListFields } from "../../util/MessageListUtils.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Nullable } = ObjectDecorators;
@@ -41,6 +42,18 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Index("message_folder", ["folderUid"])
 @Index("message_mailbox", ["mailboxUid"])
 @Index("message_mailbox_conversation", ["mailboxUid", "conversationId"])
+// The mail list's own access paths: its default ordering, and the two filters (Unread, Flagged) a mail client
+// offers on every list. Each is `folderUid` first (a list is always folder-scoped), then the filtered column,
+// then `receivedDate`, so one index serves the filter and the ordering together. The rarer sorts/filters (From,
+// Subject, Importance, Has files, Focused/Other) deliberately get no index of their own - they are already
+// narrowed to one folder by `message_folder`, and sorting within a single folder's rows is cheap next to the
+// write cost every extra index on this table would add to delivery.
+@Index("message_folder_received", ["folderUid", "receivedDate"])
+@Index("message_folder_read_received", ["folderUid", "read", "receivedDate"])
+@Index("message_folder_flagged_received", ["folderUid", "flagged", "receivedDate"])
+// Expanding one conversation (`conversationMessages()`) reads a mailbox's messages for one `conversationId` in
+// date order.
+@Index("message_mailbox_conversation_received", ["mailboxUid", "conversationId", "receivedDate"])
 @Index("message_folder_modified", ["folderUid", "dateModified", "uid"])
 @Index("message_mailbox_modified", ["mailboxUid", "dateModified", "uid"])
 @Index("message_id", ["messageId"])
@@ -117,9 +130,33 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     @Description("The read/answered/flagged state of the message.")
     public flags: MessageFlags = { read: false, flagged: false, answered: false, forwarded: false };
 
+    // The four denormalized list fields below are derived from `flags`/`from`/`importance` by
+    // `deriveMessageListFields()` in the constructor, and by `syncMessageListFields()` for a partial update
+    // (which never runs a constructor). `@Nullable`, matching the SQL side, so a row written before they existed
+    // reads back as `undefined` rather than pretending to a value it never had.
+    @Column()
+    @Description("Server-managed mirror of `flags.read`, so an unread filter can be an indexed query.")
+    @Nullable
+    public read?: boolean;
+
+    @Column()
+    @Description("Server-managed mirror of `flags.flagged`, so a flagged filter can be an indexed query.")
+    @Nullable
+    public flagged?: boolean;
+
+    @Column()
+    @Description("Server-managed mirror of `from.address`, normalized and length-bounded, so a list can sort by sender.")
+    @Nullable
+    public fromAddress?: string;
+
     @Column()
     @Description("The importance level of the message.")
     public importance: MessageImportance = MessageImportance.NORMAL;
+
+    @Column()
+    @Description("Server-managed sortable rank of `importance` (low 0, normal 1, high 2).")
+    @Nullable
+    public importanceRank?: number;
 
     @Column()
     @Description("The RFC 5322 `In-Reply-To` header value, if this message is a reply.")
@@ -345,5 +382,9 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
                 other.readReceiptDeclined !== undefined ? other.readReceiptDeclined : this.readReceiptDeclined;
             this.receiptStatus = "receiptStatus" in other ? other.receiptStatus : this.receiptStatus;
         }
+
+        // Always derived, never copied from `other`: these are server-managed mirrors of `flags`/`from`/
+        // `importance` (see `util/MessageListUtils.ts`), so taking a caller's value would let the two disagree.
+        Object.assign(this, deriveMessageListFields(this));
     }
 }

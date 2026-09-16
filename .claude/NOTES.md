@@ -2130,3 +2130,68 @@ envelope recipient still kept, a malformed header) and `MailboxImportJob` (1 eac
 
 Verification: `yarn tsc --noEmit`, `yarn lint`, `yarn build` clean. Full `yarn vitest run --coverage`: 253 files /
 4973 tests passed; coverage 100 / 96.8 / 100 / 100.
+
+## 2026-09-15 — Mail list UX phase 1 (data/API): server-side sort + filter, nested conversations, bounded bulk
+
+Phase 1 of an Outlook-parity mail list overhaul (phase 2 builds the UI in `web-client`). The whole point of this
+phase was that the *database* has to do the ordering and filtering: a client that sorts or filters a page it already
+fetched is wrong as soon as the folder is bigger than the page.
+
+- **Four denormalized `Message` mirrors, `util/MessageListUtils.ts`.** `flags` and `from` are one `simple-json`
+  column on SQL (and an embedded sub-document on Mongo), and `ModelUtils.buildSearchQuery` can't filter or sort on a
+  field *inside* one on both backends - that's the constraint react-shared's `mail/flaggedMessages.ts` had already
+  written up as the reason "every flagged message" fanned out per folder and filtered in the browser. So `read`,
+  `flagged`, `fromAddress` (normalized + `boundIndexedValue()`) and `importanceRank` (0/1/2 - the enum's stored
+  strings sort `high`, `low`, `normal`, which is useless) are now ordinary top-level columns.
+  - Kept in sync in exactly two places: `deriveMessageListFields()` in both model constructors (covers every
+    `new MessageMongo/SQL({...})` - ScanQueueJob's delivery and filter-rule copy, MailboxImportJob, compose), and
+    `syncMessageListFields()` on an update patch, which `BaseMessageRoute.prepareUpdate()` applies to every REST
+    write. The two direct `repoUtils.update()` calls that rewrite `flags` themselves (`fileSentMessage()`,
+    `ScheduledSendJob.relayDueMessage()`) spread `deriveMessageListFields()` inline. `lockUnreadForRecall()` rewrites
+    `flags` unchanged, so it needs nothing.
+  - All four are in `SERVER_MANAGED_MESSAGE_FIELDS`: a body naming them is stripped, for trusted callers too.
+    Otherwise a caller could set `read: true` without `flags.read` and the two readers would disagree.
+  - **Known gap, deliberately not closed here**: `@rapidmx/activesync-plugin`/`@rapidmx/mapi-plugin` write `flags`
+    through their own repos and will desynchronize the mirrors. `syncMessageListFields()` is exported from the
+    package root for them. A self-healing backfill was considered and rejected for now: a new job would need the
+    server's `worker.*` wiring (uncommitted in that repo at the time), and piggybacking it on
+    `MailboxQuotaRecalcJob` - the only job that already pages every message of every mailbox - muddies that job's
+    single responsibility. Same reason legacy rows aren't backfilled; they're nullable and read as
+    unread/unflagged/normal, which is documented in the release notes.
+- **Named `?filter=`/`?sortBy=`/`?sortOrder=` rather than leaving it to the generic DSL.** Two things forced it:
+  `filter=focused` has to be `inferenceClassification = "focused" OR IS NULL` (absent means focused) and
+  `stripUnsafeQueryKeys()` drops a *client's* `$or`; and `sortBy=from`/`importance` must map onto the mirrors, not
+  the fields they come from. Implemented with two new hooks on `BaseScopedChildRoute` - `listQueryParams` (keys the
+  route interprets itself, deleted before the query reaches `RepoUtils` - a non-column key fails the SQL query
+  outright) and `listQueryOverrides()` (server-built fragments merged over the stripped client query, before
+  `params` and the forced scope). `BaseMessageRoute` is the only implementer. Because `scopedFilter()` backs
+  `find()`, `count()` and `truncate()`, `HEAD` gets the same filter for free - so a filter's count matches its list.
+- **Sort always carries `receivedDate` then `uid` as tiebreakers.** Without a total order, `limit`/`page` can show
+  the same message twice or skip one. Same reasoning applied to `summarizeConversation()`, which now breaks a
+  `receivedDate` tie by `uid` - it used to depend on the database's own row order, and adding a sort to the
+  conversation scan flipped it, which is how the existing "Groups a reply with its parent" test caught it (fixture
+  now gives the root an explicitly older `receivedDate`).
+- **Conversations**: `?folderUid=`, `?filter=`, `?limit=`/`?page=` (over the grouped rows), scan ordered newest-first
+  so the cap drops the oldest, five new summary fields for a collapsed parent row, and `GET /conversations/:id` for
+  the expanded children (oldest first, mailbox-scoped, default 100 / max 500 per page, singleton fallback to a uid
+  lookup for a message with no `conversationId`). Route order is fine: `/conversations/:id` is a deeper static
+  prefix than `/:id`, and both routers match static segments by specificity.
+- **No new bulk endpoint.** `BaseScopedChildRoute.updateBulk()` (`PUT` on the collection, inherited by every scoped
+  child route) already loops `update()` per element, so bulk mark read/unread, flag, move, archive, report junk and
+  relabel are all one request through it with every per-message check intact. It was *unbounded*, though - one
+  request could be an arbitrarily long write loop - so it's now capped at `MAX_BULK_UPDATE` (100) with a 400. Its
+  fail-fast, non-atomic, partially-applied semantics are now documented on the method rather than changed: a
+  tolerant per-element variant would be a second authorization surface for no behavior the client can't get by
+  sending the items individually.
+- **Outlook options this data model cannot serve, dropped rather than invented**: sort by Category (labels are
+  multi-valued - there is no single category to order by), Flag due date (no follow-up date field), Size (no size on
+  `Message`; the raw MIME's length lives only in the blob store and `MailboxQuotaRecalcJob` reads it from there) and
+  Type (no message class). Filter by To me (would need a delivery-time boolean computed against the owning
+  mailbox's addresses - `recipients` is `simple-json`, so it isn't queryable either), Mentions me (nothing parses
+  mentions) and Has calendar invites (`ScanPipelineResult.icsPart` exists but is never persisted on the message).
+
+Tests: `test/util/MessageListUtils.test.ts` (100% on every metric) plus a shared `test/routes/messageListSuite.ts`
+run against real Mongo and real SQL (`test/routes/{mongo,sql}/MessageList.test.ts`, 32 cases each) - every sort key,
+every filter, the `$or` focused branch on both backends, paging stability, mirror derivation/re-derivation/body
+rejection, conversation fields/folder scope/filter/paging/tie-break, conversation expansion incl. the singleton
+fallback, bulk update and its cap, and the delegate/stranger ACL paths.

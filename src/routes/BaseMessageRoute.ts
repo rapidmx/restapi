@@ -28,6 +28,16 @@ import { scanAndRelay } from "../util/MailSendUtils.js";
 import { coerceDateValue } from "../util/DateCoercionUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { boundIndexedValue } from "../util/ConversationUtils.js";
+import {
+    MESSAGE_LIST_FIELDS,
+    MESSAGE_LIST_QUERY_PARAMS,
+    boundedListLimit,
+    boundedListPage,
+    buildMessageListFilter,
+    buildMessageListSort,
+    deriveMessageListFields,
+    syncMessageListFields,
+} from "../util/MessageListUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders, safeDisplayName } from "../util/MimeHeaderUtils.js";
 import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import { buildRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
@@ -71,6 +81,17 @@ export interface ConversationSummary {
     participants: Recipient[];
     /** `true` if any message in the conversation has an attachment. */
     hasAttachments: boolean;
+    /** `true` if any message in the conversation is flagged. */
+    flagged: boolean;
+    /** The most recent message's `uid` - the one a collapsed conversation row stands for, so a client can open
+     * the conversation without first expanding it. */
+    latestMessageUid: string;
+    /** The most recent message's sender. */
+    latestFrom: Recipient;
+    /** The most recent message's `bodyPreview` - the snippet a collapsed conversation row shows. */
+    latestPreview: string;
+    /** The most recent message's `folderUid`, so a collapsed row can show where the conversation last moved. */
+    latestFolderUid: string;
 }
 
 /** `Message` fields only server-side code sets (ingest/scan, send, receipts, recall, indexing, compose). A non-trusted
@@ -109,7 +130,19 @@ const SERVER_MANAGED_MESSAGE_FIELDS = [
     // `prepareCreate()`/`prepareUpdate()`).
     "verificationSeal",
     "verificationSealGeneration",
+    // Denormalized mirrors of `flags`/`from`/`importance` (`util/MessageListUtils.ts`), re-derived by this route on
+    // every write. Accepting them from a body would let a caller mark a message read for the list's Unread filter
+    // while `flags.read` - which every other reader, this library's own included, treats as authoritative - still
+    // says unread.
+    ...MESSAGE_LIST_FIELDS,
 ] as const;
+
+/** How many of a conversation's messages `conversationMessages()` returns when the caller names no `limit`. Sized
+ * to cover the whole of an ordinary thread, so expanding a conversation row is one round trip. */
+export const DEFAULT_CONVERSATION_PAGE_SIZE: number = 100;
+
+/** The most messages one `conversationMessages()` page may carry, whatever `limit` asks for. */
+export const MAX_CONVERSATION_PAGE_SIZE: number = 500;
 
 /** The longest `Message.verificationSeal` `setVerificationSeal()` accepts, in characters. */
 export const MAX_VERIFICATION_SEAL_LENGTH = 2048;
@@ -146,9 +179,15 @@ function toValidDate(value: unknown): Date | undefined {
     return date && !Number.isNaN(date.getTime()) ? date : undefined;
 }
 
-/** Builds one `ConversationSummary` from every `Message` sharing `conversationId`. */
+/** Builds one `ConversationSummary` from every `Message` sharing `conversationId`. Ordered oldest to newest,
+ * with `uid` breaking a tie: two messages can share a `receivedDate` to the millisecond (a reply filed into Sent
+ * Items in the same tick the original was delivered, an mbox import), and without a total order which of them
+ * `latest` names - and so the whole summary's subject, sender and preview - would depend on the order the
+ * database happened to return them in. */
 function summarizeConversation(conversationId: string, messages: Message[]): ConversationSummary {
-    const sorted = [...messages].sort((a, b) => a.receivedDate.getTime() - b.receivedDate.getTime());
+    const sorted = [...messages].sort(
+        (a, b) => a.receivedDate.getTime() - b.receivedDate.getTime() || a.uid.localeCompare(b.uid),
+    );
     const latest = sorted[sorted.length - 1];
 
     const participantsByAddress = new Map<string, Recipient>();
@@ -171,6 +210,11 @@ function summarizeConversation(conversationId: string, messages: Message[]): Con
         latestDate: latest.receivedDate,
         participants: [...participantsByAddress.values()],
         hasAttachments: sorted.some((message) => message.hasAttachments),
+        flagged: sorted.some((message) => message.flags.flagged),
+        latestMessageUid: latest.uid,
+        latestFrom: latest.from,
+        latestPreview: latest.bodyPreview,
+        latestFolderUid: latest.folderUid,
     };
 }
 
@@ -192,6 +236,32 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     protected readonly serverManagedFields: readonly string[] = SERVER_MANAGED_MESSAGE_FIELDS;
 
     protected readonly dateFields: readonly string[] = MESSAGE_DATE_FIELDS;
+
+    protected readonly listQueryParams: readonly string[] = MESSAGE_LIST_QUERY_PARAMS;
+
+    /**
+     * Translates the mail list's own `?filter=`/`?sortBy=`/`?sortOrder=` vocabulary (`util/MessageListUtils.ts`)
+     * into the query `RepoUtils.find()`/`count()` understand, for `GET /` and `HEAD /` alike - so the count shown
+     * beside a filter is computed with exactly the predicate the list itself uses.
+     *
+     * A named vocabulary rather than the generic `op(value)` query DSL because the two of them a client can't
+     * express: `filter=focused` compiles to a two-branch `$or` (absent `inferenceClassification` means focused),
+     * and `stripUnsafeQueryKeys()` drops a client's own `$or`; and `sortBy=from`/`importance` sort on the
+     * denormalized `fromAddress`/`importanceRank` mirrors rather than the JSON sub-document and unordered enum
+     * string they come from. Anything else a client wants to filter on still goes through the generic DSL
+     * untouched (`?labelUids=...`, `?receivedDate=range(a,b)`, ...).
+     *
+     * `sort` is always set, so a list without an explicit `sortBy` is newest-first with a stable tiebreaker
+     * rather than in whatever order the storage engine returns - a client's own explicit `?sort=` still wins,
+     * since the client query is spread first and this merges over it only when it named one of these params.
+     */
+    protected listQueryOverrides(query: any): Record<string, any> {
+        const overrides: Record<string, any> = buildMessageListFilter(query?.filter);
+        if (query?.sortBy !== undefined || query?.sortOrder !== undefined || query?.sort === undefined) {
+            overrides.sort = buildMessageListSort(query?.sortBy, query?.sortOrder);
+        }
+        return overrides;
+    }
 
     protected abstract folderClass: any;
 
@@ -316,6 +386,9 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // `setVerificationSeal()`.
         delete obj.verificationSeal;
         delete obj.verificationSealGeneration;
+        // After `super.prepareCreate()` has stripped every server-managed field (the mirrors included), so what
+        // lands on the record is always derived from this create's own `flags`/`from`/`importance`.
+        Object.assign(obj, deriveMessageListFields(obj));
         if (this.isTrusted(user)) {
             return;
         }
@@ -351,6 +424,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 obj[field] = boundIndexedValue(obj[field]);
             }
         }
+        // An update is written as a patch without the model constructor that normally derives the list mirrors, so
+        // an update rewriting `flags`/`from`/`importance` has to re-derive them here or the Unread/Flagged filters
+        // and the sender/importance sorts go stale. Done for every caller, trusted included.
+        syncMessageListFields(obj, existing);
         if (typeof obj.folderUid === "string" && obj.folderUid !== existing.folderUid) {
             BaseMessageRoute.assertNotInFlight(existing);
         }
@@ -495,46 +572,67 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         }
     }
 
+    /** Checks `ACLAction.LIST` on `?mailboxUid=` and returns it - the one permission check both conversation
+     * endpoints make. Mirrors `BaseFolderRoute.find()`'s own one-mailbox-level-check shape (a single check
+     * against `mailboxUid` itself, then an `ignoreACL: true` query) rather than this route's own base class's
+     * folder-scoped `find()` - that is this codebase's established pattern for "list this mailbox's children in
+     * one call", and `Message.mailboxUid` is already denormalized for exactly this kind of whole-mailbox scan.
+     * `undefined` means "answer with an empty result", never an error, exactly as `find()` does. */
+    private async requireConversationScope(query: any, user: JWTUser | undefined): Promise<string | undefined> {
+        if (!this.repoUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const mailboxUid: unknown = query?.mailboxUid;
+        if (typeof mailboxUid !== "string" || mailboxUid.length === 0) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        return (await this.aclUtils!.hasPermission(user, mailboxUid, ACLAction.LIST)) ? mailboxUid : undefined;
+    }
+
     /**
      * Groups this mailbox's messages into conversations (RFC 5322 References/In-Reply-To threading, via
-     * `Message.conversationId`) - one summary row per conversation spanning every folder in the mailbox,
-     * newest activity first. Mirrors `BaseFolderRoute.find()`'s own one-mailbox-level-check shape (a
-     * single `ACLAction.LIST` check against `mailboxUid` itself, then an `ignoreACL: true` query) rather
-     * than this route's own base class's folder-scoped `find()` - that is this codebase's own established
-     * pattern for "list this mailbox's children in one call" (see `BaseFolderRoute.find()`'s own doc
-     * comment), and `Message.mailboxUid` is already denormalized for exactly this kind of whole-mailbox
-     * scan.
+     * `Message.conversationId`) - one summary row per conversation, newest activity first, and the parent rows
+     * of a nested conversation list. `?folderUid=` restricts both the scan and the grouping to one folder (what
+     * a per-folder conversation view wants); without it a conversation spans every folder in the mailbox, so an
+     * Inbox message and the Sent Items copy of its reply are one row.
+     *
+     * `?filter=` is the same named vocabulary the message list itself takes (`util/MessageListUtils.ts`), applied
+     * to the *messages* before they are grouped - so `filter=unread` yields each conversation's unread messages
+     * and only the conversations that have any, rather than only conversations all of whose messages are unread.
      *
      * Grouping happens in application code over one capped `find()` - there is no query-time group-by/
-     * aggregation available across both backends this library supports (`RepoUtils` has none, and Mongo's
-     * own raw `aggregate()` escape hatch has no SQL equivalent) - so a mailbox busier than
-     * `conversationScanLimit` messages will not group its oldest messages correctly.
+     * aggregation available across both backends this library supports (`RepoUtils` has none, and Mongo's own
+     * raw `aggregate()` escape hatch has no SQL equivalent) - so at most `conversationScanLimit` messages are
+     * read, newest first, and a conversation whose older messages fall outside that window reports only the part
+     * of itself inside it. `?limit=`/`?page=` then page over the grouped rows (bounded by that same scan limit):
+     * the paging is over what was scanned, so a page boundary is only as stable as the messages under it.
      */
     @Summary("List conversations")
     @Description(
-        "Groups this mailbox's messages into conversations (RFC 5322 References/In-Reply-To threading), " +
-            "one summary row per conversation spanning every folder, newest activity first. Scans at most " +
-            "conversationScanLimit messages in the mailbox - a mailbox busier than that will not group its " +
-            "oldest messages correctly.",
+        "Groups this mailbox's messages into conversations (RFC 5322 References/In-Reply-To threading), one " +
+            "summary row per conversation, newest activity first. Optionally restricted to one folderUid and " +
+            "one named filter, and paged with limit/page. Scans at most conversationScanLimit messages, newest " +
+            "first - a conversation with messages older than that window reports only the part inside it.",
     )
     @Returns([Object])
     @Get("/conversations")
     public async conversations(@Query() query: any, @AuthUser user?: JWTUser): Promise<ConversationSummary[]> {
-        if (!this.repoUtils) {
-            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
-        }
-        const mailboxUid: string | undefined = query?.mailboxUid;
+        const mailboxUid: string | undefined = await this.requireConversationScope(query, user);
         if (!mailboxUid) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
-        }
-        if (!(await this.aclUtils!.hasPermission(user, mailboxUid, ACLAction.LIST))) {
             return [];
         }
 
-        const messages: T[] = await this.repoUtils.find(
-            { mailboxUid, limit: this.conversationScanLimit } as any,
-            { limit: this.conversationScanLimit, ignoreACL: true },
-        );
+        const criteria: any = {
+            ...buildMessageListFilter(query?.filter),
+            mailboxUid: ModelUtils.literal(mailboxUid),
+            // Newest first, so the scan cap drops the oldest messages rather than an arbitrary slice of them.
+            sort: { receivedDate: "DESC", uid: "ASC" },
+            limit: this.conversationScanLimit,
+        };
+        if (typeof query?.folderUid === "string" && query.folderUid.length > 0) {
+            criteria.folderUid = ModelUtils.literal(query.folderUid);
+        }
+        const messages: T[] = await this.repoUtils!.find(criteria, { limit: this.conversationScanLimit, ignoreACL: true });
 
         const groups = new Map<string, T[]>();
         for (const message of messages) {
@@ -551,7 +649,58 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             summarizeConversation(conversationId, group),
         );
         summaries.sort((a, b) => b.latestDate.getTime() - a.latestDate.getTime());
-        return summaries;
+        const limit: number = boundedListLimit(query?.limit, this.conversationScanLimit, this.conversationScanLimit);
+        const page: number = boundedListPage(query?.page);
+        return summaries.slice(page * limit, page * limit + limit);
+    }
+
+    /**
+     * The messages of one conversation, oldest first - the child rows a client expands a conversation into,
+     * without fetching each of the summary's `messageUids` one at a time. Scoped to `?mailboxUid=` and
+     * permission-checked exactly like `conversations()`, so it can span folders the way a conversation does.
+     *
+     * A message with no `conversationId` of its own is its own singleton conversation, keyed on its `uid` (the
+     * same key `conversations()` groups it under) - so an id that matches no stored `conversationId` at all falls
+     * back to a single-message lookup by uid inside the mailbox before answering empty.
+     *
+     * Paged with `?limit=` (default `DEFAULT_CONVERSATION_PAGE_SIZE`, capped at `MAX_CONVERSATION_PAGE_SIZE`)
+     * and `?page=`: a thread is bounded in practice, but a mailing-list thread can still run to thousands.
+     */
+    @Summary("List a conversation's messages")
+    @Description(
+        "Returns one conversation's messages, oldest first, across every folder in the mailbox - the expanded " +
+            "children of a conversation row. Requires mailboxUid; paged with limit/page.",
+    )
+    @Returns([Object])
+    @Get("/conversations/:conversationId")
+    public async conversationMessages(
+        @Param("conversationId") conversationId: string,
+        @Query() query: any,
+        @AuthUser user?: JWTUser,
+    ): Promise<T[]> {
+        const mailboxUid: string | undefined = await this.requireConversationScope(query, user);
+        if (!mailboxUid) {
+            return [];
+        }
+        const limit: number = boundedListLimit(query?.limit, DEFAULT_CONVERSATION_PAGE_SIZE, MAX_CONVERSATION_PAGE_SIZE);
+        const page: number = boundedListPage(query?.page);
+
+        const criteria: any = {
+            mailboxUid: ModelUtils.literal(mailboxUid),
+            // Bounded the way the stored value was, so an over-long Message-ID's conversation still matches.
+            conversationId: ModelUtils.literal(boundIndexedValue(conversationId)),
+            sort: { receivedDate: "ASC", uid: "ASC" },
+            limit,
+            page,
+        };
+        const messages: T[] = await this.repoUtils!.find(criteria, { limit, page, ignoreACL: true });
+        if (messages.length > 0 || page > 0) {
+            return messages;
+        }
+
+        // Singleton conversation: `conversations()` keys a message with no `conversationId` on its own uid.
+        const single: T | undefined = await this.repoUtils!.findOne(conversationId, { ignoreACL: true });
+        return single && single.mailboxUid === mailboxUid && !single.conversationId ? [single] : [];
     }
 
     /**
@@ -824,13 +973,15 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         }
 
         // `messageId`/`conversationId` come from the relayed MIME and are written as a patch (no model constructor), so
-        // they are bounded here - see `boundIndexedValue()`.
+        // they are bounded here - see `boundIndexedValue()`. The same patch rewrites `flags`, so the denormalized list
+        // mirrors are re-derived with it (`syncMessageListFields()`), keeping the Sent Items list's Unread filter right.
         return await this.repoUtils!.update(
             {
                 uid: message.uid,
                 version: (current as any).version,
                 folderUid: sentFolder.uid,
                 flags,
+                ...deriveMessageListFields({ ...current, flags }),
                 sanitizedHtmlBlobKey,
                 messageId: boundIndexedValue(messageId),
                 conversationId: boundIndexedValue(conversationId),

@@ -70,6 +70,14 @@ describe("BaseMessageRoute Tests (dependency guard clause only)", () => {
         await expect(route.conversations({ mailboxUid: "mbx-1" }, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
     });
 
+    it("conversationMessages() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
+        const route = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
+
+        await expect(route.conversationMessages("thread-1", { mailboxUid: "mbx-1" }, { uid: "user-1" } as any)).rejects.toThrow(
+            /internal error/i,
+        );
+    });
+
     it("content() throws INTERNAL_ERROR when repoUtils/blobStore are not set.", async () => {
         const route = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
         const res: any = { setHeader: vi.fn().mockReturnThis(), send: vi.fn() };

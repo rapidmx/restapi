@@ -37,6 +37,15 @@ const SHARE_TOKEN_UID_PREFIX = "share:";
 /** How many uids `truncate()` deletes per `RepoUtils.truncate()` call, keeping each SQL `IN` list bounded. */
 const TRUNCATE_BATCH_SIZE = 500;
 
+/**
+ * The most objects one `PUT` (`updateBulk()`) may carry. Each element costs a full `update()` - a record read, an
+ * ACL check, the entity's own `prepareUpdate()` and a write - so an unbounded array is an unbounded write loop
+ * held open on one request. 100 comfortably covers acting on a whole page of a mail list at once (this
+ * framework's own `MAX_PAGE_SIZE` for a single list request is 1000, but no client selects that many rows by
+ * hand), and a caller with more to do simply sends more requests.
+ */
+export const MAX_BULK_UPDATE: number = 100;
+
 /** Every token `BaseCalendarShareLinkRoute` mints is 32 random bytes, base64url. Checked before any lookup, so the
  * value is always a plain literal by the time it reaches a query. */
 const SHARE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -197,11 +206,40 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         return { uid: `${SHARE_TOKEN_UID_PREFIX}${token}`, roles: [], scopes: [] };
     }
 
+    /**
+     * Query-string parameters this route interprets itself (via `listQueryOverrides()`) rather than passing
+     * through to `RepoUtils.find()` as a field filter. Left through, a name that isn't a real column fails the
+     * query outright on the SQL backend, so anything a subclass reads in `listQueryOverrides()` must be named
+     * here. Empty by default - only `BaseMessageRoute` has any.
+     */
+    protected readonly listQueryParams: readonly string[] = [];
+
+    /**
+     * Hook for server-built filter fragments merged over the client's own query in every list-shaped request
+     * (`find()`, `count()`, `truncate()`). The one thing this can express that a client's own query cannot is a
+     * `$or` group: `stripUnsafeQueryKeys()` drops every `$`-prefixed key a *client* sends, deliberately, but a
+     * fragment this route builds itself names only the fields it chose to name and can't widen the scope (which
+     * is still forced last, below). A no-op by default.
+     */
+    protected listQueryOverrides(query: any): Record<string, any> {
+        return {};
+    }
+
     /** The data filter for a list-shaped request: the client query minus anything that could widen it
-     * (`stripUnsafeQueryKeys()`), with the permission-checked scope forced last as a `ModelUtils.literal()`, so the value
-     * is never parsed as an operator or substituted (`me`/`null`). */
+     * (`stripUnsafeQueryKeys()`) and minus this route's own `listQueryParams`, with `listQueryOverrides()` merged
+     * over it and the permission-checked scope forced last as a `ModelUtils.literal()`, so the value is never
+     * parsed as an operator or substituted (`me`/`null`). */
     private scopedFilter(params: any, query: any, scopeUid: string): any {
-        return { ...stripUnsafeQueryKeys(query), ...params, [this.scopeProperty]: ModelUtils.literal(scopeUid) };
+        const stripped: Record<string, any> = stripUnsafeQueryKeys(query);
+        for (const key of this.listQueryParams) {
+            delete stripped[key];
+        }
+        return {
+            ...stripped,
+            ...this.listQueryOverrides(query),
+            ...params,
+            [this.scopeProperty]: ModelUtils.literal(scopeUid),
+        };
     }
 
     /** Whether `user` may see soft-deleted records in `scopeUid`: DELETE and UPDATE there, the two actions a restore
@@ -584,10 +622,24 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         return updated;
     }
 
+    /**
+     * Applies one update per element, in order, each through this class's own `update()` - so every permission,
+     * scope, legal-hold and entity-specific check a single update makes is made here too, and a client selecting
+     * a page of rows in a list and acting on all of them pays one request instead of one per row.
+     *
+     * Deliberately NOT atomic and deliberately fail-fast: the first element that throws (a stale `version`, a
+     * refused folder move, a revoked grant) aborts the rest, leaving the elements before it applied. A caller
+     * that needs a per-element outcome should send the updates individually instead.
+     *
+     * Bounded at `MAX_BULK_UPDATE` elements so one request can't turn into an unbounded write loop.
+     */
     @Put()
     public async updateBulk(obj: UpdateObject<T>[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
         this.requireTrustedWrite(user);
         // (A non-array body never gets here: `CRUDRoute`s bulk validator already refused it.)
+        if (obj.length > MAX_BULK_UPDATE) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A bulk update may carry at most ${MAX_BULK_UPDATE} objects.`);
+        }
         assertNoPathKeys(obj);
         const results: T[] = [];
         for (const single of obj) {
