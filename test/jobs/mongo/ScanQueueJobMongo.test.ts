@@ -41,6 +41,7 @@ import { buildEventIcs } from "../../../src/util/IcsUtils.js";
 import { sanitizeDiscoveredKey } from "../../../src/util/KeyringUtils.js";
 import { issueCertificate, makeTestIssuer } from "../../util/signerCertificates.js";
 import { buildDispositionNotification } from "../../../src/util/ReceiptUtils.js";
+import { MAX_MESSAGE_RECIPIENTS } from "../../../src/util/RecipientUtils.js";
 import {
     AttendeeResponseStatus,
     AttendeeRole,
@@ -407,6 +408,86 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         const messages = await messageRepo.find({ folderUid: inbox!.uid }).toArray();
         expect(messages.length).toBe(1);
         expect(messages[0].encrypted).toBe(true);
+    });
+
+    describe("Delivered recipients and sender", () => {
+        /** A plain message carrying exactly the originator/recipient headers a test needs. */
+        function makeAddressedRawMessage(...headers: string[]): Buffer {
+            return Buffer.from([...headers, "Subject: Addressed message", "", "Hello there.", ""].join("\r\n"));
+        }
+
+        /** Delivers `raw` to the test mailbox and returns the one `Message` row that produced. */
+        async function deliver(raw: Buffer, data?: Partial<IngestQueueEntryMongo>): Promise<MessageMongo> {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, raw);
+            await createIngestEntry({ rawBlobKey, ...data });
+            await job.run();
+            const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
+            const messages = await messageRepo.find({ folderUid: inbox!.uid }).toArray();
+            expect(messages.length).toBe(1);
+            return messages[0];
+        }
+
+        it("Records every To and Cc recipient the message names, with display names, not just the envelope recipient.", async () => {
+            const encoded = `=?utf-8?B?${Buffer.from('Grüßer, "Jörg"', "utf8").toString("base64")}?=`;
+            const message = await deliver(
+                makeAddressedRawMessage(
+                    "From: sender@example.com",
+                    'To: "Allen, Bob" <bob@partner.test>, recipient@example.com',
+                    `Cc: ${encoded} <jorg@partner.test>`,
+                ),
+            );
+
+            expect(message.recipients).toEqual([
+                { address: "bob@partner.test", displayName: "Allen, Bob", type: RecipientType.TO },
+                { address: "recipient@example.com", type: RecipientType.TO },
+                { address: "jorg@partner.test", displayName: 'Grüßer, "Jörg"', type: RecipientType.CC },
+            ]);
+        });
+
+        it("Keeps a bcc'd (or alias-only) envelope recipient no header names, recorded as bcc.", async () => {
+            const message = await deliver(makeAddressedRawMessage("From: sender@example.com", "To: bob@partner.test"));
+
+            expect(message.recipients).toEqual([
+                { address: "bob@partner.test", type: RecipientType.TO },
+                { address: "recipient@example.com", type: RecipientType.BCC },
+            ]);
+        });
+
+        it("Stores the sender's display name alone, with the address kept separately.", async () => {
+            const message = await deliver(makeAddressedRawMessage('From: "Bob Allen" <bob@partner.test>', "To: recipient@example.com"), {
+                envelopeFrom: "bob@partner.test",
+            });
+
+            expect(message.from).toEqual({ address: "bob@partner.test", displayName: "Bob Allen", type: RecipientType.TO });
+        });
+
+        it("Leaves the sender's display name unset when the From header carries none.", async () => {
+            const message = await deliver(makeAddressedRawMessage("From: sender@example.com", "To: recipient@example.com"));
+
+            expect(message.from.address).toBe("sender@example.com");
+            expect(message.from.displayName).toBeFalsy();
+        });
+
+        it("Caps a huge recipient header, still keeping the envelope recipient it doesn't name.", async () => {
+            const many = Array.from({ length: 5_000 }, (_unused, i) => `user${i}@partner.test`).join(", ");
+            const message = await deliver(makeAddressedRawMessage("From: sender@example.com", `To: ${many}`));
+
+            expect(message.recipients.length).toBe(MAX_MESSAGE_RECIPIENTS);
+            expect(message.recipients[0]).toEqual({ address: "user0@partner.test", type: RecipientType.TO });
+            expect(message.recipients[MAX_MESSAGE_RECIPIENTS - 1]).toEqual({ address: "recipient@example.com", type: RecipientType.BCC });
+        });
+
+        it("Delivers a message with a malformed recipient header, recording only the addresses it does name.", async () => {
+            const message = await deliver(
+                makeAddressedRawMessage("From: sender@example.com", 'To: Allen, Bob <bob@partner.test>, "unterminated <carol@partner.test>, not-an-address'),
+            );
+
+            expect(message.recipients.every((r) => r.address.includes("@"))).toBe(true);
+            expect(message.recipients.map((r) => r.address)).toContain("bob@partner.test");
+            expect(message.recipients.map((r) => r.address)).toContain("recipient@example.com");
+        });
     });
 
     describe("Inbound RapidMX-Key header processing (Group E3)", () => {

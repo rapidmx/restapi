@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixes
+
+- **A delivered message now records everyone it was addressed to, not just the envelope recipient.** `ScanQueueJob`
+  stored `Message.recipients` from the SMTP envelope, so each recipient's own copy listed only that one mailbox -
+  nothing server-side (or in a client) could tell who else the message went to, which broke Reply All and conversation
+  participant lists. `recipients` is now built from the message's own `To` and `Cc` headers (and a `Bcc` header only
+  when the delivered copy genuinely carries one - no bcc entry is ever invented for another recipient), RFC
+  2047-decoded with display names preserved, typed `to`/`cc`/`bcc` by the header each came from and de-duplicated
+  case-insensitively by address. An envelope recipient no header names - bcc'd, reached through an alias, or expanded
+  from a distribution list - is kept as a `bcc` entry, so a copy always still records the mailbox it was delivered to.
+  At most `MAX_MESSAGE_RECIPIENTS` (100) recipients are stored per message, and envelope recipients are never the ones
+  dropped to that cap. The same fix applies to a mail filter rule's `copyToFolderUids` copy, and to
+  `MailboxImportJob`, which imported every message with an empty `recipients` list.
+- **A delivered message's sender display name is now the name alone.** `Message.from.displayName` was the *whole*
+  parsed `From` header, so a client showing the name and the address rendered
+  `"Bob Allen" <bob@partner.test> <bob@partner.test>`. It now stores the unquoted, RFC 2047-decoded display name on
+  its own, with the address unchanged (`from.address` stays the SMTP envelope sender - what a focused-inbox sender
+  override and the search index are keyed on). An address-like display name is stored as the sender wrote it: a
+  client's "this sender's name looks like an address" phishing check needs to see it. Same fix in `MailboxImportJob`.
+- **New `util/RecipientUtils.ts`** (exported from the package root): `parseHeaderRecipients()`,
+  `buildDeliveredRecipients()`, `parseSenderDisplayName()`, `storedAddress()`, `storedDisplayName()` and
+  `MAX_MESSAGE_RECIPIENTS`. `ScanPipelineResult` gains `headerRecipients: Recipient[]` and `fromDisplayName?: string`
+  (additive - `parsedFrom` still carries the whole `From` header value for mail filter `from` conditions).
+- **No migration** (pre-release): messages delivered or imported before this change keep their old single-recipient
+  list and combined display name. Mail delivered from now on is correct immediately.
+
 ### Routes
 
 - **Recipient suggestions: `BaseDirectoryRoute`** (`DirectoryRouteMongo`, `DirectoryRouteSQL`). Mount it with

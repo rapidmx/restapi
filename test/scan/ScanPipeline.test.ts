@@ -6,7 +6,8 @@
 // `mailparser`'s `simpleParser` is exercised for real against small hand-built raw MIME messages (it's a
 // regular, already-installed dependency here, not an optional peer one worth mocking away).
 import { ScanPipeline, resolveDeliveryVerdict } from "../../src/scan/ScanPipeline.js";
-import { AvVerdict, SpamVerdict } from "../../src/models/types.js";
+import { AvVerdict, RecipientType, SpamVerdict } from "../../src/models/types.js";
+import { MAX_MESSAGE_RECIPIENTS } from "../../src/util/RecipientUtils.js";
 import type { SpamScanResult } from "../../src/scan/SpamScanProvider.js";
 import type { AvScanResult } from "../../src/scan/AvScanProvider.js";
 
@@ -395,6 +396,84 @@ describe("ScanPipeline Tests", () => {
             const result = await pipeline.run(makePlainRawMessage(), makeEnvelope());
 
             expect(result.replyToAddress).toBeUndefined();
+        });
+    });
+
+    describe("run() - sender display name and header recipient extraction", () => {
+        beforeEach(() => {
+            (pipeline as any).spamScanProvider = spamScanProvider;
+            (pipeline as any).avScanProvider = avScanProvider;
+        });
+
+        /** A header-only message carrying whatever originator/recipient headers a test needs. */
+        const withHeaders = (...headers: string[]): Buffer =>
+            Buffer.from([...headers, "Subject: Test message", "", "Body.", ""].join("\r\n"));
+
+        it("Extracts the sender's display name alone, not the whole From header.", async () => {
+            const result = await pipeline.run(withHeaders('From: "Bob Allen" <bob@partner.test>', "To: recipient@example.com"), makeEnvelope());
+
+            expect(result.fromDisplayName).toBe("Bob Allen");
+            expect(result.fromAddress).toBe("bob@partner.test");
+            // The whole header value is still what mail filter `from` conditions match against.
+            expect(result.parsedFrom).toBe('"Bob Allen" <bob@partner.test>');
+        });
+
+        it("Leaves fromDisplayName undefined for a bare address, and for a message with no From header at all.", async () => {
+            expect((await pipeline.run(withHeaders("From: bob@partner.test", "To: recipient@example.com"), makeEnvelope())).fromDisplayName).toBeUndefined();
+            expect((await pipeline.run(withHeaders("To: recipient@example.com"), makeEnvelope())).fromDisplayName).toBeUndefined();
+        });
+
+        it("Extracts every To and Cc recipient with its display name, typed by the header it came from.", async () => {
+            const result = await pipeline.run(
+                withHeaders("From: bob@partner.test", 'To: "Allen, Bob" <bob@partner.test>, carol@partner.test', "Cc: Dave <dave@partner.test>"),
+                makeEnvelope(),
+            );
+
+            expect(result.headerRecipients).toEqual([
+                { address: "bob@partner.test", displayName: "Allen, Bob", type: RecipientType.TO },
+                { address: "carol@partner.test", type: RecipientType.TO },
+                { address: "dave@partner.test", displayName: "Dave", type: RecipientType.CC },
+            ]);
+        });
+
+        it("Decodes RFC 2047 encoded words, including one holding a comma and a quote.", async () => {
+            const encoded: string = `=?utf-8?B?${Buffer.from('Grüßer, "Jörg"', "utf8").toString("base64")}?=`;
+            const result = await pipeline.run(withHeaders("From: bob@partner.test", `To: ${encoded} <jorg@partner.test>`), makeEnvelope());
+
+            expect(result.headerRecipients).toEqual([{ address: "jorg@partner.test", displayName: 'Grüßer, "Jörg"', type: RecipientType.TO }]);
+        });
+
+        it("Records a Bcc header the copy genuinely carries, and no bcc entry when it carries none.", async () => {
+            const withBcc = await pipeline.run(withHeaders("From: bob@partner.test", "To: carol@partner.test", "Bcc: hidden@partner.test"), makeEnvelope());
+            expect(withBcc.headerRecipients).toEqual([
+                { address: "carol@partner.test", type: RecipientType.TO },
+                { address: "hidden@partner.test", type: RecipientType.BCC },
+            ]);
+
+            const withoutBcc = await pipeline.run(withHeaders("From: bob@partner.test", "To: carol@partner.test"), makeEnvelope());
+            expect(withoutBcc.headerRecipients.some((r) => r.type === RecipientType.BCC)).toBe(false);
+        });
+
+        it("Survives a malformed recipient header, keeping whatever addresses it does name.", async () => {
+            const result = await pipeline.run(
+                withHeaders("From: bob@partner.test", 'To: Allen, Bob <bob@partner.test>, "unterminated <carol@partner.test>, not-an-address'),
+                makeEnvelope(),
+            );
+
+            expect(result.headerRecipients.map((r) => r.address)).toContain("bob@partner.test");
+            expect(result.headerRecipients.every((r) => r.address.includes("@"))).toBe(true);
+        });
+
+        it("Caps a huge recipient header at MAX_MESSAGE_RECIPIENTS.", async () => {
+            const many: string = Array.from({ length: 5_000 }, (_unused, i) => `user${i}@partner.test`).join(", ");
+            const result = await pipeline.run(withHeaders("From: bob@partner.test", `To: ${many}`), makeEnvelope());
+
+            expect(result.headerRecipients.length).toBe(MAX_MESSAGE_RECIPIENTS);
+            expect(result.headerRecipients[0].address).toBe("user0@partner.test");
+        });
+
+        it("Reports no header recipients for a message that names none.", async () => {
+            expect((await pipeline.run(withHeaders("From: bob@partner.test"), makeEnvelope())).headerRecipients).toEqual([]);
         });
     });
 

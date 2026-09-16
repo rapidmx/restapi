@@ -432,6 +432,39 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
         expect(attachments[0].filename).toBe("attachment");
     });
 
+    it("Records an imported message's own To and Cc recipients, and the sender's display name alone.", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        // An import has no SMTP envelope of its own - the message's own headers are the only record of who it
+        // was addressed to, and every imported message used to be stored with none at all.
+        const raw = Buffer.from(
+            [
+                'From: "Bob Allen" <bob@partner.test>',
+                'To: "Nguyen, Carol" <carol@partner.test>, recipient@example.com',
+                "Cc: Dave <dave@partner.test>",
+                "Subject: Archived message",
+                "",
+                "Hello there.",
+                "",
+            ].join("\r\n"),
+        );
+        await blobStore.put(sourceBlobKey, buildMboxEntry(raw, "bob@partner.test", new Date("2020-01-01")));
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+
+        await job.run();
+
+        expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.importedCount).toBe(1);
+        const messages = await messageRepo.find({ where: { folderUid: folder.uid } });
+        expect(messages[0].from).toEqual({ address: "bob@partner.test", displayName: "Bob Allen", type: RecipientType.TO });
+        expect(messages[0].recipients).toEqual([
+            { address: "carol@partner.test", displayName: "Nguyen, Carol", type: RecipientType.TO },
+            { address: "recipient@example.com", type: RecipientType.TO },
+            { address: "dave@partner.test", displayName: "Dave", type: RecipientType.CC },
+        ]);
+    });
+
     it("Stores a sanitized HTML blob for an imported message that has an HTML body.", async () => {
         const mailbox = await createMailbox();
         const folder = await createFolder(mailbox.uid);

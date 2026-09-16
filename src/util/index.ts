@@ -39,6 +39,7 @@ export * from "./MailboxScopeUtils.js";
 export { findPagesByUid } from "./MailboxContentUtils.js";
 export * from "./MimeHeaderUtils.js";
 export * from "./OofUtils.js";
+export * from "./RecipientUtils.js";
 export * from "./RecoverableRepoUtils.js";
 export * from "./RequestBodyUtils.js";
 export * from "./SearchIndexUtils.js";

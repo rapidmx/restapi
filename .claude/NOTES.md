@@ -2068,3 +2068,65 @@ rows) because they were unreachable and cost coverage.
 
 Verification: `tsc --noEmit`, `yarn lint`, `yarn build` clean. Full `yarn vitest run --coverage`: 252 files / 4928 tests
 passed; coverage 100 / 96.78 / 100 / 100; BaseDirectoryRoute and both concrete routes at 100% on every metric.
+
+## 2026-09-15 — Delivered messages recorded only the envelope recipient, and the whole From header as the sender's name
+
+Two bugs in what `ScanQueueJob` writes onto a delivered `Message`, both found from `@rapidmx/web-client` while fixing
+Reply All (its HEAD `7d689a0` works around the first client-side, recovering `To`/`Cc` from the raw message).
+
+- **`recipients` came from the SMTP envelope** (`entry.envelopeTo.map(...)`), and `BaseMailIngestRoute` stages one entry
+  per recipient with `envelopeTo: [address]` - so every delivered copy claimed it had exactly one recipient (itself).
+  Reply All, conversation participants (`BaseMessageRoute`'s union of `from`+`recipients`), `SearchIndexJob`'s
+  participant list and EAS/MAPI's To/Cc fields were all wrong. Now built from the message's own headers.
+- **`from.displayName` was `result.parsedFrom`**, the *whole* `From` header (`"Bob Allen" <bob@partner.test>`), so a
+  client showing the name and then the address rendered it twice.
+
+Decisions
+- **Parsing lives in `ScanPipeline`, not a second header scan.** `ScanPipelineResult` gained `headerRecipients:
+  Recipient[]` and `fromDisplayName?: string`, filled from the `ParsedMail` it already produces - mailparser has
+  already split the address lists, RFC 2047-decoded the names and expanded groups, so a huge or hostile header adds no
+  new parsing and no new regular expression to the ingest path. `parsedFrom` stays (mail filter `from` conditions match
+  the whole header value). Additive, so `@rapidmx/activesync`/`mapi` are unaffected.
+- **New `src/util/RecipientUtils.ts`** (barrel-exported): `parseHeaderRecipients()`, `buildDeliveredRecipients()`,
+  `parseSenderDisplayName()`, `storedAddress()`, `storedDisplayName()`, `MAX_MESSAGE_RECIPIENTS = 100`. Pure, so it is
+  unit-testable without a DB. Bounds: 100 recipients per message, 320-character addresses (RFC 5321), 200-character
+  display names, group nesting followed 5 deep, and the walk stops as soon as the cap is reached (a 50k-address header
+  costs 100 entries of work). Control characters are refused in an address and replaced in a name - a stray CR/LF must
+  never reach a header this server composes. No regular expression sees attacker text (character-code scans, like
+  `MimeHeaderUtils.ts`; the only regex is a literal ` {2,}` whitespace collapse).
+- **Typing**: `To` -> `to`, `Cc` -> `cc`, and a `Bcc` header **only when the stored copy genuinely carries one** (a
+  Sent Items copy, or an MTA that left it on) - a bcc entry is never invented for another recipient, since a delivered
+  copy normally has no `Bcc` header at all.
+- **The envelope recipient stays represented**, deduped case-insensitively by address: when no header names it (bcc'd,
+  alias-only, distribution-list expansion) it is added as **`bcc`** - that is what it is from this copy's point of
+  view, it keeps Reply All from putting a privately-addressed address back on a visible header (web-client already
+  carries no bcc recipient over), and it means the copy always still records the mailbox it was delivered into.
+  Envelope entries are never the ones dropped to the cap; they displace the last header recipients instead.
+- **`from.address` deliberately unchanged** - still `entry.envelopeFrom`, not the `From` header's address.
+  `BaseMessageRoute.upsertSenderOverride()` writes a focused-inbox override keyed on `message.from.address` while
+  `ScanQueueJob.classifyForInbox()` looks it up by `entry.envelopeFrom`; they must agree, and `SearchIndexJob` indexes
+  the same value. Only the display name was wrong, so only the display name changed.
+- **Not sanitized through `safeDisplayName()`**: that drops a name containing an `@`, which is right for a name this
+  server puts in front of one of its *own* addresses, but here the name is what the sender shows the reader and
+  `web-client`'s `MessageDetailPane.checkSenderName()` phishing warning needs to see it. The fix actually *improves*
+  that warning: with the whole header stored, every named sender used to look "address-like" and often "misleading"
+  (the address extracted from the name is the `From` address, compared against the envelope one). No web-client change
+  is needed; its raw-header Reply All recovery in `quotedBody.ts`/`MessageDetailPane.tsx` is now redundant for newly
+  delivered mail and can be simplified later.
+- **Other creation paths checked**: only `ScanQueueJob` (primary row + a filter rule's `copyToFolderUids` copy) and
+  `MailboxImportJob` create a delivered/ingested `Message` (`grep "new this.messageClass"`). `MailboxImportJob` stored
+  `recipients: []` and the same combined display name - fixed, with no envelope to fall back on (an import has none).
+  `BaseMessageRoute.send()`/`ScheduledSendJob` store what the client composed (already correct);
+  `MeetingSchedulingJob`, forwarding/relay copies and distribution-list expansion only relay MIME and create no
+  `Message` row; `BaseMailIngestRoute` creates only `IngestQueueEntry` rows.
+- **No migration** (pre-release): existing dev data keeps the old one-entry list and combined name. Nothing in this
+  repo reads `displayName` back apart from `safeDisplayName()` on a client-written value, so no reader tolerance was
+  needed.
+
+Tests: `test/util/RecipientUtils.test.ts` (23 unit tests, 100% on every metric), 8 new `ScanPipeline` tests, and
+matching Mongo+SQL suites for `ScanQueueJob` (6 each: multiple To/Cc with display names, a comma inside a quoted name,
+an RFC 2047 encoded word, a bcc'd/alias-only envelope recipient, no sender name, a 5000-address header capped with the
+envelope recipient still kept, a malformed header) and `MailboxImportJob` (1 each).
+
+Verification: `yarn tsc --noEmit`, `yarn lint`, `yarn build` clean. Full `yarn vitest run --coverage`: 253 files /
+4973 tests passed; coverage 100 / 96.8 / 100 / 100.

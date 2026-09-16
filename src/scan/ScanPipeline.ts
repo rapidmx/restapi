@@ -6,8 +6,9 @@ import { convert } from "html-to-text";
 import sanitizeHtml from "sanitize-html";
 import { simpleParser, ParsedMail, Attachment as ParsedAttachment } from "mailparser";
 import { ObjectDecorators } from "@rapidrest/core";
-import { AvVerdict, SpamVerdict } from "../models/types.js";
+import { AvVerdict, Recipient, SpamVerdict } from "../models/types.js";
 import { isEncryptedBody } from "../util/SmimeUtils.js";
+import { parseHeaderRecipients, parseSenderDisplayName } from "../util/RecipientUtils.js";
 import { AvScanProvider, AvScanResult } from "./AvScanProvider.js";
 import { ScanEnvelope, SpamScanProvider, SpamScanResult } from "./SpamScanProvider.js";
 const { Config, Inject, Logger } = ObjectDecorators;
@@ -54,6 +55,17 @@ export interface ScanPipelineResult {
      * from conditions - the envelope-from (`ScanEnvelope.from`) is the SMTP `MAIL FROM`, which can legitimately
      * differ from this header. */
     parsedFrom?: string;
+    /** The display name alone from the message's parsed `From` header - unquoted and RFC 2047-decoded, control
+     * characters removed and length-capped (`util/RecipientUtils.ts`'s `parseSenderDisplayName()`), or
+     * `undefined` when the sender gave no name. This is what a delivered `Message.from.displayName` stores;
+     * `parsedFrom` above (the whole header value, name *and* address) is only a mail-filter matching input. */
+    fromDisplayName?: string;
+    /** Everyone the message's own `To`/`Cc` headers name - and any `Bcc` header this copy genuinely carries -
+     * de-duplicated and capped (`util/RecipientUtils.ts`'s `parseHeaderRecipients()`), display names preserved.
+     * A delivered `Message.recipients` is built from this plus the SMTP envelope recipient
+     * (`buildDeliveredRecipients()`): the envelope alone names only the one mailbox a copy was filed into, which
+     * is not who the message was addressed to. */
+    headerRecipients: Recipient[];
     /** The bare address (no display name) from the message's parsed `From` header - `specs/
      * end-to-end_encryption.md` requires `RapidMX-Key`/DKIM-alignment processing to be "keyed on the From
      * address", which the SMTP envelope-from (`ScanEnvelope.from`/`entry.envelopeFrom`) is not: it legitimately
@@ -187,7 +199,9 @@ export class ScanPipeline {
 
         const bodyPreview: string | undefined = encrypted ? undefined : this.derivePreview(parsed);
         const parsedFrom: string | undefined = parsed.from?.text;
+        const fromDisplayName: string | undefined = parseSenderDisplayName(parsed.from);
         const fromAddress: string | undefined = parsed.from?.value?.[0]?.address;
+        const headerRecipients: Recipient[] = parseHeaderRecipients(parsed);
         const autoSubmittedHeader: string | undefined = this.getHeaderString(parsed, "auto-submitted");
         const precedenceHeader: string | undefined = this.getHeaderString(parsed, "precedence");
         const listUnsubscribeHeader: string | undefined = this.getRawHeaderLine(parsed, "list-unsubscribe");
@@ -217,6 +231,8 @@ export class ScanPipeline {
             subject: parsed.subject,
             bodyPreview,
             parsedFrom,
+            fromDisplayName,
+            headerRecipients,
             fromAddress,
             autoSubmittedHeader,
             precedenceHeader,

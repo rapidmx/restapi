@@ -32,6 +32,7 @@ import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification, parseDispositionNotification } from "../util/ReceiptUtils.js";
 import { parseRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
+import { buildDeliveredRecipients } from "../util/RecipientUtils.js";
 import { nameBasedUuid } from "../util/UuidUtils.js";
 import { sendOrThrow } from "../transport/TransportResultUtils.js";
 import {
@@ -63,6 +64,7 @@ import {
     PublicKey,
     QuarantineEntry,
     QuarantineReason,
+    Recipient,
     RecipientType,
     ScanResult,
     ScanTargetType,
@@ -872,6 +874,15 @@ export abstract class ScanQueueJob<
         isJunk: boolean,
     ): Promise<void> {
         const entry: Q = claim.row;
+        // Who this message was actually addressed to, and who sent it, as its own headers say - shared by the
+        // primary row and any rule copy below. The SMTP envelope names only the single mailbox this copy is
+        // being filed into (plus, for a bcc'd or alias-only recipient, an address no header mentions at all,
+        // which `buildDeliveredRecipients()` keeps as a `bcc` entry), so recording the envelope alone left every
+        // delivered copy claiming it had exactly one recipient - see `util/RecipientUtils.ts`.
+        const recipients: Recipient[] = buildDeliveredRecipients(result.headerRecipients, entry.envelopeTo);
+        // `displayName` is the sender's display name alone (`parsedFrom` is the whole `From` header value, name
+        // and address both, which a client then rendered a second time after the address it also shows).
+        const sender: Recipient = { address: entry.envelopeFrom, displayName: result.fromDisplayName, type: RecipientType.TO };
         // Independent of everything below (filtering, filing, junk classification) - `specs/
         // end-to-end_encryption.md`'s "Only inbound messages are processed, keyed on the From address" rule
         // applies to every delivered message regardless of which folder (or none) it ends up filed into.
@@ -953,8 +964,8 @@ export abstract class ScanQueueJob<
                     mailboxUid: entry.mailboxUid,
                     messageId,
                     subject: result.subject ?? "",
-                    from: { address: entry.envelopeFrom, displayName: result.parsedFrom, type: RecipientType.TO },
-                    recipients: entry.envelopeTo.map((address) => ({ address, type: RecipientType.TO })),
+                    from: { ...sender },
+                    recipients: recipients.map((recipient) => ({ ...recipient })),
                     sentDate: new Date(),
                     receivedDate: new Date(),
                     bodyBlobKey: entry.rawBlobKey,
@@ -1017,8 +1028,8 @@ export abstract class ScanQueueJob<
                     mailboxUid: entry.mailboxUid,
                     messageId: copyMessageId,
                     subject: result.subject ?? "",
-                    from: { address: entry.envelopeFrom, displayName: result.parsedFrom, type: RecipientType.TO },
-                    recipients: entry.envelopeTo.map((address) => ({ address, type: RecipientType.TO })),
+                    from: { ...sender },
+                    recipients: recipients.map((recipient) => ({ ...recipient })),
                     sentDate: new Date(),
                     receivedDate: new Date(),
                     bodyBlobKey: entry.rawBlobKey,

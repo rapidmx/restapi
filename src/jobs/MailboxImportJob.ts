@@ -11,6 +11,7 @@ import { ScanPipeline, ScanPipelineResult } from "../scan/ScanPipeline.js";
 import { boundIndexedValue, deriveConversationId } from "../util/ConversationUtils.js";
 import { extractHeader } from "../util/MimeHeaderUtils.js";
 import { parseMbox } from "../util/MboxUtils.js";
+import { buildDeliveredRecipients } from "../util/RecipientUtils.js";
 import { extractPstMessages } from "../util/PstImportUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import {
@@ -487,8 +488,11 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                 mailboxUid: mailbox.uid,
                 messageId,
                 subject: result.subject ?? "",
-                from: { address: result.fromAddress ?? "", displayName: result.parsedFrom, type: RecipientType.TO },
-                recipients: [],
+                from: { address: result.fromAddress ?? "", displayName: result.fromDisplayName, type: RecipientType.TO },
+                // The imported message's own `To`/`Cc` (and, on an archived Sent Items copy, `Bcc`) headers -
+                // an import has no SMTP envelope of its own to fall back on. Left empty until now, which made
+                // every imported message look like it had been sent to nobody.
+                recipients: buildDeliveredRecipients(result.headerRecipients, []),
                 sentDate,
                 receivedDate: sentDate,
                 bodyBlobKey,
