@@ -36,6 +36,7 @@ import {
     buildMessageListFilter,
     buildMessageListSort,
     deriveMessageListFields,
+    parseMessageLabelUids,
     syncMessageListFields,
 } from "../util/MessageListUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders, safeDisplayName } from "../util/MimeHeaderUtils.js";
@@ -249,19 +250,49 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * and `stripUnsafeQueryKeys()` drops a client's own `$or`; and `sortBy=from`/`importance` sort on the
      * denormalized `fromAddress`/`importanceRank` mirrors rather than the JSON sub-document and unordered enum
      * string they come from. Anything else a client wants to filter on still goes through the generic DSL
-     * untouched (`?labelUids=...`, `?receivedDate=range(a,b)`, ...).
+     * untouched (`?receivedDate=range(a,b)`, ...).
+     *
+     * `?labelUids=` is interpreted here too, for the third reason: `Message.labelUids` is a `simple-json` column
+     * on SQL and a real array on Mongo, so "carries any of these labels" is a different predicate on each
+     * backend (`buildLabelUidsFilter()`), and left to the generic DSL the same request would have answered
+     * differently on the two.
      *
      * `sort` is always set, so a list without an explicit `sortBy` is newest-first with a stable tiebreaker
      * rather than in whatever order the storage engine returns - a client's own explicit `?sort=` still wins,
      * since the client query is spread first and this merges over it only when it named one of these params.
      */
     protected listQueryOverrides(query: any): Record<string, any> {
-        const overrides: Record<string, any> = buildMessageListFilter(query?.filter);
+        const overrides: Record<string, any> = { ...buildMessageListFilter(query?.filter), ...this.labelUidsFilter(query) };
         if (query?.sortBy !== undefined || query?.sortOrder !== undefined || query?.sort === undefined) {
             overrides.sort = buildMessageListSort(query?.sortBy, query?.sortOrder);
         }
         return overrides;
     }
+
+    /**
+     * The query fragment for `?labelUids=`, or `{}` when the parameter is absent or empty. A message matches if
+     * it carries *any* of the named labels (OR), which is then ANDed with `?filter=` and the rest of the query.
+     *
+     * A label uid names a `Label` in exactly one mailbox, so naming another mailbox's label can only ever match
+     * nothing - the list is already scoped to one folder (and the conversation scan to one mailbox) by a
+     * permission-checked value this can't reach.
+     *
+     * @throws {ApiError} 400 for a malformed uid or more than `MAX_MESSAGE_LABEL_FILTER_UIDS` of them.
+     */
+    private labelUidsFilter(query: any): Record<string, any> {
+        const labelUids: string[] = parseMessageLabelUids(query?.labelUids);
+        return labelUids.length > 0 ? this.buildLabelUidsFilter(labelUids) : {};
+    }
+
+    /**
+     * Compiles "carries any of `labelUids`" into a query fragment, supplied by the Mongo/SQL concrete subclasses
+     * (`buildMessageLabelFilterMongo()`/`buildMessageLabelFilterSQL()` in `util/MessageListUtils.ts`) because
+     * `Message.labelUids` is stored as two genuinely different things: a real array on Mongo, which `$in`
+     * matches by membership, and opaque `simple-json` text on SQL, which has to be matched as the JSON it is.
+     * Abstract rather than defaulted - a default could only ever be right for one of the two backends, and the
+     * failure mode is a filter that silently returns the wrong rows.
+     */
+    protected abstract buildLabelUidsFilter(labelUids: string[]): Record<string, any>;
 
     protected abstract folderClass: any;
 
@@ -599,6 +630,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * `?filter=` is the same named vocabulary the message list itself takes (`util/MessageListUtils.ts`), applied
      * to the *messages* before they are grouped - so `filter=unread` yields each conversation's unread messages
      * and only the conversations that have any, rather than only conversations all of whose messages are unread.
+     * `?labelUids=` is applied at the same point and the same way: a conversation appears if any of its messages
+     * carries any of the named labels, and reports only those messages.
      *
      * Grouping happens in application code over one capped `find()` - there is no query-time group-by/
      * aggregation available across both backends this library supports (`RepoUtils` has none, and Mongo's own
@@ -610,9 +643,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     @Summary("List conversations")
     @Description(
         "Groups this mailbox's messages into conversations (RFC 5322 References/In-Reply-To threading), one " +
-            "summary row per conversation, newest activity first. Optionally restricted to one folderUid and " +
-            "one named filter, and paged with limit/page. Scans at most conversationScanLimit messages, newest " +
-            "first - a conversation with messages older than that window reports only the part inside it.",
+            "summary row per conversation, newest activity first. Optionally restricted to one folderUid, one " +
+            "named filter and a comma-separated labelUids set (a message matching any one of them), and paged " +
+            "with limit/page. Scans at most conversationScanLimit messages, newest first - a conversation with " +
+            "messages older than that window reports only the part inside it.",
     )
     @Returns([Object])
     @Get("/conversations")
@@ -624,6 +658,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
         const criteria: any = {
             ...buildMessageListFilter(query?.filter),
+            ...this.labelUidsFilter(query),
             mailboxUid: ModelUtils.literal(mailboxUid),
             // Newest first, so the scan cap drops the oldest messages rather than an arbitrary slice of them.
             sort: { receivedDate: "DESC", uid: "ASC" },

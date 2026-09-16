@@ -6,6 +6,7 @@ import { RouteDecorators } from "@rapidrest/service-core";
 import { AuditLogEntrySQL, DomainSQL, FocusedInboxOverrideSQL, FolderSQL, KeyVaultSQL, MailboxSQL, MatterSQL, MessageSQL } from "../../sql.js";
 import { BaseMessageRoute } from "../BaseMessageRoute.js";
 import { RecoverableRepoUtils } from "../../util/RecoverableRepoUtils.js";
+import { buildMessageLabelFilterSQL } from "../../util/MessageListUtils.js";
 const { Model } = RouteDecorators;
 
 @Model(MessageSQL)
@@ -18,4 +19,8 @@ export class MessageRouteSQL extends BaseMessageRoute<MessageSQL> {
     protected domainClass: any = DomainSQL;
     protected matterClass: any = MatterSQL;
     protected keyVaultClass: any = KeyVaultSQL;
+
+    protected buildLabelUidsFilter(labelUids: string[]): Record<string, any> {
+        return buildMessageLabelFilterSQL(labelUids);
+    }
 }

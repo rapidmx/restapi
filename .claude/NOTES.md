@@ -2195,3 +2195,51 @@ run against real Mongo and real SQL (`test/routes/{mongo,sql}/MessageList.test.t
 every filter, the `$or` focused branch on both backends, paging stability, mirror derivation/re-derivation/body
 rejection, conversation fields/folder scope/filter/paging/tie-break, conversation expansion incl. the singleton
 fallback, bulk update and its cap, and the delegate/stranger ACL paths.
+
+## 2026-09-15 — Mail list label filter: `?labelUids=`, and why it is NOT a mirror column
+
+Follow-on to the same day's phase-1 entry: web-client's Filter menu wants "filter by label, itself a menu of all
+labels, with multiple selection". `GET /mail/messages` (+ `HEAD`) and `GET /mail/messages/conversations` now take
+`?labelUids=<uid>,<uid>,...` — OR across the set, ANDed with `?filter=`, applied server-side before paging, and (for
+conversations) to the messages before they are grouped, the same point `?filter=` is applied.
+
+- **The hard part was SQL.** `MessageSQL.labelUids` is a `simple-json` column — opaque JSON *text*, not a queryable
+  array — while Mongo stores a real array. `ModelUtils`'s shared DSL can't express one predicate that means the same
+  thing on both: `in()` is array membership on Mongo and a whole-column `IN` on SQL; `like()` on Mongo's array field
+  matches a bare *element* (no JSON quotes) while on SQL it matches the serialization. So the predicate is built per
+  backend — `buildLabelUidsFilter()`, a new abstract on `BaseMessageRoute`, implemented by `MessageRoute{Mongo,SQL}`
+  over `buildMessageLabelFilter{Mongo,SQL}()` in `util/MessageListUtils.ts`. Abstract, not defaulted: a default can
+  only be right for one backend and the failure mode is silently wrong rows. (Same "one abstract per backend" shape
+  `BaseDirectoryRoute` already uses for regex-vs-LIKE.)
+  - Mongo: `{ labelUids: ModelUtils.literal(uids, "in") }` → `$in`, which against an array field *is* membership.
+  - SQL: `{ $and: [{ $or: uids.map(u => ({ labelUids: `like(*"<u>"*)` })) }] }` → one `ILike('%"<uid>"%')` per uid
+    against the stored `["a","b"]`. Matching **with the JSON quotes** is what makes it exact-uid-safe. `$and` rather
+    than a bare `$or` because `filter=focused` already emits a top-level `$or` and the fragments are merged into one
+    object — a second `$or` key would replace it. `$and`+`$or` compose on both backends (`buildSearchQuerySQL`
+    cross-products the branches; Mongo passes both keys through).
+- **Rejected: a `labelIndex`-style mirror column** (the obvious phase-1-consistent move). Three reasons: (1) it would
+  need a backfill before any *existing* deployment's already-labelled mail became findable — unlike the `read`/
+  `flagged` mirrors, where a stale value is a wrong sort, here it is a message silently missing from a filter the user
+  explicitly asked for; (2) it goes stale for any writer that sets `labelUids` outside this library's update path
+  (activesync/mapi plugins, and `BaseLabelRoute.cleanUpDeletedLabel()`'s own direct `repo.update()`); (3) it buys no
+  index anyway — a leading-wildcard `LIKE` on a mirror is exactly as unindexable as one on the JSON text. The list is
+  already narrowed to one folder by `message_folder_received` before either is evaluated. So: no schema change, no
+  migration, no write-path cost, correct for every row however it was written.
+- **Injection/ReDoS safety comes from validating the uid, not from escaping.** `parseMessageLabelUids()` requires each
+  entry to match a v4-UUID shape (every uid this library mints — `BaseScopedChildRoute.create()` refuses a
+  client-chosen one), which by construction excludes `%`/`_` (LIKE wildcards), `"`/`\` (breaking out of the JSON
+  string) and `(`/`)`/`,` (the `op(value)` DSL's own syntax). A non-uid entry is a 400 rather than a query matching
+  nothing. Cap `MAX_MESSAGE_LABEL_FILTER_UIDS` = 20 (each uid is one more OR branch / one more LIKE). Empty value =
+  unset; an empty *entry* (`a,,b`) is a 400; a repeated `?labelUids=a&labelUids=b` is flattened into one set rather
+  than going through the DSL's "zip" semantics for repeated keys.
+- **`?labelUids=` used to fall through to the generic DSL** and meant different things on the two backends (Mongo:
+  single-label array membership; SQL: a whole-column compare that matched nothing). Adding it to
+  `MESSAGE_LIST_QUERY_PARAMS` makes the route interpret it instead — noted in the release notes as a behavior change.
+
+Tests: 10 new cases in the shared `test/routes/messageListSuite.ts` (so 10 on real Mongo *and* 10 on real SQL) —
+single label, several ORed in either order, ANDed with `filter=unread`/`read` plus a sort, HEAD count, paging
+stability, unknown uid, another mailbox's uid (and that the same uid still works in its own folder), a legacy row with
+`labelUids: null`, a near-miss uid differing in its last character, empty/repeated parameter, malformed uid and cap
+exceeded, plus the conversation endpoint; and 9 unit cases in `test/util/MessageListUtils.test.ts`. Full
+`yarn vitest run --coverage`: 254 files / 5088 tests passed, coverage 100 / 96.8 / 100 / 100. `yarn tsc --noEmit`,
+`yarn lint`, `yarn build` clean.

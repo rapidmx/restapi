@@ -209,9 +209,102 @@ export function buildMessageListFilter(filter: unknown): Record<string, any> {
     return MESSAGE_LIST_FILTERS[name]();
 }
 
+/**
+ * The most `Label.uid`s one `?labelUids=` may name. A label menu with more than twenty labels ticked isn't a
+ * filter any more, and each uid costs one more `OR` branch (one more `LIKE` over the stored JSON on the SQL
+ * backend), so the cap is the point at which the query stops being worth answering rather than a storage limit.
+ */
+export const MAX_MESSAGE_LABEL_FILTER_UIDS: number = 20;
+
+/**
+ * The shape every uid this library mints has (`RepoUtils.create()` always assigns a v4 UUID, and
+ * `BaseScopedChildRoute.create()` refuses a client-chosen one), so a `?labelUids=` entry that isn't one names no
+ * label that could ever exist and is a 400 rather than a query that matches nothing.
+ *
+ * Validating the shape is also what makes the SQL predicate safe to build by string concatenation: a value
+ * matching this carries no `%`/`_` (which `LIKE` would read as wildcards), no `"`/`\` (which would break out of
+ * the JSON string it is matched inside), and no `(`/`)`/`,` (which the `op(value)` query DSL reads as syntax).
+ */
+const LABEL_UID_PATTERN: RegExp = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Parses `?labelUids=<uid>,<uid>,...` into the (deduplicated, lowercased) set of `Label.uid`s a list is being
+ * filtered to. Order-insensitive - the compiled predicate is an `OR` over the set.
+ *
+ * An absent, empty or whitespace-only value is no filter at all. A repeated parameter
+ * (`?labelUids=a&labelUids=b`) is flattened into one list rather than going through the query DSL's own
+ * "zip" semantics for repeated keys, which would compile to something else entirely.
+ *
+ * @throws {ApiError} 400 for more than `MAX_MESSAGE_LABEL_FILTER_UIDS` entries, or for an entry that isn't a uid.
+ */
+export function parseMessageLabelUids(value: unknown): string[] {
+    if (value === undefined || value === null) {
+        return [];
+    }
+    const raw: string = (Array.isArray(value) ? value.map((entry) => String(entry)).join(",") : String(value)).trim();
+    if (raw.length === 0) {
+        return [];
+    }
+    const entries: string[] = raw.split(",");
+    if (entries.length > MAX_MESSAGE_LABEL_FILTER_UIDS) {
+        throw new ApiError(
+            ApiErrors.INVALID_REQUEST,
+            400,
+            `'labelUids' may name at most ${MAX_MESSAGE_LABEL_FILTER_UIDS} labels.`,
+        );
+    }
+    const uids: string[] = [];
+    for (const entry of entries) {
+        const uid: string = entry.trim().toLowerCase();
+        if (!LABEL_UID_PATTERN.test(uid)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'labelUids' must be a comma-separated list of label uids.");
+        }
+        if (!uids.includes(uid)) {
+            uids.push(uid);
+        }
+    }
+    return uids;
+}
+
+/**
+ * The "carries any of these labels" predicate for the MongoDB backend, where `Message.labelUids` is a real
+ * array: `$in` against an array field is array *membership*, which is exactly the OR semantics wanted.
+ *
+ * `ModelUtils.literal(..., "in")` rather than an `in(a,b)` operand string, so nothing is re-parsed - the DSL's
+ * own `in()` splits its operand on commas and would have to be escaped back into one.
+ */
+export function buildMessageLabelFilterMongo(labelUids: string[]): Record<string, any> {
+    return { labelUids: ModelUtils.literal(labelUids, "in") };
+}
+
+/**
+ * The same predicate for the SQL backend, where `Message.labelUids` is a `simple-json` column - opaque JSON
+ * *text*, not a queryable array type (see `MessageSQL.labelUids`), so membership has to be a match against the
+ * stored serialization: `["uid-a","uid-b"]`. Each branch matches `"<uid>"` with its JSON quotes, so one uid can
+ * never match a substring of another, and the uid was already validated as a UUID (`LABEL_UID_PATTERN`), so the
+ * pattern carries no `LIKE` wildcard, no quote to break out of the JSON string with, and no DSL syntax.
+ * A legacy row whose column is `NULL` matches nothing, which is correct: it carries no labels.
+ *
+ * Deliberately *not* a denormalized mirror column of the kind `MessageListFields` adds for `flags`/`from`/
+ * `importance`. A mirror would need backfilling before an existing deployment's already-labelled mail became
+ * findable, and would go stale for any writer that sets `labelUids` without this library's own update path
+ * (`@rapidmx/activesync-plugin`, `@rapidmx/mapi-plugin`) - a filter that silently omits labelled messages.
+ * Matching the stored value itself is correct for every row however it was written, at no write-path cost. It
+ * is a scan either way: a leading-wildcard `LIKE` can use no index, and neither could a mirror column, so the
+ * mirror would buy nothing here. The list is already narrowed to one folder by `message_folder_received` (and
+ * the conversation scan to one mailbox) before this is evaluated - the same tradeoff the `subject`/`from`
+ * sorts already make.
+ *
+ * Wrapped in `$and` rather than emitted as a bare `$or` because `?filter=focused` compiles to a top-level
+ * `$or` of its own, and the two are merged into one query object - a second `$or` key would replace it.
+ */
+export function buildMessageLabelFilterSQL(labelUids: string[]): Record<string, any> {
+    return { $and: [{ $or: labelUids.map((uid) => ({ labelUids: `like(*"${uid}"*)` })) }] };
+}
+
 /** Every query-string parameter `BaseMessageRoute` interprets itself rather than passing through as a field
  * filter - see `BaseScopedChildRoute.listQueryParams`. */
-export const MESSAGE_LIST_QUERY_PARAMS: readonly string[] = ["filter", "sortBy", "sortOrder"];
+export const MESSAGE_LIST_QUERY_PARAMS: readonly string[] = ["filter", "labelUids", "sortBy", "sortOrder"];
 
 /** Resolves a client `limit` to a bounded page size. Shared by the conversation endpoints, which page over
  * results this library computes itself rather than over a repository query (which `ModelUtils` would bound for

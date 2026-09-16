@@ -11,6 +11,7 @@ import { ACLAction } from "@rapidrest/service-core";
 import { JWTUtils } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { MAX_BULK_UPDATE } from "../../src/routes/BaseScopedChildRoute.js";
+import { MAX_MESSAGE_LABEL_FILTER_UIDS } from "../../src/util/MessageListUtils.js";
 import { FolderType, MessageClassification, MessageImportance, RecipientType } from "../../src/models/types.js";
 
 type AclRecords = { userOrRoleId: string; actions: string[] }[];
@@ -203,6 +204,112 @@ export function messageListSuite(ctx: MessageListSuiteContext): void {
         it("still honors the generic query DSL alongside a named filter", async () => {
             const res = await get(`?folderUid=${folderUid}&filter=read&subject=${encodeURIComponent("eq(read-other)")}`);
             expect(subjects(res.body)).toEqual(["read-other"]);
+        });
+    });
+
+    describe("label filtering (GET /?labelUids=)", () => {
+        let folderUid: string;
+        let mailboxUid: string;
+        let red: string;
+        let blue: string;
+        let green: string;
+
+        /** Three labels over four messages: one red, one blue, one carrying both, and one legacy row whose
+         * `labelUids` was never written at all (`null` on both backends - see `MessageSQL.labelUids`). */
+        beforeEach(async () => {
+            const mailbox = await ctx.saveMailbox(owner.uid);
+            mailboxUid = mailbox.uid;
+            const folder = await ctx.saveFolder(mailbox.uid, FolderType.INBOX);
+            folderUid = folder.uid;
+            red = uuid.v4();
+            blue = uuid.v4();
+            green = uuid.v4();
+            await ctx.saveMessage(mailbox.uid, folderUid, { subject: "red-one", labelUids: [red], receivedDate: day(0) });
+            await ctx.saveMessage(mailbox.uid, folderUid, {
+                subject: "blue-read",
+                labelUids: [blue],
+                receivedDate: day(1),
+                flags: { read: true, flagged: false, answered: false, forwarded: false },
+            });
+            await ctx.saveMessage(mailbox.uid, folderUid, { subject: "both", labelUids: [blue, red], receivedDate: day(2) });
+            await ctx.saveMessage(mailbox.uid, folderUid, { subject: "legacy", labelUids: null, receivedDate: day(3) });
+        });
+
+        it("returns every message carrying one named label", async () => {
+            const res = await get(`?folderUid=${folderUid}&labelUids=${red}`);
+            expect(res.status).toBe(200);
+            expect(subjects(res.body).sort()).toEqual(["both", "red-one"]);
+        });
+
+        it("ORs several labels rather than requiring all of them, whatever order they are named in", async () => {
+            const res = await get(`?folderUid=${folderUid}&labelUids=${red},${blue}`);
+            expect(subjects(res.body).sort()).toEqual(["blue-read", "both", "red-one"]);
+            const reversed = await get(`?folderUid=${folderUid}&labelUids=${blue},${red}`);
+            expect(subjects(reversed.body).sort()).toEqual(["blue-read", "both", "red-one"]);
+        });
+
+        it("ANDs the label set with a named filter and honors a sort alongside it", async () => {
+            const unread = await get(`?folderUid=${folderUid}&labelUids=${red},${blue}&filter=unread&sortBy=subject`);
+            expect(subjects(unread.body)).toEqual(["both", "red-one"]);
+            expect(subjects((await get(`?folderUid=${folderUid}&labelUids=${red},${blue}&filter=read`)).body)).toEqual([
+                "blue-read",
+            ]);
+        });
+
+        it("applies the same predicate to HEAD, so a count matches the list it labels", async () => {
+            const counted = await head(`?folderUid=${folderUid}&labelUids=${red}`);
+            expect(Number(counted.headers["content-length"])).toBe(2);
+        });
+
+        it("pages the filtered set stably", async () => {
+            const first = await get(`?folderUid=${folderUid}&labelUids=${red},${blue}&limit=2&page=0`);
+            const second = await get(`?folderUid=${folderUid}&labelUids=${red},${blue}&limit=2&page=1`);
+            expect([...subjects(first.body), ...subjects(second.body)]).toEqual(["both", "blue-read", "red-one"]);
+        });
+
+        it("matches nothing for an unknown label, for another mailbox's label, and for a legacy row with none", async () => {
+            expect((await get(`?folderUid=${folderUid}&labelUids=${green}`)).body).toEqual([]);
+
+            const otherMailbox = await ctx.saveMailbox(owner.uid);
+            const otherFolder = await ctx.saveFolder(otherMailbox.uid, FolderType.INBOX);
+            const elsewhere = uuid.v4();
+            await ctx.saveMessage(otherMailbox.uid, otherFolder.uid, { subject: "theirs", labelUids: [elsewhere] });
+            // Another mailbox's label uid can only ever widen this folder's list if the predicate matched
+            // something other than the uid itself.
+            expect((await get(`?folderUid=${folderUid}&labelUids=${elsewhere}`)).body).toEqual([]);
+            expect(subjects((await get(`?folderUid=${otherFolder.uid}&labelUids=${elsewhere}`)).body)).toEqual(["theirs"]);
+            // The legacy row (no labelUids at all) is in the folder but never in a label-filtered list.
+            expect(subjects((await get(`?folderUid=${folderUid}`)).body)).toContain("legacy");
+        });
+
+        it("matches a uid exactly, never as a prefix or suffix of another label's uid", async () => {
+            // Same uid with its last character changed - a substring match on the stored JSON would still hit.
+            const nearMiss = `${red.slice(0, -1)}${red.endsWith("a") ? "b" : "a"}`;
+            expect((await get(`?folderUid=${folderUid}&labelUids=${nearMiss}`)).body).toEqual([]);
+        });
+
+        it("treats an empty labelUids as unset, and accepts a repeated parameter as one set", async () => {
+            expect((await get(`?folderUid=${folderUid}&labelUids=`)).body.length).toBe(4);
+            const repeated = await get(`?folderUid=${folderUid}&labelUids=${red}&labelUids=${blue}`);
+            expect(subjects(repeated.body).sort()).toEqual(["blue-read", "both", "red-one"]);
+        });
+
+        it("rejects a malformed uid (400) and more than MAX_MESSAGE_LABEL_FILTER_UIDS of them (400)", async () => {
+            expect((await get(`?folderUid=${folderUid}&labelUids=not-a-label`)).status).toBe(400);
+            expect((await get(`?folderUid=${folderUid}&labelUids=${red},`)).status).toBe(400);
+            const tooMany = Array.from({ length: MAX_MESSAGE_LABEL_FILTER_UIDS + 1 }, () => uuid.v4()).join(",");
+            expect((await get(`?folderUid=${folderUid}&labelUids=${tooMany}`)).status).toBe(400);
+        });
+
+        it("filters the messages of a conversation list before they are grouped", async () => {
+            const labelled = await get(`/conversations?mailboxUid=${mailboxUid}&labelUids=${red}`);
+            expect(labelled.status).toBe(200);
+            expect(labelled.body.map((c: any) => c.subject).sort()).toEqual(["both", "red-one"]);
+            expect((await get(`/conversations?mailboxUid=${mailboxUid}&labelUids=${green}`)).body).toEqual([]);
+            expect((await get(`/conversations?mailboxUid=${mailboxUid}&labelUids=nonsense`)).status).toBe(400);
+            // Combined with a named filter, exactly as the message list combines them.
+            const unread = await get(`/conversations?mailboxUid=${mailboxUid}&labelUids=${red},${blue}&filter=read`);
+            expect(unread.body.map((c: any) => c.subject)).toEqual(["blue-read"]);
         });
     });
 

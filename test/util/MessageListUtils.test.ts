@@ -10,6 +10,7 @@ import { MAX_INDEXED_VALUE_LENGTH } from "../../src/util/ConversationUtils.js";
 import {
     DEFAULT_IMPORTANCE_RANK,
     DEFAULT_MESSAGE_LIST_SORT,
+    MAX_MESSAGE_LABEL_FILTER_UIDS,
     MESSAGE_LIST_FIELDS,
     MESSAGE_LIST_FILTER_NAMES,
     MESSAGE_LIST_QUERY_PARAMS,
@@ -17,10 +18,13 @@ import {
     MESSAGE_LIST_SOURCE_FIELDS,
     boundedListLimit,
     boundedListPage,
+    buildMessageLabelFilterMongo,
+    buildMessageLabelFilterSQL,
     buildMessageListFilter,
     buildMessageListSort,
     deriveMessageListFields,
     importanceRankOf,
+    parseMessageLabelUids,
     syncMessageListFields,
 } from "../../src/util/MessageListUtils.js";
 
@@ -190,7 +194,66 @@ describe("MessageListUtils", () => {
         });
     });
 
+    describe("parseMessageLabelUids()", () => {
+        const uidA = "11111111-1111-4111-8111-111111111111";
+        const uidB = "22222222-2222-4222-8222-222222222222";
+
+        it("treats an absent or empty value as no filter at all", () => {
+            expect(parseMessageLabelUids(undefined)).toEqual([]);
+            expect(parseMessageLabelUids(null)).toEqual([]);
+            expect(parseMessageLabelUids("")).toEqual([]);
+            expect(parseMessageLabelUids("   ")).toEqual([]);
+        });
+
+        it("parses a comma-separated list, trimming, lowercasing and deduplicating", () => {
+            expect(parseMessageLabelUids(`${uidA}, ${uidB}`)).toEqual([uidA, uidB]);
+            expect(parseMessageLabelUids(`${uidA.toUpperCase()},${uidA}`)).toEqual([uidA]);
+        });
+
+        it("flattens a repeated query parameter into one list", () => {
+            expect(parseMessageLabelUids([uidA, uidB])).toEqual([uidA, uidB]);
+        });
+
+        it("rejects an entry that isn't a uid, an empty entry included", () => {
+            expect(() => parseMessageLabelUids("not-a-uid")).toThrow(/labelUids/);
+            expect(() => parseMessageLabelUids(`${uidA},,${uidB}`)).toThrow(/labelUids/);
+            // The characters that would matter if one ever reached the SQL predicate unescaped.
+            expect(() => parseMessageLabelUids(`${uidA.slice(0, -1)}%`)).toThrow(/labelUids/);
+            expect(() => parseMessageLabelUids(`"${uidA}"`)).toThrow(/labelUids/);
+        });
+
+        it("rejects more uids than the cap, and accepts exactly the cap", () => {
+            const uids = (count: number): string =>
+                Array.from({ length: count }, (_, index) => `33333333-3333-4333-8333-${String(index).padStart(12, "0")}`).join(",");
+            expect(parseMessageLabelUids(uids(MAX_MESSAGE_LABEL_FILTER_UIDS)).length).toBe(MAX_MESSAGE_LABEL_FILTER_UIDS);
+            expect(() => parseMessageLabelUids(uids(MAX_MESSAGE_LABEL_FILTER_UIDS + 1))).toThrow(/at most/);
+        });
+    });
+
+    describe("buildMessageLabelFilterMongo()/buildMessageLabelFilterSQL()", () => {
+        const uidA = "11111111-1111-4111-8111-111111111111";
+        const uidB = "22222222-2222-4222-8222-222222222222";
+
+        it("matches array membership on Mongo, as a literal so nothing is re-parsed", () => {
+            const filter: any = buildMessageLabelFilterMongo([uidA, uidB]);
+            expect(filter.labelUids.op).toBe("in");
+            expect(filter.labelUids.value).toEqual([uidA, uidB]);
+        });
+
+        it("matches each uid with its JSON quotes on SQL, so one uid can't match a substring of another", () => {
+            expect(buildMessageLabelFilterSQL([uidA, uidB])).toEqual({
+                $and: [{ $or: [{ labelUids: `like(*"${uidA}"*)` }, { labelUids: `like(*"${uidB}"*)` }] }],
+            });
+        });
+
+        it("nests the OR under $and, leaving the top-level $or a named filter may need", () => {
+            const combined: Record<string, any> = { ...buildMessageListFilter("focused"), ...buildMessageLabelFilterSQL([uidA]) };
+            expect(Array.isArray(combined.$or)).toBe(true);
+            expect(Array.isArray(combined.$and)).toBe(true);
+        });
+    });
+
     it("names exactly the query params the route has to intercept", () => {
-        expect([...MESSAGE_LIST_QUERY_PARAMS].sort()).toEqual(["filter", "sortBy", "sortOrder"]);
+        expect([...MESSAGE_LIST_QUERY_PARAMS].sort()).toEqual(["filter", "labelUids", "sortBy", "sortOrder"]);
     });
 });

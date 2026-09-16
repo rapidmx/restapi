@@ -4,6 +4,32 @@
 
 ### Features
 
+- **Filter the mail list by label.** `GET /mail/messages` (and `HEAD`) and `GET /mail/messages/conversations` now take
+  `?labelUids=<uid>,<uid>,...`, a comma-separated set of `Label.uid`s, and return the messages carrying **any** of
+  them - OR between the labels, order-insensitive, duplicates ignored - which is then ANDed with `?filter=` and with
+  anything else in the query. Applied by the database over the whole folder (or, for conversations, over the whole
+  mailbox scan) before `?limit=`/`?page=`, so paging stays correct under it, and applied to the messages *before* they
+  are grouped into conversations, exactly as `?filter=` already was.
+  - At most `MAX_MESSAGE_LABEL_FILTER_UIDS` (20) uids per request; more is a 400, as is an entry that isn't a uid (an
+    empty one included, so `a,,b` is refused rather than silently narrowed). An absent, empty or whitespace-only value
+    is no filter at all, and a repeated `?labelUids=a&labelUids=b` is read as one set.
+  - A uid naming no label - or naming a label in another mailbox - simply matches nothing; it can't widen a list,
+    which is already scoped to one permission-checked folder or mailbox.
+  - This is a behavior change for `?labelUids=`, which used to fall through to the generic query DSL: on MongoDB that
+    happened to match a single label by array membership, and on SQL it compared the whole serialized JSON column and
+    matched nothing. The same request now means the same thing on both backends.
+- **No new column and no backfill for it.** `Message.labelUids` is matched where it is stored: by array membership
+  (`$in`) on MongoDB, and against the stored `simple-json` text on SQL, one `LIKE` per uid matching `"<uid>"` with its
+  JSON quotes so one uid can never match a substring of another (a uid is validated as a UUID before it reaches the
+  predicate, so the pattern carries no wildcard, quote or query-DSL syntax). Deliberately *not* another denormalized
+  mirror of the kind the list's `read`/`flagged`/`fromAddress`/`importanceRank` fields are: a mirror would hide every
+  already-labelled message until it was backfilled, and would go stale for any writer that sets `labelUids` outside
+  this library's own update path. It is a scan either way - a leading-wildcard `LIKE` can use no index, and neither
+  could a mirror column - and the list is already narrowed to one folder by `message_folder_received` first. Existing
+  deployments need no migration and no re-indexing: mail labelled before this release is filterable immediately.
+  `parseMessageLabelUids()`, `buildMessageLabelFilterMongo()`, `buildMessageLabelFilterSQL()` and
+  `MAX_MESSAGE_LABEL_FILTER_UIDS` are exported from the package root. A concrete `BaseMessageRoute` subclass must now
+  implement `buildLabelUidsFilter()` (both of this package's own do).
 - **Server-side sorting and filtering for the mail list.** `GET /mail/messages` (and `HEAD`, so a count matches the
   list it labels) now take a named vocabulary on top of the generic query DSL:
   - `?sortBy=` one of `date` (the default, `receivedDate`), `sentDate`, `from`, `subject`, `importance` or `flagged`,
