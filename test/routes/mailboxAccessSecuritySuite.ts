@@ -9,6 +9,7 @@ import { ACLAction, ACLUtils } from "@rapidrest/service-core";
 import { JWTUtils } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { AuditAction } from "../../src/models/types.js";
+import { LOOKUP_MAX_ATTEMPTS } from "../../src/routes/BaseMailboxAccessRoute.js";
 
 export interface MailboxAccessSecuritySuiteContext {
     config: any;
@@ -75,15 +76,15 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
             expect((await lookup(aliased.uid)).body).toEqual({ userUid: ctx.ownerUid, displayName: "Aliased" });
         });
 
-        it("limits each caller to 30 lookups a minute, whatever the deployment's default for signed-in callers", async () => {
+        it(`limits each caller to ${LOOKUP_MAX_ATTEMPTS} lookups a minute, whatever the deployment's default for signed-in callers`, async () => {
             const caller: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
             const token: string = JWTUtils.createTokenSync(ctx.config.get("auth"), caller);
             const statuses: number[] = [];
-            for (let i = 0; i < 31; i++) {
+            for (let i = 0; i <= LOOKUP_MAX_ATTEMPTS; i++) {
                 statuses.push((await as(token, request(ctx.app()).get(`${ctx.baseUrl}/lookup-by-email?email=nobody@example.com`))).status);
             }
-            expect(statuses.slice(0, 30).every((status) => status === 200)).toBe(true);
-            expect(statuses[30]).toBe(429);
+            expect(statuses.slice(0, LOOKUP_MAX_ATTEMPTS).every((status) => status === 200)).toBe(true);
+            expect(statuses[LOOKUP_MAX_ATTEMPTS]).toBe(429);
         });
     });
 

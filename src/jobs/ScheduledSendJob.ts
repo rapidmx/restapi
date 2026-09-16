@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
-import { boundIndexedValue } from "../util/ConversationUtils.js";
+import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
@@ -252,7 +252,12 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 );
                 relayedRaw = result.raw;
                 messageId = result.messageId;
-                conversationId = result.conversationId;
+                // The conversation this mailbox already files the message being replied to under, falling back to
+                // what the relayed headers derive on their own - the same resolution `BaseMessageRoute.send()`
+                // applies to an immediate send, so a scheduled reply threads identically to an immediate one.
+                conversationId = await resolveConversationId(result.references, result.inReplyTo, result.messageId, (ancestors) =>
+                    findThreadConversationId(this.messageRepo!, claimed.mailboxUid, ancestors),
+                );
                 sanitizedHtmlBlobKey = result.sanitizedHtmlBlobKey ?? sanitizedHtmlBlobKey;
             } catch (err: any) {
                 if (!relayedAt) {

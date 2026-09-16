@@ -2243,3 +2243,93 @@ stability, unknown uid, another mailbox's uid (and that the same uid still works
 exceeded, plus the conversation endpoint; and 9 unit cases in `test/util/MessageListUtils.test.ts`. Full
 `yarn vitest run --coverage`: 254 files / 5088 tests passed, coverage 100 / 96.8 / 100 / 100. `yarn tsc --noEmit`,
 `yarn lint`, `yarn build` clean.
+
+## 2026-09-16 — Reply threading: the headers were never written, and a conversation is resolved against the mailbox
+
+JP: a reply chain showed up in conversation mode as separate rows ("Arthur, Jean-Philippe, Administrator — Re: Hello"
+*and* "Arthur — Re: Hello"), each opening as "1 message". Reproduced end to end against a real server (in-memory
+Mongo/Redis, `NODE_ENV=development`, mail seeded through `/internal/mta/deliver`, replies composed through the real
+`POST /mail/compose/:id/assemble` + `POST /mail/messages/:id/send` path) before changing anything.
+
+- **Root cause: nothing ever wrote `In-Reply-To`/`References`.** `server`'s `BaseMailComposeRoute.assemble()` builds
+  the MIME with `MailComposer` from `{to, cc, bcc, subject, html, attachments}` - `ComposeAssembleInput` has no
+  threading fields and `MailComposer` is given none - and `send()` only prepended `Disposition-Notification-To` and
+  `RapidMX-Key`. The relayed headers in the repro were literally `From/To/Subject/Message-ID/Date/MIME-Version/
+  Content-Type`. So every recipient's `ScanQueueJob` saw `references: []`, `inReplyTo: undefined` and
+  `deriveConversationId()` fell through to the message's own `messageId`: a new conversation per reply. The sender's
+  Sent Items copy got the same treatment from `scanAndRelay()`. The "conversation row with three participants" was
+  just *one* delivered copy whose `from` + `recipients` happen to name three people.
+- **`GET /mail/messages/conversations` was never wrong.** It keys every message on `conversationId ?? uid`, so a
+  message is in exactly one group - there is no overlap to fix. What looked like duplicates were unthreaded
+  messages. Still covered by a new test (every group's `messageUids` disjoint, every message present exactly once).
+- **The client half must supply what is being replied to** and that is the one part this repo cannot do for itself.
+  `inReplyTo`/`references` are deliberately *not* in `SERVER_MANAGED_MESSAGE_FIELDS`, so a plain
+  `POST /mail/messages` body carries them; react-shared now has `buildReplyThreading()` and
+  `createDraft(mailbox, folder, threading)`, and web-client's `ComposeWindow` has to pass them (its `createDraft()`
+  call at `apps/shared/components/mail/compose/ComposeWindow.tsx:527` sends neither today). Nothing server-side can
+  recover it: by assemble time the draft is recipients + subject + HTML.
+- **`applyThreadHeaders()`/`threadHeaders()` (`util/MailSendUtils.ts`)** write the headers at send time, from the
+  draft row, and `send()` persists the threaded bytes to the body blob *before* the claim - so a scheduled send
+  relays the same bytes and a client reading the raw source sees the thread. MIME that already carries either header
+  is returned untouched (`assemble-raw`'s client-finalized signed/encrypted bodies, EAS/MAPI compose handlers).
+  `References` is the draft's chain with the parent appended, trimmed from *after the root* to
+  `MAX_RELAYED_REFERENCES` (20) entries and `MAX_RELAYED_REFERENCES_LENGTH` (900) characters - RFC 5322 caps a header
+  line at 998 and `prependHeaders()` strips CR/LF rather than folding, so the trim is what keeps the line legal.
+  Each id is stripped of brackets/CRLF and dropped if it contains whitespace.
+- **`resolveConversationId()` + `findThreadConversationId()` (`util/ConversationUtils.ts`)** replace the pure
+  `deriveConversationId()` at both write sites (`ScanQueueJob.deliverMessage()`, its filter-rule copy,
+  `BaseMessageRoute.send()`, `ScheduledSendJob.relayDueMessage()`): one `mailboxUid` + `messageId IN (ancestors)`
+  query (`message_id` index), ancestors being `inReplyTo` then `references` reversed, bounded and deduped at
+  `MAX_CONVERSATION_ANCESTORS` (20). Needed because header-only derivation breaks at depth 3 for a client that sets
+  only `In-Reply-To`: the third message would key on the second's `Message-ID`. Deliberately *not* subject-based -
+  this codebase never implied a subject fallback, and a subject-change test pins that.
+  - Known, accepted gap: out-of-order delivery (a reply arriving before its parent, with no `References`) can leave
+    two groups that a later merge pass would have to join. No merge pass exists; documented rather than built.
+  - `MailboxImportJob` still uses the pure derivation - an mbox archive carries real `References` - and an import
+    would otherwise pay a lookup per message.
+- **The Sent Items copy now also stores the `inReplyTo`/`references` the relayed bytes carry**, not just what the
+  draft row said, so the `assemble-raw` path (headers composed client-side) records the thread too.
+
+Tests: 6 new delivery cases in each of `test/jobs/{mongo,sql}/ScanQueueJob*.test.ts` (two- and three-deep chains,
+References-only, subject change mid-chain, a same-subject message that replies to nothing, an orphan reply), 8 new
+send cases in each of `test/routes/{mongo,sql}/MessageRoute.test.ts` (headers written and persisted, three-deep via
+the mailbox lookup, References-only, replies-to-nothing, renamed reply, client-composed headers left alone, and the
+conversations endpoint reporting every message exactly once), 1 scheduled-send case per backend, plus unit tests for
+every new `ConversationUtils`/`MailSendUtils` export. An unset column reads back as `null` on SQL and `undefined` on
+Mongo - shared assertions use `?? undefined`.
+
+## 2026-09-16 — Rate limiting: only four endpoints have any, and an explicit limit beats the authenticated tier
+
+JP: "rate-limit delays while simply navigating - clicking between two folders or settings pages a second apart".
+Driven with a real browser against the compiled server (headless Chromium, `jwt` cookie, every `/api` response
+logged) plus authenticated API bursts.
+
+- **What is actually rate limited in this library**: `GET /mail/directory` and `/mail/directory/contacts`
+  (`@RateLimit({perUser, 120/60s})` each), `GET /mail/mailboxes/lookup-by-email` (30/60s), `GET /mail/mailboxes/
+  :id/keys/lookup` and the public key-discovery endpoint (`@RateLimit()` with no numbers). **Nothing else.** Measured:
+  300 rapid `GET /mail/folders` and 300 `GET /mail/messages` as an authenticated user - no 429. So folder/settings
+  navigation cannot hit a limit in this package; what it *does* do is a full document load per click that refetches
+  branding, setup, mailboxes, folders, labels (twice), keyvault and conversations (twice) - ~9 API calls per click,
+  which is the skeleton/stall JP sees. Reported to web-client; not this repo's to fix.
+- **Measured 429s** (authenticated admin, `Authorization: Bearer`): `/mail/directory` 429s on request **#121**,
+  `lookup-by-email` on **#31**. Both are the decorator's own numbers, *not* the server's `rateLimit.authenticated`
+  tier (10 000/300s): `TieredRateLimiter.checkAndIncrement()` merges `{...anonymous, ...authenticated, ...config}`
+  with the decorator's `config` **last**, so an explicit `@RateLimit({maxAttempts})` always wins over the tier. That
+  is intended (a per-endpoint limit should be able to be stricter) and already has a test asserting it - it just
+  means these constants are the ceiling interactive use runs into, which the doc comments now say.
+- **Raised**: `DIRECTORY_MAX_ATTEMPTS` 120 -> 600/60s, `LOOKUP_MAX_ATTEMPTS` 30 -> 300/60s.
+  `fetchRecipientSuggestions()` asks *both* directory endpoints per pause in typing at a 150 ms debounce, so ~20 s of
+  composing hit 120; the failure is swallowed by `Promise.allSettled` and shows as suggestions that silently stop.
+  600/min is 10/s sustained per caller per endpoint. `@RateLimit()`-with-no-numbers endpoints are left alone - they
+  correctly take the deployment's anonymous or authenticated tier.
+- **Not fixed here (service-core)**: a 429 from `RateLimiter.enforceLimit()` carries no `Retry-After` and no
+  `RateLimit-*` headers (verified on the wire), so a client cannot back off. Worth adding in
+  `@rapidrest/service-core`; nothing in this repo can add them.
+
+Verification for both entries: `yarn tsc --noEmit`, `yarn lint`, `yarn build` clean. Full `yarn vitest run --coverage`:
+256 files / 5143 tests passed, coverage 100 / 96.84 / 100 / 100. Flake worth knowing about: every
+`test/routes/mongo/*.test.ts` starts its own `MongoMemoryServer` on the **same hardcoded port 9999** (54 files), so
+under heavy machine load (other repos' suites running at the same time) one file's `mongod.stop()` can take the
+instance out from under another worker and a handful of files fail together with `MongoNetworkError: read
+ECONNRESET`, a different set each run, with zero assertion failures. Re-running those files alone passes. Not caused
+by anything in this change; worth giving each file its own port one day.

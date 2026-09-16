@@ -645,6 +645,94 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         expect(messages[0].conversationId).toBe("root@example.com");
     });
 
+
+    describe("Conversation threading across a reply chain", () => {
+        /** Delivers one message built from `headers` and returns the row it produced. */
+        const deliverThreaded = async (...headers: string[]): Promise<any> => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, Buffer.from([...headers, "", "Body text.", ""].join("\r\n")));
+            await createIngestEntry({ rawBlobKey });
+            await job.run();
+            const id: string = headers.find((header) => header.startsWith("Message-ID:"))!.replace(/^Message-ID: <|>$/g, "");
+            return (await messageRepo.find({ where: { mailboxUid } })).find((message: any) => message.messageId === id)!;
+        };
+        const headersFor = (messageId: string, subject: string, extra: string[] = []): string[] => [
+            "From: sender@example.com",
+            "To: recipient@example.com",
+            `Subject: ${subject}`,
+            `Message-ID: <${messageId}>`,
+            ...extra,
+        ];
+
+        it("Groups a two-deep reply chain into the root's conversation.", async () => {
+            const root = await deliverThreaded(...headersFor("root@example.com", "Hello"));
+            const reply = await deliverThreaded(
+                ...headersFor("reply-1@example.com", "Re: Hello", ["In-Reply-To: <root@example.com>", "References: <root@example.com>"]),
+            );
+
+            expect(root.conversationId).toBe("root@example.com");
+            expect(reply.conversationId).toBe("root@example.com");
+        });
+
+        it("Groups a three-deep chain, including a reply that names only its direct parent.", async () => {
+            const root = await deliverThreaded(...headersFor("root@example.com", "Hello"));
+            const second = await deliverThreaded(...headersFor("reply-1@example.com", "Re: Hello", ["In-Reply-To: <root@example.com>"]));
+            // Only In-Reply-To, naming the *second* message: without the mailbox lookup this would start its own
+            // conversation keyed on `reply-1@example.com`.
+            const third = await deliverThreaded(...headersFor("reply-2@example.com", "Re: Hello", ["In-Reply-To: <reply-1@example.com>"]));
+
+            expect(root.conversationId).toBe("root@example.com");
+            expect(second.conversationId).toBe("root@example.com");
+            expect(third.conversationId).toBe("root@example.com");
+        });
+
+        it("Groups a reply that carries References but no In-Reply-To.", async () => {
+            await deliverThreaded(...headersFor("root@example.com", "Hello"));
+            const reply = await deliverThreaded(
+                ...headersFor("reply-1@example.com", "Re: Hello", ["References: <root@example.com>"]),
+            );
+
+            // `?? undefined`: the SQL backend reads an unset column back as `null`, the Mongo one as `undefined`.
+            expect(reply.inReplyTo ?? undefined).toBeUndefined();
+            expect(reply.conversationId).toBe("root@example.com");
+        });
+
+        it("Keeps the thread together when the subject changes mid-chain - threading is by header, never by subject.", async () => {
+            await deliverThreaded(...headersFor("root@example.com", "Hello"));
+            const renamed = await deliverThreaded(
+                ...headersFor("reply-1@example.com", "Lunch on Friday instead", [
+                    "In-Reply-To: <root@example.com>",
+                    "References: <root@example.com>",
+                ]),
+            );
+            const after = await deliverThreaded(
+                ...headersFor("reply-2@example.com", "Re: Lunch on Friday instead", ["In-Reply-To: <reply-1@example.com>"]),
+            );
+
+            expect(renamed.conversationId).toBe("root@example.com");
+            expect(after.conversationId).toBe("root@example.com");
+        });
+
+        it("Starts its own conversation for a message that replies to nothing, even under a subject this mailbox already has.", async () => {
+            await deliverThreaded(...headersFor("root@example.com", "Hello"));
+            const unrelated = await deliverThreaded(...headersFor("unrelated@example.com", "Hello"));
+
+            expect(unrelated.conversationId).toBe("unrelated@example.com");
+        });
+
+        it("Falls back to the root a reply names when this mailbox holds none of its ancestors.", async () => {
+            const orphan = await deliverThreaded(
+                ...headersFor("reply-1@example.com", "Re: Hello", [
+                    "In-Reply-To: <never-seen@example.com>",
+                    "References: <root@elsewhere.test> <never-seen@example.com>",
+                ]),
+            );
+
+            expect(orphan.conversationId).toBe("root@elsewhere.test");
+        });
+    });
+
     it("Defaults an attachment's filename to 'attachment' when the message provides none.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const rawBlobKey = `raw/${uuid.v4()}`;

@@ -27,8 +27,18 @@ export interface ScanAndRelayResult {
 
     /** Groups this message with the rest of its RFC 5322/2822 thread - see `util/ConversationUtils.ts`'s
      * `deriveConversationId()`, computed from the same scan that already parsed `raw`'s `References`/
-     * `In-Reply-To` headers, so this needs no second parse. */
+     * `In-Reply-To` headers, so this needs no second parse. Derived from those headers alone: a caller that
+     * can look the thread up in a mailbox refines it with `resolveConversationId()` (see
+     * `BaseMessageRoute.send()`), which is what makes a chain deeper than one reply hold together. */
     conversationId: string;
+
+    /** The `In-Reply-To` `raw` carries, angle brackets stripped - the `Message-ID` of the message this one
+     * replies to, if any. Reported so a caller can persist it and resolve the thread against its own mailbox
+     * without parsing the relayed bytes a second time. */
+    inReplyTo?: string;
+
+    /** The `References` `raw` carries, oldest first, angle brackets stripped; empty when it carries none. */
+    references: string[];
 
     /** The blob key `scanResult.sanitizedHtml` (if any) was stored under - see the identical reasoning in
      * `ScanQueueJob.processEntry()`'s own doc comment on why this must never be folded into the raw body key. */
@@ -94,5 +104,85 @@ export async function scanAndRelay(
 
     const conversationId = deriveConversationId(scanResult.references, scanResult.inReplyTo, messageId);
 
-    return { raw: finalRaw, messageId, conversationId, sanitizedHtmlBlobKey, encrypted: scanResult.encrypted };
+    return {
+        raw: finalRaw,
+        messageId,
+        conversationId,
+        inReplyTo: scanResult.inReplyTo,
+        references: scanResult.references,
+        sanitizedHtmlBlobKey,
+        encrypted: scanResult.encrypted,
+    };
+}
+
+/**
+ * How many `Message-ID`s an outbound `References` header written by `applyThreadHeaders()` keeps, and how long
+ * that header line may get. RFC 5322 caps a header line at 998 characters and a `References` chain grows by one
+ * entry per reply forever, so a long-running thread's chain is trimmed rather than written out in full - which
+ * RFC 5322 section 3.6.4 explicitly allows. The root is always kept (it is what `deriveConversationId()` reads),
+ * and the entries dropped are the oldest ones after it, so the parent this message actually replies to stays.
+ */
+export const MAX_RELAYED_REFERENCES: number = 20;
+export const MAX_RELAYED_REFERENCES_LENGTH: number = 900;
+
+/** One `Message-ID` as it goes into an `In-Reply-To`/`References` header: no angle brackets, no whitespace and
+ * nothing that could start a second header line. `undefined` when nothing usable is left. */
+function headerMessageId(value: unknown): string | undefined {
+    if (typeof value !== "string") {
+        return undefined;
+    }
+    const cleaned: string = value.replace(/[\r\n<>]/g, "").trim();
+    return cleaned.length > 0 && !/\s/.test(cleaned) ? cleaned : undefined;
+}
+
+/**
+ * The `In-Reply-To`/`References` headers a reply must carry, from what the draft recorded it is replying to -
+ * or none at all when it is replying to nothing, or when the composed MIME already carries threading headers of
+ * its own (a client that composed them itself, including a signed/encrypted body assembled client-side, is
+ * never second-guessed).
+ *
+ * `References` is the thread's chain as the draft recorded it, with the parent's own `Message-ID` appended when
+ * it isn't already the last entry - exactly the chain RFC 5322 section 3.6.4 prescribes for a reply - trimmed to
+ * `MAX_RELAYED_REFERENCES` entries and `MAX_RELAYED_REFERENCES_LENGTH` characters from after the root.
+ *
+ * This is what actually makes threading work end to end: this server composes a reply's MIME from structured
+ * compose input (recipients, subject, HTML), so unless these headers are written here, every recipient's ingest
+ * pipeline sees a message that references nothing and files it as a brand-new conversation.
+ */
+export function threadHeaders(raw: Buffer, thread: { inReplyTo?: string; references?: string[] | null }): { name: string; value: string }[] {
+    if (extractHeader(raw, "In-Reply-To") !== undefined || extractHeader(raw, "References") !== undefined) {
+        return [];
+    }
+    const parent: string | undefined = headerMessageId(thread.inReplyTo);
+    const chain: string[] = [];
+    for (const reference of Array.isArray(thread.references) ? thread.references : []) {
+        const id: string | undefined = headerMessageId(reference);
+        if (id && !chain.includes(id)) {
+            chain.push(id);
+        }
+    }
+    if (parent && chain[chain.length - 1] !== parent) {
+        const duplicate: number = chain.indexOf(parent);
+        if (duplicate >= 0) {
+            chain.splice(duplicate, 1);
+        }
+        chain.push(parent);
+    }
+    if (chain.length === 0) {
+        return [];
+    }
+    const value = (): string => chain.map((id) => `<${id}>`).join(" ");
+    while (chain.length > 1 && (chain.length > MAX_RELAYED_REFERENCES || value().length > MAX_RELAYED_REFERENCES_LENGTH)) {
+        chain.splice(1, 1);
+    }
+    return [
+        ...(parent ? [{ name: "In-Reply-To", value: `<${parent}>` }] : []),
+        { name: "References", value: value() },
+    ];
+}
+
+/** `raw` with `threadHeaders()` prepended, or `raw` itself when there are none to add. */
+export function applyThreadHeaders(raw: Buffer, thread: { inReplyTo?: string; references?: string[] | null }): Buffer {
+    const headers: { name: string; value: string }[] = threadHeaders(raw, thread);
+    return headers.length > 0 ? prependHeaders(raw, headers) : raw;
 }

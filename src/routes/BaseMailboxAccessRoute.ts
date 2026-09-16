@@ -69,9 +69,16 @@ const PLAIN_ADDRESS_PATTERN = /^[^\s()@,]+@[^\s()@,]+$/;
 /** The longest address worth looking up (RFC 5321's path limit). */
 const MAX_ADDRESS_LENGTH = 320;
 
-/** How many `lookup-by-email` requests one caller may make per `LOOKUP_WINDOW_SECONDS` - enough to add members by
- * hand, far too few to walk the directory. */
-export const LOOKUP_MAX_ATTEMPTS = 30;
+/**
+ * How many `lookup-by-email` requests one signed-in caller may make per `LOOKUP_WINDOW_SECONDS`.
+ *
+ * 30 a minute was sized for "add a member by hand" and nothing else, which made it the first limit a sharing screen
+ * that resolves an address as it is typed (or re-resolves each existing member when it reloads) ran into; a screen
+ * listing a dozen delegates could exhaust it by being opened three times. 300 a minute - 5 a second sustained -
+ * leaves interactive use alone while still bounding the endpoint as an address-existence oracle. As with every
+ * explicit `@RateLimit()` limit in this library, a deployment's `rateLimit.authenticated` tier does not raise it.
+ */
+export const LOOKUP_MAX_ATTEMPTS = 300;
 export const LOOKUP_WINDOW_SECONDS = 60;
 
 /** Maps an arbitrary `ACLRecord.actions` array back onto this route's vocabulary for display - `"manager"` for

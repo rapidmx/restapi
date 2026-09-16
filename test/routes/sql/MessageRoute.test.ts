@@ -613,6 +613,191 @@ describe("Route:MessageSQL Tests", () => {
         });
     });
 
+    describe("Threading a reply this API composed", () => {
+        /** A draft whose stored MIME carries no threading headers at all - what `POST /mail/compose/:id/assemble`
+         * produces, since it composes from recipients, subject and HTML and knows nothing about a reply chain. */
+        const draftReplying = async (mailboxUid: string, folderUid: string, subject: string, thread: any) => {
+            const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await blobStore.put(
+                bodyBlobKey,
+                Buffer.from(`From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: ${subject}\r\n\r\nReply body.\r\n`),
+            );
+            return await createMessage(mailboxUid, folderUid, { bodyBlobKey, subject, ...thread });
+        };
+        const send = async (uid: string) =>
+            await request(server.getApplication()).post(`${baseUrl}/${uid}/send`).set("Authorization", "jwt " + ownerToken);
+        const relayed = (): string => {
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            return transport.sent[transport.sent.length - 1].raw.toString();
+        };
+
+        it("Writes In-Reply-To and References into the relayed MIME from what the draft records, and files the copy into the parent's conversation.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            await createMessage(mailbox.uid, inbox.uid, { messageId: "root@example.com", conversationId: "root@example.com", subject: "Hello" });
+            const draft = await draftReplying(mailbox.uid, drafts.uid, "Re: Hello", {
+                inReplyTo: "root@example.com",
+                references: ["root@example.com"],
+            });
+
+            const result = await send(draft.uid);
+
+            expect(result.status).toBe(200);
+            expect(relayed()).toContain("In-Reply-To: <root@example.com>");
+            expect(relayed()).toContain("References: <root@example.com>");
+            expect(result.body.conversationId).toBe("root@example.com");
+            expect(result.body.inReplyTo).toBe("root@example.com");
+            expect(result.body.references).toEqual(["root@example.com"]);
+        });
+
+        it("Persists those headers onto the stored body, so the Sent Items copy's own source shows the thread.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const draft = await draftReplying(mailbox.uid, drafts.uid, "Re: Hello", { inReplyTo: "root@example.com", references: [] });
+
+            expect((await send(draft.uid)).status).toBe(200);
+
+            const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const stored: string = (await blobStore.get(draft.bodyBlobKey)).toString();
+            expect(stored).toContain("In-Reply-To: <root@example.com>");
+            expect(stored).toContain("References: <root@example.com>");
+        });
+
+        it("Joins the conversation of a parent that is itself a reply, three deep, with only a direct parent named.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            await createMessage(mailbox.uid, inbox.uid, { messageId: "root@example.com", conversationId: "root@example.com", subject: "Hello" });
+            await createMessage(mailbox.uid, inbox.uid, {
+                messageId: "second@example.com",
+                conversationId: "root@example.com",
+                inReplyTo: "root@example.com",
+                subject: "Re: Hello",
+            });
+            const draft = await draftReplying(mailbox.uid, drafts.uid, "Re: Hello", { inReplyTo: "second@example.com", references: [] });
+
+            const result = await send(draft.uid);
+
+            expect(result.status).toBe(200);
+            expect(result.body.conversationId).toBe("root@example.com");
+        });
+
+        it("Threads a reply that records References but no In-Reply-To.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            await createMessage(mailbox.uid, inbox.uid, { messageId: "root@example.com", conversationId: "root@example.com", subject: "Hello" });
+            const draft = await draftReplying(mailbox.uid, drafts.uid, "Re: Hello", { references: ["root@example.com"] });
+
+            const result = await send(draft.uid);
+
+            expect(result.status).toBe(200);
+            expect(relayed()).not.toContain("In-Reply-To:");
+            expect(relayed()).toContain("References: <root@example.com>");
+            expect(result.body.conversationId).toBe("root@example.com");
+        });
+
+        it("Leaves a message that replies to nothing in its own conversation, relaying no threading headers.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            await createMessage(mailbox.uid, inbox.uid, { messageId: "root@example.com", conversationId: "root@example.com", subject: "Hello" });
+            const draft = await draftReplying(mailbox.uid, drafts.uid, "Hello", { references: [] });
+
+            const result = await send(draft.uid);
+
+            expect(result.status).toBe(200);
+            expect(relayed()).not.toContain("In-Reply-To:");
+            expect(relayed()).not.toContain("References:");
+            expect(result.body.conversationId).toBe(result.body.messageId);
+            expect(result.body.conversationId).not.toBe("root@example.com");
+        });
+
+        it("Keeps a renamed reply in the same conversation - the subject is never what threads a message.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            await createMessage(mailbox.uid, inbox.uid, { messageId: "root@example.com", conversationId: "root@example.com", subject: "Hello" });
+            const draft = await draftReplying(mailbox.uid, drafts.uid, "Lunch on Friday instead", {
+                inReplyTo: "root@example.com",
+                references: ["root@example.com"],
+            });
+
+            expect((await send(draft.uid)).body.conversationId).toBe("root@example.com");
+        });
+
+        it("Leaves a draft whose own MIME already carries threading headers exactly as it is.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await blobStore.put(
+                bodyBlobKey,
+                Buffer.from(
+                    "From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Re: Hello\r\n" +
+                        "In-Reply-To: <own@example.com>\r\nReferences: <own@example.com>\r\n\r\nReply body.\r\n",
+                ),
+            );
+            const draft = await createMessage(mailbox.uid, drafts.uid, {
+                bodyBlobKey,
+                subject: "Re: Hello",
+                inReplyTo: "other@example.com",
+                references: ["other@example.com"],
+            });
+
+            const result = await send(draft.uid);
+
+            expect(result.status).toBe(200);
+            expect(relayed()).toContain("In-Reply-To: <own@example.com>");
+            expect(relayed()).not.toContain("other@example.com");
+            // The relayed bytes are what the sent copy records, not what the draft row happened to say.
+            expect(result.body.inReplyTo).toBe("own@example.com");
+            expect(result.body.conversationId).toBe("own@example.com");
+        });
+
+        it("Reports every message exactly once - a conversation never comes back alongside its own members.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const root = await createMessage(mailbox.uid, inbox.uid, {
+                messageId: "root@example.com",
+                conversationId: "root@example.com",
+                subject: "Hello",
+                receivedDate: new Date(Date.now() - 3600_000),
+            });
+            const second = await createMessage(mailbox.uid, inbox.uid, {
+                messageId: "second@example.com",
+                conversationId: "root@example.com",
+                inReplyTo: "root@example.com",
+                subject: "Re: Hello",
+                receivedDate: new Date(Date.now() - 1800_000),
+            });
+            const loner = await createMessage(mailbox.uid, inbox.uid, { messageId: "loner@example.com", subject: "Unrelated" });
+            const draft = await draftReplying(mailbox.uid, drafts.uid, "Re: Hello", { inReplyTo: "second@example.com", references: [] });
+            const sent = await send(draft.uid);
+            expect(sent.status).toBe(200);
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/conversations?mailboxUid=${mailbox.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(200);
+            const uids: string[] = result.body.flatMap((conversation: any) => conversation.messageUids);
+            expect([...uids].sort()).toEqual([root.uid, second.uid, loner.uid, sent.body.uid].sort());
+            expect(new Set(uids).size).toBe(uids.length);
+            const thread = result.body.find((conversation: any) => conversation.conversationId === "root@example.com");
+            expect(thread.messageCount).toBe(3);
+            expect(result.body).toHaveLength(2);
+
+            const expanded = await request(server.getApplication())
+                .get(`${baseUrl}/conversations/root%40example.com?mailboxUid=${mailbox.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+            expect(expanded.body.map((message: any) => message.uid).sort()).toEqual([root.uid, second.uid, sent.body.uid].sort());
+        });
+    });
+
     describe("conversations()", () => {
         it("Groups a reply (sent via send()) with its parent message, across Inbox and Sent Items.", async () => {
             const mailbox = await createMailbox(owner.uid);

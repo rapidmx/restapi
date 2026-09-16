@@ -13,7 +13,7 @@ import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, Sca
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { hasAlignedPassingDkim } from "../util/AuthenticationResultsUtils.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
-import { boundIndexedValue, deriveConversationId } from "../util/ConversationUtils.js";
+import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
 import { isHeaderOversignedByAlignedDkim, topmostTrustedAuthenticationResults } from "../util/DkimOversignUtils.js";
@@ -947,7 +947,9 @@ export abstract class ScanQueueJob<
             const folder: F = await this.resolveTargetFolder(entry.mailboxUid, filterResult.moveToFolderUid, defaultFolderType);
 
             const messageId = result.messageIdHeader ?? crypto.randomUUID();
-            const conversationId: string | undefined = deriveConversationId(result.references, result.inReplyTo, messageId);
+            // The conversation an ancestor of this message is already filed under in this mailbox, falling back
+            // to what its own `References`/`In-Reply-To` derive - see `util/ConversationUtils.ts`.
+            const conversationId: string | undefined = await this.resolveConversation(entry.mailboxUid, result, messageId);
             // Classified before the row is written so the conversation lookup can't match this very message.
             const inferenceClassification: MessageClassification | undefined = await this.classifyForInbox(
                 entry,
@@ -1006,9 +1008,9 @@ export abstract class ScanQueueJob<
                 continue;
             }
             const copyMessageId = result.messageIdHeader ?? crypto.randomUUID();
-            const copyConversationId: string | undefined = deriveConversationId(
-                result.references,
-                result.inReplyTo,
+            const copyConversationId: string | undefined = await this.resolveConversation(
+                entry.mailboxUid,
+                result,
                 copyMessageId,
             );
             // A rule can copy into the Inbox itself, in which case that copy is classified like any other
@@ -1485,6 +1487,20 @@ export abstract class ScanQueueJob<
             { ignoreACL: true, limit: 1 },
         );
         return matches[0]?.classifyAs;
+    }
+
+    /**
+     * The conversation a message being delivered into `mailboxUid` belongs to: the one an ancestor named in its
+     * `References`/`In-Reply-To` is already filed under here, falling back to what those headers derive on their
+     * own (`util/ConversationUtils.ts`'s `resolveConversationId()`). The lookup is what holds a chain deeper
+     * than one reply together when the sending client sets only `In-Reply-To`, and it is the same resolution
+     * `BaseMessageRoute.send()` applies to the sender's Sent Items copy, so every copy of a thread in a mailbox
+     * carries the same `conversationId`.
+     */
+    private async resolveConversation(mailboxUid: string, result: ScanPipelineResult, messageId: string): Promise<string> {
+        return await resolveConversationId(result.references, result.inReplyTo, messageId, (ancestors) =>
+            findThreadConversationId(this.messageRepo!, mailboxUid, ancestors),
+        );
     }
 
     /**

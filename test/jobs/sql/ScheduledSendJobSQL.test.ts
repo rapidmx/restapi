@@ -166,6 +166,29 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         expect(updated.flags.read).toBe(true);
     });
 
+    it("Files a scheduled reply into the conversation its parent is already in, resolved the same way an immediate send is.", async () => {
+        // The parent this mailbox already holds - the scheduled reply names only its direct parent, so without the
+        // mailbox lookup it would start a conversation of its own keyed on `second@example.com`.
+        await createMessage({ messageId: "root@example.com", conversationId: "root@example.com", subject: "Hello", scheduledSendTime: undefined });
+        await createMessage({
+            messageId: "second@example.com",
+            conversationId: "root@example.com",
+            inReplyTo: "root@example.com",
+            subject: "Re: Hello",
+            scheduledSendTime: undefined,
+        });
+        const bodyBlobKey = await putBody(
+            "From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Re: Hello\r\n" +
+                "Message-ID: <scheduled@example.com>\r\nIn-Reply-To: <second@example.com>\r\n\r\nReply body.\r\n",
+        );
+        const message = await createMessage({ bodyBlobKey, scheduledSendTime: new Date(Date.now() - 60 * 1000) });
+
+        await job.run();
+
+        const updated = await findMessage(message.uid);
+        expect(updated.conversationId).toBe("root@example.com");
+    });
+
     it("Does not relay a message whose scheduledSendTime is still in the future.", async () => {
         const bodyBlobKey = await putBody();
         await createMessage({ bodyBlobKey, scheduledSendTime: new Date(Date.now() + 60 * 60 * 1000) });

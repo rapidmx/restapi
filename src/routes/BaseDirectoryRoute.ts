@@ -29,9 +29,22 @@ export const DIRECTORY_MAX_QUERY_LENGTH = 100;
 export const DIRECTORY_MAX_TERMS = 5;
 export const DIRECTORY_DEFAULT_LIMIT = 8;
 export const DIRECTORY_MAX_LIMIT = 20;
-/** Requests one caller may make to each endpoint per `DIRECTORY_WINDOW_SECONDS`: enough for suggestions while typing
- * (the web client debounces keystrokes), too few to page through a large directory quickly. */
-export const DIRECTORY_MAX_ATTEMPTS = 120;
+/**
+ * Requests one signed-in caller may make to each endpoint per `DIRECTORY_WINDOW_SECONDS`.
+ *
+ * Sized for a person using the product, not for the theoretical minimum a debounced typeahead needs: a recipient
+ * field asks both of these endpoints on every pause in typing, so one addressed message costs a burst of them, and a
+ * compose window with several recipients - or a user who keeps typing while the suggestions are open - reached the
+ * old 120 a minute in about twenty seconds of ordinary composing. The limit then answered every further request
+ * with a 429 for the rest of the minute, which a client can only show as suggestions that silently stopped working.
+ *
+ * Note this number is what a *signed-in* caller gets: a deployment's `rateLimit.authenticated` tier (the server's
+ * own config) does not raise a limit a `@RateLimit()` decorator states explicitly - an explicit per-endpoint limit
+ * is applied on top of it - so this constant, not that tier, is the ceiling interactive use runs into. 600 a minute
+ * is 10 a second sustained per caller per endpoint: far above anything a person can drive a text field at, and
+ * still a hard bound on using the directory as a bulk enumeration source.
+ */
+export const DIRECTORY_MAX_ATTEMPTS = 600;
 export const DIRECTORY_WINDOW_SECONDS = 60;
 /** How many contact folders `GET /contacts` searches at most. */
 export const DIRECTORY_MAX_CONTACT_FOLDERS = 50;

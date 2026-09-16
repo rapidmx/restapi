@@ -4,6 +4,32 @@
 
 ### Features
 
+- **Replies actually thread now.** A reply composed through this server was relayed with no `In-Reply-To` or
+  `References` header at all - the MIME is composed from the recipients, subject and HTML a compose client sends, none
+  of which say anything about what is being replied to - so every recipient's ingest pipeline, and the sender's own
+  Sent Items copy, filed it as a brand-new conversation. A mail list in conversation mode showed one row per message
+  of a thread, each reporting "1 message".
+  - `POST /mail/messages/:id/send` (and `ScheduledSendJob`, which relays the same bytes) now writes `In-Reply-To` and
+    `References` into the MIME it relays, from the `inReplyTo`/`references` the draft records, and persists those
+    bytes as the message's stored body. MIME that already carries threading headers of its own - a client that
+    composed them, an `assemble-raw` signed/encrypted body - is never rewritten.
+  - **A compose client must set `inReplyTo` and `references` on the draft it creates for a reply** (neither is
+    server-managed, so an ordinary `POST /mail/messages` body carries them). `@rapidmx/react-shared`'s
+    `createDraft(mailboxUid, folderUid, threading)` and `buildReplyThreading(message)` do this.
+  - `Message.conversationId` is no longer derived from a message's own headers alone: on delivery *and* on send it
+    first looks for an ancestor named in `References`/`In-Reply-To` that this mailbox already holds, and joins that
+    message's conversation (`resolveConversationId()`/`findThreadConversationId()`, one indexed `messageId IN (...)`
+    query of at most `MAX_CONVERSATION_ANCESTORS` (20) ids). This is what holds a chain deeper than one reply
+    together when a client sets only `In-Reply-To`, and it is the same resolution on both sides, so the sender's Sent
+    Items copy and each recipient's delivered copy carry the same `conversationId` as the rest of their thread.
+    A message whose ancestors this mailbox has never seen still falls back to the thread root its own headers name,
+    and a message that replies to nothing still starts its own conversation. Threading is by header only - a subject
+    change mid-thread keeps the conversation, and a new message sharing a thread's subject never joins it.
+  - The sent copy also records the `inReplyTo`/`references` the relayed bytes actually carry.
+  - No migration: mail already delivered keeps the `conversationId` it was given. `conversationAncestorIds()`,
+    `findThreadConversationId()`, `resolveConversationId()`, `MAX_CONVERSATION_ANCESTORS`, `threadHeaders()`,
+    `applyThreadHeaders()`, `MAX_RELAYED_REFERENCES` and `MAX_RELAYED_REFERENCES_LENGTH` are exported from the
+    package root.
 - **Filter the mail list by label.** `GET /mail/messages` (and `HEAD`) and `GET /mail/messages/conversations` now take
   `?labelUids=<uid>,<uid>,...`, a comma-separated set of `Label.uid`s, and return the messages carrying **any** of
   them - OR between the labels, order-insensitive, duplicates ignored - which is then ANDed with `?filter=` and with
@@ -60,6 +86,20 @@
   uid, which is how a message belonging to no thread is keyed.
 - **New indexes** on `Message`, both backends: `message_folder_received`, `message_folder_read_received`,
   `message_folder_flagged_received` and `message_mailbox_conversation_received`.
+
+### Changed
+
+- **Rate limits sized for interactive use, not for the theoretical minimum.** The recipient-suggestion endpoints
+  (`GET /mail/directory` and `GET /mail/directory/contacts`) go from 120 to **600 requests a minute per caller,
+  each**, and `GET /mail/mailboxes/lookup-by-email` from 30 to **300 a minute per caller**. A recipient field asks
+  both directory endpoints on every pause in typing, so a compose window with a few recipients reached the old limit
+  in about twenty seconds of ordinary composing and then got a 429 for the rest of the minute - which a client can
+  only show as suggestions that silently stopped working. The new numbers are 10 and 5 requests a second sustained
+  per caller: far above what a person can drive a text field at, and still a hard bound on using either endpoint as a
+  bulk enumeration source. Note that an explicit `@RateLimit()` limit like these is *not* raised by a deployment's
+  own "authenticated" rate-limit tier - it is applied on top of it - so these constants, not that tier, are what
+  interactive use runs into. Nothing else in this library is rate limited at all: a mail client's folder, label,
+  policy, message and count requests consume no rate-limit budget.
 
 ### Fixes
 

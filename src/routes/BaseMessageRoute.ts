@@ -24,10 +24,10 @@ import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { findActiveHoldsFor } from "../util/LegalHoldUtils.js";
-import { scanAndRelay } from "../util/MailSendUtils.js";
+import { applyThreadHeaders, scanAndRelay } from "../util/MailSendUtils.js";
 import { coerceDateValue } from "../util/DateCoercionUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
-import { boundIndexedValue } from "../util/ConversationUtils.js";
+import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
 import {
     MESSAGE_LIST_FIELDS,
     MESSAGE_LIST_QUERY_PARAMS,
@@ -816,6 +816,23 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         let raw: Buffer = await this.blobStore.get(message.bodyBlobKey);
         this.assertSenderAllowed(sendingMailbox, message, raw);
 
+        // The reply's own RFC 5322 threading headers, from the `inReplyTo`/`references` the draft records (a
+        // compose client sets them when it opens a reply; `SERVER_MANAGED_MESSAGE_FIELDS` deliberately doesn't
+        // cover them). This server composes a reply's MIME from structured compose input - recipients, subject
+        // and HTML - which carries no `In-Reply-To`/`References` of its own, so unless they are written here
+        // every recipient's ingest pipeline sees a message that references nothing and files it as a brand-new
+        // conversation, and so does this mailbox's own Sent Items copy. MIME that already carries threading
+        // headers (a client that composed its own, `assemble-raw` included) is left exactly as it is.
+        //
+        // Persisted onto the draft's body blob here - before the claim, and before a scheduled send is queued -
+        // so these are the bytes `ScheduledSendJob` later relays and the bytes a client reading the message's
+        // raw source sees.
+        const threadedRaw: Buffer = applyThreadHeaders(raw, message);
+        if (threadedRaw !== raw) {
+            await this.blobStore.put(message.bodyBlobKey, threadedRaw, { contentType: "message/rfc822" });
+            raw = threadedRaw;
+        }
+
         // "Do not deliver before" (`PR_DEFERRED_SEND_TIME`) - a future `scheduledSendTime` defers relay instead of
         // sending now. The message sits in the mailbox's Outbox folder until `ScheduledSendJob` relays it; moving it
         // back out of Outbox (e.g. to Drafts) cancels it.
@@ -922,14 +939,20 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const {
             raw: relayedRaw,
             messageId,
-            conversationId,
+            inReplyTo,
+            references,
             sanitizedHtmlBlobKey: scannedHtmlBlobKey,
             encrypted,
         } = await this.relayClaimed(claimed, message.folderUid, raw, envelopeTo);
+        // The Sent Items copy joins the conversation the message it replies to is already in, rather than
+        // starting one keyed on whichever ancestor its own headers happen to name - see `resolveConversationId()`.
+        const conversationId: string = await this.threadConversationId(message.mailboxUid, references, inReplyTo, messageId);
         try {
             return await this.fileSentMessage(message, claimed, user, raw, relayedRaw, attachesReceiptRequest, envelopeTo, {
                 messageId,
                 conversationId,
+                inReplyTo,
+                references,
                 scannedHtmlBlobKey,
                 encrypted,
             });
@@ -939,6 +962,22 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw err;
         }
         /* v8 ignore stop */
+    }
+
+    /** The `conversationId` a message carrying these threading headers belongs to in `mailboxUid`: the
+     * conversation one of its ancestors is already filed under, or - when the mailbox holds none of them - the
+     * one its own headers derive (see `util/ConversationUtils.ts`). Used for a message this mailbox sends;
+     * `ScanQueueJob` resolves a delivered one exactly the same way, so the sender's Sent Items copy and every
+     * recipient's own copy each join the thread their own mailbox already holds. */
+    private async threadConversationId(
+        mailboxUid: string,
+        references: string[],
+        inReplyTo: string | undefined,
+        messageId: string,
+    ): Promise<string> {
+        return await resolveConversationId(references, inReplyTo, messageId, (ancestors) =>
+            findThreadConversationId(this.repoUtils!, mailboxUid, ancestors),
+        );
     }
 
     /** Whether `current` is still in the Outbox `claimed` was claimed in, carrying the lease that claim wrote. */
@@ -957,9 +996,16 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         relayedRaw: Buffer,
         attachesReceiptRequest: boolean,
         envelopeTo: string[],
-        relay: { messageId: string; conversationId: string; scannedHtmlBlobKey?: string; encrypted: boolean },
+        relay: {
+            messageId: string;
+            conversationId: string;
+            inReplyTo?: string;
+            references: string[];
+            scannedHtmlBlobKey?: string;
+            encrypted: boolean;
+        },
     ): Promise<T> {
-        const { messageId, conversationId, scannedHtmlBlobKey, encrypted } = relay;
+        const { messageId, conversationId, inReplyTo, references, scannedHtmlBlobKey, encrypted } = relay;
         // Re-read: the relay can take a while, and an unrelated write (e.g. a flag change) must not fail the filing.
         const current: T = (await this.repoUtils!.findOne(message.uid, { ignoreACL: true, skipCache: true }))!;
         /* v8 ignore start -- only a lapsed lease (a relay slower than lease_ms) or a trusted caller's move */
@@ -1020,6 +1066,11 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 sanitizedHtmlBlobKey,
                 messageId: boundIndexedValue(messageId),
                 conversationId: boundIndexedValue(conversationId),
+                // What the relayed bytes actually say this message replies to, so the Sent Items copy's own
+                // record matches the headers every recipient received (the `assemble-raw` path composes its MIME
+                // client-side, and may carry threading headers the draft row never recorded).
+                inReplyTo: inReplyTo ?? (current as any).inReplyTo ?? null,
+                references: references.length > 0 ? references : ((current as any).references ?? []),
                 receiptStatus,
                 encrypted,
                 scheduledSendTime: null,
