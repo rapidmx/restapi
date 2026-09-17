@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-17
+
+### Added
+- Added BaseDirectoryRoute with DirectoryRouteMongo and DirectoryRouteSQL for compose recipient suggestions, mounted by the server at mail/directory
+- Added GET /mail/directory, which searches the server's user, shared, room and equipment mailboxes and distribution lists by name word and address prefix, returning only display name, address and kind
+- Added GET /mail/directory/contacts, which searches the contacts folders the caller can read in the mailboxes they own and in a readable mailboxUid
+- Added util/RecipientUtils.ts with parseHeaderRecipients, buildDeliveredRecipients, parseSenderDisplayName, storedAddress, storedDisplayName and MAX_MESSAGE_RECIPIENTS, capping a message at 100 recipients, addresses at 320 characters, display names at 200, group nesting at five levels and refusing control characters, over the address lists mailparser has already parsed so a huge or hostile header adds no new parsing to the ingest path
+- Added server-side sorting and filtering to the mail message list through named sortBy, sortOrder and filter query parameters on GET and HEAD /mail/messages, so a client's sort and filter menus are answered by the database over the whole folder instead of over the page it already fetched
+- Added util/MessageListUtils.ts with the derivation, the sort and filter vocabularies and the paging bounds, exported from the package root
+- Added listQueryParams and listQueryOverrides to BaseScopedChildRoute so a route can interpret its own query parameters and merge server-built filter fragments, including an $or a client can't send, over the stripped client query
+- Added GET /mail/messages/conversations/:conversationId, returning one conversation's messages oldest first across every folder in the mailbox, paged and falling back to a uid lookup for a message that belongs to no thread
+- Added label filtering to the mail message list through a comma-separated labelUids query parameter on GET and HEAD /mail/messages and on GET /mail/messages/conversations, returning the messages carrying any of the named labels - OR across the set, order-insensitive, ANDed with the existing filter, and applied by the database over the whole folder so limit and page stay correct under it
+
+### Changed
+- Refuse directory searches from callers who own no mailbox on the server unless they hold a trusted role, and leave out mailboxes with an approved or running erasure and deleted lists
+- Match query text literally through escaped regular expressions on Mongo and escaped LIKE patterns on SQL, require 2 to 100 characters, cap limit at 20 and rate limit each endpoint to 120 requests a minute per caller
+- Export parseDirectoryQuery, matchesDirectoryTerms, directoryNameWords, rankDirectoryEntries, escapeDirectoryRegExp, escapeDirectoryLike and the DIRECTORY limits
+- Test both endpoints on Mongo and SQL, and the query helpers
+- Document the routes in the release notes and NOTES
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Record everyone a delivered message was addressed to, building Message.recipients from the message's own To and Cc headers - and a Bcc header only when the delivered copy genuinely carries one - instead of the SMTP envelope, which named only the single mailbox each copy was filed into and left Reply All, conversation participants and every server-side reader with a one-entry list
+- Keep an envelope recipient no header names - bcc'd, alias-only or expanded from a distribution list - as a bcc entry, deduped case-insensitively by address, so a copy still records the mailbox it was delivered into without putting a privately addressed recipient back on a visible header
+- Store the sender's display name alone on from.displayName, unquoted and RFC 2047-decoded, instead of the whole From header, which a client rendered a second time after the address it also shows
+- Keep from.address as the envelope sender, which the focused-inbox sender overrides and the search index are keyed on, and keep an address-like display name as the sender wrote it, which a client's phishing warning needs to see
+- Expose headerRecipients and fromDisplayName on ScanPipelineResult, leaving parsedFrom as the whole From header value mail filter conditions match
+- Apply the same recipients and display name fix to a mail filter rule's folder copy and to MailboxImportJob, which imported every message with no recipients at all
+- Test both fixes on Mongo and SQL - multiple To and Cc recipients, display names with commas, quotes and encoded words, a bcc'd recipient absent from the headers, a malformed header and a 5000-address one - and unit test the new utility
+- Document the fixes in the release notes and NOTES
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Sort by date, sentDate, from, subject, importance or flagged, always with receivedDate and uid appended as tiebreakers so limit and page can't show a message twice or skip one, and refuse an unknown sortBy or sortOrder with a 400
+- Filter by all, unread, read, flagged, hasAttachments, focused or other, with focused also matching a message carrying no inferenceClassification at all
+- Store read, flagged, fromAddress and importanceRank as server-managed, indexed mirrors of flags, from and importance, since flags and from are one simple-json column on the SQL backend and nothing could filter or sort on a field inside them on both backends
+- Derive the mirrors in the Message model constructors and re-derive them on every update patch, refuse them in a request body for every caller including a trusted one, and export deriveMessageListFields and syncMessageListFields for protocol packages that write flags themselves
+- Index Message on folderUid and receivedDate, folderUid read and receivedDate, folderUid flagged and receivedDate, and mailboxUid conversationId and receivedDate, on both backends
+- Accept folderUid, filter, limit and page on GET /mail/messages/conversations, scan newest first so the conversation cap drops the oldest messages rather than an arbitrary slice, and report flagged, latestMessageUid, latestFrom, latestPreview and latestFolderUid for a collapsed conversation row
+- Break a receivedDate tie in a conversation summary by uid, so which message the summary calls latest no longer depends on the order the database happened to return them in
+- Bound a bulk PUT on any scoped child collection at MAX_BULK_UPDATE objects, and document its fail-fast, non-atomic semantics as what a mail client's multi-select bulk actions should use
+- Test every sort key, every filter, paging stability, mirror derivation and body rejection, conversation folder scoping, filtering, paging, tie-breaking and expansion, and the bulk cap, against real Mongo and real SQL
+- Document the new parameters, fields, indexes and the absence of a backfill in the release notes and NOTES
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Apply it to a conversation list's messages before they are grouped, exactly where filter is already applied, so a conversation appears when any of its messages carries any of the labels and reports only those messages
+- Match labelUids where it is already stored rather than adding another denormalized mirror: array membership on MongoDB, and one LIKE per uid against the stored simple-json text on SQL, each matching the uid with its JSON quotes so one uid can never match a substring of another
+- Keep that decision deliberate - a mirror column would hide every already-labelled message until it was backfilled, would go stale for any writer that sets labelUids outside this library's update path, and would buy no index anyway, since a leading-wildcard LIKE can use none either way and the list is already narrowed to one folder first
+- Build the predicate per backend through a new abstract buildLabelUidsFilter on BaseMessageRoute, implemented by MessageRouteMongo and MessageRouteSQL over buildMessageLabelFilterMongo and buildMessageLabelFilterSQL, since the same query DSL expression means different things against an array and against JSON text
+- Validate every entry as a uid instead of escaping it, which by construction excludes the LIKE wildcards, the quote that would break out of the JSON string and the characters the op(value) DSL reads as syntax, and refuse a malformed entry with a 400 rather than answering with a query that matches nothing
+- Cap a request at MAX_MESSAGE_LABEL_FILTER_UIDS labels with a 400, treat an absent or empty value as no filter, refuse an empty entry inside a list, and read a repeated labelUids parameter as one set
+- Interpret labelUids in the route now instead of letting it fall through to the generic query DSL, where it matched a single label by array membership on MongoDB and nothing at all on SQL
+- Export parseMessageLabelUids, buildMessageLabelFilterMongo, buildMessageLabelFilterSQL and MAX_MESSAGE_LABEL_FILTER_UIDS from the package root
+- Test the filter against real Mongo and real SQL - one label, several ORed in either order, combined with a named filter and a sort, the HEAD count, paging stability, an unknown uid, another mailbox's uid, a legacy row carrying no labels, a uid differing only in its last character, an empty and a repeated parameter, a malformed uid, the cap, and the conversation endpoint - and unit test the parsing and both predicates
+- Document the parameter, its OR semantics and the absence of any migration in the release notes and NOTES
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Write a reply's In-Reply-To and References headers into the MIME POST /mail/messages/:id/send relays, from the inReplyTo and references the draft records, since this server composes a reply's source from the recipients, subject and HTML a compose client sends and nothing in it named the message being replied to - so every recipient's ingest pipeline, and the sender's own Sent Items copy, filed a reply as a brand-new conversation and a mail list in conversation mode showed one row per message of a thread, each reporting one message
+- Persist those bytes as the message's stored body before the send is claimed, so a scheduled send relays exactly what an immediate one would and a client reading the raw source sees the thread
+- Leave MIME that already carries either header exactly as it is, including a signed or encrypted body assembled client-side through assemble-raw
+- Build the relayed References as the draft's chain with the replied-to message appended, trimmed from after the thread's root to MAX_RELAYED_REFERENCES entries and MAX_RELAYED_REFERENCES_LENGTH characters, since a chain grows by one entry per reply forever and a header line may not exceed 998
+- Resolve Message.conversationId against the mailbox instead of from a message's own headers alone, on delivery and on send alike - join the conversation an ancestor named in References or In-Reply-To is already filed under, and fall back to the header derivation only when the mailbox holds none of them
+- Keep a message that replies to nothing in its own conversation, and never thread by subject, so a subject change mid-thread holds the conversation together and a new message sharing a thread's subject never joins it
+- Look the ancestors up in one indexed messageId IN query of at most MAX_CONVERSATION_ANCESTORS ids, nearest ancestor first, which is what holds a chain deeper than one reply together when a client sets only In-Reply-To
+- Record on the sent copy the In-Reply-To and References the relayed bytes actually carry, rather than only what the draft row said
+- Raise the recipient-suggestion limit from 120 to 600 requests a minute per caller on GET /mail/directory and GET /mail/directory/contacts, and the address lookup from 30 to 300 a minute on GET /mail/mailboxes/lookup-by-email, because a recipient field asks both directory endpoints on every pause in typing and reached the old limit in about twenty seconds of ordinary composing, after which every further request was refused for the rest of the minute and the suggestions silently stopped
+- Document on both constants that an explicit limit is what interactive use runs into, since a deployment's authenticated rate-limit tier is applied under it rather than over it
+- Test the threading on delivery and on send against real MongoDB and real SQL - a two- and a three-deep chain, a reply carrying References but no In-Reply-To, a reply naming only its direct parent, a message with neither header, a subject change mid-thread, a reply whose ancestors the mailbox has never seen, a scheduled reply, and the conversation list reporting every message exactly once rather than a group alongside its own members
+- Document the fix, what a compose client must now send on a reply draft, and the new rate limits in the release notes and NOTES
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
 ## [0.12.0] - 2026-09-15
 
 ### Added
@@ -883,7 +948,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/RapidMX/restapi/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/RapidMX/restapi/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/RapidMX/restapi/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/RapidMX/restapi/compare/v0.9.0...v0.10.0
