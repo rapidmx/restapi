@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-20
+
+### Added
+- Added per-recipient SMTP and transport diagnostics to TransportResult, and capture what sendmail printed and its exit status in PostfixSendmailTransport and the exception, status and request id in SesMailTransport, so a failed relay keeps the mail system's own reason
+- Added DeliveryFailureNoticeUtils, which builds an RFC 3464 style delivery failure notice, and file one in the sender's Inbox, once, when a scheduled send is refused or given up on, or a transport refuses some recipients while relaying to others
+
+### Changed
+- Read each name from the alias field the auth-server returns rather than value or name
+- Keep only the caller's own verified name aliases, so an elevated administrator's token can't be offered, or create a mailbox for, another user's username
+- Fail a send that reached nobody with a 502 whose message is a plain sentence and whose details carry the per-recipient status codes and remote responses, and keep the message in Drafts
+- Notify a local sender when the ingest drops their message for an unresolvable recipient, never for a null sender or an automatic message
+- Preview a delivery status report by what it says, one entry per recipient, since the plain text preview cut the reason off after 500 characters
+- Test the send failure, the notices and the bounces captured from a real Postfix (null envelope sender, expired and delayed) against real MongoDB and real SQL, and the alias lookup with a stub that answers only the real URL and response shape
+- Document the changes in the README, the release notes and NOTES
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+### Fixed
+- Fixed self-service mailbox creation never offering an address, by asking the auth-server for the caller's names at GET /api/aliases?type=name&userUid=me, which exists, instead of /api/aliases/me, which reads me as an alias uid and answers 404 for everyone
+- Fixed a bounce listing no sender, by falling back to the From header when the envelope sender is null
+
 ## [0.14.0] - 2026-09-20
 
 ### Added
@@ -960,7 +980,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/RapidMX/restapi/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/RapidMX/restapi/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/RapidMX/restapi/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/RapidMX/restapi/compare/v0.11.0...v0.12.0
