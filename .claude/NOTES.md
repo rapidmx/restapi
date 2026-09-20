@@ -2333,3 +2333,19 @@ under heavy machine load (other repos' suites running at the same time) one file
 instance out from under another worker and a handful of files fail together with `MongoNetworkError: read
 ECONNRESET`, a different set each run, with zero assertion failures. Re-running those files alone passes. Not caused
 by anything in this change; worth giving each file its own port one day.
+
+## 2026-09-19 — Mailbox policy: `defaults` so an admin can reset a field to the deployed config
+
+- Ask (JP): settings editable in the admin console but sourced from `config.ts` first get a "reset" back to the config
+  value, so a newly deployed config can be taken without retyping it. `MailboxPolicy` is the only such setting in this
+  package (`system:plugins:*` are read-only config, retention/encryption policy/branding have no config source; the
+  server's own `PluginStateStore` seeds default plugins, which is a different, per-package thing not covered here).
+- `BaseMailboxPolicyRoute` `GET`/`PUT` return `{ ...values, defaults }` (`MailboxPolicyResponse`), `defaults` being
+  `this.seed()` - the live config, read per request, not the row. **Deliberately not** "reset = clear the field on the
+  row so it falls back to config live": that would make a reset field silently track config forever (an admin could no
+  longer tell an override from a default), and no other write path clears a field today. Reset is therefore a plain `PUT` of the default value (same validation,
+  same audit entry), which needs no new endpoint or migration.
+- `findOrSeedMailboxPolicy()`'s datastore-failure fallback still returns config for `get()`, and `defaults` is the same
+  object then, so a console reading during an outage shows nothing to reset.
+- Tests: `systemSettingsSuite.ts` (runs on both Mongo and SQL) - `defaults` before anything is saved, after edits, and a
+  reset by `PUT`. `tsc --noEmit`/`eslint` clean on the changed files.

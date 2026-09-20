@@ -25,6 +25,16 @@ export interface PublicMailboxPolicy {
     autoProvisionQuotaBytes: number;
 }
 
+/**
+ * The wire shape of `GET`/`PUT /system/mailbox-policy`: the values in effect, plus the server's current config values
+ * for the same fields (`defaults`), which is what an admin console's "reset" puts a field back to. `defaults` is read
+ * from config on every request rather than from the saved row, so a deployment that ships new config is offered its
+ * new values without any migration of the row.
+ */
+export interface MailboxPolicyResponse extends PublicMailboxPolicy {
+    defaults: PublicMailboxPolicy;
+}
+
 const FIELDS = ["defaultQuotaBytes", "autoProvisionEnabled", "autoProvisionQuotaBytes"] as const;
 
 /**
@@ -78,12 +88,13 @@ export abstract class BaseMailboxPolicyRoute<T extends MailboxPolicy> {
     }
 
     /** A row missing a field (`null` on SQL) takes the config value - see `findOrSeedMailboxPolicy()`. */
-    private toPublic(policy: MailboxPolicy): PublicMailboxPolicy {
+    private toPublic(policy: MailboxPolicy): MailboxPolicyResponse {
         const seed = this.seed();
         return {
             defaultQuotaBytes: policy.defaultQuotaBytes ?? seed.defaultQuotaBytes,
             autoProvisionEnabled: policy.autoProvisionEnabled ?? seed.autoProvisionEnabled,
             autoProvisionQuotaBytes: policy.autoProvisionQuotaBytes ?? seed.autoProvisionQuotaBytes,
+            defaults: seed,
         };
     }
 
@@ -100,17 +111,22 @@ export abstract class BaseMailboxPolicyRoute<T extends MailboxPolicy> {
         }
     }
 
-    /** Any signed-in user; an anonymous caller gets a `401`. Display-only, so a failed read falls back to config. */
+    /**
+     * Any signed-in user; an anonymous caller gets a `401`. Display-only, so a failed read falls back to config.
+     * `defaults` is always the current config, whatever the saved row holds.
+     */
     @Auth(["jwt"])
     @Get()
-    public async get(): Promise<PublicMailboxPolicy> {
-        return await findOrSeedMailboxPolicy(this._objectFactory!, this.mailboxPolicyClass, this.seed(), this.logger);
+    public async get(): Promise<MailboxPolicyResponse> {
+        const seed = this.seed();
+        const policy = await findOrSeedMailboxPolicy(this._objectFactory!, this.mailboxPolicyClass, seed, this.logger);
+        return { ...policy, defaults: seed };
     }
 
     @RequiresTrustedRole()
     @Put()
     @Validate("validateUpdate")
-    public async update(obj: Partial<PublicMailboxPolicy> | undefined, @AuthUser user?: JWTUser): Promise<PublicMailboxPolicy> {
+    public async update(obj: Partial<PublicMailboxPolicy> | undefined, @AuthUser user?: JWTUser): Promise<MailboxPolicyResponse> {
         const patch: Partial<PublicMailboxPolicy> = {};
         for (const field of FIELDS) {
             if (obj?.[field] !== undefined) {

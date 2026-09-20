@@ -37,15 +37,17 @@ export function systemSettingsSuite(ctx: SystemSettingsSuiteContext): void {
 
     describe("mailbox policy", () => {
         const url = () => `${ctx.prefix}/mailbox-policy`;
+        /** What the server's config says for each field - what the policy is seeded with, and what `defaults` reports. */
+        const configValues = () => ({
+            defaultQuotaBytes: DEFAULT_MAILBOX_QUOTA_BYTES,
+            autoProvisionEnabled: ctx.config.get("mail:auto_provision:enabled") ?? false,
+            autoProvisionQuotaBytes: ctx.config.get("mail:auto_provision:quota_bytes") ?? DEFAULT_MAILBOX_QUOTA_BYTES,
+        });
 
         it("returns config-derived defaults to any signed-in user before anything is saved", async () => {
             const result = await as(userToken, request(ctx.app()).get(url()));
             expect(result.status).toBe(200);
-            expect(result.body).toEqual({
-                defaultQuotaBytes: DEFAULT_MAILBOX_QUOTA_BYTES,
-                autoProvisionEnabled: ctx.config.get("mail:auto_provision:enabled") ?? false,
-                autoProvisionQuotaBytes: ctx.config.get("mail:auto_provision:quota_bytes") ?? DEFAULT_MAILBOX_QUOTA_BYTES,
-            });
+            expect(result.body).toEqual({ ...configValues(), defaults: configValues() });
             expect((await request(ctx.app()).get(url())).status).toBe(401);
         });
 
@@ -66,8 +68,21 @@ export function systemSettingsSuite(ctx: SystemSettingsSuiteContext): void {
             expect(second.body).toEqual(expect.objectContaining({ defaultQuotaBytes: 1000, autoProvisionEnabled: true, autoProvisionQuotaBytes: 2000 }));
 
             const read = await as(userToken, request(ctx.app()).get(url()));
-            expect(read.body).toEqual({ defaultQuotaBytes: 1000, autoProvisionEnabled: true, autoProvisionQuotaBytes: 2000 });
+            expect(read.body).toEqual({ defaultQuotaBytes: 1000, autoProvisionEnabled: true, autoProvisionQuotaBytes: 2000, defaults: configValues() });
             expect(await ctx.auditActions()).toEqual([AuditAction.MAILBOX_POLICY_UPDATE, AuditAction.MAILBOX_POLICY_UPDATE]);
+        });
+
+        it("reports the server's config values as defaults whatever has been saved, so an admin can reset a field to them", async () => {
+            await as(adminToken, request(ctx.app()).put(url())).send({ defaultQuotaBytes: 1000, autoProvisionEnabled: !configValues().autoProvisionEnabled, autoProvisionQuotaBytes: 2000 });
+
+            const read = await as(userToken, request(ctx.app()).get(url()));
+            expect(read.body.defaultQuotaBytes).toBe(1000);
+            expect(read.body.defaults).toEqual(configValues());
+
+            // Sending a default back is an ordinary update, and leaves the defaults themselves untouched.
+            const reset = await as(adminToken, request(ctx.app()).put(url())).send({ defaultQuotaBytes: read.body.defaults.defaultQuotaBytes });
+            expect(reset.status).toBe(200);
+            expect(reset.body).toEqual(expect.objectContaining({ defaultQuotaBytes: configValues().defaultQuotaBytes, autoProvisionQuotaBytes: 2000, defaults: configValues() }));
         });
 
         it("fills fields a previously saved row lacks from config, on reads and writes", async () => {

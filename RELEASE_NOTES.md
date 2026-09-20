@@ -1,5 +1,18 @@
 # Release Notes
 
+## Unreleased
+
+### Features
+
+- **`GET`/`PUT /system/mailbox-policy` report the server's config values as `defaults`:** the mailbox policy is seeded
+  from `mail:default_quota_bytes` and `mail:auto_provision:*` the first time it is read and is admin-editable after that,
+  so a deployment that ships new config never reached an administrator who had already saved the policy. Both responses now
+  carry `defaults` (`defaultQuotaBytes`, `autoProvisionEnabled`, `autoProvisionQuotaBytes`) alongside the values in
+  effect, always read from the current config and never from the saved row, which is what an admin console's "reset"
+  puts a field back to. Resetting is an ordinary `PUT` of the default (audited like any other edit), so nothing about
+  storage changes and there is nothing to migrate. Additive: the existing fields are untouched.
+  `MailboxPolicyResponse` is exported.
+
 ## v0.13.0
 
 ### Features
