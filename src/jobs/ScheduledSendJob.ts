@@ -6,6 +6,14 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
+import type { TransportError, TransportFailure } from "../transport/MailTransport.js";
+import type { MailRelayFailureDetails } from "../transport/TransportResultUtils.js";
+import {
+    type DeliveryNoticeSink,
+    deliveryFailureKey,
+    describeOriginal,
+    tryFileDeliveryFailureNotice,
+} from "../util/DeliveryFailureNoticeUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
@@ -49,6 +57,11 @@ const MAX_ERROR_LENGTH = 1000;
  * `scheduledSendTime` is pushed forward by `attempts x retry_backoff_ms`, which also moves it behind other due
  * messages in the (stably sorted) queue. After `max_attempts` it is left unsent with `scheduledSendError` set
  * and `scheduledSendTime` cleared.
+ * - Either way - a message refused above, or one given up on - the sender is told: a delivery failure notice (see
+ * `util/DeliveryFailureNoticeUtils.ts`) with everything the mail system said is filed in the sending mailbox's Inbox,
+ * once, after the write that took the message out of the queue succeeds. The same goes for a message the transport relayed
+ * to only some of its recipients: the ones it refused are reported. Notices are best-effort (a failure to file one is logged
+ * and never changes what happens to the message).
  * - Failure AFTER the transport accepted it (e.g. filing into Sent Items): the message is never relayed again.
  * `scheduledSendRelayedAt` is stamped on its own the moment the transport accepts (before any other write), and the
  * next run only finishes filing (subject to the same attempts/backoff budget).
@@ -211,6 +224,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
         let conversationId: string | undefined = (claimed as any).conversationId ?? undefined;
         let sanitizedHtmlBlobKey: string | undefined = (claimed as any).sanitizedHtmlBlobKey ?? undefined;
         let relayedAt: Date | undefined = alreadyRelayed ? new Date((claimed as any).scheduledSendRelayedAt) : undefined;
+        let undelivered: MailRelayFailureDetails | undefined;
 
         if (!alreadyRelayed) {
             // Wraps the transport so a failure *after* the transport accepted the message (inside
@@ -218,6 +232,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             // never retried as a fresh send - and so the relayed marker is persisted the moment the transport accepts,
             // before any other write that could fail.
             const trackingTransport = {
+                name: this.mailTransport.name,
                 send: async (outbound: any) => {
                     const result: any = await this.mailTransport.send(outbound);
                     if (result && (result.accepted ?? []).length > 0) {
@@ -259,6 +274,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     findThreadConversationId(this.messageRepo!, claimed.mailboxUid, ancestors),
                 );
                 sanitizedHtmlBlobKey = result.sanitizedHtmlBlobKey ?? sanitizedHtmlBlobKey;
+                undelivered = result.undelivered;
             } catch (err: any) {
                 if (!relayedAt) {
                     await this.recordFailedAttempt(claimed, dueAt, err, {});
@@ -272,6 +288,13 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     `ScheduledSendJob: message ${claimed.uid} was relayed but post-relay processing failed: ${err.message}`,
                 );
             }
+        }
+
+        if (undelivered) {
+            await this.reportUndelivered(claimed, deliveryFailureKey("scheduled-partial", claimed.uid), undelivered, {
+                messageId,
+                reason: "The mail system accepted this message for some of its recipients but refused these.",
+            });
         }
 
         try {
@@ -386,6 +409,54 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
         }
     }
 
+    /** Where delivery failure notices are filed. */
+    private noticeSink(): DeliveryNoticeSink {
+        return {
+            messageRepo: this.messageRepo!,
+            messageClass: this.messageClass,
+            folderRepo: this.folderRepo!,
+            folderClass: this.folderClass,
+            blobStore: this.blobStore!,
+            notificationUtils: this.notificationUtils,
+            logger: this.logger,
+        };
+    }
+
+    /**
+     * Tells `message`'s sender in their Inbox that it was not delivered (to everyone) - see `util/DeliveryFailureNoticeUtils.ts`:
+     * `details` is what the transport said (per-recipient status and responses, its error), `reason` the explanation in words
+     * when the mail system has none of its own (this job refusing the message). Best-effort and idempotent per `key`.
+     */
+    private async reportUndelivered(
+        message: M,
+        key: string,
+        details: MailRelayFailureDetails | undefined,
+        extra: { reason?: string; attempts?: number; messageId?: string; error?: TransportError },
+    ): Promise<void> {
+        await tryFileDeliveryFailureNotice(this.noticeSink(), `scheduled message ${message.uid}`, async () => {
+            const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true });
+            if (!mailbox) {
+                return undefined;
+            }
+            const recipients: string[] = (Array.isArray(message.recipients) ? message.recipients : []).map((recipient) => recipient.address);
+            const failures: TransportFailure[] =
+                details && details.failures.length > 0
+                    ? details.failures
+                    : recipients.map((address) => ({ address, response: extra.reason, temporary: false }));
+            return {
+                mailboxUid: message.mailboxUid,
+                mailboxAddress: mailbox.primarySmtpAddress,
+                key,
+                original: await describeOriginal(this.blobStore!, message, { messageId: extra.messageId }),
+                failures,
+                error: details?.error ?? extra.error,
+                transport: details?.transport,
+                reason: extra.reason,
+                attempts: extra.attempts,
+            };
+        });
+    }
+
     /** Takes `message` out of the due queue unsent with `reason` recorded. Version-checked, so a concurrent edit
      * (e.g. the user moving it into Outbox properly) wins. */
     private async refuse(message: M, reason: string): Promise<void> {
@@ -402,6 +473,9 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             { ignoreACL: true },
         );
         this.logger?.warn(`ScheduledSendJob: refusing to send scheduled message ${message.uid}: ${reason}`);
+        await this.reportUndelivered(message, deliveryFailureKey("scheduled-refused", message.uid, String((message as any).version)), undefined, {
+            reason,
+        });
     }
 
     /** Returns a refusal reason if `message` must not be relayed (or, with `folderOnly` - an already-relayed message
@@ -469,6 +543,15 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             );
             if (exhausted) {
                 this.logger?.error(`ScheduledSendJob: giving up on scheduled message ${uid} after ${attempts} attempts: ${reason}`);
+                // A message the transport had accepted (`scheduledSendRelayedAt`) is not undelivered - it only failed to be filed.
+                if (!extra.scheduledSendRelayedAt) {
+                    const details: MailRelayFailureDetails | undefined = err?.details;
+                    await this.reportUndelivered(current, deliveryFailureKey("scheduled-failed", uid, String((current as any).version)), details, {
+                        reason: `Gave up after ${attempts} attempts: ${reason}`,
+                        attempts,
+                        error: details ? undefined : { message: reason },
+                    });
+                }
             }
         } catch (updateErr: any) {
             this.logger?.warn(`ScheduledSendJob: failed to record a failed attempt for ${uid}: ${updateErr.message}`);

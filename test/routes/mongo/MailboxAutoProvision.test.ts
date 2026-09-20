@@ -61,8 +61,25 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
         return req.set("Authorization", "jwt " + token).set("Cookie", `jwt=${token}`);
     }
 
+    // What auth-server's `GET /api/aliases` answers with: `Alias` records, each naming itself in `alias`.
     function aliasResponse(values: string[], ok = true, status = 200) {
-        return { ok, status, json: vi.fn().mockResolvedValue(values.map((value) => ({ value }))) };
+        return {
+            ok,
+            status,
+            json: vi.fn().mockResolvedValue(
+                values.map((alias, i) => ({ uid: `alias-${i}`, version: 0, alias, type: "name", userUid: user.uid, verified: true })),
+            ),
+        };
+    }
+
+    const ALIAS_LIST_URL = "http://auth.test/api/aliases?type=name&userUid=me";
+
+    /** Stubs auth-server answering ONLY the real alias-list request with these name aliases; any other URL - such as the
+     * `/api/aliases/me?type=name` this route once asked for, which auth-server answers 404 - fails like the real thing. */
+    function mockAliasList(values: string[]) {
+        mockFetch.mockImplementation(async (url: string) =>
+            url === ALIAS_LIST_URL ? aliasResponse(values) : { ok: false, status: 404, json: vi.fn().mockResolvedValue({ code: "api-010" }) },
+        );
     }
 
     beforeAll(async () => {
@@ -149,7 +166,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
     });
 
     it("Returns 404 when auth-server reports no registered name aliases for the caller.", async () => {
-        mockFetch.mockResolvedValue(aliasResponse([]));
+        mockAliasList([]);
 
         const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
 
@@ -173,23 +190,145 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
         expect(result.status).toBe(404);
     });
 
-    it("Falls back to an alias entry's 'name' field when 'value' isn't present.", async () => {
+    it("Offers only name aliases not marked unverified: other types, unverified names, and entries with no alias (or in the old value/name shape) are skipped.", async () => {
         mockFetch.mockResolvedValue({
             ok: true,
             status: 200,
-            json: vi.fn().mockResolvedValue([{ name: "jsteinmetz" }]),
+            json: vi.fn().mockResolvedValue([
+                { alias: "someone@example.net", type: "email", verified: true, userUid: user.uid },
+                { alias: "pending", type: "name", verified: false, userUid: user.uid },
+                { alias: "jsteinmetz", type: "name", verified: true, userUid: user.uid },
+                { alias: "legacy", type: "name", userUid: user.uid },
+                { type: "name", verified: true, userUid: user.uid },
+                { alias: "no-type", userUid: user.uid },
+                { value: "old-shape", type: "name", verified: true, userUid: user.uid },
+                { name: "older-shape", type: "name", verified: true, userUid: user.uid },
+            ]),
         });
 
         const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
 
         expect(result.status).toBe(200);
-        expect(result.body.options).toEqual(
-            expect.arrayContaining([{ alias: "jsteinmetz", domain: "example.com", primarySmtpAddress: "jsteinmetz@example.com" }]),
-        );
+        // A record that doesn't say whether it is verified isn't treated as unverified.
+        expect(result.body.options.map((o: any) => o.primarySmtpAddress)).toEqual([
+            "jsteinmetz@example.com",
+            "jsteinmetz@example.org",
+            "legacy@example.com",
+            "legacy@example.org",
+        ]);
+    });
+
+    it("Asks auth-server for the caller's name aliases at GET /api/aliases?type=name&userUid=me, with their jwt cookie - not /api/aliases/me.", async () => {
+        mockAliasList(["jsteinmetz"]);
+
+        const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
+
+        expect(result.status).toBe(200);
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        const [url, init] = mockFetch.mock.calls[0];
+        expect(url).toBe("http://auth.test/api/aliases?type=name&userUid=me");
+        expect(new URL(url).pathname).toBe("/api/aliases");
+        expect(init.headers).toEqual({ Cookie: `jwt=${userToken}` });
+    });
+
+    it("Reads the alias out of each Alias record's 'alias' field.", async () => {
+        mockFetch.mockResolvedValue({
+            ok: true,
+            status: 200,
+            json: vi.fn().mockResolvedValue([
+                { uid: "1", version: 0, alias: "jsteinmetz", type: "name", userUid: user.uid, verified: true },
+            ]),
+        });
+
+        const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
+
+        expect(result.status).toBe(200);
+        expect(result.body.options).toEqual([
+            { alias: "jsteinmetz", domain: "example.com", primarySmtpAddress: "jsteinmetz@example.com" },
+            { alias: "jsteinmetz", domain: "example.org", primarySmtpAddress: "jsteinmetz@example.org" },
+        ]);
+    });
+
+    it("Returns 502 when auth-server answers the alias list with 404 - a missing endpoint is not 'no username'.", async () => {
+        mockFetch.mockResolvedValue({ ok: false, status: 404, json: vi.fn().mockResolvedValue({ code: "api-010" }) });
+
+        const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
+
+        expect(result.status).toBe(502);
+    });
+
+    const repoCount = async () => (await repo.find({}).toArray()).length;
+
+    describe("only the caller's own aliases count, whatever auth-server lists", () => {
+        /** A listing that mixes in aliases of other users (and of no user), as an unscoped answer to an administrator would. */
+        const mixedList = (ownUid: string) => ({
+            ok: true,
+            status: 200,
+            json: vi.fn().mockResolvedValue([
+                { uid: "1", alias: "someone-else", type: "name", userUid: uuid.v4(), verified: true },
+                { uid: "2", alias: "mine", type: "name", userUid: ownUid, verified: true },
+                { uid: "3", alias: "no-owner", type: "name", verified: true },
+                { uid: "4", alias: "mine-too", type: "name", userUid: ownUid.toUpperCase(), verified: true },
+                { uid: "5", alias: "numeric-owner", type: "name", userUid: 42, verified: true },
+            ]),
+        });
+
+        it("offers only the caller's own aliases when the answer also holds another user's.", async () => {
+            mockFetch.mockResolvedValue(mixedList(user.uid));
+
+            const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body.options.map((o: any) => o.alias)).toEqual(["mine", "mine", "mine-too", "mine-too"]);
+        });
+
+        it("offers an administrator only their own aliases, not everyone's.", async () => {
+            mockFetch.mockResolvedValue(mixedList(admin.uid));
+
+            const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), adminToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body.options.map((o: any) => o.alias)).toEqual(["mine", "mine", "mine-too", "mine-too"]);
+        });
+
+        it("refuses (400) an alias of another user requested through body.alias, creating nothing.", async () => {
+            for (const token of [userToken, adminToken]) {
+                mockFetch.mockResolvedValue(mixedList(token === userToken ? user.uid : admin.uid));
+
+                const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), token).send({
+                    alias: "someone-else",
+                    domain: "example.com",
+                });
+
+                expect(result.status).toBe(400);
+            }
+            expect(await repoCount()).toBe(0);
+        });
+
+        it("answers 404 - no username - when every alias listed belongs to someone else.", async () => {
+            mockFetch.mockResolvedValue(mixedList(uuid.v4()));
+
+            const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
+
+            expect(result.status).toBe(404);
+        });
+
+        it("refuses a plain POST / at another user's username, as at any name that is not the caller's own.", async () => {
+            mockFetch.mockResolvedValue(mixedList(user.uid));
+
+            const result = await withAuth(request(server.getApplication()).post(baseUrl), userToken).send({
+                primarySmtpAddress: "someone-else@example.com",
+                displayName: "Not mine",
+                timezone: "UTC",
+            });
+
+            expect(result.status).toBe(403);
+            expect(await repoCount()).toBe(0);
+        });
     });
 
     it("With no alias/domain chosen, returns needs_selection with the full alias x domain cross product.", async () => {
-        mockFetch.mockResolvedValue(aliasResponse(["jsteinmetz", "jp"]));
+        mockAliasList(["jsteinmetz", "jp"]);
 
         const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
 
@@ -207,7 +346,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
     });
 
     it("Rejects a chosen alias that isn't one of the caller's real auth-server aliases.", async () => {
-        mockFetch.mockResolvedValue(aliasResponse(["jsteinmetz"]));
+        mockAliasList(["jsteinmetz"]);
 
         const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken).send({
             alias: "not-mine",
@@ -218,7 +357,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
     });
 
     it("Rejects a chosen domain that isn't in the configured domain list.", async () => {
-        mockFetch.mockResolvedValue(aliasResponse(["jsteinmetz"]));
+        mockAliasList(["jsteinmetz"]);
 
         const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken).send({
             alias: "jsteinmetz",
@@ -229,7 +368,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
     });
 
     it("Creates the mailbox (with its well-known folders) for a valid chosen alias/domain, and returns status 'created'.", async () => {
-        mockFetch.mockResolvedValue(aliasResponse(["jsteinmetz"]));
+        mockAliasList(["jsteinmetz"]);
 
         const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken).send({
             alias: "jsteinmetz",
@@ -250,7 +389,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
 
     it("Uses the saved MailboxPolicy's quota for a self-created mailbox instead of the config value.", async () => {
         await policyRepo.save(new MailboxPolicyMongo({ uid: MAILBOX_POLICY_UID, autoProvisionQuotaBytes: 123_456 }));
-        mockFetch.mockResolvedValue(aliasResponse(["policyuser"]));
+        mockAliasList(["policyuser"]);
 
         const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken).send({
             alias: "policyuser",
@@ -262,7 +401,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
     });
 
     it("Seeds the MailboxPolicy from config on first use, so config-enabled auto-provisioning keeps working.", async () => {
-        mockFetch.mockResolvedValue(aliasResponse(["seeded"]));
+        mockAliasList(["seeded"]);
         const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
         expect(result.status).toBe(200);
         const policy: any = await policyRepo.findOne({ uid: MAILBOX_POLICY_UID } as any);
@@ -271,7 +410,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
 
     it("Returns 404 when the saved MailboxPolicy turns self-created mailboxes off, even though config enables them.", async () => {
         await policyRepo.save(new MailboxPolicyMongo({ uid: MAILBOX_POLICY_UID, autoProvisionEnabled: false }));
-        mockFetch.mockResolvedValue(aliasResponse(["policyuser"]));
+        mockAliasList(["policyuser"]);
 
         const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
 
@@ -337,7 +476,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
         userToken,
         adminToken,
         withAuth,
-        mockAliases: (aliases) => mockFetch.mockResolvedValue(aliasResponse(aliases)),
+        mockAliases: (aliases) => mockAliasList(aliases),
         disableSelfService: async () => {
             await policyRepo.save(new MailboxPolicyMongo({ uid: MAILBOX_POLICY_UID, autoProvisionEnabled: false }));
         },

@@ -1,5 +1,78 @@
 # Release Notes
 
+## Unreleased
+
+### Fixes
+
+- **Self-service mailbox creation (`POST /mail/mailboxes/auto-provision`, and the `POST /mail/mailboxes` and address/alias
+  changes a non-administrator makes for their own mailbox) could never work against a real auth-server.** `BaseMailboxRoute`
+  listed the caller's usernames with `GET /api/aliases/me?type=name`, which is not a list endpoint - auth-server reads `me`
+  there as an alias id (the caller's uid), finds none and answers 404 for **every** caller, one with a username included -
+  and, had it answered, read each entry's `value`/`name` where an auth-server `Alias` names itself in `alias`. The 404
+  surfaced as a 502 "Could not reach the identity service to determine your mailbox address", which a client shows as "No
+  mailbox available". It now calls `GET /api/aliases?type=name&userUid=me` (auth-server lists a non-administrator's own aliases only, and
+  `userUid=me` keeps an administrator's elevated token to their own too) and reads the `alias` of each entry that is a `name`
+  and not marked unverified - **and that belongs to the caller**: entries whose `userUid` is missing or another user's are dropped
+  here whatever auth-server answered, so an unscoped listing can never make `autoProvision()` offer, or accept, someone else's
+  username.
+  - Nothing else changes: a caller with no username still gets a 404 "No username is registered for this account.", any
+    non-2xx answer, network error or timeout is still a 502, and a caller can still only create a mailbox at one of their
+    own usernames. The request path is the one thing a deployment could have depended on: an auth-server stand-in must
+    answer `GET /api/aliases?type=name&userUid=me` with a JSON array of `{ alias, type: "name", userUid, verified }` records, instead of
+    `GET /api/aliases/me?type=name`.
+
+### Features
+
+- **A failed send now says what happened, in the mail system's own words, and nothing fails silently.** A reply to an
+  external address was accepted by Postfix and then vanished: the sender got neither an error nor a message. Delivery
+  problems are now reported on every path:
+  - **`MailTransport` results carry diagnostics.** `TransportResult` gains two optional, additive fields: `failures`
+    (`TransportFailure[]`: `address`, `code`, `enhancedCode`, `response`, `command`, `stderr`, `temporary`) and `error`
+    (`TransportError`: `message`, `code`, `response`, `responseCode`, `command`, `stderr`, `exitCode`, `requestId`).
+    `PostfixSendmailTransport` fills them from nodemailer's error plus what `sendmail` printed on stderr and its exit status
+    (nodemailer reports neither; they are captured off the child process it spawns), marking `sendmail`'s temporary exit codes
+    (EX_TEMPFAIL, EX_UNAVAILABLE, ...) temporary. `SesMailTransport` reports the SES exception name, message, HTTP status and
+    request id per recipient, throttling and server faults temporary. Diagnostic text is cleaned and capped, never a message body
+    or a credential. `sendOrThrow()`'s `TransportRejectedError` now appends the transport's error message.
+  - **`POST /messages/:id/send` (and any `scanAndRelay()` caller) answers a refused send with a `MailRelayError`:** status
+    **502**, the same `api-500` code as before, a `message` such as "This message could not be sent: the mail system refused it for
+    bob@example.net. Reason given: 554 5.7.1 <bob@example.net>: Recipient address rejected: Access denied", and a new **`details`**
+    object (`MailRelayFailureDetails`: `transport`, `recipients`, `accepted`, `rejected`, `failures`, `error`) in the response body,
+    which the framework serializes like `code`/`status`/`message`. The draft is moved back to Drafts as before. `MailRelayError`,
+    `MailRelayFailureDetails`, `relayFailureDetails()`, `transportFailuresOf()`, `describeRelayFailure()`, `parseSmtpStatus()` and
+    `cleanDiagnosticText()` are exported, and so is `util/DeliveryFailureNoticeUtils.ts` (`buildDeliveryFailureNotice()`,
+    `fileDeliveryFailureNotice()`, `tryFileDeliveryFailureNotice()`, `describeOriginal()`, `deliveryFailureKey()`) for a protocol package that
+    relays through `scanAndRelay()` and wants to report the `undelivered` recipients it now returns.
+  - **A failure notice is filed in the sender's Inbox for failures nobody is waiting on.** `util/DeliveryFailureNoticeUtils.ts`
+    composes an RFC 3464 delivery status notification - `multipart/report; report-type=delivery-status` with a plain-language
+    summary, a `message/delivery-status` part (per recipient: `Action`, `Status`, `Diagnostic-Code`, `Last-Attempt-Date`) and the
+    original's headers (not its body, and without `Bcc`) - from `Mail Delivery System <postmaster@DOMAIN>` (the identity
+    `BaseMailIngestRoute` already gives its rejection notices), marked `Auto-Submitted: auto-replied` (as Postfix marks its own
+    bounces), `X-Auto-Response-Suppress: All` and a null `Return-Path` so it cannot start a loop, and threaded onto the original.
+    It is filed unread and announced to connected clients exactly like a delivered message. `ScheduledSendJob` files one when it
+    refuses a message or gives up on it (after the write that takes it out of the queue succeeds), and both it and
+    `POST /messages/:id/send` file one for the recipients a transport refused while relaying to the others.
+  - **Idempotent by construction:** the notice's uid derives from the mailbox and a per-failure key
+    (`deliveryFailureKey()`/`deliveryFailureUid()`), so a retried job or a replayed request files one notice - and one a user
+    deleted is not filed back. Filing is best-effort: a failure to file is logged and never changes what happens to the message.
+  - **A message a local mailbox sent to a local address that resolves to nothing** is no longer dropped without a word: it used to
+    be logged and answered `queued: false` to an MTA that had already told the sender it was delivered. `POST /internal/mta/deliver`
+    now queues a notice of the same kind for the sender, as an ordinary null-sender ingest entry, once per message and recipient.
+    Nothing is sent for a null sender, an `Auto-Submitted` message, or a sender that is not one of this server's mailboxes.
+  - **Bounces from the MTA are filed like any inbound mail.** A Postfix DSN (null envelope sender, `From: MAILER-DAEMON@host`,
+    `multipart/report; report-type=delivery-status`) is now covered end to end - ingest, the scan pipeline, the Inbox - on MongoDB
+    and SQL, including an HTML notification surviving sanitization. One fix came of it: a bounce's `Message.from.address` was the
+    empty envelope sender, so the message list showed no sender; it is now the address of its `From` header
+    (`MAILER-DAEMON@host`) when the envelope sender is null. Ordinary mail is unaffected.
+  - **A bounce's list preview says why it bounced.** `ScanPipeline` used to preview a delivery status notification by its first 500
+    characters, which are Postfix's boilerplate ("This is the mail system at host ...") - the reason for the failure never fit. A
+    `multipart/report; report-type=delivery-status` message is now previewed by what its RFC 3464 report says, one entry per
+    recipient: `nobody@x.example: failed (5.1.1) - 550 5.1.1 <nobody@x.example>: Recipient address rejected: User unknown` (a
+    deferral reads `delayed (4.2.0)`). The stored source, and so what a client renders, is untouched. Verified against genuine
+    Postfix bounces (unknown recipient 550, expired 450, delayed 450) captured by `@rapidmx/postfix-bridge`, on MongoDB and SQL.
+  - No migration and nothing to configure. `RecordingMailTransport` (the test double) refuses `partial-reject@...` alone and
+    reports Postfix-style diagnostics for `reject@example.com`.
+
 ## v0.14.0
 
 ### Features

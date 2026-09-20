@@ -10,6 +10,7 @@ import { AvVerdict, RecipientType, SpamVerdict } from "../../src/models/types.js
 import { MAX_MESSAGE_RECIPIENTS } from "../../src/util/RecipientUtils.js";
 import type { SpamScanResult } from "../../src/scan/SpamScanProvider.js";
 import type { AvScanResult } from "../../src/scan/AvScanProvider.js";
+import { DSN_DELAYED_450, DSN_UNKNOWN_RECIPIENT_550 } from "../fixtures/postfixCapturedDsn.js";
 
 function makeEnvelope(overrides: any = {}) {
     return { from: "sender@example.com", to: ["recipient@example.com"], ...overrides };
@@ -527,6 +528,91 @@ describe("ScanPipeline Tests", () => {
 
             expect(result.inReplyTo).toBeUndefined();
             expect(result.references).toEqual([]);
+        });
+    });
+
+    describe("run() - delivery status notification preview", () => {
+        beforeEach(() => {
+            (pipeline as any).spamScanProvider = spamScanProvider;
+            (pipeline as any).avScanProvider = avScanProvider;
+        });
+
+        /** A notification whose report part is `report`, verbatim. */
+        const dsn = (report: string, text = "This is the mail system at host mx.example.com.\r\n\r\nBoilerplate boilerplate.") =>
+            Buffer.from(
+                [
+                    "From: Mail Delivery System <MAILER-DAEMON@mx.example.com>",
+                    "To: sender@example.com",
+                    "Subject: Undelivered Mail Returned to Sender",
+                    "MIME-Version: 1.0",
+                    'Content-Type: multipart/report; report-type=delivery-status; boundary="B"',
+                    "",
+                    "--B",
+                    "Content-Type: text/plain; charset=utf-8",
+                    "",
+                    text,
+                    "",
+                    "--B",
+                    "Content-Type: message/delivery-status",
+                    "",
+                    report,
+                    "",
+                    "--B--",
+                    "",
+                ].join("\r\n"),
+            );
+
+        it("Previews a real Postfix refusal by what its report says - recipient, action, status and the server's reason - not by its boilerplate.", async () => {
+            const result = await pipeline.run(DSN_UNKNOWN_RECIPIENT_550, makeEnvelope({ from: "" }));
+
+            expect(result.bodyPreview).toBe(
+                "nobody@refuse.lab: failed (5.1.1) - 550 5.1.1 <nobody@refuse.lab>: Recipient address rejected: User unknown in virtual mailbox table",
+            );
+        });
+
+        it("Previews a real Postfix delay as delayed, with the deferral's reason.", async () => {
+            const result = await pipeline.run(DSN_DELAYED_450, makeEnvelope({ from: "" }));
+
+            expect(result.bodyPreview).toBe(
+                "tmp@defer.lab: delayed (4.2.0) - 450 4.2.0 <tmp@defer.lab>: Recipient temporarily unavailable, try again later",
+            );
+        });
+
+        it("Lists every recipient of the report, leaves out a field it lacks, and keeps to the preview length.", async () => {
+            const report = [
+                "Reporting-MTA: dns; mx.example.com",
+                "",
+                "Final-Recipient: rfc822; a@x.example",
+                "Action: failed",
+                "",
+                "Final-Recipient: rfc822; b@x.example",
+                "Status: 4.4.1",
+                "",
+                "Final-Recipient: c@x.example",
+                "Diagnostic-Code: X-Local; " + "very long ".repeat(80),
+            ].join("\r\n");
+
+            const result = await pipeline.run(dsn(report), makeEnvelope());
+
+            expect(result.bodyPreview!.startsWith("a@x.example: failed; b@x.example: (4.4.1); c@x.example: - very long")).toBe(true);
+            expect(result.bodyPreview!.length).toBe(500);
+        });
+
+        it("Falls back to the ordinary text preview when the report names no recipient.", async () => {
+            const result = await pipeline.run(dsn("Reporting-MTA: dns; mx.example.com\r\nno-colon-here"), makeEnvelope());
+
+            expect(result.bodyPreview!.startsWith("This is the mail system at host mx.example.com.\n\nBoilerplate boilerplate.")).toBe(true);
+        });
+
+        it("Previews an ordinary message, or another kind of report, as before even if its text looks like a status report.", async () => {
+            const looksLikeOne = "Reporting-MTA: dns; mx.example.com\r\n\r\nFinal-Recipient: rfc822; a@x.example\r\nAction: failed";
+            const plain = Buffer.from(
+                ["From: a@x.example", "To: b@x.example", "Subject: Quoted", "Content-Type: text/plain", "", looksLikeOne, ""].join("\r\n"),
+            );
+            const receipt = dsn(looksLikeOne).toString().replace("report-type=delivery-status", "report-type=disposition-notification");
+
+            expect((await pipeline.run(plain, makeEnvelope())).bodyPreview).toBe(looksLikeOne.replace(/\r\n/g, "\n"));
+            expect((await pipeline.run(Buffer.from(receipt), makeEnvelope())).bodyPreview).toContain("Boilerplate boilerplate.");
         });
     });
 

@@ -6,6 +6,7 @@ import * as crypto from "crypto";
 import { ApiError } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
+import { MailRelayError, type MailRelayFailureDetails, relayFailureDetails } from "../transport/TransportResultUtils.js";
 import { deriveConversationId } from "./ConversationUtils.js";
 import { extractHeader, prependHeaders } from "./MimeHeaderUtils.js";
 import { resolveDeliveryVerdict, ScanPipeline } from "../scan/ScanPipeline.js";
@@ -48,6 +49,11 @@ export interface ScanAndRelayResult {
      * `util/SmimeUtils.ts`'s `isEncryptedBody()`. Threaded through so `BaseMessageRoute.send()` can persist
      * it onto the sent `Message`, the same signal `ScanQueueJob` stamps for inbound mail. */
     encrypted: boolean;
+
+    /** Set when the transport relayed the message to some envelope recipients but refused others: what it said about
+     * those it refused (`rejected`/`failures`), for the caller to tell the sender - see `util/DeliveryFailureNoticeUtils.ts`.
+     * Absent when every recipient was accepted. */
+    undelivered?: MailRelayFailureDetails;
 }
 
 /**
@@ -62,9 +68,12 @@ export interface ScanAndRelayResult {
  * unrelated random one. Every cross-mailbox feature that needs to recognize "the same message" across copies
  * (`recall()` in particular) depends on this identifier actually matching everywhere.
  *
- * Throws `ApiError` (422) if the scan pipeline's verdict is anything other than "deliver", or (502) if the
- * transport itself rejects the message outright - both cases callers should let propagate as the request's
- * own failure, not attempt to recover from.
+ * Throws `ApiError` (422) if the scan pipeline's verdict is anything other than "deliver", or a `MailRelayError`
+ * (502) if the transport itself rejects the message outright - both cases callers should let propagate as the request's
+ * own failure, not attempt to recover from. A `MailRelayError` says in plain words what was refused and carries the
+ * transport's own diagnostic text (SMTP/enhanced status codes, responses, what `sendmail` printed) in `details`.
+ * A transport that relays to some recipients and refuses others is not a failure: the refused ones are reported in the
+ * result's `undelivered`.
  */
 export async function scanAndRelay(
     raw: Buffer,
@@ -93,7 +102,7 @@ export async function scanAndRelay(
 
     const transportResult = await mailTransport.send({ raw: finalRaw, envelopeFrom, envelopeTo });
     if (transportResult.accepted.length === 0) {
-        throw new ApiError(ApiErrors.INTERNAL_ERROR, 502, "The mail transport rejected this message.");
+        throw new MailRelayError(relayFailureDetails(transportResult, envelopeTo, mailTransport.name));
     }
 
     let sanitizedHtmlBlobKey: string | undefined;
@@ -112,6 +121,7 @@ export async function scanAndRelay(
         references: scanResult.references,
         sanitizedHtmlBlobKey,
         encrypted: scanResult.encrypted,
+        ...((transportResult.rejected ?? []).length > 0 ? { undelivered: relayFailureDetails(transportResult, envelopeTo, mailTransport.name) } : {}),
     };
 }
 

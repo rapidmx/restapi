@@ -882,7 +882,9 @@ export abstract class ScanQueueJob<
         const recipients: Recipient[] = buildDeliveredRecipients(result.headerRecipients, entry.envelopeTo);
         // `displayName` is the sender's display name alone (`parsedFrom` is the whole `From` header value, name
         // and address both, which a client then rendered a second time after the address it also shows).
-        const sender: Recipient = { address: entry.envelopeFrom, displayName: result.fromDisplayName, type: RecipientType.TO };
+        // A bounce (a delivery status notification) has a null envelope sender - `<>` - so what its reader is shown is the address
+        // in its own `From` header (`MAILER-DAEMON@host`), not a blank.
+        const sender: Recipient = { address: entry.envelopeFrom || result.fromAddress || "", displayName: result.fromDisplayName, type: RecipientType.TO };
         // Independent of everything below (filtering, filing, junk classification) - `specs/
         // end-to-end_encryption.md`'s "Only inbound messages are processed, keyed on the From address" rule
         // applies to every delivered message regardless of which folder (or none) it ends up filed into.

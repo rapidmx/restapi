@@ -25,6 +25,8 @@ import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { findActiveHoldsFor } from "../util/LegalHoldUtils.js";
 import { applyThreadHeaders, scanAndRelay } from "../util/MailSendUtils.js";
+import type { MailRelayFailureDetails } from "../transport/TransportResultUtils.js";
+import { deliveryFailureKey, describeOriginal, tryFileDeliveryFailureNotice } from "../util/DeliveryFailureNoticeUtils.js";
 import { coerceDateValue } from "../util/DateCoercionUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
@@ -748,7 +750,11 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * `mail:jobs:scheduled_send:lease_ms`), which only one of two concurrent sends can win and which keeps the message
      * from being moved out of Outbox (409) until it's filed or the lease lapses. A message already in Outbox
      * (scheduled, or claimed by an in-flight send) is refused (409) - move it back to Drafts first. A failed relay moves
-     * it back where it was. `scheduledSendRelayedAt` is persisted the moment the transport accepts; a relay that
+     * it back where it was, and answers 502 with a `MailRelayError`: a sentence saying who was refused and why, and the
+     * mail system's own diagnostics (per-recipient SMTP/enhanced status codes and responses, the transport error) in a
+     * `details` object. A transport that relays to some recipients and refuses others is not a failure: the message is filed
+     * as sent, and the refused recipients are reported in a delivery failure notice in the sender's Inbox
+     * (`util/DeliveryFailureNoticeUtils.ts`). `scheduledSendRelayedAt` is persisted the moment the transport accepts; a relay that
      * succeeded but couldn't be filed into Sent Items is made due, so `ScheduledSendJob` only finishes the filing and
      * never relays it again. Filing only happens while the message is still in Outbox under this send's claim.
      */
@@ -943,7 +949,14 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             references,
             sanitizedHtmlBlobKey: scannedHtmlBlobKey,
             encrypted,
+            undelivered,
         } = await this.relayClaimed(claimed, message.folderUid, raw, envelopeTo);
+        // The transport relayed the message to some recipients and refused others: nobody is waiting on a failed
+        // response for those, so the sender is told in their Inbox.
+        if (undelivered) {
+            // `assertSenderAllowed()` above refused a sender that has no mailbox.
+            await this.reportUndelivered(message, sendingMailbox!, undelivered, messageId);
+        }
         // The Sent Items copy joins the conversation the message it replies to is already in, rather than
         // starting one keyed on whichever ancestor its own headers happen to name - see `resolveConversationId()`.
         const conversationId: string = await this.threadConversationId(message.mailboxUid, references, inReplyTo, messageId);
@@ -962,6 +975,33 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw err;
         }
         /* v8 ignore stop */
+    }
+
+    /**
+     * Files a delivery failure notice (`util/DeliveryFailureNoticeUtils.ts`) in `mailbox`'s Inbox for the recipients the
+     * transport refused while relaying `message` to the others. Best-effort (a failure is logged, the send is unaffected)
+     * and idempotent per message.
+     */
+    private async reportUndelivered(message: T, mailbox: Mailbox, details: MailRelayFailureDetails, messageId: string): Promise<void> {
+        const sink = {
+            messageRepo: this.repoUtils!,
+            messageClass: this.modelClass,
+            folderRepo: await this.getFolderRepo(),
+            folderClass: this.folderClass,
+            blobStore: this.blobStore!,
+            notificationUtils: this.notificationUtils,
+            logger: this.logger,
+        };
+        await tryFileDeliveryFailureNotice(sink, `message ${message.uid}`, async () => ({
+            mailboxUid: message.mailboxUid,
+            mailboxAddress: mailbox.primarySmtpAddress,
+            key: deliveryFailureKey("send-partial", message.uid),
+            original: await describeOriginal(this.blobStore!, message, { messageId }),
+            failures: details.failures,
+            error: details.error,
+            transport: details.transport,
+            reason: "The mail system accepted this message for some of its recipients but refused these.",
+        }));
     }
 
     /** The `conversationId` a message carrying these threading headers belongs to in `mailboxUid`: the
@@ -1092,6 +1132,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     private async relayClaimed(claimed: T, originalFolderUid: string, raw: Buffer, envelopeTo: string[]) {
         let accepted: boolean = false;
         const trackingTransport = {
+            name: this.mailTransport.name,
             send: async (outbound: any) => {
                 const result: any = await this.mailTransport.send(outbound);
                 if (result.accepted.length > 0) {

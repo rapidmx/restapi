@@ -199,8 +199,8 @@ mid-session — general backend capability any consumer of this library might wa
 
 - **`BaseMailboxRoute.autoProvision()`** (`POST .../auto-provision`, `@Auth(["jwt"])`): this system
   has no email registered anywhere for a brand-new user by definition, so the address has to be
-  derived from identity auth-server already has — calls auth-server's own `GET /api/aliases/me?
-  type=name`, forwarding the caller's `jwt` cookie (so it only ever sees *their* aliases), then
+  derived from identity auth-server already has — calls auth-server's own `GET /api/aliases?
+  type=name` (originally written as `/aliases/me`, which never existed - see the 2026-09-20 entry), forwarding the caller's `jwt` cookie (so it only ever sees *their* aliases), then
   offers the full cross product of those aliases against the new `mail:domains` config as the set of
   addresses the caller could register. A caller can have more than one alias and a deployment can
   serve more than one domain — deliberately **never auto-creates on the first call**, even when
@@ -2349,3 +2349,153 @@ by anything in this change; worth giving each file its own port one day.
   object then, so a console reading during an outage shows nothing to reset.
 - Tests: `systemSettingsSuite.ts` (runs on both Mongo and SQL) - `defaults` before anything is saved, after edits, and a
   reset by `PUT`. `tsc --noEmit`/`eslint` clean on the changed files.
+
+## 2026-09-20 — Self-service mailbox creation never worked: wrong auth-server alias endpoint and response field
+
+- Symptom (verified live by JP, with real accounts that all have a `name` alias): the web client showed "No mailbox
+  available - ask an administrator" for everyone. Root cause was in `BaseMailboxRoute.fetchNameAliases()` (used by
+  `autoProvision()` and by the non-trusted branches of `create()`/`validateAliasChange()`/the primary-address change),
+  which had been written against a made-up contract and only ever tested against a `fetch` mock of the same made-up contract:
+  1. It called `GET {auth}/api/aliases/me?type=name`. auth-server has no such list endpoint: `GET /aliases/:id` reads `me` as
+     the caller's *uid* (`ModelRoute.doFindById`), which is never an alias id, so it is a 404 (`api-010`) for every caller, and
+     `fetchNameAliases()` turned every non-ok answer into a 502 "Could not reach the identity service...".
+  2. It read `entry.value ?? entry.name`; an auth-server `Alias` is `{ uid, alias, type, userUid, verified, version, ... }`.
+     Fixing only the URL would have returned `[]` (a 404 "No username is registered").
+- Fix: `GET {auth}/api/aliases?type=name` (auth-server's `BaseAliasRoute.find()` forces `userUid` to the caller for a
+  non-administrator, and auth-server's own UI lists with `GET /aliases`), keep entries with `type === "name"` and
+  `verified !== false`, read `entry.alias`. Non-ok / network error / timeout stay a 502 with the same wording; an empty list
+  still ends in the 404 "No username is registered for this account."
+- **Not loosened**: `create()`'s non-trusted branch (`assertSelfServiceCreate()`) compares every address to that list via
+  `ownsAddress()`, so an account with no username (empty list) is still refused a self-chosen address (403); covered by a new
+  case in `mailboxSelfServiceCreateSuite.ts`. There is still no way to *pick* a username through this API: an account with no
+  name alias has to register one in auth-server first. A `needs_username`/create-alias flow was considered and deliberately
+  dropped - alias creation stays authoritative in auth-server (which also demands a freshly confirmed identity for it,
+  `@RequiresElevation(60)`, so a server-to-server call with an ordinary session cookie would be refused anyway).
+- **Scoping (follow-up, same day):** `BaseAliasRoute.find()` returns *every* alias to a caller carrying a trusted role (only an elevated
+  token has one), so an elevated administrator's cookie listed all users' name aliases, and `autoProvision()` would have offered and
+  accepted another user's username. Fixed twice over: (1) `fetchNameAliases(req, user)` now drops every entry whose `userUid` is not the
+  caller's (case-insensitive; missing or non-string `userUid` dropped) - the real guard, since it does not depend on auth-server -
+  applied in addition to the type/verified filter and **never to `staticAliases`** (dev); the JWTUser is passed through
+  `assertSelfServiceCreate()`, `validateAliasChange()` and `validateAddressChange()` too, so `POST /` and the alias/address updates
+  are guarded the same way; (2) the request also carries `&userUid=me`. That one is justified from source, not live: `ModelUtils.
+  coerceOperand()` turns a plain query value `"me"` into `user.uid` on both the SQL and Mongo query builders, and `RepoUtils.find()` is
+  given `options.user` by `ModelRoute.doFind()`, which `BaseAliasRoute.find()` reaches via `super.find()` for a trusted caller (a
+  non-trusted caller's `userUid` is overwritten with their own uid anyway). Tests (mongo and sql): a listing mixing another user's,
+  no-owner and non-string-owner entries offers only the caller's, for a user and for an administrator; another user's alias in
+  `body.alias` is a 400; all-foreign is the usual 404; plain `POST /` at another's username is a 403.
+- Tests: `MailboxAutoProvision.test.ts` (mongo and sql) now stub auth-server answering **only** `GET /api/aliases?type=name`
+  with real `Alias` records (any other URL, the old `/aliases/me` included, is its 404), so the whole file and the shared
+  `mailboxSelfServiceCreateSuite` fail against the old code - plus explicit request-shape, `alias` field, type/verified
+  filtering and 404 -> 502 tests.
+
+## 2026-09-20 — Delivery failures were silent: transport diagnostics, a 502 with `details`, and failure notices in the Inbox
+
+Trigger (verified live on JP's host): a reply to an external address was accepted by Postfix and vanished - no error in the UI,
+nothing in the inbox. The routing half (Postfix `transport_maps` sending everything to the bridge) is fixed in
+`postfix-bridge`; JP's requirement here: **whenever delivery fails there must be a message explaining what happened, with the
+underlying MTA/SMTP error.**
+
+- **What `sendmail` can and cannot tell us.** `PostfixSendmailTransport` submits with `sendmail -i -f from to...` via nodemailer's
+  `sendmail` transport (`nodemailer/dist/esm/sendmail-transport`). That only *queues* the message: it exits 0 once Postfix has it, so a
+  remote server's `554 5.7.1 Recipient address rejected` can only ever arrive **later, as a bounce DSN** (task D below). The
+  synchronous failures are local (sendmail missing/EX_USAGE/EX_TEMPFAIL, Postfix refusing the submission) and apply to every
+  recipient. nodemailer reports only `Sendmail exited with code N` + `code: "ESENDMAIL"` - it does **not** capture stderr, the exit
+  code as a field, or per-recipient SMTP replies - so `captureSendmail()` wraps the `_spawn` hook nodemailer exposes "for mocking
+  purposes" (`transport.transporter._spawn`) to listen to the same child's stderr (last 2000 chars) and exit status. That hook is
+  private API: without it the transport still returns the nodemailer message/code, just no stderr/exit code (tested).
+- **`TransportResult` gained `failures?: TransportFailure[]` and `error?: TransportError`** (both optional; an existing transport
+  is unaffected). `TransportFailure = { address, code?, enhancedCode?, response?, command?, stderr?, temporary? }`,
+  `TransportError = { message, code?, response?, responseCode?, command?, stderr?, exitCode?, requestId? }`.
+  `transportFailuresOf(result, envelopeTo)` (transport/TransportResultUtils.ts) normalizes: one failure per undelivered recipient,
+  the transport's own entry if any else one derived from `error` (response = error.response, else first stderr line, else message),
+  SMTP/enhanced codes parsed out of the text (`parseSmtpStatus()`, class 4 = temporary, 5 = permanent), everything through
+  `cleanDiagnosticText()` (control chars dropped, 2000 chars). Never a body, header or credential. `sendmail` exit codes 69/71-75
+  are marked temporary. SES: `err.name` -> `error.code`, `$metadata.httpStatusCode/requestId`, throttling/`$fault: "server"` temporary.
+- **Synchronous surface: `MailRelayError extends ApiError`** (transport/TransportResultUtils.ts), thrown by `scanAndRelay()` when
+  `accepted` is empty, replacing the old generic 502 "The mail transport rejected this message.". **Status 502, code unchanged
+  (`api-500`)** so existing clients keep working; `message` is a sentence ("This message could not be sent: the mail system refused it
+  for X. Reason given: 554 5.7.1 ..."), **`details: MailRelayFailureDetails`** = `{ transport, recipients, accepted, rejected,
+  failures[], error? }`. `@rapidrest/service-core`'s `Server.serializeError()` spreads the error's own enumerable props, so a subclass field
+  reaches the client with no framework change; `ApiError`'s constructor resets the prototype, hence `Object.setPrototypeOf(this,
+  MailRelayError.prototype)` in ours (same as `BulkError`). The 5xx is logged at error level by the framework, as any 502 was. The
+  message stays in Drafts: `relayClaimed()` -> `releaseClaim()` was already the behavior; now asserted (folder, lease and
+  `scheduledSendRelayedAt` cleared, nothing in Sent Items) in `messageSendFailureSuite.ts` on both backends. **No notice for a
+  synchronous failure** - the caller is being told directly; "a send that fails after the client went away" cannot be detected in
+  the request handler and is not covered separately.
+- **Partial rejection is no longer silent.** `scanAndRelay()` treated `accepted.length > 0` as success and dropped `rejected`;
+  it now returns `undelivered` (details for the refused recipients) alongside the normal result. `send()` and `ScheduledSendJob`
+  file a notice for them and carry on (the message *was* relayed). `sendmail` never produces this (`rejected` is always empty), SES
+  is all-or-nothing; it exists for any transport that reports per recipient.
+- **Notice generator: `util/DeliveryFailureNoticeUtils.ts`** (`buildDeliveryFailureNotice`, `fileDeliveryFailureNotice`,
+  `tryFileDeliveryFailureNotice`, `describeOriginal`, `originalHeaderBlock`, `deliveryFailureKey/Uid`). Built with nodemailer's
+  `MimeNode` (`MailComposer` cannot emit `multipart/report`). From = `Mail Delivery System <postmaster@<mailbox domain>>` - the
+  identity `BaseMailIngestRoute.applyTransportRules()` already uses for its rejection notices (not `mailer-daemon@`, which nothing
+  here does). Headers: `Return-Path: <>`, `Auto-Submitted: auto-replied` (what Postfix puts on its bounces; RFC 3834 also allows
+  `auto-generated`), `X-Auto-Response-Suppress: All`, `In-Reply-To`/`References` = the original's Message-ID. Parts: text/plain
+  summary (who, when, per-recipient status/SMTP code/server response/command/delivery-agent output, technical details), RFC 3464
+  `message/delivery-status` (per-message group + one group per recipient: `Action: failed`, `Status` = enhanced code, else class
+  from the SMTP code/`temporary`, else 5.0.0/4.0.0, `Diagnostic-Code: smtp; ...` or `X-RapidMX; ...` when there is no SMTP reply,
+  ASCII-only), `text/rfc822-headers` = original's header block **without Bcc**, ASCII-only, 16 KiB (never the body). At most 50
+  recipients listed, the rest counted.
+- **Where a notice is generated and filed.** *Direct into the Inbox* (not via the ingest queue) for `send()` partial failures and
+  `ScheduledSendJob`: those need it immediately, have the message/folder repos and `NotificationUtils` already, and the server wrote
+  the message so there is nothing to scan. It creates the `Message` (`importance: high`, unread), bumps the Inbox counters (same
+  retry as `ScanQueueJob.bumpFolderCounters()`, duplicated to leave that class alone) and calls
+  `NotificationUtils.sendMessage(inbox.uid, ..., "create", message)` like `deliverMessage()`. *Via the ingest queue* for the
+  `deliver()` drop (BaseMailIngestRoute has no message/folder repos): an `IngestQueueEntry` with `envelopeFrom: ""`, so
+  `ScanQueueJob` files it seconds later like a bounce. `ScheduledSendJob` notifies (a) from `refuse()` and (b) when
+  `recordFailedAttempt()` reaches `max_attempts` - and **only after the update that took the message out of the queue succeeded** - but
+  **not** when the failure is post-relay (`scheduledSendRelayedAt` set: the message was delivered, only its filing failed).
+- **Dedupe key = uid.** `nameBasedUuid("delivery-failure:<mailboxUid>:<key>")`; `fileDeliveryFailureNotice()` skips if a row with
+  that uid exists **including soft-deleted** (a notice the user deleted is not resurrected) and re-checks after a failed create (lost
+  race). Keys: `scheduled-refused:<uid>:<row version>`, `scheduled-failed:<uid>:<row version>` (the version being transitioned FROM
+  is unique per failure, so a message rescheduled and failing again reports again but a retried write does not), `scheduled-partial:<uid>`,
+  `send-partial:<uid>`, `dropped:<lowercased Message-ID or sha256(raw)>:<rcpt>` (the ingest entry's uid is the same derivation, so an MTA
+  redelivering the same transaction collides).
+- **Inbound bounces (D).** A Postfix-format DSN fixture (`test/fixtures/postfixDsn.ts`, hand-written field-for-field from bounce(8):
+  `Return-Path: <>`, `From: MAILER-DAEMON@host (Mail Delivery System)`, `Auto-Submitted: auto-replied`, `multipart/report;
+  report-type=delivery-status` with notification / `message/delivery-status` (X-Postfix-* fields) / `message/rfc822`) - **no real
+  capture existed** in `postfix-bridge` (it has no fixtures). `dsnDeliverySuite.ts` runs it through the real `ScanQueueJob` +
+  real `ScanPipeline` on Mongo and SQL: filed in the Inbox, unread, not quarantined, no auto-reply, HTML variant sanitized with the
+  diagnostic text intact. Nothing in the pipeline treats a null sender or missing SPF/DKIM as a quarantine reason (the verdict is AV +
+  spam score + TransportRule only); **what real rspamd scores a bounce is not verifiable here** (test doubles). One real bug found: a
+  bounce's `Message.from.address` was `entry.envelopeFrom` = `""`; `ScanQueueJob.deliverMessage()` now falls back to the `From` header's
+  address (`result.fromAddress`) when the envelope sender is null. `BaseMailIngestRoute.deliver()`'s "dropping delivery for unresolvable
+  recipient" path now calls `reportUnresolvableRecipient()`: only when the envelope sender is one of our own mailboxes (exact
+  primary/alias match - the postfix-bridge hands `deliver()` recipients Postfix already accepted, and locally-submitted mail bypasses
+  the `/resolve` check), never for a null sender or an `Auto-Submitted` message, best-effort. Not covered: other silent drops in
+  `deliver()` (restricted lists, unverified unsubscribe) - not asked for.
+- **Not verified here:** a real Postfix (`sendmail` stderr wording, real bounce DSN, what `smtpd`/milters do to a `<>` bounce on the way to
+  the bridge), real rspamd scoring of a bounce, and the web client's rendering of `details` and of a `multipart/report` message.
+- Files: `transport/{MailTransport,TransportResultUtils,PostfixSendmailTransport,SesMailTransport}.ts`, `util/{DeliveryFailureNoticeUtils,
+  MailSendUtils}.ts`, `routes/{BaseMessageRoute,BaseMailIngestRoute}.ts`, `jobs/{ScheduledSendJob,ScanQueueJob}.ts`. Tests:
+  `transport/*.test.ts`, `util/{DeliveryFailureNoticeUtils,MailSendUtils}.test.ts`, `routes/messageSendFailureSuite.ts` (+ mongo/sql
+  `MessageSendFailure.test.ts`), `routes/ingestDroppedNoticeSuite.ts` (in both `MailIngestRoute.test.ts`), `jobs/dsnDeliverySuite.ts` (in both
+  `ScanQueueJob*.test.ts`), the ScheduledSendJob suites, `fixtures/postfixDsn.ts`, and `testDoubles.ts`'s `RecordingMailTransport`.
+
+## 2026-09-20 (later) — Genuine Postfix bounces replace the hand-written DSN as the primary fixtures; bounce list preview
+
+`@rapidmx/postfix-bridge` captured real bounces from a boky/postfix container (docker lab, `.lab` placeholder domains) into its
+`test/fixtures/`; copied here byte-for-byte (verified equal once against the originals) as `test/fixtures/postfixCapturedDsn.ts` -
+`DSN_UNKNOWN_RECIPIENT_550`, `DSN_EXPIRED_450`, `DSN_DELAYED_450` (CRLF, exactly what the bridge POSTs to `/internal/mta/deliver`) and
+`DSN_ENVELOPE` (`X-Envelope-From` present-but-EMPTY, `X-Envelope-To: alice@owned.lab`). Stored as arrays of lines and rejoined with
+CRLF so git's autocrlf can't change them. The hand-written `postfixDsn.ts` stays only for its HTML variant.
+
+- (a) **The route treats the empty `X-Envelope-From` as the null sender.** `deliver()` reads `firstHeader(req, "x-envelope-from") ?? ""`;
+  through the real HTTP server an empty header arrives as `""` and a missing one as `undefined` -> `""`: both give a 202, `queued: true`
+  and an `IngestQueueEntry` with `envelopeFrom: ""` (not the `From:` header). Nothing needed fixing (`ingestBounceSuite`, both
+  backends). A bounce to a non-existent local address is dropped without a notice (a bounce is never bounced).
+- (b) **The `Action: delayed` notice is filed in the Inbox like the others**, unread, from `MAILER-DAEMON@mail.owned.lab`, subject
+  "Delayed Mail (still being retried)", `importance` normal. Nothing in our generator changed: it is Postfix's own text ("THIS IS A
+  WARNING ONLY. YOU DO NOT NEED TO RESEND YOUR MESSAGE", `Will-Retry-Until`), stored intact.
+- (c) **Sanitization is fine; the list *preview* was not.** Real notices are text-only (no `sanitizedHtmlBlobKey`; nothing is rewritten, the
+  wrapped diagnostic lines survive verbatim). But `bodyPreview` is the first 500 chars of `parsed.text`, and mailparser appends the
+  `message/delivery-status` part to `parsed.text` after the notification: on the captures the server's `said: 550 5.1.1 ...` starts at
+  char 433/428/621 of the notification, so the preview cut the reason off (delayed: never reached it). `ScanPipeline.derivePreview()` now
+  previews a `multipart/report; report-type=delivery-status` message by its report - `<Final-Recipient>: <Action> (<Status>) -
+  <Diagnostic-Code>` per recipient, `; `-joined, folded fields unfolded - and falls back to the text when the report names nobody. Only
+  DSNs are affected (checked via the parsed `Content-Type`: `report-type=disposition-notification` or a quoted report inside an ordinary
+  message keep the old preview). `MailFilterRule` body conditions see the new preview for a DSN. The notice this server generates is
+  the same shape, so it gets the same preview.
+- Also confirmed on the real captures: not quarantined (nothing in the verdict looks at a null sender or SPF/DKIM), no auto-reply sent,
+  `Message.from.address` = `MAILER-DAEMON@mail.owned.lab` (the earlier null-envelope fallback), stored source byte-identical to the input.

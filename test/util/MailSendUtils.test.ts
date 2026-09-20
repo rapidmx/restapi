@@ -13,6 +13,7 @@ import {
     threadHeaders,
 } from "../../src/util/MailSendUtils.js";
 import { AvVerdict, SpamVerdict } from "../../src/models/types.js";
+import { MailRelayError } from "../../src/transport/TransportResultUtils.js";
 import { InMemoryBlobStore, RecordingMailTransport } from "../testDoubles.js";
 
 function makeCleanScanResult(overrides: any = {}) {
@@ -90,12 +91,70 @@ describe("scanAndRelay() Tests", () => {
         ).rejects.toThrow(/failed spam\/malware scanning/);
     });
 
-    it("Throws a 502 ApiError when the mail transport rejects the message outright.", async () => {
-        vi.spyOn(mailTransport, "send").mockResolvedValue({ accepted: [], rejected: ["recipient@example.com"] });
+    it("Throws a 502 MailRelayError when the mail transport rejects the message outright, saying who and why.", async () => {
+        const response = "554 5.7.1 <recipient@example.com>: Recipient address rejected: Access denied";
+        vi.spyOn(mailTransport, "send").mockResolvedValue({
+            accepted: [],
+            rejected: ["recipient@example.com"],
+            failures: [{ address: "recipient@example.com", code: 554, enhancedCode: "5.7.1", response, command: "RCPT TO" }],
+            error: { message: "Sendmail exited with code 75", code: "ESENDMAIL", exitCode: 75, stderr: "sendmail: fatal: x" },
+        });
 
-        await expect(
-            scanAndRelay(makeRawMessage(), "sender@example.com", ["recipient@example.com"], scanPipeline as any, mailTransport, blobStore),
-        ).rejects.toThrow(/mail transport rejected/);
+        const error: any = await scanAndRelay(
+            makeRawMessage(),
+            "sender@example.com",
+            ["recipient@example.com"],
+            scanPipeline as any,
+            mailTransport,
+            blobStore,
+        ).catch((err) => err);
+
+        expect(error).toBeInstanceOf(MailRelayError);
+        expect(error.status).toBe(502);
+        expect(error.message).toBe(
+            "This message could not be sent: the mail system refused it for recipient@example.com. Reason given: " + response,
+        );
+        expect(error.details).toEqual({
+            transport: "recording",
+            recipients: ["recipient@example.com"],
+            accepted: [],
+            rejected: ["recipient@example.com"],
+            failures: [
+                { address: "recipient@example.com", code: 554, enhancedCode: "5.7.1", response, command: "RCPT TO", temporary: false },
+            ],
+            error: { message: "Sendmail exited with code 75", code: "ESENDMAIL", exitCode: 75, stderr: "sendmail: fatal: x" },
+        });
+    });
+
+    it("Reports the recipients a transport refused while relaying to the others as undelivered, and still succeeds.", async () => {
+        vi.spyOn(mailTransport, "send").mockResolvedValue({
+            accepted: ["a@example.com"],
+            rejected: ["b@example.com"],
+            failures: [{ address: "b@example.com", response: "550 5.1.1 no such user" }],
+        });
+
+        const result = await scanAndRelay(
+            makeRawMessage(),
+            "sender@example.com",
+            ["a@example.com", "b@example.com"],
+            scanPipeline as any,
+            mailTransport,
+            blobStore,
+        );
+
+        expect(result.undelivered).toEqual({
+            transport: "recording",
+            recipients: ["a@example.com", "b@example.com"],
+            accepted: ["a@example.com"],
+            rejected: ["b@example.com"],
+            failures: [{ address: "b@example.com", code: 550, enhancedCode: "5.1.1", response: "550 5.1.1 no such user", temporary: false }],
+        });
+    });
+
+    it("Reports nothing undelivered when every recipient was accepted.", async () => {
+        const result = await scanAndRelay(makeRawMessage(), "sender@example.com", ["a@example.com"], scanPipeline as any, mailTransport, blobStore);
+
+        expect(result.undelivered).toBeUndefined();
     });
 
     it("Stores a sanitized HTML blob when the scan result produced one.", async () => {

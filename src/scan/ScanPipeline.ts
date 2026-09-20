@@ -248,9 +248,19 @@ export class ScanPipeline {
         };
     }
 
-    /** Derives a short plain-text body preview from `parsed`'s plain-text part, falling back to its HTML part
-     * (converted to text) if it has none - truncated to `BODY_PREVIEW_MAX_LENGTH` characters. */
+    /**
+     * Derives a short plain-text body preview from `parsed`'s plain-text part, falling back to its HTML part
+     * (converted to text) if it has none - truncated to `BODY_PREVIEW_MAX_LENGTH` characters.
+     *
+     * A delivery status notification (a bounce: `multipart/report; report-type=delivery-status`) is previewed by what its
+     * report says instead (`deriveDeliveryStatusPreview()`): its notification text opens with a page of boilerplate ("This is
+     * the mail system at host ...") that would fill the preview before the reason for the failure is reached.
+     */
     private derivePreview(parsed: ParsedMail): string | undefined {
+        const report: string | undefined = this.deriveDeliveryStatusPreview(parsed);
+        if (report) {
+            return report.slice(0, BODY_PREVIEW_MAX_LENGTH);
+        }
         const text: string | undefined =
             typeof parsed.text === "string"
                 ? parsed.text
@@ -258,6 +268,42 @@ export class ScanPipeline {
                   ? convert(parsed.html, { wordwrap: false })
                   : undefined;
         return text?.trim().slice(0, BODY_PREVIEW_MAX_LENGTH);
+    }
+
+    /**
+     * One line per recipient of the delivery status report (RFC 3464) of a `multipart/report; report-type=delivery-status`
+     * message, joined with `; `: `<Final-Recipient>: <Action> (<Status>) - <Diagnostic-Code>`, e.g. `nobody@x.example: failed
+     * (5.1.1) - 550 5.1.1 <nobody@x.example>: Recipient address rejected: User unknown`. A field the report lacks is left out,
+     * folded fields are unfolded, and a group with no `Final-Recipient` (the per-message group) is skipped. `undefined` when the
+     * message is not such a report or it names no recipient.
+     *
+     * mailparser does not expose the `message/delivery-status` part as an attachment: it appends it to `parsed.text`, after the
+     * notification, where it starts at the report's mandatory `Reporting-MTA` field.
+     */
+    private deriveDeliveryStatusPreview(parsed: ParsedMail): string | undefined {
+        const contentType: any = parsed.headers.get("content-type");
+        const start: number = typeof parsed.text === "string" ? parsed.text.search(/^Reporting-MTA:/im) : -1;
+        if (contentType?.value !== "multipart/report" || contentType.params?.["report-type"] !== "delivery-status" || start < 0) {
+            return undefined;
+        }
+        const lines: string[] = [];
+        for (const group of parsed.text!.slice(start).replace(/\r\n/g, "\n").split(/\n{2,}/)) {
+            const fields: Map<string, string> = new Map();
+            for (const line of group.replace(/\n[ \t]+/g, " ").split("\n")) {
+                const colon: number = line.indexOf(":");
+                if (colon > 0) {
+                    fields.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
+                }
+            }
+            const recipient: string | undefined = fields.get("final-recipient")?.replace(/^[^;]*;\s*/, "");
+            if (recipient) {
+                const action: string | undefined = fields.get("action");
+                const status: string | undefined = fields.get("status");
+                const diagnostic: string | undefined = fields.get("diagnostic-code")?.replace(/^[^;]*;\s*/, "");
+                lines.push(`${recipient}:${action ? ` ${action}` : ""}${status ? ` (${status})` : ""}${diagnostic ? ` - ${diagnostic}` : ""}`);
+            }
+        }
+        return lines.length > 0 ? lines.join("; ") : undefined;
     }
 
     /** Finds this message's `text/calendar` part (an iTIP invite/reply/cancel), if it has one - mailparser

@@ -105,7 +105,47 @@ describe("SesMailTransport Tests", () => {
 
         const result = await transport.send(message);
 
-        expect(result).toEqual({ accepted: [], rejected: ["b@x.com", "c@x.com"] });
+        expect(result).toMatchObject({ accepted: [], rejected: ["b@x.com", "c@x.com"] });
+        expect(result.messageId).toBeUndefined();
+    });
+
+    it("Says why: the error carries SES's exception name, message, HTTP status and request id, and every recipient a failure entry.", async () => {
+        const failure: any = new Error("Email address is not verified. The following identities failed the check: a@x.com");
+        failure.name = "MessageRejected";
+        failure.$fault = "client";
+        failure.$metadata = { httpStatusCode: 400, requestId: "req-123" };
+        mockSend.mockRejectedValue(failure);
+
+        const result = await transport.send(makeMessage({ envelopeTo: ["b@x.com", "c@x.com"] }));
+
+        const response = "MessageRejected: Email address is not verified. The following identities failed the check: a@x.com";
+        expect(result.error).toEqual({
+            message: "Email address is not verified. The following identities failed the check: a@x.com",
+            code: "MessageRejected",
+            command: "SendEmail",
+            response,
+            responseCode: 400,
+            requestId: "req-123",
+        });
+        expect(result.failures).toEqual([
+            { address: "b@x.com", response, command: "SendEmail", temporary: false },
+            { address: "c@x.com", response, command: "SendEmail", temporary: false },
+        ]);
+    });
+
+    it("Marks throttling and server-side SES faults temporary, and copes with an error that names nothing.", async () => {
+        const throttled: any = Object.assign(new Error("Slow down"), { name: "TooManyRequestsException" });
+        mockSend.mockRejectedValueOnce(throttled);
+        expect((await transport.send(makeMessage())).failures![0].temporary).toBe(true);
+
+        const serverFault: any = Object.assign(new Error("Oops"), { name: "SomethingElse", $fault: "server" });
+        mockSend.mockRejectedValueOnce(serverFault);
+        expect((await transport.send(makeMessage())).failures![0].temporary).toBe(true);
+
+        mockSend.mockRejectedValueOnce({ name: 42 });
+        const bare = await transport.send(makeMessage());
+        expect(bare.error).toEqual({ message: "SES rejected the message.", command: "SendEmail", response: "SES rejected the message." });
+        expect(bare.failures![0].temporary).toBe(false);
     });
 
     it("Logs the error via the injected logger when SES throws.", async () => {
@@ -120,7 +160,7 @@ describe("SesMailTransport Tests", () => {
 
     it("Does not throw when no logger is set and SES throws.", async () => {
         mockSend.mockRejectedValue(new Error("relay refused"));
-        await expect(transport.send(makeMessage())).resolves.toEqual({
+        await expect(transport.send(makeMessage())).resolves.toMatchObject({
             accepted: [],
             rejected: expect.any(Array),
         });

@@ -6,6 +6,7 @@
 // ScheduledSendJobSQL.test.ts's file headers for the full rationale.
 import { ACLUtils, AccessControlListSQL, ConnectionManager, ObjectFactory, isSqlDataSource } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
+import { simpleParser } from "mailparser";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import config from "../../config.sql.js";
@@ -32,6 +33,15 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
     const transport = (): RecordingMailTransport => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
     const blobStore = (): any => objectFactory.getInstance<any>("BlobStore")!;
     const findMessage = async (uid: string): Promise<MessageSQL> => (await messageRepo.findOne({ where: { uid } }))!;
+
+    const findFolder = async (type: FolderType): Promise<any> => await folderRepo.findOne({ where: { mailboxUid, type } });
+    const inboxNotices = async (): Promise<MessageSQL[]> => {
+        const inbox = await findFolder(FolderType.INBOX);
+        return inbox ? await messageRepo.find({ where: { folderUid: inbox.uid } }) : [];
+    };
+    const messageRepoUpdate = async (uid: string, fields: any): Promise<void> => {
+        await messageRepo.update({ uid }, fields);
+    };
 
     const expireLease = async (uid: string): Promise<void> => {
         await messageRepo.update({ uid }, { scheduledSendTime: new Date(Date.now() - 1000) });
@@ -243,6 +253,138 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         expect(updated.scheduledSendAttempts).toBeFalsy();
         expect(updated.folderUid).toBe(outboxUid);
         expect(transport().sent.length).toBe(0);
+    });
+
+    describe("delivery failure notices", () => {
+        const past = () => new Date(Date.now() - 60 * 1000);
+        const noticeText = async (notice: any): Promise<string> => (await simpleParser(await blobStore().get(notice.bodyBlobKey))).text!;
+
+        it("Tells the sender in their Inbox, once, when it gives up on a message the mail system refused - with its diagnostics.", async () => {
+            (job as any).maxAttempts = 1;
+            const message = await createMessage({
+                subject: "Refused",
+                bodyBlobKey: await putBody("From: owner@example.com\r\nTo: reject@example.com\r\nBcc: hidden@example.com\r\nSubject: Refused\r\n\r\nSecret body\r\n"),
+                recipients: [{ address: "reject@example.com", type: RecipientType.TO }],
+                scheduledSendTime: past(),
+            });
+
+            await job.run();
+
+            const notices = await inboxNotices();
+            expect(notices).toHaveLength(1);
+            const notice: any = notices[0];
+            expect(notice.subject).toBe("Undeliverable: Refused");
+            expect(notice.from).toMatchObject({ address: "postmaster@example.com", displayName: "Mail Delivery System" });
+            expect(notice.recipients.map((recipient: any) => recipient.address)).toEqual(["owner@example.com"]);
+            expect(notice.flags.read).toBe(false);
+            const raw: string = (await blobStore().get(notice.bodyBlobKey)).toString();
+            expect(raw).toContain("Final-Recipient: rfc822; reject@example.com");
+            expect(raw).toContain("Status: 5.7.1");
+            expect(raw).toContain("Diagnostic-Code: smtp; 554 5.7.1 <reject@example.com>: Recipient address rejected: Access denied");
+            expect(raw).not.toContain("hidden@example.com");
+            expect(raw).not.toContain("Secret body");
+            const text = await noticeText(notice);
+            expect(text).toContain("Reason: Gave up after 1 attempts: This message could not be sent: the mail system refused it for reject@example.com.");
+            expect(text).toContain("Transport:   recording");
+            expect(text).toContain("Server response:  554 5.7.1 <reject@example.com>: Recipient address rejected: Access denied");
+            expect((await findMessage(message.uid)).scheduledSendError).toContain("Gave up after 1 attempts");
+
+            // Nothing more comes of it: the message is out of the queue, and a second look reports nothing new.
+            await job.run();
+            expect(await inboxNotices()).toHaveLength(1);
+        });
+
+        it("Reports each giving-up separately - a message rescheduled and failing again is a new failure.", async () => {
+            (job as any).maxAttempts = 1;
+            const message = await createMessage({
+                bodyBlobKey: await putBody("From: owner@example.com\r\nTo: reject@example.com\r\n\r\nHi\r\n"),
+                recipients: [{ address: "reject@example.com", type: RecipientType.TO }],
+                scheduledSendTime: past(),
+            });
+            await job.run();
+            expect(await inboxNotices()).toHaveLength(1);
+
+            await messageRepoUpdate(message.uid, { scheduledSendTime: past(), scheduledSendError: null });
+            await job.run();
+
+            expect(await inboxNotices()).toHaveLength(2);
+        });
+
+        it("Does not tell the sender a message failed after the transport had accepted it - it was delivered.", async () => {
+            (job as any).maxAttempts = 1;
+            const message = await createMessage({ bodyBlobKey: await putBody(), scheduledSendTime: past() });
+            // Fails the final re-fetch, after the transport already accepted the message.
+            vi.spyOn((job as any).messageRepo, "findOne").mockRejectedValueOnce(new Error("simulated filing failure"));
+
+            await job.run();
+
+            expect(transport().sent.length).toBe(1);
+            expect((await findMessage(message.uid)).scheduledSendError).toContain("Gave up after 1 attempts");
+            expect(await inboxNotices()).toEqual([]);
+        });
+
+        it("Tells the sender why a message was refused without being sent, in the job's own words.", async () => {
+            await createMessage({
+                from: { address: "ceo@example.com", type: RecipientType.TO },
+                bodyBlobKey: await putBody(),
+                scheduledSendTime: past(),
+            });
+
+            await job.run();
+
+            const notices = await inboxNotices();
+            expect(notices).toHaveLength(1);
+            const raw: string = (await blobStore().get((notices[0] as any).bodyBlobKey)).toString();
+            expect(raw).toContain("Final-Recipient: rfc822; recipient@example.com");
+            expect(raw).toContain("Status: 5.0.0");
+            expect(raw).toContain("Diagnostic-Code: X-RapidMX; The From address is not one of the sending mailbox's own addresses.");
+            expect(await noticeText(notices[0])).toContain("Reason: The From address is not one of the sending mailbox's own addresses.");
+        });
+
+        it("Tells the sender which recipients the mail system refused while relaying to the others, and still files the message as sent.", async () => {
+            const message = await createMessage({
+                subject: "Mixed",
+                bodyBlobKey: await putBody("From: owner@example.com\r\nTo: ok@example.com, partial-reject@example.com\r\nSubject: Mixed\r\n\r\nHi\r\n"),
+                recipients: [
+                    { address: "ok@example.com", type: RecipientType.TO },
+                    { address: "partial-reject@example.com", type: RecipientType.TO },
+                ],
+                scheduledSendTime: past(),
+            });
+
+            await job.run();
+
+            expect(transport().sent.map((sent) => sent.envelopeTo)).toEqual([["ok@example.com"]]);
+            const sentFolder: any = await findFolder(FolderType.SENT_ITEMS);
+            expect((await findMessage(message.uid)).folderUid).toBe(sentFolder.uid);
+            const notices = await inboxNotices();
+            expect(notices).toHaveLength(1);
+            const raw: string = (await blobStore().get((notices[0] as any).bodyBlobKey)).toString();
+            expect(raw).toContain("Final-Recipient: rfc822; partial-reject@example.com");
+            expect(raw).not.toContain("Final-Recipient: rfc822; ok@example.com");
+            expect(await noticeText(notices[0])).toContain("The mail system accepted this message for some of its recipients but refused these.");
+        });
+
+        it("Never lets a failure to file the notice change what happens to the message.", async () => {
+            (job as any).maxAttempts = 1;
+            const put = blobStore().put.bind(blobStore());
+            vi.spyOn(blobStore(), "put").mockImplementation((key: string, ...rest: any[]) =>
+                key.startsWith("notices/") ? Promise.reject(new Error("blob store down")) : put(key, ...rest),
+            );
+            const warn = vi.spyOn((job as any).logger, "warn");
+            const message = await createMessage({
+                bodyBlobKey: await putBody("From: owner@example.com\r\nTo: reject@example.com\r\n\r\nHi\r\n"),
+                recipients: [{ address: "reject@example.com", type: RecipientType.TO }],
+                scheduledSendTime: past(),
+            });
+
+            await job.run();
+
+            expect((await findMessage(message.uid)).scheduledSendError).toContain("Gave up after 1 attempts");
+            expect(await inboxNotices()).toEqual([]);
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("Failed to file the delivery failure notice for scheduled message"));
+        });
+
     });
 
     it("Does not let a permanently failing message block later due messages behind it.", async () => {

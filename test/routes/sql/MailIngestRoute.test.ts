@@ -15,6 +15,7 @@ import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL
 import { TransportRuleSQL } from "../../../src/models/sql/TransportRuleSQL.js";
 import { IngestStatus, QuarantineReason, TransportRuleActionType } from "../../../src/models/types.js";
 import { InMemoryBlobStore, RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
+import { ingestBounceSuite, ingestDroppedNoticeSuite } from "../ingestDroppedNoticeSuite.js";
 
 describe("Route:MailIngestRouteSQL Tests", () => {
     const logger = Logger();
@@ -290,6 +291,24 @@ describe("Route:MailIngestRouteSQL Tests", () => {
 
         expect(result.status).toBe(202);
         expect(result.body.results).toEqual([{ rcpt: "nobody@example.com", queued: false }]);
+    });
+
+    ingestBounceSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        secret,
+        blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        createMailbox,
+        entries: () => ingestQueueRepo.find({}),
+    });
+
+    ingestDroppedNoticeSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        secret,
+        blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        createMailbox,
+        entries: () => ingestQueueRepo.find({}),
     });
 
     it("Rejects a deliver request with an empty body.", async () => {

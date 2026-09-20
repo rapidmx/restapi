@@ -19,6 +19,7 @@ export * from "./BlobReferenceUtils.js";
 export * from "./ClientIpUtils.js";
 export * from "./ConversationUtils.js";
 export * from "./DateCoercionUtils.js";
+export * from "./DeliveryFailureNoticeUtils.js";
 export * from "./DistributionListUtils.js";
 export * from "./DraftBodyRetentionUtils.js";
 export * from "./DnsSetupUtils.js";

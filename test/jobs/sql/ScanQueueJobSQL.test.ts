@@ -15,6 +15,7 @@ import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import config from "../../config.sql.js";
+import { dsnDeliverySuite } from "../dsnDeliverySuite.js";
 import { registerTestDoubles, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
 import { ScanQueueJobSQL } from "../../../src/jobs/sql/ScanQueueJobSQL.js";
 import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
@@ -393,6 +394,24 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         const messages = await messageRepo.find({ where: { folderUid: inbox!.uid } });
         expect(messages.length).toBe(1);
         expect(messages[0].encrypted).toBe(true);
+    });
+
+    dsnDeliverySuite({
+        blobStore: () => objectFactory.getInstance<any>("BlobStore")!,
+        ingest: async (raw, envelopeFrom, envelopeTo) => {
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await objectFactory.getInstance<any>("BlobStore")!.put(rawBlobKey, raw);
+            const entry = await createIngestEntry({ rawBlobKey, envelopeFrom, ...(envelopeTo ? { envelopeTo } : {}) });
+            await job.run();
+            return entry.uid;
+        },
+        entryStatus: async (uid) => (await ingestQueueRepo.findOne({ where: { uid } }))!.status,
+        inbox: async () => {
+            const inbox = await folderRepo.findOne({ where: { mailboxUid, type: FolderType.INBOX } });
+            return inbox ? await messageRepo.find({ where: { folderUid: inbox.uid } }) : [];
+        },
+        quarantined: async () => await quarantineEntryRepo.find({ where: { mailboxUid } }),
+        relayed: () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!.sent,
     });
 
     describe("Delivered recipients and sender", () => {

@@ -15,6 +15,7 @@ import { TransportRuleMongo } from "../../../src/models/mongo/TransportRuleMongo
 import { IngestStatus, QuarantineReason, TransportRuleActionType } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { InMemoryBlobStore, RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
+import { ingestBounceSuite, ingestDroppedNoticeSuite } from "../ingestDroppedNoticeSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -297,6 +298,24 @@ describe("Route:MailIngestRouteMongo Tests", () => {
 
         expect(result.status).toBe(202);
         expect(result.body.results).toEqual([{ rcpt: "nobody@example.com", queued: false }]);
+    });
+
+    ingestBounceSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        secret,
+        blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        createMailbox,
+        entries: () => ingestQueueRepo.find({}).toArray(),
+    });
+
+    ingestDroppedNoticeSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        secret,
+        blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        createMailbox,
+        entries: () => ingestQueueRepo.find({}).toArray(),
     });
 
     it("Rejects a deliver request with both envelope headers entirely absent.", async () => {

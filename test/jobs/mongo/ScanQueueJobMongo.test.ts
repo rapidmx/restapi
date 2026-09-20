@@ -38,6 +38,7 @@ import { FocusedInboxOverrideMongo } from "../../../src/models/mongo/FocusedInbo
 import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySuppressionMongo.js";
 import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSubjectErasureRequestMongo.js";
 import { buildEventIcs } from "../../../src/util/IcsUtils.js";
+import { dsnDeliverySuite } from "../dsnDeliverySuite.js";
 import { sanitizeDiscoveredKey } from "../../../src/util/KeyringUtils.js";
 import { issueCertificate, makeTestIssuer } from "../../util/signerCertificates.js";
 import { buildDispositionNotification } from "../../../src/util/ReceiptUtils.js";
@@ -408,6 +409,24 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         const messages = await messageRepo.find({ folderUid: inbox!.uid }).toArray();
         expect(messages.length).toBe(1);
         expect(messages[0].encrypted).toBe(true);
+    });
+
+    dsnDeliverySuite({
+        blobStore: () => objectFactory.getInstance<any>("BlobStore")!,
+        ingest: async (raw, envelopeFrom, envelopeTo) => {
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await objectFactory.getInstance<any>("BlobStore")!.put(rawBlobKey, raw);
+            const entry = await createIngestEntry({ rawBlobKey, envelopeFrom, ...(envelopeTo ? { envelopeTo } : {}) });
+            await job.run();
+            return entry.uid;
+        },
+        entryStatus: async (uid) => (await ingestQueueRepo.findOne({ uid } as any))!.status,
+        inbox: async () => {
+            const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
+            return inbox ? await messageRepo.find({ folderUid: inbox.uid }).toArray() : [];
+        },
+        quarantined: async () => await quarantineEntryRepo.find({ mailboxUid }).toArray(),
+        relayed: () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!.sent,
     });
 
     describe("Delivered recipients and sender", () => {

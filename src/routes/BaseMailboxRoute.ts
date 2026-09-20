@@ -219,7 +219,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     protected trustedRoles: string[] = ["admin"];
 
     /**
-     * Base URL of the auth-server whose `GET /api/aliases/me?type=name` `autoProvision()` below calls.
+     * Base URL of the auth-server whose `GET /api/aliases?type=name` (the caller's own name aliases) `autoProvision()` below calls.
      * Falls back to `""` (rather than leaving this `@Config` field with no default at all) so
      * instantiating this route never throws in a deployment/test context that hasn't set this key —
      * `autoProvision()` already treats an empty value the same as "not configured" below, unless
@@ -471,7 +471,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 }
                 (o as any).ownerUserUid = user.uid;
             }
-            await this.assertSelfServiceCreate(objs, req);
+            await this.assertSelfServiceCreate(objs, req, user);
         } else {
             for (const o of objs) {
                 if ((o as any).ownerUserUid === null || (o as any).ownerUserUid === "") {
@@ -504,7 +504,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * aliases - must be one of the caller's own auth-server name aliases on a verified domain, and the quota is the
      * policy's self-service quota with nothing yet used, whatever the request says.
      */
-    private async assertSelfServiceCreate(objs: T[], req: HttpRequest): Promise<void> {
+    private async assertSelfServiceCreate(objs: T[], req: HttpRequest, user: JWTUser): Promise<void> {
         const policy = await findOrSeedMailboxPolicy(this._objectFactory!, this.mailboxPolicyClass, {
             defaultQuotaBytes: this.defaultQuotaBytes,
             autoProvisionEnabled: this.autoProvisionEnabled,
@@ -515,7 +515,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         if (!policy.autoProvisionEnabled || domains.length === 0 || !hasAliasSource) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Creating your own mailbox is not enabled on this server.");
         }
-        const aliases: string[] = (await this.fetchNameAliases(req)).map((alias) => alias.toLowerCase());
+        const aliases: string[] = (await this.fetchNameAliases(req, user)).map((alias) => alias.toLowerCase());
         const ownAddress = (address: unknown): boolean => ownsAddress(aliases, domains, address);
         for (const o of objs) {
             const addresses: unknown[] = [o.primarySmtpAddress, ...(Array.isArray(o.aliasAddresses) ? o.aliasAddresses : [])];
@@ -689,7 +689,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         await this.validateDisplayNameChange(id, obj);
         normalizeAddressFields(obj);
         if (obj.aliasAddresses !== undefined) {
-            await this.validateAliasChange(id, obj, isTrusted, req);
+            await this.validateAliasChange(id, obj, isTrusted, req, user);
         }
         if (obj.primarySmtpAddress !== undefined) {
             // Only re-validate when the address is genuinely changing, not merely present in the patch (a
@@ -698,7 +698,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             // `BaseDomainRoute.update()` applies to its own uid-derived `name` field).
             const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
             if (existing && normalizeAddress(existing.primarySmtpAddress) !== obj.primarySmtpAddress) {
-                await this.validateAddressChange(id, obj.primarySmtpAddress, isTrusted, req);
+                await this.validateAddressChange(id, obj.primarySmtpAddress, isTrusted, req, user);
             }
             (obj as any).keyDiscoveryHash = computeKeyDiscoveryHash(obj.primarySmtpAddress.split("@")[0]);
         }
@@ -730,7 +730,13 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * validator doesn't pass it, so a non-trusted bulk update adding an alias fails closed unless static aliases are
      * configured.
      */
-    private async validateAliasChange(id: string, obj: Record<string, any>, isTrusted: boolean, req: HttpRequest | undefined): Promise<void> {
+    private async validateAliasChange(
+        id: string,
+        obj: Record<string, any>,
+        isTrusted: boolean,
+        req: HttpRequest | undefined,
+        user: JWTUser | undefined,
+    ): Promise<void> {
         if (!Array.isArray(obj.aliasAddresses)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'aliasAddresses' must be a list of addresses.");
         }
@@ -753,7 +759,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         if (!isTrusted) {
             const hasAliasSource: boolean = this.staticAliases.length > 0 || !!this.authServerUrl;
-            const usernames: string[] = hasAliasSource && domains.length > 0 ? (await this.fetchNameAliases(req)).map((a) => a.toLowerCase()) : [];
+            const usernames: string[] = hasAliasSource && domains.length > 0 ? (await this.fetchNameAliases(req, user)).map((a) => a.toLowerCase()) : [];
             if (added.some((alias) => !ownsAddress(usernames, domains, alias))) {
                 throw new ApiError(
                     ApiErrors.AUTH_PERMISSION_FAILURE,
@@ -817,7 +823,13 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     // S/MIME certificates for and what key discovery publishes keys under, so without it an owner could rename their
     // mailbox to any unused address (`ceo@corp.com`) and become it. Fails closed (403) when no alias source or verified
     // domain is configured, and for a bulk update (which gets no `req` to forward) unless static aliases are configured.
-    private async validateAddressChange(id: string, newAddress: string, isTrusted: boolean, req: HttpRequest | undefined): Promise<void> {
+    private async validateAddressChange(
+        id: string,
+        newAddress: string,
+        isTrusted: boolean,
+        req: HttpRequest | undefined,
+        user: JWTUser | undefined,
+    ): Promise<void> {
         assertPlainAddresses([newAddress]);
         const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
         if (domains.length > 0) {
@@ -832,7 +844,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         if (!isTrusted) {
             const hasAliasSource: boolean = this.staticAliases.length > 0 || !!this.authServerUrl;
-            const usernames: string[] = hasAliasSource && domains.length > 0 ? (await this.fetchNameAliases(req)).map((a) => a.toLowerCase()) : [];
+            const usernames: string[] = hasAliasSource && domains.length > 0 ? (await this.fetchNameAliases(req, user)).map((a) => a.toLowerCase()) : [];
             if (!ownsAddress(usernames, domains, newAddress)) {
                 throw new ApiError(
                     ApiErrors.AUTH_PERMISSION_FAILURE,
@@ -879,7 +891,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             // PUT never fires for this path. `validateAddressChange()` must therefore be called explicitly
             // here too, the same "only on a genuine change" guard `validateUpdate()` itself applies.
             if (normalizeAddress(current.primarySmtpAddress) !== obj) {
-                await this.validateAddressChange(id, obj, UserUtils.hasRoles(user, this.trustedRoles), req);
+                await this.validateAddressChange(id, obj, UserUtils.hasRoles(user, this.trustedRoles), req, user);
             }
             return this.update(
                 id,
@@ -1053,7 +1065,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      *
      * A mailbox needs a `primarySmtpAddress`, which this route has no way to know on its own — the caller
      * has no email registered anywhere in this system yet by definition. Instead, this derives candidates
-     * from the identity auth-server already has for them: it calls auth-server's own `GET /api/aliases/me?
+     * from the identity auth-server already has for them: it calls auth-server's own `GET /api/aliases?
      * type=name` (forwarding the caller's own `jwt` cookie, so it only ever sees that user's own aliases)
      * and offers the caller the full cross product of those aliases against this server's verified
      * domains — a deployment can serve more than one domain, and the caller should get to pick which
@@ -1098,7 +1110,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             return { status: "existing", mailbox: existing[0] };
         }
 
-        const aliases: string[] = await this.fetchNameAliases(req);
+        const aliases: string[] = await this.fetchNameAliases(req, user);
         if (aliases.length === 0) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "No username is registered for this account.");
         }
@@ -1136,10 +1148,19 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         return await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
     }
 
-    /** The caller's own auth-server "name" aliases (e.g. usernames), via `GET /api/aliases/me?type=name` —
-     * forwarding their `jwt` cookie is what scopes the call to *their* aliases specifically. Skips that
-     * call entirely (see `staticAliases`'s own doc comment for why) when a fixed list is configured. */
-    private async fetchNameAliases(req: HttpRequest | undefined): Promise<string[]> {
+    /** The caller's own auth-server "name" aliases (e.g. usernames), via `GET /api/aliases?type=name&userUid=me` —
+     * forwarding their `jwt` cookie is what scopes the call to *their* aliases specifically (auth-server lists only
+     * the caller's own aliases to a non-administrator; `userUid=me` - a plain query value `ModelUtils.coerceOperand()`
+     * resolves to the requesting user's uid - does the same for a caller with a trusted role, who is otherwise listed
+     * every alias). The answer is also filtered here to entries whose `userUid` is the caller's (`user`): the guard that
+     * does not depend on auth-server honouring the query, and never applied to `staticAliases`. Only verified `name`
+     * entries count, read from each record's `alias` field. Skips that call entirely (see `staticAliases`'s own doc
+     * comment for why) when a fixed list is configured.
+     *
+     * This once called `GET /api/aliases/me?type=name`, which is not a list endpoint: auth-server reads `me` there as
+     * an alias id, finds none, and answers 404 - so it failed (502) for every caller, and its response was read from
+     * the wrong field (`value`/`name`) besides. */
+    private async fetchNameAliases(req: HttpRequest | undefined, user: JWTUser | undefined): Promise<string[]> {
         if (this.staticAliases.length > 0) {
             return this.staticAliases;
         }
@@ -1153,7 +1174,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         const timeoutHandle = setTimeout(() => controller.abort(), this.autoProvisionTimeoutMs);
         let response: Response;
         try {
-            response = await fetch(`${this.authServerUrl}/api/aliases/me?type=name`, {
+            response = await fetch(`${this.authServerUrl}/api/aliases?type=name&userUid=me`, {
                 headers: { Cookie: `jwt=${jwtCookie}` },
                 signal: controller.signal,
             });
@@ -1174,9 +1195,18 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             );
         }
 
-        const data = (await response.json()) as Array<{ value?: string; name?: string }>;
+        // An auth-server `Alias` record names itself in `alias` (`{ uid, alias, type, userUid, verified, ... }`). Only the
+        // caller's own are kept, whatever auth-server answered with: `userUid=me` should already have scoped the list, but
+        // an administrator's elevated token is listed unscoped by a request without it, and offering (or accepting) another
+        // user's username here would let a mailbox be created at it. An entry with no `userUid`, or another's, is dropped.
+        const data = (await response.json()) as Array<{ alias?: string; type?: string; verified?: boolean; userUid?: string }>;
+        const callerUid: string | undefined = user?.uid?.toLowerCase();
         return Array.isArray(data)
-            ? data.map((entry) => entry.value ?? entry.name).filter((value): value is string => !!value)
+            ? data
+                  .filter((entry) => callerUid !== undefined && typeof entry.userUid === "string" && entry.userUid.toLowerCase() === callerUid)
+                  .filter((entry) => entry.type === "name" && entry.verified !== false)
+                  .map((entry) => entry.alias)
+                  .filter((value): value is string => !!value)
             : [];
     }
 

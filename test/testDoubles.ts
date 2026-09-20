@@ -182,9 +182,34 @@ export class RecordingMailTransport implements MailTransport {
     public readonly name: string = "recording";
     public sent: OutboundMessage[] = [];
 
+    /** What Postfix says about a recipient it refuses - see `send()`. */
+    private static refusal(address: string) {
+        return {
+            address,
+            code: 554,
+            enhancedCode: "5.7.1",
+            response: `554 5.7.1 <${address}>: Recipient address rejected: Access denied`,
+            command: "RCPT TO",
+            temporary: false,
+        };
+    }
+
+    /** `reject@example.com` in the envelope fails the whole call; `partial-reject@...` is refused while the other recipients
+     * are accepted. Both come with the diagnostics a real transport reports. */
     public async send(message: OutboundMessage): Promise<TransportResult> {
         if (message.envelopeTo.includes("reject@example.com")) {
-            return { accepted: [], rejected: message.envelopeTo };
+            return {
+                accepted: [],
+                rejected: message.envelopeTo,
+                failures: message.envelopeTo.map(RecordingMailTransport.refusal),
+                error: { message: "The recording transport refused the message.", code: "EREJECT", command: "RCPT TO" },
+            };
+        }
+        const refused: string[] = message.envelopeTo.filter((address) => address.startsWith("partial-reject@"));
+        if (refused.length > 0 && refused.length < message.envelopeTo.length) {
+            const accepted: string[] = message.envelopeTo.filter((address) => !refused.includes(address));
+            this.sent.push({ ...message, envelopeTo: accepted });
+            return { accepted, rejected: refused, failures: refused.map(RecordingMailTransport.refusal) };
         }
         this.sent.push(message);
         return { accepted: message.envelopeTo, rejected: [] };

@@ -41,6 +41,22 @@ helpers `@rapidmx/activesync-plugin`/`@rapidmx/mapi-plugin` build their own prot
 other downstream consumer that needs to resolve a caller's mailbox or relay a composed message through the
 scan pipeline.
 
+## Delivery failures
+
+A sender is always told when mail they sent did not go out, with the mail system's own words:
+
+- **A send the transport refuses** (`POST /messages/:id/send`, EAS/MAPI `sendComposedMime()`) is a **502** whose
+  `message` is a plain-language sentence and whose `details` object (`MailRelayFailureDetails`) carries the per-recipient
+  SMTP/enhanced status codes and responses, the transport error and what `sendmail` printed. The draft stays in Drafts.
+  `MailTransport.send()` reports these through the optional `TransportResult.failures` and `.error`.
+- **A failure nobody is waiting on** - `ScheduledSendJob` giving up on or refusing a message, or a transport relaying to only
+  some recipients - is filed in the sender's **Inbox** as an RFC 3464 delivery status notification from
+  `Mail Delivery System <postmaster@DOMAIN>`, once per failure (`util/DeliveryFailureNoticeUtils.ts`).
+- **A bounce from the MTA** (Postfix accepts the message, then cannot deliver it) arrives as any inbound mail - null
+  envelope sender, `From: MAILER-DAEMON@host` - at `POST /internal/mta/deliver`, and is filed in the Inbox (the MTA must hand
+  such bounces to it like any other inbound mail). A message a local mailbox sent to a local address that resolves to nothing
+  is dropped at the same endpoint and gets the same kind of notice.
+
 ## Required deployment configuration
 
 A handful of settings are required for correct operation and are easy to miss because nothing fails loudly

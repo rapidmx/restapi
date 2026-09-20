@@ -75,6 +75,21 @@ export function mailboxSelfServiceCreateSuite(ctx: MailboxSelfServiceCreateSuite
             expect((await post(ctx.userToken, mailbox({ primarySmtpAddress: undefined }))).status).toBe(400);
         });
 
+        it("refuses an account with no username at all any address of its own choosing - an empty alias list is not an open door", async () => {
+            ctx.mockAliases([]);
+            for (const fields of [
+                { primarySmtpAddress: "chosen@example.com" },
+                { primarySmtpAddress: "chosen@example.org" },
+                { primarySmtpAddress: "postmaster@example.com" },
+                { primarySmtpAddress: "chosen@example.com", aliasAddresses: ["other@example.com"] },
+            ]) {
+                const result = await post(ctx.userToken, mailbox(fields));
+                expect(result.status).toBe(403);
+                expect(result.body.message).toBe("You can only create a mailbox at one of your own usernames on this server's domains.");
+            }
+            expect(await ctx.mailboxes()).toEqual([]);
+        });
+
         it("refuses when the mailbox policy turns self-service mailboxes off, even though config enables them", async () => {
             ctx.mockAliases(["jsteinmetz"]);
             await ctx.disableSelfService();

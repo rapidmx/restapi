@@ -23,6 +23,12 @@ import { DistributionList, IngestQueueEntry, IngestStatus, Mailbox, QuarantineRe
 import { normalizeAddress, stripPlusTag } from "../util/AddressUtils.js";
 import { rewriteHeadersForList } from "../util/DistributionListUtils.js";
 import { getVerifiedDomainNames } from "../util/DomainUtils.js";
+import {
+    buildDeliveryFailureNotice,
+    deliveryFailureKey,
+    deliveryFailureUid,
+    describeOriginal,
+} from "../util/DeliveryFailureNoticeUtils.js";
 import { extractHeader, prepareRelayCopy, prependHeaders, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { buildTransportRuleContext, evaluateTransportRules } from "../util/TransportRuleUtils.js";
@@ -473,6 +479,78 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         };
     }
 
+    /**
+     * Tells the sender that a message they sent to `rcpt` was dropped because nothing resolves `rcpt` - only when the
+     * envelope sender is one of this server's own mailboxes (a message they submitted locally, which reaches `deliver()` with
+     * its recipients unchecked). Without it the sender never learns the message went nowhere: the MTA was told it was
+     * delivered.
+     *
+     * The notice (`util/DeliveryFailureNoticeUtils.ts`) is queued as an ordinary `IngestQueueEntry` with a null envelope
+     * sender, so `ScanQueueJob` files it in the sender's Inbox like any other bounce. It is idempotent per (message, recipient)
+     * - the entry's uid derives from them, so the MTA redelivering the same transaction adds nothing - and never sent for a
+     * null sender (a bounce) or a message marked `Auto-Submitted` (an auto-reply or another notice), so it cannot loop.
+     * Best-effort: a failure here is logged and never changes the response to the MTA.
+     */
+    private async reportUnresolvableRecipient(envelopeFrom: string, rcpt: string, raw: Buffer): Promise<void> {
+        const autoSubmitted: string | undefined = extractHeader(raw, "Auto-Submitted")?.toLowerCase();
+        if (!envelopeFrom || (autoSubmitted && autoSubmitted !== "no")) {
+            return;
+        }
+        try {
+            const sender: M | undefined = await this.findExactMailboxByAddress(normalizeAddress(envelopeFrom));
+            if (!sender) {
+                return;
+            }
+            const messageId: string | undefined = extractHeader(raw, "Message-ID");
+            const key: string = deliveryFailureKey(
+                "dropped",
+                (messageId ?? crypto.createHash("sha256").update(raw).digest("hex")).toLowerCase(),
+                rcpt,
+            );
+            const uid: string = deliveryFailureUid(sender.uid, key);
+            if (await this.ingestQueueRepo!.findOne(uid, { ignoreACL: true })) {
+                return;
+            }
+            const date: Date = new Date(extractHeader(raw, "Date") ?? NaN);
+            const notice = await buildDeliveryFailureNotice({
+                mailboxUid: sender.uid,
+                mailboxAddress: sender.primarySmtpAddress,
+                key,
+                original: await describeOriginal(
+                    this.blobStore!,
+                    { subject: extractHeader(raw, "Subject"), sentDate: Number.isNaN(date.getTime()) ? undefined : date },
+                    { raw },
+                ),
+                failures: [
+                    {
+                        address: rcpt,
+                        code: 550,
+                        enhancedCode: "5.1.1",
+                        response: `550 5.1.1 <${rcpt}>: Recipient address rejected: User unknown in this mail system`,
+                        command: "RCPT TO",
+                        temporary: false,
+                    },
+                ],
+                reason: `No mailbox or distribution list exists at ${rcpt}.`,
+            });
+            const rawBlobKey: string = `ingest/${crypto.randomUUID()}`;
+            await this.blobStore!.put(rawBlobKey, notice.raw, { contentType: "message/rfc822" });
+            await this.ingestQueueRepo!.create(
+                new this.ingestQueueClass({
+                    uid,
+                    mailboxUid: sender.uid,
+                    envelopeFrom: "",
+                    envelopeTo: [sender.primarySmtpAddress],
+                    rawBlobKey,
+                    status: IngestStatus.PENDING,
+                }),
+                { ignoreACL: true },
+            );
+        } catch (err: any) {
+            this.logger?.warn(`MailIngestRoute: failed to notify '${envelopeFrom}' that delivery to '${rcpt}' was dropped: ${err.message}`);
+        }
+    }
+
     @Summary("Check relay domain")
     @Description(
         "Called by the MTA's relay-domain lookup (e.g. Postfix `relay_domains`) to decide whether it should " +
@@ -608,6 +686,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
 
             if (!list) {
                 this.logger?.warn(`MailIngestRoute: dropping delivery for unresolvable recipient '${address}'.`);
+                await this.reportUnresolvableRecipient(envelopeFrom, address, raw);
                 results.push({ rcpt: address, queued: false });
                 continue;
             }
