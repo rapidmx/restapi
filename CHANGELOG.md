@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-20
+
+### Added
+- Added the server's config values as defaults to the responses of GET and PUT /system/mailbox-policy, so an admin console can reset a field to what a newly deployed config says, since the policy is seeded from mail:default_quota_bytes and mail:auto_provision:* only the first time it is read and an administrator who had already saved it never saw a later change
+
+### Changed
+- Read defaults from the current config on every request rather than from the saved row, and leave resetting an ordinary audited PUT of the default value, so nothing about storage changes and there is nothing to migrate
+- Export MailboxPolicyResponse from the package root
+- Test defaults before anything is saved, after edits, and a reset by PUT against real MongoDB and real SQL
+- Document the change in the release notes and NOTES, including why a reset writes the default rather than clearing the field to follow config live
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
 ## [0.13.0] - 2026-09-17
 
 ### Added
@@ -948,7 +960,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/RapidMX/restapi/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/RapidMX/restapi/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/RapidMX/restapi/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/RapidMX/restapi/compare/v0.10.0...v0.11.0
