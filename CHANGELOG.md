@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-21
+
+### Added
+- Added the message_folder_deleted_flags_read and message_folder_deleted indexes the count query uses
+
+### Changed
+- Refresh the stored counters where a message is ingested, imported, sent or a failure notice is filed, as a cache reads never trust, and keep bumping the folder's sync key
+- Publish a Folder update event with the folder's uid, mailbox uid and both counts to the folder and mailbox channels after a message's folder, read flag, deletion or send changes, once per folder for a bulk change
+- Test the counts across ingest, mark read and unread, bulk changes, move, archive, delete, restore, purge, send, drafts and wrong stored counters, and that listing folders costs a bounded number of queries
+- Document the counts and the event in the README, the release notes and NOTES
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+### Fixed
+- Fixed every folder's unreadCount and totalCount being wrong, by deriving them from the folder's messages with one grouped query per request on every folder read on MongoDB and SQL, since the stored counters were only ever incremented and showed 7 unread for an inbox with none, and correct a stale stored value on the read
+
 ## [0.15.0] - 2026-09-20
 
 ### Added
@@ -980,7 +995,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/RapidMX/restapi/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/RapidMX/restapi/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/RapidMX/restapi/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/RapidMX/restapi/compare/v0.12.0...v0.13.0
