@@ -4,8 +4,9 @@
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
 import { ObjectDecorators } from "@rapidrest/core";
-import { BackgroundService, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { BackgroundService, ModelUtils, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
+import { refreshFolderCounts } from "../util/FolderCountUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline, ScanPipelineResult } from "../scan/ScanPipeline.js";
 import { boundIndexedValue, deriveConversationId } from "../util/ConversationUtils.js";
@@ -120,6 +121,10 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
 
     @Inject(ScanPipeline)
     private scanPipeline?: ScanPipeline;
+
+    /** Publishes the target folder's new counts (see `util/FolderCountUtils.ts`) once an import has filed its messages. */
+    @Inject(NotificationUtils)
+    private notificationUtils?: NotificationUtils;
 
     @Config("mail:jobs:mailbox_import:schedule", "*/30 * * * * *")
     private scheduleExpr: string = "*/30 * * * * *";
@@ -316,34 +321,24 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                 }
             }
 
-            // Isolated in its own try/catch, deliberately NOT sharing the outer one below: every message has
-            // already been durably persisted by this point, so a failure bumping the folder's own
-            // (denormalized, best-effort) counters - e.g. a version conflict against a real piece of mail
-            // concurrently delivered into the same folder by ScanQueueJob, a realistic race during a live
-            // mailbox migration - must not turn a fully-successful import into a reported "failed" one. A
-            // caller trusting that status would otherwise be invited to re-run the same import against the
-            // same source file, duplicating every message (a fresh request gets no Message-ID dedup - only a
-            // reclaimed retry of the SAME request does).
+            // The folder's counts are derived from its messages, so they are recomputed (and published) once, here, rather
+            // than incremented per message. Best-effort and never throws: every message has already been durably
+            // persisted by this point, so a failure here must not turn a fully-successful import into a reported
+            // "failed" one - a caller trusting that status would be invited to re-run the same import against the same
+            // source file, duplicating every message (a fresh request gets no Message-ID dedup - only a reclaimed retry
+            // of the SAME request does).
             if (importedCount > 0) {
-                try {
-                    const currentFolder: F | undefined = await this.folderRepo!.findOne(folder.uid, { ignoreACL: true });
-                    if (currentFolder) {
-                        await this.folderRepo!.update(
-                            {
-                                uid: currentFolder.uid,
-                                version: (currentFolder as any).version,
-                                totalCount: currentFolder.totalCount + importedCount,
-                                syncKeyVersion: currentFolder.syncKeyVersion + 1,
-                            } as any,
-                            asEntity(this.folderRepo!, currentFolder),
-                            { ignoreACL: true },
-                        );
-                    }
-                } catch (err: any) {
-                    this.logger?.warn(
-                        `MailboxImportJob: failed to update folder counters for ${folder.uid} after importing request ${processing.uid}: ${err.message}`,
-                    );
-                }
+                await refreshFolderCounts(
+                    {
+                        messageRepo: this.messageRepo!,
+                        folderRepo: this.folderRepo!,
+                        folderClass: this.folderClass,
+                        notificationUtils: this.notificationUtils,
+                        logger: this.logger,
+                    },
+                    [folder.uid],
+                    { bumpSyncKey: true },
+                );
             }
 
             // Version-checked against the lease this run still holds (renewed while importing), deliberately

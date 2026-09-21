@@ -27,6 +27,7 @@ export * from "./DomainUtils.js";
 export * from "./DomainVerificationUtils.js";
 export * from "./EntityUtils.js";
 export * from "./FocusedInboxUtils.js";
+export * from "./FolderCountUtils.js";
 export * from "./FolderUtils.js";
 export * from "./FreeBusyUtils.js";
 export * from "./IcsUtils.js";

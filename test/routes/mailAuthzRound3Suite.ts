@@ -771,7 +771,9 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
                 unreadCount: 3,
             });
             expect(counters.status).toBe(200);
-            expect(counters.body.unreadCount).toBe(3);
+            // A trusted caller may still write the stored cache, but a folder is always answered with the counts its messages
+            // have (none here) - so the write can't make a badge lie.
+            expect(counters.body.unreadCount).toBe(0);
             const renamed = await auth(request(ctx.app()).put(url(`/folders/${folder.uid}/name`)), owner).send("Renamed" as any);
             expect(renamed.status).toBe(200);
             const arrayMailbox = await auth(request(ctx.app()).post(url("/folders")), admin).send({ mailboxUid: [mailbox.uid], name: "X", type: FolderType.USER });

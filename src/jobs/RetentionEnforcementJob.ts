@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
-import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { BlobReferenceSource, deleteBlobsIfUnreferenced, messageBlobReferenceSources } from "../util/BlobReferenceUtils.js";
 import { LegalHoldIndex, loadLegalHoldIndex } from "../util/LegalHoldUtils.js";
@@ -12,6 +12,7 @@ import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { retainedBodyBlobKeysOf } from "../util/DraftBodyRetentionUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
+import { refreshFolderCounts } from "../util/FolderCountUtils.js";
 import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
 import type { SearchProvider } from "../search/SearchProvider.js";
 import { Attachment, AuditAction, AuditLogEntry, Message, RetentionPolicy } from "../models/types.js";
@@ -80,6 +81,10 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
      * can be resolved without depending on either backend directly - see `util/LegalHoldUtils.ts`. */
     protected abstract matterClass: any;
 
+    /** The concrete `Folder` class, so that purging expired messages can publish each affected folder's new counts
+     * (`util/FolderCountUtils.ts`). Optional: a subclass that leaves it unset purges without publishing. */
+    protected folderClass?: any;
+
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
@@ -87,6 +92,10 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
     private messageRepo?: RecoverableRepoUtils<M>;
     private auditLogRepo?: RepoUtils<AL>;
     private attachmentRepo?: RepoUtils<AT>;
+    private folderRepo?: RecoverableRepoUtils<any>;
+
+    @Inject(NotificationUtils)
+    private notificationUtils?: NotificationUtils;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -130,6 +139,12 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
             name: this.attachmentClass.name,
             args: [this.attachmentClass],
         });
+        if (this.folderClass) {
+            this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+                name: this.folderClass.name,
+                args: [this.folderClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {
@@ -212,6 +227,8 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
             ingestQueueEntryClass: this.ingestQueueEntryClass,
         });
 
+        // The folders a live message was purged from - a soft-deleted one was already out of its folder's counts.
+        const affectedFolders: Set<string> = new Set();
         const purgeMessage = async (message: M): Promise<void> => {
             // Every `Attachment` referencing this message first - `Message` deletion has no database-level cascade
             // onto them (see this class's own doc comment). Any attachment failure propagates and stops this message's
@@ -245,6 +262,9 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
                 { entityClass: this.messageClass, uid: message.uid },
             );
             await this.messageRepo!.delete(message.uid, { ignoreACL: true, purge: true });
+            if (!message.deleted) {
+                affectedFolders.add(message.folderUid);
+            }
             // The search document (subject/body/attachment text) must not outlive the purged message.
             await removeFromSearchIndex(this.searchProvider, "message", message.uid, this.logger);
         };
@@ -273,6 +293,20 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
             if (purgedCount >= this.batchSize) {
                 break;
             }
+        }
+
+        // Each folder a live message left has new counts - recomputed and published once per folder, not per message.
+        if (affectedFolders.size > 0 && this.folderRepo) {
+            await refreshFolderCounts(
+                {
+                    messageRepo: this.messageRepo!,
+                    folderRepo: this.folderRepo,
+                    folderClass: this.folderClass,
+                    notificationUtils: this.notificationUtils,
+                    logger: this.logger,
+                },
+                affectedFolders,
+            );
         }
 
         if (purgedCount > 0) {

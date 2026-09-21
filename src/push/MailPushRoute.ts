@@ -25,6 +25,13 @@ import { BasePushRoute } from "@rapidrest/service-core";
  * `{type: "MESSAGE", channel, data: {type, action, data}}` (the outer envelope from `BasePushRoute`'s Redis
  * subscription forwarding, the inner `{type, action, data}` from `NotificationUtils.sendMessage()`).
  *
+ * **Folder counts.** Whenever a write changes what a folder holds or which of it is read (a message created, marked
+ * read/unread, moved, deleted, sent, imported, purged), the folder's counts are published on **both the folder's own
+ * channel and its mailbox's** as
+ * `{ type: "FolderMongo" | "FolderSQL", action: "update", data: { uid, mailboxUid, unreadCount, totalCount } }` - see
+ * `util/FolderCountUtils.ts`. `data.uid` is the folder (the mailbox-channel copy names it too), and the counts are what
+ * `GET /folders` would answer at that moment.
+ *
  * !!Note!! like `BasePushRoute` itself, this class is not automatically registered with a server — the
  * consuming application must apply `@Route("/push")` (or any other chosen base path) to its own subclass:
  * ```ts

@@ -44,6 +44,17 @@ describe("BaseFolderRoute Tests (repoUtils guard clauses only)", () => {
         ).rejects.toThrow(/internal error/i);
     });
 
+    it("find() answers the stored counts, untouched, when the route has no messageClass to derive them from.", async () => {
+        const route = objectFactory.newInstance<TestFolderRoute>(TestFolderRoute, { initialize: false });
+        const stored = [{ uid: "folder-1", unreadCount: 4, totalCount: 5 }];
+        (route as any).repoUtils = { find: vi.fn().mockResolvedValue(stored) };
+        (route as any).aclUtils = { hasPermission: vi.fn().mockResolvedValue(true) };
+
+        expect(await route.find({}, { mailboxUid: "mbx-1" }, { uid: "user-1" } as any)).toEqual([
+            { uid: "folder-1", unreadCount: 4, totalCount: 5 },
+        ]);
+    });
+
     it("create() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
         const route = objectFactory.newInstance<TestFolderRoute>(TestFolderRoute, { initialize: false });
         const req: any = {};

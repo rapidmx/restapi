@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RetentionEnforcementJob } from "../RetentionEnforcementJob.js";
-import { AttachmentMongo, AuditLogEntryMongo, IngestQueueEntryMongo, MatterMongo, MessageMongo, QuarantineEntryMongo, RetentionPolicyMongo } from "../../mongo.js";
+import { AttachmentMongo, AuditLogEntryMongo, FolderMongo, IngestQueueEntryMongo, MatterMongo, MessageMongo, QuarantineEntryMongo, RetentionPolicyMongo } from "../../mongo.js";
 
 export class RetentionEnforcementJobMongo extends RetentionEnforcementJob<RetentionPolicyMongo, MessageMongo, AuditLogEntryMongo, AttachmentMongo> {
     protected retentionPolicyClass: any = RetentionPolicyMongo;
@@ -13,4 +13,5 @@ export class RetentionEnforcementJobMongo extends RetentionEnforcementJob<Retent
     protected quarantineEntryClass: any = QuarantineEntryMongo;
     protected ingestQueueEntryClass: any = IngestQueueEntryMongo;
     protected matterClass: any = MatterMongo;
+    protected folderClass: any = FolderMongo;
 }

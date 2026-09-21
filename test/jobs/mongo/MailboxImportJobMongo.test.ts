@@ -8,7 +8,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { MongoMemoryServer } from "mongodb-memory-server";
-import { ACLUtils, ConnectionManager, MongoConnection, MongoRepository, ObjectFactory } from "@rapidrest/service-core";
+import { ACLUtils, NotificationUtils, ConnectionManager, MongoConnection, MongoRepository, ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import config from "../../config.js";
@@ -192,8 +192,16 @@ describe("MailboxImportJobMongo Tests (real DB + DI)", () => {
         ]);
         await blobStore.put(sourceBlobKey, mbox);
         const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+        const sendMessageSpy = vi.spyOn(NotificationUtils.prototype, "sendMessage");
 
         await job.run();
+
+        // The folder's counts are derived from the imported messages and published once for the whole import.
+        const countEvents = sendMessageSpy.mock.calls.filter(([, type, action]) => /^Folder/.test(String(type)) && action === "update");
+        sendMessageSpy.mockRestore();
+        expect(countEvents).toEqual([
+            [[folder.uid, mailbox.uid], "FolderMongo", "update", { uid: folder.uid, mailboxUid: mailbox.uid, unreadCount: 0, totalCount: 2 }],
+        ]);
 
         const updated = await requestRepo.findOne({ uid: request.uid } as any);
         expect(updated!.status).toBe("completed");

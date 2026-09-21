@@ -1,5 +1,34 @@
 # Release Notes
 
+## Unreleased
+
+### Fixes
+
+- **A folder's unread and total counts were wrong from the moment anything but a delivery touched the folder, and never changed
+  again.** `Folder.unreadCount`/`totalCount` were stored counters that were only ever incremented (by `ScanQueueJob` and the
+  delivery failure notice) - never decremented or recomputed when a message was marked read or unread, moved, deleted, sent, saved as a
+  draft, imported or retained away - so every badge built on `GET /folders` was stale (a live mailbox showed an Inbox of 7 unread
+  messages that held 3, none unread, and Sent Items and Deleted Items at 0 over 7 and 4 messages). `GET /folders`, `GET /folders/:id` and
+  the responses of `PUT` now **derive** both numbers from the messages, from one grouped query per request rather than one per folder:
+  `totalCount` is the folder's messages that are not soft-deleted (exactly what the message list shows) and `unreadCount` those whose
+  `flags.read` is not `true`. Existing data needs no migration: a stored value that disagrees is answered with the right one and
+  repaired on the way out. `MessageMongo` gains a covering index (`message_folder_deleted_flags_read`) and `MessageSQL` a
+  `(folderUid, deleted)` index for the query.
+  - **New live event.** After any write that changes a folder's counts, `{ type: "FolderMongo" | "FolderSQL", action: "update", data:
+    { uid, mailboxUid, unreadCount, totalCount } }` is published on the folder's channel and its mailbox's channel, so a client can
+    update its badge without re-reading: a message created (ingest, draft, import, delivery failure notice), marked read or unread,
+    moved, deleted or purged (retention included), archived, a scheduled or immediate send. A bulk update, a send or a truncate
+    publishes each folder once, when it finishes. See `util/FolderCountUtils.ts`.
+  - `FolderRouteMongo`/`FolderRouteSQL` (and any `BaseFolderRoute` subclass) derive counts through a new optional `messageClass`; a
+    subclass that does not set it keeps answering with the stored values. `RetentionEnforcementJob` gains an optional `folderClass` so a
+    purge can publish (set by both concrete jobs). The counters remain server-managed: a client can neither create nor update them.
+  - `refreshFolderCounts()`, `countMessagesByFolder()`, `coalesceFolderCounts()` and `notifyFolderCounts()` are exported for a protocol
+    package that writes messages itself. `@rapidmx/mapi-plugin` reads the stored `Folder` counts directly; they are now a cache kept
+    current at each of the points above and repaired by any `GET /folders`, but a change made through its own repositories is
+    not published or cached until it calls `refreshFolderCounts()`.
+  - Ingest, the delivery failure notice and `MailboxImportJob` no longer add to the stored counters; they recompute them (still
+    bumping `syncKeyVersion`) and can no longer fail a delivery over a folder-row write.
+
 ## v0.15.0
 
 ### Fixes

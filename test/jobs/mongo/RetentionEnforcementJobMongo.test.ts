@@ -6,7 +6,7 @@
 // QuarantineRetentionJobMongo.test.ts's file header for the full rationale (bypasses `Server`, wires a real
 // ObjectFactory/ConnectionManager directly).
 import { MongoMemoryServer } from "mongodb-memory-server";
-import { ACLUtils, ConnectionManager, MongoConnection, MongoRepository, ObjectFactory } from "@rapidrest/service-core";
+import { ACLUtils, ConnectionManager, MongoConnection, MongoRepository, NotificationUtils, ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import config from "../../config.js";
@@ -16,6 +16,7 @@ import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo
 import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { IngestQueueEntryMongo } from "../../../src/models/mongo/IngestQueueEntryMongo.js";
 import { QuarantineEntryMongo } from "../../../src/models/mongo/QuarantineEntryMongo.js";
+import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
 import { RetentionPolicyMongo } from "../../../src/models/mongo/RetentionPolicyMongo.js";
 import { AuditAction, AuditLogEntry, RecipientType } from "../../../src/models/types.js";
@@ -37,6 +38,7 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
     let matterRepo: MongoRepository<MatterMongo>;
     let attachmentRepo: MongoRepository<AttachmentMongo>;
+    let folderRepo: MongoRepository<FolderMongo>;
 
     const createMessage = async (data?: Partial<MessageMongo>): Promise<MessageMongo> => {
         const obj = new MessageMongo({
@@ -90,6 +92,7 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
         const models = new Map<string, any>();
         models.set("RetentionPolicyMongo", RetentionPolicyMongo);
         models.set("MessageMongo", MessageMongo);
+        models.set("FolderMongo", FolderMongo);
         models.set("AuditLogEntryMongo", AuditLogEntryMongo);
         models.set("MatterMongo", MatterMongo);
         models.set("AttachmentMongo", AttachmentMongo);
@@ -106,6 +109,7 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
         auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
         matterRepo = conn.getMongoRepository("MatterMongo");
         attachmentRepo = conn.getMongoRepository("AttachmentMongo");
+        folderRepo = conn.getMongoRepository("FolderMongo");
 
         job = await objectFactory.newInstance(RetentionEnforcementJobMongo, { name: "default" });
     });
@@ -116,7 +120,7 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [retentionPolicyRepo, messageRepo, auditLogRepo, matterRepo, attachmentRepo]) {
+        for (const repo of [retentionPolicyRepo, messageRepo, auditLogRepo, matterRepo, attachmentRepo, folderRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -192,6 +196,30 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
         expect(entries.length).toBe(1);
         expect(entries[0].targetType).toBe("Message");
         expect(entries[0].details).toEqual({ count: 1, maxAgeDays: 30 });
+    });
+
+    it("Recomputes and publishes the counts of every folder a purge took a live message out of, once per folder - a soft-deleted one was already out of the count.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", messageRetentionDays: 30 }));
+        const mailboxUid = uuid.v4();
+        const folder = await folderRepo.save(new FolderMongo({ mailboxUid, name: "Inbox", unreadCount: 9, totalCount: 9 }));
+        const untouched = await folderRepo.save(new FolderMongo({ mailboxUid, name: "Other", unreadCount: 5, totalCount: 5 }));
+        const old = new Date(Date.now() - 35 * DAY_MS);
+        await createMessage({ mailboxUid, folderUid: folder.uid, sentDate: old });
+        await createMessage({ mailboxUid, folderUid: folder.uid, sentDate: old, flags: { read: true, flagged: false, answered: false, forwarded: false } });
+        const softDeleted = await createMessage({ mailboxUid, folderUid: untouched.uid, sentDate: old });
+        await messageRepo.updateOne({ uid: softDeleted.uid } as any, { $set: { deleted: true } });
+        await createMessage({ mailboxUid, folderUid: folder.uid, sentDate: new Date() });
+        await createMessage({ mailboxUid, folderUid: untouched.uid, sentDate: new Date() });
+        const sendMessageSpy = vi.spyOn(NotificationUtils.prototype, "sendMessage");
+
+        await job.run();
+
+        expect(sendMessageSpy.mock.calls.filter(([, type, action]) => /^Folder/.test(String(type)) && action === "update")).toEqual([
+            [[folder.uid, mailboxUid], "FolderMongo", "update", { uid: folder.uid, mailboxUid, unreadCount: 1, totalCount: 1 }],
+        ]);
+        expect(await folderRepo.findOne({ uid: folder.uid } as any)).toMatchObject({ unreadCount: 1, totalCount: 1 });
+        // Not touched by the purge of a soft-deleted row: neither published nor rewritten.
+        expect(await folderRepo.findOne({ uid: untouched.uid } as any)).toMatchObject({ unreadCount: 5, totalCount: 5 });
     });
 
     it("Purging an expired message also purges every Attachment referencing it, plus both entities' own BlobStore content - PHI/PII a retention policy asserts is gone must not survive as an orphaned, independently-downloadable row or blob.", async () => {

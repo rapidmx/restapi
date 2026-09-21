@@ -51,6 +51,10 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Index("message_folder_received", ["folderUid", "receivedDate"])
 @Index("message_folder_read_received", ["folderUid", "read", "receivedDate"])
 @Index("message_folder_flagged_received", ["folderUid", "flagged", "receivedDate"])
+// The folder counts (`util/FolderCountUtils.ts`): a `$group` over `folderUid` of the live (`deleted: false`) messages,
+// counting those whose `flags.read` is not `true`. It reads `flags.read` - not the `read` mirror, which a protocol
+// package that writes `flags` itself doesn't maintain - so this covered index answers it without loading a message.
+@Index("message_folder_deleted_flags_read", ["folderUid", "deleted", "flags.read"])
 // Expanding one conversation (`conversationMessages()`) reads a mailbox's messages for one `conversationId` in
 // date order.
 @Index("message_mailbox_conversation_received", ["mailboxUid", "conversationId", "receivedDate"])

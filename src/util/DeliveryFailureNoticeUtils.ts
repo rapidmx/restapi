@@ -9,7 +9,7 @@ import type { BlobStore } from "../blob/BlobStore.js";
 import type { TransportError, TransportFailure } from "../transport/MailTransport.js";
 import { cleanDiagnosticText } from "../transport/TransportResultUtils.js";
 import { FolderType, MessageImportance, RecipientType } from "../models/types.js";
-import { asEntity } from "./EntityUtils.js";
+import { refreshFolderCounts } from "./FolderCountUtils.js";
 import { extractHeader } from "./MimeHeaderUtils.js";
 import { findOrCreateWellKnownFolder } from "./FolderUtils.js";
 import { boundIndexedValue, deriveConversationId } from "./ConversationUtils.js";
@@ -331,36 +331,6 @@ export interface DeliveryNoticeSink {
     logger?: any;
 }
 
-/** How often bumping the Inbox's counters is retried when another writer changes the folder first. */
-const FOLDER_COUNTER_ATTEMPTS = 5;
-
-/** Adds a message to `folder`'s counters, re-reading and retrying when a concurrent write bumped its version first. */
-async function bumpInboxCounters(repo: RepoUtils<any>, folder: any): Promise<void> {
-    let current: any = folder;
-    for (let attempt = 1; ; attempt++) {
-        try {
-            await repo.update(
-                {
-                    uid: current.uid,
-                    version: current.version,
-                    unreadCount: current.unreadCount + 1,
-                    totalCount: current.totalCount + 1,
-                    syncKeyVersion: current.syncKeyVersion + 1,
-                } as any,
-                asEntity(repo, current),
-                { ignoreACL: true },
-            );
-            return;
-        } catch (err) {
-            const refetched: any = attempt < FOLDER_COUNTER_ATTEMPTS ? await repo.findOne(folder.uid, { ignoreACL: true }) : undefined;
-            if (!refetched || refetched.version === current.version) {
-                throw err;
-            }
-            current = refetched;
-        }
-    }
-}
-
 /**
  * Files a delivery failure notice (`buildDeliveryFailureNotice()`) into the sender's Inbox, unread, and tells connected
  * clients about it exactly as delivery of any inbound message does (`NotificationUtils.sendMessage()` on the Inbox's
@@ -418,8 +388,9 @@ export async function fileDeliveryFailureNotice(sink: DeliveryNoticeSink, input:
         }
         throw err;
     }
-    await bumpInboxCounters(sink.folderRepo, inbox);
     sink.notificationUtils?.sendMessage(inbox.uid, sink.messageClass.name, "create", message);
+    // The Inbox's counts are derived from its messages: recomputed and published (best-effort), not incremented.
+    await refreshFolderCounts(sink, [inbox.uid], { bumpSyncKey: true });
     return message;
 }
 

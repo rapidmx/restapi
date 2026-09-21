@@ -22,6 +22,7 @@ import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
+import { coalesceFolderCounts, notifyFolderCounts, type FolderCountsContext } from "../util/FolderCountUtils.js";
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { findActiveHoldsFor } from "../util/LegalHoldUtils.js";
 import { applyThreadHeaders, scanAndRelay } from "../util/MailSendUtils.js";
@@ -166,6 +167,11 @@ const MESSAGE_DATE_FIELDS = [
     "deliveryReceiptSentAt",
     "readReceiptSentAt",
 ] as const;
+
+/** Whether `message` counts as read for its folder's unread count: `flags.read` is `true` (anything else is unread). */
+function isRead(message: Pick<Message, "flags">): boolean {
+    return message.flags?.read === true;
+}
 
 /** Whether `message` has at least one To/Cc/Bcc recipient with an address - what a send needs for its envelope. */
 function hasRecipients(message: Pick<Message, "recipients">): boolean {
@@ -389,6 +395,27 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             });
         }
         return this.mailboxRepo;
+    }
+
+    /** What `util/FolderCountUtils.ts` needs to recompute, cache and publish the counts of this route's folders. */
+    private async folderCountsContext(): Promise<FolderCountsContext> {
+        return {
+            messageRepo: this.repoUtils!,
+            folderRepo: await this.getFolderRepo(),
+            folderClass: this.folderClass,
+            notificationUtils: this.notificationUtils,
+            logger: this.logger,
+        };
+    }
+
+    /**
+     * Publishes the counts of `folderUids` after a write changed what they hold or which of it is read
+     * (`{ action: "update", data: { uid, mailboxUid, unreadCount, totalCount } }` on each folder's channel and its
+     * mailbox's - see `util/FolderCountUtils.ts`), or, inside a bulk request's `coalesceFolderCounts()` scope, once per
+     * folder when the request ends. Best-effort: never throws.
+     */
+    private async notifyFolders(folderUids: Iterable<string | undefined | null>): Promise<void> {
+        await notifyFolderCounts(await this.folderCountsContext(), folderUids);
     }
 
     /** Every caller passes a folder uid that already passed a permission check, so it's always a real string. */
@@ -771,6 +798,11 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
+        // A send moves the message Drafts -> Outbox -> Sent Items (or back): each folder's counts are published once, when it ends.
+        return await coalesceFolderCounts(() => this.folderCountsContext(), () => this.relaySend(id, body, user));
+    }
+
+    private async relaySend(id: string, body: { scheduledSendTime?: string | null } | undefined, user: JWTUser | undefined): Promise<T> {
         if (!this.repoUtils || !this.blobStore || !this.mailTransport || !this.scanPipeline) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
@@ -845,7 +877,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const scheduledSendTime: Date | undefined = requestedSendTime ?? toValidDate(message.scheduledSendTime);
         if (scheduledSendTime && scheduledSendTime.getTime() > Date.now()) {
             const outbox: any = await findOrCreateWellKnownFolder(folderRepo, this.folderClass, message.mailboxUid, FolderType.OUTBOX, user);
-            return await this.repoUtils.update(
+            const queued: T = await this.repoUtils.update(
                 {
                     uid: message.uid,
                     version: (message as any).version,
@@ -858,6 +890,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 message,
                 { user, ignoreACL: true },
             );
+            await this.notifyFolders([message.folderUid, outbox.uid]);
+            return queued;
         }
 
         const envelopeTo: string[] = message.recipients.map((r) => r.address);
@@ -942,6 +976,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             message,
             { user, ignoreACL: true },
         );
+        await this.notifyFolders([message.folderUid, outbox.uid]);
         const {
             raw: relayedRaw,
             messageId,
@@ -1096,7 +1131,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // `messageId`/`conversationId` come from the relayed MIME and are written as a patch (no model constructor), so
         // they are bounded here - see `boundIndexedValue()`. The same patch rewrites `flags`, so the denormalized list
         // mirrors are re-derived with it (`syncMessageListFields()`), keeping the Sent Items list's Unread filter right.
-        return await this.repoUtils!.update(
+        const filed: T = await this.repoUtils!.update(
             {
                 uid: message.uid,
                 version: (current as any).version,
@@ -1120,6 +1155,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             current,
             { user, ignoreACL: true },
         );
+        await this.notifyFolders([current.folderUid, sentFolder.uid]);
+        return filed;
     }
 
     /**
@@ -1370,11 +1407,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             user,
         );
 
-        return await this.repoUtils.update(
+        const archived: T = await this.repoUtils.update(
             { uid: message.uid, version: (message as any).version, folderUid: archiveFolder.uid } as any,
             message,
             { user, ignoreACL: true },
         );
+        await this.notifyFolders([message.folderUid, archiveFolder.uid]);
+        return archived;
     }
 
     /**
@@ -1593,7 +1632,40 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     }
 
     /**
-     * Wraps the inherited `BaseScopedChildRoute.update()` (unchanged) with the read-receipt trigger: if this
+     * Wraps the inherited `BaseScopedChildRoute.create()` (unchanged) with the live folder-count event: a message
+     * created in a folder (a draft, or - for a trusted caller - anywhere) changes that folder's counts.
+     */
+    @Post()
+    public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
+        const created: T | T[] = await super.create(obj, req, user);
+        await this.notifyFolders((Array.isArray(created) ? created : [created]).map((message) => message.folderUid));
+        return created;
+    }
+
+    /**
+     * Wraps the inherited `BaseScopedChildRoute.updateBulk()` (unchanged) so that a bulk mark read/unread, move or delete
+     * publishes each affected folder's counts once, when the request ends (even one that stopped part-way, whose
+     * already-applied elements stay applied), rather than once per message.
+     */
+    @Put()
+    public async updateBulk(obj: UpdateObject<T>[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
+        return await coalesceFolderCounts(() => this.folderCountsContext(), () => super.updateBulk(obj, req, user));
+    }
+
+    /**
+     * Wraps the inherited `BaseScopedChildRoute.truncate()` (unchanged) with the live folder-count event for the folder it
+     * emptied (`?folderUid=` is the scope it was permission-checked against).
+     */
+    @Delete()
+    public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
+        await super.truncate(params, query, user);
+        await this.notifyFolders([query?.folderUid]);
+    }
+
+    /**
+     * Wraps the inherited `BaseScopedChildRoute.update()` (unchanged) with the live folder-count event (an update that
+     * moves the message to another folder, or flips `flags.read`, publishes the counts of the folder(s) concerned - see
+     * `util/FolderCountUtils.ts`) and the read-receipt trigger: if this
      * update carries `flags.read` transitioning `false → true` and the message still has a receipt to answer
      * (`dispositionNotificationTo` set, `readReceiptSentAt`/`readReceiptPending` both still unset - i.e. this
      * is genuinely the first time), decides and sends (or defers pending approval) the read MDN via
@@ -1609,6 +1681,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     ): Promise<T> {
         const existing: T | undefined = this.repoUtils ? await this.repoUtils.findOne(id, { ignoreACL: true }) : undefined;
         const updated: T = await super.update(id, obj, req, user);
+
+        // What a folder's counts depend on that an update can change: which folder the message is in, and whether it is read
+        // (`deleted` isn't client-writable: a soft delete is `delete()`'s).
+        if (existing && (existing.folderUid !== updated.folderUid || isRead(existing) !== isRead(updated))) {
+            await this.notifyFolders([existing.folderUid, updated.folderUid]);
+        }
 
         const justMarkedRead: boolean = !!existing && !existing.flags.read && updated.flags.read;
         // Judged on the state before this update as well as after it, so a trusted caller clearing the receipt fields
@@ -1887,6 +1965,9 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         await super.delete(id, version, purge, req, user);
 
         if (existing) {
+            // A soft delete or a purge takes a live message out of its folder (`existing` is undefined for one that was
+            // already soft-deleted, which changes nothing).
+            await this.notifyFolders([existing.folderUid]);
             await recordAuditLog(
                 this._objectFactory!,
                 this.auditLogClass,

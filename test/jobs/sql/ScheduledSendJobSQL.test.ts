@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Real-DB + real-DI integration test for ScheduledSendJobSQL - see ScanQueueJobSQL.test.ts's/
 // ScheduledSendJobSQL.test.ts's file headers for the full rationale.
-import { ACLUtils, AccessControlListSQL, ConnectionManager, ObjectFactory, isSqlDataSource } from "@rapidrest/service-core";
+import { ACLUtils, NotificationUtils, AccessControlListSQL, ConnectionManager, ObjectFactory, isSqlDataSource } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { simpleParser } from "mailparser";
 import * as uuid from "uuid";
@@ -158,11 +158,26 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
     it("Relays a due scheduled message, moves it to Sent Items, and clears scheduledSendTime.", async () => {
         const bodyBlobKey = await putBody();
         const message = await createMessage({ bodyBlobKey, scheduledSendTime: new Date(Date.now() - 60 * 1000) });
+        const sendMessageSpy = vi.spyOn(NotificationUtils.prototype, "sendMessage");
 
         await job.run();
 
         expect(transport().sent.length).toBe(1);
         expect(transport().sent[0].envelopeFrom).toBe("owner@example.com");
+        // Outbox -> Sent Items: the counts of both folders are published.
+        const countEvents = sendMessageSpy.mock.calls
+            .filter(([, type, action]) => /^Folder/.test(String(type)) && action === "update")
+            .map(([, , , data]: any[]) => data)
+            .filter((data) => Object.keys(data).length === 4);
+        sendMessageSpy.mockRestore();
+        const sentUid = (await findMessage(message.uid)).folderUid;
+        expect(countEvents).toEqual(
+            expect.arrayContaining([
+                { uid: outboxUid, mailboxUid, unreadCount: 0, totalCount: 0 },
+                { uid: sentUid, mailboxUid, unreadCount: 0, totalCount: 1 },
+            ]),
+        );
+        expect(countEvents).toHaveLength(2);
 
         const sentFolder = await folderRepo.findOne({ where: { mailboxUid, type: FolderType.SENT_ITEMS } });
         expect(sentFolder).toBeDefined();

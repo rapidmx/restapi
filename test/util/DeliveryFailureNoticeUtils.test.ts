@@ -8,9 +8,15 @@
 vi.mock("../../src/util/FolderUtils.js", () => ({
     findOrCreateWellKnownFolder: vi.fn(),
 }));
+// What the Inbox's counts become is `util/FolderCountUtils.ts`'s business (its own suite, and the route suites against
+// real databases): here only that the filer asks for them.
+vi.mock("../../src/util/FolderCountUtils.js", () => ({
+    refreshFolderCounts: vi.fn().mockResolvedValue(undefined),
+}));
 
 import { simpleParser } from "mailparser";
 import { findOrCreateWellKnownFolder } from "../../src/util/FolderUtils.js";
+import { refreshFolderCounts } from "../../src/util/FolderCountUtils.js";
 import {
     buildDeliveryFailureNotice,
     type DeliveryFailureNoticeInput,
@@ -345,6 +351,7 @@ describe("fileDeliveryFailureNotice()", () => {
     }
 
     beforeEach(() => {
+        vi.mocked(refreshFolderCounts).mockClear();
         blobStore = new InMemoryBlobStore();
         messageRepo = {
             findOne: vi.fn().mockResolvedValue(undefined),
@@ -361,7 +368,7 @@ describe("fileDeliveryFailureNotice()", () => {
         sink = { messageRepo, messageClass: MessageClass, folderRepo, folderClass: class {}, blobStore, notificationUtils, logger };
     });
 
-    it("Files the notice unread in the Inbox under a uid derived from its key, stores its source, bumps the Inbox and notifies clients.", async () => {
+    it("Files the notice unread in the Inbox under a uid derived from its key, stores its source, notifies clients and has the Inbox's counts refreshed.", async () => {
         const message = await fileDeliveryFailureNotice(sink, input());
         const uid = deliveryFailureUid("mailbox-1", "send-partial:message-1");
 
@@ -384,11 +391,9 @@ describe("fileDeliveryFailureNotice()", () => {
         expect(message.fields.bodyPreview).toContain("bob@example.net");
         expect((await blobStore.get(`notices/${uid}`)).toString()).toContain("Final-Recipient: rfc822; bob@example.net");
         expect(findOrCreate).toHaveBeenCalledWith(folderRepo, sink.folderClass, "mailbox-1", "inbox");
-        expect(folderRepo.update).toHaveBeenCalledWith(
-            { uid: "inbox-1", version: 3, unreadCount: 5, totalCount: 10, syncKeyVersion: 8 },
-            expect.anything(),
-            { ignoreACL: true },
-        );
+        // The counts are derived from the messages, never incremented here.
+        expect(folderRepo.update).not.toHaveBeenCalled();
+        expect(refreshFolderCounts).toHaveBeenCalledWith(sink, ["inbox-1"], { bumpSyncKey: true });
         expect(notificationUtils.sendMessage).toHaveBeenCalledWith("inbox-1", "MessageClass", "create", message);
     });
 
@@ -409,7 +414,7 @@ describe("fileDeliveryFailureNotice()", () => {
         expect(messageRepo.findOne).toHaveBeenCalledWith(deliveryFailureUid("mailbox-1", "send-partial:message-1"), { ignoreACL: true, includeDeleted: true });
         expect(messageRepo.create).not.toHaveBeenCalled();
         expect(notificationUtils.sendMessage).not.toHaveBeenCalled();
-        expect(folderRepo.update).not.toHaveBeenCalled();
+        expect(refreshFolderCounts).not.toHaveBeenCalled();
     });
 
     it("Files nothing when a concurrent filer of the same failure wins the uid, and rethrows any other create failure.", async () => {
@@ -421,38 +426,6 @@ describe("fileDeliveryFailureNotice()", () => {
         messageRepo.findOne.mockReset().mockResolvedValue(undefined);
         messageRepo.create.mockRejectedValueOnce(new Error("datastore down"));
         await expect(fileDeliveryFailureNotice(sink, input())).rejects.toThrow("datastore down");
-    });
-
-    it("Re-reads the Inbox and retries bumping its counters when another writer changed it first.", async () => {
-        folderRepo.update.mockRejectedValueOnce(new Error("version conflict")).mockResolvedValueOnce(undefined);
-        folderRepo.findOne.mockResolvedValue({ ...inbox, version: 4, unreadCount: 6, totalCount: 11, syncKeyVersion: 9 });
-
-        await fileDeliveryFailureNotice(sink, input());
-
-        expect(folderRepo.update).toHaveBeenCalledTimes(2);
-        expect(folderRepo.update).toHaveBeenLastCalledWith(
-            { uid: "inbox-1", version: 4, unreadCount: 7, totalCount: 12, syncKeyVersion: 10 },
-            expect.anything(),
-            { ignoreACL: true },
-        );
-    });
-
-    it("Gives up bumping the counters when the Inbox is unchanged (a real failure), and after five conflicts.", async () => {
-        folderRepo.update.mockRejectedValue(new Error("write failed"));
-        folderRepo.findOne.mockResolvedValue({ ...inbox });
-        await expect(fileDeliveryFailureNotice(sink, input())).rejects.toThrow("write failed");
-        expect(folderRepo.update).toHaveBeenCalledTimes(1);
-
-        folderRepo.update.mockReset().mockRejectedValue(new Error("always conflicting"));
-        let version = 3;
-        folderRepo.findOne.mockImplementation(async () => ({ ...inbox, version: ++version }));
-        messageRepo.findOne.mockResolvedValue(undefined);
-        await expect(fileDeliveryFailureNotice(sink, input({ key: "again" }))).rejects.toThrow("always conflicting");
-        expect(folderRepo.update).toHaveBeenCalledTimes(5);
-
-        folderRepo.update.mockReset().mockRejectedValue(new Error("gone"));
-        folderRepo.findOne.mockResolvedValue(undefined);
-        await expect(fileDeliveryFailureNotice(sink, input({ key: "gone" }))).rejects.toThrow("gone");
     });
 });
 

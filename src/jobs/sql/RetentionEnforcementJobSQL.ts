@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RetentionEnforcementJob } from "../RetentionEnforcementJob.js";
-import { AttachmentSQL, AuditLogEntrySQL, IngestQueueEntrySQL, MatterSQL, MessageSQL, QuarantineEntrySQL, RetentionPolicySQL } from "../../sql.js";
+import { AttachmentSQL, AuditLogEntrySQL, FolderSQL, IngestQueueEntrySQL, MatterSQL, MessageSQL, QuarantineEntrySQL, RetentionPolicySQL } from "../../sql.js";
 
 export class RetentionEnforcementJobSQL extends RetentionEnforcementJob<RetentionPolicySQL, MessageSQL, AuditLogEntrySQL, AttachmentSQL> {
     protected retentionPolicyClass: any = RetentionPolicySQL;
@@ -13,4 +13,5 @@ export class RetentionEnforcementJobSQL extends RetentionEnforcementJob<Retentio
     protected quarantineEntryClass: any = QuarantineEntrySQL;
     protected ingestQueueEntryClass: any = IngestQueueEntrySQL;
     protected matterClass: any = MatterSQL;
+    protected folderClass: any = FolderSQL;
 }

@@ -6,6 +6,7 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
+import { refreshFolderCounts } from "../util/FolderCountUtils.js";
 import type { TransportError, TransportFailure } from "../transport/MailTransport.js";
 import type { MailRelayFailureDetails } from "../transport/TransportResultUtils.js";
 import {
@@ -357,6 +358,8 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 { ignoreACL: true },
             );
             this.notificationUtils?.sendMessage(sentFolder.uid, this.messageClass.name, "update", updated);
+            // Outbox -> Sent Items: both folders' counts changed.
+            await refreshFolderCounts(this.noticeSink(), [refetched.folderUid, sentFolder.uid]);
         } catch (err: any) {
             // The message WAS relayed - never restore it as a fresh send. Stamp the relayed marker (plus what the
             // relay produced) so the next run only finishes filing.

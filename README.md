@@ -41,6 +41,28 @@ helpers `@rapidmx/activesync-plugin`/`@rapidmx/mapi-plugin` build their own prot
 other downstream consumer that needs to resolve a caller's mailbox or relay a composed message through the
 scan pipeline.
 
+## Folder counts
+
+A folder's `unreadCount` and `totalCount` are **derived from its messages**, never trusted from the row:
+
+- `GET /folders` (any query or paging) and `GET /folders/:id` - and the responses of `PUT` - answer with `totalCount` = the folder's
+  messages that are not soft-deleted (exactly what `GET /messages?folderUid=` lists) and `unreadCount` = those whose `flags.read`
+  is not `true` (unset counts as unread), from **one grouped query per request** (a `$group` on MongoDB, a `GROUP BY` on SQL),
+  however many folders are listed. The stored fields are only a cache, refreshed whenever this library changes what a folder holds and
+  repaired when a read finds them stale; they stay server-managed (a client cannot set them). `FolderRouteMongo`/`FolderRouteSQL` do
+  this through their `messageClass`; a custom `BaseFolderRoute` subclass must set `messageClass` too, or it answers with the stored values.
+- **Live event.** After a write that changes a folder's counts (message created, marked read or unread, moved, deleted, sent, imported,
+  purged, retained away - a move publishes both folders, a bulk update or a send publishes each folder once) the folder's counts are
+  published on the folder's channel **and** its mailbox's channel:
+
+  ```json
+  { "type": "FolderMongo", "action": "update", "data": { "uid": "<folder>", "mailboxUid": "<mailbox>", "unreadCount": 3, "totalCount": 27 } }
+  ```
+
+  (`type` is `FolderMongo` or `FolderSQL`; match `/^Folder/`. `data` carries exactly those four fields, not the folder row.)
+  Publishing is best-effort. A protocol package that writes `Message.flags` or `folderUid` itself should call `refreshFolderCounts()`
+  (exported) afterwards, with its own `FolderCountsContext`, so the cache and the event follow.
+
 ## Delivery failures
 
 A sender is always told when mail they sent did not go out, with the mail system's own words:

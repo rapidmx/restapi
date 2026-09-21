@@ -51,6 +51,10 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Index("message_folder_received", ["folderUid", "receivedDate"])
 @Index("message_folder_read_received", ["folderUid", "read", "receivedDate"])
 @Index("message_folder_flagged_received", ["folderUid", "flagged", "receivedDate"])
+// The folder counts (`util/FolderCountUtils.ts`) are a `GROUP BY folderUid` of the live (`deleted = false`) messages,
+// matched on `flags` (opaque JSON text here, so nothing can cover it): `message_folder` finds a folder's rows, and this
+// one lets the `deleted` test be answered from the index before any row is read.
+@Index("message_folder_deleted", ["folderUid", "deleted"])
 // Expanding one conversation (`conversationMessages()`) reads a mailbox's messages for one `conversationId` in
 // date order.
 @Index("message_mailbox_conversation_received", ["mailboxUid", "conversationId", "receivedDate"])

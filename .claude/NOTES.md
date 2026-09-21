@@ -887,8 +887,9 @@ Queues (findings 2, 7)
   New nullable IngestQueueEntry fields `attempts`, `nextAttemptAt`, `scanLeaseExpiresAt`.
 - Idempotent delivery: the target Message/QuarantineEntry uid, ScanResult uid, rule-copy uids, attachment uids and the
   attachment/sanitized blob keys are all derived from the entry uid and looked up before create. An already-filed
-  message isn't re-sent receipts, auto-replies or forwards; iTIP re-applies (it's idempotent). Folder counter bumps
-  retry on a version conflict. Residual: counters can be under-counted if a worker dies between filing and bumping.
+  message isn't re-sent receipts, auto-replies or forwards; iTIP re-applies (it's idempotent). ~~Folder counter bumps
+  retry on a version conflict. Residual: counters can be under-counted if a worker dies between filing and bumping.~~
+  Superseded 2026-09-20 ("Folder counts are derived"): counts are recomputed from the messages, so there is nothing to under-count.
 - RetentionEnforcementJob/QuarantineRetentionJob read `(date, uid)`-sorted pages past skipped/failed rows (the remaining
   set is always "rows skipped so far, then unread rows"). Held mailboxes are excluded from the message/quarantine
   query with `mailboxUid nin(...)` (conservative: ignores the hold's date range); audit entries are skipped in memory
@@ -2499,3 +2500,80 @@ CRLF so git's autocrlf can't change them. The hand-written `postfixDsn.ts` stays
   the same shape, so it gets the same preview.
 - Also confirmed on the real captures: not quarantined (nothing in the verdict looks at a null sender or SPF/DKIM), no auto-reply sent,
   `Message.from.address` = `MAILER-DAEMON@mail.owned.lab` (the earlier null-envelope fallback), stored source byte-identical to the input.
+
+## 2026-09-20 (later) — Folder counts are derived from the messages, and published when they change
+
+Trigger (measured on JP's live Mongo): a folder's stored `unreadCount`/`totalCount` were **write-only**. Only `ScanQueueJob.bumpFolderCounters()` and
+`DeliveryFailureNoticeUtils.bumpInboxCounters()` (and, for `totalCount` only, `MailboxImportJob`) ever wrote them, always as `+1`. Nothing
+decremented or recomputed them on mark read/unread, move, delete/restore, purge, retention, send (Sent Items/Outbox), or draft create/delete. Live
+mailbox: inbox stored 7/7 vs actual 0 unread of 3; sent_items stored 0/0 vs 0/7; deleted_items 0/0 vs 0/4. The web client's badge was wrong at all
+times and never changed. JP's standing rule: pre-release, no migrations - existing rows must simply become right.
+
+- **Design: the messages are the source of truth; counts are derived on read** (`util/FolderCountUtils.ts`). `BaseFolderRoute.find/findById` (and
+  the `update`/`updateBulk`/`updateProperty` responses) replace `unreadCount`/`totalCount` with `countMessagesByFolder()`'s answer: ONE grouped
+  query for the whole request (Mongo `aggregate` `$match`+`$group` on `folderUid`; SQL `GROUP BY folderUid` via the query builder), chunked at 500
+  uids only to bound a SQL `IN`. Tested: 1 grouped query for 1, 3 and 25 folders on both backends, and for `GET /:id`. Not N queries, not a stored
+  counter: there is no second source of truth that can disagree on a read.
+- **What counts = exactly what the message list shows.** The list is `RepoUtils.find()` scoped to `folderUid`, whose only implicit exclusion is
+  `deleted: false` (a soft-deleted row); drafts/Outbox/scheduled rows, released quarantine mail etc. are all listed, so all count. Unread =
+  `flags.read !== true` (unset, `false` or a missing `flags` are unread - tested with a row whose `flags` is `{}`). New inbound mail is filed with
+  `flags.read = filterResult.markRead` (explicit `false` unless a rule marks it read); the derivation doesn't depend on that. Non-message folder
+  types (Calendar/Contacts/Tasks/Notes) simply derive 0/0 (no messages), which is what they always stored.
+- **`flags.read`, NOT the `read` mirror.** `Message.read` is indexed for the Unread filter, but (see the 2026-09-15 mirror entry) the ActiveSync/MAPI
+  plugins write `flags` through their own repos and never maintain it, and it is `NULL` on rows older than it. Counting on the mirror would make the
+  badge wrong exactly when a device marks mail read. Mongo reads `$flags.read`; SQL has `flags` as `simple-json` text, so it matches
+  `flags LIKE '%"read":true%'` (`MessageFlags` holds only booleans, and `JSON.stringify` writes no spaces, so this can't match anything but the key).
+  Consequence, unchanged and documented: `?filter=unread` (the mirror) can still disagree with the badge for a row written by a plugin that skipped
+  `syncMessageListFields()` - the badge is the one that's right.
+- **Indexes.** `message_folder` (`folderUid`) exists on both. Added `MessageMongo` `message_folder_deleted_flags_read` `[folderUid, deleted, flags.read]`
+  - the group reads only those three fields, so it's a covered index scan (a dotted key works with `MongoSchemaSync`, which builds the key from the
+  column name; SQL can't cover JSON text) - and `MessageSQL` `message_folder_deleted` `[folderUid, deleted]`.
+- **The stored fields are now a best-effort cache, and reads never trust them.** Written by `refreshFolderCounts()` (version-checked `update` with
+  `skipPush: true`, so it doesn't also publish the whole folder row; on a version race it recomputes the counts too, up to 3 attempts, then gives
+  up silently) and by `healStoredFolderCounts()` when a read finds a stored value that disagrees (so JP's wrong rows repair themselves on the first
+  `GET /folders`). `SERVER_MANAGED_FOLDER_FIELDS` still lists both (client `PUT` drops them, `PUT /:id/unreadCount` is 403, `POST` zeroes them) - tested.
+  The dead `+1` increments were replaced, not just removed: `bumpFolderCounters`/`bumpInboxCounters`/`MailboxImportJob`'s `totalCount + n` now call
+  `refreshFolderCounts(ctx, [folderUid], { bumpSyncKey: true })` (`syncKeyVersion` is still bumped on every add, as before - nothing in this
+  workspace reads it, but it is documented as the EAS/ICS watermark). **Behavior change:** a failing folder-row write can no longer fail a delivery
+  (it used to throw after the message was filed and fail the queue entry for retry); four tests that used that failure as their injection point
+  (delivery receipt / auto-reply "on retry") now fail the job's own `create` notice instead, and the three "counter bump retry" tests were rewritten
+  around the refresh.
+- **Who reads the stored fields (grepped across `d:\github\rapidmx\*`).** Only `@rapidmx/mapi-plugin` in production code: `rop/FolderTarget.ts`
+  `resolveFolderInfo()` reads `folder.unreadCount/totalCount` straight from `folderRepo.findOne()` (via `PropertyResolvers`), so it does not go through
+  the route classes. `@rapidmx/activesync-plugin`, `autodiscover` and `server` do not read them (activesync only seeds them to 0 in tests). Resolution:
+  kept them as a cache refreshed at every point this library changes a folder's contents, repaired by any `GET /folders`, and exported
+  `refreshFolderCounts()`/`countMessagesByFolder()`/`coalesceFolderCounts()`/`notifyFolderCounts()` from the root for a plugin that writes messages through
+  its own repos (mapi/activesync flag writes, moves and deletes do NOT run this library's routes, so until they call `refreshFolderCounts()` the cache and
+  the event lag for those writes; the REST reads are right regardless). Not changed in those repos (read-only here). The ideal follow-up is mapi resolving
+  counts with `countMessagesByFolder()`.
+- **Live event** (the contract the web client codes against):
+  `{ type: <FolderClass.name: "FolderMongo" | "FolderSQL">, action: "update", data: { uid, mailboxUid, unreadCount, totalCount } }` via
+  `notificationUtils.sendMessage([folder.uid, folder.mailboxUid], type, "update", data)`. **Channels: both the folder's uid and its mailbox's uid.**
+  Reason: today's folder-level events are split (`BaseFolderRoute.create` publishes on the *mailbox* channel; `RepoUtils`' own record events on the
+  *folder's*), and `MailPushRoute` subscribes per bare uid with no fan-out from a mailbox to its folders; the web client subscribes to every folder
+  channel but caps channels (`PUSH_MAX_CHANNELS`) and lists mailboxes last, so publishing to both means the badge updates whichever it kept. A client
+  subscribed to both hears it twice (idempotent: `data.uid` names the folder). `data` is exactly those four fields, not the row. Computed with the
+  same derivation as the read, always published for the affected folders (not gated on "changed" - the stored value may be stale), best-effort and
+  fire-and-forget (`refreshFolderCounts()` catches everything; a publish failure never fails the mutation). Events from overlapping writes to one
+  folder are not ordered; the client's poll/reconnect re-read (`GET /folders`) is the backstop.
+- **Where it fires.** `BaseMessageRoute` (through `notifyFolders()`): `create` (single or array), `update` (only when `folderUid` or `flags.read` changed -
+  `deleted` is not client-writable), `delete` (soft delete or purge of a live row; a soft-deleted row is a 404 and publishes nothing), `truncate`, `archive`,
+  `send` (Drafts -> Outbox -> Sent Items, scheduled Drafts -> Outbox) and `updateBulk`. **Coalescing:** `coalesceFolderCounts()` uses an `AsyncLocalStorage`
+  scope (per request, so concurrent requests can't leak into each other) that collects folder uids and publishes once per folder when the scope ends -
+  `finally`, so a bulk that failed part-way still publishes for what it applied. `send()` was split into `send()` (scope) + `relaySend()` (the old body).
+  Jobs (direct calls to `refreshFolderCounts`): `ScanQueueJob` (delivery, rule copies, recall delete), `ScheduledSendJob` (Outbox -> Sent),
+  `MailboxImportJob` (once per import), `RetentionEnforcementJob` (once per folder per run, live rows only; needs the optional `folderClass` +
+  `NotificationUtils` injection), `DeliveryFailureNoticeUtils` (Inbox). Not covered: `ErasureExecutionJob` (erases a whole mailbox - its folders go with
+  it), a *restore* (this library has no route that un-deletes a message, so a restore done elsewhere shows on the next read but is not published), and
+  plugin-side writes (above).
+- **`BaseFolderRoute` needs `messageClass`** (a new optional protected field, set by `FolderRouteMongo/SQL`; unset = stored values, so a downstream
+  subclass keeps working unchanged). `update`/`updateBulk`/`updateProperty` are overridden **without** decorators (like the existing `updateProperty`) so
+  `CRUDRoute`'s `@Validate`/`@Transactional` metadata still applies; `findById` re-declares `@Get("/:id")` like `find` does.
+- Tests: `test/routes/folderCountsSuite.ts` (+ `{mongo,sql}/FolderCounts.test.ts`: derived list/by-id/filtered/paged, wrong stored counters incl. negative,
+  cache repair, PUT responses, client counts ignored, bounded queries, list == count, mark read/unread, no event for an unrelated update, bulk once per
+  folder, part-way bulk, move, archive, delete/restore/purge, truncate, draft create/delete/bulk, send/failed send/scheduled send, event payloads and
+  channels), `test/util/FolderCountUtils.test.ts` (batching, string sums, lost version race recomputes, give-up, missing folder, failures logged,
+  coalescing), plus event assertions in the ScanQueueJob (ingest, recall, refresh conflict), ScheduledSendJob, MailboxImportJob and
+  RetentionEnforcementJob suites.
+- Not verified here: the web client actually rendering the event, mapi's tables with real Outlook, and behavior on MySQL/PostgreSQL (the SQL suite is
+  SQLite; the query uses only portable `COUNT`/`SUM(CASE)`/`LIKE` and driver-string sums are coerced with `Number()`).

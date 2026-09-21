@@ -363,6 +363,32 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         await expect(job.run()).resolves.toBeUndefined();
     });
 
+    it("Publishes the Inbox's counts after each delivery, derived from its messages rather than added to whatever was stored, and refreshes the stored cache.", async () => {
+        await createMailbox();
+        const inbox = await folderRepo.save(
+            new FolderMongo({ mailboxUid, name: "Inbox", type: FolderType.INBOX, unreadCount: 7, totalCount: 7, syncKeyVersion: 0 }),
+        );
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        for (let i = 0; i < 2; i++) {
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage());
+            await createIngestEntry({ rawBlobKey });
+        }
+        const sendMessageSpy = vi.spyOn(NotificationUtils.prototype, "sendMessage");
+
+        await job.run();
+
+        const events = sendMessageSpy.mock.calls
+            .filter(([, type, action]) => /^Folder/.test(String(type)) && action === "update")
+            .map(([channels, type, , data]) => [channels, type, data]);
+        sendMessageSpy.mockRestore();
+        expect(events).toEqual([
+            [[inbox.uid, mailboxUid], "FolderMongo", { uid: inbox.uid, mailboxUid, unreadCount: 1, totalCount: 1 }],
+            [[inbox.uid, mailboxUid], "FolderMongo", { uid: inbox.uid, mailboxUid, unreadCount: 2, totalCount: 2 }],
+        ]);
+        expect(await folderRepo.findOne({ uid: inbox.uid } as any)).toMatchObject({ unreadCount: 2, totalCount: 2, syncKeyVersion: 2 });
+    });
+
     it("Delivers a clean message with an attachment to the mailbox's Inbox, creating the folder, and marks the entry DELIVERED.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const rawBlobKey = `raw/${uuid.v4()}`;
@@ -2181,10 +2207,23 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         it("Deletes the target message and reports success when it's still unread.", async () => {
             await createMailbox();
             const targetMessageId = "target-message@example.com";
+            // The Inbox holds the target and one message already read, and its stored counters are stale.
+            const inbox = await folderRepo.save(new FolderMongo({ mailboxUid, name: "Inbox", type: FolderType.INBOX, unreadCount: 4, totalCount: 4 }));
+            await messageRepo.save(
+                new MessageMongo({
+                    mailboxUid,
+                    folderUid: inbox.uid,
+                    messageId: "already-read@example.com",
+                    from: { address: "sender@example.com", type: RecipientType.TO },
+                    recipients: [{ address: "recipient@example.com", type: RecipientType.TO }],
+                    bodyBlobKey: `bodies/${uuid.v4()}`,
+                    flags: { read: true, flagged: false, answered: false, forwarded: false },
+                }),
+            );
             const target = await messageRepo.save(
                 new MessageMongo({
                     mailboxUid,
-                    folderUid: "inbox-folder",
+                    folderUid: inbox.uid,
                     messageId: targetMessageId,
                     from: { address: "sender@example.com", type: RecipientType.TO },
                     recipients: [{ address: "recipient@example.com", type: RecipientType.TO }],
@@ -2196,15 +2235,25 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             const rawBlobKey = `raw/${uuid.v4()}`;
             await blobStore.put(rawBlobKey, makeRecallRaw(targetMessageId));
             await createIngestEntry({ rawBlobKey, envelopeFrom: "sender@example.com", envelopeTo: ["recipient@example.com"] });
+            const sendMessageSpy = vi.spyOn(NotificationUtils.prototype, "sendMessage");
 
             await job.run();
+
+            // The recalled message is out of the Inbox's counts, and the change is published.
+            expect(sendMessageSpy).toHaveBeenCalledWith([inbox.uid, mailboxUid], "FolderMongo", "update", {
+                uid: inbox.uid,
+                mailboxUid,
+                unreadCount: 0,
+                totalCount: 1,
+            });
+            sendMessageSpy.mockRestore();
 
             const found = await messageRepo.findOne({ uid: target.uid } as any);
             expect(found!.deleted).toBe(true);
 
             // The recall control message itself is never filed anywhere in the recipient's mailbox.
             const allMessages = await messageRepo.find({ mailboxUid }).toArray();
-            expect(allMessages.length).toBe(1);
+            expect(allMessages.length).toBe(2); // the already-read message and the (soft-deleted) target
 
             const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
             expect(transport.sent.length).toBe(1);
@@ -3562,14 +3611,15 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             expect((await ingestQueueRepo.findOne({ uid: entry.uid } as any))!.status).toBe(IngestStatus.DELIVERED);
         });
 
-        it("Retries the folder counter bump after a concurrent delivery changed the folder first.", async () => {
+        it("Retries the folder counts refresh after a concurrent write changed the folder first, storing counts derived from the messages.", async () => {
             const repo = (job as any).folderRepo;
             const realUpdate = repo.update.bind(repo);
             let conflicts = 0;
             vi.spyOn(repo, "update").mockImplementation(async (obj: any, ...rest: any[]) => {
                 if (obj.totalCount !== undefined && conflicts === 0) {
                     conflicts++;
-                    await folderRepo.updateOne({ uid: obj.uid }, { $inc: { version: 1, totalCount: 1 } });
+                    // Someone else bumps the row (and its now-wrong counters) between the read and this write.
+                    await folderRepo.updateOne({ uid: obj.uid }, { $inc: { version: 1, totalCount: 5 } });
                     throw new Error("simulated version conflict");
                 }
                 return await realUpdate(obj, ...rest);
@@ -3581,11 +3631,12 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             expect(conflicts).toBe(1);
             expect((await ingestQueueRepo.findOne({ uid: entry.uid } as any))!.status).toBe(IngestStatus.DELIVERED);
             const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
-            // The concurrent delivery's increment plus this one's - neither lost.
-            expect(inbox!.totalCount).toBe(2);
+            // Never an increment of whatever was stored: the one message the Inbox holds, whatever the row said before.
+            expect(inbox!.totalCount).toBe(1);
+            expect(inbox!.unreadCount).toBe(1);
         });
 
-        it("Gives up on the folder counter bump (failing the entry for retry) after the bounded number of conflicting attempts.", async () => {
+        it("Delivers the message and still publishes the folder's counts when the stored counts can't be updated (a bounded number of attempts).", async () => {
             const repo = (job as any).folderRepo;
             const realUpdate = repo.update.bind(repo);
             let attempts = 0;
@@ -3597,33 +3648,22 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
                 }
                 return await realUpdate(obj, ...rest);
             });
+            const sendMessageSpy = vi.spyOn(NotificationUtils.prototype, "sendMessage");
             const entry = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
 
             await job.run();
 
-            expect(attempts).toBe(5);
-            const after = await ingestQueueRepo.findOne({ uid: entry.uid } as any);
-            expect(after!.status).toBe(IngestStatus.FAILED);
-            expect(after!.errorMessage).toContain("simulated persistent version conflict");
-        });
-
-        it("Fails the counter bump immediately when the conflicting folder's version didn't actually change.", async () => {
-            const repo = (job as any).folderRepo;
-            const realUpdate = repo.update.bind(repo);
-            let attempts = 0;
-            vi.spyOn(repo, "update").mockImplementation(async (obj: any, ...rest: any[]) => {
-                if (obj.totalCount !== undefined) {
-                    attempts++;
-                    throw new Error("simulated non-conflict update failure");
-                }
-                return await realUpdate(obj, ...rest);
-            });
-            const entry = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
-
-            await job.run();
-
-            expect(attempts).toBe(1);
-            expect((await ingestQueueRepo.findOne({ uid: entry.uid } as any))!.errorMessage).toContain("simulated non-conflict update failure");
+            // The stored counts are only a cache: failing to refresh them never fails the delivery.
+            expect(attempts).toBe(3);
+            expect((await ingestQueueRepo.findOne({ uid: entry.uid } as any))!.status).toBe(IngestStatus.DELIVERED);
+            const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
+            expect(sendMessageSpy).toHaveBeenCalledWith(
+                [inbox!.uid, mailboxUid],
+                "FolderMongo",
+                "update",
+                { uid: inbox!.uid, mailboxUid, unreadCount: 1, totalCount: 1 },
+            );
+            sendMessageSpy.mockRestore();
         });
 
         it("Ignores an iTIP message with no From address at all (no verifiable sender).", async () => {
@@ -3974,19 +4014,21 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             it("Sends the delivery receipt on retry when the earlier attempt filed the message but failed before sending it.", async () => {
                 await createMailbox();
                 await verifiedDomain();
-                const folders = (job as any).folderRepo;
-                const realUpdate = folders.update.bind(folders);
+                // The job's own live "create" notice of the filed message (on the folder's channel, as a bare uid - a repository's
+                // own publish passes a list) is the step between filing it and answering it.
+                const realSend = NotificationUtils.prototype.sendMessage;
                 let failed = false;
-                vi.spyOn(folders, "update").mockImplementation(async (obj: any, ...rest: any[]) => {
-                    if (obj.totalCount !== undefined && !failed) {
+                const notifySpy = vi.spyOn(NotificationUtils.prototype, "sendMessage").mockImplementation(function (this: any, ...args: any[]) {
+                    if (!failed && typeof args[0] === "string" && /^Message/.test(args[1]) && args[2] === "create") {
                         failed = true;
-                        throw new Error("simulated counter failure");
+                        throw new Error("simulated notification failure");
                     }
-                    return await realUpdate(obj, ...rest);
+                    return (realSend as any).apply(this, args);
                 });
                 const entry = await createIngestEntry({ rawBlobKey: await putRaw(receiptRequest()), envelopeFrom: "colleague@example.com" });
 
                 await job.run();
+                notifySpy.mockRestore();
                 expect(await messageRepo.find({ mailboxUid }).toArray()).toHaveLength(1);
                 expect(receiptsSent()).toBe(0);
 
@@ -4820,20 +4862,22 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
 
             it("Sends the automatic reply on a retry of an attempt that filed the message but failed before replying - and only once.", async () => {
                 await createMailbox({ oofEnabled: true, oofMessage: "I'm currently out of office." });
-                const folders = (job as any).folderRepo;
-                const realUpdate = folders.update.bind(folders);
+                // The job's own live "create" notice of the filed message (on the folder's channel, as a bare uid - a repository's
+                // own publish passes a list) is the step between filing it and answering it.
+                const realSend = NotificationUtils.prototype.sendMessage;
                 let failed = false;
-                vi.spyOn(folders, "update").mockImplementation(async (obj: any, ...rest: any[]) => {
-                    if (obj.totalCount !== undefined && !failed) {
+                const notifySpy = vi.spyOn(NotificationUtils.prototype, "sendMessage").mockImplementation(function (this: any, ...args: any[]) {
+                    if (!failed && typeof args[0] === "string" && /^Message/.test(args[1]) && args[2] === "create") {
                         failed = true;
-                        throw new Error("simulated counter failure");
+                        throw new Error("simulated notification failure");
                     }
-                    return await realUpdate(obj, ...rest);
+                    return (realSend as any).apply(this, args);
                 });
                 const autoReplies = (): number => transport().sent.filter((m) => m.raw.toString().includes("Automatic reply")).length;
                 const entry = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
 
                 await job.run();
+                notifySpy.mockRestore();
                 expect(await messagesInMailbox()).toHaveLength(1);
                 expect((await entryRow(entry.uid)).status).toBe(IngestStatus.FAILED);
                 expect(autoReplies()).toBe(0);

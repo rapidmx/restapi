@@ -5,7 +5,7 @@
 // Real-DB + real-DI integration test for RetentionEnforcementJobSQL - see
 // QuarantineRetentionJobSQL.test.ts's file header for the full rationale (bypasses `Server`, wires a real
 // ObjectFactory/ConnectionManager directly).
-import { ACLUtils, AccessControlListSQL, ConnectionManager, ObjectFactory, isSqlDataSource } from "@rapidrest/service-core";
+import { ACLUtils, AccessControlListSQL, ConnectionManager, NotificationUtils, ObjectFactory, isSqlDataSource } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
@@ -16,6 +16,7 @@ import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
 import { QuarantineEntrySQL } from "../../../src/models/sql/QuarantineEntrySQL.js";
+import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
 import { RetentionPolicySQL } from "../../../src/models/sql/RetentionPolicySQL.js";
 import { AuditAction, AuditLogEntry, RecipientType } from "../../../src/models/types.js";
@@ -33,6 +34,7 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
     let auditLogRepo: Repository<AuditLogEntrySQL>;
     let matterRepo: Repository<MatterSQL>;
     let attachmentRepo: Repository<AttachmentSQL>;
+    let folderRepo: Repository<FolderSQL>;
 
     const createMessage = async (data?: Partial<MessageSQL>): Promise<MessageSQL> => {
         const obj = new MessageSQL({
@@ -86,6 +88,7 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
         models.set("AccessControlListSQL", AccessControlListSQL);
         models.set("RetentionPolicySQL", RetentionPolicySQL);
         models.set("MessageSQL", MessageSQL);
+        models.set("FolderSQL", FolderSQL);
         models.set("AuditLogEntrySQL", AuditLogEntrySQL);
         models.set("MatterSQL", MatterSQL);
         models.set("AttachmentSQL", AttachmentSQL);
@@ -102,6 +105,7 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
         auditLogRepo = conn.getRepository(AuditLogEntrySQL);
         matterRepo = conn.getRepository(MatterSQL);
         attachmentRepo = conn.getRepository(AttachmentSQL);
+        folderRepo = conn.getRepository(FolderSQL);
 
         job = await objectFactory.newInstance(RetentionEnforcementJobSQL, { name: "default" });
     });
@@ -116,6 +120,7 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
         await auditLogRepo.clear();
         await matterRepo.clear();
         await attachmentRepo.clear();
+        await folderRepo.clear();
         (job as any).batchSize = config.get("mail:jobs:retention_enforcement:batch_size") ?? 500;
     });
 
@@ -183,6 +188,30 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
         expect(entries.length).toBe(1);
         expect(entries[0].targetType).toBe("Message");
         expect(entries[0].details).toEqual({ count: 1, maxAgeDays: 30 });
+    });
+
+    it("Recomputes and publishes the counts of every folder a purge took a live message out of, once per folder - a soft-deleted one was already out of the count.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
+        const mailboxUid = uuid.v4();
+        const folder = await folderRepo.save(new FolderSQL({ mailboxUid, name: "Inbox", unreadCount: 9, totalCount: 9 }));
+        const untouched = await folderRepo.save(new FolderSQL({ mailboxUid, name: "Other", unreadCount: 5, totalCount: 5 }));
+        const old = new Date(Date.now() - 35 * DAY_MS);
+        await createMessage({ mailboxUid, folderUid: folder.uid, sentDate: old });
+        await createMessage({ mailboxUid, folderUid: folder.uid, sentDate: old, flags: { read: true, flagged: false, answered: false, forwarded: false } });
+        const softDeleted = await createMessage({ mailboxUid, folderUid: untouched.uid, sentDate: old });
+        await messageRepo.update({ uid: softDeleted.uid }, { deleted: true });
+        await createMessage({ mailboxUid, folderUid: folder.uid, sentDate: new Date() });
+        await createMessage({ mailboxUid, folderUid: untouched.uid, sentDate: new Date() });
+        const sendMessageSpy = vi.spyOn(NotificationUtils.prototype, "sendMessage");
+
+        await job.run();
+
+        expect(sendMessageSpy.mock.calls.filter(([, type, action]) => /^Folder/.test(String(type)) && action === "update")).toEqual([
+            [[folder.uid, mailboxUid], "FolderSQL", "update", { uid: folder.uid, mailboxUid, unreadCount: 1, totalCount: 1 }],
+        ]);
+        expect(await folderRepo.findOne({ where: { uid: folder.uid } })).toMatchObject({ unreadCount: 1, totalCount: 1 });
+        // Not touched by the purge of a soft-deleted row: neither published nor rewritten.
+        expect(await folderRepo.findOne({ where: { uid: untouched.uid } })).toMatchObject({ unreadCount: 5, totalCount: 5 });
     });
 
     it("Purging an expired message also purges every Attachment referencing it, plus both entities' own BlobStore content - PHI/PII a retention policy asserts is gone must not survive as an orphaned, independently-downloadable row or blob.", async () => {

@@ -792,10 +792,17 @@ export interface Folder extends RecoverableBaseEntity {
     /** The unique identifier of the parent folder, or `undefined` if this is a top-level folder. */
     parentFolderUid?: string;
 
-    /** The number of unread items contained directly in this folder. */
+    /**
+     * The number of unread messages in this folder (those not soft-deleted whose `flags.read` isn't `true`).
+     *
+     * **Derived, not stored truth**: `BaseFolderRoute` answers every read with the count of the folder's messages as they
+     * are right now (see `util/FolderCountUtils.ts`); the stored field is only a best-effort cache, refreshed whenever
+     * this library changes what a folder holds, and repaired when a read finds it stale. Read the folder through the route
+     * (or `countMessagesByFolder()`) rather than trusting the stored value. Server-managed: never client-writable.
+     */
     unreadCount: number;
 
-    /** The total number of items contained directly in this folder. */
+    /** The number of messages in this folder that aren't soft-deleted (what the message list shows). Derived like `unreadCount`. */
     totalCount: number;
 
     /**

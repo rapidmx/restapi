@@ -64,11 +64,17 @@ export class FolderSQL extends RecoverableBaseEntity implements Folder {
     public parentFolderUid?: string;
 
     @Column()
-    @Description("The number of unread items contained directly in this folder.")
+    @Description(
+        "The number of unread messages in this folder. Derived from the messages on every read; the stored value is " +
+            "only a best-effort cache (see `util/FolderCountUtils.ts`).",
+    )
     public unreadCount: number = 0;
 
     @Column()
-    @Description("The total number of items contained directly in this folder.")
+    @Description(
+        "The number of messages in this folder that are not soft-deleted. Derived from the messages on every read; " +
+            "the stored value is only a best-effort cache (see `util/FolderCountUtils.ts`).",
+    )
     public totalCount: number = 0;
 
     @Column()

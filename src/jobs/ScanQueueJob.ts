@@ -17,6 +17,7 @@ import { boundIndexedValue, findThreadConversationId, resolveConversationId } fr
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
 import { isHeaderOversignedByAlignedDkim, topmostTrustedAuthenticationResults } from "../util/DkimOversignUtils.js";
+import { refreshFolderCounts, type FolderCountsContext } from "../util/FolderCountUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { buildEventIcs, expandOccurrencesDetailed, OccurrenceExpansion, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
 import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
@@ -103,8 +104,6 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const FORWARD_LOOP_HEADER = "X-RapidMX-Loop";
 /** How many rule forwards a single message may pass through before it's treated as looping. */
 const MAX_FORWARD_HOPS = 5;
-/** How many times `bumpFolderCounters()` tries its version-checked update before giving up. */
-const FOLDER_COUNTER_ATTEMPTS = 5;
 /** How far past a booking request's own start `decideResourceBooking()` looks for conflicts against an
  * indefinitely-recurring existing booking - a bound on worst-case cost, not a real policy limit. */
 const RESOURCE_BOOKING_HORIZON_MS = 731 * MS_PER_DAY;
@@ -992,7 +991,7 @@ export abstract class ScanQueueJob<
             );
             this.notificationUtils?.sendMessage(folder.uid, this.messageClass.name, "create", message);
             await this.attachRows(storedAttachments, message, folder, entry.mailboxUid);
-            await this.bumpFolderCounters(folder, filterResult.markRead ? 0 : 1);
+            await refreshFolderCounts(this.folderCountsContext(), [folder.uid], { bumpSyncKey: true });
             await this.completeDeliveryReceipt(entry, raw, result, message);
         }
 
@@ -1054,7 +1053,7 @@ export abstract class ScanQueueJob<
             );
             this.notificationUtils?.sendMessage(copyFolder.uid, this.messageClass.name, "create", copyMessage);
             await this.attachRows(storedAttachments, copyMessage, copyFolder, entry.mailboxUid);
-            await this.bumpFolderCounters(copyFolder, filterResult.markRead ? 0 : 1);
+            await refreshFolderCounts(this.folderCountsContext(), [copyFolder.uid], { bumpSyncKey: true });
         }
 
         await this.renewLeaseIfDue(claim);
@@ -1576,32 +1575,17 @@ export abstract class ScanQueueJob<
         }
     }
 
-    /** Increments `folder`'s counters with a version-checked update, re-reading and retrying when another delivery
-     * into the same folder updated it first (so concurrent deliveries don't lose increments or fail each other). */
-    private async bumpFolderCounters(folder: F, unreadIncrement: number): Promise<void> {
-        let current: F = folder;
-        for (let attempt = 1; ; attempt++) {
-            try {
-                await this.folderRepo!.update(
-                    {
-                        uid: current.uid,
-                        version: (current as any).version,
-                        unreadCount: current.unreadCount + unreadIncrement,
-                        totalCount: current.totalCount + 1,
-                        syncKeyVersion: current.syncKeyVersion + 1,
-                    } as any,
-                    asEntity(this.folderRepo!, current),
-                    { ignoreACL: true },
-                );
-                return;
-            } catch (err: any) {
-                const refetched: F | undefined = attempt < FOLDER_COUNTER_ATTEMPTS ? await this.folderRepo!.findOne(folder.uid, { ignoreACL: true }) : undefined;
-                if (!refetched || (refetched as any).version === (current as any).version) {
-                    throw err;
-                }
-                current = refetched;
-            }
-        }
+    /** What `util/FolderCountUtils.ts` needs to recompute, cache and publish a folder's counts: a folder's
+     * `unreadCount`/`totalCount` are derived from its messages, so after filing (or deleting) one the counts are
+     * recomputed and published as a live event rather than incremented. Best-effort (never fails the delivery). */
+    private folderCountsContext(): FolderCountsContext {
+        return {
+            messageRepo: this.messageRepo!,
+            folderRepo: this.folderRepo!,
+            folderClass: this.folderClass,
+            notificationUtils: this.notificationUtils,
+            logger: this.logger,
+        };
     }
 
     /**
@@ -1739,6 +1723,7 @@ export abstract class ScanQueueJob<
         let outcome: "succeeded" | "already_read" | "not_found";
         if (target && (await this.lockUnreadForRecall(target))) {
             await this.messageRepo!.delete(target.uid, { ignoreACL: true });
+            await refreshFolderCounts(this.folderCountsContext(), [target.folderUid]);
             // Recalled content must stop being searchable, not just hidden from folder views.
             await removeFromSearchIndex(this.searchProvider, "message", target.uid, this.logger);
             outcome = "succeeded";

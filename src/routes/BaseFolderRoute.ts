@@ -16,6 +16,7 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import type { CalendarShareLink, Folder } from "../models/types.js";
+import { countMessagesByFolder, healStoredFolderCounts } from "../util/FolderCountUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 const { Get, Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
@@ -23,8 +24,9 @@ const { Get, Head, Param, Post, Query, Request, Response, User: AuthUser } = Rou
 const SHARE_TOKEN_UID_PREFIX = "share:";
 const SHARE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
-/** `Folder` fields only server-side code maintains (counters and the EAS sync key), plus `mailboxUid`, which is the
- * folder's ACL parent and so can't be moved to another mailbox by a client. */
+/** `Folder` fields only server-side code maintains (the counters - derived from the messages, see
+ * `util/FolderCountUtils.ts` - and the EAS sync key), plus `mailboxUid`, which is the folder's ACL parent and so
+ * can't be moved to another mailbox by a client. */
 const SERVER_MANAGED_FOLDER_FIELDS = ["unreadCount", "totalCount", "syncKeyVersion", "mailboxUid"] as const;
 
 /** See `stripUnsafeQueryKeys()` on `BaseScopedChildRoute.ts`. */
@@ -76,6 +78,16 @@ function stripUnsafeQueryKeys(query: any): Record<string, any> {
  * `create` always has the server mint `uid` and zero the counters; a non-trusted caller's update can't set the
  * `SERVER_MANAGED_FOLDER_FIELDS`.
  *
+ * **`unreadCount`/`totalCount` are derived, never trusted from storage.** Every folder these routes return (`find`,
+ * `findById`, and the responses of `update`/`updateBulk`/`updateProperty`) carries the counts of the folder's messages
+ * as they are right now - the messages not soft-deleted, of which those whose `flags.read` isn't `true` are unread,
+ * i.e. exactly what the message list shows - computed with ONE grouped query for the whole request
+ * (`countMessagesByFolder()`, `util/FolderCountUtils.ts`), never one per folder. A stored value that disagrees is
+ * overwritten with the derived one on the way out (best-effort), so a reader that goes to the `Folder` row directly
+ * (`@rapidmx/mapi-plugin`) converges too. Needs `messageClass`; a subclass that doesn't set it answers with the stored
+ * counts. The live `{ action: "update", data: { uid, mailboxUid, unreadCount, totalCount } }` event published when a
+ * message write changes a folder's counts is described in `util/FolderCountUtils.ts`.
+ *
  * KNOWN LIMITATIONS:
  * - `update`/`delete` (folder rename/move/removal) do NOT publish a live-update notification, unlike every
  * mutation on the folder-scoped entities in `BaseScopedChildRoute`. Overriding them here purely to add a
@@ -95,7 +107,36 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
     /** The concrete `CalendarShareLink` model class, so `exists()` can resolve `?shareToken=`. Unset: tokens are ignored. */
     protected shareLinkClass?: any;
 
+    /** The concrete `Message` class (supplied by the Mongo/SQL subclasses), whose rows the folder counts are derived from.
+     * Unset: the stored counts are returned as they are. */
+    protected messageClass?: any;
+
     private shareLinkRepo?: RepoUtils<CalendarShareLink>;
+
+    private messageRepo?: RepoUtils<any>;
+
+    /**
+     * Replaces the counts of every folder in `folders` with the ones derived from its messages (see this class's doc
+     * comment) - one grouped query for all of them - and refreshes the stored cache of any that disagreed.
+     */
+    private async applyDerivedCounts(folders: T[]): Promise<void> {
+        if (!this.messageClass || folders.length === 0) {
+            return;
+        }
+        if (!this.messageRepo) {
+            this.messageRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
+        const counts = await countMessagesByFolder(this.messageRepo, folders.map((folder) => folder.uid));
+        await healStoredFolderCounts(this.repoUtils!, folders, counts);
+        for (const folder of folders) {
+            const derived = counts.get(folder.uid)!;
+            folder.unreadCount = derived.unreadCount;
+            folder.totalCount = derived.totalCount;
+        }
+    }
 
     /** See `BaseScopedChildRoute.resolveEffectiveUser()` - identical, for a link whose `folderUid` is `folderUid`. */
     private async resolveEffectiveUser(user: JWTUser | undefined, query: any, folderUid: string): Promise<JWTUser | undefined> {
@@ -173,7 +214,9 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         if (!(propertyName in patch)) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, `'${propertyName}' is managed by the server.`);
         }
-        return super.updateProperty(id, propertyName, obj, user);
+        const folder: T = await super.updateProperty(id, propertyName, obj, user);
+        await this.applyDerivedCounts([folder]);
+        return folder;
     }
 
     @Head()
@@ -250,10 +293,36 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
             return [];
         }
         // The client query can't widen the checked mailbox - see `stripUnsafeQueryKeys()`.
-        return await this.repoUtils.find(
+        const folders: T[] = await this.repoUtils.find(
             await this.listFilter(params, query, mailboxUid, user),
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
+        await this.applyDerivedCounts(folders);
+        return folders;
+    }
+
+    /** `CRUDRoute.findById()` (the folder's own ACL decides), answering with the derived counts. */
+    @Get("/:id")
+    public async findById(@Param("id") id: string, @Query() query: any, @AuthUser user?: JWTUser): Promise<T | null> {
+        const folder: T | null = await super.findById(id, query, user);
+        if (folder) {
+            await this.applyDerivedCounts([folder]);
+        }
+        return folder;
+    }
+
+    /** `CRUDRoute.update()`, answering with the derived counts. */
+    public async update(id: string, obj: UpdateObject<T>, req: HttpRequest, user?: JWTUser): Promise<T> {
+        const folder: T = await super.update(id, obj, req, user);
+        await this.applyDerivedCounts([folder]);
+        return folder;
+    }
+
+    /** `CRUDRoute.updateBulk()`, answering with the derived counts of every folder. */
+    public async updateBulk(obj: UpdateObject<T>[], req: HttpRequest, user?: JWTUser): Promise<T[]> {
+        const folders: T[] = await super.updateBulk(obj, req, user);
+        await this.applyDerivedCounts(folders);
+        return folders;
     }
 
     @Head("/:id")
