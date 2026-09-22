@@ -50,6 +50,11 @@ export interface LocalKeyDiscovery {
     domainNames: () => Promise<string[]>;
     /** The query value matching one element of `aliasAddresses` (`BaseMailIngestRoute.aliasQueryValue()`'s Mongo/SQL split). */
     aliasQueryValue: (address: string) => any;
+    /** Rewrites an address from a pure alias `Domain` onto the domain it aliases (`DomainUtils.resolveDomainAlias()`),
+     * so `jean-philippe@plc.gg` discovers the same mailbox/keys as `jean-philippe@powerlevel.gg` when `plc.gg` is a
+     * pure alias of `powerlevel.gg`. Optional so an existing caller that hasn't wired one in keeps its previous,
+     * alias-unaware behavior rather than throwing. */
+    resolveDomainAlias?: (address: string) => Promise<string | undefined>;
     /** Whether `user+tag@domain` delivers to `user@domain` (`mail:plus_addressing:enabled`), so it is looked up as it. */
     plusAddressing: boolean;
 }
@@ -65,13 +70,25 @@ export interface LocalKeys {
 
 /** The mailbox with exactly this (normalized) primary address or alias, the way inbound delivery resolves a recipient
  * (`BaseMailIngestRoute.findMailboxByAddress()`): exact primary, then exact alias, then - when `address` has a `+tag` and
- * plus-addressing is on - the same two exact matches against the untagged address. */
+ * plus-addressing is on - the same two exact matches against the untagged address, then - when `address`'s domain is a
+ * pure alias `Domain` and `local.resolveDomainAlias` is wired in - the same tiers again against the address rewritten
+ * onto the domain it aliases. */
 async function findMailbox(local: LocalKeyDiscovery, address: string): Promise<Mailbox | undefined> {
     const exact = async (candidate: string): Promise<Mailbox | undefined> =>
         (await local.mailboxRepo.find({ primarySmtpAddress: ModelUtils.literal(candidate), limit: 1 } as any, { ignoreACL: true, limit: 1 }))[0] ??
         (await local.mailboxRepo.find({ aliasAddresses: local.aliasQueryValue(candidate), limit: 1 } as any, { ignoreACL: true, limit: 1 }))[0];
     const untagged: string = stripPlusTag(address);
-    return (await exact(address)) ?? (local.plusAddressing && untagged !== address ? await exact(untagged) : undefined);
+    const direct: Mailbox | undefined =
+        (await exact(address)) ?? (local.plusAddressing && untagged !== address ? await exact(untagged) : undefined);
+    if (direct) {
+        return direct;
+    }
+    const rewritten: string | undefined = await local.resolveDomainAlias?.(address);
+    if (!rewritten) {
+        return undefined;
+    }
+    const rewrittenUntagged: string = stripPlusTag(rewritten);
+    return (await exact(rewritten)) ?? (local.plusAddressing && rewrittenUntagged !== rewritten ? await exact(rewrittenUntagged) : undefined);
 }
 
 /**

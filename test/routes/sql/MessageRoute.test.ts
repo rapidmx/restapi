@@ -264,6 +264,106 @@ describe("Route:MessageSQL Tests", () => {
         expect(result.body.encrypted).toBe(false);
     });
 
+    describe("domain alias sending", () => {
+        it("Allows sending From an address on a pure alias domain of the mailbox's own domain, with no aliasAddresses entry needed.", async () => {
+            await domainRepo.save(new DomainSQL({ name: "example.com", enabled: true, verified: true } as any));
+            await domainRepo.save(new DomainSQL({ name: "plc.gg", enabled: true, verified: true, aliasOf: "example.com" } as any));
+            const mailbox = await createMailbox(owner.uid);
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            // "owner" is the local part of one of this mailbox's own addresses (aliasAddresses: ["owner@example.com"]) -
+            // `plc.gg` being a pure alias of `example.com` should let it send as owner@plc.gg too.
+            await blobStore.put(
+                bodyBlobKey,
+                Buffer.from("From: owner@plc.gg\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n"),
+            );
+            const message = await createMessage(mailbox.uid, draftsFolder.uid, {
+                bodyBlobKey,
+                from: { address: "owner@plc.gg", type: RecipientType.TO },
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/send`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent.length).toBe(1);
+            expect(transport.sent[0].envelopeFrom).toBe("owner@plc.gg");
+        });
+
+        it("Refuses sending From an address on a domain that isn't a pure alias of the mailbox's own domain (403).", async () => {
+            await domainRepo.save(new DomainSQL({ name: "example.com", enabled: true, verified: true } as any));
+            await domainRepo.save(new DomainSQL({ name: "other.com", enabled: true, verified: true } as any));
+            await domainRepo.save(new DomainSQL({ name: "plc.gg", enabled: true, verified: true, aliasOf: "other.com" } as any));
+            const mailbox = await createMailbox(owner.uid);
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await blobStore.put(
+                bodyBlobKey,
+                Buffer.from("From: owner@plc.gg\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n"),
+            );
+            const message = await createMessage(mailbox.uid, draftsFolder.uid, {
+                bodyBlobKey,
+                from: { address: "owner@plc.gg", type: RecipientType.TO },
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/send`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(403);
+        });
+
+        it("A mailbox spanning two domains only gets the alias treatment for the domain that actually has one.", async () => {
+            await domainRepo.save(new DomainSQL({ name: "example.com", enabled: true, verified: true } as any));
+            await domainRepo.save(new DomainSQL({ name: "other.org", enabled: true, verified: true } as any));
+            await domainRepo.save(new DomainSQL({ name: "plc.gg", enabled: true, verified: true, aliasOf: "example.com" } as any));
+            const mailbox = await mailboxRepo.save(
+                new MailboxSQL({
+                    ownerUserUid: owner.uid,
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    // Two aliases, on two different domains - only "example.com" has a pure-alias domain.
+                    aliasAddresses: ["owner@example.com", "owner@other.org"],
+                    displayName: "Two-Domain Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                }),
+            );
+            await aclRepo.save({
+                uid: mailbox.uid,
+                dateCreated: new Date(),
+                dateModified: new Date(),
+                version: 0,
+                records: [{ userOrRoleId: owner.uid, actions: ["*"] }],
+                parentUid: "Mailbox",
+            });
+            const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await blobStore.put(
+                bodyBlobKey,
+                Buffer.from("From: owner@plc.gg\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n"),
+            );
+            const message = await createMessage(mailbox.uid, draftsFolder.uid, {
+                bodyBlobKey,
+                from: { address: "owner@plc.gg", type: RecipientType.TO },
+            });
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${message.uid}/send`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+        });
+    });
+
     it("Sending an already S/MIME-encrypted draft persists encrypted: true on the sent message.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);

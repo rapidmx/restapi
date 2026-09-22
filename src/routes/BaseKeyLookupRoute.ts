@@ -21,7 +21,7 @@ import type { DnsResolver } from "../dns/DnsResolver.js";
 import { AuditAction, Contact, EncryptionPreference, Folder, KeyConflict, Mailbox, PreviousKey, PublicKey } from "../models/types.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { ContactKeyMerge, ContactKeyWriteResult, ContactKeyWriteTarget, writeContactKeys } from "../util/ContactKeyUtils.js";
-import { getVerifiedDomainNames } from "../util/DomainUtils.js";
+import { getVerifiedDomainNames, resolveDomainAlias } from "../util/DomainUtils.js";
 import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { addPreviousKey, addRejectedKey, discoverAndMergeKeys, listField, normalizeKeyConflicts, withoutKey } from "../util/KeyringUtils.js";
 import { LocalKeyDiscovery } from "../util/LocalKeyDiscoveryUtils.js";
@@ -198,6 +198,7 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
             keyVaultRepo: this.keyVaultRepo!,
             domainNames: () => getVerifiedDomainNames(this._objectFactory!, this.domainClass),
             aliasQueryValue: (address) => this.aliasQueryValue(address),
+            resolveDomainAlias: (address) => resolveDomainAlias(this._objectFactory!, this.domainClass, address),
             plusAddressing: this.plusAddressingEnabled,
         };
     }

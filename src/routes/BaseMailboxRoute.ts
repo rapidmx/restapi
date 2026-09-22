@@ -20,7 +20,7 @@ import { AuditAction, DistributionList, EscrowScope, Mailbox } from "../models/t
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
 import { assertAdminScope, hasMailAccess, isAdminScope, isTrustedUser, stripTrustedRoles } from "../util/MailAccessUtils.js";
-import { getVerifiedDomainNames } from "../util/DomainUtils.js";
+import { getPrimaryDomainNames, getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { ensureWellKnownFolders } from "../util/FolderUtils.js";
 import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { hasAddressLikeDisplayName } from "../util/MimeHeaderUtils.js";
@@ -739,10 +739,12 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             // A missing primary address is answered with its own 400 below.
             assertPlainAddresses([...(o.primarySmtpAddress ? [o.primarySmtpAddress] : []), ...(o.aliasAddresses ?? [])]);
         }
-        // Applies to every caller, trusted or not — this server's verified `Domain`s (once at least one
-        // exists) are the one source of truth for which domains it accepts mail on at all, not just a
-        // self-service guard.
-        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        // Applies to every caller, trusted or not — this server's verified, non-alias `Domain`s (once at
+        // least one exists) are the one source of truth for which domains a mailbox may actually live on -
+        // not just a self-service guard. A pure alias `Domain` (`Domain.aliasOf`) is deliberately excluded:
+        // it has no mailboxes of its own by design (mail addressed to it is delivered via
+        // `resolveDomainAlias()` to a mailbox on the domain it aliases instead - see `BaseMailIngestRoute`).
+        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
         if (domains.length > 0) {
             for (const o of objs) {
                 const domain = o.primarySmtpAddress?.split("@")[1]?.toLowerCase();
@@ -1037,7 +1039,9 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         user: JWTUser | undefined,
     ): Promise<void> {
         assertPlainAddresses([newAddress]);
-        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        // Same non-alias restriction `createMailboxes()` applies to a brand-new mailbox's address - a rename
+        // can't land a mailbox on a pure alias domain any more than creating one there could.
+        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
         if (domains.length > 0) {
             const domain = newAddress.split("@")[1]?.toLowerCase();
             if (!domain || !domains.includes(domain)) {
@@ -1345,7 +1349,9 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         const hasAliasSource = this.staticAliases.length > 0 || !!this.authServerUrl;
-        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        // Non-alias domains only - auto-provisioning creates a real `Mailbox`, so it's bound by the same
+        // domain restriction `createMailboxes()` enforces (see `getPrimaryDomainNames()`'s own doc comment).
+        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
         const policy = await findOrSeedMailboxPolicy(this._objectFactory!, this.mailboxPolicyClass, {
             defaultQuotaBytes: this.defaultQuotaBytes,
             autoProvisionEnabled: this.autoProvisionEnabled,
@@ -1392,13 +1398,14 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         return { status: "created", mailbox };
     }
 
-    /** This server's verified domains — lets a client (e.g. the admin console's "New mailbox" form)
-     * constrain the domain half of an address to what this server actually accepts, without hardcoding or
-     * duplicating that list client-side. */
+    /** This server's verified, non-alias domains — lets a client (e.g. the admin console's "New mailbox"
+     * form) constrain the domain half of an address to what a mailbox may actually be created on, without
+     * hardcoding or duplicating that list client-side. A pure alias domain is deliberately left out - see
+     * `getPrimaryDomainNames()`'s own doc comment. */
     @Auth(["jwt"])
     @Get("/domains")
     public async listDomains(): Promise<string[]> {
-        return await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        return await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
     }
 
     /** The caller's own auth-server "name" aliases (e.g. usernames), via `GET /api/aliases?type=name&userUid=me` —

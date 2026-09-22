@@ -16,7 +16,7 @@ import {
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
-import { getVerifiedDomainNames } from "../util/DomainUtils.js";
+import { getPrimaryDomainNames } from "../util/DomainUtils.js";
 import { AuditAction, DistributionList, Mailbox } from "../models/types.js";
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
@@ -67,11 +67,12 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
     }
 
     /**
-     * Validates a candidate list's `primarySmtpAddress` (its domain must be one of this server's verified
-     * `Domain`s, once at least one exists - same rule `BaseMailboxRoute.create()` applies), derives its
-     * `uid` from that address, and rejects a collision against either an existing `DistributionList`
-     * (including a soft-deleted one, which still occupies its uid) or an existing `Mailbox`. Mutates
-     * `o.uid` in place.
+     * Validates a candidate list's `primarySmtpAddress` (its domain must be one of this server's verified,
+     * non-alias `Domain`s, once at least one exists - same rule `BaseMailboxRoute.create()` applies, and
+     * for the same reason: a pure alias `Domain` has no addressable entities of its own, list or mailbox -
+     * see `getPrimaryDomainNames()`'s own doc comment), derives its `uid` from that address, and rejects a
+     * collision against either an existing `DistributionList` (including a soft-deleted one, which still
+     * occupies its uid) or an existing `Mailbox`. Mutates `o.uid` in place.
      */
     private async assignUidAndCheckCollision(o: Partial<T>, domains: string[]): Promise<void> {
         if (!o.primarySmtpAddress) {
@@ -106,7 +107,7 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
     @RequiresTrustedRole()
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
-        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
 
         const seenUids: Set<string> = new Set();
         for (const o of objs) {
@@ -153,7 +154,7 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
      * be caught by a `uid`-keyed check alone.
      */
     private async validateAddressChange(existing: T, newAddress: string): Promise<void> {
-        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
         const domain: string | undefined = newAddress.split("@")[1]?.toLowerCase();
         if (domains.length > 0 && (!domain || !domains.includes(domain))) {
             throw new ApiError(

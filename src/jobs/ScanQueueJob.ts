@@ -14,7 +14,7 @@ import { normalizeAddress } from "../util/AddressUtils.js";
 import { hasAlignedPassingDkim } from "../util/AuthenticationResultsUtils.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
-import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
+import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames, resolveDomainAlias } from "../util/DomainUtils.js";
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
 import { isHeaderOversignedByAlignedDkim, topmostTrustedAuthenticationResults } from "../util/DkimOversignUtils.js";
 import { refreshFolderCounts, type FolderCountsContext } from "../util/FolderCountUtils.js";
@@ -1455,6 +1455,7 @@ export abstract class ScanQueueJob<
                 keyVaultRepo: this.keyVaultRepo!,
                 domainNames: () => getVerifiedDomainNames(this._objectFactory!, this.domainClass),
                 aliasQueryValue: (address) => this.aliasQueryValue(address),
+                resolveDomainAlias: (address) => resolveDomainAlias(this._objectFactory!, this.domainClass, address),
                 plusAddressing: this.plusAddressingEnabled,
             }),
         );

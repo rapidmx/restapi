@@ -73,4 +73,19 @@ describe("Route:DistributionListMongo domain-restriction Tests", () => {
         expect(result.status).toBeGreaterThanOrEqual(200);
         expect(result.status).toBeLessThan(300);
     });
+
+    it("Rejects an address on a pure alias domain (400) - a DistributionList has no address of its own there, same as a Mailbox.", async () => {
+        const primary = "aliased-primary.com";
+        await domainRepo.save(new DomainMongo({ name: primary, enabled: true, verified: true, verificationToken: uuid.v4(), uid: primary }));
+        await domainRepo.save(
+            new DomainMongo({ name: "alias.com", enabled: true, verified: true, verificationToken: uuid.v4(), uid: "alias.com", aliasOf: primary }),
+        );
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ primarySmtpAddress: "sales@alias.com", name: "Sales", memberAddresses: [] });
+
+        expect(result.status).toBe(400);
+    });
 });

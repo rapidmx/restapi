@@ -3183,3 +3183,96 @@ Files: new `src/models/mongo/CalendarEventAttendeeLinkMongo.ts`, `src/models/sql
 `test/models/{mongo,sql}.test.ts`, `RELEASE_NOTES.md` (Unreleased section; no version bumped, nothing committed). No `package.json` change needed - `@rapidmx/restapi/mongo`/`/sql` already re-export the whole model barrel, so
 both new classes are importable by a plugin the moment this builds. `server` does not subclass `MeetingSchedulingJob` (it only re-exports
 `MeetingSchedulingJob{Mongo,SQL}` from `src/{mongo,sql}/Jobs.ts`), so nothing there needs rebuilding for this.
+
+### 2026-09-22 (later still) - Pure domain aliases: a `Domain` with no mailboxes of its own
+
+JP's ask: `plc.gg` as a shorthand alias of `powerlevel.gg`, so `jean-philippe@powerlevel.gg` can receive AND send as
+`jean-philippe@plc.gg`, with no `Mailbox`/`DistributionList` ever created at `plc.gg` itself.
+
+**Design.** New optional `Domain.aliasOf` (a domain name, matching the target's own `uid`). An alias domain still goes
+through the exact same DNS-ownership-proof and DKIM-key-generation flow as any other `Domain` (`BaseDomainRoute`
+untouched there) - it is a real, independently-verified domain in its own right, just one with no addressable entities
+of its own. Three new `util/DomainUtils.ts` functions carry the whole feature:
+- `getPrimaryDomainNames()` - `getVerifiedDomainNames()` minus any row with `aliasOf` set. This is the list
+  `BaseMailboxRoute`/`BaseDistributionListRoute` actually restrict a *new* address to (create, rename, the self-service
+  `assertSelfServiceCreate()`/`autoProvision()` domain choices, and the `GET /mailboxes/domains` list a client's "New
+  mailbox" form reads) - an alias domain is deliberately excluded from all of them. `getVerifiedDomainNames()` itself is
+  untouched and still includes alias domains, which is correct: `BaseMailIngestRoute.domain()` (the MTA's relay-accept
+  check) and `isInternalAddress()`/`classifyRecipientTier()` should both still treat mail to/from an alias domain as
+  this server's own.
+- `resolveDomainAlias(objectFactory, domainClass, address)` - two indexed `findOne`s (never a full domain scan): if
+  `address`'s domain is a currently enabled+verified alias whose `aliasOf` target is itself currently enabled+verified,
+  returns the same local part on the target's own name; otherwise `undefined` (dangling/disabled reference resolves to
+  nothing, never misroutes). Wired into `BaseMailIngestRoute.findExactMailboxByAddress()`/`findDistributionListByAddress()`
+  as a fallback retry after a direct match misses - this is the ONE place inbound delivery actually resolves an alias,
+  and it's why `resolve()`/`deliver()`/`expandDistributionList()`'s member loop/`reportUnresolvableRecipient()` all pick
+  it up for free (they all funnel through those two methods). Also wired into `util/LocalKeyDiscoveryUtils.ts`'s
+  `findMailbox()` (new optional `LocalKeyDiscovery.resolveDomainAlias` field, wired from both
+  `BaseKeyLookupRoute.localKeyDiscovery()` and `ScanQueueJob.maybeRefreshRotatedKey()`) so federation key discovery for
+  an alias address finds the primary mailbox's own published keys instead of "nothing published here."
+- `getAliasDomainNames(objectFactory, domainClass, primaryDomainName)` - the reverse lookup (every enabled+verified
+  domain whose `aliasOf` names this one). Used only by `BaseMessageRoute.assertSenderAllowed()`, now `async`: for each
+  domain among a mailbox's own addresses (`primarySmtpAddress` + `aliasAddresses`), every alias domain of it lets that
+  same local part send too - so `jean-philippe@powerlevel.gg` can send as `jean-philippe@plc.gg` with **zero**
+  per-mailbox configuration, the whole point of a *pure* alias. `BaseDomainRoute` validates `aliasOf` on both create and
+  update: must name an existing `Domain`, that domain must not itself be an alias (no chains - every alias resolves in
+  exactly one hop), no self-alias, and turning a domain that already HAS dependents into an alias itself is refused the
+  same way (checked before the chain check, so the more specific 409 wins over the generic 400). `delete()` refuses
+  removing a domain other domains still alias (`IDENTIFIER_EXISTS`/409, same convention as `BaseMatterRoute`'s
+  "still has EscrowAccessRequests referencing it").
+
+**DKIM/DNS needs no restapi change at all.** Since an alias domain is an ordinary `Domain` row that goes through
+`BaseDomainRoute.create()`/`dnsSetup()` unchanged, `FsDkimKeyProvider`/OpenDKIM signing infra (see the 2026-09-09 and
+2026-09-20 entries above) picks it up automatically, keyed by its own `domain.name` - no new integration point needed.
+
+**Regression found the hard way: several "isolated unit test" files construct a lightweight `TestMailIngestRoute` (or
+similar) that never sets `domainClass` at all** (only `mailboxClass`/`ingestQueueClass`/`distributionListClass`/
+`transportRuleClass`), because before this change `domainClass` was only ever touched by `applyTransportRules()` when
+at least one enabled `TransportRule` exists - every such harness registers zero rules, so the field was never
+exercised. My first version of `findExactMailboxByAddress()`/`findDistributionListByAddress()` called
+`resolveDomainAlias()` unconditionally on every failed direct lookup, which now touches `domainClass` on **every**
+delivery regardless of transport rules, and `getDomainRepo()` throws on `domainClass.name` with `domainClass`
+`undefined`. Confirmed via a full, uncontended `yarn vitest run`: `test/routes/BaseMailIngestRoute.DistributionLists.test.ts`
+failed 8/8, all the same `Cannot read properties of undefined (reading 'name')` stack. Fixed at the source
+(`resolveDomainAlias()` returns `undefined` immediately when `domainClass` is falsy - the same
+"unwired-optional-dependency degrades gracefully" posture `DkimKeyProvider`'s own doc comment already establishes for
+`NullDkimKeyProvider`), not by patching every lightweight test harness - a real Mongo/SQL route subclass always
+supplies `domainClass`, so this only ever matters for exactly this class of test double.
+
+**A second, false-alarm regression while chasing the first one**: running a second, separate `yarn vitest run` against
+this repo (a narrow `--coverage.include` probe) WHILE the first full-suite run was still going produced 34 unrelated
+failures in `test/routes/sql/RoutesKeysRound5.test.ts` (owner ACL moves, display names, attachments-follow-folder) -
+nothing to do with domains at all. Re-ran that file alone: 9/9 clean. This is the same "two vitest processes racing the
+one shared on-disk SQLite file" hazard this file's own SQL-datastore entries already warn about elsewhere in this
+document - **never run a second `vitest run` against this repo while another one is already in flight**; wait for it to
+finish (or scope both to disjoint files you're certain don't share the SQL fixture file) instead.
+
+New/changed tests: `test/util/DomainUtils.test.ts` (`getPrimaryDomainNames`/`getAliasDomainNames`/`resolveDomainAlias`,
+including the just-described unset-`domainClass` guard), `test/routes/{mongo,sql}/DomainRoute.test.ts` (`aliasOf`
+create/update validation - self-alias, chain, dangling reference, turning a domain-with-dependents into an alias,
+round-tripping the same value as a no-op, delete guard both directions), `test/routes/{mongo,sql}/MailIngestRoute.test.ts`
+(`/domain`, `/resolve`, `/deliver` through an alias domain, to both a `Mailbox` and a `DistributionList`, plus the
+disabled-alias-domain no-op case), `test/routes/mongo/DistributionListDomains.test.ts` +
+`test/routes/sql/DistributionListDomains.test.ts` (alias domain rejected for a new list's address), new `describe("domain
+alias")` blocks in `test/routes/{mongo,sql}/MailboxRoute.test.ts` (create/rename rejected on an alias domain,
+`GET /mailboxes/domains` excludes it) and `test/routes/{mongo,sql}/MessageRoute.test.ts` (send-as-alias allowed with zero
+config, refused for an unrelated alias, and the two-different-owned-domains case that's the only way to hit
+`assertSenderAllowed()`'s inner-loop `continue` branch), `test/util/LocalKeyDiscoveryUtils.test.ts` (`resolveDomainAlias`
+wired vs. unwired, including the plus-tag-after-rewrite case).
+
+Files: changed `src/models/types.ts` (`Domain.aliasOf`), `src/models/mongo/DomainMongo.ts`, `src/models/sql/DomainSQL.ts`,
+`src/util/DomainUtils.ts`, `src/routes/BaseDomainRoute.ts`, `src/routes/BaseMailboxRoute.ts`,
+`src/routes/BaseDistributionListRoute.ts`, `src/routes/BaseMailIngestRoute.ts`, `src/routes/BaseMessageRoute.ts`,
+`src/routes/BaseKeyLookupRoute.ts`, `src/jobs/ScanQueueJob.ts`, `src/util/LocalKeyDiscoveryUtils.ts`, `RELEASE_NOTES.md`
+(Unreleased > Features; no version bumped, nothing committed) and the test files listed above. Full suite (clean,
+uncontended run): **296/296 files, 100/97.18/100/100 (stmts/branch/func/lines)** - gates 100/95/100/100. `yarn tsc
+--noEmit` clean.
+
+Companion changes (separate repos, same session): `@rapidmx/react-shared`'s `admin/domainsApi.ts` gains `aliasOf` on
+`Domain`/`CreateDomainInput`/`UpdateDomainInput` (pure type addition, no logic - full suite unaffected, still 96/96
+files/1264/1264 tests); `@rapidmx/web-client`'s domains admin pages (`new`, detail, list) gain an alias-of
+picker/display/edit/column (full suite 273/273 files, 4180/4180 tests). Neither is wired into `server`'s own
+`node_modules` yet (both are real npm deps there, not portal/workspace links - see this file's own "monorepo checkout"
+entry) - `web-client`'s own `tsc --noEmit` won't go green on the new `aliasOf` usages until `react-shared` actually
+publishes and `web-client` bumps its dependency, same release order every prior cross-repo client addition in this log
+has followed. No `package.json` version bumped anywhere, nothing committed.

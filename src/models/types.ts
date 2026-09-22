@@ -1789,6 +1789,27 @@ export interface Domain extends BaseEntity {
     /** Optional mailto target for DMARC aggregate reports (the record's `rua=` tag), if the admin wants
      * reports sent somewhere. */
     dmarcReportEmail?: string;
+
+    /**
+     * When set, this domain is a **pure alias** of another `Domain` - identified here by that domain's own
+     * `name` (lowercased/normalized, matching its `uid`) - rather than a domain with mailboxes of its own.
+     * An alias domain still proves DNS ownership and gets its own DKIM key pair exactly like any other
+     * `Domain` (see `BaseDomainRoute`) - only mail *addressing* is special: `util/DomainUtils.ts`'s
+     * `resolveDomainAlias()` rewrites `local@<this domain>` to `local@<aliasOf>` wherever an inbound
+     * address is resolved to a `Mailbox`/`DistributionList` (`BaseMailIngestRoute`), and
+     * `getAliasDomainNames()` lets a mailbox on `aliasOf` send as the matching `local@<this domain>` address
+     * too (`BaseMessageRoute.assertSenderAllowed()`) - so e.g. `plc.gg` aliasing `powerlevel.gg` lets
+     * `jean-philippe@powerlevel.gg` receive and send as `jean-philippe@plc.gg` with no `Mailbox` ever
+     * created at `plc.gg` itself.
+     *
+     * Must name an existing, *non-alias* `Domain` (`BaseDomainRoute` rejects both a dangling reference and a
+     * chain of aliases) - a domain can't itself have mailboxes AND be aliased to another at the same time,
+     * and every alias resolves in exactly one hop. `undefined` (the default) means this domain is a normal,
+     * standalone domain with mailboxes of its own. `getPrimaryDomainNames()` is the domain list every
+     * `Mailbox`/`DistributionList` address is actually restricted to - an alias domain is deliberately
+     * excluded from it.
+     */
+    aliasOf?: string;
 }
 
 /**

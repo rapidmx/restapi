@@ -106,11 +106,44 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         (o as any).dkimPublicKey = keyPair.publicKey;
     }
 
+    /** Validates a candidate `aliasOf` (already normalized to lowercase): it must name an existing `Domain`
+     * other than `uid` itself (no self-alias), and that `Domain` must not itself be an alias (no chains - see
+     * `Domain.aliasOf`'s own doc comment: every alias resolves in exactly one hop). Called with `aliasOf`
+     * already stripped to `undefined` for an empty string, so this only ever runs on a real candidate value. */
+    private async validateAliasOf(aliasOf: string, uid: string): Promise<void> {
+        if (aliasOf === uid) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain cannot be an alias of itself.");
+        }
+        const target: T | undefined = await this.repoUtils!.findOne(aliasOf, { ignoreACL: true });
+        if (!target) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${aliasOf}' is not a domain known to this server - add it first.`);
+        }
+        if (target.aliasOf) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${aliasOf}' is itself an alias of '${target.aliasOf}' - a domain cannot alias another alias.`);
+        }
+    }
+
+    /** Refuses to leave a dangling alias: rejects a 409 if any other `Domain` currently names `uid` via its
+     * own `aliasOf`. Checked by `delete()` before a primary domain (or a domain that has never been aliased)
+     * can be removed - without this, deleting `powerlevel.gg` while `plc.gg` still names it as `aliasOf`
+     * would leave `plc.gg` resolving to a primary domain that no longer exists. */
+    private async assertNoDependentAliases(uid: string): Promise<void> {
+        const dependents: T[] = await this.repoUtils!.find({ aliasOf: uid } as any, { ignoreACL: true, limit: 1 });
+        if (dependents.length > 0) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                `Cannot delete '${uid}' while '${dependents[0].name}' is still configured as an alias of it - delete or repoint that domain first.`,
+            );
+        }
+    }
+
     /** Normalizes `o.name`, derives `uid` from it, and rejects a 409 on collision against an existing
      * `Domain`. Mutates `o` in place - assigns `uid`, and starts a freshly created domain unverified with a
      * new token (DNS ownership has never been checked for it yet), unless `o.name` is under a reserved,
      * never-publicly-resolvable TLD (see `isReservedDomainName()`), in which case it starts already
-     * verified instead. */
+     * verified instead. A caller-supplied `aliasOf` (see `Domain.aliasOf`'s own doc comment) is normalized
+     * and validated the same way `validateAliasOf()` validates one on `update()`. */
     private async assignUidAndCheckCollision(o: Partial<T>): Promise<void> {
         if (!o.name) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
@@ -120,6 +153,12 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         (o as any).uid = uid;
         (o as any).verificationToken = this.newVerificationToken();
         await this.ensureDkimFields(o);
+        if (typeof o.aliasOf === "string") {
+            (o as any).aliasOf = normalizeAddress(o.aliasOf) || undefined;
+        }
+        if (o.aliasOf) {
+            await this.validateAliasOf(o.aliasOf, uid);
+        }
         if (isReservedDomainName(uid)) {
             // A reserved/special-use TLD (.local, .internal, etc. - see `isReservedDomainName()`'s own doc
             // comment) is never resolvable via public DNS, so ownership can't be proven that way. Adding
@@ -203,6 +242,17 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain's name cannot be changed - delete and re-create it instead.");
         }
         validateDmarcPolicy(patch.dmarcPolicy);
+        if (patch.aliasOf !== undefined) {
+            patch.aliasOf = normalizeAddress(String(patch.aliasOf)) || undefined;
+            if (patch.aliasOf && patch.aliasOf !== existing.aliasOf) {
+                // Only checked on a genuine new alias assignment, not a no-op round-trip of the existing value -
+                // matches every other "only act on a real change" guard in this class. Refuses turning a domain
+                // that other domains already alias INTO an alias itself, which is the same one-hop-only rule
+                // `validateAliasOf()` enforces from the other direction (a fresh alias can't target an alias).
+                await this.assertNoDependentAliases(existing.uid);
+                await this.validateAliasOf(patch.aliasOf, existing.uid);
+            }
+        }
 
         const updated: T = await this.repoUtils!.update(patch, existing, { user, version: (obj as any).version, ignoreACL: true });
 
@@ -272,6 +322,7 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
+        await this.assertNoDependentAliases(existing.uid);
         await this.repoUtils!.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });
 
         await recordAuditLog(

@@ -22,7 +22,7 @@ import { sendOrThrow } from "../transport/TransportResultUtils.js";
 import { DistributionList, IngestQueueEntry, IngestStatus, Mailbox, QuarantineReason, TransportRule } from "../models/types.js";
 import { normalizeAddress, stripPlusTag } from "../util/AddressUtils.js";
 import { rewriteHeadersForList } from "../util/DistributionListUtils.js";
-import { getVerifiedDomainNames } from "../util/DomainUtils.js";
+import { getVerifiedDomainNames, resolveDomainAlias } from "../util/DomainUtils.js";
 import {
     buildDeliveryFailureNotice,
     deliveryFailureKey,
@@ -179,16 +179,36 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         }
     }
 
-    /** An exact `primarySmtpAddress`/`aliasAddresses` match for `address`, with no plus-tag fallback. Split out
-     * from `findMailboxByAddress()` so callers that must not let the plus-tag fallback tier shadow an exact
-     * `DistributionList` match (`deliver()`, `expandDistributionList()`) can check this tier, then a
-     * `DistributionList`, before ever falling back to a plus-stripped mailbox match. */
-    private async findExactMailboxByAddress(address: string): Promise<M | undefined> {
+    /** An exact `primarySmtpAddress`/`aliasAddresses` match for `address` only - no domain-alias rewrite, no
+     * plus-tag fallback. The one place that actually queries `mailboxRepo` by address; `findExactMailboxByAddress()`
+     * wraps this with the domain-alias retry every other caller needs. */
+    private async findExactMailboxByAddressRaw(address: string): Promise<M | undefined> {
         const mailboxes: M[] = await this.mailboxRepo!.find({ primarySmtpAddress: ModelUtils.literal(address) } as any, { ignoreACL: true, limit: 1 });
         return (
             mailboxes[0] ??
             (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(address) }, { ignoreACL: true, limit: 1 }))[0]
         );
+    }
+
+    /**
+     * An exact `primarySmtpAddress`/`aliasAddresses` match for `address`, with no plus-tag fallback - but WITH
+     * a domain-alias retry: when `address`'s domain has no direct match and is a pure alias `Domain`
+     * (`util/DomainUtils.ts`'s `resolveDomainAlias()`), retries once against the equivalent address on the
+     * domain it aliases. This is how `jean-philippe@plc.gg` delivers to the mailbox actually provisioned at
+     * `jean-philippe@powerlevel.gg` when `plc.gg` is a pure alias of `powerlevel.gg` - no `Mailbox` is ever
+     * created at the alias domain itself (see `BaseMailboxRoute`'s own non-alias domain restriction).
+     *
+     * Split out from `findMailboxByAddress()` so callers that must not let the plus-tag fallback tier shadow an
+     * exact `DistributionList` match (`deliver()`, `expandDistributionList()`) can check this tier, then a
+     * `DistributionList`, before ever falling back to a plus-stripped mailbox match.
+     */
+    private async findExactMailboxByAddress(address: string): Promise<M | undefined> {
+        const direct: M | undefined = await this.findExactMailboxByAddressRaw(address);
+        if (direct) {
+            return direct;
+        }
+        const rewritten: string | undefined = await resolveDomainAlias(this._objectFactory!, this.domainClass, address);
+        return rewritten ? await this.findExactMailboxByAddressRaw(rewritten) : undefined;
     }
 
     /** Only the plus-tag fallback tier of `findMailboxByAddress()` - an exact match against the plus-stripped
@@ -225,7 +245,8 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         return (await this.findExactMailboxByAddress(address)) ?? (await this.findPlusStrippedMailbox(address));
     }
 
-    private async findDistributionListByAddress(address: string): Promise<DistributionList | undefined> {
+    /** No domain-alias rewrite, no plus-tag fallback - the raw query `findDistributionListByAddress()` wraps. */
+    private async findDistributionListByAddressRaw(address: string): Promise<DistributionList | undefined> {
         const lists: DistributionList[] = await this.distributionListRepo!.find(
             { primarySmtpAddress: ModelUtils.literal(address) } as any,
             { ignoreACL: true, limit: 1 },
@@ -239,6 +260,17 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 )
             )[0]
         );
+    }
+
+    /** Same domain-alias retry as `findExactMailboxByAddress()`, for a `DistributionList` - a list provisioned at
+     * `sales@powerlevel.gg` is also reachable at `sales@plc.gg` once `plc.gg` is a pure alias of `powerlevel.gg`. */
+    private async findDistributionListByAddress(address: string): Promise<DistributionList | undefined> {
+        const direct: DistributionList | undefined = await this.findDistributionListByAddressRaw(address);
+        if (direct) {
+            return direct;
+        }
+        const rewritten: string | undefined = await resolveDomainAlias(this._objectFactory!, this.domainClass, address);
+        return rewritten ? await this.findDistributionListByAddressRaw(rewritten) : undefined;
     }
 
     /**

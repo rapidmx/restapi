@@ -14,6 +14,9 @@
 - Every fallback is graceful and per attendee: an attendee with no row (and everyone, when the lookup fails or the meeting is gone) gets the event's own plain stored `location` and today's
   invite text, and one attendee's refused scan or rejected relay is logged and skipped while the rest still go out. An event **without** a `videoMeetingUid` - the overwhelming majority -
   takes exactly the path it always did and issues no extra query at all, and a cancellation (`CANCEL`) is unaffected in every case: it never needs a join link and never looks one up.
+- **A meeting reminder now carries the event's own `location`.** `CalendarReminderJob`'s `"reminder"` push event gains `location` alongside `eventUid`/`title`/`startDate` - plain, undecorated
+  text (not actually encrypted today regardless of `encryptionOrigin` - see that field's own doc comment), so a client already free to show `location` as-is elsewhere can also read it as a
+  join link when it looks like one, e.g. offering a one-click way into a video call from the reminder pop-up itself.
 
 ## v0.18.0
 

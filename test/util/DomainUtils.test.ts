@@ -9,8 +9,11 @@ import {
     classifyRecipientTier,
     createFederatedPeerCheck,
     extractPublicHostname,
+    getAliasDomainNames,
+    getPrimaryDomainNames,
     getVerifiedDomainNames,
     isInternalAddress,
+    resolveDomainAlias,
 } from "../../src/util/DomainUtils.js";
 
 function makeStubClass(): any {
@@ -57,6 +60,124 @@ describe("getVerifiedDomainNames() Tests", () => {
 
         expect(objectFactory.newInstance).toHaveBeenCalledTimes(1);
         expect(repo.find).toHaveBeenCalledTimes(2);
+    });
+});
+
+describe("getPrimaryDomainNames() Tests", () => {
+    let repo: { find: ReturnType<typeof vi.fn> };
+    let objectFactory: { newInstance: ReturnType<typeof vi.fn> };
+
+    beforeEach(() => {
+        repo = { find: vi.fn().mockResolvedValue([]) };
+        objectFactory = { newInstance: vi.fn().mockResolvedValue(repo) };
+    });
+
+    it("Returns an empty array when there are no Domain rows.", async () => {
+        const result = await getPrimaryDomainNames(objectFactory as any, makeStubClass());
+        expect(result).toEqual([]);
+    });
+
+    it("Includes a plain domain with no aliasOf.", async () => {
+        repo.find.mockResolvedValue([{ name: "powerlevel.gg" }]);
+        const result = await getPrimaryDomainNames(objectFactory as any, makeStubClass());
+        expect(result).toEqual(["powerlevel.gg"]);
+    });
+
+    it("Excludes a domain whose aliasOf is set, even though the query itself still returned it.", async () => {
+        repo.find.mockResolvedValue([{ name: "powerlevel.gg" }, { name: "plc.gg", aliasOf: "powerlevel.gg" }]);
+        const result = await getPrimaryDomainNames(objectFactory as any, makeStubClass());
+        expect(result).toEqual(["powerlevel.gg"]);
+    });
+});
+
+describe("getAliasDomainNames() Tests", () => {
+    let repo: { find: ReturnType<typeof vi.fn> };
+    let objectFactory: { newInstance: ReturnType<typeof vi.fn> };
+
+    beforeEach(() => {
+        repo = { find: vi.fn().mockResolvedValue([]) };
+        objectFactory = { newInstance: vi.fn().mockResolvedValue(repo) };
+    });
+
+    it("Returns an empty array when no domain aliases the given primary domain.", async () => {
+        const result = await getAliasDomainNames(objectFactory as any, makeStubClass(), "powerlevel.gg");
+        expect(result).toEqual([]);
+    });
+
+    it("Returns the names of every domain whose aliasOf matches, and queries case-insensitively.", async () => {
+        repo.find.mockResolvedValue([{ name: "plc.gg", aliasOf: "powerlevel.gg" }]);
+        const result = await getAliasDomainNames(objectFactory as any, makeStubClass(), "POWERLEVEL.GG");
+        expect(result).toEqual(["plc.gg"]);
+        expect(repo.find).toHaveBeenCalledWith(
+            { enabled: true, verified: true, aliasOf: "powerlevel.gg", limit: 10_000 },
+            { ignoreACL: true, limit: 10_000 },
+        );
+    });
+});
+
+describe("resolveDomainAlias() Tests", () => {
+    let repo: { findOne: ReturnType<typeof vi.fn> };
+    let objectFactory: { newInstance: ReturnType<typeof vi.fn> };
+
+    beforeEach(() => {
+        repo = { findOne: vi.fn() };
+        objectFactory = { newInstance: vi.fn().mockResolvedValue(repo) };
+    });
+
+    it("Returns undefined for an address with no @.", async () => {
+        const result = await resolveDomainAlias(objectFactory as any, makeStubClass(), "not-an-address");
+        expect(result).toBeUndefined();
+        expect(objectFactory.newInstance).not.toHaveBeenCalled();
+    });
+
+    it("Returns undefined without querying at all when domainClass itself is unset (a lightweight test double that never wired one up).", async () => {
+        const result = await resolveDomainAlias(objectFactory as any, undefined, "user@plc.gg");
+        expect(result).toBeUndefined();
+        expect(objectFactory.newInstance).not.toHaveBeenCalled();
+    });
+
+    it("Returns undefined when the address's domain isn't a Domain row at all.", async () => {
+        repo.findOne.mockResolvedValue(undefined);
+        const result = await resolveDomainAlias(objectFactory as any, makeStubClass(), "user@unknown.gg");
+        expect(result).toBeUndefined();
+    });
+
+    it("Returns undefined when the domain exists but isn't an alias (no aliasOf).", async () => {
+        repo.findOne.mockResolvedValue({ name: "powerlevel.gg", enabled: true, verified: true });
+        const result = await resolveDomainAlias(objectFactory as any, makeStubClass(), "user@powerlevel.gg");
+        expect(result).toBeUndefined();
+    });
+
+    it("Returns undefined when the alias domain itself isn't enabled/verified.", async () => {
+        repo.findOne.mockResolvedValue({ name: "plc.gg", enabled: false, verified: true, aliasOf: "powerlevel.gg" });
+        const result = await resolveDomainAlias(objectFactory as any, makeStubClass(), "user@plc.gg");
+        expect(result).toBeUndefined();
+    });
+
+    it("Returns undefined when the aliased-to primary domain is missing, disabled, or unverified.", async () => {
+        repo.findOne
+            .mockResolvedValueOnce({ name: "plc.gg", enabled: true, verified: true, aliasOf: "powerlevel.gg" })
+            .mockResolvedValueOnce(undefined);
+        const result = await resolveDomainAlias(objectFactory as any, makeStubClass(), "user@plc.gg");
+        expect(result).toBeUndefined();
+    });
+
+    it("Rewrites the address onto the primary domain's own name when the alias resolves cleanly.", async () => {
+        repo.findOne
+            .mockResolvedValueOnce({ name: "plc.gg", enabled: true, verified: true, aliasOf: "powerlevel.gg" })
+            .mockResolvedValueOnce({ name: "powerlevel.gg", enabled: true, verified: true });
+        const result = await resolveDomainAlias(objectFactory as any, makeStubClass(), "jean-philippe@plc.gg");
+        expect(result).toBe("jean-philippe@powerlevel.gg");
+        expect(repo.findOne).toHaveBeenNthCalledWith(1, "plc.gg", { ignoreACL: true });
+        expect(repo.findOne).toHaveBeenNthCalledWith(2, "powerlevel.gg", { ignoreACL: true });
+    });
+
+    it("Is case-insensitive on the address's domain.", async () => {
+        repo.findOne
+            .mockResolvedValueOnce({ name: "plc.gg", enabled: true, verified: true, aliasOf: "powerlevel.gg" })
+            .mockResolvedValueOnce({ name: "powerlevel.gg", enabled: true, verified: true });
+        const result = await resolveDomainAlias(objectFactory as any, makeStubClass(), "jean-philippe@PLC.GG");
+        expect(result).toBe("jean-philippe@powerlevel.gg");
     });
 });
 

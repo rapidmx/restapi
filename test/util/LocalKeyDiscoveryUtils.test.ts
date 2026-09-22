@@ -111,6 +111,43 @@ describe("LocalKeyDiscoveryUtils", () => {
             expect(await discoverLocalKeys(localOf([mailbox()]), "ghost@example.com")).toEqual({ address: "ghost@example.com" });
         });
 
+        it("rewrites a pure alias domain address onto the mailbox found at its primary-domain equivalent, when resolveDomainAlias is wired in", async () => {
+            const resolveDomainAlias = vi.fn(async (address: string) => (address === "bob@plc.gg" ? "bob@example.com" : undefined));
+            const local = localOf([mailbox()], [], { resolveDomainAlias });
+
+            const found = await discoverLocalKeys(local, "bob@plc.gg");
+
+            expect(found?.address).toBe("bob@example.com");
+            expect(resolveDomainAlias).toHaveBeenCalledWith("bob@plc.gg");
+        });
+
+        it("rewrites via alias, then still applies the plus-tag fallback against the rewritten address", async () => {
+            const resolveDomainAlias = vi.fn(async (address: string) => (address === "bob+news@plc.gg" ? "bob+news@example.com" : undefined));
+            const local = localOf([mailbox()], [], { resolveDomainAlias });
+
+            const found = await discoverLocalKeys(local, "bob+news@plc.gg");
+
+            expect(found?.address).toBe("bob@example.com");
+        });
+
+        it("does not call resolveDomainAlias at all once a direct match is found", async () => {
+            const resolveDomainAlias = vi.fn();
+            const local = localOf([mailbox()], [], { resolveDomainAlias });
+
+            await discoverLocalKeys(local, "bob@example.com");
+
+            expect(resolveDomainAlias).not.toHaveBeenCalled();
+        });
+
+        it("falls through to the served-domain check when resolveDomainAlias has nothing to rewrite (no alias, or unset)", async () => {
+            const resolveDomainAlias = vi.fn(async () => undefined);
+            const withResolver = await discoverLocalKeys(localOf([mailbox()], [], { resolveDomainAlias }), "ghost@example.com");
+            const withoutResolver = await discoverLocalKeys(localOf([mailbox()]), "ghost@example.com");
+
+            expect(withResolver).toEqual({ address: "ghost@example.com" });
+            expect(withoutResolver).toEqual({ address: "ghost@example.com" });
+        });
+
         it("has no answer for another server's address, or an address that isn't one", async () => {
             const local = localOf([mailbox()]);
 

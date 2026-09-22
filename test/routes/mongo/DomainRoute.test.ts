@@ -413,6 +413,149 @@ describe("Route:DomainMongo Tests", () => {
         });
     });
 
+    describe("aliasOf", () => {
+        it("Creates a domain aliasing an existing primary domain.", async () => {
+            await createDomain({ name: "powerlevel.gg" });
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ name: "plc.gg", aliasOf: "powerlevel.gg" });
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.aliasOf).toBe("powerlevel.gg");
+        });
+
+        it("Is case-insensitive on the referenced domain's name.", async () => {
+            await createDomain({ name: "powerlevel.gg" });
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ name: "plc.gg", aliasOf: "POWERLEVEL.GG" });
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.aliasOf).toBe("powerlevel.gg");
+        });
+
+        it("Rejects aliasOf naming a domain that doesn't exist (400).", async () => {
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ name: "plc.gg", aliasOf: "no-such-domain.gg" });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects a domain aliasing itself (400).", async () => {
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ name: "self-alias.gg", aliasOf: "self-alias.gg" });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects a domain aliasing another alias (no chains) (400).", async () => {
+            await createDomain({ name: "powerlevel.gg" });
+            await createDomain({ name: "plc.gg", aliasOf: "powerlevel.gg" });
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ name: "third.gg", aliasOf: "plc.gg" });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Allows updating a domain to set aliasOf against a valid primary domain.", async () => {
+            await createDomain({ name: "powerlevel.gg" });
+            const domain = await createDomain({ name: "plc.gg" });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${domain.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: domain.uid, version: domain.version, aliasOf: "powerlevel.gg" });
+
+            expect(result.status).toBe(200);
+            expect(result.body.aliasOf).toBe("powerlevel.gg");
+        });
+
+        it("Rejects updating aliasOf to a domain that doesn't exist (400).", async () => {
+            const domain = await createDomain({ name: "plc.gg" });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${domain.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: domain.uid, version: domain.version, aliasOf: "no-such-domain.gg" });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects updating a domain to alias itself (400).", async () => {
+            const domain = await createDomain({ name: "self-alias-update.gg" });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${domain.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: domain.uid, version: domain.version, aliasOf: domain.uid });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects updating a domain that other domains already alias INTO an alias itself (409).", async () => {
+            const primary = await createDomain({ name: "primary-with-dependents.gg" });
+            await createDomain({ name: "dependent.gg", aliasOf: primary.uid });
+            const other = await createDomain({ name: "other-primary.gg" });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${primary.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: primary.uid, version: primary.version, aliasOf: other.uid });
+
+            expect(result.status).toBe(409);
+        });
+
+        it("Is a no-op round-tripping the same already-set aliasOf value (no re-validation, no error).", async () => {
+            await createDomain({ name: "powerlevel-roundtrip.gg" });
+            const domain = await createDomain({ name: "plc-roundtrip.gg", aliasOf: "powerlevel-roundtrip.gg" });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${domain.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: domain.uid, version: domain.version, aliasOf: "powerlevel-roundtrip.gg", enabled: false });
+
+            expect(result.status).toBe(200);
+            expect(result.body.aliasOf).toBe("powerlevel-roundtrip.gg");
+            expect(result.body.enabled).toBe(false);
+        });
+
+        it("Rejects deleting a primary domain while another domain still aliases it (409).", async () => {
+            const primary = await createDomain({ name: "still-aliased.gg" });
+            await createDomain({ name: "alias-of-it.gg", aliasOf: primary.uid });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${primary.uid}`)
+                .set("Authorization", "jwt " + adminToken);
+
+            expect(result.status).toBe(409);
+        });
+
+        it("Allows deleting an alias domain itself (it has no dependents).", async () => {
+            const primary = await createDomain({ name: "primary-ok-to-keep.gg" });
+            const alias = await createDomain({ name: "alias-ok-to-delete.gg", aliasOf: primary.uid });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${alias.uid}`)
+                .set("Authorization", "jwt " + adminToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+        });
+    });
+
     it("Rejects an invalid dmarcPolicy on create (400).", async () => {
         const result = await request(server.getApplication())
             .post(baseUrl)

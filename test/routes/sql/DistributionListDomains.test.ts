@@ -53,6 +53,8 @@ describe("Route:DistributionListSQL domain-restriction Tests", () => {
         // own unrestricted-domain assumptions within the same `vitest run` process.
         await domainRepo.delete({ uid: "example.com" });
         await domainRepo.delete({ uid: "example.org" });
+        await domainRepo.delete({ uid: "alias.com" });
+        await domainRepo.delete({ uid: "aliased-primary.com" });
         await server.stop();
         await objectFactory.destroy();
     });
@@ -74,5 +76,20 @@ describe("Route:DistributionListSQL domain-restriction Tests", () => {
 
         expect(result.status).toBeGreaterThanOrEqual(200);
         expect(result.status).toBeLessThan(300);
+    });
+
+    it("Rejects an address on a pure alias domain (400) - a DistributionList has no address of its own there, same as a Mailbox.", async () => {
+        const primary = "aliased-primary.com";
+        await domainRepo.save(new DomainSQL({ name: primary, enabled: true, verified: true, verificationToken: uuid.v4(), uid: primary } as any));
+        await domainRepo.save(
+            new DomainSQL({ name: "alias.com", enabled: true, verified: true, verificationToken: uuid.v4(), uid: "alias.com", aliasOf: primary } as any),
+        );
+
+        const result = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ primarySmtpAddress: "sales@alias.com", name: "Sales", memberAddresses: [] });
+
+        expect(result.status).toBe(400);
     });
 });

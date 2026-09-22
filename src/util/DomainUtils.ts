@@ -87,6 +87,77 @@ export async function getVerifiedDomainNames(objectFactory: ObjectFactory, domai
 }
 
 /**
+ * Returns the names of every `Domain` that is both `enabled` and `verified` AND is not a pure alias of
+ * another domain (`Domain.aliasOf` unset) - the domain list a `Mailbox`/`DistributionList` address is
+ * actually restricted to (`BaseMailboxRoute`/`BaseDistributionListRoute`). An alias domain (see
+ * `Domain.aliasOf`'s own doc comment) is deliberately excluded here even though it's a real, verified
+ * domain this server accepts mail on (`getVerifiedDomainNames()` still includes it) - it has no mailboxes
+ * of its own by design, only ever reached through `resolveDomainAlias()`.
+ */
+export async function getPrimaryDomainNames(objectFactory: ObjectFactory, domainClass: any): Promise<string[]> {
+    const repo = await getDomainRepo(objectFactory, domainClass);
+    // Filtered client-side rather than pushing `aliasOf` into the query itself - an "is unset" filter doesn't
+    // translate identically across the Mongo/SQL backends (a SQL `NULL` column vs. a Mongo missing field), and
+    // this list is already capped at `MAX_VERIFIED_DOMAINS` rows, the same trade-off `isReservedDomainName()`'s
+    // caller-side checks elsewhere in this module already make.
+    const domains = await repo.find({ enabled: true, verified: true, limit: MAX_VERIFIED_DOMAINS } as any, {
+        ignoreACL: true,
+        limit: MAX_VERIFIED_DOMAINS,
+    });
+    return domains.filter((d: any) => !d.aliasOf).map((d: any) => d.name);
+}
+
+/**
+ * Returns the names of every currently enabled-and-verified `Domain` whose `aliasOf` names
+ * `primaryDomainName` (case-insensitive) - the alias domains a mailbox on `primaryDomainName` may also
+ * send as (`BaseMessageRoute.assertSenderAllowed()`). Not cached like `getVerifiedDomainNames()`/
+ * `getPrimaryDomainNames()`'s own full-table scan - callers only ever need this for one specific domain at
+ * a time, so a narrow query is cheaper than filtering the whole list client-side.
+ */
+export async function getAliasDomainNames(objectFactory: ObjectFactory, domainClass: any, primaryDomainName: string): Promise<string[]> {
+    const repo = await getDomainRepo(objectFactory, domainClass);
+    const domains = await repo.find(
+        { enabled: true, verified: true, aliasOf: primaryDomainName.toLowerCase(), limit: MAX_VERIFIED_DOMAINS } as any,
+        { ignoreACL: true, limit: MAX_VERIFIED_DOMAINS },
+    );
+    return domains.map((d: any) => d.name);
+}
+
+/**
+ * Rewrites `address` from an alias domain onto its primary domain, for inbound address resolution
+ * (`BaseMailIngestRoute.findExactMailboxByAddress()`/`findDistributionListByAddress()`) and local key
+ * discovery (`util/LocalKeyDiscoveryUtils.ts`). Returns `undefined` when no rewrite applies: `address` has
+ * no `@`, its domain isn't a currently enabled-and-verified alias `Domain`, or the `Domain` it names via
+ * `aliasOf` isn't itself currently enabled-and-verified (a dangling/disabled reference resolves to nothing
+ * rather than silently misrouting mail) - the caller falls back to treating `address` as-is in every case.
+ * A single point (indexed `findOne` lookups, not a full domain scan) so every caller pays for at most two
+ * lookups regardless of how many domains exist. `domainClass` itself is falsy only for a lightweight test
+ * double that never wires one up (every real Mongo/SQL route subclass always supplies it) - treated the
+ * same as "nothing to rewrite" rather than throwing, matching this module's `DkimKeyProvider`-style
+ * tolerance of an unwired optional dependency elsewhere in this library.
+ */
+export async function resolveDomainAlias(objectFactory: ObjectFactory, domainClass: any, address: string): Promise<string | undefined> {
+    if (!domainClass) {
+        return undefined;
+    }
+    const atIndex: number = address.lastIndexOf("@");
+    if (atIndex < 0) {
+        return undefined;
+    }
+    const domainName: string = address.slice(atIndex + 1).toLowerCase();
+    const repo = await getDomainRepo(objectFactory, domainClass);
+    const domain = await repo.findOne(domainName, { ignoreACL: true });
+    if (!domain?.enabled || !domain.verified || !domain.aliasOf) {
+        return undefined;
+    }
+    const primary = await repo.findOne(domain.aliasOf.toLowerCase(), { ignoreACL: true });
+    if (!primary?.enabled || !primary.verified) {
+        return undefined;
+    }
+    return `${address.slice(0, atIndex)}@${primary.name.toLowerCase()}`;
+}
+
+/**
  * `true` if `address`'s domain is one of "this server's domains" (see `getVerifiedDomainNames()`) - the same
  * "internal sender" signal `ScanQueueJob.classifyForInbox()` already computes for Focused Inbox, reused as-is
  * for the delivery/read receipt design's own internal-vs-external mailbox settings (`ScanQueueJob.

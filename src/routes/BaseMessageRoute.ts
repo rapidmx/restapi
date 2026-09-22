@@ -23,7 +23,7 @@ import { pointInlineImages, SanitizedBodyLoader, type InlineImageMode } from "..
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
-import { classifyRecipientTier, createFederatedPeerCheck } from "../util/DomainUtils.js";
+import { classifyRecipientTier, createFederatedPeerCheck, getAliasDomainNames } from "../util/DomainUtils.js";
 import { coalesceFolderCounts, notifyFolderCounts, type FolderCountsContext } from "../util/FolderCountUtils.js";
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { findActiveHoldsFor } from "../util/LegalHoldUtils.js";
@@ -606,18 +606,41 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
     /**
      * Refuses (403) a send/recall whose sender isn't the sending mailbox: `from.address` - and every address in the
-     * composed source's own `From` header, when there is one - must be the mailbox's primary address or one of its
-     * aliases. `from` is ordinary draft data, and it becomes the envelope sender, so without this any caller with
-     * write access to one mailbox could send as any address at all.
+     * composed source's own `From` header, when there is one - must be the mailbox's primary address, one of its
+     * aliases, or one of those same addresses' local part on a pure alias `Domain` of its own domain (see
+     * `Domain.aliasOf`'s own doc comment: `jean-philippe@powerlevel.gg` may also send as `jean-philippe@plc.gg` once
+     * `plc.gg` is a pure alias of `powerlevel.gg`, with no per-mailbox configuration needed). `from` is ordinary
+     * draft data, and it becomes the envelope sender, so without this any caller with write access to one mailbox
+     * could send as any address at all.
      */
     //
     // With `raw`, the composed source's originator headers are checked too (`checkOriginatorHeaders()`): exactly one
     // `From`, at most one `Sender`, every address in them (group members included) the mailbox's own, no address-like
     // text outside an address, and no address in a display name or comment.
-    private assertSenderAllowed(mailbox: Mailbox | undefined, message: T, raw?: Buffer): void {
-        const allowed: Set<string> = new Set(
-            mailbox ? [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].filter((a) => typeof a === "string").map(normalizeAddress) : [],
-        );
+    private async assertSenderAllowed(mailbox: Mailbox | undefined, message: T, raw?: Buffer): Promise<void> {
+        const ownAddresses: string[] = mailbox
+            ? [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].filter((a): a is string => typeof a === "string")
+            : [];
+        const allowed: Set<string> = new Set(ownAddresses.map(normalizeAddress));
+
+        const ownDomains: Set<string> = new Set(ownAddresses.map((a) => normalizeAddress(a).split("@")[1]).filter((d): d is string => !!d));
+        for (const ownDomain of ownDomains) {
+            const aliasDomains: string[] = await getAliasDomainNames(this._objectFactory!, this.domainClass, ownDomain);
+            if (aliasDomains.length === 0) {
+                continue;
+            }
+            for (const address of ownAddresses) {
+                const normalized: string = normalizeAddress(address);
+                if (normalized.split("@")[1] !== ownDomain) {
+                    continue;
+                }
+                const localPart: string = normalized.split("@")[0];
+                for (const aliasDomain of aliasDomains) {
+                    allowed.add(`${localPart}@${aliasDomain}`);
+                }
+            }
+        }
+
         const isAllowed = (address: unknown): boolean => typeof address === "string" && allowed.has(normalizeAddress(address));
         const refused: boolean =
             !isAllowed(message.from?.address) ||
@@ -959,14 +982,14 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const sendingMailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, {
             ignoreACL: true,
         });
-        this.assertSenderAllowed(sendingMailbox, message);
+        await this.assertSenderAllowed(sendingMailbox, message);
 
         // The message's `bodyBlobKey` already holds the fully composed RFC 5322 source (assembled by the
         // webmail compose UI, or an EAS/MAPI "send" handler, before this endpoint is called) — this route's
         // job is scanning and relay, not MIME composition. Its originator headers are checked before a scheduled send
         // is queued too - `ScheduledSendJob` relays these same bytes.
         let raw: Buffer = await this.blobStore.get(message.bodyBlobKey);
-        this.assertSenderAllowed(sendingMailbox, message, raw);
+        await this.assertSenderAllowed(sendingMailbox, message, raw);
 
         // The reply's own RFC 5322 threading headers, from the `inReplyTo`/`references` the draft records (a
         // compose client sets them when it opens a reply; `SERVER_MANAGED_MESSAGE_FIELDS` deliberately doesn't
@@ -1390,7 +1413,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This message cannot be recalled.");
         }
         // The recall notice goes out with `from.address` as its sender - same rule as `send()`.
-        this.assertSenderAllowed(await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true }), message);
+        await this.assertSenderAllowed(await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true }), message);
 
         const envelopeTo: string[] = message.recipients.map((r) => r.address);
         // `from.displayName` is ordinary client-writable data - an address-like one is left out (`safeDisplayName()`).

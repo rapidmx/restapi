@@ -76,6 +76,11 @@ export class DomainMongo extends BaseMongoEntity implements Domain {
     @Nullable
     public dmarcReportEmail?: string;
 
+    @Column()
+    @Description("When set, this domain is a pure alias of another domain (named here) and has no mailboxes of its own.")
+    @Nullable
+    public aliasOf?: string;
+
     constructor(other?: Partial<DomainMongo>) {
         super(other);
 
@@ -90,6 +95,7 @@ export class DomainMongo extends BaseMongoEntity implements Domain {
             this.dkimPublicKey = "dkimPublicKey" in other ? other.dkimPublicKey : this.dkimPublicKey;
             this.dmarcPolicy = "dmarcPolicy" in other ? other.dmarcPolicy : this.dmarcPolicy;
             this.dmarcReportEmail = "dmarcReportEmail" in other ? other.dmarcReportEmail : this.dmarcReportEmail;
+            this.aliasOf = "aliasOf" in other ? other.aliasOf : this.aliasOf;
         }
     }
 }

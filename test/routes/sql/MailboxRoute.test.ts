@@ -490,6 +490,73 @@ describe("Route:MailboxSQL Tests", () => {
         expect(result.body.primarySmtpAddress).toBe(newAddress);
     });
 
+    describe("domain alias", () => {
+        const seedAlias = async (): Promise<void> => {
+            await domainRepo.save(new DomainSQL({ name: "powerlevel.gg", enabled: true, verified: true } as any));
+            await domainRepo.save(new DomainSQL({ name: "plc.gg", enabled: true, verified: true, aliasOf: "powerlevel.gg" } as any));
+        };
+
+        it("Rejects creating a mailbox directly on a pure alias domain (400), even though it's a verified domain.", async () => {
+            await seedAlias();
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({
+                    primarySmtpAddress: `${uuid.v4()}@plc.gg`,
+                    aliasAddresses: [],
+                    displayName: "Alias Domain Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Allows creating a mailbox on the primary domain an alias points to.", async () => {
+            await seedAlias();
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({
+                    primarySmtpAddress: `${uuid.v4()}@powerlevel.gg`,
+                    aliasAddresses: [],
+                    displayName: "Primary Domain Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                });
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+        });
+
+        it("Rejects renaming primarySmtpAddress onto a pure alias domain (400).", async () => {
+            await seedAlias();
+            const obj = await createMailboxSQL({ primarySmtpAddress: `${uuid.v4()}@powerlevel.gg` });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: obj.uid, version: obj.version, primarySmtpAddress: `${uuid.v4()}@plc.gg` });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("GET /mailboxes/domains excludes a pure alias domain from the list a client offers for a new mailbox.", async () => {
+            await seedAlias();
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/domains`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body).toEqual(["powerlevel.gg"]);
+        });
+    });
+
     it("Refuses (403) a non-trusted owner renaming primarySmtpAddress to an address that isn't one of their own usernames - by PUT, property PUT or bulk PUT - leaving it unchanged. (Renames onto the owner's own username: see mailboxSelfServiceCreateSuite.ts.)", async () => {
         const obj = await createMailboxSQL();
         const newAddress = `ceo-${uuid.v4()}@example.com`;

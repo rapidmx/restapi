@@ -265,6 +265,95 @@ describe("Route:MailIngestRouteMongo Tests", () => {
         expect(entries[0].envelopeFrom).toBe("sender@example.com");
     });
 
+    describe("domain alias", () => {
+        it("Accepts the /domain relay check for a pure alias domain, same as any other verified domain.", async () => {
+            await createDomain({ name: "powerlevel.gg" });
+            await createDomain({ name: "plc.gg", aliasOf: "powerlevel.gg" });
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/domain?name=plc.gg`)
+                .set("Authorization", `Bearer ${secret}`);
+            expect(result.status).toBe(200);
+        });
+
+        it("Resolves a recipient addressed at the alias domain to the mailbox provisioned on the primary domain.", async () => {
+            await createDomain({ name: "powerlevel.gg" });
+            await createDomain({ name: "plc.gg", aliasOf: "powerlevel.gg" });
+            await createMailbox({ primarySmtpAddress: "jean-philippe@powerlevel.gg" });
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/resolve?rcpt=jean-philippe@plc.gg`)
+                .set("Authorization", `Bearer ${secret}`);
+
+            expect(result.status).toBe(200);
+        });
+
+        it("Delivers a message addressed at the alias domain into the primary domain's mailbox.", async () => {
+            await createDomain({ name: "powerlevel.gg" });
+            await createDomain({ name: "plc.gg", aliasOf: "powerlevel.gg" });
+            const mailbox = await createMailbox({ primarySmtpAddress: "jean-philippe@powerlevel.gg" });
+            const raw = Buffer.from("From: sender@example.com\r\nTo: jean-philippe@plc.gg\r\n\r\nHello\r\n");
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/deliver`)
+                .set("Authorization", `Bearer ${secret}`)
+                .set("X-Envelope-From", "sender@example.com")
+                .set("X-Envelope-To", "jean-philippe@plc.gg")
+                .set("Content-Type", "message/rfc822")
+                .send(raw);
+
+            expect(result.status).toBe(202);
+            expect(result.body.results).toEqual([{ rcpt: "jean-philippe@plc.gg", queued: true }]);
+
+            const entries: IngestQueueEntryMongo[] = await ingestQueueRepo.find({ mailboxUid: mailbox.uid }).toArray();
+            expect(entries.length).toBe(1);
+        });
+
+        it("Delivers a message addressed at the alias domain into a DistributionList provisioned on the primary domain.", async () => {
+            await createDomain({ name: "powerlevel.gg" });
+            await createDomain({ name: "plc.gg", aliasOf: "powerlevel.gg" });
+            const member = await createMailbox({ primarySmtpAddress: "member@powerlevel.gg" });
+            await createList({ primarySmtpAddress: "sales@powerlevel.gg", memberAddresses: [member.primarySmtpAddress] });
+            const raw = Buffer.from("From: sender@example.com\r\nTo: sales@plc.gg\r\n\r\nHello\r\n");
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/deliver`)
+                .set("Authorization", `Bearer ${secret}`)
+                .set("X-Envelope-From", "sender@example.com")
+                .set("X-Envelope-To", "sales@plc.gg")
+                .set("Content-Type", "message/rfc822")
+                .send(raw);
+
+            expect(result.status).toBe(202);
+
+            const entries: IngestQueueEntryMongo[] = await ingestQueueRepo.find({ mailboxUid: member.uid }).toArray();
+            expect(entries.length).toBe(1);
+        });
+
+        it("Reports a recipient at an alias domain as unresolvable when no matching mailbox exists on the primary domain.", async () => {
+            await createDomain({ name: "powerlevel.gg" });
+            await createDomain({ name: "plc.gg", aliasOf: "powerlevel.gg" });
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/resolve?rcpt=nobody@plc.gg`)
+                .set("Authorization", `Bearer ${secret}`);
+
+            expect(result.status).toBe(404);
+        });
+
+        it("Does not rewrite a recipient whose domain is disabled as an alias (falls through, unresolvable).", async () => {
+            await createDomain({ name: "powerlevel.gg" });
+            await createDomain({ name: "plc.gg", aliasOf: "powerlevel.gg", enabled: false });
+            await createMailbox({ primarySmtpAddress: "jean-philippe@powerlevel.gg" });
+
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/resolve?rcpt=jean-philippe@plc.gg`)
+                .set("Authorization", `Bearer ${secret}`);
+
+            expect(result.status).toBe(404);
+        });
+    });
+
     it("Delivers a plus-tagged RCPT TO to the base mailbox, preserving the tagged address in the stored message.", async () => {
         const local = uuid.v4();
         const mailbox = await createMailbox({ primarySmtpAddress: `${local}@example.com` });
