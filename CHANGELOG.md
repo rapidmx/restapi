@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-22
+
+### Added
+- Added a default autodiscover.public_url config block and fix its plugin's stale documentation, so Autodiscover has something real to point clients at once an administrator sets it
+- Added the two DNS record types EAS and Outlook clients actually need to find this server automatically, an autodiscover.<domain> CNAME and a _autodiscover._tcp.<domain> SRV record that needs no extra certificate, only shown when the Autodiscover plugin is active
+- Added DnsResolver.resolveCname and resolveSrv, needed to check the new records
+- Added resolving a mailbox's owner and an escrow scope's key holder before either is saved, each gated at least as strictly as the write it feeds, so an administrator confirms the actual person before typing a raw uid blind
+
+### Changed
+- Test both new record types across Mongo and SQL, including a dedicated server instance for a real configured public_url, since it binds at construction and can't vary per test otherwise
+- Document the fix and the operator runbook for powerlevel.gg in the release notes and NOTES
+- Lift mailbox sharing's exact-match address, username, alias or uid resolution into a shared util, so it can serve other fields that grant access by uid without repeating it
+- Test both new resolve endpoints, and the shared resolution logic against mailbox sharing's own full suite to prove its behavior is unchanged
+- Document the fix and what was confirmed already fine in the release notes and NOTES
+- Require an elevated token, not just a trusted role, for every escrow scope management action - configuring who holds escrow keys, how many are required, and the scope's own public key
+- Leave the M-of-N access request approval flow and a holder's own audit log visibility unchanged, since both are deliberately usable by non-admin holders by design
+- Test every escrow scope action against an anonymous, an ordinary and an unelevated administrator caller, on both backends
+- Document the fix and the design boundary it deliberately stops at in the release notes and NOTES
+
+### Fixed
+- Fixed a guard test that called updateBulk with no user at all, now refused for elevation before it ever reaches the guard it meant to test
+
 ## [0.17.0] - 2026-09-22
 
 ### Added
@@ -1018,7 +1040,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/RapidMX/restapi/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/RapidMX/restapi/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/RapidMX/restapi/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/RapidMX/restapi/compare/v0.14.0...v0.15.0

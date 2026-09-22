@@ -1,6 +1,6 @@
 {
     "name": "@rapidmx/restapi",
-    "version": "0.17.0",
+    "version": "0.18.0",
     "description": "Core data model and standard REST API for building a mail server on RapidREST.",
     "repository": "https://github.com/RapidMX/restapi.git",
     "author": "RapidREST <rapidrests@gmail.com>",
