@@ -4,6 +4,15 @@
 
 ### Features
 
+- **A `Domain` can now be a pure alias of another domain, with no mailboxes of its own.** New optional `Domain.aliasOf` names an existing, non-alias domain: e.g. `plc.gg` aliasing `powerlevel.gg`
+  lets `jean-philippe@powerlevel.gg` receive mail addressed to `jean-philippe@plc.gg` and send as it too, with no per-mailbox configuration and no `Mailbox`/`DistributionList` ever created at
+  `plc.gg` itself. An alias domain still proves DNS ownership and gets its own DKIM key pair exactly like any other domain (`BaseDomainRoute`'s existing verification/DNS-setup flow is unchanged) -
+  only address *resolution* is special: `util/DomainUtils.ts`'s new `resolveDomainAlias()` rewrites `local@<alias>` onto `local@<aliasOf>` wherever `BaseMailIngestRoute` resolves an inbound
+  recipient to a `Mailbox`/`DistributionList`, and new `getAliasDomainNames()` lets `BaseMessageRoute.assertSenderAllowed()` treat every alias domain of a mailbox's own domain as an equally valid
+  `From` for that mailbox's own addresses. New `getPrimaryDomainNames()` (verified, enabled, non-alias domains) is the list `BaseMailboxRoute`/`BaseDistributionListRoute` actually restrict a new
+  address to - an alias domain is deliberately excluded, matching "no mailboxes of its own". `BaseDomainRoute` validates `aliasOf` on create/update (must name an existing non-alias domain, no
+  self-alias, no chains) and refuses deleting a domain other domains still alias. `util/LocalKeyDiscoveryUtils.ts`'s local key discovery (`BaseKeyLookupRoute`/`ScanQueueJob`'s contact-key refresh)
+  resolves the same alias so federation discovery for an alias address finds the primary mailbox's own published keys.
 - **A meeting invite can now carry a different link for every attendee, without this library knowing which plugin produced them.** New `CalendarEvent.videoMeetingUid` (optional, unindexed,
   no foreign key) marks an event as having a linked video meeting, and a new generic entity `CalendarEventAttendeeLink` (`CalendarEventAttendeeLinkMongo`/`CalendarEventAttendeeLinkSQL`,
   exported from `@rapidmx/restapi/mongo` and `/sql`) holds one row per attendee: `mailboxUid`, `calendarEventUid`, `attendeeAddress`, `url` and an optional `label`. It has no route and its
