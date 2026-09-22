@@ -269,8 +269,10 @@ describe("Route:MessageMongo Tests", () => {
 
     describe("domain alias sending", () => {
         it("Allows sending From an address on a pure alias domain of the mailbox's own domain, with no aliasAddresses entry needed.", async () => {
-            await domainRepo.save(new DomainMongo({ name: "example.com", enabled: true, verified: true } as any));
-            await domainRepo.save(new DomainMongo({ name: "plc.gg", enabled: true, verified: true, aliasOf: "example.com" } as any));
+            await domainRepo.save(new DomainMongo({ name: "example.com", enabled: true, verified: true }));
+            await domainRepo.save(
+                new DomainMongo({ name: "plc.gg", enabled: true, verified: true, aliasOf: "example.com" }),
+            );
             const mailbox = await createMailbox(owner.uid);
             const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
             const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
@@ -299,9 +301,11 @@ describe("Route:MessageMongo Tests", () => {
         });
 
         it("Refuses sending From an address on a domain that isn't a pure alias of the mailbox's own domain (403).", async () => {
-            await domainRepo.save(new DomainMongo({ name: "example.com", enabled: true, verified: true } as any));
-            await domainRepo.save(new DomainMongo({ name: "other.com", enabled: true, verified: true } as any));
-            await domainRepo.save(new DomainMongo({ name: "plc.gg", enabled: true, verified: true, aliasOf: "other.com" } as any));
+            await domainRepo.save(new DomainMongo({ name: "example.com", enabled: true, verified: true }));
+            await domainRepo.save(new DomainMongo({ name: "other.com", enabled: true, verified: true }));
+            await domainRepo.save(
+                new DomainMongo({ name: "plc.gg", enabled: true, verified: true, aliasOf: "other.com" }),
+            );
             const mailbox = await createMailbox(owner.uid);
             const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
             const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
@@ -323,9 +327,11 @@ describe("Route:MessageMongo Tests", () => {
         });
 
         it("A mailbox spanning two domains only gets the alias treatment for the domain that actually has one.", async () => {
-            await domainRepo.save(new DomainMongo({ name: "example.com", enabled: true, verified: true } as any));
-            await domainRepo.save(new DomainMongo({ name: "other.org", enabled: true, verified: true } as any));
-            await domainRepo.save(new DomainMongo({ name: "plc.gg", enabled: true, verified: true, aliasOf: "example.com" } as any));
+            await domainRepo.save(new DomainMongo({ name: "example.com", enabled: true, verified: true }));
+            await domainRepo.save(new DomainMongo({ name: "other.org", enabled: true, verified: true }));
+            await domainRepo.save(
+                new DomainMongo({ name: "plc.gg", enabled: true, verified: true, aliasOf: "example.com" }),
+            );
             const mailbox = await mailboxRepo.save(
                 new MailboxMongo({
                     ownerUserUid: owner.uid,

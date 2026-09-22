@@ -465,8 +465,10 @@ describe("Route:MailboxMongo Tests", () => {
 
     describe("domain alias", () => {
         const seedAlias = async (): Promise<void> => {
-            await domainRepo.save(new DomainMongo({ name: "powerlevel.gg", enabled: true, verified: true } as any));
-            await domainRepo.save(new DomainMongo({ name: "plc.gg", enabled: true, verified: true, aliasOf: "powerlevel.gg" } as any));
+            await domainRepo.save(new DomainMongo({ name: "powerlevel.gg", enabled: true, verified: true }));
+            await domainRepo.save(
+                new DomainMongo({ name: "plc.gg", enabled: true, verified: true, aliasOf: "powerlevel.gg" }),
+            );
         };
 
         it("Rejects creating a mailbox directly on a pure alias domain (400), even though it's a verified domain.", async () => {
