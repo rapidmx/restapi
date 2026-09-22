@@ -42,7 +42,11 @@ describe("Admin write guard Tests (updateBulk() non-array bodies)", () => {
     it("BaseEscrowScopeRoute.updateBulk() rejects a non-array body (400).", async () => {
         const route = objectFactory.newInstance<TestEscrowScopeRoute>(TestEscrowScopeRoute, { initialize: false });
 
-        await expect(route.updateBulk({} as any, {} as any)).rejects.toMatchObject({ status: 400 });
+        // A trusted, elevated caller - assertAdminScope() runs first in every action on this route (see its own
+        // doc comment), so an unauthorized caller would be refused before ever reaching this guard, not with a 400.
+        await expect(route.updateBulk({} as any, {} as any, { uid: "admin", roles: ["admin"], elevated: Date.now() } as any)).rejects.toMatchObject({
+            status: 400,
+        });
     });
 
     it("BaseMatterRoute.updateBulk() rejects a non-array body (400), including an iterable string.", async () => {

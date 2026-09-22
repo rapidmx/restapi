@@ -3103,3 +3103,32 @@ no user/mailbox targeting at all); admin impersonation (already a searchable mai
 Files: new `src/util/PrincipalResolutionUtils.ts`, `test/routes/principalResolveEndpointSuite.ts`; changed `src/routes/BaseMailboxAccessRoute.ts`,
 `src/routes/BaseMailboxRoute.ts`, `src/routes/BaseEscrowScopeRoute.ts`, `src/routes/sql/EscrowScopeRouteSQL.ts`, `test/routes/{mongo,sql}/MailboxRoute.test.ts`,
 `test/routes/{mongo,sql}/EscrowScopeRoute.test.ts`. Full suite (combined with the Autodiscover work above, both landed in the same working tree): clean.
+
+### 2026-09-22 (later) - Every escrow scope action now also requires elevation, not just a trusted role
+
+JP's own call after I flagged it: the two new `resolve-owner`/`resolve-holder` endpoints above were gated to match their write paths exactly, which
+for escrow raised the question of whether that write path itself should be stricter. Asked; answer was scope/holder management specifically, not the
+M-of-N approval flow or a holder's own audit visibility (both deliberately usable by non-admin holders, see `BaseEscrowScopeRoute`'s doc comment on
+"Separation of duties" - requiring elevation there would mean only elevated administrators could ever approve an access request, collapsing the very
+separation the feature exists to enforce).
+
+`BaseEscrowScopeRoute` gains a `protected trustedRoles: string[] = ["admin"]` field (it didn't have one) and calls `assertAdminScope(user,
+this.trustedRoles)` - the same "trusted role AND elevated" gate `BaseSigningEnrollmentAdminRoute`/`BaseMailboxRoute`'s admin-scope reads already use -
+as the first statement of every one of its ten `@RequiresTrustedRole()`-decorated actions (`resolveHolder`, `create`, `update`, `updateBulk`,
+`updateProperty`, `truncate`, `delete`, `find`, `count`, `findById`). Deliberately first: an unauthorized caller is refused before any body validation
+or repo lookup, so e.g. `updateBulk()`'s own non-array-body 400 is now unreachable without elevation too (found by `BaseAdminWriteGuards.test.ts`'s
+existing direct-call unit test, which called `updateBulk()` with no user at all expecting 400 - fixed by passing a trusted, elevated one, since the
+guard it's testing is a layer beneath the new elevation check, not a replacement for it).
+
+Confirmed via `AdminShell.tsx` (web-client) that this is pure defense-in-depth, not a new restriction on the admin console's own UX: the whole admin
+console, escrow scopes included, was already gated behind a single canary (`GET /admin/release-notes`, itself `@RequiresElevation()`) before any
+section renders, independent of what individual routes required. What this closes is a direct-API-caller gap - a trusted-but-unelevated token (an
+administrator's normal, non-console session) could previously call these endpoints directly without ever going through that UI gate.
+
+New test: `test/routes/escrowControlsSuite.ts`'s "escrow scope management: a trusted role AND an elevated token, and nothing else" describe block, an
+`it.each` table over all ten actions (mirroring `signingEnrollmentAdminSuite.ts`'s identical pattern) proving each is refused to an anonymous caller,
+an ordinary user (`api-103`) and an unelevated administrator (`api-104`), and one further test that a trusted, elevated administrator still gets
+through. Shared by both Mongo and SQL (`SecurityControls.test.ts`). No web-client or react-shared changes needed.
+
+Files: changed `src/routes/BaseEscrowScopeRoute.ts`, `test/routes/escrowControlsSuite.ts`, `test/routes/BaseAdminWriteGuards.test.ts`. Full suite:
+296/296 files, 7491/7491 tests, 100/97.26/100/100 (stmts/branch/func/lines).

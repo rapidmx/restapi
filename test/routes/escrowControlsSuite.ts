@@ -97,6 +97,50 @@ export function escrowControlsSuite(ctx: SecurityControlsSuiteContext): void {
             .clear("EscrowAccessRequest", "EscrowAuditLogEntry", "AuditLogEntry", "KeyVault", "Matter", "MatterExportRequest", "Mailbox", "EscrowScope");
     });
 
+    describe("escrow scope management: a trusted role AND an elevated token, and nothing else", () => {
+        const admin = newUser(["admin"]);
+        const unelevatedAdmin = { ...admin, elevated: undefined };
+        const ordinary = newUser();
+        // Every call names a nonexistent scope/property ("x") - `assertAdminScope()` runs before any lookup in
+        // every handler below, so an unauthorized caller is refused without ever reaching validation or a 404.
+        // `user` is `undefined` for the anonymous case - no Authorization header at all, matching
+        // `signingEnrollmentAdminSuite.ts`'s identical convention (`as()` always sets one, even for a made-up user).
+        const anon = (path: string, method: "get" | "head" | "post" | "put" | "delete" = "get") => (request(ctx.app()) as any)[method](`${ctx.prefix}${path}`);
+        const calls: Array<[string, (user?: any) => any]> = [
+            ["GET /escrow-scopes/resolve-holder", (user) => (user ? as(user).get("/escrow-scopes/resolve-holder?principal=x@example.com") : anon("/escrow-scopes/resolve-holder?principal=x@example.com"))],
+            ["POST /escrow-scopes", (user) => (user ? as(user).post("/escrow-scopes", { name: "x", publicKey: publicKey(), requiredHolders: 1 }) : anon("/escrow-scopes", "post").send({ name: "x" }))],
+            ["PUT /escrow-scopes/:id", (user) => (user ? as(user).put("/escrow-scopes/x", { uid: "x", version: 1, name: "y" }) : anon("/escrow-scopes/x", "put").send({ uid: "x" }))],
+            ["PUT /escrow-scopes (bulk)", (user) => (user ? as(user).put("/escrow-scopes", [{ uid: "x", version: 1, name: "y" }]) : anon("/escrow-scopes", "put").send([{ uid: "x" }]))],
+            ["PUT /escrow-scopes/:id/:property", (user) => (user ? as(user).put("/escrow-scopes/x/name", "y") : anon("/escrow-scopes/x/name", "put").send("y"))],
+            ["DELETE /escrow-scopes", (user) => (user ? as(user).delete("/escrow-scopes") : anon("/escrow-scopes", "delete"))],
+            ["DELETE /escrow-scopes/:id", (user) => (user ? as(user).delete("/escrow-scopes/x") : anon("/escrow-scopes/x", "delete"))],
+            ["GET /escrow-scopes", (user) => (user ? as(user).get("/escrow-scopes") : anon("/escrow-scopes"))],
+            ["HEAD /escrow-scopes", (user) => (user ? as(user).head("/escrow-scopes") : anon("/escrow-scopes", "head"))],
+            ["GET /escrow-scopes/:id", (user) => (user ? as(user).get("/escrow-scopes/x") : anon("/escrow-scopes/x"))],
+        ];
+
+        it.each(calls)("%s is refused to an anonymous caller, an ordinary user (api-103) and an unelevated administrator (api-104)", async (name, call) => {
+            expect([401, 403]).toContain((await call()).status);
+            const ordinaryResult = await call(ordinary);
+            const unelevatedResult = await call(unelevatedAdmin);
+            // HEAD never carries a body (HTTP semantics) - only its status is checkable.
+            if ((name as string).startsWith("HEAD")) {
+                expect(ordinaryResult.status).toBe(403);
+                expect(unelevatedResult.status).toBe(403);
+                return;
+            }
+            expect([ordinaryResult.status, ordinaryResult.body.code]).toEqual([403, "api-103"]);
+            expect([unelevatedResult.status, unelevatedResult.body.code]).toEqual([403, "api-104"]);
+        });
+
+        it("still lets a trusted, elevated administrator through", async () => {
+            const created = await as(admin).post("/escrow-scopes", { name: "x", publicKey: publicKey(), requiredHolders: 1 });
+            expect(created.status).toBe(200);
+            expect((await as(admin).get("/escrow-scopes")).status).toBe(200);
+            expect((await as(admin).get(`/escrow-scopes/${created.body.uid}`)).status).toBe(200);
+        });
+    });
+
     describe("escrow scope dual control", () => {
         it("refuses an administrator making themselves a holder, on create and update", async () => {
             const adminA = newUser(["admin"]);

@@ -4,6 +4,12 @@
 
 ### Security
 
+- **Every escrow scope action now requires a trusted role AND an elevated token, not a trusted role alone.** Configuring who holds escrow keys, how many are required, and the scope's own public key -
+  `create`/`update`/`updateBulk`/`updateProperty`/`delete`/`truncate`/`find`/`count`/`findById`/`resolve-holder` on `BaseEscrowScopeRoute` - previously only checked `@RequiresTrustedRole()`, the state most
+  of an administrator's session is in; a merely trusted, unelevated token could already read, create or change a scope's holder list. Every action now also calls `assertAdminScope()` (403 `api-104`
+  without elevation), the same gate `BaseSigningEnrollmentAdminRoute` uses. Deliberately unchanged: the M-of-N access-request approval flow (`BaseEscrowAccessRequestRoute`) still runs on holder
+  membership, not a trusted role or elevation - holders are meant to be a check on admin power, not administrators themselves - and a holder's own read of `BaseEscrowAuditLogRoute`'s audit trail for
+  scopes they hold is still open to them unelevated, for their own accountability.
 - **An administrator could read everybody's mail through the ordinary mail API - fixed: no role sees another user's mailbox any more.** Any signed-in administrator holding an *elevated* token (the
   admin console asks every administrator to elevate) was treated by `@rapidrest/service-core`'s `ACLUtils.hasPermission()` - and so by `RepoUtils`, `BaseACLRoute` and `BasePushRoute` - as a
   superuser: `GET /mail/mailboxes` listed every mailbox, and `GET /mail/folders`, `/mail/messages`, `/messages/:id/content`, attachments, contacts, events, tasks, notes, labels, filter
