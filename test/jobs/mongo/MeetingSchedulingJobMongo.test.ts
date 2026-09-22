@@ -15,8 +15,10 @@ import * as uuid from "uuid";
 import config from "../../config.js";
 import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
 import { MeetingSchedulingJobMongo } from "../../../src/jobs/mongo/MeetingSchedulingJobMongo.js";
+import { CalendarEventAttendeeLinkMongo } from "../../../src/models/mongo/CalendarEventAttendeeLinkMongo.js";
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
+import { meetingSchedulingLinkSuite } from "../meetingSchedulingLinkSuite.js";
 import {
     AttendeeResponseStatus,
     AttendeeRole,
@@ -36,6 +38,7 @@ describe("MeetingSchedulingJobMongo Tests (real DB + DI)", () => {
     let job: MeetingSchedulingJobMongo;
     let calendarEventRepo: MongoRepository<CalendarEventMongo>;
     let mailboxRepo: MongoRepository<MailboxMongo>;
+    let attendeeLinkRepo: MongoRepository<CalendarEventAttendeeLinkMongo>;
 
     const mailboxUid = uuid.v4();
     /** A second mailbox whose organizer identity is one of its alias addresses, not its primary one. */
@@ -84,6 +87,7 @@ describe("MeetingSchedulingJobMongo Tests (real DB + DI)", () => {
         connectionManager = await objectFactory.newInstance(ConnectionManager, { name: "default" });
         const models = new Map<string, any>();
         models.set("CalendarEventMongo", CalendarEventMongo);
+        models.set("CalendarEventAttendeeLinkMongo", CalendarEventAttendeeLinkMongo);
         models.set("MailboxMongo", MailboxMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
@@ -93,6 +97,7 @@ describe("MeetingSchedulingJobMongo Tests (real DB + DI)", () => {
         }
         calendarEventRepo = conn.getMongoRepository("CalendarEventMongo");
         mailboxRepo = conn.getMongoRepository("MailboxMongo");
+        attendeeLinkRepo = conn.getMongoRepository("CalendarEventAttendeeLinkMongo");
         await mailboxRepo.clear().catch(() => undefined);
 
         // The organizer's own mailbox (primary address = the default test organizer), and one whose organizer
@@ -823,5 +828,19 @@ describe("MeetingSchedulingJobMongo Tests (real DB + DI)", () => {
             expect(mail().sent).toHaveLength(0);
             expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("failed to process invites"))).toBe(true);
         });
+    });
+
+    meetingSchedulingLinkSuite({
+        job: () => job as any,
+        transport: () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!,
+        mailboxUid: () => mailboxUid,
+        createEvent: async (data?: any) => await createEvent(data),
+        createLink: async (link) => {
+            await attendeeLinkRepo.save(new CalendarEventAttendeeLinkMongo(link));
+        },
+        clearLinks: async () => {
+            await attendeeLinkRepo.clear().catch(() => undefined);
+        },
+        reload: async (uid: string) => await reload(uid),
     });
 });

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Features
+
+- **A meeting invite can now carry a different link for every attendee, without this library knowing which plugin produced them.** New `CalendarEvent.videoMeetingUid` (optional, unindexed,
+  no foreign key) marks an event as having a linked video meeting, and a new generic entity `CalendarEventAttendeeLink` (`CalendarEventAttendeeLinkMongo`/`CalendarEventAttendeeLinkSQL`,
+  exported from `@rapidmx/restapi/mongo` and `/sql`) holds one row per attendee: `mailboxUid`, `calendarEventUid`, `attendeeAddress`, `url` and an optional `label`. It has no route and its
+  `AccessControlList` denies everything to everyone - a plugin writes it through a `RepoUtils` of its own, the way it already does for `Mailbox`. `MeetingSchedulingJob` reads those rows
+  generically at send time: for an iTIP `REQUEST` on an event with a `videoMeetingUid`, it composes, scans and relays **one message per attendee**, each carrying that attendee's own `url`
+  as the iCalendar `LOCATION` and naming it in the body, instead of one shared message fanned out by envelope. Nothing about this names or imports a plugin - the dependency direction is
+  unchanged, and any future plugin needing per-attendee invite content can use the same table.
+- Every fallback is graceful and per attendee: an attendee with no row (and everyone, when the lookup fails or the meeting is gone) gets the event's own plain stored `location` and today's
+  invite text, and one attendee's refused scan or rejected relay is logged and skipped while the rest still go out. An event **without** a `videoMeetingUid` - the overwhelming majority -
+  takes exactly the path it always did and issues no extra query at all, and a cancellation (`CANCEL`) is unaffected in every case: it never needs a join link and never looks one up.
+
 ## v0.18.0
 
 ## v0.17.0

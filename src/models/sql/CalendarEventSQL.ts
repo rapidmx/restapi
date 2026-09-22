@@ -178,6 +178,17 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
     @Description("Provenance for this event's encryption state - see EncryptionOrigin's own doc comment.")
     public encryptionOrigin: EncryptionOrigin = "none";
 
+    // Not indexed: nothing ever queries by this field - `MeetingSchedulingJob` only reads it off rows it has
+    // already loaded, to decide whether that one event's invites need per-attendee personalization.
+    // `nullable: true` for the same reason as `encryptionOrigin` above: added after the table already existed.
+    @Column({ nullable: true })
+    @Description(
+        "The identifier of the video meeting a compose client linked to this event, if any (e.g. a " +
+            "`@rapidmx/videoconf-plugin` `VideoMeeting.uid`). No foreign-key enforcement.",
+    )
+    @Nullable
+    public videoMeetingUid?: string;
+
     constructor(other?: Partial<CalendarEventSQL>) {
         super(other);
 
@@ -208,6 +219,7 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
             this.cancelNoticeSentAt = "cancelNoticeSentAt" in other ? other.cancelNoticeSentAt : this.cancelNoticeSentAt;
             this.reminderSentFor = "reminderSentFor" in other ? other.reminderSentFor : this.reminderSentFor;
             this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
+            this.videoMeetingUid = "videoMeetingUid" in other ? other.videoMeetingUid : this.videoMeetingUid;
         }
     }
 }

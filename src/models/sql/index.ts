@@ -2,6 +2,7 @@ export * from "./AppearancePreferencesSQL.js";
 export * from "./AttachmentSQL.js";
 export * from "./AuditLogEntrySQL.js";
 export * from "./BrandingSQL.js";
+export * from "./CalendarEventAttendeeLinkSQL.js";
 export * from "./CalendarEventSQL.js";
 export * from "./CalendarShareLinkSQL.js";
 export * from "./ContactSQL.js";

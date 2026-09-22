@@ -166,6 +166,16 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
     @Description("Provenance for this event's encryption state - see EncryptionOrigin's own doc comment.")
     public encryptionOrigin: EncryptionOrigin = "none";
 
+    // Not indexed: nothing ever queries by this field - `MeetingSchedulingJob` only reads it off rows it has
+    // already loaded, to decide whether that one event's invites need per-attendee personalization.
+    @Column()
+    @Description(
+        "The identifier of the video meeting a compose client linked to this event, if any (e.g. a " +
+            "`@rapidmx/videoconf-plugin` `VideoMeeting.uid`). No foreign-key enforcement.",
+    )
+    @Nullable
+    public videoMeetingUid?: string;
+
     constructor(other?: Partial<CalendarEventMongo>) {
         super(other);
 
@@ -196,6 +206,7 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
             this.cancelNoticeSentAt = "cancelNoticeSentAt" in other ? other.cancelNoticeSentAt : this.cancelNoticeSentAt;
             this.reminderSentFor = "reminderSentFor" in other ? other.reminderSentFor : this.reminderSentFor;
             this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
+            this.videoMeetingUid = "videoMeetingUid" in other ? other.videoMeetingUid : this.videoMeetingUid;
         }
     }
 }

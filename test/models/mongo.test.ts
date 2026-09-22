@@ -25,6 +25,7 @@ import {
 import { AttachmentMongo } from "../../src/models/mongo/AttachmentMongo.js";
 import { AuditLogEntryMongo } from "../../src/models/mongo/AuditLogEntryMongo.js";
 import { BrandingMongo } from "../../src/models/mongo/BrandingMongo.js";
+import { CalendarEventAttendeeLinkMongo } from "../../src/models/mongo/CalendarEventAttendeeLinkMongo.js";
 import { CalendarEventMongo } from "../../src/models/mongo/CalendarEventMongo.js";
 import { CalendarShareLinkMongo } from "../../src/models/mongo/CalendarShareLinkMongo.js";
 import { ContactMongo } from "../../src/models/mongo/ContactMongo.js";
@@ -664,6 +665,7 @@ describe("Mongo model default construction", () => {
         expect(obj.icalUid).toBe("");
         expect(obj.sequence).toBe(0);
         expect(obj.encryptionOrigin).toBe("none");
+        expect(obj.videoMeetingUid).toBeUndefined();
     });
 
     it("CalendarEventMongo applies provided overrides when constructed with data.", () => {
@@ -696,6 +698,7 @@ describe("Mongo model default construction", () => {
             icalUid: "ical-uid-1",
             sequence: 2,
             encryptionOrigin: "originated",
+            videoMeetingUid: "meeting-1",
         });
 
         expect(obj.folderUid).toBe("folder-1");
@@ -723,6 +726,33 @@ describe("Mongo model default construction", () => {
         expect(obj.icalUid).toBe("ical-uid-1");
         expect(obj.sequence).toBe(2);
         expect(obj.encryptionOrigin).toBe("originated");
+        expect(obj.videoMeetingUid).toBe("meeting-1");
+    });
+
+    it("CalendarEventAttendeeLinkMongo falls back to class defaults when constructed with no data.", () => {
+        const obj = new CalendarEventAttendeeLinkMongo();
+
+        expect(obj.mailboxUid).toBe("");
+        expect(obj.calendarEventUid).toBe("");
+        expect(obj.attendeeAddress).toBe("");
+        expect(obj.url).toBe("");
+        expect(obj.label).toBeUndefined();
+    });
+
+    it("CalendarEventAttendeeLinkMongo applies provided overrides when constructed with data.", () => {
+        const obj = new CalendarEventAttendeeLinkMongo({
+            mailboxUid: "mailbox-1",
+            calendarEventUid: "event-1",
+            attendeeAddress: "attendee@example.com",
+            url: "https://video.example/join/abc",
+            label: "Join video call",
+        });
+
+        expect(obj.mailboxUid).toBe("mailbox-1");
+        expect(obj.calendarEventUid).toBe("event-1");
+        expect(obj.attendeeAddress).toBe("attendee@example.com");
+        expect(obj.url).toBe("https://video.example/join/abc");
+        expect(obj.label).toBe("Join video call");
     });
 
     it("CalendarShareLinkMongo falls back to class defaults when constructed with no data.", () => {

@@ -13,8 +13,10 @@ import { Repository } from "typeorm";
 import config from "../../config.sql.js";
 import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
 import { MeetingSchedulingJobSQL } from "../../../src/jobs/sql/MeetingSchedulingJobSQL.js";
+import { CalendarEventAttendeeLinkSQL } from "../../../src/models/sql/CalendarEventAttendeeLinkSQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { meetingSchedulingLinkSuite } from "../meetingSchedulingLinkSuite.js";
 import {
     AttendeeResponseStatus,
     AttendeeRole,
@@ -30,6 +32,7 @@ describe("MeetingSchedulingJobSQL Tests (real DB + DI)", () => {
     let job: MeetingSchedulingJobSQL;
     let calendarEventRepo: Repository<CalendarEventSQL>;
     let mailboxRepo: Repository<MailboxSQL>;
+    let attendeeLinkRepo: Repository<CalendarEventAttendeeLinkSQL>;
 
     const mailboxUid = uuid.v4();
     /** A second mailbox whose organizer identity is one of its alias addresses, not its primary one. */
@@ -80,6 +83,7 @@ describe("MeetingSchedulingJobSQL Tests (real DB + DI)", () => {
         // throws "No metadata found" from `getRepository()` for any entity not explicitly in this map.
         models.set("AccessControlListSQL", AccessControlListSQL);
         models.set("CalendarEventSQL", CalendarEventSQL);
+        models.set("CalendarEventAttendeeLinkSQL", CalendarEventAttendeeLinkSQL);
         models.set("MailboxSQL", MailboxSQL);
         await connectionManager.connect(config.get("datastores"), models);
 
@@ -89,6 +93,7 @@ describe("MeetingSchedulingJobSQL Tests (real DB + DI)", () => {
         }
         calendarEventRepo = conn.getRepository(CalendarEventSQL);
         mailboxRepo = conn.getRepository(MailboxSQL);
+        attendeeLinkRepo = conn.getRepository(CalendarEventAttendeeLinkSQL);
         await mailboxRepo.clear();
 
         // The organizer's own mailbox (primary address = the default test organizer), and one whose organizer
@@ -711,5 +716,19 @@ describe("MeetingSchedulingJobSQL Tests (real DB + DI)", () => {
             expect(mail().sent).toHaveLength(0);
             expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("failed to process invites"))).toBe(true);
         });
+    });
+
+    meetingSchedulingLinkSuite({
+        job: () => job as any,
+        transport: () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!,
+        mailboxUid: () => mailboxUid,
+        createEvent: async (data?: any) => await createEvent(data),
+        createLink: async (link) => {
+            await attendeeLinkRepo.save(new CalendarEventAttendeeLinkSQL(link));
+        },
+        clearLinks: async () => {
+            await attendeeLinkRepo.clear();
+        },
+        reload: async (uid: string) => await reload(uid),
     });
 });

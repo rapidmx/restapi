@@ -2079,6 +2079,22 @@ export interface CalendarEvent extends RecoverableBaseEntity {
      * see `ScanQueueJob.processItipRequest()`.
      */
     encryptionOrigin: EncryptionOrigin;
+
+    /**
+     * The identifier of the video meeting a compose client linked to this event, if any - e.g. a
+     * `@rapidmx/videoconf-plugin` `VideoMeeting.uid`, named here generically and by name only: this library
+     * never imports a plugin's package, and nothing in this library resolves this value against any plugin's
+     * own tables. A plain, nullable string with no foreign-key enforcement, exactly like `Task.assignedTo`/
+     * `Task.taskListUid` - a value naming a meeting that no longer exists (or whose plugin was uninstalled) is
+     * simply a link nothing matches, never an error.
+     *
+     * Its one server-side effect: `MeetingSchedulingJob` treats a truthy value as "this event's invites may
+     * need per-attendee personalization" and, for an iTIP `REQUEST` only, looks up that event's
+     * `CalendarEventAttendeeLink` rows to give each attendee their own `LOCATION` - see that job's doc
+     * comment. `undefined` for the overwhelming majority of events, which take exactly the same
+     * compose-once-fan-out path they always have, with no extra query of any kind.
+     */
+    videoMeetingUid?: string;
 }
 
 /**
@@ -2131,6 +2147,60 @@ export interface CalendarShareLink extends BaseEntity {
     expiresAt?: Date;
 
     createdByUserUid: string;
+}
+
+/**
+ * A generic, plugin-agnostic personalization hook: one row is a single attendee's own personalized link for one
+ * `CalendarEvent`, written by whatever plugin minted it (e.g. a video-conferencing plugin's per-invitee join
+ * links) and read by `MeetingSchedulingJob` at send time to substitute into that one attendee's own copy of the
+ * invite — see that job's doc comment.
+ *
+ * Deliberately generic (no video-specific naming) so any future plugin that needs the same "each attendee gets
+ * their own personalized invite content" capability can reuse it. This library never imports a plugin's package
+ * — the dependency direction always runs the other way: a plugin depends on `@rapidmx/restapi`, never the
+ * reverse — so a plugin that needs this library to mail something per-attendee writes it here (through its own
+ * `RepoUtils` over `CalendarEventAttendeeLinkMongo`/`CalendarEventAttendeeLinkSQL`, the same way
+ * `videoconf-plugin`'s routes already build one over the imported `MailboxMongo`/`MailboxSQL`) instead of this
+ * library reading the plugin's own tables directly, which it has no way to even name.
+ *
+ * Written and read only by trusted server-side code: there is no `ApiRoute` for it and its `AccessControlList`
+ * denies every action to everyone, the same posture every other system-managed entity in this library takes.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface CalendarEventAttendeeLink extends BaseEntity {
+    /**
+     * The unique identifier of the `Mailbox` that owns the `CalendarEvent` named by `calendarEventUid` —
+     * denormalized for the same reasons every other child row in this codebase denormalizes its owning mailbox
+     * (mailbox-scoped queries, and the erasure/export jobs that must be able to find every row belonging to a
+     * mailbox without walking its parents), not enforced as a foreign key.
+     */
+    mailboxUid: string;
+
+    /**
+     * The `CalendarEvent.uid` this personalization applies to. No foreign-key enforcement: a row whose event no
+     * longer exists is simply never matched by `MeetingSchedulingJob`'s lookup, which only ever queries by the
+     * uid of an event it has already loaded.
+     */
+    calendarEventUid: string;
+
+    /**
+     * The attendee's own address, normalized (trimmed, lowercased) — matched case-insensitively against
+     * `CalendarEvent.attendees[].address` at send time via this library's own `normalizeAddress()`, so a writer
+     * that stores an un-normalized value still matches.
+     */
+    attendeeAddress: string;
+
+    /**
+     * The personalized URL this attendee's own copy of the invite should carry, substituted into that one
+     * attendee's `LOCATION` (and mentioned in their invite email's body) in place of the event's plain, shared
+     * `location`.
+     */
+    url: string;
+
+    /** An optional short label for `url` (e.g. `"Join video call"`). Unused by `MeetingSchedulingJob` today —
+     * carried for a client, or a future personalization, that wants to render the link with its own wording. */
+    label?: string;
 }
 
 export enum TaskPriority {

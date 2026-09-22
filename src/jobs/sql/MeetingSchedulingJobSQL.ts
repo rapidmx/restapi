@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { MeetingSchedulingJob } from "../MeetingSchedulingJob.js";
-import { CalendarEventSQL, MailboxSQL } from "../../sql.js";
+import { CalendarEventAttendeeLinkSQL, CalendarEventSQL, MailboxSQL } from "../../sql.js";
 
 export class MeetingSchedulingJobSQL extends MeetingSchedulingJob<CalendarEventSQL> {
     protected calendarEventClass: any = CalendarEventSQL;
     protected mailboxClass: any = MailboxSQL;
+    protected attendeeLinkClass: any = CalendarEventAttendeeLinkSQL;
 }

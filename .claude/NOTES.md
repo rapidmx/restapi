@@ -3132,3 +3132,54 @@ through. Shared by both Mongo and SQL (`SecurityControls.test.ts`). No web-clien
 
 Files: changed `src/routes/BaseEscrowScopeRoute.ts`, `test/routes/escrowControlsSuite.ts`, `test/routes/BaseAdminWriteGuards.test.ts`. Full suite:
 296/296 files, 7491/7491 tests, 100/97.26/100/100 (stmts/branch/func/lines).
+
+### 2026-09-22 (later still) - Per-attendee personalized invite links, without restapi ever learning a plugin exists
+
+A `@rapidmx/videoconf-plugin` mints a `VideoMeeting` with a distinct `joinToken` per invitee, and each invitee's iTIP `REQUEST` has to carry
+*their own* join URL - which means `MeetingSchedulingJob` has to mail something it cannot compute, held in a table it must never import. The
+dependency direction is the whole constraint: every plugin depends on `@rapidmx/restapi`, so `restapi` importing `@rapidmx/videoconf-plugin`
+(or reading its tables by name) would invert it. Solved with a deliberately generic, plugin-agnostic hook rather than anything video-shaped:
+a new `CalendarEventAttendeeLink` entity (`mailboxUid`, `calendarEventUid`, `attendeeAddress`, `url`, optional `label`) that *any* plugin
+needing "each attendee gets their own personalized invite content" can write through a `RepoUtils` it builds itself over the exported
+`CalendarEventAttendeeLinkMongo`/`CalendarEventAttendeeLinkSQL` - the same way `videoconf-plugin`'s routes already build one over the imported
+`MailboxMongo`/`MailboxSQL`. No `@ApiRoute` and a deny-all `@Protect` (both `anonymous` and `.*` get `actions: []`), like every other
+system-managed entity here: it is written and read only by trusted server-side code. Indexed on `calendarEventUid` (the job's only lookup) and
+`mailboxUid` (scoped/erasure queries). `restapi` imports nothing from any plugin; `@rapidmx/videoconf-plugin` is named in prose, in doc comments
+only, and never in an `import`.
+
+`CalendarEvent.videoMeetingUid?: string` is the switch - a plain nullable string, no FK, styled after `Task.assignedTo`/`Task.taskListUid`, and
+deliberately **unindexed**: nothing queries by it, the job only reads it off rows it already loaded. That is what buys the property this change
+was designed around and which its regression test asserts directly (by spying on the job's own attendee-link repo and proving it was never
+called): an event with no linked video meeting adds **zero** database reads and executes exactly the pre-existing code path. The single new
+branch on the way to a send is `method === "request" && event.videoMeetingUid`, an in-memory field read placed *after* the shared
+plain-address filter, organizer-excluding dedup, attendee cap and "nobody to mail" early return - all of which both paths still share verbatim.
+
+What changes only for a `REQUEST` on an event that has one: instead of composing one `MailComposer`/ICS and fanning the same bytes out by
+envelope, the job composes, scans and relays **one message per attendee**, each with `location` set to that attendee's own url (falling back
+per-attendee to the event's plain stored `location` when there is no matching row) and, only when a url was substituted, a
+`\n\nJoin the video call: <url>` line appended to the body. Every failure mode degrades rather than aborting: the link lookup itself throwing
+logs a warning and is treated as an empty result (everyone falls back to the plain location); each attendee's compose+scan+relay is its own
+try/catch logging the existing `failed to send <what> for event <uid> to <to>` line and continuing. That last one *generalizes* the class's
+standing "Known limitation" posture rather than changing it - on this path "log and continue" now also covers a **scan refusal** of one
+attendee's own copy, which cannot happen on the shared path (there is only one message there to refuse, and refusing it still fails the whole
+event). The claim-then-send optimistic lock, the organizer-owned-rows-only check, the `encryptionOrigin === "originated"` skip and the attendee
+cap are all provably untouched. `CANCEL` is unconditionally unchanged - a cancellation never needs a join link, so `sendCancellations()`/the
+`"cancel"` path never looks anything up at all, asserted with its own regression test (both attendees still receive byte-identical bytes).
+
+The organizer can never be mailed on the new path either, and that falls out structurally rather than from a new check: `recipients` already
+excludes the organizer's own address, and the personalized loop only ever mails addresses that list holds - so even a contrived
+`CalendarEventAttendeeLink` row for the organizer's address cannot produce a message (tested).
+
+Tests follow this repo's shared-suite convention (`test/jobs/backgroundSendSuite.ts`'s shape): one new `test/jobs/meetingSchedulingLinkSuite.ts`
+called from inside both `MeetingSchedulingJob{Mongo,SQL}.test.ts`, covering the no-`videoMeetingUid` regression (including the zero-extra-queries
+assertion), full/partial/zero row matches, case-insensitive address matching, rows belonging to a different event, a throwing lookup, the
+organizer, an unaffected CANCEL, a per-attendee transport rejection and a per-attendee scan refusal. Both job test files also register the new
+entity in their `models` map (a bare TypeORM `DataSource`/`MongoConnection` here needs every entity named explicitly - no `ClassLoader` scan).
+
+Files: new `src/models/mongo/CalendarEventAttendeeLinkMongo.ts`, `src/models/sql/CalendarEventAttendeeLinkSQL.ts`,
+`test/jobs/meetingSchedulingLinkSuite.ts`; changed `src/models/types.ts`, `src/models/mongo/CalendarEventMongo.ts`,
+`src/models/sql/CalendarEventSQL.ts`, `src/models/{mongo,sql}/index.ts`, `src/jobs/MeetingSchedulingJob.ts`,
+`src/jobs/mongo/MeetingSchedulingJobMongo.ts`, `src/jobs/sql/MeetingSchedulingJobSQL.ts`, `test/jobs/{mongo,sql}/MeetingSchedulingJob*.test.ts`,
+`test/models/{mongo,sql}.test.ts`, `RELEASE_NOTES.md` (Unreleased section; no version bumped, nothing committed). No `package.json` change needed - `@rapidmx/restapi/mongo`/`/sql` already re-export the whole model barrel, so
+both new classes are importable by a plugin the moment this builds. `server` does not subclass `MeetingSchedulingJob` (it only re-exports
+`MeetingSchedulingJob{Mongo,SQL}` from `src/{mongo,sql}/Jobs.ts`), so nothing there needs rebuilding for this.
