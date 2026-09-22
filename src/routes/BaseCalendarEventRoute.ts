@@ -199,7 +199,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (!event) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        if (!(await this.aclUtils!.hasPermission(user, event.folderUid, ACLAction.UPDATE))) {
+        if (!(await this.hasMailAccess(user, event.folderUid, ACLAction.UPDATE))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 

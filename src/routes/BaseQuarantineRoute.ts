@@ -8,7 +8,7 @@ import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 
 /**
  * `mailboxUid`-scoped CRUD for `QuarantineEntry`. A mailbox owner or delegate can read their mailbox's quarantined
- * mail; only a trusted caller can write (`trustedOnlyWrites`) - entries are produced by the scan pipeline, and their
+ * mail (an administrator has no access to it beyond `?scope=admin`, see `BaseScopedChildRoute`); only a trusted caller can write (`trustedOnlyWrites`) - entries are produced by the scan pipeline, and their
  * `reason`/`scanResultUid`/`rawBlobKey` are that pipeline's record of what happened.
  *
  * "Releasing" an entry is a trusted `PUT /:id` whose body sets `releasedAt` (any non-empty value): the server stamps
@@ -22,6 +22,9 @@ export abstract class BaseQuarantineRoute<T extends QuarantineEntry> extends Bas
     protected readonly scopeProperty: string = "mailboxUid";
 
     protected readonly trustedOnlyWrites: boolean = true;
+
+    /** A trusted AND elevated caller reviews (and releases) any mailbox's entries with `?scope=admin`, audited. */
+    protected readonly adminScope: boolean = true;
 
     protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
         await super.prepareCreate(obj, user);

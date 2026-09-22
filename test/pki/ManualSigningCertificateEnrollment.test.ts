@@ -208,6 +208,63 @@ describe("ManualSigningCertificateEnrollment Tests", () => {
         expect(await fs.readFile((enrollment as any).storePath, "utf-8")).toBe(before);
     });
 
+    describe("describeProgress()/listEnrollments()", () => {
+        it("reports one active stage while an administrator has yet to upload the certificate.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("wait@example.com", await generateCsr("wait@example.com"));
+
+            const progress = await enrollment.describeProgress(enrollmentId);
+
+            expect(progress).toEqual({
+                status: "pending",
+                certificate: undefined,
+                error: undefined,
+                stage: "submitted",
+                stages: [{ id: "submitted", label: "Waiting for an administrator to upload the certificate", state: "active", at: progress.requestedAt }],
+                progress: 5,
+                requestedAt: progress.requestedAt,
+                updatedAt: progress.requestedAt,
+            });
+        });
+
+        it("reports issued, with when, once the certificate was uploaded.", async () => {
+            const csr: string = await generateCsr("done@example.com");
+            const { enrollmentId } = await enrollment.startEnrollment("done@example.com", csr);
+            const certificate: string = await signCertForCsr(csr);
+            await enrollment.uploadCertificate(enrollmentId, certificate);
+
+            const progress = await enrollment.describeProgress(enrollmentId);
+
+            expect(progress).toEqual(expect.objectContaining({ status: "issued", stage: "issued", progress: 100, certificate }));
+            expect(progress.issuedAt).toBeTruthy();
+            expect(progress.stages.map((stage) => stage.state)).toEqual(["done", "done"]);
+        });
+
+        it("reports failed and retryable, for a cancellation and for an explicit failure.", async () => {
+            const cancelled = (await enrollment.startEnrollment("c@example.com", await generateCsr("c@example.com"))).enrollmentId;
+            const failed = (await enrollment.startEnrollment("f@example.com", await generateCsr("f@example.com"))).enrollmentId;
+            await enrollment.cancelEnrollment(cancelled, "Cancelled by the mailbox owner.");
+            await enrollment.markFailed(failed, "The CA refused.");
+
+            for (const [id, error] of [[cancelled, "Cancelled by the mailbox owner."], [failed, "The CA refused."]]) {
+                expect(await enrollment.describeProgress(id)).toEqual(
+                    expect.objectContaining({ status: "failed", stage: "failed", error, errorCode: "failed", retryable: true }),
+                );
+            }
+        });
+
+        it("throws 404 for an unknown id.", async () => {
+            await expect(enrollment.describeProgress("nope")).rejects.toMatchObject({ status: 404 });
+        });
+
+        it("lists every enrollment with its binding and state.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("list@example.com", await generateCsr("list@example.com"));
+
+            const list = await enrollment.listEnrollments();
+
+            expect(list).toContainEqual({ enrollmentId, identity: "list@example.com", status: "pending", createdAt: expect.any(String) });
+        });
+    });
+
     it("Rethrows a filesystem error other than ENOENT while reading the store.", async () => {
         const dirAsFile: string = path.join(tmpDir, "a-directory-not-a-file.json");
         await fs.mkdir(dirAsFile, { recursive: true });

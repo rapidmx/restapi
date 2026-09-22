@@ -17,6 +17,8 @@ import {
 } from "@rapidrest/service-core";
 import type { CalendarShareLink, Folder } from "../models/types.js";
 import { countMessagesByFolder, healStoredFolderCounts } from "../util/FolderCountUtils.js";
+import { ensureWellKnownFolders } from "../util/FolderUtils.js";
+import { hasMailAccess, stripTrustedRoles } from "../util/MailAccessUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 const { Get, Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
@@ -33,7 +35,7 @@ const SERVER_MANAGED_FOLDER_FIELDS = ["unreadCount", "totalCount", "syncKeyVersi
 function stripUnsafeQueryKeys(query: any): Record<string, any> {
     const result: Record<string, any> = {};
     for (const [key, value] of Object.entries(query ?? {})) {
-        if (key === "shareToken" || key.split(".").some((segment) => segment.startsWith("$"))) {
+        if (key === "shareToken" || key === "scope" || key.split(".").some((segment) => segment.startsWith("$"))) {
             continue;
         }
         result[key] = value;
@@ -75,6 +77,11 @@ function stripUnsafeQueryKeys(query: any): Record<string, any> {
  * when `shareLinkClass` is set (see `BaseScopedChildRoute`'s doc comment for the full mechanism). `find`/`count`
  * check the owning mailbox, which a folder-scoped link never grants, so they don't consult it.
  *
+ * **No role widens access.** An administrator sees the folders of their own mailbox and of mailboxes shared with them,
+ * nothing else: every check goes through `hasMailAccess()` and every inherited `CRUDRoute` handler is handed
+ * `mailUser()` - the caller with their trusted roles taken away - because `RepoUtils` would otherwise apply the
+ * framework's "trusted users always have permission" shortcut (see `util/MailAccessUtils.ts`).
+ *
  * `create` always has the server mint `uid` and zero the counters; a non-trusted caller's update can't set the
  * `SERVER_MANAGED_FOLDER_FIELDS`.
  *
@@ -88,13 +95,21 @@ function stripUnsafeQueryKeys(query: any): Record<string, any> {
  * counts. The live `{ action: "update", data: { uid, mailboxUid, unreadCount, totalCount } }` event published when a
  * message write changes a folder's counts is described in `util/FolderCountUtils.ts`.
  *
+ * **Every mailbox has every well-known folder.** `find` (which always names a `mailboxUid`) and `findById` first make
+ * sure the mailbox the caller is allowed to list has all of them (`ensureWellKnownFolders()`, `util/FolderUtils.ts`):
+ * one existence query per request, nothing written when the set is complete, best-effort (a failure is logged and the
+ * read goes on). This is how a mailbox created before its folders were all provisioned at creation (or one that never
+ * got some) heals, with no migration. The mailbox's access is checked first (`hasMailAccess()`), so a caller can never
+ * make folders appear in a mailbox they can't list.
+ *
+ * **Live events** (channels: the folder's uid and its mailbox's uid; `type` is the concrete class name, `FolderMongo` or
+ * `FolderSQL`): `create` carries the folder (`{ uid, mailboxUid, type, name, unreadCount, totalCount, ... }`) - published
+ * for every folder created, client-made or server-made (`findOrCreateWellKnownFolder()`); `update` carries either the
+ * counts only (`{ uid, mailboxUid, unreadCount, totalCount }`, `util/FolderCountUtils.ts`) or, when a client changed the
+ * folder itself (a rename, a move), the whole folder; `delete` carries `{ uid, mailboxUid, version }`. Bulk `truncate` is
+ * not published (it is not available to a mailbox user at all).
+ *
  * KNOWN LIMITATIONS:
- * - `update`/`delete` (folder rename/move/removal) do NOT publish a live-update notification, unlike every
- * mutation on the folder-scoped entities in `BaseScopedChildRoute`. Overriding them here purely to add a
- * notify call would mean re-implementing (and re-testing) the exact ACL-delegation behavior this class's own
- * doc comment above is careful to leave untouched by relying on `CRUDRoute`'s defaults — a real gap, but a
- * deliberate one given how comparatively rare and low-urgency folder structural changes are next to new-mail
- * delivery, matching this library's existing "pragmatic subset, not full fidelity" scope elsewhere.
  * - `findById` (also left on `CRUDRoute`'s default) does NOT resolve `?shareToken=` — a share link's token
  * grants read access to the folder's *children* (e.g. its `CalendarEvent`s, via `BaseScopedChildRoute`), not
  * to fetching the `Folder` record itself by id. A client wanting the calendar's display name alongside its
@@ -114,6 +129,40 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
     private shareLinkRepo?: RepoUtils<CalendarShareLink>;
 
     private messageRepo?: RepoUtils<any>;
+
+    /** Whether `user` holds `action` on `uid` (a mailbox or folder uid) by ownership or an ACL record - never by a
+     * trusted role. */
+    protected hasMailAccess(user: JWTUser | undefined, uid: string, action: string): Promise<boolean> {
+        return hasMailAccess(this.aclUtils, this.trustedRoles, user, uid, action);
+    }
+
+    /** `user` without its trusted roles, for the inherited handlers (`RepoUtils` treats a trusted caller as a superuser). */
+    protected mailUser(user: JWTUser | undefined): JWTUser | undefined {
+        return stripTrustedRoles(user, this.trustedRoles);
+    }
+
+    /**
+     * Gives `mailboxUid` every well-known folder it lacks (`ensureWellKnownFolders()`) - only when `user` may list that
+     * mailbox (`checkAccess`, for a caller that hasn't been checked against it yet) - best-effort: a failure is logged and
+     * the read it belongs to goes on without it.
+     */
+    private async healWellKnownFolders(mailboxUid: string, user: JWTUser | undefined, checkAccess: boolean): Promise<void> {
+        try {
+            if (!checkAccess || (await this.hasMailAccess(user, mailboxUid, ACLAction.LIST))) {
+                await ensureWellKnownFolders(this.repoUtils!, this.modelClass, mailboxUid);
+            }
+        } catch (err: any) {
+            this.logger?.warn(`${this.modelClass.name}: could not provision the well-known folders of mailbox '${mailboxUid}': ${err?.message}`);
+        }
+    }
+
+    /** Publishes `data` as `action` on `folder`'s mailbox's channel (the folder's own channel is `RepoUtils`'s to publish
+     * on, for the writes it performs). Fire-and-forget: `NotificationUtils` never lets a broadcast failure surface. */
+    private publishToMailbox(folder: { mailboxUid?: string }, action: string, data: unknown): void {
+        if (folder.mailboxUid) {
+            this.notificationUtils?.sendMessage(folder.mailboxUid, this.modelClass.name, action, data);
+        }
+    }
 
     /**
      * Replaces the counts of every folder in `folders` with the ones derived from its messages (see this class's doc
@@ -171,8 +220,8 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
      * `BaseScopedChildRoute.canViewDeleted()`). */
     private async canViewDeleted(user: JWTUser | undefined, aclUid: string): Promise<boolean> {
         return (
-            (await this.aclUtils!.hasPermission(user, aclUid, ACLAction.DELETE)) &&
-            (await this.aclUtils!.hasPermission(user, aclUid, ACLAction.UPDATE))
+            (await this.hasMailAccess(user, aclUid, ACLAction.DELETE)) &&
+            (await this.hasMailAccess(user, aclUid, ACLAction.UPDATE))
         );
     }
 
@@ -214,8 +263,9 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         if (!(propertyName in patch)) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, `'${propertyName}' is managed by the server.`);
         }
-        const folder: T = await super.updateProperty(id, propertyName, obj, user);
+        const folder: T = await super.updateProperty(id, propertyName, obj, this.mailUser(user));
         await this.applyDerivedCounts([folder]);
+        this.publishToMailbox(folder, "update", folder);
         return folder;
     }
 
@@ -233,7 +283,7 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         if (!mailboxUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        if (typeof mailboxUid !== "string" || !(await this.aclUtils!.hasPermission(user, mailboxUid, ACLAction.COUNT))) {
+        if (typeof mailboxUid !== "string" || !(await this.hasMailAccess(user, mailboxUid, ACLAction.COUNT))) {
             return res.status(200).setHeader("content-length", 0);
         }
         const result: number = await this.repoUtils.count(
@@ -255,11 +305,9 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         const objs: Partial<T>[] = Array.isArray(obj) ? obj : [obj];
         const results: T[] = [];
         for (const raw of objs) {
-            const mailboxUid: string | undefined = raw.mailboxUid;
-            if (!mailboxUid || !(await this.aclUtils!.hasPermission(user, mailboxUid, ACLAction.CREATE))) {
-                throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
-            }
-            if (typeof mailboxUid !== "string") {
+            const mailboxUid: unknown = raw.mailboxUid;
+            // A non-string (`mailboxUid[]=a`) names no single mailbox - refused before anything looks it up.
+            if (typeof mailboxUid !== "string" || !mailboxUid || !(await this.hasMailAccess(user, mailboxUid, ACLAction.CREATE))) {
                 throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
             }
             // The uid is always server-minted: `RepoUtils.create()` reuses an existing `AccessControlList` whose uid
@@ -289,9 +337,11 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         if (!mailboxUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        if (typeof mailboxUid !== "string" || !(await this.aclUtils!.hasPermission(user, mailboxUid, ACLAction.LIST))) {
+        if (typeof mailboxUid !== "string" || !(await this.hasMailAccess(user, mailboxUid, ACLAction.LIST))) {
             return [];
         }
+        // Already checked against `mailboxUid` just above. Before the read, so what it returns includes anything created.
+        await this.healWellKnownFolders(mailboxUid, user, false);
         // The client query can't widen the checked mailbox - see `stripUnsafeQueryKeys()`.
         const folders: T[] = await this.repoUtils.find(
             await this.listFilter(params, query, mailboxUid, user),
@@ -304,24 +354,49 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
     /** `CRUDRoute.findById()` (the folder's own ACL decides), answering with the derived counts. */
     @Get("/:id")
     public async findById(@Param("id") id: string, @Query() query: any, @AuthUser user?: JWTUser): Promise<T | null> {
-        const folder: T | null = await super.findById(id, query, user);
+        // A folder the caller can't read answers exactly like one that doesn't exist (404), not the framework's own 403.
+        if (!(await this.hasMailAccess(user, id, ACLAction.READ))) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        const folder: T | null = await super.findById(id, query, this.mailUser(user));
         if (folder) {
             await this.applyDerivedCounts([folder]);
+            await this.healWellKnownFolders(folder.mailboxUid, user, true);
         }
         return folder;
     }
 
     /** `CRUDRoute.update()`, answering with the derived counts. */
     public async update(id: string, obj: UpdateObject<T>, req: HttpRequest, user?: JWTUser): Promise<T> {
-        const folder: T = await super.update(id, obj, req, user);
+        const folder: T = await super.update(id, obj, req, this.mailUser(user));
         await this.applyDerivedCounts([folder]);
+        this.publishToMailbox(folder, "update", folder);
         return folder;
+    }
+
+    /** `CRUDRoute.delete()` as `mailUser()`: a folder is deleted by its mailbox's owner or a delegate with DELETE, never by a role. */
+    public async delete(id: string, version: string | undefined, purge: string | undefined, req: HttpRequest, user?: JWTUser): Promise<void> {
+        // The folder is gone by the time `RepoUtils` publishes its own `delete` (on the folder's channel, `{ uid, version }`), so
+        // the mailbox it belonged to is read first for the event on the mailbox's channel.
+        const existing: T | undefined = await this.repoUtils?.findOne(id, { ignoreACL: true, includeDeleted: true, skipCache: true });
+        await super.delete(id, version, purge, req, this.mailUser(user));
+        if (existing) {
+            this.publishToMailbox(existing, "delete", { uid: existing.uid, mailboxUid: existing.mailboxUid, version });
+        }
+    }
+
+    /** `CRUDRoute.truncate()` as `mailUser()`. */
+    public async truncate(params: any, query: any, user?: JWTUser): Promise<void> {
+        return super.truncate(params, query, this.mailUser(user));
     }
 
     /** `CRUDRoute.updateBulk()`, answering with the derived counts of every folder. */
     public async updateBulk(obj: UpdateObject<T>[], req: HttpRequest, user?: JWTUser): Promise<T[]> {
-        const folders: T[] = await super.updateBulk(obj, req, user);
+        const folders: T[] = await super.updateBulk(obj, req, this.mailUser(user));
         await this.applyDerivedCounts(folders);
+        for (const folder of folders) {
+            this.publishToMailbox(folder, "update", folder);
+        }
         return folders;
     }
 
@@ -342,7 +417,7 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         });
         const effectiveUser: JWTUser | undefined = existing ? await this.resolveEffectiveUser(user, query, existing.uid) : undefined;
         const permitted: boolean = existing
-            ? (await this.aclUtils!.hasPermission(effectiveUser, existing.uid, ACLAction.EXISTS)) &&
+            ? (await this.hasMailAccess(effectiveUser, existing.uid, ACLAction.EXISTS)) &&
               ((existing as any).deleted !== true || (await this.canViewDeleted(effectiveUser, existing.uid)))
             : false;
         return permitted

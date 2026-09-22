@@ -80,6 +80,12 @@ describe("Route:MailboxAccessMongo Tests", () => {
         await objectFactory.destroy();
     });
 
+    // The users these tests grant access to are known to the server - each owns a mailbox here.
+    const seedKnownUsers = async (): Promise<void> => {
+        await createMailbox({ ownerUserUid: otherUser.uid });
+        await createMailbox({ ownerUserUid: strangerUser.uid });
+    };
+
     beforeEach(async () => {
         for (const r of [mailboxRepo]) {
             try {
@@ -97,6 +103,7 @@ describe("Route:MailboxAccessMongo Tests", () => {
                 throw err;
             }
         }
+        await seedKnownUsers();
     });
 
     describe("listMembers", () => {

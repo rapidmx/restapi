@@ -39,6 +39,7 @@ import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySupp
 import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSubjectErasureRequestMongo.js";
 import { buildEventIcs } from "../../../src/util/IcsUtils.js";
 import { dsnDeliverySuite } from "../dsnDeliverySuite.js";
+import { htmlMailSuite } from "../htmlMailSuite.js";
 import { sanitizeDiscoveredKey } from "../../../src/util/KeyringUtils.js";
 import { issueCertificate, makeTestIssuer } from "../../util/signerCertificates.js";
 import { buildDispositionNotification } from "../../../src/util/ReceiptUtils.js";
@@ -453,6 +454,21 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         },
         quarantined: async () => await quarantineEntryRepo.find({ mailboxUid }).toArray(),
         relayed: () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!.sent,
+    });
+
+    htmlMailSuite({
+        blobStore: () => objectFactory.getInstance<any>("BlobStore")!,
+        ingest: async (raw) => {
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await objectFactory.getInstance<any>("BlobStore")!.put(rawBlobKey, raw);
+            await createIngestEntry({ rawBlobKey });
+            await job.run();
+        },
+        inbox: async () => {
+            const inbox = await folderRepo.findOne({ mailboxUid, type: FolderType.INBOX } as any);
+            return inbox ? await messageRepo.find({ folderUid: inbox.uid }).toArray() : [];
+        },
+        attachmentsOf: async (messageUid) => await attachmentRepo.find({ messageUid }).toArray(),
     });
 
     describe("Delivered recipients and sender", () => {

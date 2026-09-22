@@ -176,11 +176,18 @@ export class AlwaysCleanAvScanProvider implements AvScanProvider {
  * (accepts none of) any envelope recipient whose address is exactly `reject@example.com`, so an
  * integration test can exercise `BaseMessageRoute.send()`'s transport-rejection (502) path via a real
  * HTTP request - by addressing the message to that recipient - rather than needing a mocked
- * MailTransport.
+ * MailTransport. `temp-fail@example.com` is refused too, but with a temporary (4xx) failure a retry can fix. Setting `gate`
+ * holds every send until it resolves, and `inFlight`/`maxInFlight` say how many sends were running at once - what a test
+ * of a background send needs to prove the request did not wait for the relay.
  */
 export class RecordingMailTransport implements MailTransport {
     public readonly name: string = "recording";
     public sent: OutboundMessage[] = [];
+
+    /** While set, `send()` waits for it before doing anything. */
+    public gate?: Promise<void>;
+    public inFlight: number = 0;
+    public maxInFlight: number = 0;
 
     /** What Postfix says about a recipient it refuses - see `send()`. */
     private static refusal(address: string) {
@@ -197,6 +204,30 @@ export class RecordingMailTransport implements MailTransport {
     /** `reject@example.com` in the envelope fails the whole call; `partial-reject@...` is refused while the other recipients
      * are accepted. Both come with the diagnostics a real transport reports. */
     public async send(message: OutboundMessage): Promise<TransportResult> {
+        this.inFlight++;
+        this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+        try {
+            if (this.gate) {
+                await this.gate;
+            }
+            return await this.relay(message);
+        } finally {
+            this.inFlight--;
+        }
+    }
+
+    private async relay(message: OutboundMessage): Promise<TransportResult> {
+        if (message.envelopeTo.includes("temp-fail@example.com")) {
+            const failures = message.envelopeTo.map((address) => ({
+                address,
+                code: 451,
+                enhancedCode: "4.3.0",
+                response: `451 4.3.0 <${address}>: Temporary local problem - please try again later`,
+                command: "DATA",
+                temporary: true,
+            }));
+            return { accepted: [], rejected: message.envelopeTo, failures, error: { message: "The recording transport is busy.", code: "ETEMP", command: "DATA" } };
+        }
         if (message.envelopeTo.includes("reject@example.com")) {
             return {
                 accepted: [],

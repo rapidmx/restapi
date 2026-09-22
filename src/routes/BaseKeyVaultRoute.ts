@@ -13,12 +13,13 @@ import {
     ApiErrorMessages,
     ApiErrors,
     DatabaseDecorators,
+    HttpResponse,
     ObjectFactory,
     RepoUtils,
     RouteDecorators,
 } from "@rapidrest/service-core";
 import { EncryptionCertificateAuthority } from "../pki/EncryptionCertificateAuthority.js";
-import { EnrollmentBinding, EnrollmentResult, SigningCertificateEnrollment } from "../pki/SigningCertificateEnrollment.js";
+import { EnrollmentBinding, EnrollmentProgress, EnrollmentSummary, SigningCertificateEnrollment } from "../pki/SigningCertificateEnrollment.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import {
@@ -32,7 +33,7 @@ import { asEntity } from "../util/EntityUtils.js";
 import { AuditAction, EscrowScope, KeyVault, Mailbox, MasterKeyWrap, PublicKey, WrappedPrivateKey } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
-const { Delete, Get, Param, Post, Put, Query, User: AuthUser } = RouteDecorators;
+const { Delete, Get, Param, Post, Put, Query, Response, User: AuthUser } = RouteDecorators;
 
 /** The wire shape `GET /mailbox/:id/keyvault` returns - identical to the `KeyVault` entity minus its own
  * bookkeeping fields (`uid`/`mailboxUid`/etc.), matching `specs/end-to-end_encryption.md`'s own `KeyVault`
@@ -347,10 +348,12 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         return !!scope;
     }
 
+    /** The mailbox `mailboxId` names. A mailbox that doesn't exist is refused (403) exactly like one the caller has no access to
+     * (`requireMailboxAccess()`), so the answer doesn't reveal which addresses have a key vault. */
     private async requireMailbox(mailboxId: string): Promise<M> {
         const mailbox: M | undefined = await this.mailboxRepo!.findOne(mailboxId, { ignoreACL: true });
         if (!mailbox) {
-            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
         return mailbox;
     }
@@ -634,21 +637,91 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         return { enrollmentId };
     }
 
-    /** Reports the current status of a previously started automated enrollment - see `startSignEnrollment()`. Only an
-     * enrollment of the path mailbox (`requireEnrollmentOf()`) - any other id is a `404`, so mailbox access to one
-     * mailbox doesn't read another mailbox's enrollment. */
+    /** Reports the current status of a previously started automated enrollment - see `startSignEnrollment()` - and how far along
+     * it is (`EnrollmentProgress`: `stage`, `stages`, `progress`, timestamps, and for a failure `errorCode`/`retryable`; every field
+     * beyond `status`/`certificate`/`error` is additive). Only an enrollment of the path mailbox (`requireEnrollmentOf()`) - any
+     * other id is a `404`, so mailbox access to one mailbox doesn't read another mailbox's enrollment. */
     @Get("/:id/keyvault/keys/sign-enrollment/:enrollmentId")
     public async checkSignEnrollmentStatus(
         @Param("id") mailboxId: string,
         @Param("enrollmentId") enrollmentId: string,
         @AuthUser user?: JWTUser,
-    ): Promise<EnrollmentResult> {
+    ): Promise<EnrollmentProgress> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
         await this.requireEnrollmentOf(mailbox, enrollmentId);
 
-        return await this.signingCertificateEnrollment!.checkStatus(enrollmentId);
+        return await this.enrollmentProgress(enrollmentId);
+    }
+
+    /**
+     * The mailbox's CURRENT signing-certificate enrollment - one still in flight (pending, or issued and not yet installed) - or, when
+     * none is, its most recent one, in the same shape as `checkSignEnrollmentStatus()` plus its `enrollmentId`: how a client on
+     * another device, or with its storage cleared, finds an enrollment it never saw start. `404` when the mailbox has never enrolled
+     * (also for an implementation that keeps no list: the `Null` default, which has no enrollments).
+     */
+    @Get("/:id/keyvault/keys/sign-enrollment")
+    public async currentSignEnrollment(
+        @Param("id") mailboxId: string,
+        @AuthUser user?: JWTUser,
+    ): Promise<EnrollmentProgress & { enrollmentId: string }> {
+        await this.init();
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
+
+        const all: EnrollmentSummary[] = (await this.signingCertificateEnrollment!.listEnrollments?.()) ?? [];
+        const own: EnrollmentSummary[] = all
+            .filter((enrollment) => this.enrollmentBelongsTo(enrollment, mailbox))
+            .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+        const current: EnrollmentSummary | undefined =
+            own.find((enrollment) => enrollment.status === "pending" || (enrollment.status === "issued" && !enrollment.installedAt)) ?? own[0];
+        if (!current) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        return { enrollmentId: current.enrollmentId, ...(await this.enrollmentProgress(current.enrollmentId)) };
+    }
+
+    /**
+     * Checks a pending enrollment right now instead of waiting for the background job's next tick - answering the CA's
+     * challenge, polling the order, downloading the certificate - and answers with the same object as
+     * `checkSignEnrollmentStatus()`. Whoever may read the enrollment may ask (the owner or a delegate with READ); it changes
+     * nothing that isn't already due. **Rate limited per enrollment**: asking again within about 10 seconds is a `429` with
+     * `Retry-After`. **Bounded**: it never waits on the CA for more than a few seconds - a slow CA leaves the check running and
+     * the answer carries the current state and a `note`. A finished enrollment is answered as it is (no CA call, no limit).
+     */
+    @Post("/:id/keyvault/keys/sign-enrollment/:enrollmentId/check")
+    public async checkSignEnrollmentNow(
+        @Param("id") mailboxId: string,
+        @Param("enrollmentId") enrollmentId: string,
+        @Response res: HttpResponse,
+        @AuthUser user?: JWTUser,
+    ): Promise<EnrollmentProgress> {
+        await this.init();
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
+        await this.requireEnrollmentOf(mailbox, enrollmentId);
+
+        if (typeof this.signingCertificateEnrollment!.checkNow !== "function") {
+            // Nothing to poll (an enrollment an administrator completes by hand): the current state is the answer.
+            return await this.enrollmentProgress(enrollmentId);
+        }
+        try {
+            return await this.signingCertificateEnrollment!.checkNow(enrollmentId);
+        } catch (err: any) {
+            if (err?.status === 429 && typeof err.retryAfterSeconds === "number") {
+                res.setHeader("Retry-After", String(err.retryAfterSeconds));
+            }
+            throw err;
+        }
+    }
+
+    /** The enrollment's status with its progress - `describeProgress()` where the implementation has it, else the plain status. */
+    private async enrollmentProgress(enrollmentId: string): Promise<EnrollmentProgress> {
+        const enrollment: SigningCertificateEnrollment = this.signingCertificateEnrollment!;
+        return typeof enrollment.describeProgress === "function"
+            ? await enrollment.describeProgress(enrollmentId)
+            : ((await enrollment.checkStatus(enrollmentId)) as EnrollmentProgress);
     }
 
     /**
@@ -661,7 +734,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         @Param("id") mailboxId: string,
         @Param("enrollmentId") enrollmentId: string,
         @AuthUser user?: JWTUser,
-    ): Promise<EnrollmentResult> {
+    ): Promise<EnrollmentProgress> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         this.requireMailboxOwner(mailbox, user);
@@ -670,7 +743,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
         await this.signingCertificateEnrollment!.cancelEnrollment(enrollmentId, "Cancelled by the mailbox owner.");
-        return await this.signingCertificateEnrollment!.checkStatus(enrollmentId);
+        return await this.enrollmentProgress(enrollmentId);
     }
 
     /**

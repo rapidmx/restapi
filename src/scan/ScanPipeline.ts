@@ -2,14 +2,14 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { convert } from "html-to-text";
-import sanitizeHtml from "sanitize-html";
 import { simpleParser, ParsedMail, Attachment as ParsedAttachment } from "mailparser";
 import { ObjectDecorators } from "@rapidrest/core";
 import { AvVerdict, Recipient, SpamVerdict } from "../models/types.js";
 import { isEncryptedBody } from "../util/SmimeUtils.js";
 import { parseHeaderRecipients, parseSenderDisplayName } from "../util/RecipientUtils.js";
 import { AvScanProvider, AvScanResult } from "./AvScanProvider.js";
+import { DEFAULT_ALLOWED_TAGS, HtmlSanitizeOptions, SANITIZE_DEFAULTS, sanitizeMailHtml, stampSanitizedHtml } from "./HtmlSanitizer.js";
+import { htmlPreview } from "./HtmlPreview.js";
 import { ScanEnvelope, SpamScanProvider, SpamScanResult } from "./SpamScanProvider.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 
@@ -147,20 +147,50 @@ export class ScanPipeline {
     @Inject("AvScanProvider")
     private avScanProvider?: AvScanProvider;
 
-    // A default MUST be supplied here even though `sanitize()` already has its own `?? sanitizeHtml.defaults...`
-    // fallback for an undefined value: `ObjectFactory.initialize()`'s config-injection loop throws
-    // "No configuration variable is defined at path: ..." for ANY `@Config` field that has neither a config
-    // value present nor an explicit default - confirmed live via a real docker-compose boot, where this made
-    // constructing a `ScanPipeline` (as `ScanQueueJob`'s/`MessageRoute`'s own `@Inject`-ed dependency) fail
-    // outright with `mail:scan:sanitize:allowed_tags` unset, silently disabling ALL spam/AV scanning - every
-    // other `@Config` usage in this codebase already supplies a default for exactly this reason.
-    @Config("mail:scan:sanitize:allowed_tags", sanitizeHtml.defaults.allowedTags.filter((tag) => tag !== "script"))
+    // A default MUST be supplied for every `@Config` here: `ObjectFactory.initialize()`'s config-injection loop throws
+    // "No configuration variable is defined at path: ..." for ANY `@Config` field that has neither a config value
+    // present nor an explicit default - confirmed live via a real docker-compose boot, where this made constructing a
+    // `ScanPipeline` (as `ScanQueueJob`'s/`MessageRoute`'s own `@Inject`-ed dependency) fail outright with
+    // `mail:scan:sanitize:allowed_tags` unset, silently disabling ALL spam/AV scanning - every other `@Config` usage in
+    // this codebase already supplies a default for exactly this reason.
+
+    /** Restricts the HTML elements a sanitized message keeps to these (a subset of `DEFAULT_ALLOWED_TAGS`); empty keeps them all. */
+    @Config("mail:scan:sanitize:allowed_tags", DEFAULT_ALLOWED_TAGS)
     private allowedTags?: string[];
+
+    /** The largest decoded `data:` image, in bytes, a sanitized message keeps (`<img src>`, `background`, CSS `url()`). */
+    @Config("mail:scan:sanitize:max_data_image_bytes", SANITIZE_DEFAULTS.maxDataImageBytes)
+    private maxDataImageBytes: number = SANITIZE_DEFAULTS.maxDataImageBytes;
+
+    /** The most sanitized CSS, in bytes, all of a message's `<style>` blocks may add up to. */
+    @Config("mail:scan:sanitize:max_css_bytes", SANITIZE_DEFAULTS.maxCssBytes)
+    private maxCssBytes: number = SANITIZE_DEFAULTS.maxCssBytes;
+
+    /** The most CSS rules a sanitized message keeps. */
+    @Config("mail:scan:sanitize:max_css_rules", SANITIZE_DEFAULTS.maxCssRules)
+    private maxCssRules: number = SANITIZE_DEFAULTS.maxCssRules;
+
+    /** HTML beyond this many characters is cut off before sanitizing. */
+    @Config("mail:scan:sanitize:max_input_length", SANITIZE_DEFAULTS.maxInputLength)
+    private maxInputLength: number = SANITIZE_DEFAULTS.maxInputLength;
+
+    /** Elements nested deeper than this lose their tags (their text stays). */
+    @Config("mail:scan:sanitize:max_depth", SANITIZE_DEFAULTS.maxDepth)
+    private maxDepth: number = SANITIZE_DEFAULTS.maxDepth;
+
+    /** Elements beyond this many lose their tags. */
+    @Config("mail:scan:sanitize:max_elements", SANITIZE_DEFAULTS.maxElements)
+    private maxElements: number = SANITIZE_DEFAULTS.maxElements;
 
     @Logger
     private logger: any;
 
-    public async run(raw: Buffer, envelope: ScanEnvelope): Promise<ScanPipelineResult> {
+    /**
+     * Scans and parses `raw`. `options.skipPreview` leaves `bodyPreview` out: deriving it converts the whole HTML body to text
+     * (about as costly as sanitizing it - some 40 ms per 200 KB on the main thread), which a caller that does not use it, like a
+     * send whose draft already has its own preview, should not pay for.
+     */
+    public async run(raw: Buffer, envelope: ScanEnvelope, options: { skipPreview?: boolean } = {}): Promise<ScanPipelineResult> {
         if (!this.spamScanProvider || !this.avScanProvider) {
             throw new Error(
                 "ScanPipeline requires both a SpamScanProvider and an AvScanProvider to be registered. " +
@@ -168,7 +198,7 @@ export class ScanPipeline {
             );
         }
 
-        const parsed: ParsedMail = await simpleParser(raw);
+        const parsed: ParsedMail = await this.parse(raw);
         // Computed before the attachment scan below (not after, where the rest of this method derives it) -
         // for an S/MIME `EnvelopedData` body, mailparser folds the *entire* encrypted body into
         // `parsed.attachments` as a synthetic "attachment" node (it isn't `text/plain`/`text/html`, so
@@ -197,7 +227,7 @@ export class ScanPipeline {
         const sanitizedHtml: string | undefined =
             !encrypted && typeof parsed.html === "string" ? this.sanitize(parsed.html) : undefined;
 
-        const bodyPreview: string | undefined = encrypted ? undefined : this.derivePreview(parsed);
+        const bodyPreview: string | undefined = encrypted || options.skipPreview ? undefined : this.derivePreview(parsed);
         const parsedFrom: string | undefined = parsed.from?.text;
         const fromDisplayName: string | undefined = parseSenderDisplayName(parsed.from);
         const fromAddress: string | undefined = parsed.from?.value?.[0]?.address;
@@ -250,7 +280,9 @@ export class ScanPipeline {
 
     /**
      * Derives a short plain-text body preview from `parsed`'s plain-text part, falling back to its HTML part
-     * (converted to text) if it has none - truncated to `BODY_PREVIEW_MAX_LENGTH` characters.
+     * (converted to text by `htmlPreview()`, which leaves out its stylesheet, head and hidden preheader) if it has none -
+     * truncated to `BODY_PREVIEW_MAX_LENGTH` characters. `parse()` keeps mailparser from making its own text of an HTML-only
+     * message, so an empty `parsed.text` means there is no plain-text part.
      *
      * A delivery status notification (a bounce: `multipart/report; report-type=delivery-status`) is previewed by what its
      * report says instead (`deriveDeliveryStatusPreview()`): its notification text opens with a page of boilerplate ("This is
@@ -261,12 +293,7 @@ export class ScanPipeline {
         if (report) {
             return report.slice(0, BODY_PREVIEW_MAX_LENGTH);
         }
-        const text: string | undefined =
-            typeof parsed.text === "string"
-                ? parsed.text
-                : typeof parsed.html === "string"
-                  ? convert(parsed.html, { wordwrap: false })
-                  : undefined;
+        const text: string | undefined = parsed.text || (typeof parsed.html === "string" ? htmlPreview(parsed.html, BODY_PREVIEW_MAX_LENGTH) : parsed.text);
         return text?.trim().slice(0, BODY_PREVIEW_MAX_LENGTH);
     }
 
@@ -372,7 +399,8 @@ export class ScanPipeline {
                 filename: attachment.filename,
                 contentType: attachment.contentType,
                 content: attachment.content,
-                contentId: attachment.contentId,
+                // Without the angle brackets of the header (`<image001@x>`): the form a `cid:` reference in the HTML uses.
+                contentId: attachment.cid ?? attachment.contentId?.replace(/^<|>$/g, ""),
                 isInline: attachment.contentDisposition === "inline",
                 av,
             });
@@ -381,17 +409,44 @@ export class ScanPipeline {
     }
 
     /**
-     * Strips `<script>` tags and other active/executable content from an HTML body. Defense in depth alongside
-     * clamd's own HTML/JS signature detection (run against the raw message above) and whatever sandboxing the
-     * eventual client renderer applies.
+     * Parses `raw`. mailparser is told to leave a message's inline (`cid:`) images alone: by default it replaces each with a
+     * `data:` URI of the whole image, which would copy every inline image into the stored HTML (and, over the sanitizer's size
+     * limit, lose it). They are attachments already, and the stored HTML refers to them by `cid:` (`resolveInlineImages()`).
+     * It is also told not to derive a plain text from an HTML-only message (the copy the preview is made of), which would put
+     * the stylesheet and hidden preheader into it: `htmlPreview()` reads the HTML instead, and stops as soon as it has enough.
+     */
+    private parse(raw: Buffer): Promise<ParsedMail> {
+        return simpleParser(raw, { skipImageLinks: true, skipHtmlToText: true });
+    }
+
+    /**
+     * Sanitizes the HTML body of `raw` and nothing else - no spam or AV scan, no attachments: what `GET /messages/:id/content`
+     * runs to bring a message stored by an older sanitizer up to date. `undefined` for a message with no HTML body or an S/MIME
+     * encrypted one (there is nothing the server can show).
+     */
+    public async sanitizeRaw(raw: Buffer): Promise<string | undefined> {
+        const parsed: ParsedMail = await this.parse(raw);
+        return !isEncryptedBody(parsed) && typeof parsed.html === "string" ? this.sanitize(parsed.html) : undefined;
+    }
+
+    /**
+     * The message's HTML with everything that could run, navigate, submit, overlay or track removed and its design kept (colours,
+     * fonts, tables, backgrounds, images, `@media` styles) - see `HtmlSanitizer.ts`. Defense in depth alongside clamd's own
+     * HTML/JS signature detection (run against the raw message above) and the sandbox, CSP and second sanitizer the client's
+     * renderer applies. Stamped with the sanitizer's version (`SANITIZER_VERSION`) so a message stored by an older one is found and
+     * redone on demand.
      */
     private sanitize(html: string): string {
-        return sanitizeHtml(html, {
-            allowedTags: this.allowedTags ?? sanitizeHtml.defaults.allowedTags.filter((tag) => tag !== "script"),
-            allowVulnerableTags: false,
-            disallowedTagsMode: "discard",
-            allowedSchemes: ["http", "https", "mailto", "cid"],
-        });
+        const options: HtmlSanitizeOptions = {
+            allowedTags: this.allowedTags,
+            maxDataImageBytes: this.maxDataImageBytes,
+            maxCssBytes: this.maxCssBytes,
+            maxCssRules: this.maxCssRules,
+            maxInputLength: this.maxInputLength,
+            maxDepth: this.maxDepth,
+            maxElements: this.maxElements,
+        };
+        return stampSanitizedHtml(sanitizeMailHtml(html, options));
     }
 }
 

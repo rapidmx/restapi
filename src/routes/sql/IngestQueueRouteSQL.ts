@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { IngestQueueEntrySQL } from "../../sql.js";
+import { AuditLogEntrySQL, IngestQueueEntrySQL } from "../../sql.js";
 import { BaseScopedChildRoute } from "../BaseScopedChildRoute.js";
 const { Model } = RouteDecorators;
 
@@ -16,5 +16,8 @@ export class IngestQueueRouteSQL extends BaseScopedChildRoute<IngestQueueEntrySQ
     protected readonly scopeProperty: string = "mailboxUid";
     /** Entries are produced by ingest; only a trusted caller (ops) may change them. */
     protected readonly trustedOnlyWrites: boolean = true;
+    /** Ops review any mailbox's entries with `?scope=admin` (trusted + elevated, audited) - nothing else widens access. */
+    protected readonly adminScope: boolean = true;
+    protected auditLogClass: any = AuditLogEntrySQL;
     protected readonly dateFields: readonly string[] = ["nextAttemptAt", "scanLeaseExpiresAt"];
 }

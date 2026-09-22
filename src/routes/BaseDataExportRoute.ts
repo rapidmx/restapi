@@ -31,6 +31,11 @@ const VALID_FORMATS: ReadonlySet<string> = new Set<DataExportFormat>(["json", "m
  * mailbox is used regardless of what `mailboxUid` they send (if any); only a trusted caller's supplied
  * `mailboxUid` is honored.
  *
+ * **This is one of the few things designed to cross mailboxes** (a data-subject access request handled by an
+ * administrator): a trusted caller can export - and download the archive of - ANY mailbox's content. It is its own
+ * explicit request workflow, not a way in through the mail routes: the request (`DATA_EXPORT_REQUESTED`) and every
+ * download by somebody who is not the mailbox owner (`DATA_EXPORT_DOWNLOADED`) are audited.
+ *
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extends Mailbox> {
@@ -186,6 +191,20 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
 
         const content: Buffer = await this.blobStore.get(request.blobKey);
         const extension = request.format === "mbox" ? "mbox" : "ndjson";
+        const owner: MB | undefined = await this.mailboxRepo!.findOne(request.mailboxUid, { ignoreACL: true });
+        if (!owner || (owner as any).ownerUserUid !== user!.uid) {
+            await recordAuditLog(
+                this._objectFactory!,
+                this.auditLogClass,
+                { config: this.config, user, logger: this.logger },
+                {
+                    action: AuditAction.DATA_EXPORT_DOWNLOADED,
+                    targetType: "DataExportRequest",
+                    targetUid: request.uid,
+                    mailboxUid: request.mailboxUid,
+                },
+            );
+        }
         res.setHeader("content-type", request.format === "mbox" ? "application/mbox" : "application/x-ndjson");
         res.setHeader("content-disposition", `attachment; filename="mailbox-export-${request.mailboxUid}.${extension}"`);
         res.send(content);

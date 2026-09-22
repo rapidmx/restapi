@@ -5,9 +5,10 @@
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, DocDecorators, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { CandidateResultPage, SearchEntityType, SearchProvider, SearchResultPage } from "../search/SearchProvider.js";
+import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { Mailbox } from "../models/types.js";
-const { Inject, Logger } = ObjectDecorators;
+const { Config, Inject, Logger } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Auth, Get, Query, User: AuthUser } = RouteDecorators;
 
@@ -55,6 +56,9 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
 
+    @Config("trusted_roles", ["admin"])
+    private trustedRoles: string[] = ["admin"];
+
     @Logger
     private logger: any;
 
@@ -80,7 +84,8 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
             }
             const mailbox: M | undefined = await mailboxRepo.findOne(requestedMailboxUid, { ignoreACL: true });
-            if (!mailbox || !this.aclUtils || !(await this.aclUtils.hasPermission(user, mailbox.uid, ACLAction.READ))) {
+            // By ownership or an ACL record - a trusted role is no grant (`util/MailAccessUtils.ts`).
+            if (!mailbox || !(await hasMailAccess(this.aclUtils, this.trustedRoles, user, mailbox.uid, ACLAction.READ))) {
                 throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
             }
             return mailbox.uid;

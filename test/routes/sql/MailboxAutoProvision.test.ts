@@ -337,7 +337,7 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
             request(server.getApplication()).get(`/sql/folders?mailboxUid=${result.body.mailbox.uid}`),
             userToken,
         );
-        expect(folders.body.map((f: any) => f.type).sort()).toEqual(["calendar", "contacts", "drafts", "inbox", "tasks"]);
+        expect(folders.body.map((f: any) => f.type).sort()).toEqual(["archive", "calendar", "contacts", "deleted_items", "drafts", "inbox", "junk", "notes", "outbox", "sent_items", "tasks"]);
     });
 
     it("Returns 502 when auth-server responds with a non-OK status.", async () => {

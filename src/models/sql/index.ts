@@ -1,3 +1,4 @@
+export * from "./AppearancePreferencesSQL.js";
 export * from "./AttachmentSQL.js";
 export * from "./AuditLogEntrySQL.js";
 export * from "./BrandingSQL.js";

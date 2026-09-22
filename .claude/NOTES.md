@@ -2577,3 +2577,348 @@ times and never changed. JP's standing rule: pre-release, no migrations - existi
   RetentionEnforcementJob suites.
 - Not verified here: the web client actually rendering the event, mapi's tables with real Outlook, and behavior on MySQL/PostgreSQL (the SQL suite is
   SQLite; the query uses only portable `COUNT`/`SUM(CASE)`/`LIKE` and driver-string sums are coerced with `Number()`).
+
+## 2026-09-21 — Appearance preferences (per user) and background send (`{ background: true }`)
+
+Not committed. Batch of web-client UX work; this repo's half. JP's principle: the app feels instantaneous - user actions return at once, work continues in the
+background, failures surface as notifications. The contracts below are what the web-client agents code against; the README has them in full.
+
+### A. Appearance preferences (`BaseAppearanceRoute`, `util/AppearanceUtils.ts`)
+
+- **Model:** `AppearancePreferencesMongo/SQL` (`models/types.ts` `AppearancePreferences`), one row per **user**, uid = `nameBasedUuid("appearance-preferences:<userUid>")` (so two first
+  writes at once collide on the uid instead of making two rows; `userUid` also has a unique index), columns `mode`, `colors` and `background` (JSON: `simple-json` on SQL, sub-documents on
+  Mongo) and route-managed `backgroundContentType`. Deny-all class ACL like every route-managed entity; the routes read and write with `ignoreACL` and a row can only be named through the
+  JWT's own `uid`, so a trusted role reads and writes only its own (tested: an admin's `GET` is its own defaults, its `PUT` does not touch another user's row, `?userUid=` is ignored).
+  The wire object has `version: 1` (the shape's version) which is **not** the entity's optimistic-lock `version` - `toPublicAppearance()` maps one to the other.
+- **JP removed `invertDarkMessages` (mid-task): HTML mail is always rendered as authored.** It is not in the model, the validation or the defaults; a `PUT` that still sends it is a 400 naming it
+  like any unknown key (tested).
+- **Contract decisions (mine, where the brief left room):** `updatedAt` of a user with no row is the epoch (so any real save is newer). `PUT` accepts `version` (must be 1) and `updatedAt`
+  so a client can send back what it read. `colors` merges per key, `null` clears one / all; `background` merges per key; `background: null` is a 400 (use `DELETE /background` or
+  `kind: "none"`); `background.imageVersion` in a `PUT` must equal the stored one (400) - a client cannot name an image. `kind: "image"` without an upload and `kind: "color"` without a colour
+  are 400s. Switching `kind` away from `"image"` **keeps** the blob and `imageVersion` (switching back needs no re-upload); only `DELETE /background` removes it. An empty `PUT {}` writes nothing
+  and publishes nothing. Colours are stored lowercase. Rate limits (`@RateLimit({perUser})`): `PUT` 600/min, upload 30/min, `DELETE` 60/min; `GET`s none.
+- **Upload:** `Content-Type` must be `image/png|jpeg|webp|avif` (else **415**), the bytes are sniffed (`sniffImageType()`: PNG, JPEG, WebP = RIFF...WEBP, AVIF = an `ftyp` box naming `avif`/`avis` as
+  major or compatible brand) and the sniffed type is what is stored and served - a JPEG sent as `image/png` is stored as `image/jpeg`; SVG, GIF, HEIC and anything else are **415** whatever the
+  header says. Empty body 400. Above `mail:preferences:background_max_bytes` (default 8 MiB, `Number()`-coerced) **413** from the route (the server's `max_body_size` is 100 MiB, the framework's
+  own default 10 MiB, so the route's is the effective one). Stored as sent (no re-encode, nothing stripped) at `appearance/<userUid>/<uuid>`; the previous blob is deleted **after** the row
+  points at the new one (a crash in between leaks a blob, never a dangling reference); a failed row write deletes the new blob. Two uploads at once: the version-checked write retries from a fresh
+  read (3 attempts), the loser's blob is deleted as "previous" - tested (one row, one blob).
+- **Serve:** `GET /background/:version` 404s for a stale version and for anyone else (the row is looked up by the caller's uid, so another user's image cannot even be addressed); headers as the
+  brief (`private, max-age=31536000, immutable`, `nosniff`, `inline`, `default-src 'none'; sandbox`) plus `Content-Length`. Reads the whole blob (8 MiB cap) rather than streaming.
+- **Live event:** `NotificationUtils.sendMessage(user.uid, <entity class name>, "update", <public prefs>)` - the type is `AppearancePreferencesMongo`/`AppearancePreferencesSQL` (the brief's
+  `AppearancePreferences*`), match `/^AppearancePreferences/`. After a `PUT` that changed something, an upload and a `DELETE`; best-effort. The writes pass `skipPush: true` so `RepoUtils` does
+  not also publish the whole entity.
+- **`fetchAppearanceForSSR()`** (exported from the root; used by the server's `wwwRoute.fetchProps`): one `findOne`, `undefined` for no row / no uid, never throws (debug log).
+  **Caveat, not fixed:** `@rapidrest/react`'s `ReactRoute` caches the rendered HTML in Redis in production for 60 s **per user** (`hashRequest()`: path + query + `userUid`), so the `appearance` prop can
+  be up to a minute stale after a change - the client must still apply the live event / its own copy after hydration. `cacheKeyExtras()` is synchronous and cannot read the row.
+- Files: `models/{mongo,sql}/AppearancePreferences*.ts`, `models/types.ts`, `routes/BaseAppearanceRoute.ts`, `routes/{mongo,sql}/AppearanceRoute*.ts`, `util/AppearanceUtils.ts`. Tests:
+  `test/routes/appearanceSuite.ts` (+ `{mongo,sql}/AppearanceRoute.test.ts`, real HTTP: 65 tests each incl. the 26-row validation table, all four image types, size limit at and above the boundary,
+  SVG/GIF/type-lie/empty refusals, replace/delete blob bookkeeping, ownership 404 for another user and an admin, concurrent writes and uploads, events), `test/util/AppearanceUtils.test.ts`.
+
+### B. Background send (`BaseMessageRoute.send`, `ScheduledSendJob`)
+
+- **Design: the message is queued as an ordinary *due* message in Outbox and the existing `ScheduledSendJob` relays it; the route just kicks it.** Not a second relay implementation and not the sync
+  path detached: `relaySend(background=true)` does the cheap checks (unchanged code, same order), persists the thread headers as before, moves the draft into Outbox with `scheduledSendTime = now`
+  (no lease - the job leases when it claims), `notifyFolders`, answers `202 { status: "queued", message }` and only then (`setImmediate`, so the CPU-bound scan starts after the response is on its
+  way) calls `ScheduledSendJob.enqueue(uid)` on the job instance of this process (`objectFactory.getInstance(sendJobClass)` = the one the background service manager made, else one created under the
+  name `background-send`). Crash safety is therefore free: at every instant the message is either due in Outbox (the job's next `run()`, and `start()` now sweeps at once, finish it), or claimed with a
+  lease (lapses -> due again), or relayed-and-marked (`scheduledSendRelayedAt`, filing only). Never-twice = the version-checked claim + `scheduledSendRelayedAt`, both pre-existing and now covered
+  by tests for: claim lost to another process, crash before the claim / after the claim before the relay / after the relay before the filing, kick + scheduled run + repeated requests at once.
+- **Job additions** (`jobs/ScheduledSendJob.ts`): `enqueue(uid)` (looks the row up, skips it unless it has a due `scheduledSendTime`, so a message cancelled since is untouched), a bounded pool
+  (`mail:jobs:scheduled_send:concurrency`, default 4; `run()` still goes one at a time, oldest first, but through the same slots and per-uid de-duplication), `whenIdle()`, `start()` sweep, `stop()` drains
+  (`drain_ms` 15 s) and then refuses new work. **`ScheduledSendJobSQL` runs one relay at a time on SQLite** (`maxParallel()` checks `datastores:sql:type`): two overlapping relays on the single
+  better-sqlite3 connection failed each other's transactions ("cannot start a transaction within a transaction") *including the relayed-marker write after the transport had accepted* - found by the pool
+  test; irrelevant for Postgres/MySQL. (For the same reason the SQL route tests fire requests one after another; concurrent duplicate requests are tested on Mongo, and claim-loss on both.)
+- **Events** (`SendEventData`, exported): `{ type: <MessageMongo|MessageSQL>, action: "send-succeeded"|"send-retrying"|"send-failed", data: { uid, mailboxUid, subject, recipients[], attempt,
+  nextAttemptAt?, error?: { message, details? } } }` via one `sendMessage([mailboxUid, outboxUid(, sentUid)], ...)`. Fired by the job for **every** message it relays (scheduled sends too - a scheduled
+  send arriving is worth a toast; the web client can filter on `uid`). `attempt` = attempts so far + 1 = the one the event is about. A post-relay filing failure (mail system took it, Sent Items could
+  not be written) is `send-retrying` with the message "The message was sent, but could not be filed in Sent Items: ..." and is never relayed again.
+- **Failure semantics chosen: a failed message STAYS IN OUTBOX marked failed** (`scheduledSendError` set, `scheduledSendTime` null, no lease) - that is exactly what the job already did on give-up /
+  refuse, the Outbox list then shows it, and the notice is still filed once (`scheduled-failed`/`scheduled-refused` keys). It does **not** go back to Drafts (the sync path does, because there the client is
+  being told directly). Retrying: `POST send { background: true }` on it queues it afresh (attempts/error cleared); moving it to Drafts still works. `scheduledSendAttempts` is reset to null when it gives
+  up (existing behaviour), the count is in the error text ("Gave up after N attempts").
+- **Permanent failures are final at once** (`isPermanentRelayFailure()` in `transport/TransportResultUtils.ts`): a 422 spam/malware verdict, or a `MailRelayError` whose failures are all
+  `temporary === false` (SMTP 5xx). Anything else retries up to `max_attempts` with the existing `attempts x retry_backoff_ms` backoff. This closes the "left alone" note in the server's 2026-09-20 (QA)
+  entry (a 554 used to take 12 minutes to reach the Inbox). Two existing tests changed for it (a 554 recipient is no longer "attempt 1, retried"). With `max_attempts` reached at the same time the old
+  "Gave up after N attempts" wording is kept.
+- **Idempotency** (route): already in Outbox and (leased, or due, or waiting out a retry backoff) -> same 202 with the current copy; two racing requests -> the loser's version conflict is re-read and
+  answers the winner's 202; in Outbox with `scheduledSendError` and nothing due/leased -> retry (above); a future user-chosen `scheduledSendTime` in Outbox stays 409; relayed / Sent Items 409. `background`
+  not a boolean -> 400; a route without `sendJobClass` -> 501. `background: true` with a future `scheduledSendTime` -> the same 202, message waits in Outbox.
+- **The job now relays what an immediate send relays** - a gap found while building this: `send()` added `Disposition-Notification-To` (when a receipt is requested; the mailbox default
+  `alwaysRequestReceiptInternal` is **true**, so any send to an own-domain recipient) and `RapidMX-Key`, and filed `receiptStatus`/`encrypted`/`inReplyTo`/`references`; `ScheduledSendJob` did none of it.
+  Both now use `prepareOutboundMime()` / `seedReceiptStatus()` (`util/MailSendUtils.ts`); the job needs `domainClass` (set by the Mongo/SQL subclasses; the SQL job test's connection now loads
+  `DomainSQL`) and `@Inject("DnsResolver")`. Behaviour change for scheduled sends: their Sent copy now tracks receipts, and `Disposition-Notification-To` goes out when the mailbox asks for it.
+- **Measurements** (real HTTP, in-memory Mongo/SQLite, fake scanners/transport, this machine): background 202 median 13 ms / p95 16 ms (Mongo), 31 / 39 ms (SQL); the same request without
+  `background` 17 / 18 ms and 21 / 28 ms - i.e. with instant fakes there is little to win; the win is what the fakes hide. **What dominates the real seconds** (micro-benchmarks of `scanAndRelay` with
+  fake providers, 5 runs, median): small mail 3 ms; 200 KB HTML mail **93 ms** (sanitize-html 46 + html-to-text 42 + mailparser 3); mail with a 5 MB attachment **427 ms** (mailparser ~266 ms of it, the
+  base64 decode); 25 MB **2.1 s** - all CPU on the one main thread (blocking every other request while it runs), before the real rspamd HTTP call, ClamAV `INSTREAM` (the raw message once **and each
+  attachment again**) and the `sendmail` spawn (~49 ms for a trivial child process here). The 202 does none of it inline.
+  **Low-hanging fruit taken:** `scanAndRelay()` now passes `ScanPipeline.run(..., { skipPreview: true })` - the send path never used `bodyPreview` and deriving it (`convert()` of the whole HTML) was
+  ~45% of the pipeline for HTML mail. **Not done** (would change behaviour or is a larger change): scanning attachments once (the raw scan already covers them), moving sanitize/parse to a worker thread,
+  skipping the scan for internal-only recipients, streaming instead of buffering 25 MB.
+- Files: `routes/BaseMessageRoute.ts` (`send()` gained `@Response res` before the user; `relaySend(background)`; `QueuedSend`; the 501/400 guards), `routes/{mongo,sql}/MessageRoute*.ts` (`sendJobClass`),
+  `jobs/ScheduledSendJob.ts`, `jobs/{mongo,sql}/ScheduledSendJob*.ts`, `util/MailSendUtils.ts`, `transport/TransportResultUtils.ts`, `scan/ScanPipeline.ts`. Tests: `test/jobs/backgroundSendSuite.ts`
+  (in both `ScheduledSendJob*.test.ts`: 20 tests each), `test/routes/backgroundSendRouteSuite.ts` (+ `{mongo,sql}/MessageBackgroundSend.test.ts`, real HTTP: 14 each), `RecordingMailTransport` gained
+  `temp-fail@example.com` (4xx), `gate`, `inFlight`/`maxInFlight`; unit tests for `isPermanentRelayFailure`, `prepareOutboundMime`, `seedReceiptStatus`, `skipPreview`.
+
+### C. `GET /system/encryption-policy`
+
+Verified, no code change: any signed-in user (a token with no roles and no `elevated`, an ordinary one, an admin) gets 200 with the all-`"optional"` defaults when no row exists, and the `GET` creates no
+row; unauthenticated is still 403. Test added to both `EncryptionPolicyRoute.test.ts` files.
+
+### Authorization note (for the privacy work running alongside)
+
+Appearance: owner-only by construction (the caller's own uid is the only row any route can address; no `isTrusted`/`ignoreACL`-for-others path). Background send: it reuses `relaySend()`'s existing checks unchanged and adds none of its own - the caller needs UPDATE on the message's folder via `aclUtils.hasPermission()` (whose framework-level trusted-role bypass is what a privacy change would have to close at that call site), and `assertSenderAllowed()` only ties the *From* to the message's own mailbox's addresses, not the caller to the mailbox. `isTrusted(user)` still exempts a caller from "only a Drafts message can be sent". `util/MailAccessUtils.ts` did not exist when this was written, so nothing here uses it; the job (`ScheduledSendJob`) has no caller identity at all - it relays whatever is due in the mailbox's own Outbox.
+
+### Not verified here
+
+A real Postfix/rspamd/ClamAV (all timings above are with fakes), the web client's handling of the 202/events, behaviour on MySQL/PostgreSQL (the SQL suites are SQLite; the pool runs relays in
+parallel there by design - untested against a real pooled driver), a multi-replica run (claims are version-checked, so replicas are safe by construction but were not run).
+
+## 2026-09-21 — PRIVACY: no role reads another user's mail (an admin sees their own mailbox and shared ones, nothing else)
+
+Uncommitted, no version bump, no migrations. JP called it "a big one": any administrator holding an elevated token (roles `['admin']`) could list every mailbox and read every folder/message/attachment
+through the ordinary mail API, and the web client's mailbox switcher and Settings dropdown listed everybody. Evidence from the live host: elevated admin -> `GET /mail/mailboxes` = every mailbox,
+`GET /mail/messages?folderUid=<other's inbox>` = 200 with the message; the same user non-elevated (roles empty) = nothing. Root cause: `ACLUtils.hasPermission()` (service-core, read-only) returns `true` for a
+trusted role (`UserUtils.hasRoles(user, trustedRoles, aclUid)`), and `RepoUtils` (every `{ user }` call without `ignoreACL`), `BaseACLRoute` and `BasePushRoute` (subscribe/publish) all go through it;
+restapi's own routes leaned on it (and added `isTrusted` branches that listed "every mailbox unfiltered").
+
+### Policy as implemented
+
+- **P1** Anything scoped to a mailbox needs: the caller owns it (the mailbox's ACL carries the owner's `FULL`, written on create and on every owner change) OR holds an explicit ACL record on it (folders inherit
+  from their mailbox by `parentUid`). A trusted role, an elevated token, `ignoreACL` and `isTrusted()` never widen that. Impersonation needs no code: the token is the target's own identity (no trusted role,
+  not elevated) and nothing keys off the impersonator (grep: no `impersonat` anywhere in restapi src). Read-shaped denials are 404/empty like a record that doesn't exist; mailbox-address lookups
+  (key lookup/trust/resolve, key vault, escrow info, sharing) answer 403 for "missing" too, so no route tells which addresses have a mailbox.
+- **ONE helper**, `util/MailAccessUtils.ts` (exported from `util/index.ts`): `hasMailAccess(aclUtils, trustedRoles, user, uid|acl, action)`, `assertMailAccess()`, `stripTrustedRoles(user, trustedRoles)` (also
+  drops org-prefixed `<org>.<role>` and `elevated`), `isTrustedUser()`, `ADMIN_SCOPE`/`isAdminScope()`/`assertAdminScope()` (401 / 403 `api-103` trusted role / 403 `api-104` elevation). `hasMailAccess` =
+  `aclUtils.hasPermission(stripTrustedRoles(user), uid, action)`: verified in ACLUtils/RepoUtils that a role-less copy takes the ordinary owner/delegate path (`getRecord`, parents, wildcard/role records)
+  with no superuser shortcut. `BaseScopedChildRoute`, `BaseFolderRoute`, `BaseMailboxRoute` have `hasMailAccess()` (+ `mailUser()` = stripped user) methods; the inherited `CRUDRoute` handlers
+  (`findById`/`update`/`updateBulk`/`updateProperty`/`delete`/`truncate` of Folder and Mailbox) are handed `mailUser(user)`. Mailbox `find`/`count` use `accessibleMailboxUids()` (candidates from
+  `findAccessibleMailboxUids(mailUser)`, then READ-checked) for EVERYONE.
+- **Ownerless (org/shared) mailboxes:** an administrator who creates one gets an explicit `FULL` record (`grantCreator()`; `details.sharedWithCreator` on `mailbox.create`); existing ones
+  (`hello@`) are invisible until the administrator adds themselves through Sharing (`PUT /mail/mailboxes/:id/access/:uid`, audited `mailbox_access.grant`).
+- **P2 admin scope** `?scope=admin` (trusted + elevated): `GET`/`HEAD /mail/mailboxes`, `GET`/`HEAD /mail/mailboxes/:id` -> `ADMIN_METADATA_FIELDS` + `shared`; query keys limited to those fields + `limit`/`page`/
+  `sort` (a sort/filter by a hidden field is dropped); audit `mailbox.admin-list` (`targetUid: "*"`, `details.count/query`) / `mailbox.admin-read`. Quarantine and ingest queue (`adminScope` flag on
+  `BaseScopedChildRoute`, `auditLogClass` on the four concrete routes): `?scope=admin` list/count/read/exists, and their trusted-only writes (create/update=release/delete/truncate) need trusted + elevated,
+  audited `mail_queue.admin_access` (`details.operation`). Admin management of a mailbox with no grant (`isAdminOnly()`): `validateUpdate()`/`update()` reduce the patch to `ADMIN_MANAGED_FIELDS`
+  (owner, addresses, displayName, timezone, quota, resource flags, escrow scope), `updateProperty` of another field is 403, the answer is `toAdminMetadata()`, audits `mailbox.admin-update`
+  (`details.fields`) / `mailbox.admin-delete`. Sharing (`BaseMailboxAccessRoute`): owner/manager as of right; an administrator (trusted + elevated) may list (audited `mailbox_access.admin-list`),
+  revoke any member, and grant on an OWNERLESS mailbox (themselves included); granting on an owned mailbox is 403 ("the owner's to give, or the administrator's to do by impersonating"). This is the
+  decision for "an admin granting themselves access through /api/acls": the generic `/api/acls` route (server) never lets a trusted role touch a mail ACL at all (see server NOTES), so Sharing is the only door.
+- **P4 push:** `MailPushRoute` overrides `connect()` and `send()` to hand `BasePushRoute` `stripTrustedRoles(user)`; SUBSCRIBE (initial, reconnect re-check, later frames) and publish then go through
+  the ordinary ACL resolution. Tests: `test/push/MailPushAccess.test.ts` (real ACL store, faked `redis`): owner/read delegate/impersonation get folder+mailbox, an elevated admin gets nothing (not even another
+  user's uid or `Mailbox`), an admin with a delegate grant gets it; `send` is 403 for the admin. Channels published by `ScheduledSendJob` (`send-*` on mailbox/outbox/sent) are the same uids, so covered.
+- **Import** (`BaseMailboxImportRoute`): a trusted caller's `?mailboxUid=` is honoured only with CREATE on it (403 otherwise, also for a non-string); an ordinary caller's stays ignored.
+  **Send-as** (`send()`, sync and background): `relaySend()` requires UPDATE on the message's folder via `hasMailAccess`, and `assertSenderAllowed()` ties From to that mailbox - an admin can no longer send as a user.
+- Kept (field-level, after access is decided): `isTrusted()` privileges inside `BaseMessageRoute`/`BaseScopedChildRoute`/`BaseFolderRoute` (server-managed fields, Drafts-only send) apply to a trusted caller on
+  mailboxes they own or hold a grant on. Listed in `TRUSTED_ROLE_USES` (test table) with why.
+
+### Route audit (`test/routes/mailAccessRouteTable.ts` is the source; `mailAccessGuard.test.ts` enforces it)
+
+Concrete route classes in restapi: 24 mailbox-scoped (incl. `MailPushRoute`), 1 per-user, 8 compliance (cross-mailbox by design), 10 platform-admin, 2 public/machine = 45; the server table lists 15
+(4 mailbox-scoped incl. `PushRoute`, 5 admin, 2 user, 4 public) and mounts the rest as subclasses. None unclassified; a folder or mailbox by id the caller can't read is a 404 like a missing one.
+
+| Class | Routes | Gate |
+| --- | --- | --- |
+| mailbox | Mailbox, Folder, Message, Attachment, CalendarEvent, CalendarShareLink, Contact, ContactList, Note, Task, TaskList, Label, MailSignature, MailFilterRule, FocusedInboxOverride, Quarantine, IngestQueue, MailboxAccess, Search, KeyVault, KeyLookup, Directory (own contacts), MailboxImportRequest, MailPushRoute (server `PushRoute`) | `hasMailAccess`; admin scope only where listed above |
+| server mailbox | MessageRawContent, MailCompose, EscrowInfo | `hasMailAccess` (raw/compose), owner/ACL record without bypass (escrow info) |
+| user | Appearance (own row only, no trusted path), GiphySearch, wwwRoute | own identity |
+| compliance | DataExportRequest, DataSubjectErasureRequest, EscrowAccessRequest, EscrowAuditLog, EscrowScope, Matter, MatterSearch, MatterExportRequest | see below |
+| admin | AuditLog, Branding, DistributionList, Domain, EncryptionPolicy, MailboxPolicy, Plugin, RetentionPolicy, Setup, TransportRule; server: ACLRoute (guarded), AdminConsole, Admin, EscrowConsole, Metrics | trusted (class ACL), audited writes; no mail content |
+| public | KeyDiscovery (published keys by hash), MailIngest (MTA secret); server: OpenAPI, PublicPage, StaticAsset, Status | anonymous / machine |
+
+### Still crosses mailboxes by design (JP decides whether any stay)
+
+1. **`DataExportRequest`** (`POST`/`GET /data-export-requests`, `/:id/download`): a trusted caller may export - and download the complete mbox/ndjson of - ANY mailbox. Audited: `data_export.requested`;
+   `data_export.downloaded` (new) for any download by someone who isn't the mailbox owner. This is the one place message-level content reaches a plain trusted role. Stricter options: require the request
+   to carry a matter/approval, or make it owner-only and let an admin impersonate.
+2. `DataSubjectErasureRequest`: a trusted caller approves/denies/executes erasure of any mailbox - destroys data, exposes none. Audited (`erasure_request.*`).
+3. `EscrowAuditLog`/`EscrowScope`: trusted reads the hash-chained escrow audit and configures scopes - metadata and keys' public halves only.
+4. **Quarantine / IngestQueue entries** with `?scope=admin`: envelope from/to, reason, error text, blob key of any mailbox's held/pending mail - not the content (no route serves `rawBlobKey`). Audited per call.
+5. Sharing (`MailboxAccess`) admin path above, `MailboxImportRequest` list (`find`/`findById` show a trusted caller who imported what where - metadata) and `DirectoryRoute.search` (the org address book, not private).
+6. Not cross-mailbox: `EscrowAccessRequest`/`Matter*`/eDiscovery are gated by escrow-scope holdership (`requireEscrowHolder()`, never a trusted role) with dual control.
+7. System jobs (`ScanQueueJob`, `ScheduledSendJob`, retention, erasure, imports, exports) run as the system - unaffected.
+
+### Outside this repo (read-only, reported)
+
+`activesync` (`SyncCommand`, `ItemOperationsCommand`, `MoveItemsCommand`, `PingCommand`, `SearchCommand`, `GetItemEstimateCommand`, `MeetingResponseCommand`, `ComposeMailCommand`: ~25 direct
+`aclUtils.hasPermission(ctx.user, folderUid, ...)` calls on client-supplied folder ids) and `booking-plugin` (`BaseBookingProfileRoute`, `BaseBookingTypeRoute`) still call the framework directly, so a caller with
+a trusted role in the token they authenticate with could reach other users' folders through them; they resolve the caller's own mailbox by `ownerUserUid` (as does `mapi`), and an EAS/MAPI device signs in with
+its user's normal token (no trusted role), so this is latent, not the reported leak. They should switch to `hasMailAccess()` (exported from `@rapidmx/restapi`) in their next release.
+
+### Tests
+
+New: `test/routes/mailAccessMatrixSuite.ts` (+ `{mongo,sql}/MailAccessMatrix.test.ts`: 6 personas x every case per backend: owner, read delegate, write delegate, unrelated user, elevated admin, impersonation
+token), `mailAdminScopeSuite.ts` (scope=admin, admin management, Sharing, quarantine/ingest admin, data export), `mailAccessRouteTable.ts` + `mailAccessGuard.test.ts` (route table, matrix coverage, no direct
+`hasPermission`, trusted-role uses listed), `test/push/MailPushAccess.test.ts`, `test/util/MailAccessUtils.test.ts`. Changed because they encoded "trusted sees everything" (each still tests its point):
+`MailboxRoute` (admin list/count/read -> own-only + `?scope=admin`; ownerless create -> creator grant; eager folders read as the owner; keyDiscoveryHash read back as the owner; other user's mailbox 403 -> 404),
+`MailAuthzRound3/4` suites + `verificationSealSuite` (an admin exercising trusted-only field privileges now holds an explicit grant), `mailboxAccessSecuritySuite` (admin reads the version via
+`?scope=admin`; trusted role -> `access/me` all-false; missing mailbox -> all-false; own-record change by a trusted manager), `KeyLookup`/`keyTrust`/`keyResolve` (missing mailbox 404 -> 403),
+`MailboxImportRequest` (admin import needs a grant; 404 -> 403), `Quarantine`/`IngestQueue` (admin list -> `?scope=admin`, audited), `CalendarShareLink` (the two "fails open when the folder ACL is
+missing" tests reached it through the trusted bypass; they now mock the permission check to simulate the race), `MessageRoute` (admin content read -> 404; a delegate admin is still audited),
+`MailPushRoute` ("no overrides" -> the two overrides).
+
+### 2026-09-21 (later) - a shared mailbox grant stored against a username matched nobody: sharing now RESOLVES the principal and stores only a user uid
+
+**Live example.** The ACL of the ownerless mailbox `hello@powerlevel.gg` ("Support") was `{ uid: "hello@powerlevel.gg", parentUid: "Mailbox", records: [{ userOrRoleId: "jean-philippe", actions: ["read","list","count","exists"] }] }` - the grant was stored against the USERNAME the
+admin typed into the console's Sharing form (it wrote it through the generic `/acls`, verbatim), not JP's uid (`94337e42-...`). An ACL record matches only a token's uid or a role of that name, so it could never apply: the mailbox only ever showed up because a trusted token bypassed ACLs -
+which the privacy fix removes, so it became visible as a bug. Fix, in both write paths:
+- `BaseMailboxAccessRoute.setMember` (`PUT /mail/mailboxes/:id/access/:principal`): the path segment is now a PRINCIPAL resolved by `resolvePrincipal()`: the caller's own uid or configured username (`mail:auto_provision:static_aliases`, for a deployment with no auth-server) -> the caller;
+  a uid -> itself if it owns a mailbox here, or (caller's cookie) auth-server holds an alias for it; an address with a@b -> that mailbox's owner (primary/alias/uid; an ownerless mailbox names nobody); else a username/e-mail alias ->
+  `GET {mail:auth_server_url}/api/aliases?alias=<x>&limit=10` with the caller's `jwt` cookie, keeping a verified entry whose alias matches exactly (case-insensitively) and whose `userUid` is UUID-shaped. Verified against `rapidrest/auth`'s `BaseAliasRoute.find()`: an ordinary caller is only ever
+  listed their OWN aliases (`userUid` forced to theirs), a trusted (elevated) caller everybody's - so an administrator resolves anyone's username/e-mail alias, a user can name themselves, and a user can name anybody else by mailbox address or uid (the Settings page's existing address lookup). ONLY the resolved lowercase uid is stored; anything unresolvable is
+  400 `No user found for "<x>".`; an unreachable/erroring auth-server is 502 (never a guess). A uid that already has a record on this mailbox needs no second lookup (role changes still work). No compatibility trick lets a username match a uid: existing bad grants are re-created through the fixed flow.
+- `GET /mail/mailboxes/:id/access/resolve?principal=` (new; same standing as listing members, rate limited like `lookup-by-email`): `{ userUid, displayName?, address? }` or 404 - for a sharing screen to show the person (name + address) before saving.
+- `listMembers` marks a member whose id is not a user uid (and not `.*`/`*`/`anonymous`/`share:<token>`) with `noEffect: true` - a role of that name is the only thing it can match - so the UI can flag it ("has no effect - replace or remove"); the fix is PUT the resolved user, DELETE the string (`DELETE` matches the stored string exactly).
+- `/api/acls` (server `BaseGuardedACLRoute`): a create/update/updateProperty/updateBulk of a MAIL ACL whose records name a principal that is not a lowercase user uid, unless that exact id is already stored on the ACL, is 400 `No user found for "<x>".`.
+- `GET`/`findById` of a mailbox now carries `accessRole: "owner" | "delegate"` (computed on the way out; dropped from create/update bodies) so a client can label the ones shared with the caller; the admin scope answer has `shared` instead.
+- **Places that accept a principal string (10):** (1) `PUT /mail/mailboxes/:id/access/:principal` (resolved); (2) `DELETE .../access/:principal` (matches a stored string exactly - needed to remove a bad one; writes nothing); (3) `GET .../access/resolve?principal=` (read-only); (4) `GET /mail/mailboxes/lookup-by-email` (address -> owner uid; read-only); (5) `/api/acls` create/update/updateProperty/updateBulk (server; mail ACLs validated, other ACLs unchanged);
+  (6) `POST`/`PUT /mail/mailboxes` `ownerUserUid` (`parseOwnerUserUid`: UUID-shaped only, trusted only) which writes the owner's ACL record; (7) the console's new-mailbox form's "Owner user uid" (goes through 6); (8) `BaseCalendarShareLinkRoute` (`share:<token>` records, minted by the server, no client string); (9) `moveOwnerAcl`/`grantCreator` (server-derived from `ownerUserUid`/the caller's uid);
+  (10) escrow `holderUserUids`/matter custodians (not ACL records; unrelated to mailbox access). Only (1) and (5) could store a client-supplied string in an ACL; both now resolve or validate.
+- Tests (Mongo and SQL, `mailPrincipalSuite.ts`): grant by address / alias address / uid (upper- and lowercase) / username / e-mail alias / own configured username; the uid is what is stored; a delegate then sees the mailbox with a non-elevated token, labelled `delegate` (owner: `owner`); an administrator with no mailbox adds themselves by uid and by username;
+  unresolvable names, an unverified alias, an unknown uid and an ownerless mailbox's own address are 400 with nothing stored; no cookie / unreachable / erroring / malformed identity service; `resolve` (200/404/400/403); the live `hello@` shape (`jean-philippe` flagged `noEffect`, replaced through PUT + DELETE, the real grantee unaffected); revoking removes the mailbox again. Existing sharing tests now grant to KNOWN users (they own a mailbox) and expect `No user found` instead of "Access can only be granted to a user".
+
+## 2026-09-21 — Every mailbox has every well-known folder, and folder events (R3, task A)
+
+Trigger (JP's screenshot + live Mongo): a brand-new account showed only Inbox/Drafts/Deleted Items after its first e-mail was sent - Outbox and Sent Items
+were created lazily at that send (`findOrCreateWellKnownFolder()`) and the open client was never told; the shared mailbox `hello@` had only
+`calendar, contacts, drafts, inbox, tasks`. (Deleted Items was never created by this library at all - a client made it.)
+
+- **Well-known set** (`util/FolderUtils.ts`, `WELL_KNOWN_FOLDER_TYPES` - every `FolderType` but `USER`): inbox, drafts, outbox, sent_items, deleted_items, junk,
+  archive, calendar, contacts, tasks, notes - 11 folders, created in that order (so `dateCreated` reads Inbox first). Names from `DEFAULT_FOLDER_NAMES`
+  ("Junk Email", "Sent Items", ...). Uids stay `wellKnownFolderUid(mailboxUid, type)`.
+- **`ensureWellKnownFolders(folderRepo, folderClass, mailboxUid, user?)`**: ONE uncached existence query (`{ mailboxUid: literal, type: [all 11], limit }` - an array
+  value is an OR on both backends), then `findOrCreateWellKnownFolder()` for each missing type, so it inherits the existing race safety (deterministic uid + unique
+  index, ACL repair). A complete mailbox costs the one query and writes nothing. `BaseMailboxRoute.create()` calls it (was: 5 hand-picked `findOrCreate...` calls;
+  `create()` is also the only path for auto-provisioning - `autoProvision` is just `POST /` under the policy). Nothing else creates mailboxes (import needs an
+  existing mailbox; the server package has no creation path).
+- **Heal on read** (`BaseFolderRoute.healWellKnownFolders()`): `find()` (after its `hasMailAccess(LIST)` check, before the query, so the answer includes what was created) and
+  `findById()` (only when the caller may LIST the folder's whole mailbox - a folder-only share heals nothing). Best-effort: a failure is logged and the read goes on.
+  Called WITHOUT `user`: `RepoUtils.create()` grants a non-trusted creator on the new record's ACL, so passing a delegate's user would have handed a read-only delegate
+  FULL on every healed folder (the suite proves a READ delegate cannot rename a healed folder). `BaseMailboxRoute.create()` still passes its caller (owner/creator), as before.
+  Nothing is created for a mailbox the caller has no access to (stranger, trusted+elevated admin without a grant, nonexistent mailbox - all tested).
+- **Events, and where each comes from**: `RepoUtils.create()` already publishes `{ type: <class name>, action: "create", data: <record> }` on `[folder.uid, ...options.pushChannels]`
+  through its own injected `NotificationUtils` - nobody listens on a brand-new folder's own channel, which is why lazy creation was silent. So `createWellKnownFolder()` now passes
+  `pushChannels: [mailboxUid]`: every creation path (mailbox create, heal, and the lazy ones in `ScanQueueJob`, `ScheduledSendJob`, `BaseMessageRoute`, `ContactKeyUtils`,
+  `DeliveryFailureNoticeUtils` - all through `findOrCreateWellKnownFolder()`) announces on both channels with no change at any call site. A lost race publishes nothing (its insert
+  throws before `RepoUtils` publishes; the winner's did) - proven by 6 concurrent `GET /folders` on an empty mailbox ending with 11 folders and exactly 11 create events. The
+  route's client `POST /folders` is unchanged (RepoUtils -> folder channel, the route -> mailbox channel). New in `BaseFolderRoute`: `update`/`updateBulk`/`updateProperty` publish
+  `{ action: "update", data: <whole folder, derived counts> }` on the mailbox's channel (RepoUtils only published it on the folder's own), and `delete` publishes
+  `{ action: "delete", data: { uid, mailboxUid, version } }` there (reads the folder first: it is gone by the time RepoUtils publishes its own `{ uid, version }`). The counts-only
+  update event (`FolderCountUtils`) is unchanged. Bulk `truncate` is not published (a mailbox user can't call it - `mailUser()`).
+- **A latent race in `findOrCreateWellKnownFolder()`, found by the concurrency test (1 run in ~40)**: when a concurrent create won and the loser's type lookup didn't see the winner's row yet, the
+  loser found the row by uid on its next look and treated it as "a soft-deleted folder holds the deterministic uid" - creating a SECOND folder of that type under a random uid (a mailbox with two
+  Notes). It now uses that row when it is live (`deleted !== true`) and falls back to a random uid only for a really soft-deleted holder. 150 concurrent-read iterations on Mongo: no duplicates.
+- **Existing tests that legitimately changed**: `GET /folders` for a mailbox with no folders is no longer `[]` (it lists the 11): `FolderRoute` (mongo+sql) "Owner can list folders"
+  (1 -> 12: the user folder + 11), `folderCountsSuite` "empty mailbox" (now 11 zero-count folders, still one grouped query) and "one grouped query" (1/25 -> 11/35 folders),
+  `MailboxRoute` "eagerly provisions" (5 -> 11 types - note it reads through the route, so it would pass even without eager creation; `WellKnownFolders` reads the raw rows).
+- **Tests**: `test/routes/wellKnownFoldersSuite.ts` + `{mongo,sql}/WellKnownFolders.test.ts` (creation by an admin for an owner and for a shared mailbox, heal via list and by id, idempotency,
+  concurrency, delegate, stranger, admin, missing mailbox, lazy/client create, rename/bulk/property/delete events), `FolderUtils.test.ts` (`ensureWellKnownFolders` on a mock repo), `BaseFolderRoute.test.ts`.
+- **For the web client (W-D)**: the client used to create its own Deleted Items (that is where `arthur@`'s came from) - after this it exists, so it must not POST a second one (duplicates of a
+  well-known type already exist in the wild; `findOrCreateWellKnownFolder()` returns the oldest, so a second one is invisible to the server but shows twice in the tree).
+- **Shared-test-infrastructure warning**: every `test/routes/mongo/*.test.ts` starts its own mongod on port 9999, and every SQL test uses the same better-sqlite3 FILE (`rrst-test`, relative to the
+  restapi cwd, see `sqlDatastoreConfig()`). Two agents running suites at once in this repo therefore collide (a `clear()` in one wipes the other's rows: sporadic 403/500/404 in unrelated SQL
+  tests, a different set each run). Re-run the file alone; consider a per-run database name.
+
+## 2026-09-21 — Signing-certificate status, progress and check-now (R3, task B)
+
+JP: "There should be a progress bar and status shown for the digital signature cert with a button to check/update the status." `GET .../sign-enrollment/:enrollmentId` said only `pending`.
+
+- **Where the state lives** (correction to the brief): the RFC 8823 enrollment records are NOT in Mongo/SQL - `Rfc8823AcmeSigningCertificateEnrollment` keeps them in a JSON file
+  (`enrollments.json` in `mail:pki:rfc8823:store_dir`, `FileStoreUtils`), like the manual CA's. The stage timestamps went onto that record (all optional, so an old record reads correctly:
+  `updatedAt`, `challengeReceivedAt`, `finalizedAt`, `issuedAt`, `failedAt`, `errorCode`, `retryable`, `orderExpires`, `orderStatus`, `lastCheckedAt`, `lastForcedCheckAt`, `lastError`). The route tests run
+  on Mongo and SQL (the mailbox/ACL side) with the real enrollment on a temp store and a fake `acme-client` `Client` (`test/pki/acmeTestDoubles.ts`).
+- **Stage machine** (`pki/EnrollmentStages.ts`, pure, `test/pki/EnrollmentStages.test.ts`), the sequence as the code really runs it: submitted (`startEnrollment` opened the order) ->
+  awaiting-challenge (until `recordChallengeToken()` stores the CA's e-mail token - `challengeReceivedAt`) -> challenge-answered (until `advanceEnrollment` sent the reply + `completeChallenge()` -
+  `replySentAt`) -> validating (polling `getOrder()` until `ready`, then `finalizeOrder()` - `finalizedAt`) -> issuing (order `processing`, until `valid` + `getCertificate()` - `issuedAt`) -> issued.
+  A stage is done when its milestone or any later one is; a failed enrollment fails in the stage it reached (an issued-then-cancelled one on the last, progress capped at 90). `progress`: 15/40/60/85/100.
+- **Failure classification** (`retryable` = a new request could succeed): ACME problem types `rejectedIdentifier|unsupportedIdentifier|caa|badCSR|badPublicKey|...` -> `rejected`, not retryable;
+  `unauthorized|incorrectResponse` -> `challenge-failed`; `serverInternal|rateLimited|connection|dns|tls` -> `ca-error`; anything else `order-invalid`; local `order-expired` and `cancelled`.
+  The old free-text `error` (JSON of the ACME problem) is unchanged. Attempts that throw while still pending (CA unreachable, reply not relayed, `completeChallenge` refused) are stored as `lastError`
+  and shown as `errorCode` `ca-unreachable|reply-not-sent|rate-limited|ca-error` + `retryable: true` + `note`, cleared by the next step that succeeds; `advanceEnrollment()` still rethrows so the job logs as before.
+- **Expiry** (was: a request whose challenge e-mail never came stayed pending forever): the CA's `order.expires` is stored at start (and refreshed from `getOrder()`); past it - or, with none,
+  `createdAt + mail:pki:rfc8823:max_pending_hours` (168) - a still-waiting request fails `order-expired`, retryable, with no CA call. An order already being finalized is never expired locally.
+- **Check-now** (`checkNow()`, `POST .../:enrollmentId/check`): one `advance` (the job's own step) and, if that step was answering the challenge, one more (the poll the job would leave to the next tick);
+  while the e-mail is still awaited it also peeks at the order (`peekOrder`) so a request the CA already gave up on is noticed - the background tick doesn't do that (unchanged: no CA call without a digest).
+  Rate limit is in the record (`lastForcedCheckAt`), so it holds across replicas and restarts: 429 with `retryAfterSeconds` on the error, which the route turns into `Retry-After`; only pending
+  enrollments are limited/checked. The wait is bounded by `Promise.race` against 8 s: the step keeps running (the per-enrollment lock serializes it) and the answer carries a `note`. A CA problem never
+  throws out of it. The route requires READ on the mailbox (owner or delegate - `requireMailboxAccess`, no trusted bypass), like the status endpoints; start/cancel stay owner-only.
+- **Current enrollment** (`GET .../sign-enrollment`): `listEnrollments()` (metadata only) filtered with the existing `enrollmentBelongsTo()` (recorded mailbox uid, else address), the newest in-flight one
+  (pending, or issued and not installed), else the newest. 404 for none; the Null default has an empty list (so 404, not its usual 500); an implementation without the method also 404s.
+- **Not done here / limits**: nothing installs the certificate on a check - `AcmeEnrollmentDriverJob` does that on its next tick (<= 5 min), so a client sees `issued` before `installedAt`
+  (documented; `installedAt` is in the response). `nextCheckAt` is `lastCheckedAt + mail:pki:rfc8823:poll_interval_seconds` (300) - an estimate tied to that config matching the job's cron,
+  and a past value means due. The 8 s bound is not configurable from the route (an option on `checkNow()`). Slow-CA behavior is tested at the class level only (a route test would wait 8 s).
+- Manual CA: `describeProgress()` = one active stage (waiting for an administrator to upload), then issued/failed; no `checkNow` (the route answers with the current status), no `nextCheckAt`.
+
+### 2026-09-21 - HTML mail keeps its design: a faithful-but-safe sanitizer (R4)
+
+Not committed. **Defect:** `ScanPipeline.sanitize()` called `sanitize-html` with its default attribute allow-list, so every stored HTML mail was an unstyled skeleton - no `<img>` (inline `cid:` images
+gone), no `<style>`, `style`, `class`, `bgcolor`, `color`, `face`, `width`, `cellpadding`... JP's rule: mail renders faithfully to its HTML including styling, safely, no JS. The reading pane (web-client,
+NOTES 2026-09-21) sandboxes and re-sanitizes, but can only show what the server stored.
+
+- **Threat model.** The HTML is written by an attacker. Goals to stop: script execution (tags, `on*`, `javascript:`/`vbscript:`/`data:` URLs, CSS `expression()`/`behavior`/`-moz-binding`, mXSS through
+  namespace/`noscript`/`<style>` re-parsing), navigation and exfiltration (`meta refresh`, `base`, `form`, `iframe`, `link`, `@import`, `@font-face`, `url()` to anything not an image), overlay/clickjacking
+  (`position: fixed|absolute|sticky`, `z-index`), DOM clobbering (`name`, `id`), tracking that the client would follow, and denial of service (5 MB of CSS, 50,000-deep nesting, 5 MB attributes). Defence in depth: this sanitizer
+  is layer 1 of 4 and relies on none of the others (client: DOMPurify + hardening pass, CSP, sandbox without `allow-scripts`).
+- **Design: re-serialize, never copy.** `scan/HtmlSanitizer.ts` walks `htmlparser2`'s events and writes the output itself: allow-listed elements only, each attribute value validated and rewritten to a canonical
+  form, text/attribute escaping, every tag closed. Whatever a browser would parse differently in the *input* does not matter; the output has no raw-text elements (`script`, `textarea`, `title`, `xmp`, `noscript`
+  are dropped; `style` is written from tokens with `<` escaped to `\3c `) and never `svg`/`math`, so there is nothing to mutate. Dropped-with-content vs unwrapped (tag removed, text kept) is the split in the
+  README table; unknown/custom/namespaced elements and form wrappers unwrap. A run that unwrapped an element repeats on its own output until nothing is unwrapped (max 3 passes) - removing an element can change
+  how the rest nests (`<p>` in `<p>`), and this keeps `sanitize(sanitize(x)) === sanitize(x)`, proven on both corpora and 300 random inputs. Output is a full document (`<!DOCTYPE html><html><head>[meta
+  color-scheme][style...]</head><body attrs>...</body></html>`): every `<style>` moves to the head, the first `<html>`/`<body>` attributes are kept (a template's `bgcolor` lives there), comments (Outlook `[if mso]`)
+  are dropped, `<!--[if !mso]><!-->` content stays (a non-Outlook client shows it).
+- **CSS (`scan/CssSanitizer.ts`), and the library choice.** `css-tree` is not installed; `postcss` (via `sanitize-html`) and `lightningcss` (dev-only native) were evaluated. A stylesheet parser is only half the job:
+  what the sanitizer checks must be what the browser reads, so every value needs a CSS-Syntax tokenizer (escapes decoded, comments removed) anyway, and the output has to be re-serialized from those tokens. So a
+  ~900-line purpose-built tokenizer/parser/serializer (`tokenizeCss`, `serializeCssTokens`) does all of it, with no dependency: `u\72l(javascript:x)`, `expr/**/ession(` and `\75rl(` are `url(javascript:x)` and
+  `expression(` by the time they are checked. Rules: property allow-list (README), function allow-list (colours, `calc`/`min`/`max`/`clamp`, gradients; anything else - `var()`, `image-set()`, `attr()`,
+  `expression()` - refuses the declaration), `url()` only `cid:`/small raster `data:`/`http(s)` and only on `background*`/`list-style*`, `display`/`position`/`overflow` value checks, `!important` kept,
+  `@media` kept (3 levels, plain media queries only), every other at-rule dropped, selectors re-serialized (ID selectors renamed with the `m-` prefix the `id` attributes get, pseudo functions allow-listed),
+  syntax errors dropped rule by rule, `<!--`/`-->` ignored. Budget across all `<style>` blocks: `max_css_bytes`, `max_css_rules`; input beyond 4x the byte budget is not even tokenized. Style text with a
+  control character in a name (`\9` hacks) is refused. `mso-*` and vendor-only properties drop as not in the list.
+- **URLs (`scan/MailUrlRules.ts`).** Tabs/newlines/control characters are removed before the scheme is read (as a browser does), the canonical form is what is written. Links: `http(s)`, `mailto`, `tel`; relative,
+  protocol-relative and `#fragment` links lose the `href` (a link in an `about:srcdoc` frame goes nowhere) and keep their text; every link gets `target=_blank rel="noopener noreferrer nofollow"`. Images: `cid:`,
+  `data:image/(png|jpeg|gif|webp|avif);base64` up to `max_data_image_bytes` (measured decoded), `http(s)` verbatim (not proxied here; the client's CSP does not load them). `cid:` tokens are restricted to
+  `[A-Za-z0-9._~@+=!$*/-]{1,256}`, which is what lets the serving step find them again with a regex.
+- **Decisions.** (1) `id` is prefixed `m-`, not dropped: MailChimp-style templates style through `#templateHeader`; selectors are renamed the same way; prefix is not re-added (idempotent). (2) `noscript` content is
+  dropped (it is usually a tracking pixel fallback); `form`/`button`/`label` unwrap (an ASP.NET page is one big `<form>`). (3) `<meta name=color-scheme>` is the only meta kept, so a dark-aware mail is
+  recognised by the reading pane. (4) `allowed_tags`: an empty list now means "all"; the tests' config set `[]`, which with sanitize-html had silently meant "no tags"; the list restricts, never adds. (5) The version is a stamp
+  **inside the blob** (`<!--rapidmx-sanitized:2-->` in front), not a model field: no Mongo/SQL model change, nothing to keep in step across `ScanQueueJob` (2 sites), `MailboxImportJob`, `MailSendUtils`,
+  `ScheduledSendJob` and `BaseMessageRoute.send()` (which all just store `result.sanitizedHtml`), and the version travels atomically with the content; a blob without a stamp is version 0. (6) mailparser is called with
+  `skipImageLinks` (by default it rewrites every `cid:` image in the HTML to a `data:` URI of the whole image - which the size cap would then drop) and `skipHtmlToText` (its own HTML-to-text put the stylesheet and
+  the preheader in `parsed.text`, which is what the preview used); `bodyPreview` for HTML-only mail is now `scan/HtmlPreview.ts` (own extractor over the same parser: skips `style`/`head`/scripts/hidden
+  preheaders, stops after ~560 characters; 200 KB: 0.4 ms vs ~5 ms for `html-to-text`). `html-to-text` stays (search extraction, transport rules use it).
+- **Attachments' `contentId`** was stored with the header's angle brackets (`<logo@x>`); the HTML says `cid:logo@x`. `ScanPipeline` now stores it without them (new mail); old rows keep theirs and the serving lookup
+  ignores brackets and case.
+- **Serving (`GET /messages/:id/content`, `scan/SanitizedBody.ts`, small edits in `BaseMessageRoute.content()`; authorization untouched - R2's).** `SanitizedBodyLoader.load()` reads the blob; a version below
+  `SANITIZER_VERSION` is re-sanitized from `bodyBlobKey` (`ScanPipeline.sanitizeRaw()`: parse + sanitize, no rspamd/ClamAV), overwriting the blob. Race-safety: pure function of the raw MIME, so concurrent
+  writers write identical bytes; `put` is an atomic replace on the local FS and S3; one shared promise per blob key in a process; the blob is only replaced if it still exists (an erased message is not resurrected;
+  narrow window remains between `exists` and `put`). Bounds: `lazy_max_raw_bytes` (16 MiB), `lazy_timeout_ms` (10 s; the run finishes in the background), failures remembered 5 minutes (max 2000). Failure never fails the
+  request: the stored HTML is served. Then `pointInlineImages()`: `?cid=attachment` rewrites each known reference to `<attachment_url_prefix>/<uid>/content`, `?cid=keep` leaves it `cid:`, default by
+  `Sec-Fetch-Dest` (`empty` = fetch() = keep; else attachment); unknown references lose the `src`/`url()` (`none`). CSP header `img-src data: 'self'` (was `data: cid:`). `attachmentClass` is a new optional
+  hook on `BaseMessageRoute`, set by `MessageRouteMongo`/`SQL` (downstream subclasses without it just have no inline attachments to resolve).
+- **Client compatibility (read from `web-client/.../reading/{bodyHtml,safeDocument,frameDocument}.ts`, `react-shared/mail/messageBodySanitizer.ts`).** Everything the client keeps it gets: `cid:` on `<img>`
+  (resolved by `makeCidResolver` against `Attachment.contentId`, which is why `keep` mode and unbracketed ids exist), `data:` images, `<meta name=color-scheme>`, `@media (prefers-color-scheme)`, `<body>`
+  `bgcolor/text/link/style/class/dir`, head `<style>`s, `http(s)`/`mailto`/`tel` links. **What the client strips that the server now emits usefully:** (a) every `http(s)` image, `background` and CSS `url()` (its
+  DOMPurify hook keeps only `data:`/`cid:`) - kept by the server for a future "load remote images" affordance, currently shown as nothing; (b) `cid:` in a CSS `url()` or a `background` attribute is not
+  resolved by `hardenImage()` (only `<img src>` is) and `frameCsp` allows only `data:` and the attachment prefix, so inline background images do not show; (c) a server-rewritten `/api/mail/attachments/<uid>/content`
+  `src` (`?cid=attachment`) would be removed by `hardenImage()` - the reading pane must use `?cid=keep` or a `fetch()` (it does by default: `Sec-Fetch-Dest: empty`); (d) `makeCidResolver` compares `contentId`
+  exactly - rows written before this change carry brackets (`<logo@x>`), so the client should strip them when comparing; (e) the served document is now a full page (`<html><head><style>...`), which its
+  `DOMParser` path handles, but a reply-quote of `/content` should take the body. The client's `id` hardening finds nothing to strip (ids already `m-`-prefixed).
+- **Proof.** Unit: 127 hostile payloads (`test/scan/fixtures/mailCorpus.ts`: OWASP evasions, entity/CSS-escape obfuscation, mXSS `svg`/`math`/`noscript`, `srcset`, `@import`, `expression()`, `meta refresh`,
+  `base`, `form`, `iframe srcdoc`, `object data:`, `link`, unclosed tags, 20,000-deep nesting, 5 MB CSS/attribute, 30,000 rules, 100,000 elements) all pass `test/scan/fixtures/inert.ts` (an independent re-parse
+  that lists any non-allow-listed element/attribute, URL or CSS hazard), in under a second each, idempotent; 7 design fixtures (plain reply, Gmail, Apple Mail, Outlook/Word with conditional comments and mso
+  styles, MailChimp-style newsletter, dark-mode newsletter, legacy font/center page) keep their colours, fonts, layout and images. **Real browser (Edge via Playwright, a throwaway script, not kept):** the
+  sanitized 127 payloads, in an iframe with `sandbox="allow-scripts allow-same-origin"` and *no CSP* (worst case) and in the reading pane's own configuration (no scripts + its CSP), with `window.__pwned`
+  and `alert` canaries, a dialog/popup/navigation/request watch and DOM checks: 127/127 inert in both, 0 requests with the CSP (3 payloads request their remote images without it, by design), no
+  script/iframe/object/form/svg/handler/`fixed`-position element in any rendered document; harness self-check: 5 of 6 raw (unsanitized) canary payloads fire (the sixth needs a click); the 7 design fixtures render with
+  their computed background/font colours.
+- **Measured** (this machine, 200 KB table-layout newsletter, median of 20): old `sanitize-html` 5.3 ms, new `sanitizeMailHtml` 4.9 ms; 184 KB Word-style (`o:p`, second pass): 4.4 vs 6.1 ms; the preview 5.0 vs
+  0.4 ms. (An earlier build of this run was 3x slower until `<head>` stopped forcing a second pass and repeated `style` values were memoized.)
+- **Known gaps.** No proxy for remote images (kept verbatim; blocked by the client CSP); `<svg>`/`<math>` mail (some icon sets) is dropped; a `background` `cid:` inside CSS needs a client change; `mso-` conditional
+  content is dropped in full (correct for non-Outlook readers); `position: absolute` layouts flatten; CSS custom properties/`var()` and `@supports` are dropped; `@media` range syntax (`width <= 600px`)
+  is dropped; `?cid=attachment` in a browser tab under `sandbox` CSP loads attachments only if the browser sends the session cookie for a sandboxed document's same-origin subresource (not verified in a browser - the
+  reading pane does not use it); an erasure racing a re-sanitization can leave the window described above; `sanitizeRaw()` parses the whole raw MIME (bounded by `lazy_max_raw_bytes`) though only the HTML is needed.
+- Files: new `src/scan/{HtmlSanitizer,CssSanitizer,MailUrlRules,HtmlPreview,SanitizedBody}.ts`; changed `src/scan/ScanPipeline.ts` (config, `parse()`, `sanitizeRaw()`, `contentId`, preview),
+  `src/routes/BaseMessageRoute.ts` (`content()` + `sanitizedHtmlOf()`, `attachmentClass`, 3 `@Config`), `src/routes/{mongo/MessageRouteMongo,sql/MessageRouteSQL}.ts` (`attachmentClass`), `package.json`/`yarn.lock`
+  (`htmlparser2`); tests `test/scan/{HtmlSanitizer,CssSanitizer,MailUrlRules,HtmlPreview,SanitizedBody}.test.ts`, `test/scan/fixtures/{mailCorpus,inert}.ts`, `test/scan/ScanPipeline.test.ts`,
+  `test/routes/sanitizedContentSuite.ts` + `{mongo,sql}/MessageSanitizedContent.test.ts`, `test/jobs/htmlMailSuite.ts` (+2 calls in `ScanQueueJob{Mongo,SQL}.test.ts`), `test/routes/mailAuthzRound3Suite.ts` (one CSP string).

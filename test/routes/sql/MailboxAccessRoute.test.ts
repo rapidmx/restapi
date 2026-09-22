@@ -78,9 +78,16 @@ describe("Route:MailboxAccessSQL Tests", () => {
         await objectFactory.destroy();
     });
 
+    // The users these tests grant access to are known to the server - each owns a mailbox here.
+    const seedKnownUsers = async (): Promise<void> => {
+        await createMailbox({ ownerUserUid: otherUser.uid });
+        await createMailbox({ ownerUserUid: strangerUser.uid });
+    };
+
     beforeEach(async () => {
         await mailboxRepo.clear();
         await aclRepo.clear();
+        await seedKnownUsers();
     });
 
     describe("listMembers", () => {
@@ -228,11 +235,15 @@ describe("Route:MailboxAccessSQL Tests", () => {
     });
 
     describe("error paths", () => {
-        it("404s for a mailbox that doesn't exist.", async () => {
+        it("403s for a mailbox that doesn't exist (the same as for one the caller can't manage - it doesn't reveal which exist), 404s only for an administrator.", async () => {
             const result = await request(server.getApplication())
                 .get(`${baseUrl}/${uuid.v4()}/access`)
                 .set("Authorization", "jwt " + ownerToken);
-            expect(result.status).toBe(404);
+            expect(result.status).toBe(403);
+            const admin = await request(server.getApplication())
+                .get(`${baseUrl}/${uuid.v4()}/access`)
+                .set("Authorization", "jwt " + JWTUtils.createTokenSync(config.get("auth"), { uid: uuid.v4(), roles: ["admin"], scopes: [], elevated: Date.now() }));
+            expect(admin.status).toBe(404);
         });
 
         it("500s for a mailbox with no ACL document, which every mailbox is seeded with on creation.", async () => {

@@ -208,14 +208,19 @@ describe("Route:MailboxMongo Tests", () => {
         expectMatchingFields(result.body, obj);
     });
 
-    it("A different authenticated user cannot read someone else's mailbox by id (record-level ACL denies it, native 403).", async () => {
+    it("A different authenticated user cannot read someone else's mailbox by id - 404, exactly as for a mailbox that doesn't exist, so the answer reveals no address.", async () => {
         const obj = await createMailboxMongo();
 
         const result = await request(server.getApplication())
             .get(`${baseUrl}/${obj.uid}`)
             .set("Authorization", "jwt " + otherUserToken);
+        const missing = await request(server.getApplication())
+            .get(`${baseUrl}/${uuid.v4()}`)
+            .set("Authorization", "jwt " + otherUserToken);
 
-        expect(result.status).toBe(403);
+        expect(result.status).toBe(404);
+        expect(missing.status).toBe(404);
+        expect(result.body).toEqual(missing.body);
     });
 
     it("Does not audit an owner reading their own mailbox profile.", async () => {
@@ -230,18 +235,49 @@ describe("Route:MailboxMongo Tests", () => {
         expect(entries.some((e) => e.action === AuditAction.MAILBOX_ACCESSED)).toBe(false);
     });
 
-    it("Audits a trusted admin reading another user's mailbox profile.", async () => {
-        const obj = await createMailboxMongo();
+    it("A trusted admin cannot read another user's mailbox profile (404, like a mailbox that doesn't exist) - only `?scope=admin` shows its administrative metadata, audited.", async () => {
+        const obj = await createMailboxMongo({ oofMessage: "Away until Monday" });
+
+        const plain = await request(server.getApplication())
+            .get(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(plain.status).toBe(404);
+        const missing = await request(server.getApplication())
+            .get(`${baseUrl}/${uuid.v4()}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(missing.status).toBe(404);
+        expect(await auditLogRepo.find({ targetUid: obj.uid }).toArray()).toEqual([]);
 
         const result = await request(server.getApplication())
-            .get(`${baseUrl}/${obj.uid}`)
+            .get(`${baseUrl}/${obj.uid}?scope=admin`)
             .set("Authorization", "jwt " + adminToken);
 
         expect(result.status).toBe(200);
+        expect(result.body.primarySmtpAddress).toBe(obj.primarySmtpAddress);
+        expect(result.body.shared).toBe(false);
+        // Metadata only: nothing of the owner's own settings.
+        expect(result.body.oofMessage).toBeUndefined();
+        expect(result.body.keys).toBeUndefined();
         const entries = await auditLogRepo.find({ targetUid: obj.uid }).toArray();
         expect(entries.length).toBe(1);
-        expect(entries[0].action).toBe(AuditAction.MAILBOX_ACCESSED);
+        expect(entries[0].action).toBe(AuditAction.MAILBOX_ADMIN_READ);
         expect(entries[0].actorUserUid).toBe(admin.uid);
+    });
+
+    it("`?scope=admin` needs a trusted role (403 api-103) and an elevated token (403 api-104).", async () => {
+        const obj = await createMailboxMongo();
+        const ordinary = await request(server.getApplication())
+            .get(`${baseUrl}/${obj.uid}?scope=admin`)
+            .set("Authorization", "jwt " + ownerToken);
+        expect(ordinary.status).toBe(403);
+        expect(ordinary.body.code).toBe("api-103");
+
+        const unelevatedAdmin = JWTUtils.createTokenSync(config.get("auth"), { uid: admin.uid, roles: ["admin"], scopes: [] });
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}?scope=admin`)
+            .set("Authorization", "jwt " + unelevatedAdmin);
+        expect(result.status).toBe(403);
+        expect(result.body.code).toBe("api-104");
     });
 
     it("A different authenticated user's list of mailboxes does not include another user's mailbox.", async () => {
@@ -286,9 +322,15 @@ describe("Route:MailboxMongo Tests", () => {
             .set("Authorization", "jwt " + adminToken)
             .send({ uid: obj.uid, version: unrelatedUpdate.body.version, primarySmtpAddress: newAddress });
 
+        // An administrator with no grant is answered with metadata only - the hash is read back as the owner.
         expect(addressUpdate.status).toBe(200);
-        expect(addressUpdate.body.keyDiscoveryHash).toBe(computeKeyDiscoveryHash(newAddress.split("@")[0]));
-        expect(addressUpdate.body.keyDiscoveryHash).not.toBe(originalHash);
+        expect(addressUpdate.body.primarySmtpAddress).toBe(newAddress);
+        expect(addressUpdate.body.keyDiscoveryHash).toBeUndefined();
+        const stored = await request(server.getApplication())
+            .get(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken);
+        expect(stored.body.keyDiscoveryHash).toBe(computeKeyDiscoveryHash(newAddress.split("@")[0]));
+        expect(stored.body.keyDiscoveryHash).not.toBe(originalHash);
     });
 
     it("A different authenticated user cannot update someone else's mailbox.", async () => {
@@ -351,7 +393,10 @@ describe("Route:MailboxMongo Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.body.primarySmtpAddress).toBe(newAddress);
-        expect(result.body.keyDiscoveryHash).toBe(computeKeyDiscoveryHash(newAddress.split("@")[0]));
+        const stored = await request(server.getApplication())
+            .get(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken);
+        expect(stored.body.keyDiscoveryHash).toBe(computeKeyDiscoveryHash(newAddress.split("@")[0]));
     });
 
     it("Rejects renaming a mailbox's primarySmtpAddress to an address already used by an existing DistributionList (409) - previously let a self-service owner silently hijack a list's mail flow.", async () => {
@@ -467,7 +512,11 @@ describe("Route:MailboxMongo Tests", () => {
             .send([{ uid: obj.uid, version: obj.version, primarySmtpAddress: newAddress }]);
 
         expect(result.status).toBe(200);
-        expect(result.body[0].keyDiscoveryHash).toBe(computeKeyDiscoveryHash(newAddress.split("@")[0]));
+        expect(result.body[0].primarySmtpAddress).toBe(newAddress);
+        const stored = await request(server.getApplication())
+            .get(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken);
+        expect(stored.body.keyDiscoveryHash).toBe(computeKeyDiscoveryHash(newAddress.split("@")[0]));
     });
 
     it("Deleting a nonexistent mailbox returns 404.", async () => {
@@ -688,25 +737,54 @@ describe("Route:MailboxMongo Tests", () => {
         expect(names).toEqual(["Owner's own mailbox", "Shared Mailbox"]);
     });
 
-    it("A trusted (admin) caller's list includes every mailbox, not just their own.", async () => {
-        await createMailboxMongo({ displayName: "Owner's mailbox" });
+    it("A trusted (admin) caller's plain list is only their own and shared-with-them mailboxes - here none - and `?scope=admin` lists every mailbox as metadata, audited.", async () => {
+        await createMailboxMongo({ displayName: "Owner's mailbox", oofMessage: "Away" });
         await createMailboxMongo({ displayName: "Other user's mailbox" }, otherUser.uid);
 
-        const result = await request(server.getApplication())
+        const plain = await request(server.getApplication())
             .get(baseUrl)
+            .set("Authorization", "jwt " + adminToken);
+        expect(plain.status).toBe(200);
+        expect(plain.body).toEqual([]);
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}?scope=admin`)
             .set("Authorization", "jwt " + adminToken);
 
         expect(result.status).toBe(200);
         const names = result.body.map((m: any) => m.displayName).sort();
         expect(names).toEqual(["Other user's mailbox", "Owner's mailbox"]);
+        expect(result.body.every((m: any) => m.oofMessage === undefined && m.keys === undefined && typeof m.shared === "boolean")).toBe(true);
+        const entries = await auditLogRepo.find({ action: AuditAction.MAILBOX_ADMIN_LIST }).toArray();
+        expect(entries.length).toBe(1);
+        expect(entries[0].actorUserUid).toBe(admin.uid);
+        expect(entries[0].details.count).toBe(2);
     });
 
-    it("A trusted (admin) caller's count includes every mailbox, not just their own.", async () => {
+    it("`?scope=admin` can't be used to probe a field it doesn't show (filtering by the out-of-office text is ignored).", async () => {
+        await createMailboxMongo({ displayName: "Has OOF", oofMessage: "secret-oof" });
+        await createMailboxMongo({ displayName: "No OOF" }, otherUser.uid);
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}?scope=admin&oofMessage=secret-oof`)
+            .set("Authorization", "jwt " + adminToken);
+
+        expect(result.status).toBe(200);
+        expect(result.body.length).toBe(2);
+    });
+
+    it("A trusted (admin) caller's count is only their own and shared-with-them mailboxes, and every mailbox with `?scope=admin`.", async () => {
         await createMailboxMongo();
         await createMailboxMongo({}, otherUser.uid);
 
-        const result = await request(server.getApplication())
+        const plain = await request(server.getApplication())
             .head(baseUrl)
+            .set("Authorization", "jwt " + adminToken);
+        expect(plain.status).toBe(200);
+        expect(plain.headers["content-length"]).toBe("0");
+
+        const result = await request(server.getApplication())
+            .head(`${baseUrl}?scope=admin`)
             .set("Authorization", "jwt " + adminToken);
 
         expect(result.status).toBeGreaterThanOrEqual(200);
@@ -753,9 +831,14 @@ describe("Route:MailboxMongo Tests", () => {
         expect(result.status).toBeLessThan(300);
         expect(result.body.ownerUserUid == null).toBe(true);
 
-        // The admin who created it shouldn't be left with a stray self-grant on its ACL either.
+        // An administrator has no implicit access to any mailbox, so the one who creates a shared mailbox is granted it
+        // explicitly (full rights) - and appears in the list of "their" mailboxes.
         const acl: any = await aclRepo.findOne({ uid: result.body.uid } as any);
-        expect(acl?.records ?? []).toEqual([]);
+        expect(acl?.records ?? []).toEqual([{ userOrRoleId: admin.uid, actions: ["*"] }]);
+        const mine = await request(server.getApplication())
+            .get(baseUrl)
+            .set("Authorization", "jwt " + adminToken);
+        expect(mine.body.map((m: any) => m.uid)).toEqual([result.body.uid]);
     });
 
     it("Writes an AuditLogEntry when a trusted caller creates a mailbox (self-service creation isn't audited - see mailboxSelfServiceCreateSuite.ts).", async () => {
@@ -828,7 +911,7 @@ describe("Route:MailboxMongo Tests", () => {
         expectMatchingFields(result.body, obj);
     });
 
-    it("Creating a mailbox eagerly provisions its Inbox, Drafts, Calendar, Contacts, and Tasks folders (the webmail client needs each to render anything at all).", async () => {
+    it("Creating a mailbox eagerly provisions every well-known folder (the webmail client needs each to render anything at all).", async () => {
         const obj: MailboxMongo = new MailboxMongo({
             ownerUserUid: owner.uid,
             primarySmtpAddress: `${uuid.v4()}@example.com`,
@@ -849,11 +932,24 @@ describe("Route:MailboxMongo Tests", () => {
 
         const folders = await request(server.getApplication())
             .get(`/mongo/folders?mailboxUid=${result.body.uid}`)
-            .set("Authorization", "jwt " + adminToken);
+            .set("Authorization", "jwt " + ownerToken);
 
+        // Read as the mailbox's owner: the administrator who created it has no access to its folders.
         expect(folders.status).toBe(200);
         const types = folders.body.map((f: any) => f.type).sort();
-        expect(types).toEqual(["calendar", "contacts", "drafts", "inbox", "tasks"]);
+        expect(types).toEqual([
+            "archive",
+            "calendar",
+            "contacts",
+            "deleted_items",
+            "drafts",
+            "inbox",
+            "junk",
+            "notes",
+            "outbox",
+            "sent_items",
+            "tasks",
+        ]);
     });
 
     it("An admin can still create a mailbox for themselves like any other authenticated user.", async () => {

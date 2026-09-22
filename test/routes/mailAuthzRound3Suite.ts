@@ -62,6 +62,18 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
         await ctx.saveAcl({ uid: mailbox.uid, parentUid: "Mailbox", records: [{ userOrRoleId: ownerUid, actions: ["*"] }] });
         return mailbox;
     };
+
+    /** An administrator has no implicit access to anyone's mailbox: the tests of a trusted caller's own field privileges give the
+     * administrator an explicit full grant on the mailbox they act on. */
+    const grantAdmin = async (mailbox: any) =>
+        await ctx.saveAcl({
+            uid: mailbox.uid,
+            parentUid: "Mailbox",
+            records: [
+                { userOrRoleId: mailbox.ownerUserUid, actions: ["*"] },
+                { userOrRoleId: admin.uid, actions: ["*"] },
+            ],
+        });
     const createFolder = async (mailboxUid: string, type: FolderType = FolderType.INBOX) => {
         const folder = await ctx.save("Folder", { mailboxUid, name: type, type, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 });
         await ctx.saveAcl({ uid: folder.uid, parentUid: mailboxUid, records: [] });
@@ -199,7 +211,9 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
                 request(ctx.app()).get(url(`/folders?q=${q({ mailboxUid: mine.uid, $or: [{ mailboxUid: victim.uid }] })}`)),
                 owner,
             );
-            expect(folders.body.map((f: any) => f.mailboxUid)).toEqual([mine.uid]);
+            // Only `mine` - which lists its well-known folders (provisioned by the read) as well as the one made above - and never the victim's.
+            expect(folders.body.length).toBeGreaterThan(0);
+            expect(new Set(folders.body.map((f: any) => f.mailboxUid))).toEqual(new Set([mine.uid]));
         });
     });
 
@@ -287,6 +301,7 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
 
         it("a trusted caller can still set them", async () => {
             const mailbox = await createMailbox(owner.uid);
+            await grantAdmin(mailbox);
             const inbox = await createFolder(mailbox.uid);
             const message = await createMessage(mailbox, inbox.uid);
             const result = await auth(request(ctx.app()).put(url(`/messages/${message.uid}`)), admin).send({
@@ -657,7 +672,7 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
             const result = await auth(request(ctx.app()).get(url(`/messages/${message.uid}/content`)), owner);
             expect(result.status).toBe(200);
             expect(result.headers["x-content-type-options"]).toBe("nosniff");
-            expect(result.headers["content-security-policy"]).toBe("default-src 'none'; img-src data: cid:; style-src 'unsafe-inline'; sandbox");
+            expect(result.headers["content-security-policy"]).toBe("default-src 'none'; img-src data: 'self'; style-src 'unsafe-inline'; sandbox");
         });
     });
 
@@ -764,6 +779,7 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
 
         it("trusted callers keep full control of folder counters, message dates and folder creation input", async () => {
             const mailbox = await createMailbox(owner.uid);
+            await grantAdmin(mailbox);
             const folder = await createFolder(mailbox.uid, FolderType.USER);
             const counters = await auth(request(ctx.app()).put(url(`/folders/${folder.uid}`)), admin).send({
                 uid: folder.uid,

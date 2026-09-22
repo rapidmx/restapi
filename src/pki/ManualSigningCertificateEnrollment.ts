@@ -9,7 +9,8 @@ import * as x509 from "@peculiar/x509";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { readFileIfExists, updateJsonFile } from "./FileStoreUtils.js";
-import { EnrollmentBinding, EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
+import { computeManualStages } from "./EnrollmentStages.js";
+import { EnrollmentBinding, EnrollmentProgress, EnrollmentResult, EnrollmentSummary, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
 const { Config, Logger } = ObjectDecorators;
 
 x509.cryptoProvider.set(crypto);
@@ -21,6 +22,10 @@ interface PendingEnrollment {
     certificate?: string;
     error?: string;
     createdAt: string;
+    /** When the record last changed / the certificate was uploaded / the enrollment failed or was cancelled (ISO 8601). */
+    updatedAt?: string;
+    issuedAt?: string;
+    failedAt?: string;
 }
 
 /**
@@ -106,6 +111,38 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
         return { identity: enrollment.identity };
     }
 
+    /**
+     * A manual enrollment has one thing to wait for - an administrator obtaining the certificate from a CA by hand and uploading it
+     * (`uploadCertificate()`) - so it reports a single stage (`submitted`, active) until then, then `issued` or `failed`. There is no
+     * CA to poll, hence no `checkNow()` (the endpoint that would call it answers with this instead), no `nextCheckAt`, no `lastCheckedAt`.
+     */
+    public async describeProgress(enrollmentId: string): Promise<EnrollmentProgress> {
+        const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
+        const { stage, stages, progress } = computeManualStages(enrollment);
+        return {
+            status: enrollment.status,
+            certificate: enrollment.certificate,
+            error: enrollment.error,
+            stage,
+            stages,
+            progress,
+            requestedAt: enrollment.createdAt,
+            updatedAt: enrollment.updatedAt ?? enrollment.createdAt,
+            ...(enrollment.issuedAt ? { issuedAt: enrollment.issuedAt } : {}),
+            ...(enrollment.status === "failed" ? { errorCode: "failed", retryable: true } : {}),
+        };
+    }
+
+    /** See `SigningCertificateEnrollment.listEnrollments()`. */
+    public async listEnrollments(): Promise<EnrollmentSummary[]> {
+        return Object.entries(await this.loadStore()).map(([enrollmentId, enrollment]) => ({
+            enrollmentId,
+            identity: enrollment.identity,
+            status: enrollment.status,
+            createdAt: enrollment.createdAt,
+        }));
+    }
+
     /** See `SigningCertificateEnrollment.cancelEnrollment()` - only a still-pending enrollment changes. */
     public async cancelEnrollment(enrollmentId: string, reason: string): Promise<void> {
         await this.updateStore(async (store) => {
@@ -113,6 +150,7 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
             if (enrollment.status === "pending") {
                 enrollment.status = "failed";
                 enrollment.error = reason;
+                enrollment.failedAt = enrollment.updatedAt = new Date().toISOString();
             }
         });
     }
@@ -154,6 +192,7 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
 
             enrollment.status = "issued";
             enrollment.certificate = certificatePem;
+            enrollment.issuedAt = enrollment.updatedAt = new Date().toISOString();
         });
     }
 
@@ -170,6 +209,7 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
             const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
             enrollment.status = "failed";
             enrollment.error = reason;
+            enrollment.failedAt = enrollment.updatedAt = new Date().toISOString();
         });
     }
 }

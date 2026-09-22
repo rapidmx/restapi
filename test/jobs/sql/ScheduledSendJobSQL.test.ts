@@ -11,7 +11,9 @@ import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import config from "../../config.sql.js";
 import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
+import { backgroundSendSuite } from "../backgroundSendSuite.js";
 import { ScheduledSendJobSQL } from "../../../src/jobs/sql/ScheduledSendJobSQL.js";
+import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
@@ -82,6 +84,7 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         connectionManager = await objectFactory.newInstance(ConnectionManager, { name: "default" });
         const models = new Map<string, any>();
         models.set("AccessControlListSQL", AccessControlListSQL);
+        models.set("DomainSQL", DomainSQL);
         models.set("FolderSQL", FolderSQL);
         models.set("MailboxSQL", MailboxSQL);
         models.set("MessageSQL", MessageSQL);
@@ -135,9 +138,11 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         expect(job.schedule).toBe(config.get("mail:jobs:scheduled_send:schedule"));
     });
 
-    it("start() and stop() are no-ops beyond init().", async () => {
+    it("start() sweeps without waiting and stop() waits for what is in flight - both are quiet with nothing due.", async () => {
         await expect(job.start()).resolves.toBeUndefined();
-        expect(job.stop()).toBeUndefined();
+        await job.whenIdle();
+        await expect(job.stop()).resolves.toBeUndefined();
+        await job.start();
     });
 
     it("Does nothing when there are no due messages.", async () => {
@@ -415,7 +420,10 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         await job.run();
         // Oldest-due first: only the failing message was in this batch.
         expect(transport().sent.length).toBe(0);
-        expect((await findMessage(failing.uid)).scheduledSendAttempts).toBe(1);
+        // Refused for good (an SMTP 5xx for every recipient) - out of the queue at once, not retried.
+        const refused: any = await findMessage(failing.uid);
+        expect(refused.scheduledSendTime).toBeFalsy();
+        expect(refused.scheduledSendError).toContain("Recipient address rejected");
 
         await job.run();
         expect(transport().sent.length).toBe(1);
@@ -860,5 +868,32 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
             expect(after.deleted).toBe(true);
             expect(after.scheduledSendRelayedAt).toBeTruthy();
         });
+    });
+    it("runs one relay at a time on a single-connection SQLite driver, and as many as `concurrency` says on any other", () => {
+        const original = (job as any).appConfig;
+        try {
+            expect((job as any).maxParallel()).toBe(1);
+            (job as any).appConfig = { get: () => "mysql" };
+            expect((job as any).maxParallel()).toBe(Math.max(1, Number((job as any).concurrency)));
+            (job as any).appConfig = undefined;
+            expect((job as any).maxParallel()).toBe(Math.max(1, Number((job as any).concurrency)));
+        } finally {
+            (job as any).appConfig = original;
+        }
+    });
+
+    backgroundSendSuite({
+        job: () => job,
+        transport,
+        mailboxUid: () => mailboxUid,
+        outboxUid: () => outboxUid,
+        putBody,
+        createMessage,
+        findMessage,
+        findFolder,
+        inboxNotices,
+        updateMessage: messageRepoUpdate,
+        repo: () => (job as any).messageRepo,
+        parallel: 1,
     });
 });

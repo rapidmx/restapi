@@ -14,6 +14,74 @@ export interface EnrollmentResult {
     error?: string;
 }
 
+/** Where an enrollment is in its life - see `EnrollmentProgress.stage` and `pki/EnrollmentStages.ts` for the sequence. */
+export type EnrollmentStage = "submitted" | "awaiting-challenge" | "challenge-answered" | "validating" | "issuing" | "issued" | "failed";
+
+/** One step of an enrollment, as a client shows it in a progress list. */
+export interface EnrollmentStageStatus {
+    /** The stage this step is (never `"failed"` - that is a `state`). */
+    id: Exclude<EnrollmentStage, "failed">;
+    /** Human-readable, truthful to what this implementation does at that step. */
+    label: string;
+    /** `done`, `active` (in progress now), `pending` (not reached) or `failed` (the enrollment ended here). */
+    state: "done" | "active" | "pending" | "failed";
+    /** When the step completed (ISO 8601), when known. */
+    at?: string;
+}
+
+/**
+ * An `EnrollmentResult` plus how far along the enrollment is - what `GET .../sign-enrollment/:enrollmentId` (and the
+ * `.../check` and current-enrollment endpoints) answer with. Every field beyond `EnrollmentResult` is additive: a client that
+ * only reads `status`/`certificate`/`error` keeps working.
+ */
+export interface EnrollmentProgress extends EnrollmentResult {
+    /** The stage in progress; `"issued"` or `"failed"` once it ended. */
+    stage: EnrollmentStage;
+    /** Every stage of this implementation's flow, in order. */
+    stages: EnrollmentStageStatus[];
+    /** 0..100 - for a progress bar. A failed enrollment keeps the value of the stage it failed in (never 100). */
+    progress: number;
+    /** When the request was submitted (ISO 8601). */
+    requestedAt: string;
+    /** When the record last changed (ISO 8601). */
+    updatedAt: string;
+    /** When the CA (or the state of the request) was last checked - by the background job or a check-now (ISO 8601). */
+    lastCheckedAt?: string;
+    /** When the background job is next expected to check a pending enrollment (ISO 8601); a time already past means it is due. */
+    nextCheckAt?: string;
+    /** A stable machine-readable code for a failure, or for what is holding up a pending enrollment (see `errorCode` values in
+     * `pki/EnrollmentStages.ts`): `order-expired`, `challenge-failed`, `rejected`, `ca-error`, `order-invalid`, `cancelled`
+     * (final); `ca-unreachable`, `reply-not-sent`, `rate-limited`, `ca-error` (a pending enrollment's last attempt failed and is retried). */
+    errorCode?: string;
+    /** For a failed enrollment: whether starting a new request could succeed (`false`: the CA refused the request itself). For a
+     * pending one whose last attempt failed: `true`, the next check tries again. */
+    retryable?: boolean;
+    /** A note about this response - e.g. that a check-now returned before the CA answered - or the last transient error's message. */
+    note?: string;
+    /** When the certificate was issued (ISO 8601). */
+    issuedAt?: string;
+    /** When the issued certificate was installed into the mailbox's key vault (ISO 8601); it is installed by the background job. */
+    installedAt?: string;
+    /** The issued certificate's expiry (ISO 8601). */
+    notAfter?: string;
+    /** The issued certificate's serial number (hex). */
+    serialNumber?: string;
+    /** The issued certificate's issuer distinguished name. */
+    issuer?: string;
+    /** The issued certificate's subject distinguished name. */
+    subject?: string;
+}
+
+/** What `listEnrollments()` reports about each enrollment (never the CSR, key or certificate). */
+export interface EnrollmentSummary extends EnrollmentBinding {
+    enrollmentId: string;
+    status: EnrollmentResult["status"];
+    /** When it was requested (ISO 8601). */
+    createdAt: string;
+    /** Set once an issued certificate was installed. */
+    installedAt?: string;
+}
+
 /**
  * Enrolls a mailbox's signing public key for a certificate from a publicly-trusted CA -
  * `specs/end-to-end_encryption.md`'s Digital Signatures feature needs a certificate any external recipient's
@@ -79,6 +147,28 @@ export interface SigningCertificateEnrollment {
      * @throws If `enrollmentId` is not recognized.
      */
     cancelEnrollment?(enrollmentId: string, reason: string): Promise<void>;
+
+    /**
+     * The enrollment's status and how far along it is (`EnrollmentProgress`) - a pure read, like `checkStatus()`.
+     * `BaseKeyVaultRoute` answers the status endpoints with this when present, with `checkStatus()` otherwise.
+     *
+     * @throws If `enrollmentId` is not recognized.
+     */
+    describeProgress?(enrollmentId: string): Promise<EnrollmentProgress>;
+
+    /**
+     * Forces an immediate re-check of one enrollment - the step a background job would take on its next tick - and answers
+     * with the resulting progress. Never blocks past `options.timeoutMs`: a CA that answers slower leaves the check running and
+     * the answer carries the current state and a `note`. Refuses (429, `retryAfterSeconds` on the error) when the enrollment
+     * was force-checked within the last `options.minIntervalMs`.
+     *
+     * @throws If `enrollmentId` is not recognized.
+     */
+    checkNow?(enrollmentId: string, options?: { timeoutMs?: number; minIntervalMs?: number }): Promise<EnrollmentProgress>;
+
+    /** Every enrollment this implementation knows of (metadata only), so the endpoint that finds a mailbox's current one can pick
+     * among them. */
+    listEnrollments?(): Promise<EnrollmentSummary[]>;
 }
 
 /** What `describeEnrollment()` reports about the mailbox an enrollment belongs to. */

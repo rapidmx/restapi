@@ -1,3 +1,4 @@
+export * from "./AppearanceRouteSQL.js";
 export * from "./AttachmentRouteSQL.js";
 export * from "./AuditLogRouteSQL.js";
 export * from "./BrandingRouteSQL.js";

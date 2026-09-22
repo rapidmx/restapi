@@ -7,9 +7,10 @@
 // relative to that.
 import * as crypto from "crypto";
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
-import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
+import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, Folder, Mailbox, MailboxImportFormat, MailboxImportRequest } from "../models/types.js";
@@ -26,9 +27,10 @@ const VALID_FORMATS: ReadonlySet<string> = new Set<MailboxImportFormat>(["mbox",
  * `BaseDataExportRoute`: visibility is "the requester, the target mailbox's own owner, or a trusted
  * admin" - not a class of grant this platform's record-level ACL model expresses.
  *
- * `create()` is BOTH the self-service and admin-mediated endpoint, per the same "trusted caller may act
- * on someone else's behalf, an ordinary caller's own identity always wins" idiom `BaseDataExportRoute`
- * already establishes for `mailboxUid`.
+ * `create()` imports into the caller's own mailbox (an ordinary caller's `?mailboxUid=` is ignored, as before); a trusted
+ * caller's `?mailboxUid=` is honored only when they hold CREATE on it (by ownership or an ACL record - a trusted role is no
+ * grant: importing plants mail in somebody's mailbox, so an administrator does it by impersonating the owner; 403 otherwise). `find()`/`findById()` show a trusted caller every request - who imported
+ * what into which mailbox, and how it went; never the imported content.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -52,6 +54,9 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
+
+    @Inject(ACLUtils)
+    private aclUtils?: ACLUtils;
 
     /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
     @Config()
@@ -130,8 +135,15 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         }
 
         const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
-        const mailboxUid: string | undefined =
-            isTrusted && mailboxUidParam ? mailboxUidParam : await resolveCallerMailboxUid(this.mailboxRepo!, user);
+        let mailboxUid: string | undefined = await resolveCallerMailboxUid(this.mailboxRepo!, user);
+        if (isTrusted && mailboxUidParam && mailboxUidParam !== mailboxUid) {
+            // A trusted caller's own choice of mailbox is honored only with a grant on it - a trusted role is no grant, so an
+            // administrator imports into somebody else's mailbox by impersonating them (403 otherwise, whether or not it exists).
+            if (typeof mailboxUidParam !== "string" || !(await hasMailAccess(this.aclUtils, this.trustedRoles, user, mailboxUidParam, ACLAction.CREATE))) {
+                throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+            }
+            mailboxUid = mailboxUidParam;
+        }
         if (!mailboxUid) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }

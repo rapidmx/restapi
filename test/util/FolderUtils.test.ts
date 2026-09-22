@@ -4,7 +4,13 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Isolated unit tests for findOrCreateWellKnownFolder() - a hand-built RepoUtils-shaped mock and a fake
 // folder class stand in for the real Mongo/SQL repository/entity.
-import { findOrCreateWellKnownFolder, getMailboxUidForFolder, wellKnownFolderUid } from "../../src/util/FolderUtils.js";
+import {
+    ensureWellKnownFolders,
+    findOrCreateWellKnownFolder,
+    getMailboxUidForFolder,
+    WELL_KNOWN_FOLDER_TYPES,
+    wellKnownFolderUid,
+} from "../../src/util/FolderUtils.js";
 import { FolderType } from "../../src/models/types.js";
 
 /** A fake Folder entity class that just captures the data it was constructed with. */
@@ -127,8 +133,24 @@ describe("findOrCreateWellKnownFolder() Tests", () => {
         const result: any = await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.INBOX);
 
         expect(repo.create).toHaveBeenCalledTimes(2);
-        expect(repo.findOne).toHaveBeenCalledWith(wellKnownFolderUid("mbx-1", FolderType.INBOX), { ignoreACL: true, includeDeleted: true });
+        expect(repo.findOne).toHaveBeenCalledWith(wellKnownFolderUid("mbx-1", FolderType.INBOX), { ignoreACL: true, includeDeleted: true, skipCache: true });
         expect(result.data.uid).toBeUndefined();
+    });
+
+    it("Uses the winner - never a random-uid duplicate - when its row only becomes visible after the type lookup came up empty.", async () => {
+        const winner = { uid: wellKnownFolderUid("mbx-1", FolderType.NOTES), type: FolderType.NOTES };
+        const repo = makeRepo({
+            // Lost the race, and the type lookup ran before the winner's insert was visible ...
+            create: vi.fn().mockRejectedValue(new Error("duplicate key")),
+            find: vi.fn().mockResolvedValue([]),
+            // ... but the uid lookup sees it (a live row, not a soft-deleted one).
+            findOne: vi.fn().mockResolvedValue(winner),
+        });
+
+        const result = await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.NOTES);
+
+        expect(result).toBe(winner);
+        expect(repo.create).toHaveBeenCalledTimes(1);
     });
 
     it("Rethrows a create() failure that isn't a lost race.", async () => {
@@ -306,6 +328,84 @@ describe("findOrCreateWellKnownFolder() Tests", () => {
 
         const [createdInstance] = repo.create.mock.calls[0];
         expect(createdInstance.data.name).toBe("Archive");
+    });
+
+    it("Asks create() to publish the new folder on the mailbox's channel as well as its own (pushChannels), for either uid.", async () => {
+        const repo = makeRepo();
+        await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.OUTBOX);
+        expect(repo.create.mock.calls[0][1].pushChannels).toEqual(["mbx-1"]);
+
+        const fallback = makeRepo({
+            create: vi
+                .fn()
+                .mockRejectedValueOnce(new Error("duplicate key"))
+                .mockImplementation(async (instance: any) => instance),
+            findOne: vi.fn().mockResolvedValue({ uid: wellKnownFolderUid("mbx-1", FolderType.INBOX), deleted: true }),
+        });
+        await findOrCreateWellKnownFolder(fallback, FakeFolder, "mbx-1", FolderType.INBOX);
+        expect(fallback.create.mock.calls[1][1].pushChannels).toEqual(["mbx-1"]);
+    });
+});
+
+describe("ensureWellKnownFolders() Tests", () => {
+    it("Lists every mail folder plus calendar, contacts, tasks and notes, and never the user type.", () => {
+        expect([...WELL_KNOWN_FOLDER_TYPES]).toEqual([
+            FolderType.INBOX,
+            FolderType.DRAFTS,
+            FolderType.OUTBOX,
+            FolderType.SENT_ITEMS,
+            FolderType.DELETED_ITEMS,
+            FolderType.JUNK,
+            FolderType.ARCHIVE,
+            FolderType.CALENDAR,
+            FolderType.CONTACTS,
+            FolderType.TASKS,
+            FolderType.NOTES,
+        ]);
+    });
+
+    it("Costs one uncached existence query and writes nothing when the mailbox already has every well-known folder.", async () => {
+        const present = WELL_KNOWN_FOLDER_TYPES.map((type) => ({ uid: `f-${type}`, type }));
+        const repo = makeRepo({ find: vi.fn().mockResolvedValue([...present, { uid: "mine", type: FolderType.USER }]) });
+
+        const ensured = await ensureWellKnownFolders(repo, FakeFolder, "mbx-1");
+
+        expect(ensured).toEqual([]);
+        expect(repo.find).toHaveBeenCalledTimes(1);
+        expect(repo.create).not.toHaveBeenCalled();
+        const [query, options] = repo.find.mock.calls[0];
+        expect(query.type).toEqual([...WELL_KNOWN_FOLDER_TYPES]);
+        expect(options).toEqual(expect.objectContaining({ ignoreACL: true, skipCache: true }));
+    });
+
+    it("Creates exactly the missing ones, in the well-known order, through findOrCreateWellKnownFolder().", async () => {
+        // The existence query sees the Inbox and Drafts; each single-folder lookup that follows sees nothing.
+        const find = vi
+            .fn()
+            .mockResolvedValueOnce([
+                { uid: "inbox", type: FolderType.INBOX },
+                { uid: "drafts", type: FolderType.DRAFTS },
+            ])
+            .mockResolvedValue([]);
+        const repo = makeRepo({ find });
+
+        const ensured: any[] = await ensureWellKnownFolders(repo, FakeFolder, "mbx-1");
+
+        expect(ensured.map((folder) => folder.data.type)).toEqual(WELL_KNOWN_FOLDER_TYPES.filter((type) => type !== FolderType.INBOX && type !== FolderType.DRAFTS));
+        expect(repo.create).toHaveBeenCalledTimes(9);
+        expect(ensured[0].uid).toBe(wellKnownFolderUid("mbx-1", FolderType.OUTBOX));
+    });
+
+    it("Passes the creator through to each create() (the mailbox-creation path), and none when healing on read.", async () => {
+        const user: any = { uid: "user-1", roles: [] };
+        const creating = makeRepo();
+        await ensureWellKnownFolders(creating, FakeFolder, "mbx-1", user);
+        expect(creating.create).toHaveBeenCalledTimes(WELL_KNOWN_FOLDER_TYPES.length);
+        expect(creating.create.mock.calls.every(([, options]: any[]) => options.user === user)).toBe(true);
+
+        const healing = makeRepo();
+        await ensureWellKnownFolders(healing, FakeFolder, "mbx-1");
+        expect(healing.create.mock.calls.every(([, options]: any[]) => options.user === undefined)).toBe(true);
     });
 });
 

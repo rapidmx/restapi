@@ -39,7 +39,14 @@ describe("BaseMessageRoute Tests (dependency guard clause only)", () => {
         const route = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
         const req: any = {};
 
-        await expect(route.send("msg-1", undefined, req, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
+        await expect(route.send("msg-1", undefined, req, {} as any, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
+    });
+
+    it("send() refuses a background send with a 501 when the route has no ScheduledSendJob to hand it to, and a background flag that is not a boolean with a 400.", async () => {
+        const route = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
+
+        await expect(route.send("msg-1", { background: true }, {} as any, {} as any, { uid: "user-1" } as any)).rejects.toMatchObject({ status: 501 });
+        await expect(route.send("msg-1", { background: "yes" as any }, {} as any, {} as any, { uid: "user-1" } as any)).rejects.toMatchObject({ status: 400 });
     });
 
     it("recall() throws INTERNAL_ERROR when repoUtils/mailTransport are not set.", async () => {

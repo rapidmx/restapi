@@ -21,13 +21,26 @@ import { WrappedPrivateKey } from "../models/types.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { createFileExclusive, lockKeyForPath, readFileIfExists, updateJsonFile, withLock, writeFileAtomic } from "./FileStoreUtils.js";
-import { EnrollmentBinding, EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
+import { AcmeMilestones, classifyOrderFailure, classifyTransientFailure, computeStages, FailureClass } from "./EnrollmentStages.js";
+import {
+    EnrollmentBinding,
+    EnrollmentProgress,
+    EnrollmentResult,
+    EnrollmentSummary,
+    SigningCertificateEnrollment,
+} from "./SigningCertificateEnrollment.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 
 x509.cryptoProvider.set(crypto);
 
 /** Upper bound on `ensureAccount()`'s lost-race re-read loop - see its doc comment. */
 const MAX_INIT_ATTEMPTS = 5;
+
+/** How long `checkNow()` waits for the CA before answering with the current state (the check keeps running). */
+const DEFAULT_CHECK_TIMEOUT_MS = 8_000;
+
+/** How soon after one `checkNow()` the same enrollment refuses another (429). */
+const DEFAULT_CHECK_MIN_INTERVAL_MS = 10_000;
 
 /** The lowercased domain part of an email address (bare `local@domain`, or a trailing `<local@domain>`), or
  * `undefined` if `address` doesn't look like a single address at all. */
@@ -39,6 +52,22 @@ function addressDomain(address: string): string | undefined {
         return undefined;
     }
     return bare.slice(at + 1).toLowerCase().replace(/\.$/, "");
+}
+
+/** The fields of `EnrollmentProgress` that come from the issued certificate itself (the first certificate of a PEM chain);
+ * none when it can't be parsed. */
+function certificateDetails(pem: string | undefined): Pick<EnrollmentProgress, "notAfter" | "serialNumber" | "issuer" | "subject"> {
+    try {
+        const certificate: x509.X509Certificate = new x509.X509Certificate(pem ?? "");
+        return {
+            notAfter: certificate.notAfter.toISOString(),
+            serialNumber: certificate.serialNumber,
+            issuer: certificate.issuer,
+            subject: certificate.subject,
+        };
+    } catch {
+        return {};
+    }
 }
 
 /** One in-progress RFC 8823 enrollment, from `startEnrollment()` through to a downloaded certificate.
@@ -94,6 +123,32 @@ interface PendingEnrollment {
     certificate?: string;
     error?: string;
     createdAt: string;
+    /** Every field below is the enrollment's progress record (`describeProgress()`): stage timestamps that survive a
+     * restart, and what the last check saw. All optional - a record from before they existed reads correctly from the
+     * fields above (`computeStages()`). */
+    /** When the record last changed. */
+    updatedAt?: string;
+    /** When the CA's verification e-mail was received and its token recorded. */
+    challengeReceivedAt?: string;
+    /** When the order was finalized with the CSR. */
+    finalizedAt?: string;
+    /** When the certificate was downloaded. */
+    issuedAt?: string;
+    /** When the enrollment failed (or was cancelled). */
+    failedAt?: string;
+    /** Why it failed (`FailureClass.errorCode`) and whether a new request could succeed. */
+    errorCode?: string;
+    retryable?: boolean;
+    /** The order's `expires` as the CA reported it (ISO 8601): past it, a request still waiting on the challenge is dead. */
+    orderExpires?: string;
+    /** The last order status the CA reported. */
+    orderStatus?: string;
+    /** When this enrollment was last checked (background job tick or check-now). */
+    lastCheckedAt?: string;
+    /** When check-now last ran - what the per-enrollment rate limit reads, so it holds across replicas and restarts. */
+    lastForcedCheckAt?: string;
+    /** The last attempt's failure while the enrollment is still pending (cleared by the next step that succeeds). */
+    lastError?: { code: string; message: string; at: string };
 }
 
 /**
@@ -144,6 +199,15 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
 
     @Config("mail:pki:rfc8823:store_dir", "/var/lib/rapidmx/pki/rfc8823")
     private storeDir: string = "/var/lib/rapidmx/pki/rfc8823";
+
+    /** How often `AcmeEnrollmentDriverJob` checks a pending enrollment (seconds) - only what `EnrollmentProgress.nextCheckAt` is
+     * computed from, so keep it equal to that job's own schedule (`mail:jobs:acme_enrollment_driver:schedule`, every 5 minutes). */
+    @Config("mail:pki:rfc8823:poll_interval_seconds", 300)
+    private pollIntervalSeconds: number = 300;
+
+    /** How long a request may stay pending when the CA did not say when its order expires (`order.expires`). */
+    @Config("mail:pki:rfc8823:max_pending_hours", 168)
+    private maxPendingHours: number = 168;
 
     @Logger
     private logger: any;
@@ -301,6 +365,7 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
                 tokenPart2,
                 status: "pending",
                 createdAt: new Date().toISOString(),
+                ...(order.expires ? { orderExpires: order.expires } : {}),
             };
         });
 
@@ -413,13 +478,13 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
             const keyAuthorization: string = await client.getChallengeKeyAuthorization(fakeHttpChallenge);
             const digest: string = nodeCrypto.createHash("sha256").update(keyAuthorization).digest("base64url");
 
-            await this.updateStore(async (store) => {
-                const current: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+            await this.mutateEnrollment(enrollmentId, (current) => {
                 current.tokenPart1 = tokenPart1;
                 current.replyTo = replyTo;
                 current.challengeMessageId = messageId;
                 current.challengeSubject = subject;
                 current.digest = digest;
+                current.challengeReceivedAt = new Date().toISOString();
             });
         });
     }
@@ -468,11 +533,9 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * marked failed, so `listPendingEnrollments()` drops it and nothing is installed from it. */
     public async cancelEnrollment(enrollmentId: string, reason: string): Promise<void> {
         await this.withEnrollmentLock(enrollmentId, async () => {
-            await this.updateStore(async (store) => {
-                const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+            await this.mutateEnrollment(enrollmentId, (enrollment) => {
                 if (enrollment.status === "pending" || (enrollment.status === "issued" && enrollment.installedAt === undefined)) {
-                    enrollment.status = "failed";
-                    enrollment.error = reason;
+                    this.markFailed(enrollment, reason, { errorCode: "cancelled", retryable: true });
                 }
             });
         });
@@ -508,8 +571,8 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * @throws If `enrollmentId` is not recognized.
      */
     public async markInstalled(enrollmentId: string): Promise<void> {
-        await this.updateStore(async (store) => {
-            (await this.requireEnrollment(store, enrollmentId)).installedAt = new Date().toISOString();
+        await this.mutateEnrollment(enrollmentId, (enrollment) => {
+            enrollment.installedAt = new Date().toISOString();
         });
     }
 
@@ -561,44 +624,276 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * downloads the certificate and marks this enrollment `"issued"`.
      */
     public async advanceEnrollment(enrollmentId: string): Promise<void> {
+        await this.advance(enrollmentId, false);
+    }
+
+    /**
+     * `advanceEnrollment()`'s step, shared with `checkNow()`. Beyond what that method documents: a request whose CA order has
+     * expired (`hasExpired()`) is failed rather than left pending forever; the check is recorded (`lastCheckedAt`); and an
+     * error thrown mid-step (the CA unreachable, the reply not relayed) is recorded as the enrollment's `lastError` - still
+     * pending, retried on the next tick - and rethrown, so the job logs it exactly as before. `peekOrder` (check-now only)
+     * also asks the CA about the order while the challenge e-mail hasn't arrived, which is how a request the CA has already
+     * given up on is noticed before the e-mail is ever due.
+     */
+    private async advance(enrollmentId: string, peekOrder: boolean): Promise<void> {
         await this.withEnrollmentLock(enrollmentId, async () => {
             const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
-            if (enrollment.status !== "pending" || enrollment.digest === undefined) {
+            if (enrollment.status !== "pending") {
+                return;
+            }
+            if (this.hasExpired(enrollment, Date.now())) {
+                await this.mutateEnrollment(enrollmentId, (current) => {
+                    this.markFailed(current, "The certificate authority did not finish validating this request before it expired. Start a new request.", {
+                        errorCode: "order-expired",
+                        retryable: true,
+                    });
+                });
                 return;
             }
 
-            const client: acme.Client = await this.ensureAccount();
-
-            if (enrollment.replySentAt === undefined) {
-                await this.sendChallengeReply(enrollment);
-                await client.completeChallenge({ url: enrollment.challengeUrl, status: "pending" } as any);
-                await this.updateStore(async (store) => {
-                    (await this.requireEnrollment(store, enrollmentId)).replySentAt = new Date().toISOString();
-                });
+            await this.mutateEnrollment(enrollmentId, (current) => {
+                current.lastCheckedAt = new Date().toISOString();
+            });
+            if (enrollment.digest === undefined && !peekOrder) {
                 return;
             }
 
-            const order: acme.Order = await client.getOrder({ url: enrollment.orderUrl } as any);
-            if (order.status === "invalid") {
-                await this.updateStore(async (store) => {
-                    const current: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
-                    current.status = "failed";
-                    current.error = order.error ? JSON.stringify(order.error) : "The certificate authority marked this order invalid.";
-                });
-            } else if (order.status === "ready") {
-                await client.finalizeOrder({ url: enrollment.orderUrl, finalize: enrollment.orderFinalizeUrl } as any, enrollment.csr);
-                // Finalizing transitions the order to "processing" server-side - the next call to this method
-                // re-fetches and observes that, no local state to persist here.
-            } else if (order.status === "valid") {
-                const certificate: string = await client.getCertificate({ url: enrollment.orderUrl, status: "valid" } as any);
-                await this.updateStore(async (store) => {
-                    const current: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
-                    current.status = "issued";
-                    current.certificate = certificate;
+            let phase: "reply" | "ca" = "ca";
+            try {
+                const client: acme.Client = await this.ensureAccount();
+                if (enrollment.digest === undefined) {
+                    // Waiting for the CA's verification e-mail: only an order the CA already marked invalid changes anything.
+                    const order: acme.Order = await client.getOrder({ url: enrollment.orderUrl } as any);
+                    await this.recordOrderStatus(enrollmentId, order);
+                } else if (enrollment.replySentAt === undefined) {
+                    phase = "reply";
+                    await this.sendChallengeReply(enrollment);
+                    phase = "ca";
+                    await client.completeChallenge({ url: enrollment.challengeUrl, status: "pending" } as any);
+                    await this.mutateEnrollment(enrollmentId, (current) => {
+                        current.replySentAt = new Date().toISOString();
+                    });
+                } else {
+                    await this.advanceOrder(enrollmentId, enrollment, client);
+                }
+            } catch (err: any) {
+                await this.recordTransientFailure(enrollmentId, err, phase);
+                throw err;
+            }
+            if (enrollment.lastError) {
+                await this.mutateEnrollment(enrollmentId, (current) => {
+                    delete current.lastError;
                 });
             }
-            // "pending"/"processing": still waiting on the CA - nothing to do until the next call.
         });
+    }
+
+    /** Re-fetches the order (`getOrder()`, one plain GET) and takes the step its status calls for: `"ready"` finalizes with the
+     * original CSR, `"valid"` downloads the certificate, `"invalid"` fails the enrollment, anything else waits. */
+    private async advanceOrder(enrollmentId: string, enrollment: PendingEnrollment, client: acme.Client): Promise<void> {
+        const order: acme.Order = await client.getOrder({ url: enrollment.orderUrl } as any);
+        if (order.status === "ready") {
+            await client.finalizeOrder({ url: enrollment.orderUrl, finalize: enrollment.orderFinalizeUrl } as any, enrollment.csr);
+            // Finalizing transitions the order to "processing" server-side - the next call to this method re-fetches and
+            // observes that.
+            await this.mutateEnrollment(enrollmentId, (current) => {
+                current.finalizedAt = new Date().toISOString();
+                current.orderStatus = "ready";
+            });
+        } else if (order.status === "valid") {
+            const certificate: string = await client.getCertificate({ url: enrollment.orderUrl, status: "valid" } as any);
+            await this.mutateEnrollment(enrollmentId, (current) => {
+                const now: string = new Date().toISOString();
+                current.status = "issued";
+                current.certificate = certificate;
+                current.issuedAt = now;
+                current.finalizedAt ??= now;
+                current.orderStatus = "valid";
+            });
+        } else {
+            // "pending"/"processing": still waiting on the CA - nothing to do until the next call ("invalid" fails it).
+            await this.recordOrderStatus(enrollmentId, order);
+        }
+    }
+
+    /** Stores what the CA said about the order (its status and expiry), failing the enrollment if it is `invalid`. */
+    private async recordOrderStatus(enrollmentId: string, order: acme.Order): Promise<void> {
+        await this.mutateEnrollment(enrollmentId, (current) => {
+            current.orderStatus = order.status;
+            if (order.expires) {
+                current.orderExpires = order.expires;
+            }
+            if (order.status === "invalid") {
+                this.markFailed(current, order.error ? JSON.stringify(order.error) : "The certificate authority marked this order invalid.", classifyOrderFailure(order.error));
+            }
+        });
+    }
+
+    /** Persists the failure of an attempt on a still-pending enrollment (`lastError`), best-effort. */
+    private async recordTransientFailure(enrollmentId: string, err: any, phase: "reply" | "ca"): Promise<void> {
+        try {
+            const failure: FailureClass = classifyTransientFailure(err, phase);
+            await this.mutateEnrollment(enrollmentId, (current) => {
+                current.lastError = { code: failure.errorCode, message: String(err?.message ?? err), at: new Date().toISOString() };
+            });
+        } catch (writeErr: any) {
+            this.logger?.warn(`Rfc8823AcmeSigningCertificateEnrollment: could not record the failure of enrollment '${enrollmentId}': ${writeErr?.message}`);
+        }
+    }
+
+    /** Marks `enrollment` failed - the one place every failure (CA refusal, expiry, cancellation) is recorded. */
+    private markFailed(enrollment: PendingEnrollment, reason: string, failure: FailureClass): void {
+        enrollment.status = "failed";
+        enrollment.error = reason;
+        enrollment.errorCode = failure.errorCode;
+        enrollment.retryable = failure.retryable;
+        enrollment.failedAt = new Date().toISOString();
+    }
+
+    /** Whether a request still waiting on the CA has outlived its ACME order: the CA's own `expires`, else `maxPendingHours` from
+     * the request. An order the CA is already finalizing is not expired - it is the CA's to finish. */
+    private hasExpired(enrollment: PendingEnrollment, now: number): boolean {
+        if (enrollment.finalizedAt !== undefined || enrollment.orderStatus === "ready" || enrollment.orderStatus === "processing") {
+            return false;
+        }
+        const limit: number = enrollment.orderExpires ? Date.parse(enrollment.orderExpires) : Date.parse(enrollment.createdAt) + this.maxPendingHours * 3_600_000;
+        return limit <= now;
+    }
+
+    /** Locked re-read -> `mutate` -> write of one enrollment, stamping `updatedAt`. */
+    private async mutateEnrollment(enrollmentId: string, mutate: (enrollment: PendingEnrollment) => void): Promise<void> {
+        await this.updateStore(async (store) => {
+            const current: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+            mutate(current);
+            current.updatedAt = new Date().toISOString();
+        });
+    }
+
+    /**
+     * Forces an immediate re-check of one enrollment: the same step the background job takes on its next tick - and, when that step
+     * was answering the CA's challenge, the poll of the order that would otherwise wait for the tick after - plus a look at the
+     * order while the challenge e-mail is still awaited. Answers with the resulting progress.
+     *
+     * - **Rate limited per enrollment** (`minIntervalMs`, default 10 s, persisted as `lastForcedCheckAt`): a repeat inside it is a 429
+     * with `retryAfterSeconds` on the error. Only enrollments still pending are checked or limited - a finished one just answers.
+     * - **Never blocks for long**: past `timeoutMs` (default 8 s) it answers with the current state and a `note`; the step it
+     * started keeps running and its result lands in the record.
+     * - **Never throws for a CA problem**: an unreachable CA or a failed reply is in the answer (`errorCode`, `note`), as it is in
+     * the record. Only an unknown id (404) and the rate limit are errors.
+     */
+    public async checkNow(enrollmentId: string, options: { timeoutMs?: number; minIntervalMs?: number } = {}): Promise<EnrollmentProgress> {
+        const timeoutMs: number = options.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS;
+        const minIntervalMs: number = options.minIntervalMs ?? DEFAULT_CHECK_MIN_INTERVAL_MS;
+        const found: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
+        if (found.status !== "pending") {
+            return this.toProgress(found);
+        }
+
+        const retryAfter: number = await this.updateStore(async (store) => {
+            const current: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+            const now: number = Date.now();
+            const last: number = current.lastForcedCheckAt ? Date.parse(current.lastForcedCheckAt) : Number.NEGATIVE_INFINITY;
+            if (now - last < minIntervalMs) {
+                return Math.max(1, Math.ceil((minIntervalMs - (now - last)) / 1000));
+            }
+            current.lastForcedCheckAt = new Date(now).toISOString();
+            return 0;
+        });
+        if (retryAfter > 0) {
+            const err = new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 429, `This enrollment was checked a moment ago. Try again in ${retryAfter} seconds.`);
+            (err as any).retryAfterSeconds = retryAfter;
+            throw err;
+        }
+
+        const run: Promise<"done"> = (async () => {
+            await this.advance(enrollmentId, true);
+            // The reply just went out: the CA has the challenge now, so ask how it is doing rather than leave that to the next tick.
+            if (found.replySentAt === undefined && (await this.requireEnrollment(await this.loadStore(), enrollmentId)).replySentAt !== undefined) {
+                await this.advance(enrollmentId, true);
+            }
+            return "done" as const;
+        })();
+        let timer: NodeJS.Timeout | undefined;
+        const outcome: "done" | "timeout" = await Promise.race([
+            // A CA problem is already recorded on the enrollment (`lastError`) and reported by `toProgress()`.
+            run.catch((): "done" => "done"),
+            new Promise<"timeout">((resolve) => {
+                timer = setTimeout(() => resolve("timeout"), timeoutMs);
+            }),
+        ]);
+        clearTimeout(timer);
+
+        const progress: EnrollmentProgress = this.toProgress(await this.requireEnrollment(await this.loadStore(), enrollmentId));
+        if (outcome === "timeout") {
+            progress.note = "The certificate authority is taking longer than usual to answer. The check is still running - the status will update shortly.";
+        }
+        return progress;
+    }
+
+    /** See `SigningCertificateEnrollment.describeProgress()`. */
+    public async describeProgress(enrollmentId: string): Promise<EnrollmentProgress> {
+        return this.toProgress(await this.requireEnrollment(await this.loadStore(), enrollmentId));
+    }
+
+    /** See `SigningCertificateEnrollment.listEnrollments()`. */
+    public async listEnrollments(): Promise<EnrollmentSummary[]> {
+        return Object.entries(await this.loadStore()).map(([enrollmentId, enrollment]) => ({
+            enrollmentId,
+            identity: enrollment.identity,
+            mailboxUid: enrollment.mailboxUid,
+            status: enrollment.status,
+            createdAt: enrollment.createdAt,
+            installedAt: enrollment.installedAt,
+        }));
+    }
+
+    /** The `EnrollmentProgress` of `enrollment` - see `pki/EnrollmentStages.ts` for the stages and `EnrollmentProgress` for each field. */
+    private toProgress(enrollment: PendingEnrollment): EnrollmentProgress {
+        const milestones: AcmeMilestones = {
+            status: enrollment.status,
+            createdAt: enrollment.createdAt,
+            challengeReceivedAt: enrollment.challengeReceivedAt,
+            hasDigest: enrollment.digest !== undefined,
+            replySentAt: enrollment.replySentAt,
+            finalizedAt: enrollment.finalizedAt,
+            issuedAt: enrollment.issuedAt,
+            failedAt: enrollment.failedAt,
+            orderStatus: enrollment.orderStatus,
+        };
+        const { stage, stages, progress } = computeStages(milestones);
+        const result: EnrollmentProgress = {
+            status: enrollment.status,
+            certificate: enrollment.certificate,
+            error: enrollment.error,
+            stage,
+            stages,
+            progress,
+            requestedAt: enrollment.createdAt,
+            updatedAt: enrollment.updatedAt ?? enrollment.createdAt,
+        };
+        if (enrollment.lastCheckedAt) {
+            result.lastCheckedAt = enrollment.lastCheckedAt;
+        }
+        if (enrollment.status === "pending") {
+            result.nextCheckAt = new Date(Date.parse(enrollment.lastCheckedAt ?? enrollment.createdAt) + this.pollIntervalSeconds * 1000).toISOString();
+            if (enrollment.lastError) {
+                result.errorCode = enrollment.lastError.code;
+                result.retryable = true;
+                result.note = enrollment.lastError.message;
+            }
+        } else if (enrollment.status === "failed") {
+            result.errorCode = enrollment.errorCode ?? "failed";
+            result.retryable = enrollment.retryable ?? true;
+        } else {
+            Object.assign(result, certificateDetails(enrollment.certificate));
+        }
+        if (enrollment.issuedAt) {
+            result.issuedAt = enrollment.issuedAt;
+        }
+        if (enrollment.installedAt) {
+            result.installedAt = enrollment.installedAt;
+        }
+        return result;
     }
 
     /**

@@ -16,6 +16,7 @@ import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import config from "../../config.sql.js";
 import { dsnDeliverySuite } from "../dsnDeliverySuite.js";
+import { htmlMailSuite } from "../htmlMailSuite.js";
 import { registerTestDoubles, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
 import { ScanQueueJobSQL } from "../../../src/jobs/sql/ScanQueueJobSQL.js";
 import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
@@ -438,6 +439,21 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         },
         quarantined: async () => await quarantineEntryRepo.find({ where: { mailboxUid } }),
         relayed: () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!.sent,
+    });
+
+    htmlMailSuite({
+        blobStore: () => objectFactory.getInstance<any>("BlobStore")!,
+        ingest: async (raw) => {
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await objectFactory.getInstance<any>("BlobStore")!.put(rawBlobKey, raw);
+            await createIngestEntry({ rawBlobKey });
+            await job.run();
+        },
+        inbox: async () => {
+            const inbox = await folderRepo.findOne({ where: { mailboxUid, type: FolderType.INBOX } });
+            return inbox ? await messageRepo.find({ where: { folderUid: inbox.uid } }) : [];
+        },
+        attachmentsOf: async (messageUid) => await attachmentRepo.find({ where: { messageUid } }),
     });
 
     describe("Delivered recipients and sender", () => {

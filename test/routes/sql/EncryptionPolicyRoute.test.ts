@@ -60,6 +60,20 @@ describe("Route:EncryptionPolicySQL Tests", () => {
             expect(result.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional" });
         });
 
+        it("Answers 200 with the defaults for any signed-in user - a token with no roles and no elevation, an ordinary one, an administrator - and creates no row for any of them.", async () => {
+            const bare = JWTUtils.createTokenSync(config.get("auth"), { uid: uuid.v4(), roles: [] } as any);
+
+            for (const token of [bare, userToken, adminToken]) {
+                const result = await request(server.getApplication())
+                    .get(baseUrl)
+                    .set("Authorization", "jwt " + token);
+
+                expect(result.status).toBe(200);
+                expect(result.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional" });
+            }
+            expect(await policyRepo.find()).toEqual([]);
+        });
+
         it("Returns the configured policy once an admin has set it, for an ordinary (non-trusted) authenticated user.", async () => {
             await request(server.getApplication())
                 .put(baseUrl)

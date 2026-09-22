@@ -124,14 +124,18 @@ export function folderCountsSuite(ctx: FolderCountsSuiteContext): void {
                 [sent.uid]: { unreadCount: 0, totalCount: 7 },
                 [deleted.uid]: { unreadCount: 2, totalCount: 4 },
             };
+            // A mailbox has every well-known folder (the other eight are empty), so a page of one can land on any of them.
+            const all = await listFolders(mailbox.uid, "");
+            const empty = { unreadCount: 0, totalCount: 0 };
             const seen = new Set<string>();
-            for (let page = 0; page < 3; page++) {
+            for (let page = 0; page < all.body.length; page++) {
                 const paged = await listFolders(mailbox.uid, `&limit=1&page=${page}`);
                 expect(paged.body).toHaveLength(1);
-                expect(counts(paged.body[0])).toEqual(expected[paged.body[0].uid]);
+                expect(counts(paged.body[0])).toEqual(expected[paged.body[0].uid] ?? empty);
                 seen.add(paged.body[0].uid);
             }
-            expect(seen.size).toBe(3);
+            expect(seen.size).toBe(all.body.length);
+            expect([inbox.uid, sent.uid, deleted.uid].every((uid) => seen.has(uid))).toBe(true);
         });
 
         it("equals what the message list shows: every listed message is counted, the unread filter's rows are the unread ones", async () => {
@@ -207,14 +211,15 @@ export function folderCountsSuite(ctx: FolderCountsSuiteContext): void {
             expect(counts((await getFolder(created.body.uid)).body)).toEqual({ unreadCount: 0, totalCount: 0 });
         });
 
-        it("answers an empty list for a mailbox with no folders, without counting anything", async () => {
+        it("answers a mailbox with no folders with its well-known folders, all empty, counted with one grouped query", async () => {
             const mailbox = await ctx.createMailbox(ctx.ownerUid);
 
             const { result, queries } = await ctx.countGroupedQueries(() => listFolders(mailbox.uid));
 
             expect(result.status).toBe(200);
-            expect(result.body).toEqual([]);
-            expect(queries).toBe(0);
+            expect(result.body).toHaveLength(11);
+            expect(result.body.map(counts)).toEqual(Array(11).fill({ unreadCount: 0, totalCount: 0 }));
+            expect(queries).toBe(1);
         });
 
         it("costs one grouped query however many folders it lists", async () => {
@@ -222,7 +227,8 @@ export function folderCountsSuite(ctx: FolderCountsSuiteContext): void {
             const first = await ctx.createFolder(mailbox.uid, FolderType.INBOX);
             await ctx.createMessage(mailbox.uid, first.uid, { flags: UNREAD });
             const few = await ctx.countGroupedQueries(() => listFolders(mailbox.uid));
-            expect(few.result.body).toHaveLength(1);
+            // The mailbox's other ten well-known folders are provisioned by the first read.
+            expect(few.result.body).toHaveLength(11);
             expect(few.queries).toBe(1);
 
             for (let i = 0; i < 24; i++) {
@@ -230,7 +236,7 @@ export function folderCountsSuite(ctx: FolderCountsSuiteContext): void {
                 await ctx.createMessage(mailbox.uid, folder.uid, { flags: i % 2 ? READ : UNREAD });
             }
             const many = await ctx.countGroupedQueries(() => listFolders(mailbox.uid));
-            expect(many.result.body).toHaveLength(25);
+            expect(many.result.body).toHaveLength(35);
             expect(many.queries).toBe(1);
             expect(many.result.body.reduce((total: number, folder: any) => total + folder.totalCount, 0)).toBe(25);
             expect(many.result.body.reduce((total: number, folder: any) => total + folder.unreadCount, 0)).toBe(13);

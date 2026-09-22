@@ -166,6 +166,19 @@ export class MailRelayError extends ApiError {
     }
 }
 
+/**
+ * Whether a failed relay is one no retry can fix: the message failed spam/malware scanning (a 422 - scanning it again gives
+ * the same answer), or the transport refused it and every recipient's failure is explicitly permanent (an SMTP 5xx). Anything
+ * else - a transport that threw, a 4xx, a failure that says nothing either way - may pass later and is worth another attempt.
+ */
+export function isPermanentRelayFailure(err: unknown): boolean {
+    if (err instanceof MailRelayError) {
+        const failures: TransportFailure[] = err.details.failures;
+        return failures.length > 0 && failures.every((failure) => failure.temporary === false);
+    }
+    return err instanceof ApiError && err.status === 422;
+}
+
 /** The `MailRelayFailureDetails` of a relay that reached nobody: `result` is what the transport said (possibly nothing). */
 export function relayFailureDetails(result: TransportResult | undefined, envelopeTo: string[], transportName?: string): MailRelayFailureDetails {
     const source: TransportError | undefined = result?.error;

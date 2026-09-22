@@ -213,12 +213,12 @@ export function keyTrustSuite(ctx: KeyTrustSuiteContext): void {
             expect((await trust(mailbox.uid, { address: "heidi@trust-7.example.com", certificate: usages.certificate })).status).toBe(200);
         });
 
-        it("returns 404 for a missing mailbox, 403 for another user or a read-only delegate, and 200 for a manager", async () => {
+        it("returns 403 for a missing mailbox (as for another user's - it doesn't reveal which addresses have one), 403 for another user or a read-only delegate, and 200 for a manager", async () => {
             const mailbox = await createMailbox();
             const address = "ivan@trust-8.example.com";
             const { certificate } = await signer(address);
 
-            expect((await trust(uuid.v4(), { address, certificate })).status).toBe(404);
+            expect((await trust(uuid.v4(), { address, certificate })).status).toBe(403);
             expect((await trust(mailbox.uid, { address, certificate }, other)).status).toBe(403);
             expect((await trust(mailbox.uid, { address, certificate }, viewer)).status).toBe(403);
             expect(await ctx.findContacts(mailbox.uid)).toHaveLength(0);

@@ -1089,10 +1089,28 @@ describe("Route:MessageMongo Tests", () => {
         expect(entries.some((e) => e.action === AuditAction.MESSAGE_CONTENT_ACCESSED)).toBe(false);
     });
 
-    it("Audits a trusted admin reading a message's content in another user's mailbox.", async () => {
+    it("A trusted admin with no grant on the mailbox can't read a message's content (404, like a message that doesn't exist) and leaves no trace of it.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid, FolderType.INBOX);
         const message = await createMessage(mailbox.uid, folder.uid, { subject: "Confidential" });
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${message.uid}/content`)
+            .set("Authorization", "jwt " + adminToken);
+        const missing = await request(server.getApplication())
+            .get(`${baseUrl}/${uuid.v4()}/content`)
+            .set("Authorization", "jwt " + adminToken);
+
+        expect(result.status).toBe(404);
+        expect(missing.status).toBe(404);
+        expect(await auditLogRepo.find({ targetUid: message.uid }).toArray()).toEqual([]);
+    });
+
+    it("Audits an admin who has been granted the mailbox (a delegate) reading a message's content in another user's mailbox.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+        const message = await createMessage(mailbox.uid, folder.uid, { subject: "Confidential" });
+        await aclRepo.updateOne({ uid: mailbox.uid } as any, { $push: { records: { userOrRoleId: admin.uid, actions: ["read", "list"] } } } as any);
 
         const result = await request(server.getApplication())
             .get(`${baseUrl}/${message.uid}/content`)

@@ -9,12 +9,14 @@ import {
     applyThreadHeaders,
     MAX_RELAYED_REFERENCES,
     MAX_RELAYED_REFERENCES_LENGTH,
+    prepareOutboundMime,
     scanAndRelay,
+    seedReceiptStatus,
     threadHeaders,
 } from "../../src/util/MailSendUtils.js";
 import { AvVerdict, SpamVerdict } from "../../src/models/types.js";
 import { MailRelayError } from "../../src/transport/TransportResultUtils.js";
-import { InMemoryBlobStore, RecordingMailTransport } from "../testDoubles.js";
+import { InMemoryBlobStore, RecordingMailTransport, StaticDnsResolver } from "../testDoubles.js";
 
 function makeCleanScanResult(overrides: any = {}) {
     return {
@@ -54,7 +56,7 @@ describe("scanAndRelay() Tests", () => {
         expect(result.messageId).toBe("existing-id@example.com");
         expect(result.raw).toBe(raw);
         expect(mailTransport.sent[0].raw).toBe(raw);
-        expect(scanPipeline.run).toHaveBeenCalledWith(raw, { from: "sender@example.com", to: ["recipient@example.com"] });
+        expect(scanPipeline.run).toHaveBeenCalledWith(raw, { from: "sender@example.com", to: ["recipient@example.com"] }, { skipPreview: true });
     });
 
     it("Generates and injects a Message-ID when the raw message has none, using envelopeFrom's domain.", async () => {
@@ -66,7 +68,7 @@ describe("scanAndRelay() Tests", () => {
         expect(result.raw).not.toBe(raw);
         expect(result.raw.toString()).toContain(`Message-ID: <${result.messageId}>`);
         // The augmented raw - not the original - is what actually gets scanned and relayed.
-        expect(scanPipeline.run).toHaveBeenCalledWith(result.raw, { from: "sender@example.com", to: ["recipient@example.com"] });
+        expect(scanPipeline.run).toHaveBeenCalledWith(result.raw, { from: "sender@example.com", to: ["recipient@example.com"] }, { skipPreview: true });
         expect(mailTransport.sent[0].raw).toBe(result.raw);
     });
 
@@ -331,5 +333,101 @@ describe("threadHeaders()/applyThreadHeaders() Tests", () => {
         expect(threaded.toString()).toContain("References: <root@example.com>");
         expect(threaded.toString()).toContain("Message-ID: <self@example.com>");
         expect(threaded.toString().endsWith(`Hello world${String.fromCharCode(13, 10)}`)).toBe(true);
+    });
+});
+
+describe("prepareOutboundMime() and seedReceiptStatus() Tests", () => {
+    const raw = makeRawMessage();
+    const message = { from: { address: "sender@example.com" }, recipients: [{ address: "someone@example.com" }] };
+    const mailbox = (overrides: any = {}): any => ({
+        alwaysRequestReceiptInternal: false,
+        alwaysRequestReceiptFederated: false,
+        alwaysRequestReceiptExternal: false,
+        keys: [],
+        ...overrides,
+    });
+    // A fresh class per test: the domain repository is cached per class.
+    const factoryWithDomains = (...names: string[]): any => ({ newInstance: async () => ({ find: async () => names.map((name) => ({ name })) }) });
+
+    it("returns the bytes untouched, requesting no receipt, without a mailbox or when the mailbox and message ask for none", async () => {
+        const dns = new StaticDnsResolver();
+
+        expect(await prepareOutboundMime({ raw, message, mailbox: undefined, objectFactory: factoryWithDomains(), domainClass: class A {}, dnsResolver: dns })).toEqual({
+            raw,
+            attachesReceiptRequest: false,
+        });
+        const none = await prepareOutboundMime({ raw, message, mailbox: mailbox(), objectFactory: factoryWithDomains(), domainClass: class B {}, dnsResolver: dns });
+        expect(none.raw).toBe(raw);
+        expect(none.attachesReceiptRequest).toBe(false);
+    });
+
+    it("requests a receipt for a recipient in a tier the mailbox asks receipts for, by the mailbox's own default", async () => {
+        const dns = new StaticDnsResolver();
+        const internal = await prepareOutboundMime({
+            raw,
+            message,
+            mailbox: mailbox({ alwaysRequestReceiptInternal: true }),
+            objectFactory: factoryWithDomains("example.com"),
+            domainClass: class C {},
+            dnsResolver: dns,
+        });
+        const externalOnly = await prepareOutboundMime({
+            raw,
+            message,
+            mailbox: mailbox({ alwaysRequestReceiptInternal: true }),
+            objectFactory: factoryWithDomains("elsewhere.example"),
+            domainClass: class D {},
+            dnsResolver: dns,
+        });
+
+        expect(internal.attachesReceiptRequest).toBe(true);
+        expect(internal.raw.toString()).toMatch(/^Disposition-Notification-To: sender@example.com\r\n/);
+        expect(externalOnly.attachesReceiptRequest).toBe(false);
+        expect(externalOnly.raw).toBe(raw);
+    });
+
+    it("lets the message's own requestReceipt override the mailbox's defaults either way", async () => {
+        const dns = new StaticDnsResolver();
+        const asked = await prepareOutboundMime({ raw, message: { ...message, requestReceipt: true }, mailbox: mailbox(), objectFactory: factoryWithDomains(), domainClass: class E {}, dnsResolver: dns });
+        const declined = await prepareOutboundMime({
+            raw,
+            message: { ...message, requestReceipt: false },
+            mailbox: mailbox({ alwaysRequestReceiptInternal: true, alwaysRequestReceiptExternal: true }),
+            objectFactory: factoryWithDomains("example.com"),
+            domainClass: class F {},
+            dnsResolver: dns,
+        });
+
+        expect(asked.attachesReceiptRequest).toBe(true);
+        expect(declined.attachesReceiptRequest).toBe(false);
+    });
+
+    it("requests no receipt when it has nothing to classify recipients with (no domain class or no resolver)", async () => {
+        const asks = { ...message, requestReceipt: true };
+
+        expect((await prepareOutboundMime({ raw, message: asks, mailbox: mailbox(), objectFactory: factoryWithDomains() })).attachesReceiptRequest).toBe(false);
+        expect(
+            (await prepareOutboundMime({ raw, message: asks, mailbox: mailbox(), objectFactory: factoryWithDomains(), domainClass: class G {} })).attachesReceiptRequest,
+        ).toBe(false);
+    });
+
+    it("announces the mailbox's active encryption key, and only an active one", async () => {
+        const dns = new StaticDnsResolver();
+        const key = (overrides: any = {}) => ({ useType: "encrypt", type: "x509", publicKey: "S0VZ", notAfter: Date.now() + 60_000, ...overrides });
+        const send = async (keys: any[], encryptPreference?: any) =>
+            (await prepareOutboundMime({ raw, message, mailbox: mailbox({ keys, encryptPreference }), objectFactory: factoryWithDomains(), domainClass: class H {}, dnsResolver: dns })).raw.toString();
+
+        expect(await send([key()], { preferEncrypt: "mutual" })).toMatch(/^RapidMX-Key: addr=sender@example.com; prefer-encrypt=mutual; type=x509; keydata=S0VZ\r\n/);
+        expect(await send([key()])).toContain("prefer-encrypt=nopreference");
+        expect(await send([key({ revokedAt: Date.now() - 1 }), key({ notAfter: Date.now() - 1 }), key({ useType: "sign" })])).toBe(raw.toString());
+        expect((await prepareOutboundMime({ raw, message, mailbox: { ...mailbox(), keys: null }, objectFactory: factoryWithDomains(), domainClass: class I {}, dnsResolver: dns })).raw).toBe(raw);
+    });
+
+    it("seeds one tracking row per distinct recipient, case variants collapsed", () => {
+        expect(seedReceiptStatus(["A@Example.com", "b@example.com", "a@example.com"])).toEqual([
+            { recipientAddress: "a@example.com" },
+            { recipientAddress: "b@example.com" },
+        ]);
+        expect(seedReceiptStatus([])).toEqual([]);
     });
 });

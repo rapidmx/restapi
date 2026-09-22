@@ -55,6 +55,32 @@ describe("BaseFolderRoute Tests (repoUtils guard clauses only)", () => {
         ]);
     });
 
+    it("find() logs, and still answers the list, when the mailbox's well-known folders can't be provisioned.", async () => {
+        const route = objectFactory.newInstance<TestFolderRoute>(TestFolderRoute, { initialize: false });
+        const stored = [{ uid: "folder-1", unreadCount: 0, totalCount: 0 }];
+        void Object.defineProperty(route, "modelClass", { value: class FolderTest {} });
+        (route as any).logger = { warn: vi.fn() };
+        (route as any).repoUtils = { find: vi.fn().mockRejectedValueOnce(new Error("database is down")).mockResolvedValue(stored) };
+        (route as any).aclUtils = { hasPermission: vi.fn().mockResolvedValue(true) };
+
+        expect(await route.find({}, { mailboxUid: "mbx-1" }, { uid: "user-1" } as any)).toEqual(stored);
+        expect((route as any).logger.warn).toHaveBeenCalledWith(expect.stringContaining("database is down"));
+    });
+
+    it("findById() heals only for a caller who may list the folder's whole mailbox.", async () => {
+        const route = objectFactory.newInstance<TestFolderRoute>(TestFolderRoute, { initialize: false });
+        void Object.defineProperty(route, "modelClass", { value: class FolderTest {} });
+        (route as any).repoUtils = { find: vi.fn().mockResolvedValue([]), findOne: vi.fn().mockResolvedValue({ uid: "folder-1", mailboxUid: "mbx-1" }) };
+        // READ on the folder itself, but nothing on the mailbox: a folder-only share.
+        (route as any).aclUtils = { hasPermission: vi.fn().mockImplementation(async (_user: any, uid: string) => uid === "folder-1") };
+        vi.spyOn(Object.getPrototypeOf(BaseFolderRoute.prototype), "findById").mockResolvedValue({ uid: "folder-1", mailboxUid: "mbx-1" });
+
+        const folder = await route.findById("folder-1", {}, { uid: "user-1" } as any);
+
+        expect(folder?.uid).toBe("folder-1");
+        expect((route as any).repoUtils.find).not.toHaveBeenCalled();
+    });
+
     it("create() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
         const route = objectFactory.newInstance<TestFolderRoute>(TestFolderRoute, { initialize: false });
         const req: any = {};

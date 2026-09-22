@@ -57,6 +57,8 @@ export function verificationSealSuite(ctx: VerificationSealSuiteContext): void {
             { userOrRoleId: delegate.uid, actions: [ACLAction.READ, ACLAction.UPDATE] },
             { userOrRoleId: reader.uid, actions: [ACLAction.READ] },
             { userOrRoleId: updaterOnly.uid, actions: [ACLAction.UPDATE] },
+            // A trusted caller has no implicit access to a mailbox: the tests of trusted callers hold an explicit full grant.
+            { userOrRoleId: admin.uid, actions: [ACLAction.FULL] },
         ]);
         const message = await ctx.saveMessage({
             mailboxUid: mailbox.uid,

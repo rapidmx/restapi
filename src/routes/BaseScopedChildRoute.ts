@@ -16,8 +16,10 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import type { CalendarShareLink } from "../models/types.js";
+import { AuditAction, type CalendarShareLink } from "../models/types.js";
+import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { coerceDateFields } from "../util/DateCoercionUtils.js";
+import { assertAdminScope, hasMailAccess, isAdminScope, isTrustedUser } from "../util/MailAccessUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 const { Delete, Get, Head, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
@@ -54,12 +56,12 @@ const SHARE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
  * Returns a client-supplied list query without any key that could widen it past the scope the route forces:
  * `$`-prefixed keys (`$or`/`$and`/...) and dotted paths with a `$` segment - on SQL, service-core's
  * `buildSearchQuerySQL` merges each `$or` branch OVER the other keys, so a branch naming the scope field replaced the
- * permission-checked value - plus the `shareToken` credential, which names no field.
+ * permission-checked value - plus the `shareToken` credential and the `scope` selector, which name no field.
  */
 function stripUnsafeQueryKeys(query: any): Record<string, any> {
     const result: Record<string, any> = {};
     for (const [key, value] of Object.entries(query ?? {})) {
-        if (key === "shareToken" || key.split(".").some((segment) => segment.startsWith("$"))) {
+        if (key === "shareToken" || key === "scope" || key.split(".").some((segment) => segment.startsWith("$"))) {
             continue;
         }
         result[key] = value;
@@ -86,6 +88,13 @@ function stripUnsafeQueryKeys(query: any): Record<string, any> {
  * deny-by-default class-level ACL and fail. `doCreateObject`/`doBulkCreate` are the exception (verified safe:
  * they forward `options`, `ignoreACL` included, straight through to `RepoUtils.create()`), so `create()` still
  * uses them. Every other operation calls `this.repoUtils` directly instead.
+ *
+ * **No role widens access.** Every permission check goes through `hasMailAccess()` (`util/MailAccessUtils.ts`), which
+ * takes the caller's trusted roles away first: an administrator reads and writes exactly the scopes they own or hold an
+ * ACL grant on - the framework's "trusted users always have permission" shortcut never applies to a person's mail. The
+ * only exception is a route that sets `adminScope` (the quarantine and ingest-queue review pages): there a trusted AND
+ * elevated caller reads any mailbox's entries with `?scope=admin` (and, like every write on those routes, writes them),
+ * and each such call is recorded as `AuditAction.MAIL_QUEUE_ADMIN_ACCESS`.
  *
  * Read-shaped denials (`find`/`count`/`exists`/`findById`) fail quietly (an empty result / zero count / `404`)
  * rather than `403`, so a caller with no access can't distinguish "records exist but you can't see them" from
@@ -125,6 +134,15 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * scoped as usual. */
     protected readonly trustedOnlyWrites: boolean = false;
 
+    /** When `true`, a trusted AND elevated caller may read any mailbox's records with `?scope=admin` and (on a
+     * `trustedOnlyWrites` route) write them, each call audited - for records the platform produces about mail flow
+     * (`IngestQueueEntry`, `QuarantineEntry`) that an administrator reviews. Off everywhere else: an administrator has no
+     * more access to these routes' mailboxes than anyone else. Needs `auditLogClass`. */
+    protected readonly adminScope: boolean = false;
+
+    /** The concrete `AuditLogEntry` class (supplied by the Mongo/SQL subclasses of an `adminScope` route). */
+    protected auditLogClass?: any;
+
     /** Fields only server-side code sets. Dropped from a non-trusted caller's create/update body, so a full object
      * round-tripped back keeps the stored values. */
     protected readonly serverManagedFields: readonly string[] = [];
@@ -143,6 +161,38 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
 
     protected isTrusted(user: JWTUser | undefined): boolean {
         return !!user && UserUtils.hasRoles(user, this.trustedRoles);
+    }
+
+    /** Whether `user` holds `action` on `uid` (a mailbox or folder uid) by ownership or an ACL record - never by a trusted
+     * role. See `util/MailAccessUtils.ts`. */
+    protected hasMailAccess(user: JWTUser | undefined, uid: string, action: string): Promise<boolean> {
+        return hasMailAccess(this.aclUtils, this.trustedRoles, user, uid, action);
+    }
+
+    /** Whether this read asks for the administration scope on a route that offers it (`adminScope`) - then the caller must
+     * be trusted and elevated (403 otherwise). A route that doesn't offer it ignores `?scope=`. */
+    private adminScopeRequested(query: any, user: JWTUser | undefined): boolean {
+        if (!this.adminScope || !isAdminScope(query)) {
+            return false;
+        }
+        assertAdminScope(user, this.trustedRoles);
+        return true;
+    }
+
+    /** Records one administration-scope access to `mailboxUid`'s records. */
+    private async auditAdminAccess(user: JWTUser | undefined, operation: string, mailboxUid: string, count?: number): Promise<void> {
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, user, logger: this.logger },
+            {
+                action: AuditAction.MAIL_QUEUE_ADMIN_ACCESS,
+                targetType: this.modelClass.name,
+                targetUid: mailboxUid,
+                mailboxUid,
+                details: { operation, ...(count === undefined ? {} : { count }) },
+            },
+        );
     }
 
     private requireTrustedWrite(user: JWTUser | undefined): void {
@@ -247,8 +297,8 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * a read-only delegate doesn't qualify. */
     private async canViewDeleted(user: JWTUser | undefined, scopeUid: string): Promise<boolean> {
         return (
-            (await this.aclUtils!.hasPermission(user, scopeUid, ACLAction.DELETE)) &&
-            (await this.aclUtils!.hasPermission(user, scopeUid, ACLAction.UPDATE))
+            (await this.hasMailAccess(user, scopeUid, ACLAction.DELETE)) &&
+            (await this.hasMailAccess(user, scopeUid, ACLAction.UPDATE))
         );
     }
 
@@ -267,7 +317,17 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
     }
 
     private async requirePermission(scopeUid: string | undefined, user: JWTUser | undefined, action: string): Promise<void> {
-        if (!scopeUid || !(await this.aclUtils!.hasPermission(user, scopeUid, action))) {
+        if (!scopeUid) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+        if (this.adminScope && this.trustedOnlyWrites && isTrustedUser(user, this.trustedRoles)) {
+            // The records of an `adminScope` route are written only by trusted callers (see `requireTrustedWrite()`), who
+            // need no grant on the mailbox for it - but must hold an elevated token, and every write is audited.
+            assertAdminScope(user, this.trustedRoles);
+            await this.auditAdminAccess(user, action, scopeUid);
+            return;
+        }
+        if (!(await this.hasMailAccess(user, scopeUid, action))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
     }
@@ -356,14 +416,18 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!scopeUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
+        const admin: boolean = this.adminScopeRequested(query, user);
         const effectiveUser: JWTUser | undefined = await this.resolveEffectiveUser(user, query, scopeUid);
-        if (!(await this.aclUtils!.hasPermission(effectiveUser, scopeUid, ACLAction.COUNT))) {
+        if (!admin && !(await this.hasMailAccess(effectiveUser, scopeUid, ACLAction.COUNT))) {
             return res.status(200).setHeader("content-length", 0);
         }
         const result: number = await this.repoUtils.count(
             await this.listFilter(params, query, scopeUid, effectiveUser),
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
+        if (admin) {
+            await this.auditAdminAccess(user, "count", scopeUid, result);
+        }
         return res.status(200).setHeader("content-length", result);
     }
 
@@ -438,10 +502,14 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         });
         const scopeUid: string | undefined = existing ? this.scopeUidOf(existing) : undefined;
         const effectiveUser: JWTUser | undefined = scopeUid ? await this.resolveEffectiveUser(user, query, scopeUid) : undefined;
+        const admin: boolean = this.adminScopeRequested(query, user);
         const permitted: boolean = scopeUid
-            ? (await this.aclUtils!.hasPermission(effectiveUser, scopeUid, ACLAction.EXISTS)) &&
+            ? (admin || (await this.hasMailAccess(effectiveUser, scopeUid, ACLAction.EXISTS))) &&
               (await this.deletedVisible(existing!, scopeUid, effectiveUser))
             : false;
+        if (admin && permitted) {
+            await this.auditAdminAccess(user, "exists", scopeUid!);
+        }
         return permitted
             ? res.status(200).setHeader("content-length", 1)
             : res.status(404).setHeader("content-length", 0);
@@ -456,14 +524,19 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!scopeUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
+        const admin: boolean = this.adminScopeRequested(query, user);
         const effectiveUser: JWTUser | undefined = await this.resolveEffectiveUser(user, query, scopeUid);
-        if (!(await this.aclUtils!.hasPermission(effectiveUser, scopeUid, ACLAction.LIST))) {
+        if (!admin && !(await this.hasMailAccess(effectiveUser, scopeUid, ACLAction.LIST))) {
             return [];
         }
-        return await this.repoUtils.find(
+        const found: T[] = await this.repoUtils.find(
             await this.listFilter(params, query, scopeUid, effectiveUser),
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
         );
+        if (admin) {
+            await this.auditAdminAccess(user, "list", scopeUid, found.length);
+        }
+        return found;
     }
 
     @Get("/:id")
@@ -478,12 +551,16 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         });
         const scopeUid: string | undefined = existing ? this.scopeUidOf(existing) : undefined;
         const effectiveUser: JWTUser | undefined = scopeUid ? await this.resolveEffectiveUser(user, query, scopeUid) : undefined;
+        const admin: boolean = this.adminScopeRequested(query, user);
         if (
             !scopeUid ||
-            !(await this.aclUtils!.hasPermission(effectiveUser, scopeUid, ACLAction.READ)) ||
+            !(admin || (await this.hasMailAccess(effectiveUser, scopeUid, ACLAction.READ))) ||
             !(await this.deletedVisible(existing!, scopeUid, effectiveUser))
         ) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        if (admin) {
+            await this.auditAdminAccess(user, "read", scopeUid);
         }
         return existing!;
     }

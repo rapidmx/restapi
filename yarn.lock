@@ -1288,6 +1288,7 @@ __metadata:
     eslint-plugin-jsdoc: "npm:^64.3.6"
     globals: "npm:^17.12.0"
     html-to-text: "npm:^10.0.1"
+    htmlparser2: "npm:^10.1.0"
     lodash-es: "npm:^4.18.1"
     mailparser: "npm:^3.9.23"
     mammoth: "npm:^1.12.2"

@@ -170,9 +170,28 @@ describe("Route:MailboxImportRequestMongo Tests", () => {
             expect(Buffer.compare(stored, raw)).toBe(0);
         });
 
-        it("Admin-mediated: a trusted caller can create a request for another user's mailbox.", async () => {
+        it("A trusted caller can't import into another user's mailbox (403) - a trusted role is no grant on it - and nothing is created.", async () => {
             const mailbox = await createMailbox(owner.uid);
             const folder = await createFolder(mailbox.uid);
+
+            const result = await request(server.getApplication())
+                .post(importUrl({ format: "pst", targetFolderUid: folder.uid, mailboxUid: mailbox.uid }))
+                .set("Authorization", "jwt " + adminToken)
+                .set("Content-Type", "application/vnd.ms-outlook")
+                .send(Buffer.from("fake pst bytes"));
+
+            expect(result.status).toBe(403);
+            expect(await requestRepo.find({}).toArray()).toEqual([]);
+        });
+
+        it("A trusted caller can create a request for a mailbox they hold a grant on, whoever owns it.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            await objectFactory
+            .getInstance(ConnectionManager)!
+            .connections.get("acl")!
+            .getMongoRepository("AccessControlListMongo")
+            .save({ uid: mailbox.uid, dateCreated: new Date(), dateModified: new Date(), version: 0, parentUid: "Mailbox", records: [{ userOrRoleId: admin.uid, actions: ["*"] }] });
 
             const result = await request(server.getApplication())
                 .post(importUrl({ format: "pst", targetFolderUid: folder.uid, mailboxUid: mailbox.uid }))
@@ -186,13 +205,29 @@ describe("Route:MailboxImportRequestMongo Tests", () => {
             expect(result.body.requestedByUserUid).toBe(admin.uid);
         });
 
-        it("Rejects a trusted caller's request for a nonexistent mailbox (404).", async () => {
+        it("Answers 404 for a mailbox the caller holds a grant on whose row no longer exists (a leftover ACL).", async () => {
+            const ghost = `${uuid.v4()}@example.com`;
+            await objectFactory
+                .getInstance(ConnectionManager)!
+                .connections.get("acl")!
+                .getMongoRepository("AccessControlListMongo")
+                .save({ uid: ghost, dateCreated: new Date(), dateModified: new Date(), version: 0, parentUid: "Mailbox", records: [{ userOrRoleId: admin.uid, actions: ["*"] }] });
+
+            const result = await request(server.getApplication())
+                .post(importUrl({ format: "mbox", targetFolderUid: uuid.v4(), mailboxUid: ghost }))
+                .set("Authorization", "jwt " + adminToken)
+                .set("Content-Type", "application/mbox")
+                .send(Buffer.from("From x\r\n\r\n"));
+            expect(result.status).toBe(404);
+        });
+
+        it("Rejects a trusted caller's request for a nonexistent mailbox (403, as for anyone else's - it doesn't reveal which exist).", async () => {
             const result = await request(server.getApplication())
                 .post(importUrl({ format: "mbox", targetFolderUid: uuid.v4(), mailboxUid: uuid.v4() }))
                 .set("Authorization", "jwt " + adminToken)
                 .set("Content-Type", "application/mbox")
                 .send(Buffer.from("From x\r\n\r\n"));
-            expect(result.status).toBe(404);
+            expect(result.status).toBe(403);
         });
 
         it("Records an audit log entry.", async () => {

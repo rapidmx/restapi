@@ -7,6 +7,7 @@
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrors, ModelUtils, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { Contact, DataSubjectErasureRequest, DistributionList, Folder, FolderType, Mailbox } from "../models/types.js";
+import { hasMailAccess } from "../util/MailAccessUtils.js";
 const { Config, Inject } = ObjectDecorators;
 const { Auth, Get, Query, RateLimit, User: AuthUser } = RouteDecorators;
 
@@ -275,7 +276,7 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
         await this.init();
         const mailboxUids = new Set<string>((await this.ownedMailboxes(user!)).map((mailbox) => mailbox.uid));
         if (typeof mailboxUid === "string" && mailboxUid && !mailboxUids.has(mailboxUid)) {
-            if (await this.aclUtils!.hasPermission(user, mailboxUid, ACLAction.READ)) {
+            if (await hasMailAccess(this.aclUtils, this.trustedRoles, user, mailboxUid, ACLAction.READ)) {
                 mailboxUids.add(mailboxUid);
             }
         }
@@ -288,7 +289,7 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
         );
         const readable: string[] = [];
         for (const folder of folders) {
-            if (folder.deleted !== true && (await this.aclUtils!.hasPermission(user, folder.uid, ACLAction.READ))) {
+            if (folder.deleted !== true && (await hasMailAccess(this.aclUtils, this.trustedRoles, user, folder.uid, ACLAction.READ))) {
                 readable.push(folder.uid);
             }
         }

@@ -1700,6 +1700,26 @@ export enum AuditAction {
      * `EscrowAuditAction.MATTER_EXPORT_REQUESTED`/`READY` entries a successful export's own mailboxes get
      * instead (see `MatterExportRequest`'s own doc comment for why). */
     MATTER_EXPORT_FAILED = "matter_export.failed",
+    /** `GET /mail/mailboxes?scope=admin` - an administrator listed every mailbox's administrative metadata (see
+     * `BaseMailboxRoute`). One entry per call: `targetUid` is `*`, `details` carries the `count` returned and the
+     * `query`. Never a way into mail content. */
+    MAILBOX_ADMIN_LIST = "mailbox.admin-list",
+    /** `GET /mail/mailboxes/:id?scope=admin` - an administrator read one mailbox's administrative metadata. */
+    MAILBOX_ADMIN_READ = "mailbox.admin-read",
+    /** An administrator (who neither owns the mailbox nor holds a grant on it) changed a mailbox's administrative
+     * settings (`PUT`s on `/mail/mailboxes`). `details.fields` names what changed; nothing else is writable that way. */
+    MAILBOX_ADMIN_UPDATE = "mailbox.admin-update",
+    /** An administrator (who neither owns the mailbox nor holds a grant on it) deleted a mailbox. */
+    MAILBOX_ADMIN_DELETE = "mailbox.admin-delete",
+    /** `GET`/`PUT`s with `?scope=admin` on the quarantine and ingest-queue routes: an administrator reviewed or acted on
+     * a mailbox's mail-flow records (`details.operation`: list, count, read, exists, or the write's action). `targetType` is
+     * the record's model, `targetUid`/`mailboxUid` the mailbox. */
+    MAIL_QUEUE_ADMIN_ACCESS = "mail_queue.admin_access",
+    /** An administrator read the members (sharing list) of a mailbox they neither own nor hold a grant on
+     * (`GET /mail/mailboxes/:id/access`). Granting and revoking are `MAILBOX_ACCESS_GRANT`/`MAILBOX_ACCESS_REVOKE`. */
+    MAILBOX_ACCESS_ADMIN_LIST = "mailbox_access.admin-list",
+    /** Somebody other than the requester or the mailbox owner downloaded a data export (`GET /data-export/:id/download`). */
+    DATA_EXPORT_DOWNLOADED = "data_export.downloaded",
 }
 
 /**
@@ -2452,4 +2472,66 @@ export interface Plugin extends BaseEntity {
 
     /** A snapshot of the package's `rapidmx.plugin` block for `version`. */
     manifest: PluginManifest;
+}
+
+/** How the web client chooses between its light and dark themes. */
+export type AppearanceMode = "system" | "light" | "dark";
+
+/** How an uploaded background image is fitted to the window. */
+export type AppearanceBackgroundFit = "cover" | "contain" | "tile";
+
+/** The colour overrides a user has chosen, each `#rrggbb`. A missing key means "the application's (or this deployment's
+ * branding's) own colour". */
+export interface AppearanceColors {
+    primary?: string;
+    accent?: string;
+    surface?: string;
+    text?: string;
+}
+
+/** A user's window background. `imageVersion` names the uploaded image (`GET .../background/:version`); it is set by
+ * the upload and never by a client. */
+export interface AppearanceBackground {
+    kind: "none" | "color" | "image";
+    color?: string;
+    imageVersion?: string;
+    /** How far the background is darkened, 0 (not at all) to 0.8. */
+    dim: number;
+    /** How far the background is blurred, in pixels, 0 to 20. */
+    blur: number;
+    fit: AppearanceBackgroundFit;
+}
+
+/**
+ * The web client's appearance settings for one user: one row per user (`userUid`), not per mailbox, so the look follows
+ * the person to every mailbox and device. Written only by `BaseAppearanceRoute`, which lets a caller touch nothing but
+ * their own row - hence the deny-all class ACL, like every other route-managed entity here.
+ *
+ * `backgroundContentType` is route-managed bookkeeping (the type sniffed from the uploaded image's bytes) and never part
+ * of the wire shape (`PublicAppearancePreferences`).
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface AppearancePreferences extends BaseEntity {
+    /** The `uid` of the user these preferences belong to (the JWT's `uid`). Unique. */
+    userUid: string;
+
+    mode: AppearanceMode;
+
+    colors?: AppearanceColors | null;
+
+    background?: AppearanceBackground | null;
+
+    /** The content type sniffed from the uploaded background image's bytes. */
+    backgroundContentType?: string | null;
+}
+
+/** The wire shape of `AppearancePreferences`: what `GET`/`PUT /mail/preferences/appearance` and the page's `appearance` prop carry. */
+export interface PublicAppearancePreferences {
+    /** The shape's own version, always 1 (`version` on the entity is the optimistic-lock counter). */
+    version: 1;
+    mode: AppearanceMode;
+    colors?: AppearanceColors;
+    background?: AppearanceBackground;
+    updatedAt: string;
 }

@@ -3,12 +3,17 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
-import { ApiError } from "@rapidrest/core";
+import { ApiError, type ObjectFactory } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
+import type { DnsResolver } from "../dns/DnsResolver.js";
+import type { Mailbox, MessageReceiptEntry, PublicKey } from "../models/types.js";
 import { MailRelayError, type MailRelayFailureDetails, relayFailureDetails } from "../transport/TransportResultUtils.js";
+import { normalizeAddress } from "./AddressUtils.js";
 import { deriveConversationId } from "./ConversationUtils.js";
+import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "./DomainUtils.js";
 import { extractHeader, prependHeaders } from "./MimeHeaderUtils.js";
+import { buildRapidMxKeyHeader } from "./RapidMxKeyHeaderUtils.js";
 import { resolveDeliveryVerdict, ScanPipeline } from "../scan/ScanPipeline.js";
 
 /** The outcome of `scanAndRelay()` a caller needs to finish persisting a sent message. */
@@ -94,7 +99,8 @@ export async function scanAndRelay(
         finalRaw = prependHeaders(raw, [{ name: "Message-ID", value: `<${messageId}>` }]);
     }
 
-    const scanResult = await scanPipeline.run(finalRaw, { from: envelopeFrom, to: envelopeTo });
+    // No preview: no caller of a send uses one (the draft already has its own), and deriving it converts the whole HTML body to text.
+    const scanResult = await scanPipeline.run(finalRaw, { from: envelopeFrom, to: envelopeTo }, { skipPreview: true });
     const verdict = resolveDeliveryVerdict(scanResult);
     if (verdict !== "deliver") {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 422, "This message could not be sent because it failed spam/malware scanning.");
@@ -195,4 +201,99 @@ export function threadHeaders(raw: Buffer, thread: { inReplyTo?: string; referen
 export function applyThreadHeaders(raw: Buffer, thread: { inReplyTo?: string; references?: string[] | null }): Buffer {
     const headers: { name: string; value: string }[] = threadHeaders(raw, thread);
     return headers.length > 0 ? prependHeaders(raw, headers) : raw;
+}
+
+/** What `prepareOutboundMime()` needs to know about the message being sent. */
+export interface OutboundMessageInfo {
+    from: { address: string };
+    recipients: { address: string }[];
+    /** An explicit per-draft receipt request, overriding all three of the mailbox's `alwaysRequestReceipt*` defaults. */
+    requestReceipt?: boolean | null;
+}
+
+/**
+ * The bytes a message is relayed as: `raw` with the headers the sending side adds at send time.
+ *
+ * - `Disposition-Notification-To` when a receipt is requested for any recipient. A receipt request is a single message-level
+ * header (RFC 3798 has no "only for these recipients"), so it is attached when it applies to *any* recipient: each one is
+ * classified same-organisation/federated/external (`classifyRecipientTier()`) and the per-draft `requestReceipt` overrides all
+ * three of the mailbox's `alwaysRequestReceipt*` defaults at once when set.
+ * - `RapidMX-Key`, announcing the mailbox's active (non-revoked, non-expired) encryption key.
+ *
+ * Shared by `BaseMessageRoute.send()` and `ScheduledSendJob`, so a message goes out the same whichever of them sends it - a
+ * background send is relayed by the job. `attachesReceiptRequest` says whether the first header was added (the Sent Items
+ * copy then tracks the receipts, see `seedReceiptStatus()`). Without a `domainClass` and a `dnsResolver` no recipient can be
+ * classified and no receipt is requested.
+ */
+export async function prepareOutboundMime(args: {
+    raw: Buffer;
+    message: OutboundMessageInfo;
+    mailbox: Mailbox | undefined;
+    objectFactory: ObjectFactory;
+    domainClass?: any;
+    dnsResolver?: DnsResolver;
+}): Promise<{ raw: Buffer; attachesReceiptRequest: boolean }> {
+    const { message, mailbox, objectFactory } = args;
+    let raw: Buffer = args.raw;
+    const envelopeTo: string[] = message.recipients.map((recipient) => recipient.address);
+
+    let attachesReceiptRequest = false;
+    if (mailbox && args.domainClass && args.dnsResolver) {
+        const effectiveInternal: boolean = message.requestReceipt ?? mailbox.alwaysRequestReceiptInternal;
+        const effectiveFederated: boolean = message.requestReceipt ?? mailbox.alwaysRequestReceiptFederated;
+        const effectiveExternal: boolean = message.requestReceipt ?? mailbox.alwaysRequestReceiptExternal;
+        if (effectiveInternal || effectiveFederated || effectiveExternal) {
+            // Fetched once and passed to every `classifyRecipientTier()` call (`verifiedDomainNames`) rather than each one
+            // re-querying "this server's domains" from scratch. The per-recipient DNS federated-peer checks are independent
+            // of each other, so they run concurrently - `resolveFederationPolicy()` already caches per domain.
+            const verifiedDomainNames: string[] = await getVerifiedDomainNames(objectFactory, args.domainClass);
+            const federatedPeerCheck = createFederatedPeerCheck(args.dnsResolver);
+            const tiers = await Promise.all(
+                envelopeTo.map((address) => classifyRecipientTier(objectFactory, args.domainClass, address, federatedPeerCheck, verifiedDomainNames)),
+            );
+            attachesReceiptRequest = tiers.some(
+                (tier) =>
+                    (tier === "same-org" && effectiveInternal) || (tier === "federated" && effectiveFederated) || (tier === "external" && effectiveExternal),
+            );
+        }
+    }
+    if (attachesReceiptRequest) {
+        raw = prependHeaders(raw, [{ name: "Disposition-Notification-To", value: message.from.address }]);
+    }
+
+    // Announces the sending mailbox's current encryption key (the Autocrypt-style opportunistic-discovery half of the protocol).
+    // `?? []`: defense in depth against a legacy row whose SQL `keys` column was backfilled to `null` rather than the column's
+    // own default - the documented "SQL returns null, not undefined, for an unset column" hazard.
+    const activeEncryptKey: PublicKey | undefined = (mailbox?.keys ?? []).find((k) => k.useType === "encrypt" && !k.revokedAt && k.notAfter > Date.now());
+    if (activeEncryptKey) {
+        raw = prependHeaders(raw, [
+            {
+                name: "RapidMX-Key",
+                value: buildRapidMxKeyHeader(
+                    message.from.address,
+                    (mailbox!.encryptPreference ?? { preferEncrypt: "nopreference" }).preferEncrypt,
+                    activeEncryptKey,
+                ),
+            },
+        ]);
+    }
+    return { raw, attachesReceiptRequest };
+}
+
+/**
+ * One placeholder row per *distinct* recipient (case variants across To/Cc collapse) for a Sent Items copy that requested
+ * receipts, for `processReceipt()` to fill in as the real MDNs arrive. A `DistributionList`'s own address is kept as-is: its
+ * expanded members can only be discovered later, as their own receipts arrive.
+ */
+export function seedReceiptStatus(envelopeTo: string[]): MessageReceiptEntry[] {
+    const seen: Set<string> = new Set();
+    const receiptStatus: MessageReceiptEntry[] = [];
+    for (const address of envelopeTo) {
+        const normalized: string = normalizeAddress(address);
+        if (!seen.has(normalized)) {
+            seen.add(normalized);
+            receiptStatus.push({ recipientAddress: normalized });
+        }
+    }
+    return receiptStatus;
 }

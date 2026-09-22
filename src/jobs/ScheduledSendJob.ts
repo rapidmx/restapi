@@ -8,7 +8,8 @@ import { boundIndexedValue, findThreadConversationId, resolveConversationId } fr
 import { asEntity } from "../util/EntityUtils.js";
 import { refreshFolderCounts } from "../util/FolderCountUtils.js";
 import type { TransportError, TransportFailure } from "../transport/MailTransport.js";
-import type { MailRelayFailureDetails } from "../transport/TransportResultUtils.js";
+import { isPermanentRelayFailure, type MailRelayFailureDetails } from "../transport/TransportResultUtils.js";
+import type { DnsResolver } from "../dns/DnsResolver.js";
 import {
     type DeliveryNoticeSink,
     deliveryFailureKey,
@@ -19,7 +20,7 @@ import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
-import { scanAndRelay } from "../util/MailSendUtils.js";
+import { prepareOutboundMime, scanAndRelay, seedReceiptStatus } from "../util/MailSendUtils.js";
 import { deriveMessageListFields } from "../util/MessageListUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
@@ -28,6 +29,27 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** Maximum length of a persisted `scheduledSendError`. */
 const MAX_ERROR_LENGTH = 1000;
+
+/** What a send attempt came to - the `action` of the event `ScheduledSendJob` publishes. */
+export type SendEventAction = "send-succeeded" | "send-failed" | "send-retrying";
+
+/**
+ * The `data` of a `send-succeeded` / `send-failed` / `send-retrying` event: `{ type: <the Message class name>, action, data }`,
+ * published on the sending mailbox's uid channel and on the Outbox (and, once filed, Sent Items) folder channels.
+ */
+export interface SendEventData {
+    uid: string;
+    mailboxUid: string;
+    subject: string;
+    /** Every To, Cc and Bcc address. */
+    recipients: string[];
+    /** Which attempt this is about, counting from 1: the one that succeeded, the one that failed. */
+    attempt: number;
+    /** `send-retrying` only: when the next attempt is due. */
+    nextAttemptAt?: string;
+    /** `send-failed` and `send-retrying`: why. `details` is what the mail system said (per-recipient SMTP status, its error), when it said anything. */
+    error?: { message: string; details?: MailRelayFailureDetails };
+}
 
 /**
  * Polls `Message` rows whose `scheduledSendTime` (set by `BaseMessageRoute.send()`'s deferred-send branch - see
@@ -70,6 +92,20 @@ const MAX_ERROR_LENGTH = 1000;
  * Filing into Sent Items only happens while the run's claim still stands - the message is still in the Outbox it was
  * claimed in, carrying that claim's `scheduledSendLeaseExpiresAt` - and does nothing otherwise.
  *
+ * Background send (`POST /messages/:id/send` with `{ background: true }`): the route moves the message into Outbox, due now, answers
+ * 202 and calls `enqueue()` - so this job relays it at once, in this process, a bounded number at a time
+ * (`mail:jobs:scheduled_send:concurrency`), instead of at the next scheduled run. Nothing else changes: the message is an ordinary
+ * due message in Outbox, so a process that dies before, during or after the relay leaves it for the next run - and `start()`
+ * sweeps at once - to finish, with the claim and the relayed marker below keeping it from being sent twice.
+ *
+ * Every outcome is published as an event `{ type: <Message class name>, action, data: SendEventData }` on the mailbox's uid
+ * channel and the Outbox/Sent Items folder channels: `send-succeeded` when it is filed in Sent Items, `send-retrying` (with
+ * `nextAttemptAt`) when an attempt failed and another is due, `send-failed` when it will not be tried again - refused, given up
+ * on after `max_attempts`, or failed for a reason no retry can fix (spam/malware verdict, every recipient refused with an SMTP
+ * 5xx: `isPermanentRelayFailure()`). A message that fails for good stays in Outbox with `scheduledSendError` set and nothing due
+ * (the sender's Inbox gets the delivery failure notice); the user moves it back to Drafts, or sends it again, which starts a
+ * fresh retry budget.
+ *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`ScheduledSendJobMongo`/
  * `ScheduledSendJobSQL`), following the same generic pattern `CalendarReminderJob` uses.
  *
@@ -79,6 +115,9 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
     protected abstract messageClass: any;
     protected abstract folderClass: any;
     protected abstract mailboxClass: any;
+
+    /** The `Domain` class, for classifying recipients when a receipt is requested. Without it no receipt is requested. */
+    protected domainClass?: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -99,6 +138,9 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
     @Inject(NotificationUtils)
     private notificationUtils?: NotificationUtils;
 
+    @Inject("DnsResolver")
+    private dnsResolver?: DnsResolver;
+
     @Config("mail:jobs:scheduled_send:schedule", "*/30 * * * * *")
     private scheduleExpr: string = "*/30 * * * * *";
 
@@ -115,8 +157,28 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
     @Config("mail:jobs:scheduled_send:lease_ms", 900_000)
     private leaseMs: number = 900_000;
 
+    /** How many relays run at once for background sends and scheduled runs together. */
+    @Config("mail:jobs:scheduled_send:concurrency", 4)
+    private concurrency: number = 4;
+
+    /** How long `stop()` waits for relays in flight to finish. */
+    @Config("mail:jobs:scheduled_send:drain_ms", 15_000)
+    private drainMs: number = 15_000;
+
     @Logger
     private logger: any;
+
+    /** The messages being relayed or waiting for a slot, by uid - so nothing is worked on twice in this process. */
+    private readonly pending: Map<string, Promise<void>> = new Map();
+
+    private active: number = 0;
+
+    private readonly slotWaiters: Array<() => void> = [];
+
+    private stopping: boolean = false;
+
+    /** The startup sweep, so `whenIdle()` covers it too. */
+    private sweeping?: Promise<void>;
 
     public get schedule(): string | undefined {
         return this.scheduleExpr;
@@ -138,12 +200,97 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
         });
     }
 
+    /** Sweeps once, without waiting: whatever a process that died left due or half-finished (a background send queued but not
+     * yet relayed, a relay accepted but not filed) is finished now rather than at the next scheduled run. */
     public async start(): Promise<void> {
-        // Nothing to do at startup beyond `init()` above; processing happens entirely in `run()`.
+        this.stopping = false;
+        this.sweeping = this.run().catch((err: any) => {
+            this.logger?.warn(`ScheduledSendJob: the startup sweep failed: ${err?.message}`);
+        });
     }
 
-    public stop(): Promise<void> | void {
-        // Do nothing
+    /** Stops taking new work and waits (up to `drain_ms`) for the relays in flight, so a shutdown does not cut one off. */
+    public async stop(): Promise<void> {
+        this.stopping = true;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            await Promise.race([
+                this.whenIdle(),
+                new Promise<void>((resolve) => {
+                    timer = setTimeout(resolve, Number(this.drainMs));
+                }),
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    /** Resolves once nothing is being relayed or waiting to be. */
+    public async whenIdle(): Promise<void> {
+        await this.sweeping;
+        while (this.pending.size > 0) {
+            await Promise.allSettled([...this.pending.values()]);
+        }
+    }
+
+    /**
+     * Relays the message `uid` now if it is due - what a background send does after answering 202. Returns at once with a
+     * promise for when it is done (never rejecting: a failure is recorded on the message, logged and published as an event).
+     * A message already being relayed here is not started twice, one that is not due (cancelled since, or waiting for a
+     * time) is left alone, and after `stop()` nothing new starts - the message stays due for the next process.
+     */
+    public enqueue(uid: string): Promise<void> {
+        if (this.stopping || !this.messageRepo) {
+            return Promise.resolve();
+        }
+        return this.track(uid, async () => {
+            const message: M | undefined = await this.messageRepo!.findOne(uid, { ignoreACL: true, skipCache: true });
+            const dueAt: number = message?.scheduledSendTime ? new Date(message.scheduledSendTime).getTime() : NaN;
+            if (message && dueAt <= Date.now()) {
+                await this.relayDueMessage(message);
+            }
+        });
+    }
+
+    /** Runs `work` for `uid` in one of the `concurrency` slots, unless `uid` is already being worked on (then that work is what is awaited). */
+    private track(uid: string, work: () => Promise<void>): Promise<void> {
+        const existing: Promise<void> | undefined = this.pending.get(uid);
+        if (existing) {
+            return existing;
+        }
+        const promise: Promise<void> = this.withSlot(work)
+            .catch((err: any) => {
+                this.logger?.warn(`ScheduledSendJob: failed to relay scheduled message ${uid}: ${err?.message}`);
+            })
+            .finally(() => {
+                this.pending.delete(uid);
+            });
+        this.pending.set(uid, promise);
+        return promise;
+    }
+
+    /** How many relays may run at once: `mail:jobs:scheduled_send:concurrency`, less if the datastore cannot take more. */
+    protected maxParallel(): number {
+        return Math.max(1, Number(this.concurrency));
+    }
+
+    private async withSlot(work: () => Promise<void>): Promise<void> {
+        if (this.active >= this.maxParallel()) {
+            // The slot is handed over by whoever finishes, so `active` is never decremented in between.
+            await new Promise<void>((resolve) => this.slotWaiters.push(resolve));
+        } else {
+            this.active++;
+        }
+        try {
+            await work();
+        } finally {
+            const next: (() => void) | undefined = this.slotWaiters.shift();
+            if (next) {
+                next();
+            } else {
+                this.active--;
+            }
+        }
     }
 
     public async run(): Promise<void> {
@@ -166,12 +313,10 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             { ignoreACL: true, limit: this.batchSize },
         );
 
+        // One at a time, oldest first - through the same slots and de-duplication as `enqueue()`, so a message a background send
+        // has just started is waited for, not relayed a second time.
         for (const message of due) {
-            try {
-                await this.relayDueMessage(message);
-            } catch (err: any) {
-                this.logger?.warn(`ScheduledSendJob: failed to relay scheduled message ${message.uid}: ${err.message}`);
-            }
+            await this.track(message.uid, () => this.relayDueMessage(message));
         }
     }
 
@@ -193,6 +338,8 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             return;
         }
         const ownAddresses: Set<string> = validation.ownAddresses ?? new Set();
+        const sendingMailbox: Mailbox | undefined = validation.mailbox;
+        const attemptNumber: number = ((message as any).scheduledSendAttempts ?? 0) + 1;
 
         // Claimed via a version-checked update BEFORE any relay/side-effecting work happens - the same "claim
         // first, work second" discipline `DataExportJob.processRequest()` uses. Without this, `scanAndRelay()`
@@ -226,6 +373,8 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
         let sanitizedHtmlBlobKey: string | undefined = (claimed as any).sanitizedHtmlBlobKey ?? undefined;
         let relayedAt: Date | undefined = alreadyRelayed ? new Date((claimed as any).scheduledSendRelayedAt) : undefined;
         let undelivered: MailRelayFailureDetails | undefined;
+        let relayInfo: { encrypted: boolean; inReplyTo?: string; references: string[] } | undefined;
+        let attachesReceiptRequest: boolean = false;
 
         if (!alreadyRelayed) {
             // Wraps the transport so a failure *after* the transport accepted the message (inside
@@ -258,8 +407,18 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     return;
                 }
                 const envelopeTo: string[] = claimed.recipients.map((r) => r.address);
-                const result = await scanAndRelay(
+                // The receipt request and encryption-key announcement an immediate send adds (`prepareOutboundMime()`).
+                const prepared = await prepareOutboundMime({
                     raw,
+                    message: claimed,
+                    mailbox: sendingMailbox,
+                    objectFactory: this._objectFactory!,
+                    domainClass: this.domainClass,
+                    dnsResolver: this.dnsResolver,
+                });
+                attachesReceiptRequest = prepared.attachesReceiptRequest;
+                const result = await scanAndRelay(
+                    prepared.raw,
                     claimed.from.address,
                     envelopeTo,
                     this.scanPipeline!,
@@ -267,6 +426,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     this.blobStore!,
                 );
                 relayedRaw = result.raw;
+                relayInfo = { encrypted: result.encrypted, inReplyTo: result.inReplyTo, references: result.references };
                 messageId = result.messageId;
                 // The conversation this mailbox already files the message being replied to under, falling back to
                 // what the relayed headers derive on their own - the same resolution `BaseMessageRoute.send()`
@@ -347,6 +507,16 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     sanitizedHtmlBlobKey: sanitizedHtmlBlobKey ?? null,
                     ...(messageId ? { messageId: boundIndexedValue(messageId) } : {}),
                     conversationId: boundIndexedValue(conversationId) ?? null,
+                    // What the relayed bytes say (only known to the run that relayed them): the threading headers recipients
+                    // received, whether the body is S/MIME encrypted, and the receipts to track - as an immediate send files them.
+                    ...(relayInfo
+                        ? {
+                              encrypted: relayInfo.encrypted,
+                              inReplyTo: relayInfo.inReplyTo ?? (refetched as any).inReplyTo ?? null,
+                              references: relayInfo.references.length > 0 ? relayInfo.references : ((refetched as any).references ?? []),
+                          }
+                        : {}),
+                    ...(attachesReceiptRequest ? { receiptStatus: seedReceiptStatus(claimed.recipients.map((r) => r.address)) } : {}),
                     // Releases the claim's lease.
                     scheduledSendTime: null,
                     scheduledSendLeaseExpiresAt: null,
@@ -358,6 +528,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 { ignoreACL: true },
             );
             this.notificationUtils?.sendMessage(sentFolder.uid, this.messageClass.name, "update", updated);
+            this.publishSendEvent("send-succeeded", refetched, [refetched.folderUid, sentFolder.uid], { attempt: attemptNumber });
             // Outbox -> Sent Items: both folders' counts changed.
             await refreshFolderCounts(this.noticeSink(), [refetched.folderUid, sentFolder.uid]);
         } catch (err: any) {
@@ -371,6 +542,41 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             });
             throw err;
         }
+    }
+
+    /** What an event says about a failure: a message the transport had already accepted was delivered and only its filing failed. */
+    private eventErrorMessage(reason: string, extra: Record<string, any>): string {
+        return extra.scheduledSendRelayedAt ? `The message was sent, but could not be filed in Sent Items: ${reason}` : reason;
+    }
+
+    /**
+     * Publishes a `SendEventData` (`{ type: <Message class name>, action, data }`) once, on the sending mailbox's uid channel and on
+     * each of `folderUids` - the Outbox, and Sent Items once it is filed - so a client subscribed to either sees it.
+     * Best-effort: a publish failure is logged and changes nothing.
+     */
+    private publishSendEvent(
+        action: SendEventAction,
+        message: M,
+        folderUids: (string | undefined)[],
+        outcome: { attempt: number; nextAttemptAt?: Date; error?: { message: string; details?: MailRelayFailureDetails } },
+    ): void {
+        try {
+            const data: SendEventData = {
+                uid: message.uid,
+                mailboxUid: message.mailboxUid,
+                subject: message.subject ?? "",
+                recipients: (Array.isArray(message.recipients) ? message.recipients : []).map((recipient) => recipient.address),
+                attempt: outcome.attempt,
+                ...(outcome.nextAttemptAt ? { nextAttemptAt: outcome.nextAttemptAt.toISOString() } : {}),
+                ...(outcome.error ? { error: { message: outcome.error.message, ...(outcome.error.details ? { details: outcome.error.details } : {}) } } : {}),
+            };
+            const channels: string[] = [...new Set([message.mailboxUid, ...folderUids].filter((uid): uid is string => !!uid))];
+            this.notificationUtils?.sendMessage(channels, this.messageClass.name, action, data);
+            /* v8 ignore start -- only a notification transport that throws synchronously */
+        } catch (err: any) {
+            this.logger?.warn(`ScheduledSendJob: failed to publish ${action} for message ${message.uid}: ${err?.message}`);
+        }
+        /* v8 ignore stop */
     }
 
     /** Whether `current` is still in the Outbox `claimed` was claimed in, carrying the lease that claim wrote. */
@@ -476,6 +682,10 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             { ignoreACL: true },
         );
         this.logger?.warn(`ScheduledSendJob: refusing to send scheduled message ${message.uid}: ${reason}`);
+        this.publishSendEvent("send-failed", message, [message.folderUid], {
+            attempt: ((message as any).scheduledSendAttempts ?? 0) + 1,
+            error: { message: reason },
+        });
         await this.reportUndelivered(message, deliveryFailureKey("scheduled-refused", message.uid, String((message as any).version)), undefined, {
             reason,
         });
@@ -484,7 +694,10 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
     /** Returns a refusal reason if `message` must not be relayed (or, with `folderOnly` - an already-relayed message
      * that only needs filing - must not be filed); otherwise the sending mailbox's own (normalized) addresses, for the
      * stored MIME's originator-header check. */
-    private async validateForRelay(message: M, folderOnly: boolean = false): Promise<{ refusal?: string; ownAddresses?: Set<string> }> {
+    private async validateForRelay(
+        message: M,
+        folderOnly: boolean = false,
+    ): Promise<{ refusal?: string; ownAddresses?: Set<string>; mailbox?: Mailbox }> {
         const folder: any = message.folderUid
             ? await this.folderRepo!.findOne(message.folderUid, { ignoreACL: true })
             : undefined;
@@ -509,7 +722,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
         if (!fromAddress || !ownAddresses.has(fromAddress)) {
             return { refusal: "The From address is not one of the sending mailbox's own addresses." };
         }
-        return { ownAddresses };
+        return { ownAddresses, mailbox };
     }
 
     /**
@@ -528,7 +741,10 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             }
             const attempts: number = ((current as any).scheduledSendAttempts ?? 0) + 1;
             const reason: string = String(err?.message ?? err).slice(0, MAX_ERROR_LENGTH);
-            const exhausted: boolean = attempts >= this.maxAttempts;
+            // A failure no retry can fix (a spam/malware verdict, every recipient refused with an SMTP 5xx) is final at once.
+            const permanent: boolean = isPermanentRelayFailure(err);
+            const exhausted: boolean = permanent || attempts >= this.maxAttempts;
+            const finalReason: string = permanent && attempts < this.maxAttempts ? reason : `Gave up after ${attempts} attempts: ${reason}`;
             const nextAttemptAt: Date = new Date(Math.max(Date.now(), new Date(dueAt).getTime() || 0) + attempts * this.retryBackoffMs);
             await this.messageRepo!.update(
                 {
@@ -539,22 +755,32 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     scheduledSendLeaseExpiresAt: null,
                     // Reset once exhausted so a later, user-initiated reschedule starts with a fresh budget.
                     scheduledSendAttempts: exhausted ? null : attempts,
-                    scheduledSendError: exhausted ? `Gave up after ${attempts} attempts: ${reason}` : reason,
+                    scheduledSendError: exhausted ? finalReason : reason,
                 } as any,
                 asEntity(this.messageRepo!, current),
                 { ignoreACL: true },
             );
             if (exhausted) {
-                this.logger?.error(`ScheduledSendJob: giving up on scheduled message ${uid} after ${attempts} attempts: ${reason}`);
+                this.logger?.error(`ScheduledSendJob: giving up on scheduled message ${uid} after ${attempts} attempt(s): ${reason}`);
+                this.publishSendEvent("send-failed", current, [current.folderUid], {
+                    attempt: attempts,
+                    error: { message: this.eventErrorMessage(finalReason, extra), details: err?.details },
+                });
                 // A message the transport had accepted (`scheduledSendRelayedAt`) is not undelivered - it only failed to be filed.
                 if (!extra.scheduledSendRelayedAt) {
                     const details: MailRelayFailureDetails | undefined = err?.details;
                     await this.reportUndelivered(current, deliveryFailureKey("scheduled-failed", uid, String((current as any).version)), details, {
-                        reason: `Gave up after ${attempts} attempts: ${reason}`,
+                        reason: finalReason,
                         attempts,
                         error: details ? undefined : { message: reason },
                     });
                 }
+            } else {
+                this.publishSendEvent("send-retrying", current, [current.folderUid], {
+                    attempt: attempts,
+                    nextAttemptAt,
+                    error: { message: this.eventErrorMessage(reason, extra), details: err?.details },
+                });
             }
         } catch (updateErr: any) {
             this.logger?.warn(`ScheduledSendJob: failed to record a failed attempt for ${uid}: ${updateErr.message}`);

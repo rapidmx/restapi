@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { JWTUser, ObjectFactory } from "@rapidrest/core";
-import { type AccessControlList, type ACLRecord, type ACLUtils, RepoUtils } from "@rapidrest/service-core";
+import { type AccessControlList, type ACLRecord, type ACLUtils, ModelUtils, RepoUtils } from "@rapidrest/service-core";
 import { Folder, FolderType } from "../models/types.js";
 import { nameBasedUuid } from "./UuidUtils.js";
 
@@ -62,11 +62,82 @@ export function wellKnownFolderUid(mailboxUid: string, type: FolderType): string
     return nameBasedUuid(`folder:${mailboxUid}:${type}`);
 }
 
+/** A folder type every mailbox has exactly one of (every `FolderType` but `USER`). */
+export type WellKnownFolderType = Exclude<FolderType, FolderType.USER>;
+
+/**
+ * Every well-known folder a mailbox has, in the order `ensureWellKnownFolders()` creates them (so a listing ordered by
+ * `dateCreated` reads Inbox first): the mail set - Inbox, Drafts, Outbox, Sent Items, Deleted Items, Junk Email, Archive -
+ * and the calendar, contacts, tasks and notes folders.
+ */
+export const WELL_KNOWN_FOLDER_TYPES: readonly WellKnownFolderType[] = [
+    FolderType.INBOX,
+    FolderType.DRAFTS,
+    FolderType.OUTBOX,
+    FolderType.SENT_ITEMS,
+    FolderType.DELETED_ITEMS,
+    FolderType.JUNK,
+    FolderType.ARCHIVE,
+    FolderType.CALENDAR,
+    FolderType.CONTACTS,
+    FolderType.TASKS,
+    FolderType.NOTES,
+];
+
+/** How many rows the existence query of `ensureWellKnownFolders()` may read: far more than the well-known types could
+ * ever legitimately hold, but still bounded should a mailbox be full of duplicates. */
+const WELL_KNOWN_QUERY_LIMIT: number = 200;
+
+/**
+ * Makes sure `mailboxUid` has every well-known folder (`WELL_KNOWN_FOLDER_TYPES`), creating the missing ones - the one
+ * step that gives a new mailbox all its folders at creation (`BaseMailboxRoute.create()`) and gives an older mailbox,
+ * one created when only some were provisioned (or by another path), the rest the next time its folders are read
+ * (`BaseFolderRoute.find()`/`findById()`). Idempotent and race-safe: ONE existence query (`type` in the well-known
+ * set, uncached) decides whether anything is missing and a complete mailbox costs nothing more and writes nothing;
+ * each missing folder is created through `findOrCreateWellKnownFolder()` (a deterministic uid, so concurrent callers
+ * settle on one folder each and only the winner's create is published - see below).
+ *
+ * **Access is the caller's to check first**: this creates folders in whichever mailbox it is given, so a request handler
+ * asks `hasMailAccess()` for that mailbox before calling it. `user` is only the creator recorded on a new folder's ACL
+ * (`BaseMailboxRoute.create()` passes its caller); a handler healing on read leaves it unset so a delegate's read never
+ * grants them a record on a folder.
+ *
+ * Each created folder is published like any other creation (see `findOrCreateWellKnownFolder()`), one event per folder.
+ *
+ * @returns The folders that were missing and are now present (created here, or by a concurrent caller that won).
+ */
+export async function ensureWellKnownFolders<F extends Folder>(
+    folderRepo: RepoUtils<F>,
+    folderClass: any,
+    mailboxUid: string,
+    user?: JWTUser,
+): Promise<F[]> {
+    const present: F[] = await folderRepo.find(
+        { mailboxUid: ModelUtils.literal(mailboxUid), type: [...WELL_KNOWN_FOLDER_TYPES], limit: WELL_KNOWN_QUERY_LIMIT } as any,
+        { ignoreACL: true, limit: WELL_KNOWN_QUERY_LIMIT, skipCache: true },
+    );
+    const have: Set<FolderType> = new Set(present.map((folder) => folder.type));
+    const ensured: F[] = [];
+    for (const type of WELL_KNOWN_FOLDER_TYPES) {
+        if (!have.has(type)) {
+            ensured.push(await findOrCreateWellKnownFolder(folderRepo, folderClass, mailboxUid, type, user));
+        }
+    }
+    return ensured;
+}
+
 /**
  * Finds the given mailbox's well-known folder of `type` (e.g. its Inbox, Junk, Sent Items), creating it — with
- * the platform's conventional display name — if it does not already exist. Every well-known folder is
- * provisioned lazily this way rather than all at once when a `Mailbox` is created, so a mailbox that never
- * receives a piece of spam, for example, never has an empty Junk folder to show for it.
+ * the platform's conventional display name — if it does not already exist. A mailbox gets every well-known folder
+ * when it is created and again whenever its folders are read (`ensureWellKnownFolders()`); this is the single-folder
+ * step underneath, and what a delivery, a send or an import calls for the one it needs (so a mailbox that predates
+ * that, or lost a folder, still works).
+ *
+ * **A folder this creates is announced**: `RepoUtils.create()` publishes
+ * `{ type: "FolderMongo" | "FolderSQL", action: "create", data: <the folder> }` on the folder's own channel, and this asks
+ * it to publish on the mailbox's channel too (`pushChannels`) - the one a client subscribes to - so a folder created
+ * lazily (at first send, first junk delivery, ...) appears in an open client without a reload. Best-effort and
+ * fire-and-forget (a failed publish never fails the create); a lost race publishes nothing (the winner's create did).
  *
  * Safe against concurrent callers (e.g. two replicas delivering a new mailbox's first messages at the same
  * time): a new folder is created under `wellKnownFolderUid()`, so the losing `create()` fails on the uid's unique
@@ -118,10 +189,17 @@ export async function findOrCreateWellKnownFolder<F extends Folder>(
             }
             return winner;
         }
-        // No visible folder holds the uid, so this wasn't a lost race - unless a soft-deleted folder already has
+        // No folder of this type was visible a moment ago. Either the create failed for another reason (nothing holds the
+        // uid: rethrown), or the winner's row only became visible now (used - a random-uid folder created here instead left
+        // the mailbox with two of the same type, seen under concurrent first reads), or a soft-deleted folder already holds
         // the deterministic uid, in which case a random uid is used rather than failing delivery.
-        if (!(await folderRepo.findOne(deterministicUid, { ignoreACL: true, includeDeleted: true }))) {
+        const holder: F | undefined = await folderRepo.findOne(deterministicUid, { ignoreACL: true, includeDeleted: true, skipCache: true });
+        if (!holder) {
             throw err;
+        }
+        if ((holder as any).deleted !== true) {
+            await ensureFolderACL(folderRepo, holder.uid, mailboxUid);
+            return holder;
         }
         return await createWellKnownFolder(folderRepo, folderClass, mailboxUid, type, undefined, user);
     }
@@ -151,9 +229,11 @@ async function createWellKnownFolder<F extends Folder>(
     // architecture note on `Message.mailboxUid`). Matches `BaseFolderRoute.create()`'s same seeding for
     // client-initiated folder creation.
     const acl = { uid: instance.uid, parentUid: mailboxUid, records: [] };
+    // `RepoUtils.create()` publishes the new folder on its own channel; the mailbox's is where a client is listening.
+    const pushChannels: string[] = [mailboxUid];
     if (!uid) {
         // A random uid: no existing ACL can legitimately be there, so service-core's default refusal applies.
-        return await folderRepo.create(instance, { user, ignoreACL: true, acl });
+        return await folderRepo.create(instance, { user, ignoreACL: true, acl, pushChannels });
     }
 
     // The deterministic uid is derived server-side from the mailbox uid and type and never taken from a client, and
@@ -171,7 +251,7 @@ async function createWellKnownFolder<F extends Folder>(
     // "its" ACL - the only one this folder has. `ensureFolderACL()` recreates it, here and in the loser's re-read.
     const aclUtils: ACLUtils | undefined = (folderRepo as any).aclUtils;
     const leftover: AccessControlList | undefined = await aclUtils?.findACL(uid, [], { skipCache: true, skipParents: true });
-    const created: F = await folderRepo.create(instance, { user, ignoreACL: true, acl, allowExistingACL: true });
+    const created: F = await folderRepo.create(instance, { user, ignoreACL: true, acl, allowExistingACL: true, pushChannels });
     if (leftover) {
         await resetLeftoverACL(aclUtils!, uid, mailboxUid, leftover);
     }

@@ -139,15 +139,16 @@ describe("Route:FolderMongo Tests", () => {
 
     it("Owner can list folders in their own mailbox.", async () => {
         const mailbox = await createMailbox(owner.uid);
-        await createFolder(mailbox.uid, { name: "Inbox" });
+        await createFolder(mailbox.uid, { name: "Projects" });
 
         const result = await request(server.getApplication())
             .get(`${baseUrl}?mailboxUid=${mailbox.uid}`)
             .set("Authorization", "jwt " + ownerToken);
 
         expect(result.status).toBe(200);
-        expect(result.body.length).toBe(1);
-        expect(result.body[0].name).toBe("Inbox");
+        // The user folder, plus the well-known folders the read provisioned for the mailbox (see WellKnownFolders.test.ts).
+        expect(result.body.length).toBe(12);
+        expect(result.body.filter((folder: any) => folder.type === "user").map((folder: any) => folder.name)).toEqual(["Projects"]);
     });
 
     it("A different user cannot list folders in a mailbox they don't own (silently empty, not an error).", async () => {
@@ -323,15 +324,19 @@ describe("Route:FolderMongo Tests", () => {
         expect(result.body.uid).toBe(folder.uid);
     });
 
-    it("A different user cannot read a folder by id in a mailbox they don't own.", async () => {
+    it("A different user cannot read a folder by id in a mailbox they don't own - 404, exactly as for a folder that doesn't exist.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid);
 
         const result = await request(server.getApplication())
             .get(`${baseUrl}/${folder.uid}`)
             .set("Authorization", "jwt " + otherUserToken);
+        const missing = await request(server.getApplication())
+            .get(`${baseUrl}/${uuid.v4()}`)
+            .set("Authorization", "jwt " + otherUserToken);
 
-        expect(result.status).toBe(403);
+        expect(result.status).toBe(404);
+        expect(missing.status).toBe(404);
     });
 
     it("Owner sees a folder they own exists (200, content-length 1).", async () => {

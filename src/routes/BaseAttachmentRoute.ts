@@ -241,7 +241,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
             return this.keepInFolder(await super.find(params, query, user), String(query.folderUid));
         }
         const message: M | undefined = await this.findMessage(messageUid);
-        if (!message || !(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.LIST))) {
+        if (!message || !(await this.hasMailAccess(user, message.folderUid, ACLAction.LIST))) {
             return [];
         }
         const rows: T[] = await this.repoUtils!.find(this.messageFilter(params, query, message), {
@@ -261,7 +261,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         const messageUid: string | undefined = this.messageUidOf(query);
         if (messageUid === undefined) {
             const folderUid: unknown = query?.folderUid;
-            if (typeof folderUid !== "string" || !folderUid || !(await this.aclUtils!.hasPermission(user, folderUid, ACLAction.COUNT))) {
+            if (typeof folderUid !== "string" || !folderUid || !(await this.hasMailAccess(user, folderUid, ACLAction.COUNT))) {
                 return super.count(params, query, res, user);
             }
             // Filtered in memory like `find()`, so every page is read.
@@ -276,7 +276,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
             return res.status(200).setHeader("content-length", total);
         }
         const message: M | undefined = await this.findMessage(messageUid);
-        if (!message || !(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.COUNT))) {
+        if (!message || !(await this.hasMailAccess(user, message.folderUid, ACLAction.COUNT))) {
             return res.status(200).setHeader("content-length", 0);
         }
         const result: number = await this.repoUtils!.count(this.messageFilter(params, query, message), {
@@ -297,7 +297,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
             return undefined;
         }
         const location: AttachmentLocation = await this.locate(existing);
-        return (await this.aclUtils!.hasPermission(user, location.folderUid, action)) ? this.located(existing, location) : undefined;
+        return (await this.hasMailAccess(user, location.folderUid, action)) ? this.located(existing, location) : undefined;
     }
 
     @Get("/:id")
@@ -320,7 +320,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
      * so a refused caller's attempt changes nothing, and so a caller who can write only the folder the message left is
      * refused even though the stored (stale) `folderUid` would let `BaseScopedChildRoute` through. */
     private async requireAccessWhereItIs(attachment: T, user: JWTUser | undefined, action: string): Promise<void> {
-        if (!(await this.aclUtils!.hasPermission(user, (await this.locate(attachment)).folderUid, action))) {
+        if (!(await this.hasMailAccess(user, (await this.locate(attachment)).folderUid, action))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
     }
@@ -357,7 +357,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
     @Delete()
     public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
         const folderUid: unknown = query?.folderUid;
-        if (typeof folderUid === "string" && folderUid && (await this.aclUtils!.hasPermission(user, folderUid, ACLAction.TRUNCATE))) {
+        if (typeof folderUid === "string" && folderUid && (await this.hasMailAccess(user, folderUid, ACLAction.TRUNCATE))) {
             for await (const rows of findPagesByUid<T>(this.repoUtils!, { folderUid: ModelUtils.literal(folderUid) }, this.folderScanPageSize)) {
                 for (const row of rows) {
                     await this.realign(row);
@@ -409,7 +409,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         if (!message) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        if (!(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))) {
+        if (!(await this.hasMailAccess(user, message.folderUid, ACLAction.UPDATE))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 

@@ -403,14 +403,16 @@ describe("Route:CalendarShareLinkSQL Tests", () => {
         it("Creating a share link still succeeds (fails open) even if the target folder's ACL document is missing.", async () => {
             const mailbox = await createMailbox(owner.uid);
             const folder = await createFolder(mailbox.uid);
-            // Simulates a corrupt/missing folder ACL document - a trusted (`admin`) role is required to still
-            // pass the underlying `requirePermission()` check without a real ACL record to match against.
+            // Simulates the folder's ACL document disappearing between the route's permission check (which nobody - an
+            // administrator included - can pass without a real ACL record) and the grant: the check is answered "yes" here.
             await aclRepo.delete({ uid: folder.uid });
+            const permitted = vi.spyOn(ACLUtils.prototype, "hasPermission").mockResolvedValue(true);
 
             const result = await request(server.getApplication())
                 .post(baseUrl)
-                .set("Authorization", "jwt " + adminToken)
-                .send({ folderUid: folder.uid, permittedActions: ["read"], createdByUserUid: admin.uid });
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ folderUid: folder.uid, permittedActions: ["read"], createdByUserUid: owner.uid });
+            permitted.mockRestore();
 
             expect(result.status).toBeLessThan(300);
             const acl = await aclRepo.findOne({ where: { uid: folder.uid } });
@@ -425,17 +427,19 @@ describe("Route:CalendarShareLinkSQL Tests", () => {
                 .set("Authorization", "jwt " + ownerToken)
                 .send({ folderUid: folder.uid, permittedActions: ["read"], createdByUserUid: owner.uid });
             // Simulates the folder's ACL document disappearing (e.g. the folder was purged) between the share
-            // link's creation and its deletion - a trusted (`admin`) role is required to still pass the
-            // underlying `requirePermission()` check without a real ACL record to match against. Goes through
+            // link's creation and its deletion - the route's permission check is answered "yes" below (nobody, an
+            // administrator included, can pass it without a real ACL record). Goes through
             // `ACLUtils.removeACL()` (rather than deleting the row directly) so its cache entry - populated by
             // the `findACL()` call the creation above already made - is invalidated too; a raw row delete would
             // leave that stale cached copy readable by the very `findACL()` call this test means to make miss.
             const aclUtils: ACLUtils = objectFactory.getInstance(ACLUtils)!;
             await aclUtils.removeACL(folder.uid);
+            const permitted = vi.spyOn(ACLUtils.prototype, "hasPermission").mockResolvedValue(true);
 
             const result = await request(server.getApplication())
                 .delete(`${baseUrl}/${created.body.uid}`)
-                .set("Authorization", "jwt " + adminToken);
+                .set("Authorization", "jwt " + ownerToken);
+            permitted.mockRestore();
 
             expect(result.status).toBeGreaterThanOrEqual(200);
             expect(result.status).toBeLessThan(300);

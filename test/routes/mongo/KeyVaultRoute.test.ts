@@ -188,12 +188,12 @@ describe("Route:KeyVaultMongo Tests", () => {
             expect(result.status).toBe(403);
         });
 
-        it("Returns 404 for a nonexistent mailbox.", async () => {
+        it("Returns 403 for a nonexistent mailbox - the same answer as for another user's, so it reveals no address.", async () => {
             const result = await request(server.getApplication())
                 .get(`${baseUrl}/${uuid.v4()}/keyvault`)
                 .set("Authorization", "jwt " + ownerToken);
 
-            expect(result.status).toBe(404);
+            expect(result.status).toBe(403);
         });
 
         it("A caller cannot read a mailbox with no ACL row at all (no findACL() result to check a record against).", async () => {
@@ -541,17 +541,17 @@ describe("Route:KeyVaultMongo Tests", () => {
             expect(result.status).toBe(403);
         });
 
-        it("404s for a nonexistent mailbox on both endpoints.", async () => {
+        it("403s for a nonexistent mailbox on both endpoints (as for another user's).", async () => {
             const startResult = await request(server.getApplication())
                 .post(`${baseUrl}/${uuid.v4()}/keyvault/keys/sign-enrollment`)
                 .set("Authorization", "jwt " + ownerToken)
                 .send({ csr: await generateTestCsr("x@example.com"), wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } });
-            expect(startResult.status).toBe(404);
+            expect(startResult.status).toBe(403);
 
             const statusResult = await request(server.getApplication())
                 .get(`${baseUrl}/${uuid.v4()}/keyvault/keys/sign-enrollment/some-id`)
                 .set("Authorization", "jwt " + ownerToken);
-            expect(statusResult.status).toBe(404);
+            expect(statusResult.status).toBe(403);
         });
     });
 

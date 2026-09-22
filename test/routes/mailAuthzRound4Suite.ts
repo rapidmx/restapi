@@ -65,6 +65,18 @@ export function mailAuthzRound4Suite(ctx: MailAuthzRound4SuiteContext): void {
         await ctx.saveAcl({ uid: mailbox.uid, parentUid: "Mailbox", records: [{ userOrRoleId: ownerUid, actions: ["*"] }] });
         return mailbox;
     };
+
+    /** An administrator has no implicit access to anyone's mailbox: the tests of a trusted caller's own field privileges give the
+     * administrator an explicit full grant on the mailbox they act on. */
+    const grantAdmin = async (mailbox: any) =>
+        await ctx.saveAcl({
+            uid: mailbox.uid,
+            parentUid: "Mailbox",
+            records: [
+                { userOrRoleId: mailbox.ownerUserUid, actions: ["*"] },
+                { userOrRoleId: admin.uid, actions: ["*"] },
+            ],
+        });
     const createFolder = async (mailboxUid: string, type: FolderType = FolderType.INBOX) => {
         const folder = await ctx.save("Folder", { mailboxUid, name: type, type, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 });
         await ctx.saveAcl({ uid: folder.uid, parentUid: mailboxUid, records: [] });
@@ -518,6 +530,7 @@ export function mailAuthzRound4Suite(ctx: MailAuthzRound4SuiteContext): void {
     describe("date fields are stored as dates (finding 11a)", () => {
         it("mailbox OOF window, share link expiry, task due/reminder and trusted message dates", async () => {
             const mailbox = await createMailbox(owner.uid);
+            await grantAdmin(mailbox);
             const when = "2030-05-01T10:00:00.000Z";
             const sameInstant = (value: any) => {
                 expect(new Date(value).toISOString()).toBe(when);
@@ -656,6 +669,7 @@ export function mailAuthzRound4Suite(ctx: MailAuthzRound4SuiteContext): void {
 
         it("a message whose send is in flight can't be moved out of Outbox, by the owner or an admin, until its lease lapses", async () => {
             const mailbox = await createMailbox(owner.uid);
+            await grantAdmin(mailbox);
             const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
             const outbox = await createFolder(mailbox.uid, FolderType.OUTBOX);
             const inFlight = await createMessage(mailbox, outbox.uid, {
@@ -884,6 +898,7 @@ export function mailAuthzRound4Suite(ctx: MailAuthzRound4SuiteContext): void {
 
         it("drafts can still move between Drafts folders, a scheduled send can still be cancelled back to Drafts, and trusted callers are exempt", async () => {
             const mailbox = await createMailbox(owner.uid);
+            await grantAdmin(mailbox);
             const inbox = await createFolder(mailbox.uid);
             const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
             const otherDrafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
@@ -928,6 +943,7 @@ export function mailAuthzRound4Suite(ctx: MailAuthzRound4SuiteContext): void {
 
         it("a message outside Drafts can't be sent or scheduled, so sent mail can't be walked back into Drafts through Outbox", async () => {
             const mailbox = await createMailbox(owner.uid);
+            await grantAdmin(mailbox);
             const inbox = await createFolder(mailbox.uid);
             const archive = await createFolder(mailbox.uid, FolderType.ARCHIVE);
             const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
@@ -1004,6 +1020,7 @@ export function mailAuthzRound4Suite(ctx: MailAuthzRound4SuiteContext): void {
 
         it("a message whose send is in flight can't be deleted, by the owner or an admin, until its lease lapses", async () => {
             const mailbox = await createMailbox(owner.uid);
+            await grantAdmin(mailbox);
             const outbox = await createFolder(mailbox.uid, FolderType.OUTBOX);
             const inFlight = await createMessage(mailbox, outbox.uid, { scheduledSendLeaseExpiresAt: new Date(Date.now() + 600_000) });
             for (const user of [owner, admin]) {

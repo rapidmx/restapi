@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
-import { EnrollmentBinding, EnrollmentResult, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
+import { EnrollmentBinding, EnrollmentProgress, EnrollmentResult, EnrollmentSummary, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
 
 /**
  * The default `SigningCertificateEnrollment` - throws rather than silently doing nothing.
@@ -40,6 +40,20 @@ export class NullSigningCertificateEnrollment implements SigningCertificateEnrol
             500,
             "Signing certificate enrollment is not available for this deployment.",
         );
+    }
+
+    /** Throws, like every other method - there is no enrollment to report on. */
+    public async describeProgress(_enrollmentId: string): Promise<EnrollmentProgress> {
+        throw new ApiError(
+            ApiErrors.INTERNAL_ERROR,
+            500,
+            "Signing certificate enrollment is not available for this deployment.",
+        );
+    }
+
+    /** There are never any enrollments - what lets "the mailbox's current enrollment" answer 404 rather than fail. */
+    public async listEnrollments(): Promise<EnrollmentSummary[]> {
+        return [];
     }
 
     /** Throws, like every other method - there are no enrollments to describe. */

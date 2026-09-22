@@ -22,6 +22,7 @@ import {
 import { AuditAction, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { assertAdminScope, hasMailAccess, isTrustedUser } from "../util/MailAccessUtils.js";
 import { normalizeUserUid } from "../util/UserUidUtils.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Auth, Delete, Get, Param, Put, Query, RateLimit, Request, User: AuthUser } = RouteDecorators;
@@ -38,6 +39,19 @@ export interface MailboxAccessMember {
     role: MailboxAccessRole;
     /** The record's raw actions - what a `"custom"` member can actually do. */
     actions: string[];
+    /** Set when `userOrRoleId` is not a user uid (a username or address typed in free text, say): a person's token
+     * carries a uid, never that string, so the entry can only ever match a ROLE of that name and almost certainly grants
+     * nothing to anyone. It should be replaced with the user it was meant for (`PUT` them, then `DELETE` this). */
+    noEffect?: boolean;
+}
+
+/** The person a principal - a mailbox address, an auth-server username or e-mail alias, or a user uid - resolved to. */
+export interface ResolvedPrincipal {
+    /** The user uid every grant is stored against (lowercase). */
+    userUid: string;
+    /** The person's display name and address when this server knows a mailbox they own - for a UI to confirm who it is. */
+    displayName?: string;
+    address?: string;
 }
 
 /** `"viewer"` mirrors `ShareAccessCard`'s existing `DEFAULT_DELEGATE_ACTIONS` exactly (no regression for
@@ -68,6 +82,20 @@ const PLAIN_ADDRESS_PATTERN = /^[^\s()@,]+@[^\s()@,]+$/;
 
 /** The longest address worth looking up (RFC 5321's path limit). */
 const MAX_ADDRESS_LENGTH = 320;
+
+/** The longest principal (address, username or uid) worth resolving. */
+const MAX_PRINCIPAL_LENGTH = MAX_ADDRESS_LENGTH;
+
+/** `principal` as the 400 every grant to somebody who can't be found gets. */
+function noUserFound(principal: string): ApiError {
+    return new ApiError(ApiErrors.INVALID_REQUEST, 400, `No user found for "${principal}".`);
+}
+
+/** Whether a record id is something other than a user uid that could mean a person: not a uid, not a wildcard, not
+ * `anonymous`, not a share-link identity (`share:<token>`, minted by the calendar share links). */
+function isUnresolvedPrincipal(recordId: string): boolean {
+    return normalizeUserUid(recordId) === undefined && recordId !== ".*" && recordId !== "*" && recordId !== "anonymous" && !recordId.startsWith("share:");
+}
 
 /**
  * How many `lookup-by-email` requests one signed-in caller may make per `LOOKUP_WINDOW_SECONDS`.
@@ -123,6 +151,15 @@ function sameMember(recordId: string, memberId: string): boolean {
  * Every grant and revocation is audited (`MAILBOX_ACCESS_GRANT`/`MAILBOX_ACCESS_REVOKE`) when the concrete
  * subclass supplies `auditLogClass`.
  *
+ * **A trusted role is not a grant** (`util/MailAccessUtils.ts`): only the owner, or a delegate holding `update`, manages a
+ * mailbox's members as of right. This route is also the ONE explicit, audited way an administrator (trusted AND
+ * elevated) reaches a mailbox they hold no grant on - the mailbox Sharing action of the admin console - and only for
+ * what administering needs: they may list the members of any mailbox (`MAILBOX_ACCESS_ADMIN_LIST`), revoke any member
+ * of any mailbox, and grant access on an OWNERLESS (shared/org) mailbox, themselves included - how an existing shared
+ * mailbox such as `hello@` becomes one of the administrator's own. They may NOT grant access to a mailbox with an owner
+ * (403): that would be a way into a person's mail, so it is the owner's to give - or the administrator's to do by
+ * impersonating the owner.
+ *
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
@@ -144,6 +181,19 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
 
     @Config("trusted_roles", ["admin"])
     private trustedRoles: string[] = ["admin"];
+
+    /** Base URL of auth-server, whose `GET /api/aliases` resolves a username or e-mail alias to a user uid (see
+     * `resolvePrincipal()`); the same setting `BaseMailboxRoute`'s self-service creation reads. Empty: none. */
+    @Config("mail:auth_server_url", "")
+    private authServerUrl: string = "";
+
+    /** The caller's own usernames when there is no auth-server at all (local development) - the same setting as
+     * `BaseMailboxRoute`'s. */
+    @Config("mail:auto_provision:static_aliases", [] as string[])
+    private staticAliases: string[] = [];
+
+    @Config("mail:auto_provision:timeout_ms", 10_000)
+    private authTimeoutMs: number = 10_000;
 
     @Logger
     private logger: any;
@@ -170,29 +220,37 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         return ModelUtils.literal(address);
     }
 
-    private async requireMailbox(mailboxId: string): Promise<M> {
-        await this.init();
-        const mailbox: M | undefined = await this.mailboxRepo!.findOne(mailboxId, { ignoreACL: true });
-        if (!mailbox) {
-            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
-        }
-        return mailbox;
-    }
-
     /** Checks `action` against `acl` - the same uncached ACL (parents included) a change then saves, so a permission
      * revoked a moment ago can't still authorize the change through a cached copy. */
-    private async requirePermission(acl: AccessControlList, user: JWTUser | undefined, action: string): Promise<void> {
-        if (!(await this.aclUtils!.hasPermission(user, acl, action))) {
+    private async requirePermission(acl: AccessControlList, user: JWTUser | undefined, action: string, admin: boolean = false): Promise<void> {
+        if (!admin && !(await hasMailAccess(this.aclUtils, this.trustedRoles, user, acl, action))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
     }
 
-    /** The mailbox and its uncached ACL, once the caller is known to be allowed to manage its members. */
-    private async requireManagePermission(mailboxId: string, user?: JWTUser): Promise<{ mailbox: M; acl: AccessControlList }> {
-        const mailbox: M = await this.requireMailbox(mailboxId);
+    /**
+     * The mailbox and its uncached ACL, once the caller is known to be allowed to manage its members: by their own grant
+     * (`admin: false`), or as an administrator with none (`admin: true` - trusted AND elevated, 403 `api-104` without).
+     * Everyone else is refused (403) - a mailbox that doesn't exist too, so the answer doesn't reveal which addresses have one
+     * (404 only for an administrator, who is shown every mailbox's address in the admin console anyway).
+     */
+    private async requireManagePermission(mailboxId: string, user?: JWTUser): Promise<{ mailbox: M; acl: AccessControlList; admin: boolean }> {
+        await this.init();
+        const mailbox: M | undefined = await this.mailboxRepo!.findOne(mailboxId, { ignoreACL: true });
+        if (!mailbox) {
+            throw isTrustedUser(user, this.trustedRoles)
+                ? new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND)
+                : new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
         const acl: AccessControlList = await this.requireAcl(mailbox.uid);
-        await this.requirePermission(acl, user, MANAGE_ACTION);
-        return { mailbox, acl };
+        if (await hasMailAccess(this.aclUtils, this.trustedRoles, user, acl, MANAGE_ACTION)) {
+            return { mailbox, acl, admin: false };
+        }
+        if (!isTrustedUser(user, this.trustedRoles)) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+        assertAdminScope(user, this.trustedRoles);
+        return { mailbox, acl, admin: true };
     }
 
     /** Refuses a change to the owner's implicit access, or to the caller's own record unless they're trusted. */
@@ -273,15 +331,30 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
      * the owner's own access is implicit, not "a member" someone else granted, and records granting nothing. */
     @Get("/:id/access")
     public async listMembers(@Param("id") mailboxId: string, @AuthUser user?: JWTUser): Promise<MailboxAccessMember[]> {
-        const { mailbox, acl } = await this.requireManagePermission(mailboxId, user);
+        const { mailbox, acl, admin } = await this.requireManagePermission(mailboxId, user);
+        if (admin) {
+            await this.audit(undefined, user, AuditAction.MAILBOX_ACCESS_ADMIN_LIST, mailbox, { userOrRoleId: "*" });
+        }
         return acl.records
             .filter((record) => record.userOrRoleId !== mailbox.ownerUserUid && record.actions.length > 0)
-            .map((record) => ({ userOrRoleId: record.userOrRoleId, role: roleFromActions(record.actions), actions: record.actions }));
+            .map((record) => ({
+                userOrRoleId: record.userOrRoleId,
+                role: roleFromActions(record.actions),
+                actions: record.actions,
+                ...(isUnresolvedPrincipal(record.userOrRoleId) ? { noEffect: true } : {}),
+            }));
     }
 
     /** Grants (or, if already a member, updates the role of) a user's access to this mailbox - a plain
      * upsert on the mailbox's own ACL record list, matching `grantShareTokenAccess()`'s identical
      * read-modify-write shape. */
+    /**
+     * `userOrRoleId` is the PERSON to grant, however the caller names them: a mailbox address (its owner), an auth-server
+     * username or e-mail alias, or a user uid - resolved by `resolvePrincipal()`, and ONLY the resolved user uid is
+     * stored. An ACL record matches a token's uid (or a role of that name), so a grant stored against a username
+     * (`jean-philippe`) can never apply to anyone; nothing here stores an unverified string. `400` (`No user found for
+     * "<x>".`) for anything that doesn't resolve.
+     */
     @Put("/:id/access/:userOrRoleId")
     public async setMember(
         @Param("id") mailboxId: string,
@@ -289,14 +362,27 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         body: { role: MailboxAccessRole },
         @AuthUser user?: JWTUser,
         @Request req?: HttpRequest,
-    ): Promise<Omit<MailboxAccessMember, "actions">> {
-        const { mailbox, acl } = await this.requireManagePermission(mailboxId, user);
-        this.assertManageableMember(mailbox, userOrRoleId, user);
-        // Stored lowercase, so the owner and self checks above and the ACL's own exact matching agree on who it is.
-        const memberId: string | undefined = normalizeUserUid(userOrRoleId);
-        if (memberId === undefined || this.trustedRoles.includes(memberId)) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Access can only be granted to a user.");
+    ): Promise<Omit<MailboxAccessMember, "actions" | "noEffect">> {
+        const { mailbox, acl, admin } = await this.requireManagePermission(mailboxId, user);
+        if (admin && mailbox.ownerUserUid) {
+            throw new ApiError(
+                ApiErrors.AUTH_PERMISSION_FAILURE,
+                403,
+                "Access to a personal mailbox is the owner's to give - an administrator can only share a mailbox that has no owner.",
+            );
         }
+        // Stored lowercase, so the owner and self checks below and the ACL's own exact matching agree on who it is.
+        // A uid that already has a record on THIS mailbox was accepted when it was granted: changing its role needs no second lookup.
+        const existingUid: string | undefined = normalizeUserUid(userOrRoleId);
+        const resolved: ResolvedPrincipal | undefined =
+            existingUid !== undefined && acl.records.some((record) => sameMember(record.userOrRoleId, existingUid))
+                ? { userUid: existingUid }
+                : await this.resolvePrincipal(userOrRoleId, user, req);
+        if (!resolved) {
+            throw noUserFound(userOrRoleId);
+        }
+        const memberId: string = resolved.userUid;
+        this.assertManageableMember(mailbox, memberId, user);
         const role: MailboxAccessRole = body?.role;
         if (role !== "viewer" && role !== "manager") {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'role' must be 'viewer' or 'manager'.");
@@ -304,7 +390,7 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         const previous: ACLRecord | undefined = acl.records.find((record) => sameMember(record.userOrRoleId, memberId));
         if (role === "manager" || previous?.actions.includes(ACLAction.FULL) || this.hasFullAccessElsewhere(acl, memberId)) {
             // Granting, taking away or overriding full access takes full access.
-            await this.requirePermission(acl, user, ACLAction.FULL);
+            await this.requirePermission(acl, user, ACLAction.FULL, admin);
         }
         acl.records = [
             ...acl.records.filter((record) => !sameMember(record.userOrRoleId, memberId)),
@@ -319,6 +405,119 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         return { userOrRoleId: memberId, role };
     }
 
+    /**
+     * Who `principal` - a mailbox address, an auth-server username or e-mail alias, or a user uid - is, without granting
+     * anything: `{ userUid, displayName?, address? }`, for a sharing screen to show the person before saving. 404 for
+     * nobody. Needs the same standing as listing the members, and is rate limited like `lookup-by-email`.
+     */
+    @Auth(["jwt"])
+    @RateLimit({ perUser: true, maxAttempts: LOOKUP_MAX_ATTEMPTS, windowSeconds: LOOKUP_WINDOW_SECONDS })
+    @Get("/:id/access/resolve")
+    public async resolve(
+        @Param("id") mailboxId: string,
+        @Query("principal") principal: unknown,
+        @AuthUser user?: JWTUser,
+        @Request req?: HttpRequest,
+    ): Promise<ResolvedPrincipal> {
+        await this.requireManagePermission(mailboxId, user);
+        if (typeof principal !== "string" || principal.trim().length === 0 || principal.length > MAX_PRINCIPAL_LENGTH) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The 'principal' query parameter must be an address, username or user uid.");
+        }
+        const resolved: ResolvedPrincipal | undefined = await this.resolvePrincipal(principal, user, req);
+        if (!resolved) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, `No user found for "${principal.trim()}".`);
+        }
+        return resolved;
+    }
+
+    /**
+     * Resolves what a caller typed to the user it names, or `undefined` - never guessing. In order:
+     * (1) the caller's own uid, or one of their own usernames (`mail:auto_provision:static_aliases`, for a deployment with no
+     * auth-server) is the caller; (2) a user uid is itself, when this server knows the user (they own a mailbox here) or, for
+     * a caller auth-server lets read other users' aliases (a trusted, elevated token), when auth-server has an alias for that
+     * uid; (3) a mailbox address (primary, alias or uid) is that mailbox's owner (an ownerless mailbox names nobody);
+     * (4) otherwise a username or e-mail alias is the user auth-server holds a verified alias of that name for
+     * (`GET /api/aliases?alias=<x>` with the caller's own cookie: auth-server lists an ordinary caller only their own
+     * aliases and a trusted, elevated one everybody's, so a user can name themselves and an administrator anyone).
+     * Usernames are never stored: they can be released and claimed by someone else, which would silently move the access.
+     */
+    private async resolvePrincipal(principal: string, user: JWTUser | undefined, req: HttpRequest | undefined): Promise<ResolvedPrincipal | undefined> {
+        const typed: string = principal.trim();
+        if (typed.length === 0 || typed.length > MAX_PRINCIPAL_LENGTH) {
+            return undefined;
+        }
+        const lower: string = typed.toLowerCase();
+        if (user?.uid && (lower === user.uid.toLowerCase() || this.staticAliases.some((alias) => alias.toLowerCase() === lower))) {
+            return this.describeUser(user.uid.toLowerCase());
+        }
+        const uid: string | undefined = normalizeUserUid(typed);
+        if (uid !== undefined) {
+            const known: boolean = !!(await this.findOwnedMailbox(uid)) || (await this.lookupAliases(`userUid=${encodeURIComponent(uid)}`, req)).some((entry) => entry.userUid?.toLowerCase() === uid);
+            return known ? await this.describeUser(uid) : undefined;
+        }
+        if (typed.includes("@")) {
+            const mailbox: M | undefined = PLAIN_ADDRESS_PATTERN.test(lower) ? await this.findMailboxByAddress(lower) : undefined;
+            if (mailbox?.ownerUserUid) {
+                return { userUid: mailbox.ownerUserUid.toLowerCase(), displayName: mailbox.displayName, address: mailbox.primarySmtpAddress };
+            }
+        }
+        const alias = (await this.lookupAliases(`alias=${encodeURIComponent(typed)}`, req)).find(
+            (entry) => entry.alias?.toLowerCase() === lower && entry.verified !== false && normalizeUserUid(entry.userUid) !== undefined,
+        );
+        return alias ? await this.describeUser(alias.userUid!.toLowerCase()) : undefined;
+    }
+
+    /** `{ userUid, displayName?, address? }` for `uid`, from a mailbox they own here when there is one. */
+    private async describeUser(uid: string): Promise<ResolvedPrincipal> {
+        const mailbox: M | undefined = await this.findOwnedMailbox(uid);
+        return mailbox ? { userUid: uid, displayName: mailbox.displayName, address: mailbox.primarySmtpAddress } : { userUid: uid };
+    }
+
+    /** A mailbox `uid` owns on this server (compared as stored and lowercased), if any. */
+    private async findOwnedMailbox(uid: string): Promise<M | undefined> {
+        await this.init();
+        return (await this.mailboxRepo!.find({ ownerUserUid: ModelUtils.literal([...new Set([uid, uid.toLowerCase()])], "in"), limit: 1 } as any, { ignoreACL: true, limit: 1 }))[0];
+    }
+
+    /** The mailbox with exactly this (lowercased plain) address as its uid, primary address or alias - see `lookupOwnerByEmail()`. */
+    private async findMailboxByAddress(address: string): Promise<M | undefined> {
+        await this.init();
+        const byUid: M | undefined = await this.mailboxRepo!.findOne(address, { ignoreACL: true });
+        const hasAddress = (candidate: M): boolean =>
+            normalizeAddress(candidate.primarySmtpAddress) === address || candidate.aliasAddresses.some((alias) => normalizeAddress(alias) === address);
+        return (
+            (byUid && hasAddress(byUid) ? byUid : undefined) ??
+            (await this.mailboxRepo!.find({ primarySmtpAddress: ModelUtils.literal(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }))[0] ??
+            (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(address), limit: 1 }, { ignoreACL: true, limit: 1 }))[0]
+        );
+    }
+
+    /** `GET <auth-server>/api/aliases?<query>` with the caller's own `jwt` cookie: what auth-server lists them (see
+     * `resolvePrincipal()`). Nothing when there is no auth-server or cookie to ask with; 502 when it can't be reached. */
+    private async lookupAliases(query: string, req: HttpRequest | undefined): Promise<Array<{ alias?: string; userUid?: string; verified?: boolean }>> {
+        const jwtCookie: string | undefined = req?.cookies?.["jwt"];
+        if (!this.authServerUrl || !jwtCookie) {
+            return [];
+        }
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), this.authTimeoutMs);
+        try {
+            const response: Response = await fetch(`${this.authServerUrl}/api/aliases?${query}&limit=10`, {
+                headers: { Cookie: `jwt=${jwtCookie}` },
+                signal: controller.signal,
+            });
+            if (!response.ok) {
+                throw new Error(`auth-server answered ${response.status}`);
+            }
+            const data: unknown = await response.json();
+            return Array.isArray(data) ? data : [];
+        } catch {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 502, "Could not reach the identity service to look that user up.");
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
     /** Revokes a delegate's access to this mailbox - idempotent (a no-op, not a 404, if the given
      * `userOrRoleId` was never a member), matching `revokeShareTokenAccess()`'s identical fail-open
      * convention for "nothing to remove." Any existing record can be removed, including one this route
@@ -330,7 +529,7 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         @AuthUser user?: JWTUser,
         @Request req?: HttpRequest,
     ): Promise<void> {
-        const { mailbox, acl } = await this.requireManagePermission(mailboxId, user);
+        const { mailbox, acl, admin } = await this.requireManagePermission(mailboxId, user);
         this.assertManageableMember(mailbox, userOrRoleId, user);
         const previous: ACLRecord | undefined = acl.records.find((record) => sameMember(record.userOrRoleId, userOrRoleId));
         if (!previous) {
@@ -338,7 +537,7 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         }
         if (previous.actions.includes(ACLAction.FULL) || this.hasFullAccessElsewhere(acl, previous.userOrRoleId)) {
             // Removing a record that narrows a full-access grant from elsewhere hands that full access back.
-            await this.requirePermission(acl, user, ACLAction.FULL);
+            await this.requirePermission(acl, user, ACLAction.FULL, admin);
         }
         acl.records = acl.records.filter((record) => record !== previous);
         await this.saveAcl(acl);
@@ -357,10 +556,17 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
     @Auth(["jwt"])
     @Get("/:id/access/me")
     public async myAccess(@Param("id") mailboxId: string, @AuthUser user?: JWTUser): Promise<MailboxMyAccess> {
-        const mailbox: M = await this.requireMailbox(mailboxId);
+        await this.init();
+        const mailbox: M | undefined = await this.mailboxRepo!.findOne(mailboxId, { ignoreACL: true });
+        if (!mailbox) {
+            // The same answer as for a mailbox the caller has no access to - it doesn't reveal which addresses have one.
+            return { canRead: false, canCreate: false, canUpdate: false, canDelete: false, canManage: false };
+        }
         // A plain (possibly cached) read, like every other permission check - this changes nothing.
         const acl: AccessControlList | string = (await this.aclUtils!.findACL(mailbox.uid)) ?? mailbox.uid;
-        const can = (action: string): Promise<boolean> => this.aclUtils!.hasPermission(user, acl, action);
+        // What the caller may do as themselves: a trusted role grants nothing here (an administrator's standing on a
+        // mailbox they hold no grant on is the Sharing action's, above).
+        const can = (action: string): Promise<boolean> => hasMailAccess(this.aclUtils, this.trustedRoles, user, acl, action);
         const [canRead, canCreate, canUpdate, canDelete, canManage] = await Promise.all([
             can(ACLAction.READ),
             can(ACLAction.CREATE),
@@ -404,17 +610,10 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         if (address.length > MAX_ADDRESS_LENGTH || !PLAIN_ADDRESS_PATTERN.test(address)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The 'email' query parameter must be a single email address.");
         }
-        await this.init();
         // A mailbox's uid is its lowercased address when it was created, which matches regardless of the case its
         // address was stored in. It's only used while the mailbox still has that address - `uid` stays put when the
         // address changes - otherwise the stored addresses are queried.
-        const byUid: M | undefined = await this.mailboxRepo!.findOne(address, { ignoreACL: true });
-        const hasAddress = (candidate: M): boolean =>
-            normalizeAddress(candidate.primarySmtpAddress) === address || candidate.aliasAddresses.some((alias) => normalizeAddress(alias) === address);
-        const mailbox: M | undefined =
-            (byUid && hasAddress(byUid) ? byUid : undefined) ??
-            (await this.mailboxRepo!.find({ primarySmtpAddress: ModelUtils.literal(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }))[0] ??
-            (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(address), limit: 1 }, { ignoreACL: true, limit: 1 }))[0];
+        const mailbox: M | undefined = await this.findMailboxByAddress(address);
         if (!mailbox || !mailbox.ownerUserUid) {
             return null;
         }

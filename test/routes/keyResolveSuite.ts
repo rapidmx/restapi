@@ -241,7 +241,7 @@ export function keyResolveSuite(ctx: KeyTrustSuiteContext): void {
             expect(await ctx.findAuditEntries(mailbox.uid)).toHaveLength(0);
         });
 
-        it("refuses 404 for a missing mailbox, contact, pinned key or conflict", async () => {
+        it("refuses 403 for a missing mailbox (as for another user's) and 404 for a missing contact, pinned key or conflict", async () => {
             const mailbox = await createMailbox();
             const address = "frank@resolve-6.example.com";
             const pinned = keyOf(await signer(address));
@@ -249,7 +249,7 @@ export function keyResolveSuite(ctx: KeyTrustSuiteContext): void {
             const accept = { address, useType: "sign", action: "accept", expectedPinnedFingerprint: pinned.fingerprint };
             const reject = { ...accept, action: "reject" };
 
-            expect((await resolve(uuid.v4(), accept)).status).toBe(404);
+            expect((await resolve(uuid.v4(), accept)).status).toBe(403);
             expect((await resolve(mailbox.uid, accept)).status).toBe(404);
             expect((await resolve(mailbox.uid, reject)).status).toBe(404);
             expect(await ctx.findContacts(mailbox.uid)).toHaveLength(0);

@@ -1,5 +1,125 @@
 # Release Notes
 
+## Unreleased
+
+### Security
+
+- **An administrator could read everybody's mail through the ordinary mail API - fixed: no role sees another user's mailbox any more.** Any signed-in administrator holding an *elevated* token (the
+  admin console asks every administrator to elevate) was treated by `@rapidrest/service-core`'s `ACLUtils.hasPermission()` - and so by `RepoUtils`, `BaseACLRoute` and `BasePushRoute` - as a
+  superuser: `GET /mail/mailboxes` listed every mailbox, and `GET /mail/folders`, `/mail/messages`, `/messages/:id/content`, attachments, contacts, events, tasks, notes, labels, filter
+  rules, signatures, search, the mailbox key vault's reads and the live push channels answered for any mailbox. The web client's mailbox switcher and Settings "Mailbox" dropdown then listed
+  everyone's mailbox. A sign-in that did not elevate (roles empty) never had this. Now nothing scoped to a mailbox is reachable through a trusted role, an elevated token or `ignoreACL`: a caller
+  needs to **own** the mailbox or hold an **explicit ACL grant** on it, and an administrator sees their own mailbox and the mailboxes shared with them - to see anybody else's they impersonate
+  that user (whose token is simply that user's own identity). Every mailbox-scoped check goes through one helper, `util/MailAccessUtils.ts` (`hasMailAccess()`, `stripTrustedRoles()`), and
+  `MailPushRoute` no longer grants a channel (a mailbox's or folder's live payloads - subject, sender, `bodyPreview`) or a publish to a trusted role either. A mailbox or message the caller
+  can't see answers 404 exactly as one that doesn't exist (mailbox lookups by address answer 403 for both).
+  - `GET /mail/mailboxes` (list and count) is the caller's own and shared-with-them mailboxes for **every** caller. New `?scope=admin` on `GET`/`HEAD /mail/mailboxes` and `GET`/`HEAD /mail/mailboxes/:id`
+    (a trusted role AND an elevated token, else 403 `api-103`/`api-104`) answers **administrative metadata only** for every mailbox (`uid`, addresses, display name, `ownerUserUid`, `shared`,
+    quota/usage, timestamps, resource flags, escrow scope, encryption preference - no keys, out-of-office text, settings or anything per folder), filterable and sortable by those fields only, and
+    writes one audit entry per call (`mailbox.admin-list`, `mailbox.admin-read`).
+  - An administrator still manages mailboxes they hold no grant on - create, rename, aliases, owner, quota, resource settings, delete - but only those administrative fields are writable that way (the
+    rest of a body is dropped), the answer is the metadata above, and each change is audited (`mailbox.admin-update`, `mailbox.admin-delete`).
+  - A shared (ownerless) mailbox an administrator creates gets an explicit `FULL` grant for its creator. An existing ownerless mailbox (`hello@`) is not visible in the mail client until an administrator
+    adds themselves through the mailbox Sharing action (`PUT /mail/mailboxes/:id/access/:uid`), an audited act. Sharing is also the one place an administrator (trusted + elevated) reaches a mailbox
+    with no grant: they may list any mailbox's members (`mailbox_access.admin-list`), revoke any member, and grant on an ownerless mailbox - not grant access to a mailbox that has an owner (403).
+  - Quarantine and the ingest queue keep their review pages with `?scope=admin` (trusted + elevated, every call audited as `mail_queue.admin_access`); without it they are the mailbox's own. Importing
+    into a mailbox needs a grant on it; `GET /mail/mailboxes/:id/access/me` answers all-false for an administrator with no grant.
+  - **Unchanged by design (compliance workflows that cross mailboxes, each with its own authorization and audit):** a trusted caller can still request a GDPR data export of any mailbox and download it
+    (the request and every download by somebody other than the owner are audited - `data_export.downloaded` is new), approve an erasure, and read the escrow audit; eDiscovery search/export and
+    escrow access stay with escrow-scope holders (a trusted role never counted). Impersonation is unchanged and needs no special handling.
+  - Rollout: an administrator's **existing elevated session** keeps working until it expires, but it no longer shows other people's mail once this version runs. Nothing else needs changing; sign out
+    and back in only if a browser tab still shows another user's mailbox from before.
+  - Breaking for code built on the base routes: `aclUtils.hasPermission()` must not be called directly on mailbox-scoped data (a source-scan test enforces it in this package); use `hasMailAccess()`.
+    `BaseScopedChildRoute` has new `adminScope`/`auditLogClass` fields (off by default), `BaseFolderRoute`/`BaseMailboxRoute` new `hasMailAccess()`/`mailUser()` methods, and `MailPushRoute` overrides
+    `connect()` and `send()`. New `AuditAction` values: `MAILBOX_ADMIN_LIST`, `MAILBOX_ADMIN_READ`, `MAILBOX_ADMIN_UPDATE`, `MAILBOX_ADMIN_DELETE`, `MAIL_QUEUE_ADMIN_ACCESS`,
+    `MAILBOX_ACCESS_ADMIN_LIST`, `DATA_EXPORT_DOWNLOADED`.
+
+### Fixes
+
+- **A grant on a shared mailbox typed as a username never applied to anyone - sharing now resolves who it grants to.** On a live host the shared mailbox `hello@` ("Support") was granted to `jean-philippe`: the console's Sharing form stored the text typed, and an ACL record matches only a token's user uid or a role of that name, so the mailbox appeared for nobody (it only ever showed up to a
+  token that bypassed ACLs, which the privacy fix above removes). `PUT /mail/mailboxes/:id/access/:principal` now takes a mailbox address (its owner), an auth-server username or e-mail alias, or a user uid the server knows, and stores only the resolved uid; a name that resolves to nobody is 400 `No user found for "<x>".` and nothing is stored, an unreachable identity service is 502. New
+  `GET /mail/mailboxes/:id/access/resolve?principal=` answers who a principal is (`{ userUid, displayName?, address? }`) for a sharing screen to confirm; the member list marks an entry that is not a user uid with `noEffect: true`; `GET /mail/mailboxes` and `GET /:id` carry `accessRole: "owner" | "delegate"` to label shared mailboxes. Usernames are deliberately never matched against uids: they can be released and claimed
+  by someone else, which would silently move the access - so an existing bad grant (like the live one) must be re-created through the fixed flow: add the person again and revoke the old entry (the admin console's "Replace with a user" does both). Sharing needs `mail:auth_server_url` (already used by self-service mailbox creation) for usernames and aliases; addresses and uids need nothing.
+- **A new mailbox showed only some of its folders (Outbox and Sent Items appeared at the first send, unannounced; a shared mailbox never had them) - every mailbox now has every well-known folder from
+  the start, and every folder creation is announced live.** On a live host a brand-new account listed only Inbox, Drafts and Deleted Items after its first e-mail was sent - Outbox and Sent Items were
+  created lazily at that send and the open client was never told - and the shared mailbox `hello@` had only `calendar, contacts, drafts, inbox, tasks`. `POST /mailboxes` now creates the whole set in one
+  idempotent, race-safe step (`ensureWellKnownFolders()`): Inbox, Drafts, Outbox, Sent Items, Deleted Items, Junk Email, Archive, Calendar, Contacts, Tasks and Notes (`WELL_KNOWN_FOLDER_TYPES`, deterministic
+  uids as before). An **existing** mailbox heals on read, with no migration: `GET /folders?mailboxUid=` and `GET /folders/:id` check for the whole set with one existence query (nothing is written when it is
+  complete) and create what is missing - only for a caller who may list that mailbox (owner or explicit grant, never a role), granting them nothing on the new folders, and never failing the read.
+  - Every folder creation is now published as `{ type: "FolderMongo" | "FolderSQL", action: "create", data: <the folder> }` on the folder's channel and its mailbox's channel - the mailbox create, the heal, a
+    client's `POST /folders` and the lazy paths (`findOrCreateWellKnownFolder()` at a send, a delivery, an import) - one event per folder, best-effort. A folder a client renames or moves publishes
+    `{ action: "update", data: <the whole folder> }` and a deleted one `{ action: "delete", data: { uid, mailboxUid, version } }`, both on the mailbox's channel; the counts-only `update`
+    (`{ uid, mailboxUid, unreadCount, totalCount }`) is unchanged.
+  - `findOrCreateWellKnownFolder()` could leave a mailbox with two folders of one type when two servers created it at the same moment and one saw the other's row late; it now uses the row that won.
+  - Behaviour change: `GET /folders` for a mailbox with no folders is no longer `[]` - it provisions and lists the eleven. A client that creates its own Deleted Items/Junk/Archive folder when none is listed
+    should stop: they exist. New exports `ensureWellKnownFolders`, `WELL_KNOWN_FOLDER_TYPES`, `WellKnownFolderType`.
+
+- **HTML mail lost all its styling and images - it is now stored and served the way the sender designed it, sanitized.** The sanitizer behind `Message.sanitizedHtmlBlobKey` (`sanitize-html` with its default
+  allow-lists) kept only a bare skeleton: no `<img>` (an inline `cid:` image vanished entirely), no `<style>`, no `style` attribute, no `class`, `bgcolor`, `color`, `face`, `width`, `cellpadding`... - every
+  newsletter, invoice and Word/Outlook mail arrived as unstyled text. The new sanitizer (`scan/HtmlSanitizer.ts`, `scan/CssSanitizer.ts`, `scan/MailUrlRules.ts`) parses the HTML and writes a complete document from
+  allow-lists, keeping the design - colours, backgrounds, fonts, table layout, `<style>` blocks with `@media` queries (`prefers-color-scheme` too), `<body>` attributes, `<meta name="color-scheme">`, inline
+  images (`cid:` by the attachment, small `data:` images, `http(s)` URLs as written) - and dropping everything that can run, navigate, submit, overlay or load: scripts, `on*`, `javascript:`/`data:` links,
+  frames, objects, forms, `<svg>`/`<math>`, `<meta refresh>`, `<base>`, `<link>`, Outlook conditional comments, `position: fixed|absolute|sticky`, `expression()`, `@import`, `@font-face`, `url()` that is not an
+  image, and more (the README's "HTML mail" section lists every one). Proven against a corpus of 127 hostile payloads (OWASP evasions, mXSS, entity and CSS-escape obfuscation, 5 MB of CSS, 50,000-deep nesting)
+  in the unit tests and rendered in a real browser (Edge) with scripts allowed and no CSP: nothing executes, navigates or opens.
+  - **Existing mail needs no migration.** Every sanitized blob now starts with a version stamp (`SANITIZER_VERSION`, 2). `GET /messages/:id/content` re-sanitizes a message whose blob has no stamp or an older one
+    from its raw MIME on first read (parse + sanitize only - no spam or virus scan), overwrites the blob, and serves the result; concurrent readers share one run, a failure or a run over
+    `mail:scan:sanitize:lazy_timeout_ms` serves the HTML already stored, and a raw message over `lazy_max_raw_bytes` is left alone.
+  - **Inline images:** the stored HTML refers to them as `cid:` (mailparser no longer copies each into the HTML as a `data:` URI) and `GET /messages/:id/content` points each at the message's attachment,
+    `<mail:scan:sanitize:attachment_url_prefix>/<uid>/content` (default `/api/mail/attachments`) - or leaves known ones as `cid:` for `?cid=keep` and for `fetch()` requests
+    (`Sec-Fetch-Dest: empty`), which is what the reading pane resolves itself; a reference to a part the message does not have loses its `src` and keeps its `alt`. The response's CSP is now
+    `default-src 'none'; img-src data: 'self'; style-src 'unsafe-inline'; sandbox` (was `img-src data: cid:`). `Attachment.contentId` is stored without its angle brackets (`<logo@x>` -> `logo@x`) on new mail.
+  - **The body preview no longer starts with a stylesheet or a hidden preheader:** for an HTML-only message `bodyPreview` is now the message's text (`<style>`, the head and `display:none` / `mso-hide:all` /
+    zero-size preheaders left out) and takes a fraction of the time (200 KB of HTML: ~5 ms with `html-to-text` before, under 1 ms now).
+  - **Settings** (`mail:scan:sanitize:*`, all optional): `allowed_tags` (an **empty list now means "all", not "none"**), `max_data_image_bytes`, `max_css_bytes`, `max_css_rules`, `max_input_length`,
+    `max_depth`, `max_elements`, `attachment_url_prefix`, `lazy_max_raw_bytes`, `lazy_timeout_ms`. New dependency: `htmlparser2` (already installed through `html-to-text` and `sanitize-html`).
+
+### Features
+
+- **Appearance preferences, per user.** New `BaseAppearanceRoute` (`AppearanceRouteMongo`/`AppearanceRouteSQL`, models `AppearancePreferencesMongo`/`AppearancePreferencesSQL`, one row
+  per user keyed by the JWT's `uid`, not per mailbox): `GET` answers the caller's `{ version: 1, mode, colors?, background?, updatedAt }` or the defaults (never a 404), `PUT` merges
+  a partial body and rejects anything invalid with a 400 naming the field (`#rrggbb` colours, `dim` 0..0.8, `blur` 0..20, enums, unknown keys), and a caller can only ever touch
+  their own row - a trusted role gets no exception. After every write the preferences are published on the user's own uid channel
+  (`{ type: "AppearancePreferencesMongo" | "AppearancePreferencesSQL", action: "update", data }`) so other tabs and devices update live. `fetchAppearanceForSSR()` reads the row for a
+  server-rendered page's props and never fails the page. Mounted by the server at `/api/mail/preferences/appearance`.
+- **A background image per user.** `POST /background` takes the raw image, decides what it is from its bytes (PNG, JPEG, WebP and AVIF; an SVG or a GIF is a 415 whatever the header
+  says), refuses one above `mail:preferences:background_max_bytes` (8 MiB by default) with a 413, stores it in the `BlobStore` under `appearance/<userUid>/<version>` (a new random version per
+  upload, the previous blob deleted) and answers the saved preferences. `GET /background/:version` serves it with `Cache-Control: private, max-age=31536000, immutable`,
+  `X-Content-Type-Options: nosniff`, `Content-Disposition: inline` and `Content-Security-Policy: default-src 'none'; sandbox`, to its owner only (a 404 for anyone else, so another user's
+  image is never revealed); `DELETE /background` removes it.
+- **Send in the background.** `POST /messages/:id/send` with `{ "background": true }` does only the cheap checks (sender allowed, has recipients, still a draft, permission, not already
+  sent), moves the message into Outbox and answers `202 { status: "queued", message }` at once; the scan, relay and filing into Sent Items follow in the same process, started right away
+  by `ScheduledSendJob.enqueue()` (a bounded number at a time, `mail:jobs:scheduled_send:concurrency`, default 4). A queued message is an ordinary due message in Outbox, so a process
+  that dies at any point leaves it for the job's next run - `start()` now sweeps at once - and it is never relayed twice (the version-checked claim and `scheduledSendRelayedAt`).
+  `stop()` waits up to `mail:jobs:scheduled_send:drain_ms` (15 s) for relays in flight. A repeated request answers the same 202 (or the usual 409 once it has been filed) and sends once. `send()` takes the response as a new parameter before the user, for the 202.
+- **The outcome of a send is an event.** `ScheduledSendJob` publishes `{ type: "MessageMongo" | "MessageSQL", action: "send-succeeded" | "send-retrying" | "send-failed", data: { uid, mailboxUid,
+  subject, recipients, attempt, nextAttemptAt?, error?: { message, details? } } }` on the sender's mailbox channel and the Outbox and Sent Items folder channels - for a background send, a
+  scheduled send and a send the job finishes after a restart alike. `send-retrying` carries when the next attempt is due; `send-failed` leaves the message in Outbox with
+  `scheduledSendError` set and nothing due (the delivery failure notice is still filed once), and asking again with `{ background: true }` queues it afresh with a new retry budget.
+- **A failure no retry can fix is final at once.** A message that fails spam/malware scanning, or that the mail system refuses for every recipient with an SMTP 5xx (`isPermanentRelayFailure()`),
+  used to be tried `max_attempts` times over `attempts x 60 s` before the sender heard anything; it is now `send-failed` on the first attempt, with the notice in the Inbox at once.
+  Anything else (a 4xx, a transport that threw, a failure that says nothing either way) is still retried.
+- **A background or scheduled send is relayed the way an immediate send is.** `prepareOutboundMime()` (shared with `send()`) adds `Disposition-Notification-To` when a receipt is requested and the
+  `RapidMX-Key` announcement, and the job files the Sent Items copy with the receipt tracking rows (`seedReceiptStatus()`), `encrypted`, `inReplyTo` and `references`, which a scheduled send
+  did not before. `ScheduledSendJobMongo`/`ScheduledSendJobSQL` gain a `domainClass` for it; `MessageRouteMongo`/`MessageRouteSQL` gain a `sendJobClass` (a route class without one answers a
+  background send with a 501).
+- **A send no longer derives a body preview it never uses.** `ScanPipeline.run()` takes `{ skipPreview: true }`, which `scanAndRelay()` passes: converting the whole HTML body to text cost about
+  as much as sanitizing it (about 40 ms per 200 KB on the main thread).
+- **Signing-certificate status and progress, and a check-now button's endpoint.** `GET /mailboxes/:id/keyvault/keys/sign-enrollment/:enrollmentId` used to say only `pending`, `issued` or `failed`; it now
+  also answers `stage` (`submitted`, `awaiting-challenge`, `challenge-answered`, `validating`, `issuing`, `issued`, `failed`), `stages` (the RFC 8823 sequence this server really runs, each `done`, `active`,
+  `pending` or `failed`, with when it happened), `progress` (0..100), `requestedAt`, `updatedAt`, `lastCheckedAt`, `nextCheckAt`, `errorCode` and `retryable` for a failure (or for a pending request whose last
+  attempt failed and will be retried: `ca-unreachable`, `reply-not-sent`, `rate-limited`, `ca-error`), and once issued `issuedAt`, `installedAt`, `notAfter`, `serialNumber`, `issuer` and `subject` - all
+  optional additions, so a client reading `status`/`certificate`/`error` is unaffected. The stage timestamps are stored on the enrollment record (they survive a restart), and the stage machine is explicit
+  (`pki/EnrollmentStages.ts`, unit-tested transition by transition). A request whose ACME order has expired - or, when the CA gave no expiry, outlived `mail:pki:rfc8823:max_pending_hours` (168) - is
+  now failed (`order-expired`, retryable) instead of pending forever, and a CA refusal (`rejected`) is marked not retryable.
+  - New `POST .../sign-enrollment/:enrollmentId/check` takes the step the background job would take now (answer the CA's challenge, poll the order, finalize, download) and answers with the same object.
+    Rate limited per enrollment (a second check within about 10 seconds is a 429 with `Retry-After`, stored with the enrollment so it holds across servers), it never waits on the CA for more than 8 seconds
+    (a slow CA leaves the check running; the answer is the current state with a `note`), and reports an unreachable CA in the answer rather than as an error. The owner or a delegate with READ may call it.
+  - New `GET .../sign-enrollment` (no id) answers the mailbox's current enrollment - one in flight, else its most recent - in the same shape plus `enrollmentId`, or 404: how a client on another device finds one
+    it never saw start.
+  - `SigningCertificateEnrollment` gained the optional `describeProgress()`, `checkNow()` and `listEnrollments()`; the manual-CA implementation reports a single stage, the default one has no enrollments.
+    New config `mail:pki:rfc8823:poll_interval_seconds` (300, only what `nextCheckAt` is computed from - keep it equal to the driver job's schedule) and `mail:pki:rfc8823:max_pending_hours`.
+
 ## v0.16.0
 
 ### Fixes

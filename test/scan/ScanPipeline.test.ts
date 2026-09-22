@@ -6,6 +6,7 @@
 // `mailparser`'s `simpleParser` is exercised for real against small hand-built raw MIME messages (it's a
 // regular, already-installed dependency here, not an optional peer one worth mocking away).
 import { ScanPipeline, resolveDeliveryVerdict } from "../../src/scan/ScanPipeline.js";
+import { readSanitizerVersion, SANITIZER_VERSION } from "../../src/scan/HtmlSanitizer.js";
 import { AvVerdict, RecipientType, SpamVerdict } from "../../src/models/types.js";
 import { MAX_MESSAGE_RECIPIENTS } from "../../src/util/RecipientUtils.js";
 import type { SpamScanResult } from "../../src/scan/SpamScanProvider.js";
@@ -42,6 +43,52 @@ function makeRawMessage(opts: { attachmentContent?: string } = {}): Buffer {
         "",
     ].join("\r\n");
     return Buffer.from(raw);
+}
+
+/** A single-part HTML message with a newsletter's typical design: body colour, a stylesheet with a media query, a table, inline styles. */
+function makeStyledRawMessage(extraBody: string = ""): Buffer {
+    const html = [
+        '<html><head><title>Sale</title><style>.hero{background-color:#003366;color:#ffffff}@media (max-width:480px){.hero{padding:8px!important}}</style></head>',
+        '<body bgcolor="#f4f4f4" style="margin:0" onload="alert(1)">',
+        '<div style="display:none;max-height:0;overflow:hidden">Preheader text nobody should see in the preview</div>',
+        '<table width="600" cellpadding="0" border="0" align="center" bgcolor="#ffffff"><tr>',
+        '<td class="hero" style="font-family:Arial,sans-serif;font-size:16px;color:#ffffff">Sale</td></tr>',
+        '<tr><td>Everything must go. <a href="https://shop.example.com/?a=1&amp;b=2" onclick="alert(1)">Shop</a></td></tr></table>',
+        extraBody,
+        "<script>alert(1)</script></body></html>",
+    ].join("");
+    return Buffer.from(
+        ["From: Sender <sender@example.com>", "To: Recipient <recipient@example.com>", "Subject: Sale", "MIME-Version: 1.0", "Content-Type: text/html; charset=utf-8", "", html, ""].join("\r\n"),
+    );
+}
+
+/** An HTML message whose logo is a related `image/png` part the HTML refers to as `cid:logo@example.com`. */
+function makeInlineImageRawMessage(): Buffer {
+    return Buffer.from(
+        [
+            "From: Sender <sender@example.com>",
+            "To: Recipient <recipient@example.com>",
+            "Subject: Inline image",
+            "MIME-Version: 1.0",
+            'Content-Type: multipart/related; boundary="REL"',
+            "",
+            "--REL",
+            "Content-Type: text/html; charset=utf-8",
+            "",
+            '<p>Hi</p><img src="cid:logo@example.com" alt="Logo" width="40">',
+            "",
+            "--REL",
+            'Content-Type: image/png; name="logo.png"',
+            "Content-Transfer-Encoding: base64",
+            "Content-Disposition: inline",
+            "Content-ID: <logo@example.com>",
+            "",
+            Buffer.from("fake png bytes").toString("base64"),
+            "",
+            "--REL--",
+            "",
+        ].join("\r\n"),
+    );
 }
 
 /** A message with no HTML body and no attachments at all. */
@@ -266,7 +313,113 @@ describe("ScanPipeline Tests", () => {
 
             const result = await pipeline.run(makeRawMessage(), makeEnvelope());
 
-            expect(result.sanitizedHtml?.trim()).toBe("<p>Hello</p>");
+            // The page is a complete document now (`HtmlSanitizer`); of its elements only the allowed ones are kept - and the text of the rest.
+            expect(result.sanitizedHtml).toContain("<body><p>Hello</p>");
+            expect(result.sanitizedHtml).not.toContain("<script");
+            (pipeline as any).allowedTags = ["b"];
+            expect((await pipeline.run(makeRawMessage(), makeEnvelope())).sanitizedHtml).toContain("<body>Hello");
+        });
+
+        it("Treats an empty allowedTags setting as the default set, not as 'no tags' (the test config sets it to []).", async () => {
+            (pipeline as any).allowedTags = [];
+
+            const result = await pipeline.run(makeRawMessage(), makeEnvelope());
+
+            expect(result.sanitizedHtml).toContain("<p>Hello</p>");
+        });
+
+        it("Stamps the sanitized HTML with the sanitizer's version.", async () => {
+            const result = await pipeline.run(makeRawMessage(), makeEnvelope());
+
+            expect(result.sanitizedHtml).toMatch(/^<!--rapidmx-sanitized:\d+--><!DOCTYPE html>/);
+            expect(readSanitizerVersion(result.sanitizedHtml!)).toBe(SANITIZER_VERSION);
+        });
+
+        it("Keeps the message's design: colours, fonts, table layout, styles and media queries.", async () => {
+            const result = await pipeline.run(makeStyledRawMessage(), makeEnvelope());
+
+            const html: string = result.sanitizedHtml!;
+            expect(html).toContain('<body bgcolor="#f4f4f4" style="margin:0">');
+            expect(html).toContain("<style>.hero{background-color:#003366;color:#ffffff}@media (max-width:480px){.hero{padding:8px!important}}</style>");
+            expect(html).toContain('<table width="600" cellpadding="0" border="0" align="center" bgcolor="#ffffff">');
+            expect(html).toContain('<td class="hero" style="font-family:Arial,sans-serif;font-size:16px;color:#ffffff">Sale</td>');
+            expect(html).toContain('href="https://shop.example.com/?a=1&amp;b=2" target="_blank" rel="noopener noreferrer nofollow"');
+            expect(html).not.toContain("<script");
+            expect(html).not.toContain("onclick");
+        });
+
+        it("Leaves inline images as cid: references to the attachments (mailparser's own data: URI inlining is off), and stores the Content-ID without its angle brackets.", async () => {
+            const result = await pipeline.run(makeInlineImageRawMessage(), makeEnvelope());
+
+            expect(result.sanitizedHtml).toContain('<img src="cid:logo@example.com" alt="Logo" width="40">');
+            expect(result.sanitizedHtml).not.toContain("data:image");
+            expect(result.attachments).toHaveLength(1);
+            expect(result.attachments[0].contentId).toBe("logo@example.com");
+            expect(result.attachments[0].isInline).toBe(true);
+        });
+
+        it("Leaves an attachment with no Content-ID without one.", async () => {
+            const result = await pipeline.run(makeRawMessage(), makeEnvelope());
+
+            expect(result.attachments[0].contentId).toBeUndefined();
+        });
+
+        it("Applies the configured limits.", async () => {
+            (pipeline as any).maxDataImageBytes = 4;
+            const raw = makeStyledRawMessage('<img src="data:image/png;base64,QUJDREVGR0g=" alt="tiny">');
+
+            const result = await pipeline.run(raw, makeEnvelope());
+
+            expect(result.sanitizedHtml).toContain('<img alt="tiny">');
+            (pipeline as any).maxDataImageBytes = 100;
+            expect((await pipeline.run(raw, makeEnvelope())).sanitizedHtml).toContain("data:image/png;base64,QUJDREVGR0g=");
+            (pipeline as any).maxCssRules = 0;
+            expect((await pipeline.run(raw, makeEnvelope())).sanitizedHtml).not.toContain("<style>");
+        });
+    });
+
+    describe("sanitizeRaw() - what the lazy re-sanitization of an old message runs", () => {
+        it("Sanitizes the HTML of the raw message, stamped, without any scan.", async () => {
+            const html = await pipeline.sanitizeRaw(makeStyledRawMessage());
+
+            expect(html).toContain("<style>.hero{background-color:#003366;color:#ffffff}");
+            expect(readSanitizerVersion(html!)).toBe(SANITIZER_VERSION);
+            expect(spamScanProvider.scoreMessage).not.toHaveBeenCalled();
+            expect(avScanProvider.scanBuffer).not.toHaveBeenCalled();
+        });
+
+        it("Gives nothing for a message with no HTML body or an S/MIME encrypted one.", async () => {
+            expect(await pipeline.sanitizeRaw(makePlainRawMessage())).toBeUndefined();
+            expect(await pipeline.sanitizeRaw(makeEncryptedRawMessage())).toBeUndefined();
+        });
+    });
+
+    describe("run() - body preview from HTML", () => {
+        beforeEach(() => {
+            (pipeline as any).spamScanProvider = spamScanProvider;
+            (pipeline as any).avScanProvider = avScanProvider;
+        });
+
+        it("Is the message's text: not its stylesheet, its head or its hidden preheader.", async () => {
+            const result = await pipeline.run(makeStyledRawMessage(), makeEnvelope());
+
+            expect(result.bodyPreview).toBe("Sale\nEverything must go. Shop");
+        });
+    });
+
+    describe("run() - skipPreview", () => {
+        beforeEach(() => {
+            (pipeline as any).spamScanProvider = spamScanProvider;
+            (pipeline as any).avScanProvider = avScanProvider;
+        });
+
+        it("Leaves the body preview out when asked, and derives everything else as usual.", async () => {
+            const withPreview = await pipeline.run(makePlainRawMessage(), makeEnvelope());
+            const withoutPreview = await pipeline.run(makePlainRawMessage(), makeEnvelope(), { skipPreview: true });
+
+            expect(withPreview.bodyPreview).toBe("Just plain text, no HTML, no attachments.");
+            expect(withoutPreview.bodyPreview).toBeUndefined();
+            expect({ ...withoutPreview, bodyPreview: withPreview.bodyPreview }).toEqual(withPreview);
         });
     });
 

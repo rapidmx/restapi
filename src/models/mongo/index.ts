@@ -1,3 +1,4 @@
+export * from "./AppearancePreferencesMongo.js";
 export * from "./AttachmentMongo.js";
 export * from "./AuditLogEntryMongo.js";
 export * from "./BrandingMongo.js";

@@ -12,7 +12,9 @@ import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import config from "../../config.js";
 import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
+import { backgroundSendSuite } from "../backgroundSendSuite.js";
 import { ScheduledSendJobMongo } from "../../../src/jobs/mongo/ScheduledSendJobMongo.js";
+import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
@@ -87,6 +89,7 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
 
         connectionManager = await objectFactory.newInstance(ConnectionManager, { name: "default" });
         const models = new Map<string, any>();
+        models.set("DomainMongo", DomainMongo);
         models.set("FolderMongo", FolderMongo);
         models.set("MailboxMongo", MailboxMongo);
         models.set("MessageMongo", MessageMongo);
@@ -147,9 +150,11 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
         expect(job.schedule).toBe(config.get("mail:jobs:scheduled_send:schedule"));
     });
 
-    it("start() and stop() are no-ops beyond init().", async () => {
+    it("start() sweeps without waiting and stop() waits for what is in flight - both are quiet with nothing due.", async () => {
         await expect(job.start()).resolves.toBeUndefined();
-        expect(job.stop()).toBeUndefined();
+        await job.whenIdle();
+        await expect(job.stop()).resolves.toBeUndefined();
+        await job.start();
     });
 
     it("Does nothing when there are no due messages.", async () => {
@@ -429,7 +434,10 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
         await job.run();
         // Oldest-due first: only the failing message was in this batch.
         expect(transport().sent.length).toBe(0);
-        expect((await findMessage(failing.uid)).scheduledSendAttempts).toBe(1);
+        // Refused for good (an SMTP 5xx for every recipient) - out of the queue at once, not retried.
+        const refused: any = await findMessage(failing.uid);
+        expect(refused.scheduledSendTime).toBeFalsy();
+        expect(refused.scheduledSendError).toContain("Recipient address rejected");
 
         await job.run();
         expect(transport().sent.length).toBe(1);
@@ -909,5 +917,19 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
             expect(after.deleted).toBe(true);
             expect(after.scheduledSendRelayedAt).toBeTruthy();
         });
+    });
+    backgroundSendSuite({
+        job: () => job,
+        transport,
+        mailboxUid: () => mailboxUid,
+        outboxUid: () => outboxUid,
+        putBody,
+        createMessage,
+        findMessage,
+        findFolder,
+        inboxNotices,
+        updateMessage: messageRepoUpdate,
+        repo: () => (job as any).messageRepo,
+        parallel: 2,
     });
 });

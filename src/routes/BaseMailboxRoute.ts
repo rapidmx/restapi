@@ -16,11 +16,12 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import { AuditAction, DistributionList, EscrowScope, FolderType, Mailbox } from "../models/types.js";
+import { AuditAction, DistributionList, EscrowScope, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
+import { assertAdminScope, hasMailAccess, isAdminScope, isTrustedUser, stripTrustedRoles } from "../util/MailAccessUtils.js";
 import { getVerifiedDomainNames } from "../util/DomainUtils.js";
-import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
+import { ensureWellKnownFolders } from "../util/FolderUtils.js";
 import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { hasAddressLikeDisplayName } from "../util/MimeHeaderUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
@@ -85,6 +86,66 @@ function rejectServerManagedFields(obj: Record<string, unknown>): void {
  * storing. A delegate with plain update access could otherwise take the mailbox over or lift its quota. */
 const TRUSTED_ONLY_FIELDS = ["ownerUserUid", "quotaBytes", "usedBytes"] as const;
 
+/** The `Mailbox` fields an administrator may change on a mailbox they neither own nor hold a grant on (and the only ones
+ * `?scope=admin` shows): how the mailbox is addressed, who owns it, how much it may store, and the resource/policy
+ * flags. Anything else on the row - the out-of-office text, the receipt and encryption preferences, the keys - is the
+ * owner's, and is neither shown to nor writable by an administrator without impersonating the owner. */
+const ADMIN_MANAGED_FIELDS = [
+    "ownerUserUid",
+    "primarySmtpAddress",
+    "aliasAddresses",
+    "displayName",
+    "timezone",
+    "quotaBytes",
+    "usedBytes",
+    "isResource",
+    "resourceType",
+    "resourceCapacity",
+    "autoAcceptBookings",
+    "allowConflicts",
+    "bookingWindowDays",
+    "maxDurationMinutes",
+    "escrowScopeId",
+] as const;
+
+/** What an administration-scope (`?scope=admin`) read of a mailbox returns: `ADMIN_MANAGED_FIELDS` plus the entity's own
+ * bookkeeping and the mailbox's encryption preference (a policy input). Never keys, rules, signatures, the out-of-office
+ * text or anything counted per folder. */
+const ADMIN_METADATA_FIELDS = ["uid", "version", "dateCreated", "dateModified", ...ADMIN_MANAGED_FIELDS, "encryptPreference"] as const;
+
+/** Query keys an administration-scope list may filter or sort by - the metadata only, so a filter can't be used to probe
+ * a field the projection hides (`oofMessage=like(...)`). Paging keys pass too. */
+const ADMIN_QUERY_KEYS: ReadonlySet<string> = new Set([...ADMIN_METADATA_FIELDS, "limit", "page", "sort"]);
+
+/** `mailbox` reduced to what an administrator may see without owning or being granted it (`ADMIN_METADATA_FIELDS`), with
+ * `shared` (no single owner) added. */
+function toAdminMetadata<T extends Mailbox>(mailbox: T): Record<string, unknown> {
+    const result: Record<string, unknown> = {};
+    for (const field of ADMIN_METADATA_FIELDS) {
+        const value: unknown = (mailbox as any)[field];
+        if (value !== undefined) {
+            result[field] = value;
+        }
+    }
+    result.shared = !mailbox.ownerUserUid;
+    return result;
+}
+
+/** `query` restricted to `ADMIN_QUERY_KEYS` (no `$` keys, no paths, no `scope`), for an administration-scope list. */
+function sanitizeAdminQuery(query: any): Record<string, any> {
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(query ?? {})) {
+        const allowed: boolean =
+            key === "sort"
+                ? typeof value === "string" && value.split(",").every((part) => ADMIN_QUERY_KEYS.has(part.replace(/^-/, "")))
+                : ADMIN_QUERY_KEYS.has(key);
+        if (allowed) {
+            result[key] = value;
+        }
+    }
+    return result;
+}
+
 /** Lowercases a patch's addresses in place, as `create()` does - mail delivery and every address comparison in this
  * codebase already work on lowercased addresses, and `uid` is the lowercased address too. */
 function normalizeAddressFields(obj: Record<string, unknown>): void {
@@ -146,7 +207,7 @@ function assertValidDisplayName(value: unknown): void {
 function stripUnsafeQueryKeys(query: any): Record<string, any> {
     const result: Record<string, any> = {};
     for (const [key, value] of Object.entries(query ?? {})) {
-        if (!key.split(".").some((segment) => segment.startsWith("$"))) {
+        if (key !== "scope" && !key.split(".").some((segment) => segment.startsWith("$"))) {
             result[key] = value;
         }
     }
@@ -195,6 +256,18 @@ export type MailboxAutoProvisionResult<T> =
  * `BaseACLRoute` (`@rapidrest/service-core`). `RepoUtils.create()`'s automatic owner-grant is already
  * conditioned on the creator lacking a trusted role, so a trusted caller creating an ownerless mailbox does
  * not, on its own, leave behind a stray self-grant for the admin who happened to create it.
+ *
+ * **Nobody sees a mailbox they neither own nor were granted - an administrator included.** `find`/`count` answer with
+ * the owned and ACL-granted mailboxes for EVERY caller, `findById`/`exists`/`update`/`delete` resolve the caller through
+ * `hasMailAccess()`/`mailUser()` (`util/MailAccessUtils.ts`), and a trusted role is never a grant. An administrator who
+ * needs to see who else has a mailbox asks `?scope=admin` (`GET /` and `GET /:id`; trusted AND elevated, else 403
+ * `api-103`/`api-104`), which answers `ADMIN_METADATA_FIELDS` for every mailbox and is audited (`MAILBOX_ADMIN_LIST`/
+ * `MAILBOX_ADMIN_READ`); an administrator manages a mailbox they hold no grant on through the same `PUT`/`DELETE`s, but
+ * only `ADMIN_MANAGED_FIELDS` are writable that way, the answer is that same metadata, and the change is audited
+ * (`MAILBOX_ADMIN_UPDATE`/`MAILBOX_ADMIN_DELETE`). A mailbox an administrator creates without an owner (a shared/org
+ * mailbox) gets an explicit `FULL` grant for the creating administrator, so it is one of "their" shared mailboxes; an
+ * existing ownerless mailbox reaches an administrator only through the mailbox Sharing action
+ * (`BaseMailboxAccessRoute`), an explicit and audited act.
  *
  * `find`/`count` still need overriding despite the real per-record ACL: `RepoUtils.find()`/`count()` both
  * check the class-level ACL as an unconditional first gate *before* any per-record narrowing, and even that
@@ -309,6 +382,58 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      */
     protected abstract findAccessibleMailboxUids(user: JWTUser): Promise<string[]>;
 
+    /** Whether `user` holds `action` on `uid` (a mailbox uid) by ownership or an ACL record - never by a trusted role. */
+    protected hasMailAccess(user: JWTUser | undefined, uid: string, action: string): Promise<boolean> {
+        return hasMailAccess(this.aclUtils, this.trustedRoles, user, uid, action);
+    }
+
+    /** `user` without its trusted roles, for the inherited `CRUDRoute` handlers (`RepoUtils` treats a trusted caller as a
+     * superuser). */
+    protected mailUser(user: JWTUser | undefined): JWTUser | undefined {
+        return stripTrustedRoles(user, this.trustedRoles);
+    }
+
+    /** Whether `user` is acting as an administrator on mailbox `id`: trusted, and holding no grant of their own for
+     * `action` on it. Only `ADMIN_MANAGED_FIELDS` may then be written and only their metadata is answered. */
+    private async isAdminOnly(id: string, user: JWTUser | undefined, action: string): Promise<boolean> {
+        return isTrustedUser(user, this.trustedRoles) && !(await this.hasMailAccess(user, id, action));
+    }
+
+    /** Drops everything but `ADMIN_MANAGED_FIELDS` (and the record's `uid`/`version`, and the `keyDiscoveryHash` this route
+     * derives from a changed address - a client's own is refused by `rejectServerManagedFields()`) from a patch, silently - so
+     * a full-object round trip of what an administrator was shown still saves. */
+    private restrictToAdminFields(obj: Record<string, unknown>): void {
+        for (const key of Object.keys(obj)) {
+            if (key !== "uid" && key !== "version" && key !== "keyDiscoveryHash" && !(ADMIN_MANAGED_FIELDS as readonly string[]).includes(key)) {
+                delete obj[key];
+            }
+        }
+    }
+
+    /** The uids of the mailboxes `user` may see in a list of their mailboxes: the ones they hold READ on, by ownership or
+     * an ACL record for their uid (or one of their non-trusted roles) - the same for every caller. */
+    private async accessibleMailboxUids(user: JWTUser): Promise<string[]> {
+        const candidates: string[] = await this.findAccessibleMailboxUids(this.mailUser(user)!);
+        const readable: boolean[] = await Promise.all(candidates.map((uid) => this.hasMailAccess(user, uid, ACLAction.READ)));
+        return candidates.filter((_uid, i) => readable[i]);
+    }
+
+    /** Records one administration-scope action on a mailbox (or, for a list, `targetUid: "*"`). */
+    private async auditAdmin(
+        req: HttpRequest | undefined,
+        user: JWTUser | undefined,
+        action: AuditAction,
+        targetUid: string,
+        details: Record<string, any>,
+    ): Promise<void> {
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, req, user, logger: this.logger },
+            { action, targetType: "Mailbox", targetUid, ...(targetUid === "*" ? {} : { mailboxUid: targetUid }), details },
+        );
+    }
+
     /** The query value matching one element of an `aliasAddresses` column - a literal on Mongo (array-element
      * equality); `MailboxRouteSQL` overrides it for the serialized `simple-json` column, like `MailIngestRouteSQL`. */
     protected aliasQueryValue(address: string): any {
@@ -341,6 +466,29 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                     "This address is already in use by another mailbox or distribution list.",
                 );
             }
+        }
+    }
+
+    /** Adds a `FULL` record for `userUid` to the (new, ownerless) mailbox's ACL. Retried on a concurrent ACL save. */
+    private async grantCreator(mailboxUid: string, userUid: string): Promise<void> {
+        for (let attempt = 1; ; attempt++) {
+            const acl = await this.aclUtils!.findACL(mailboxUid, [], { skipCache: true });
+            /* v8 ignore if -- every mailbox is created with an ACL */
+            if (!acl) {
+                return;
+            }
+            // A brand-new mailbox's ACL holds no record yet (a trusted creator gets none from `RepoUtils.create()`).
+            acl.records = [...acl.records, { userOrRoleId: userUid, actions: [ACLAction.FULL] }];
+            try {
+                await this.aclUtils!.saveACL(acl);
+                return;
+                /* v8 ignore start -- only a concurrent ACL write between the read and the save reaches here */
+            } catch (err) {
+                if (attempt >= 3) {
+                    throw err;
+                }
+            }
+            /* v8 ignore stop */
         }
     }
 
@@ -447,6 +595,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         for (const o of objs) {
             // `_id` would replace another mailbox's document on Mongo - see `util/RequestBodyUtils.ts`.
             stripClientCreateFields(o);
+            delete (o as any).accessRole;
             coerceDateFields(o, MAILBOX_DATE_FIELDS);
             rejectServerManagedFields(o as Record<string, unknown>);
             // A brand-new mailbox always starts unscoped - assignment only ever happens afterward via
@@ -609,27 +758,28 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // client's `MailShell`/`CalendarShell`/`ContactsShell`/`TasksShell` each select a specific
         // well-known folder as their default view (with none found, they show an empty/broken state even
         // though the mailbox itself exists), and Compose needs a `drafts` folder uid in hand before it will
-        // create a new draft. Every *other* well-known folder (Junk, Sent Items, Deleted Items, ...) stays
-        // lazily provisioned on first actual use — see `findOrCreateWellKnownFolder`'s own doc comment —
-        // only these five are load-bearing for the client to render anything at all, so only these five are
-        // created eagerly here.
+        // create a new draft. So EVERY well-known folder (Inbox, Drafts, Outbox, Sent Items, Deleted Items, Junk Email,
+        // Archive, Calendar, Contacts, Tasks, Notes - `WELL_KNOWN_FOLDER_TYPES`) is created here, in one idempotent step
+        // (`ensureWellKnownFolders()`): folders that only appeared at first use (Outbox/Sent Items at the first send)
+        // were never announced to a client that was already open, and a shared mailbox never had them at all.
         // `RepoUtils.create()` grants only a non-trusted creator; a mailbox an administrator creates for someone else
         // would leave its owner with no access record at all.
+        //
+        // An ownerless (shared/org) mailbox an administrator creates is granted to that administrator explicitly - an
+        // administrator has no implicit access to any mailbox, so without it the creator could not open what they just made.
         if (isTrusted) {
             for (const mailbox of created) {
                 if (mailbox.ownerUserUid) {
                     await this.moveOwnerAcl({ mailboxUid: mailbox.uid, previous: undefined, next: mailbox.ownerUserUid });
+                } else {
+                    await this.grantCreator(mailbox.uid, user.uid);
                 }
             }
         }
 
         const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
         for (const mailbox of created) {
-            await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.INBOX, user);
-            await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.DRAFTS, user);
-            await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.CALENDAR, user);
-            await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.CONTACTS, user);
-            await findOrCreateWellKnownFolder(folderRepo, this.folderClass, mailbox.uid, FolderType.TASKS, user);
+            await ensureWellKnownFolders(folderRepo, this.folderClass, mailbox.uid, user);
         }
 
         // Only a trusted caller's mailbox creation is audited - matches `AuditAction`'s own scope
@@ -645,7 +795,11 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                         targetType: "Mailbox",
                         targetUid: mailbox.uid,
                         mailboxUid: mailbox.uid,
-                        details: { primarySmtpAddress: mailbox.primarySmtpAddress, isResource: !!(mailbox as any).isResource },
+                        details: {
+                            primarySmtpAddress: mailbox.primarySmtpAddress,
+                            isResource: !!(mailbox as any).isResource,
+                            ...(mailbox.ownerUserUid ? {} : { sharedWithCreator: user.uid }),
+                        },
                     },
                 );
             }
@@ -681,8 +835,14 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // `aliasAddresses.3`/`keys.0` would be Mongo update paths past every check below - see `util/RequestBodyUtils.ts`.
         assertNoPathKeys(obj);
         stripClientId(obj);
+        // Computed on read (`withAccessRole()`), so a full object round-tripped back doesn't store it.
+        delete (obj as any).accessRole;
         coerceDateFields(obj, MAILBOX_DATE_FIELDS);
         const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
+        // An administrator with no grant of their own on this mailbox may change its administrative settings only.
+        if (isTrusted && !(await this.hasMailAccess(user, id, ACLAction.UPDATE))) {
+            this.restrictToAdminFields(obj);
+        }
         await this.validateEscrowScopeAssignment(id, obj, isTrusted);
         rejectServerManagedFields(obj);
         await this.validateTrustedOnlyFields(id, obj, user, isTrusted);
@@ -876,6 +1036,13 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      */
     public async updateProperty(id: string, propertyName: string, obj: any, user?: JWTUser, @Request req?: HttpRequest): Promise<T> {
         assertPlainPropertyName(propertyName);
+        if (propertyName === "accessRole") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'accessRole' is computed from who is asking and cannot be set.");
+        }
+        const adminOnly: boolean = await this.isAdminOnly(id, user, ACLAction.UPDATE);
+        if (adminOnly && !(ADMIN_MANAGED_FIELDS as readonly string[]).includes(propertyName)) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, `'${propertyName}' belongs to the mailbox's owner.`);
+        }
         if (propertyName === "primarySmtpAddress") {
             const current: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
             if (!current) {
@@ -909,21 +1076,48 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // a normalized alias list or owner uid, not the raw one.
         const patch: Record<string, any> = { [propertyName]: obj };
         await this.validateUpdate(id, patch as UpdateObject<T>, user, req);
+        // An administrator with no grant is the trusted caller `RepoUtils` lets through; anybody else is checked against the
+        // mailbox's ACL as themselves.
+        const caller: JWTUser | undefined = adminOnly ? user : this.mailUser(user);
+        let updated: T;
         if (propertyName !== "ownerUserUid") {
-            return this.doUpdateProperty(id, propertyName, patch[propertyName], { user });
+            updated = await this.doUpdateProperty(id, propertyName, patch[propertyName], { user: caller });
+        } else {
+            const change: OwnerChange = { mailboxUid: id, previous: await this.ownerOf(id), next: patch.ownerUserUid || undefined };
+            updated = await this.withOwnerAclMoved([change], () => this.doUpdateProperty(id, propertyName, patch[propertyName], { user: caller }));
         }
-        const change: OwnerChange = { mailboxUid: id, previous: await this.ownerOf(id), next: patch.ownerUserUid || undefined };
-        return this.withOwnerAclMoved([change], () => this.doUpdateProperty(id, propertyName, patch[propertyName], { user }));
+        return adminOnly ? await this.adminUpdated(updated, [propertyName], req, user) : updated;
+    }
+
+    /** What an administrator who changed a mailbox they hold no grant on is answered with and leaves behind: the mailbox's
+     * administrative metadata (never the row) and a `MAILBOX_ADMIN_UPDATE` audit entry naming the fields. */
+    private async adminUpdated(updated: T, fields: string[], req: HttpRequest | undefined, user: JWTUser | undefined): Promise<T> {
+        await this.auditAdmin(req, user, AuditAction.MAILBOX_ADMIN_UPDATE, updated.uid, {
+            primarySmtpAddress: updated.primarySmtpAddress,
+            fields,
+        });
+        return toAdminMetadata(updated) as unknown as T;
     }
 
     /** As `CRUDRoute.update()`, moving the owner's ACL record when the update changes `ownerUserUid` (see
      * `withOwnerAclMoved()`). */
     public async update(id: string, obj: UpdateObject<T>, req: HttpRequest, user?: JWTUser): Promise<T> {
-        if (!Object.keys(Object(obj)).includes("ownerUserUid")) {
-            return super.update(id, obj, req, user);
+        const adminOnly: boolean = await this.isAdminOnly(id, user, ACLAction.UPDATE);
+        if (adminOnly) {
+            this.restrictToAdminFields(obj);
         }
-        const change: OwnerChange = { mailboxUid: id, previous: await this.ownerOf(id), next: (obj as any).ownerUserUid || undefined };
-        return this.withOwnerAclMoved([change], () => super.update(id, obj, req, user));
+        // An administrator with no grant is the trusted caller `RepoUtils` lets through (only `ADMIN_MANAGED_FIELDS` remain
+        // in the patch); anybody else is checked against the mailbox's ACL as themselves.
+        const caller: JWTUser | undefined = adminOnly ? user : this.mailUser(user);
+        const fields: string[] = Object.keys(Object(obj)).filter((key) => key !== "uid" && key !== "version");
+        let updated: T;
+        if (!fields.includes("ownerUserUid")) {
+            updated = await super.update(id, obj, req, caller);
+        } else {
+            const change: OwnerChange = { mailboxUid: id, previous: await this.ownerOf(id), next: (obj as any).ownerUserUid || undefined };
+            updated = await this.withOwnerAclMoved([change], () => super.update(id, obj, req, caller));
+        }
+        return adminOnly ? await this.adminUpdated(updated, fields, req, user) : updated;
     }
 
     /** As `CRUDRoute.updateBulk()`, moving each changed owner's ACL record (see `withOwnerAclMoved()`). */
@@ -935,7 +1129,20 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 changes.push({ mailboxUid, previous: await this.ownerOf(mailboxUid), next: (single as any).ownerUserUid || undefined });
             }
         }
-        return this.withOwnerAclMoved(changes, () => super.updateBulk(obj, req, user));
+        // A trusted caller is passed through as themselves: each element was already reduced to `ADMIN_MANAGED_FIELDS` by
+        // `validateUpdate()` unless they hold a grant on that mailbox. Anybody else is checked as themselves.
+        const caller: JWTUser | undefined = isTrustedUser(user, this.trustedRoles) ? user : this.mailUser(user);
+        const updated: T[] = await this.withOwnerAclMoved(changes, () => super.updateBulk(obj, req, caller));
+        const result: T[] = [];
+        for (const mailbox of updated) {
+            if (await this.isAdminOnly(mailbox.uid, user, ACLAction.UPDATE)) {
+                const single: Record<string, unknown> = obj.find((candidate) => candidate.uid === mailbox.uid)!;
+                result.push(await this.adminUpdated(mailbox, Object.keys(single).filter((key) => key !== "uid" && key !== "version"), req, user));
+            } else {
+                result.push(mailbox);
+            }
+        }
+        return result;
     }
 
     private async ownerOf(id: string): Promise<string | undefined> {
@@ -1210,33 +1417,59 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             : [];
     }
 
-    public async find(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<T[]> {
+    /**
+     * The caller's own mailboxes and the ones shared with them - the same for EVERY caller, an administrator included.
+     * `?scope=admin` (trusted AND elevated, else 403) instead answers the administrative metadata of every mailbox
+     * (`ADMIN_METADATA_FIELDS`), filterable and sortable by those fields only, and writes a `MAILBOX_ADMIN_LIST` audit
+     * entry per call.
+     */
+    public async find(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser, @Request req?: HttpRequest): Promise<T[]> {
         if (!this.repoUtils || !user) {
             return [];
         }
-        const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
-        let scopedQuery: any = { ...query, ...params };
-        if (!isTrusted) {
-            // `$or` and friends would override the forced `uid` filter below on SQL - see `stripUnsafeQueryKeys()`.
-            scopedQuery = { ...stripUnsafeQueryKeys(query), ...params };
-            const accessibleUids: string[] = await this.findAccessibleMailboxUids(user);
-            // An empty array must short-circuit rather than be passed through as a query filter value: the
-            // underlying query builder "zips" an array filter value's *last* element onto any query branch
-            // past its own length, so an empty array resolves to `undefined` for that field — which TypeORM
-            // (and this builder) treats as "no filter on this field", not "match nothing". Passing it through
-            // would incorrectly return every mailbox to a caller who is entitled to see none.
-            if (accessibleUids.length === 0) {
-                return [];
-            }
-            scopedQuery = { ...scopedQuery, uid: accessibleUids };
+        if (isAdminScope(query)) {
+            return (await this.findAdminScope(params, query, user, req)) as unknown as T[];
         }
-        return await this.repoUtils.find(scopedQuery, {
+        // `$or` and friends would override the forced `uid` filter below on SQL - see `stripUnsafeQueryKeys()`.
+        const scopedQuery: any = { ...stripUnsafeQueryKeys(query), ...params };
+        const accessibleUids: string[] = await this.accessibleMailboxUids(user);
+        // An empty array must short-circuit rather than be passed through as a query filter value: the
+        // underlying query builder "zips" an array filter value's *last* element onto any query branch
+        // past its own length, so an empty array resolves to `undefined` for that field — which TypeORM
+        // (and this builder) treats as "no filter on this field", not "match nothing". Passing it through
+        // would incorrectly return every mailbox to a caller who is entitled to see none.
+        if (accessibleUids.length === 0) {
+            return [];
+        }
+        const rows: T[] = await this.repoUtils.find({ ...scopedQuery, uid: accessibleUids }, {
+            limit: query?.limit,
+            page: query?.page,
+            version: query?.version,
+            user: this.mailUser(user),
+            ignoreACL: true,
+        });
+        return rows.map((row) => this.withAccessRole(row, user));
+    }
+
+    /** `mailbox` with `accessRole` for `user`: `"owner"` for their own mailbox, `"delegate"` for one shared with them - so a
+     * client can label the shared ones. Computed on the way out, never stored (and dropped from a body that echoes it). */
+    private withAccessRole(mailbox: T, user: JWTUser): T {
+        return { ...mailbox, accessRole: sameOwner(mailbox.ownerUserUid, user.uid) ? "owner" : "delegate" };
+    }
+
+    /** `find()` for `?scope=admin`: every mailbox's metadata, audited. */
+    private async findAdminScope(params: any, query: any, user: JWTUser, req: HttpRequest | undefined): Promise<Record<string, unknown>[]> {
+        assertAdminScope(user, this.trustedRoles);
+        const filter: Record<string, any> = { ...sanitizeAdminQuery(query), ...sanitizeAdminQuery(params) };
+        const rows: T[] = await this.repoUtils!.find(filter, {
             limit: query?.limit,
             page: query?.page,
             version: query?.version,
             user,
             ignoreACL: true,
         });
+        await this.auditAdmin(req, user, AuditAction.MAILBOX_ADMIN_LIST, "*", { count: rows.length, query: filter });
+        return rows.map((row) => toAdminMetadata(row));
     }
 
     public async count(
@@ -1248,11 +1481,14 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         if (!this.repoUtils || !user) {
             return res.status(200).setHeader("content-length", 0);
         }
-        const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
-        let scopedQuery: any = { ...query, ...params };
-        if (!isTrusted) {
+        const admin: boolean = isAdminScope(query);
+        let scopedQuery: any;
+        if (admin) {
+            assertAdminScope(user, this.trustedRoles);
+            scopedQuery = { ...sanitizeAdminQuery(query), ...sanitizeAdminQuery(params) };
+        } else {
             scopedQuery = { ...stripUnsafeQueryKeys(query), ...params };
-            const accessibleUids: string[] = await this.findAccessibleMailboxUids(user);
+            const accessibleUids: string[] = await this.accessibleMailboxUids(user);
             // See the identical short-circuit (and its rationale) in `find()` above.
             if (accessibleUids.length === 0) {
                 return res.status(200).setHeader("content-length", 0);
@@ -1263,9 +1499,12 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             limit: query?.limit,
             page: query?.page,
             version: query?.version,
-            user,
+            user: admin ? user : this.mailUser(user),
             ignoreACL: true,
         });
+        if (admin) {
+            await this.auditAdmin(undefined, user, AuditAction.MAILBOX_ADMIN_LIST, "*", { count: result, query: scopedQuery, head: true });
+        }
         return res.status(200).setHeader("content-length", result);
     }
 
@@ -1283,9 +1522,11 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             includeDeleted: query?.deleted === true || query?.deleted === "true",
             ignoreACL: true,
         });
-        const permitted: boolean = existing
-            ? await this.aclUtils!.hasPermission(user, existing.uid, ACLAction.EXISTS)
-            : false;
+        const admin: boolean = isAdminScope(query);
+        if (admin) {
+            assertAdminScope(user, this.trustedRoles);
+        }
+        const permitted: boolean = existing ? admin || (await this.hasMailAccess(user, existing.uid, ACLAction.EXISTS)) : false;
         return permitted
             ? res.status(200).setHeader("content-length", 1)
             : res.status(404).setHeader("content-length", 0);
@@ -1297,8 +1538,25 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * `util/AuditLogUtils.ts`'s `isNonOwnerAccess()`.
      */
     @Get("/:id")
-    public async findById(@Param("id") id: string, @Query() query: any, @AuthUser user?: JWTUser): Promise<T | null> {
-        const result: T | null = await super.findById(id, query, user);
+    public async findById(@Param("id") id: string, @Query() query: any, @AuthUser user?: JWTUser, @Request req?: HttpRequest): Promise<T | null> {
+        if (isAdminScope(query)) {
+            // Administrative metadata only, audited - see `find()`.
+            assertAdminScope(user, this.trustedRoles);
+            const existing: T | undefined = await this.repoUtils!.findOne(id, { version: query?.version, ignoreACL: true });
+            if (!existing) {
+                throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+            }
+            await this.auditAdmin(req, user, AuditAction.MAILBOX_ADMIN_READ, existing.uid, { primarySmtpAddress: existing.primarySmtpAddress });
+            return toAdminMetadata(existing) as unknown as T;
+        }
+        // A mailbox the caller holds no READ on answers exactly like one that doesn't exist (404) - the framework's own 403
+        // would reveal which addresses have a mailbox. `RepoUtils` then resolves the mailbox's ACL for `mailUser()`, the
+        // caller without a trusted role.
+        if (!(await this.hasMailAccess(user, id, ACLAction.READ))) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        const found: T | null = await super.findById(id, query, this.mailUser(user));
+        const result: T | null = found && user ? this.withAccessRole(found, user) : found;
         if (result && isNonOwnerAccess(result, user)) {
             await recordAuditLog(
                 this._objectFactory!,
@@ -1337,6 +1595,9 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         const existing: T | undefined = await this.repoUtils.findOne(id, { version, ignoreACL: true });
+        // An administrator with no grant on the mailbox deletes it as the trusted caller `RepoUtils` lets through, audited;
+        // anybody else needs DELETE on it as themselves.
+        const adminOnly: boolean = await this.isAdminOnly(id, user, ACLAction.DELETE);
         if (existing) {
             try {
                 await assertNotOnLegalHold(this._objectFactory!, this.matterClass, existing.uid);
@@ -1355,7 +1616,10 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 throw err;
             }
         }
-        await super.delete(id, version, purge, req, user);
+        await super.delete(id, version, purge, req, adminOnly ? user : this.mailUser(user));
+        if (adminOnly && existing) {
+            await this.auditAdmin(req, user, AuditAction.MAILBOX_ADMIN_DELETE, existing.uid, { primarySmtpAddress: existing.primarySmtpAddress });
+        }
     }
 
     /** Fetches every page of `repoUtils.find(criteria, ...)` results - `truncate()`'s legal-hold check
@@ -1420,6 +1684,12 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         for (let i = 0; i < matched.length; i += TRUNCATE_BATCH_SIZE) {
             const uids: string[] = matched.slice(i, i + TRUNCATE_BATCH_SIZE).map((existing) => existing.uid);
             await this.repoUtils.truncate({ uid: ModelUtils.literal(uids, "in") } as any, { user, ignoreACL: true });
+        }
+        for (const existing of matched) {
+            await this.auditAdmin(undefined, user, AuditAction.MAILBOX_ADMIN_DELETE, existing.uid, {
+                primarySmtpAddress: existing.primarySmtpAddress,
+                bulk: true,
+            });
         }
     }
 }

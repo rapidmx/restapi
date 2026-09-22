@@ -38,6 +38,11 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
         vi.restoreAllMocks();
     });
 
+    // A grant names a person the server can resolve: `target` is a known user because they own a mailbox here.
+    beforeEach(async () => {
+        await ctx.createMailbox([], { ownerUserUid: target });
+    });
+
     const as = (token: string, req: any) => req.set("Authorization", "jwt " + token);
     const access = (mailboxUid: string, member: string = "") => `${ctx.baseUrl}/${mailboxUid}/access${member ? `/${encodeURIComponent(member)}` : ""}`;
 
@@ -93,7 +98,8 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
         const mailboxUrl = (uid: string, property: string = "") => `${ctx.baseUrl}/${uid}${property ? `/${property}` : ""}`;
         /** A full-object style `PUT`, carrying the mailbox's current optimistic-lock version. */
         const putMailbox = async (token: string, uid: string, body: Record<string, unknown>) => {
-            const { version } = (await as(adminToken, request(ctx.app()).get(mailboxUrl(uid)))).body;
+            // An administrator reads a mailbox's version through the administration scope (metadata) - a plain read is the owner's.
+            const { version } = (await as(adminToken, request(ctx.app()).get(`${mailboxUrl(uid)}?scope=admin`))).body;
             return await as(token, request(ctx.app()).put(mailboxUrl(uid))).send({ uid, version, ...body });
         };
 
@@ -183,7 +189,8 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
             const token = (user: any) => JWTUtils.createTokenSync(ctx.config.get("auth"), user);
 
             expect((await get(ctx.ownerToken)).body).toEqual(all);
-            expect((await get(adminToken)).body).toEqual(all);
+            // A trusted role is no grant: an administrator with no record of their own can do nothing to the mailbox as themselves.
+            expect((await get(adminToken)).body).toEqual(none);
             expect((await get(token(roleUser))).body).toEqual(all);
             expect((await get(delegateToken)).body).toEqual({ canRead: true, canCreate: false, canUpdate: true, canDelete: false, canManage: true });
             const denied = await get(token(stranger));
@@ -194,8 +201,10 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
             expect((await get(token(stranger), open.uid)).body).toEqual({ ...none, canRead: true });
         });
 
-        it("returns 404 for a missing mailbox and 401 without a signed-in caller", async () => {
-            expect((await as(ctx.ownerToken, request(ctx.app()).get(me(`${uuid.v4()}@example.com`)))).status).toBe(404);
+        it("reports no access for a missing mailbox (as for one the caller has no access to) and is 401 without a signed-in caller", async () => {
+            const missing = await as(ctx.ownerToken, request(ctx.app()).get(me(`${uuid.v4()}@example.com`)));
+            expect(missing.status).toBe(200);
+            expect(missing.body).toEqual(none);
             const mailbox = await ctx.createMailbox();
             expect((await request(ctx.app()).get(me(mailbox.uid))).status).toBe(401);
         });
@@ -210,7 +219,7 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
             const mailbox = await ctx.createMailbox();
             const put = await as(ctx.ownerToken, request(ctx.app()).put(access(mailbox.uid, "me"))).send({ role: "viewer" });
             expect(put.status).toBe(400);
-            expect(put.body.message).toBe("Access can only be granted to a user.");
+            expect(put.body.message).toBe('No user found for "me".');
             expect((await as(ctx.ownerToken, request(ctx.app()).delete(access(mailbox.uid, "me")))).status).toBe(204);
             expect((await as(ctx.ownerToken, request(ctx.app()).get(access(mailbox.uid)))).body).toEqual([]);
             expect((await as(ctx.ownerToken, request(ctx.app()).get(me(mailbox.uid)))).body).toEqual(all);
@@ -218,12 +227,13 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
     });
 
     describe("who can be granted access", () => {
-        it("only grants access to a user uid, never a role, anonymous or a wildcard", async () => {
+        it("only grants access to a user who can be found, never a role, anonymous, a wildcard or an unknown string", async () => {
             const mailbox = await ctx.createMailbox();
-            for (const member of ["anonymous", ".*", "*", "admin", "not-a-uuid", `${uuid.v4()}x`]) {
+            // Nothing that doesn't resolve to a user is stored - a role, a wildcard, a username, a uid nobody has.
+            for (const member of ["anonymous", ".*", "*", "admin", "not-a-uuid", `${uuid.v4()}x`, uuid.v4()]) {
                 const result = await as(ctx.ownerToken, request(ctx.app()).put(access(mailbox.uid, member))).send({ role: "viewer" });
                 expect(result.status).toBe(400);
-                expect(result.body.message).toBe("Access can only be granted to a user.");
+                expect(result.body.message).toBe(`No user found for "${member}".`);
             }
         });
 
@@ -318,7 +328,7 @@ export function mailboxAccessSecuritySuite(ctx: MailboxAccessSecuritySuiteContex
         it("refuses a caller changing their own record, unless they're trusted", async () => {
             const mailbox = await ctx.createMailbox([
                 { userOrRoleId: delegate.uid, actions: updateOnly },
-                { userOrRoleId: admin.uid, actions: [ACLAction.READ] },
+                { userOrRoleId: admin.uid, actions: [ACLAction.FULL] },
             ]);
             const own = await as(delegateToken, request(ctx.app()).put(access(mailbox.uid, delegate.uid))).send({ role: "manager" });
             expect(own.status).toBe(403);

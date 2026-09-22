@@ -138,16 +138,52 @@ describe("Route:IngestQueueMongo Tests", () => {
         expect(result.body).toEqual([]);
     });
 
-    it("A trusted (admin) caller can list ingest queue entries in any mailbox.", async () => {
+    it("A trusted (admin) caller sees no ingest queue entries of a mailbox they hold no grant on - unless they ask for the administration scope, which is audited.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const entry = await createIngestQueueEntry(mailbox.uid);
+
+        const plain = await request(server.getApplication())
+            .get(`${baseUrl}?mailboxUid=${mailbox.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(plain.status).toBe(200);
+        expect(plain.body).toEqual([]);
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}?mailboxUid=${mailbox.uid}&scope=admin`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(result.status).toBe(200);
+        expect(result.body.map((row: any) => row.uid)).toEqual([entry.uid]);
+
+        const one = await request(server.getApplication())
+            .get(`${baseUrl}/${entry.uid}?scope=admin`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(one.status).toBe(200);
+        const hidden = await request(server.getApplication())
+            .get(`${baseUrl}/${entry.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(hidden.status).toBe(404);
+
+        const audit = await request(server.getApplication())
+            .get(`/${baseUrl.split("/")[1]}/audit-logs?action=mail_queue.admin_access&mailboxUid=${mailbox.uid}`)
+            .set("Authorization", "jwt " + adminToken);
+        expect(audit.status).toBe(200);
+        expect(audit.body.map((row: any) => row.details.operation).sort()).toEqual(["list", "read"]);
+        expect(audit.body.every((row: any) => row.mailboxUid === mailbox.uid && row.actorUserUid === admin.uid)).toBe(true);
+    });
+
+    it("The administration scope needs a trusted role (403) and an elevated token (403) - an ordinary caller can't use it on their own ingest queue.", async () => {
         const mailbox = await createMailbox(owner.uid);
         await createIngestQueueEntry(mailbox.uid);
 
+        const ordinary = await request(server.getApplication())
+            .get(`${baseUrl}?mailboxUid=${mailbox.uid}&scope=admin`)
+            .set("Authorization", "jwt " + ownerToken);
+        expect(ordinary.status).toBe(403);
+        const unelevated = JWTUtils.createTokenSync(config.get("auth"), { uid: admin.uid, roles: ["admin"], scopes: [] });
         const result = await request(server.getApplication())
-            .get(`${baseUrl}?mailboxUid=${mailbox.uid}`)
-            .set("Authorization", "jwt " + adminToken);
-
-        expect(result.status).toBe(200);
-        expect(result.body.length).toBe(1);
+            .get(`${baseUrl}?mailboxUid=${mailbox.uid}&scope=admin`)
+            .set("Authorization", "jwt " + unelevated);
+        expect(result.status).toBe(403);
     });
 
     it("Can make a count request scoped to a mailbox the caller has access to.", async () => {

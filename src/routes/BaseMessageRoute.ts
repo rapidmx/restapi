@@ -19,14 +19,17 @@ import {
 import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
+import { pointInlineImages, SanitizedBodyLoader, type InlineImageMode } from "../scan/SanitizedBody.js";
+import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
-import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "../util/DomainUtils.js";
+import { classifyRecipientTier, createFederatedPeerCheck } from "../util/DomainUtils.js";
 import { coalesceFolderCounts, notifyFolderCounts, type FolderCountsContext } from "../util/FolderCountUtils.js";
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { findActiveHoldsFor } from "../util/LegalHoldUtils.js";
-import { applyThreadHeaders, scanAndRelay } from "../util/MailSendUtils.js";
+import { applyThreadHeaders, prepareOutboundMime, scanAndRelay, seedReceiptStatus } from "../util/MailSendUtils.js";
 import type { MailRelayFailureDetails } from "../transport/TransportResultUtils.js";
+import type { ScheduledSendJob } from "../jobs/ScheduledSendJob.js";
 import { deliveryFailureKey, describeOriginal, tryFileDeliveryFailureNotice } from "../util/DeliveryFailureNoticeUtils.js";
 import { coerceDateValue } from "../util/DateCoercionUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
@@ -42,9 +45,8 @@ import {
     parseMessageLabelUids,
     syncMessageListFields,
 } from "../util/MessageListUtils.js";
-import { checkOriginatorHeaders, extractHeader, prependHeaders, safeDisplayName } from "../util/MimeHeaderUtils.js";
+import { checkOriginatorHeaders, extractHeader, safeDisplayName } from "../util/MimeHeaderUtils.js";
 import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
-import { buildRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification } from "../util/ReceiptUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
@@ -58,12 +60,21 @@ import {
     MessageClassification,
     MessageFlags,
     MessageReceiptEntry,
-    PublicKey,
     Recipient,
 } from "../models/types.js";
 const { Config, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Delete, Get, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
+
+/** The answer to a background send: the message as it now sits in Outbox. */
+export interface QueuedSend<T> {
+    status: "queued";
+    message: T;
+}
+
+function isQueuedSend<T>(value: unknown): value is QueuedSend<T> {
+    return typeof value === "object" && value !== null && (value as any).status === "queued" && "message" in value;
+}
 
 /** One row of `BaseMessageRoute.conversations()` - a computed summary over every `Message` sharing one
  * `conversationId`, never persisted on its own (see that method's own doc comment). */
@@ -329,6 +340,15 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * master key generation without depending on either backend directly. */
     protected abstract keyVaultClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses: the `ScheduledSendJob` that relays a message queued by a background send
+     * (`POST /:id/send` with `{ background: true }`). Left unset (a downstream subclass that predates it), a background send
+     * is refused with a 501 rather than pretending to be one. */
+    protected sendJobClass?: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses: the `Attachment` entity, so `content()` can point a message's inline (`cid:`)
+     * images at its attachments. Left unset (a downstream subclass that predates it), a message has no inline attachments to point at. */
+    protected attachmentClass?: any;
+
     private keyVaultRepo?: RepoUtils<KeyVault>;
 
     private folderRepo?: RecoverableRepoUtils<any>;
@@ -366,6 +386,20 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * `ScheduledSendJob` leases its own claims for. Must comfortably exceed a relay's worst-case duration. */
     @Config("mail:jobs:scheduled_send:lease_ms", 900_000)
     private sendLeaseMs: number = 900_000;
+
+    /** Where an inline image's attachment is served from - the attachment route as the client reaches it (`<prefix>/<uid>/content`). */
+    @Config("mail:scan:sanitize:attachment_url_prefix", "/api/mail/attachments")
+    private attachmentUrlPrefix: string = "/api/mail/attachments";
+
+    /** A message stored by an older sanitizer is re-sanitized on first read (`SanitizedBodyLoader`) unless its raw MIME is larger than this. */
+    @Config("mail:scan:sanitize:lazy_max_raw_bytes", 16 * 1024 * 1024)
+    private lazySanitizeMaxRawBytes: number = 16 * 1024 * 1024;
+
+    /** How long a reader waits for that re-sanitization before being served the HTML already stored. */
+    @Config("mail:scan:sanitize:lazy_timeout_ms", 10_000)
+    private lazySanitizeTimeoutMs: number = 10_000;
+
+    private sanitizedBodyLoader?: SanitizedBodyLoader;
 
     private async getFolderRepo(): Promise<RecoverableRepoUtils<any>> {
         if (!this.folderRepo) {
@@ -646,7 +680,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (typeof mailboxUid !== "string" || mailboxUid.length === 0) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        return (await this.aclUtils!.hasPermission(user, mailboxUid, ACLAction.LIST)) ? mailboxUid : undefined;
+        return (await this.hasMailAccess(user, mailboxUid, ACLAction.LIST)) ? mailboxUid : undefined;
     }
 
     /**
@@ -784,25 +818,98 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * (`util/DeliveryFailureNoticeUtils.ts`). `scheduledSendRelayedAt` is persisted the moment the transport accepts; a relay that
      * succeeded but couldn't be filed into Sent Items is made due, so `ScheduledSendJob` only finishes the filing and
      * never relays it again. Filing only happens while the message is still in Outbox under this send's claim.
+     *
+     * With `{ background: true }` in the body the request does only what is cheap and answers at once: the same checks (sender
+     * allowed, has recipients, still a draft, folder permission, not already sent) and the move into Outbox, made due now
+     * (`scheduledSendTime` = now, nothing leased), then `202 { status: "queued", message: <the Outbox copy> }`. Scanning, relaying
+     * and filing into Sent Items happen afterwards in this process (`ScheduledSendJob.enqueue()`, started at once, a bounded
+     * number at a time), and the outcome arrives as a `send-succeeded` / `send-retrying` / `send-failed` event (see
+     * `ScheduledSendJob`). Because the message is simply due in Outbox until the job claims it, a process that dies at any point
+     * leaves it for the job's next run (or its startup sweep) to finish - never relayed twice (the job's claim and
+     * `scheduledSendRelayedAt`). A repeat request for a message already queued or being sent answers the same 202 without
+     * sending again; one for a message that failed for good (`scheduledSendError` set, in Outbox, nothing due) queues it afresh
+     * with a fresh retry budget. With a future `scheduledSendTime` the answer is the same 202, the message waiting in Outbox.
      */
     @Summary("Send message")
     @Description(
         "Scans and relays a drafted message via the configured MailTransport, then moves it into the " +
-            "mailbox's Sent Items folder. A future scheduledSendTime in the body queues it in Outbox instead.",
+            "mailbox's Sent Items folder. A future scheduledSendTime in the body queues it in Outbox instead. " +
+            "With background: true the message is queued in Outbox and the request answers 202 at once; the result " +
+            "arrives as a send-succeeded, send-retrying or send-failed event.",
     )
     @Returns([Object])
     @Post("/:id/send")
     public async send(
         @Param("id") id: string,
-        body: { scheduledSendTime?: string | null } | undefined,
+        body: { scheduledSendTime?: string | null; background?: boolean } | undefined,
         @Request req: HttpRequest,
+        @Response res: HttpResponse,
         @AuthUser user?: JWTUser,
-    ): Promise<T> {
+    ): Promise<T | HttpResponse> {
+        const background: unknown = (body as any)?.background;
+        if (background !== undefined && background !== null && typeof background !== "boolean") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'background' must be true or false.");
+        }
+        if (background === true && !this.sendJobClass) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 501, "This server cannot send in the background.");
+        }
         // A send moves the message Drafts -> Outbox -> Sent Items (or back): each folder's counts are published once, when it ends.
-        return await coalesceFolderCounts(() => this.folderCountsContext(), () => this.relaySend(id, body, user));
+        const result: T | QueuedSend<T> = await coalesceFolderCounts(
+            () => this.folderCountsContext(),
+            () => this.relaySend(id, body, user, background === true),
+        );
+        if (isQueuedSend<T>(result)) {
+            res.status(202).json(result);
+            // Started after the response is on its way: scanning is CPU work on this same thread.
+            setImmediate(() => void this.startBackgroundSend(result.message.uid));
+            return res;
+        }
+        return result;
     }
 
-    private async relaySend(id: string, body: { scheduledSendTime?: string | null } | undefined, user: JWTUser | undefined): Promise<T> {
+    /** The `ScheduledSendJob` instance this process runs (the one the background service manager created, else one made here). */
+    private async sendJob(): Promise<ScheduledSendJob<T>> {
+        return (
+            this._objectFactory!.getInstance(this.sendJobClass) ??
+            (await this._objectFactory!.newInstance(this.sendJobClass, { name: "background-send" }))
+        );
+    }
+
+    /** Hands a queued message to the job right away. Best-effort: if it cannot be started here the message is still due in
+     * Outbox, and the job's next run picks it up. */
+    private async startBackgroundSend(uid: string): Promise<void> {
+        try {
+            void (await this.sendJob()).enqueue(uid);
+            /* v8 ignore start -- only a job that cannot be instantiated */
+        } catch (err: any) {
+            this.logger?.warn(`BaseMessageRoute: could not start the background send of message ${uid}; ScheduledSendJob will pick it up: ${err?.message}`);
+        }
+        /* v8 ignore stop */
+    }
+
+    /** Whether `message` (in Outbox, not relayed) is queued or being sent now - due, leased, or waiting out a retry backoff -
+     * rather than held for a time the user chose. */
+    private static isQueuedNow(message: Message, now: number): boolean {
+        const due: Date | undefined = toValidDate(message.scheduledSendTime);
+        const lease: Date | undefined = toValidDate((message as any).scheduledSendLeaseExpiresAt);
+        return (
+            (lease !== undefined && lease.getTime() > now) ||
+            (due !== undefined && (due.getTime() <= now || ((message as any).scheduledSendAttempts ?? 0) > 0))
+        );
+    }
+
+    /** Whether `message` sits in Outbox after a send that failed for good: nothing due, nothing leased, a recorded error. */
+    private static isFailedInOutbox(message: Message, now: number): boolean {
+        const lease: Date | undefined = toValidDate((message as any).scheduledSendLeaseExpiresAt);
+        return !message.scheduledSendTime && !(lease && lease.getTime() > now) && !!(message as any).scheduledSendError;
+    }
+
+    private async relaySend(
+        id: string,
+        body: { scheduledSendTime?: string | null; background?: boolean } | undefined,
+        user: JWTUser | undefined,
+        background: boolean,
+    ): Promise<T | QueuedSend<T>> {
         if (!this.repoUtils || !this.blobStore || !this.mailTransport || !this.scanPipeline) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
@@ -811,7 +918,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (!message) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        if (!(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))) {
+        if (!(await this.hasMailAccess(user, message.folderUid, ACLAction.UPDATE))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
         const requestedSendTime: Date | undefined = coerceDateValue((body as any)?.scheduledSendTime, "scheduledSendTime") || undefined;
@@ -821,7 +928,14 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if ((message as any).scheduledSendRelayedAt || currentFolderType === FolderType.SENT_ITEMS) {
             throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "This message has already been sent.");
         }
-        if (currentFolderType === FolderType.OUTBOX) {
+        // A background send repeated for a message that is already on its way answers the same 202, and one repeated for a
+        // message that failed for good queues it again (the way to retry from Outbox); everything else in Outbox is refused.
+        const now: number = Date.now();
+        const retryingFailed: boolean = background && currentFolderType === FolderType.OUTBOX && BaseMessageRoute.isFailedInOutbox(message, now);
+        if (background && currentFolderType === FolderType.OUTBOX && !retryingFailed && BaseMessageRoute.isQueuedNow(message, now)) {
+            return { status: "queued", message };
+        }
+        if (currentFolderType === FolderType.OUTBOX && !retryingFailed) {
             throw new ApiError(
                 ApiErrors.INVALID_OBJECT_VERSION,
                 409,
@@ -832,7 +946,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // be "scheduled" into Outbox, taken back to Drafts (the scheduled-send cancel path), re-assembled by the compose
         // route and moved back - rewriting mail history, a held custodian's included. Trusted callers are exempt, like
         // the Drafts/Outbox move rules in `prepareScheduledSendUpdate()`.
-        if (!this.isTrusted(user) && currentFolderType !== FolderType.DRAFTS) {
+        if (!this.isTrusted(user) && currentFolderType !== FolderType.DRAFTS && !retryingFailed) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Only a message in Drafts can be sent.");
         }
 
@@ -873,92 +987,54 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
         // "Do not deliver before" (`PR_DEFERRED_SEND_TIME`) - a future `scheduledSendTime` defers relay instead of
         // sending now. The message sits in the mailbox's Outbox folder until `ScheduledSendJob` relays it; moving it
-        // back out of Outbox (e.g. to Drafts) cancels it.
+        // back out of Outbox (e.g. to Drafts) cancels it. A background send is the same queueing with the time set to now:
+        // the job (or the in-process kick that follows the 202) relays it as soon as it can claim it.
         const scheduledSendTime: Date | undefined = requestedSendTime ?? toValidDate(message.scheduledSendTime);
-        if (scheduledSendTime && scheduledSendTime.getTime() > Date.now()) {
+        const deferred: boolean = !!scheduledSendTime && scheduledSendTime.getTime() > Date.now();
+        if (deferred || background) {
             const outbox: any = await findOrCreateWellKnownFolder(folderRepo, this.folderClass, message.mailboxUid, FolderType.OUTBOX, user);
-            const queued: T = await this.repoUtils.update(
-                {
-                    uid: message.uid,
-                    version: (message as any).version,
-                    folderUid: outbox.uid,
-                    scheduledSendTime,
-                    scheduledSendAttempts: null,
-                    scheduledSendError: null,
-                    scheduledSendLeaseExpiresAt: null,
-                } as any,
-                message,
-                { user, ignoreACL: true },
-            );
+            let queued: T;
+            try {
+                queued = await this.repoUtils.update(
+                    {
+                        uid: message.uid,
+                        version: (message as any).version,
+                        folderUid: outbox.uid,
+                        scheduledSendTime: deferred ? scheduledSendTime : new Date(),
+                        scheduledSendAttempts: null,
+                        scheduledSendError: null,
+                        scheduledSendLeaseExpiresAt: null,
+                    } as any,
+                    message,
+                    { user, ignoreACL: true },
+                );
+            } catch (err) {
+                // Two background sends of the same draft at once: one won the move; the other answers what is now true.
+                const current: T | undefined = background ? await this.repoUtils.findOne(id, { ignoreACL: true, skipCache: true }) : undefined;
+                if (current && (await this.folderTypeOf(current.folderUid)) === FolderType.OUTBOX && BaseMessageRoute.isQueuedNow(current, Date.now())) {
+                    return { status: "queued", message: current };
+                }
+                /* v8 ignore next -- only a failed write that is not the lost race above */
+                throw err;
+            }
             await this.notifyFolders([message.folderUid, outbox.uid]);
-            return queued;
+            return background ? { status: "queued", message: queued } : queued;
         }
 
         const envelopeTo: string[] = message.recipients.map((r) => r.address);
 
-        // A receipt request is a single message-level header - RFC 3798 has no "only notify me for these
-        // recipients" concept, every recipient's own system independently decides whether to honor it - so
-        // the rule is "attach it if it applies to *any* recipient": each recipient is classified by
-        // `classifyRecipientTier()` (`util/DomainUtils.ts` - same-org/federated/external), and an explicit
-        // per-draft `message.requestReceipt` overrides all three of the sending mailbox's own
-        // `alwaysRequestReceipt*` defaults at once when set.
-        let attachesReceiptRequest = false;
-        if (sendingMailbox) {
-            const effectiveInternal: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptInternal;
-            const effectiveFederated: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptFederated;
-            const effectiveExternal: boolean = message.requestReceipt ?? sendingMailbox.alwaysRequestReceiptExternal;
-            if (effectiveInternal || effectiveFederated || effectiveExternal) {
-                // Fetched once and passed to every `classifyRecipientTier()` call below (`verifiedDomainNames`)
-                // rather than each iteration independently re-querying "this server's domains" from scratch -
-                // a message to N recipients previously cost N sequential `Domain` queries, all inside this
-                // HTTP request, before the message was even handed off for relay. The per-recipient DNS
-                // federated-peer checks are independent of each other, so they run concurrently
-                // (`Promise.all`) instead of a sequential loop - `resolveFederationPolicy()` already caches
-                // per domain, so this also collapses to one real lookup per distinct cold domain rather than
-                // one per recipient.
-                const verifiedDomainNames: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
-                const federatedPeerCheck = createFederatedPeerCheck(this.dnsResolver!);
-                const tiers = await Promise.all(
-                    envelopeTo.map((address) =>
-                        classifyRecipientTier(this._objectFactory!, this.domainClass, address, federatedPeerCheck, verifiedDomainNames),
-                    ),
-                );
-                attachesReceiptRequest = tiers.some(
-                    (tier) =>
-                        (tier === "same-org" && effectiveInternal) ||
-                        (tier === "federated" && effectiveFederated) ||
-                        (tier === "external" && effectiveExternal),
-                );
-            }
-        }
-        if (attachesReceiptRequest) {
-            raw = prependHeaders(raw, [{ name: "Disposition-Notification-To", value: message.from.address }]);
-        }
-
-        // Announces the sending mailbox's current encryption key (C2) to the recipient, mirroring the
-        // Disposition-Notification-To attachment above - the Autocrypt-style opportunistic-discovery half of
-        // the protocol (E3 is the inbound counterpart). Only the active (non-revoked, non-expired) "encrypt"
-        // key is ever announced - a revoked/expired one would be actively harmful advice to a recipient.
-        // `?? []`: defense in depth against a legacy row whose SQL `keys` column was backfilled to `null`
-        // rather than the column's own default (e.g. a migration applied outside this ORM) - the documented
-        // "SQL returns `null`, not `undefined`, for an unset column" hazard this codebase already guards
-        // against elsewhere (see `ScanQueueJob`'s own note on the same class of issue).
-        const activeEncryptKey: PublicKey | undefined = (sendingMailbox?.keys ?? []).find(
-            (k) => k.useType === "encrypt" && !k.revokedAt && k.notAfter > Date.now(),
-        );
-        if (activeEncryptKey) {
-            raw = prependHeaders(raw, [
-                {
-                    name: "RapidMX-Key",
-                    value: buildRapidMxKeyHeader(
-                        message.from.address,
-                        // `?? {...}`: same legacy-SQL-row `null` hazard as `keys` above.
-                        (sendingMailbox!.encryptPreference ?? { preferEncrypt: "nopreference" }).preferEncrypt,
-                        activeEncryptKey,
-                    ),
-                },
-            ]);
-        }
+        // The receipt request and the encryption-key announcement (`util/MailSendUtils.ts`'s `prepareOutboundMime()`, which
+        // `ScheduledSendJob` applies to what it relays too) - the same for a message sent now and one sent in the background.
+        const prepared = await prepareOutboundMime({
+            raw,
+            message,
+            mailbox: sendingMailbox,
+            objectFactory: this._objectFactory!,
+            domainClass: this.domainClass,
+            dnsResolver: this.dnsResolver,
+        });
+        raw = prepared.raw;
+        const attachesReceiptRequest: boolean = prepared.attachesReceiptRequest;
 
         // Claim: a version-checked move into Outbox carrying an in-flight lease (`scheduledSendLeaseExpiresAt`) and no
         // `scheduledSendTime`, so `ScheduledSendJob` ignores it. Of two concurrent sends only one gets past this, and while
@@ -1115,18 +1191,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // later, as their own real MDNs arrive, not predicted here) - deduplicated by normalized address so a
         // recipient appearing twice (e.g. a case-variant duplicate across To/Cc) doesn't seed two rows that
         // `processReceipt()`'s `findIndex()` could only ever update the first of.
-        let receiptStatus: MessageReceiptEntry[] | undefined;
-        if (attachesReceiptRequest) {
-            const seenAddresses: Set<string> = new Set();
-            receiptStatus = [];
-            for (const address of envelopeTo) {
-                const normalized: string = normalizeAddress(address);
-                if (!seenAddresses.has(normalized)) {
-                    seenAddresses.add(normalized);
-                    receiptStatus.push({ recipientAddress: normalized });
-                }
-            }
-        }
+        const receiptStatus: MessageReceiptEntry[] | undefined = attachesReceiptRequest ? seedReceiptStatus(envelopeTo) : undefined;
 
         // `messageId`/`conversationId` come from the relayed MIME and are written as a patch (no model constructor), so
         // they are bounded here - see `boundIndexedValue()`. The same patch rewrites `flags`, so the denormalized list
@@ -1312,7 +1377,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (!message) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        if (!(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))) {
+        if (!(await this.hasMailAccess(user, message.folderUid, ACLAction.UPDATE))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
@@ -1389,7 +1454,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (!message) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        if (!(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))) {
+        if (!(await this.hasMailAccess(user, message.folderUid, ACLAction.UPDATE))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
@@ -1462,7 +1527,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (!message) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        if (!(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))) {
+        if (!(await this.hasMailAccess(user, message.folderUid, ACLAction.UPDATE))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
@@ -1527,8 +1592,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
             }
             if (
-                !(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.READ)) ||
-                !(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))
+                !(await this.hasMailAccess(user, message.folderUid, ACLAction.READ)) ||
+                !(await this.hasMailAccess(user, message.folderUid, ACLAction.UPDATE))
             ) {
                 throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
             }
@@ -1866,7 +1931,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (!message) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        if (!(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.UPDATE))) {
+        if (!(await this.hasMailAccess(user, message.folderUid, ACLAction.UPDATE))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
@@ -1938,7 +2003,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
         // Like a move out of Outbox, a delete is refused while a send of the message is in flight (for every caller): a
         // soft-deleted message could otherwise miss its relay marker and be restored and sent a second time.
-        if (existing && (await this.aclUtils!.hasPermission(user, existing.folderUid, ACLAction.DELETE))) {
+        if (existing && (await this.hasMailAccess(user, existing.folderUid, ACLAction.DELETE))) {
             BaseMessageRoute.assertNotInFlight(existing);
         }
 
@@ -1987,20 +2052,23 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     @Description(
         "Streams the message's sanitized HTML body (post-`ScanPipeline`, safe to render directly) if one " +
             "exists, otherwise falls back to its plain-text preview. Never serves `bodyBlobKey`'s raw MIME " +
-            "source directly — that content is never sanitized.",
+            "source directly — that content is never sanitized. HTML stored by an older sanitizer is re-sanitized " +
+            "on first read. Inline (`cid:`) images are pointed at the message's attachments (`?cid=attachment`) " +
+            "or left as `cid:` for a client that resolves them itself (`?cid=keep`, the default for a `fetch()`).",
     )
     @Get("/:id/content")
     public async content(
         @Param("id") id: string,
         @Response res: HttpResponse,
         @AuthUser user?: JWTUser,
+        @Request req?: HttpRequest,
     ): Promise<void> {
         if (!this.repoUtils || !this.blobStore) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
 
         const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
-        if (!message || !(await this.aclUtils!.hasPermission(user, message.folderUid, ACLAction.READ))) {
+        if (!message || !(await this.hasMailAccess(user, message.folderUid, ACLAction.READ))) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
 
@@ -2028,15 +2096,57 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // Defense in depth behind the sanitizer, for a client that opens this URL directly rather than rendering the
         // HTML in its own sandbox: no sniffing, no script, no network fetches, and a sandboxed (opaque-origin) document.
         res.setHeader("x-content-type-options", "nosniff");
-        res.setHeader("content-security-policy", "default-src 'none'; img-src data: cid:; style-src 'unsafe-inline'; sandbox");
+        // Images are the message's own inline attachments (same origin) and `data:` images; a remote image is not fetched.
+        res.setHeader("content-security-policy", "default-src 'none'; img-src data: 'self'; style-src 'unsafe-inline'; sandbox");
         if (message.sanitizedHtmlBlobKey) {
-            const html: Buffer = await this.blobStore.get(message.sanitizedHtmlBlobKey);
+            const html: string = await this.sanitizedHtmlOf(message, req);
             res.setHeader("content-type", "text/html; charset=utf-8");
-            res.send(html);
+            res.send(Buffer.from(html, "utf-8"));
             return;
         }
 
         res.setHeader("content-type", "text/plain; charset=utf-8");
         res.send(Buffer.from(message.bodyPreview ?? "", "utf-8"));
+    }
+
+    /**
+     * `message`'s sanitized HTML as `content()` serves it: current (a blob written by an older sanitizer is redone from the raw MIME
+     * first - see `SanitizedBodyLoader`) and with its inline images pointed at its attachments (`pointInlineImages()`).
+     *
+     * The image mode is `?cid=attachment` (each `cid:` becomes the attachment's URL, which loads in a browser tab) or `?cid=keep` (each
+     * known `cid:` stays for a client that resolves them itself, as the web client's reading pane does); without the parameter, a
+     * `fetch()`/XHR (`Sec-Fetch-Dest: empty`) gets `keep` and everything else - a browser opening the URL, curl - gets `attachment`.
+     */
+    private async sanitizedHtmlOf(message: T, req?: HttpRequest): Promise<string> {
+        if (!this.sanitizedBodyLoader) {
+            this.sanitizedBodyLoader = new SanitizedBodyLoader(
+                this.blobStore!,
+                this.scanPipeline!,
+                { maxRawBytes: this.lazySanitizeMaxRawBytes, timeoutMs: this.lazySanitizeTimeoutMs },
+                this.logger,
+            );
+        }
+        const html: string = await this.sanitizedBodyLoader.load({
+            uid: message.uid,
+            bodyBlobKey: message.bodyBlobKey,
+            sanitizedHtmlBlobKey: message.sanitizedHtmlBlobKey!,
+        });
+        if (!html.includes("cid:")) {
+            return html;
+        }
+        const requested: unknown = req?.query?.cid;
+        const fetched: boolean = String(req?.headers?.["sec-fetch-dest"] ?? "").toLowerCase() === "empty";
+        const mode: InlineImageMode = requested === "keep" || requested === "attachment" ? requested : fetched ? "keep" : "attachment";
+        const attachments: { uid: string; contentId?: string }[] = [];
+        if (this.attachmentClass) {
+            const repo: RepoUtils<any> = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.attachmentClass.name,
+                args: [this.attachmentClass],
+            });
+            for await (const page of findPagesByUid<any>(repo, { messageUid: message.uid })) {
+                attachments.push(...page.map((attachment) => ({ uid: attachment.uid, contentId: attachment.contentId })));
+            }
+        }
+        return pointInlineImages(html, attachments, mode, this.attachmentUrlPrefix);
     }
 }

@@ -21,6 +21,7 @@ import type { DnsResolver } from "../dns/DnsResolver.js";
 import { AuditAction, Contact, EncryptionPreference, Folder, KeyConflict, Mailbox, PreviousKey, PublicKey } from "../models/types.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { ContactKeyMerge, ContactKeyWriteResult, ContactKeyWriteTarget, writeContactKeys } from "../util/ContactKeyUtils.js";
+import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { addPreviousKey, addRejectedKey, discoverAndMergeKeys, listField, normalizeKeyConflicts, withoutKey } from "../util/KeyringUtils.js";
 import { isPlainAddress } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
@@ -92,9 +93,8 @@ function revalidatedConflictKey(conflict: KeyConflict, address: string, now: num
  * that has no signing key pinned yet - see `trust()`. `POST /mailbox/:id/keys/resolve` accepts or rejects a changed key
  * (`Contact.keyConflicts`) - see `resolve()`.
  *
- * Ordinary `ACLUtils.hasPermission()` (with its usual trusted-role bypass) is used here, deliberately unlike
- * `BaseKeyVaultRoute` - this endpoint only ever touches the mailbox's own address book, never private key
- * material, so there is no reason to exclude the standard bypass the way `KeyVault` access does.
+ * Access is by ownership or an explicit ACL record (`hasMailAccess()`, `util/MailAccessUtils.ts`) - a trusted role
+ * grants nothing, since a mailbox's address book (and the keys pinned in it) is the owner's personal data.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -113,6 +113,9 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
+
+    @Config("trusted_roles", ["admin"])
+    private trustedRoles: string[] = ["admin"];
 
     @Inject("DnsResolver")
     private dnsResolver?: DnsResolver;
@@ -167,20 +170,18 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         };
     }
 
-    /** The mailbox `mailboxId` names, which `user` must be able to UPDATE (404 when missing, 403 without UPDATE). */
+    /** The mailbox `mailboxId` names, which `user` must be able to UPDATE - 403 when it doesn't exist too, so the answer
+     * doesn't reveal which addresses have a mailbox. */
     private async requireUpdatableMailbox(mailboxId: string, user: JWTUser | undefined): Promise<M> {
         const mailbox: M | undefined = await this.mailboxRepo!.findOne(mailboxId, { ignoreACL: true });
-        if (!mailbox) {
-            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
-        }
-        if (!(await this.aclUtils!.hasPermission(user, mailbox.uid, ACLAction.UPDATE))) {
+        if (!mailbox || !(await hasMailAccess(this.aclUtils, this.trustedRoles, user, mailbox.uid, ACLAction.UPDATE))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
         return mailbox;
     }
 
     private async requirePermission(user: JWTUser | undefined, uid: string, action: string): Promise<void> {
-        if (!(await this.aclUtils!.hasPermission(user, uid, action))) {
+        if (!(await hasMailAccess(this.aclUtils, this.trustedRoles, user, uid, action))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
     }

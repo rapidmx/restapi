@@ -24,4 +24,12 @@ describe("NullSigningCertificateEnrollment Tests", () => {
     it("describeEnrollment() throws since signing certificates are unavailable/disabled.", async () => {
         await expect(enrollment.describeEnrollment("some-id")).rejects.toThrow(/Signing certificate enrollment is not available/);
     });
+
+    it("describeProgress() throws since signing certificates are unavailable/disabled.", async () => {
+        await expect(enrollment.describeProgress("some-id")).rejects.toThrow(/Signing certificate enrollment is not available/);
+    });
+
+    it("listEnrollments() is empty - there is never an enrollment to find.", async () => {
+        await expect(enrollment.listEnrollments()).resolves.toEqual([]);
+    });
 });

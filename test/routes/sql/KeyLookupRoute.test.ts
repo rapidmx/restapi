@@ -271,12 +271,12 @@ describe("Route:KeyLookupSQL Tests", () => {
         expect(result.status).toBe(400);
     });
 
-    it("Returns 404 for a nonexistent mailbox.", async () => {
+    it("Returns 403 for a nonexistent mailbox - the same answer as for another user's, so it reveals no address.", async () => {
         const result = await request(server.getApplication())
             .get(`${baseUrl}/${uuid.v4()}/keys/lookup?addr=x@example.com`)
             .set("Authorization", "jwt " + ownerToken);
 
-        expect(result.status).toBe(404);
+        expect(result.status).toBe(403);
     });
 
     it("A different, unrelated user cannot look up keys through someone else's mailbox (403).", async () => {

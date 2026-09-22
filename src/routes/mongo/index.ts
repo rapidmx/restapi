@@ -1,3 +1,4 @@
+export * from "./AppearanceRouteMongo.js";
 export * from "./AttachmentRouteMongo.js";
 export * from "./AuditLogRouteMongo.js";
 export * from "./BrandingRouteMongo.js";

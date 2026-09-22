@@ -384,7 +384,7 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
             request(server.getApplication()).get(`/mongo/folders?mailboxUid=${result.body.mailbox.uid}`),
             userToken,
         );
-        expect(folders.body.map((f: any) => f.type).sort()).toEqual(["calendar", "contacts", "drafts", "inbox", "tasks"]);
+        expect(folders.body.map((f: any) => f.type).sort()).toEqual(["archive", "calendar", "contacts", "deleted_items", "drafts", "inbox", "junk", "notes", "outbox", "sent_items", "tasks"]);
     });
 
     it("Uses the saved MailboxPolicy's quota for a self-created mailbox instead of the config value.", async () => {

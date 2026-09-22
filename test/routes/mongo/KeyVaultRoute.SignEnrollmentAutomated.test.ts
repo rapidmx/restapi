@@ -122,6 +122,25 @@ describe("Route:KeyVaultMongo Tests - automated sign-enrollment", () => {
         expect(statusResult.body.status).toBe("pending");
     });
 
+    it("Answers a check-now, for an enrollment with nothing to poll, with its current status - and 404 for a mailbox's current enrollment when the implementation keeps no list.", async () => {
+        const mailbox = await createMailbox();
+        const startResult = await request(server.getApplication())
+            .post(`${baseUrl}/${mailbox.uid}/keyvault/keys/sign-enrollment`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ csr: await generateTestCsr(mailbox.primarySmtpAddress), wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } });
+
+        const checked = await request(server.getApplication())
+            .post(`${baseUrl}/${mailbox.uid}/keyvault/keys/sign-enrollment/${startResult.body.enrollmentId}/check`)
+            .set("Authorization", "jwt " + ownerToken);
+        const current = await request(server.getApplication())
+            .get(`${baseUrl}/${mailbox.uid}/keyvault/keys/sign-enrollment`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(checked.status).toBe(200);
+        expect(checked.body.status).toBe("pending");
+        expect(current.status).toBe(404);
+    });
+
     keyVaultRound5Suite({
         app: () => server.getApplication(),
         baseUrl,

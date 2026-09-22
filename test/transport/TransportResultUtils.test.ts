@@ -6,6 +6,7 @@ import { ApiError } from "@rapidrest/core";
 import {
     cleanDiagnosticText,
     describeRelayFailure,
+    isPermanentRelayFailure,
     isTransportResultDelivered,
     MailRelayError,
     parseSmtpStatus,
@@ -280,6 +281,36 @@ describe("TransportResultUtils Tests", () => {
             expect(relayFailureDetails({ accepted: [], rejected: [], error: { message: "\u0007" } }, []).error).toEqual({
                 message: "The mail transport reported an error.",
             });
+        });
+    });
+
+    describe("isPermanentRelayFailure()", () => {
+        const failed = (...temporary: (boolean | undefined)[]) =>
+            new MailRelayError({
+                recipients: temporary.map((_, i) => `r${i}@x`),
+                accepted: [],
+                rejected: temporary.map((_, i) => `r${i}@x`),
+                failures: temporary.map((flag, i) => ({ address: `r${i}@x`, ...(flag === undefined ? {} : { temporary: flag }) })),
+            });
+
+        it("is true when the transport refused the message and every recipient's failure is an explicit permanent one", () => {
+            expect(isPermanentRelayFailure(failed(false))).toBe(true);
+            expect(isPermanentRelayFailure(failed(false, false))).toBe(true);
+        });
+
+        it("is false when any failure is temporary or says nothing either way, or there are no failures to go by", () => {
+            expect(isPermanentRelayFailure(failed(true))).toBe(false);
+            expect(isPermanentRelayFailure(failed(false, true))).toBe(false);
+            expect(isPermanentRelayFailure(failed(false, undefined))).toBe(false);
+            expect(isPermanentRelayFailure(failed())).toBe(false);
+            expect(isPermanentRelayFailure(new MailRelayError({ recipients: [], accepted: [], rejected: [], failures: [] }))).toBe(false);
+        });
+
+        it("is true for a spam/malware verdict (422) and false for any other error", () => {
+            expect(isPermanentRelayFailure(new ApiError("invalid_request", 422, "failed scanning"))).toBe(true);
+            expect(isPermanentRelayFailure(new ApiError("internal_error", 502, "bad gateway"))).toBe(false);
+            expect(isPermanentRelayFailure(new Error("spawn sendmail ENOENT"))).toBe(false);
+            expect(isPermanentRelayFailure(undefined)).toBe(false);
         });
     });
 });
