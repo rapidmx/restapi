@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.19.0
+
 ### Features
 
 - **A `Domain` can now be a pure alias of another domain, with no mailboxes of its own.** New optional `Domain.aliasOf` names an existing, non-alias domain: e.g. `plc.gg` aliasing `powerlevel.gg`

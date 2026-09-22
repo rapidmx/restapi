@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-22
+
+### Added
+- Added CalendarEventAttendeeLink, a plugin-agnostic record of a URL for one attendee of one calendar event, and CalendarEvent.videoMeetingUid marking an event a video meeting is attached to
+- Added Domain.aliasOf so a domain can be a pure alias of another, with no mailboxes of its own
+- Added getPrimaryDomainNames, getAliasDomainNames and resolveDomainAlias to util/DomainUtils.ts
+
+### Changed
+- Personalize each attendee's meeting invite with their own link when one is on file for the event, composing and scanning once per attendee instead of once for the whole event, never adding a query for an event without one
+- Fall back to the event's plain location for an attendee with no link on file or when the lookup itself fails, logged, never aborting the send
+- Test every case on both backends, including a direct assertion that no attendee-link query ever runs for an event without one, and that a scan refusal now costs only that one attendee instead of the whole send
+- Document the change, including the one real behavioral difference it introduces, in the release notes and NOTES
+- Restrict new Mailbox/DistributionList addresses (create, rename, self-service, the /mailboxes/domains list) to non-alias verified domains
+- Resolve an alias domain to its primary in BaseMailIngestRoute's mailbox/distribution-list address lookup, so inbound mail addressed to the alias delivers correctly
+- Let BaseMessageRoute.assertSenderAllowed accept a mailbox's own local part on every alias domain of its own domain, with no per-mailbox configuration
+- Resolve the same alias in LocalKeyDiscoveryUtils so federation key discovery for an alias address finds the primary mailbox's own keys
+- Validate aliasOf on create and update in BaseDomainRoute: must name an existing non-alias domain, no self-alias, no chains, and refuse turning a domain with dependents into an alias
+- Refuse deleting a domain that another domain still aliases
+- Guard resolveDomainAlias against an unset domainClass so a lightweight test double that never wires one up keeps working
+- Test the new behavior across both Mongo and SQL backends, including the alias-domain delivery, sender and admin-validation paths
+- Document the feature in the release notes and NOTES
+- Restore the Domain.aliasOf release note bullet dropped by a concurrent edit collision in 0d6e922
+- Carry the event's own location in CalendarReminderJob's reminder push event, alongside eventUid/title/startDate
+- Test that a real location value comes through unchanged on both backends, fixing two existing SQL assertions for a null location where Mongo's absent field stays undefined
+- Document the change and the Mongo-vs-SQL null/undefined difference it surfaced in the release notes and NOTES
+
+### Fixed
+- Fixed linter errors
+
 ## [0.18.0] - 2026-09-22
 
 ### Added
@@ -1040,7 +1069,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/RapidMX/restapi/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/RapidMX/restapi/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/RapidMX/restapi/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/RapidMX/restapi/compare/v0.15.0...v0.16.0
