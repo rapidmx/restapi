@@ -18,6 +18,7 @@ import { AuditAction } from "../../../src/models/types.js";
 import { EnrollmentResult, SigningCertificateEnrollment } from "../../../src/pki/SigningCertificateEnrollment.js";
 import { publicKeyFromCertificatePem } from "../../../src/util/CertificateInstallUtils.js";
 import { issueTestLeaf, makeTestCa } from "../../routes/keyRotationContinuitySuite.js";
+import { caHealthSuite } from "../caHealthSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
@@ -523,6 +524,11 @@ describe("AcmeEnrollmentDriverJobMongo Tests (real DB + DI)", () => {
         } finally {
             FakeDrivenEnrollment.prototype.listPendingEnrollments = original;
         }
+    });
+
+    caHealthSuite({
+        job: () => job,
+        auditEntries: async (action) => (await auditLogRepo.find({}).toArray()).filter((entry) => entry.action === action),
     });
 
     describe("flagExpiringSigningCerts()", () => {

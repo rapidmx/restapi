@@ -215,6 +215,7 @@ describe("ManualSigningCertificateEnrollment Tests", () => {
             const progress = await enrollment.describeProgress(enrollmentId);
 
             expect(progress).toEqual({
+                provider: "manual",
                 status: "pending",
                 certificate: undefined,
                 error: undefined,
@@ -245,11 +246,22 @@ describe("ManualSigningCertificateEnrollment Tests", () => {
             await enrollment.cancelEnrollment(cancelled, "Cancelled by the mailbox owner.");
             await enrollment.markFailed(failed, "The CA refused.");
 
-            for (const [id, error] of [[cancelled, "Cancelled by the mailbox owner."], [failed, "The CA refused."]]) {
+            for (const [id, error, errorCode] of [[cancelled, "Cancelled by the mailbox owner.", "cancelled"], [failed, "The CA refused.", "rejected"]]) {
                 expect(await enrollment.describeProgress(id)).toEqual(
-                    expect.objectContaining({ status: "failed", stage: "failed", error, errorCode: "failed", retryable: true }),
+                    expect.objectContaining({ provider: "manual", status: "failed", stage: "failed", error, errorCode, retryable: true }),
                 );
             }
+        });
+
+        it("falls back to errorCode 'failed' for a legacy failed record with no errorCode of its own.", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("legacy@example.com", await generateCsr("legacy@example.com"));
+            const store = JSON.parse(await fs.readFile((enrollment as any).storePath, "utf-8"));
+            delete store[enrollmentId].errorCode;
+            store[enrollmentId].status = "failed";
+            store[enrollmentId].error = "old failure";
+            await fs.writeFile((enrollment as any).storePath, JSON.stringify(store));
+
+            expect(await enrollment.describeProgress(enrollmentId)).toEqual(expect.objectContaining({ status: "failed", errorCode: "failed", retryable: true }));
         });
 
         it("throws 404 for an unknown id.", async () => {

@@ -21,6 +21,7 @@ import { AuditAction } from "../../../src/models/types.js";
 import { EnrollmentResult, SigningCertificateEnrollment } from "../../../src/pki/SigningCertificateEnrollment.js";
 import { publicKeyFromCertificatePem } from "../../../src/util/CertificateInstallUtils.js";
 import { issueTestLeaf, makeTestCa } from "../../routes/keyRotationContinuitySuite.js";
+import { caHealthSuite } from "../caHealthSuite.js";
 
 interface FakeEntry {
     identity: string;
@@ -529,6 +530,11 @@ describe("AcmeEnrollmentDriverJobSQL Tests (real DB + DI)", () => {
         } finally {
             FakeDrivenEnrollment.prototype.listPendingEnrollments = original;
         }
+    });
+
+    caHealthSuite({
+        job: () => job,
+        auditEntries: async (action) => (await auditLogRepo.find({})).filter((entry) => entry.action === action),
     });
 
     describe("flagExpiringSigningCerts()", () => {

@@ -194,6 +194,7 @@ export abstract class ScanQueueJob<
     protected abstract focusedInboxOverrideClass: any;
     protected abstract contactClass: any;
     protected abstract domainClass: any;
+    protected abstract keyVaultClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -205,6 +206,7 @@ export abstract class ScanQueueJob<
     private quarantineEntryRepo?: RepoUtils<QE>;
     private scanResultRepo?: RepoUtils<SR>;
     private mailboxRepo?: RepoUtils<X>;
+    private keyVaultRepo?: RepoUtils<any>;
     private mailFilterRuleRepo?: RepoUtils<MFR>;
     private calendarEventRepo?: RecoverableRepoUtils<CE>;
     private oofReplySuppressionRepo?: RepoUtils<OS>;
@@ -311,6 +313,10 @@ export abstract class ScanQueueJob<
      * `Authentication-Results` header is ever trusted - rather than silently accepting any header found. */
     @Config("mail:security:trusted_authserv_id", "")
     private trustedAuthservId: string = "";
+
+    /** Gmail-style `user+tag@domain` plus-addressing - see `discoverLocalKeys()` (`util/LocalKeyDiscoveryUtils.ts`). */
+    @Config("mail:plus_addressing:enabled", true)
+    private plusAddressingEnabled: boolean = true;
 
     @Logger
     private logger: any;
@@ -1280,6 +1286,15 @@ export abstract class ScanQueueJob<
     }
 
     /**
+     * The query value matching one element of `Mailbox.aliasAddresses` - a literal on MongoDB (implicit array-element
+     * equality); `ScanQueueJobSQL` overrides it for the serialized `simple-json` column, exactly as
+     * `BaseMailIngestRoute.aliasQueryValue()` does.
+     */
+    protected aliasQueryValue(address: string): any {
+        return ModelUtils.literal(address);
+    }
+
+    /**
      * Implements `specs/end-to-end_encryption.md`'s In-Band Key Attachment processing rules for an inbound
      * message's `RapidMX-Key` header (Group E3). Reuses `util/KeyringUtils.ts`'s `applyDiscoveredKeys()` -
      * the same TOFU/Key-Conflict/Anti-Downgrade merge logic Group E2's `GET /keys/lookup` uses, applied here
@@ -1416,7 +1431,8 @@ export abstract class ScanQueueJob<
      * Implements the receiving half of `specs/end-to-end_encryption.md`'s "Rotation Notification" mechanism
      * (Group E5): when an inbound MDN carries either of `util/ReceiptUtils.ts`'s `rotatedKeyFingerprint`/
      * `policyId` extension fields, this method re-runs real Discovery (`util/KeyringUtils.ts`'s
-     * `discoverAndMergeKeys()`) against the authoritative endpoint for `peerAddress` - it never installs the
+     * `discoverAndMergeKeys()`) against the authoritative source for `peerAddress` - the local mailbox when the peer lives
+     * on this deployment (no DNS, no HTTP), else its remote endpoint - it never installs the
      * MDN's own claimed fingerprint directly, exactly per the spec's "cache invalidation hint only" rule: an
      * MDN is only hop-authenticated at best, so trusting its claimed value directly would let a forged MDN
      * force a key change. Called from `processReceipt()` only after that method has already confirmed
@@ -1431,8 +1447,16 @@ export abstract class ScanQueueJob<
      */
     private async maybeRefreshRotatedKey(mailboxUid: string, peerAddress: string): Promise<void> {
         const now: number = Date.now();
+        // Only a rotation notice needs it, so it isn't set up for every delivery.
+        this.keyVaultRepo ??= await this._objectFactory!.newInstance(RepoUtils, { name: this.keyVaultClass.name, args: [this.keyVaultClass] });
         await this.persistContactKeyUpdate(mailboxUid, peerAddress, now, (existingContact) =>
-            discoverAndMergeKeys(this.dnsResolver!, peerAddress, existingContact, now),
+            discoverAndMergeKeys(this.dnsResolver!, peerAddress, existingContact, now, {
+                mailboxRepo: this.mailboxRepo!,
+                keyVaultRepo: this.keyVaultRepo!,
+                domainNames: () => getVerifiedDomainNames(this._objectFactory!, this.domainClass),
+                aliasQueryValue: (address) => this.aliasQueryValue(address),
+                plusAddressing: this.plusAddressingEnabled,
+            }),
         );
     }
 

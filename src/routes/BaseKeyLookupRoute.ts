@@ -21,8 +21,10 @@ import type { DnsResolver } from "../dns/DnsResolver.js";
 import { AuditAction, Contact, EncryptionPreference, Folder, KeyConflict, Mailbox, PreviousKey, PublicKey } from "../models/types.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { ContactKeyMerge, ContactKeyWriteResult, ContactKeyWriteTarget, writeContactKeys } from "../util/ContactKeyUtils.js";
+import { getVerifiedDomainNames } from "../util/DomainUtils.js";
 import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { addPreviousKey, addRejectedKey, discoverAndMergeKeys, listField, normalizeKeyConflicts, withoutKey } from "../util/KeyringUtils.js";
+import { LocalKeyDiscovery } from "../util/LocalKeyDiscoveryUtils.js";
 import { isPlainAddress } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { parseContactKey, parseTrustedSignerKey } from "../util/SignerCertificateUtils.js";
@@ -84,6 +86,11 @@ function revalidatedConflictKey(conflict: KeyConflict, address: string, now: num
  * (`util/KeyringUtils.ts`'s `discoverAndMergeKeys()`) rather than expecting the client to - browsers have no
  * DNS TXT API and would hit CORS fetching an arbitrary third-party domain directly.
  *
+ * An `addr` that lives on THIS deployment (a mailbox's primary address or alias, plus-tags resolved as delivery does, or
+ * an address of one of this deployment's own domains) is answered from the local mailbox before any DNS or HTTP: the same
+ * `KeyDiscoveryResponse` the public endpoint serves (`util/LocalKeyDiscoveryUtils.ts`), merged the same way. A local
+ * address no mailbox has answers 404; a mailbox that published nothing answers 200 with `keys: []`, as a remote peer does.
+ *
  * The result is persisted onto a `Contact` in the mailbox's own address book (creating one, in its
  * `CONTACTS` folder, if `addr` has never been seen before) - Key Conflict Handling and Anti-Downgrade are
  * `discoverAndMergeKeys()`'s job, not this route's; this route only decides what to do with the *result*
@@ -103,11 +110,14 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
     protected abstract contactClass: any;
     protected abstract folderClass: any;
     protected abstract auditLogClass: any;
+    protected abstract keyVaultClass: any;
+    protected abstract domainClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     private mailboxRepo?: RepoUtils<M>;
+    private keyVaultRepo?: RepoUtils<any>;
     private contactRepo?: RecoverableRepoUtils<C>;
     private folderRepo?: RecoverableRepoUtils<F>;
 
@@ -116,6 +126,11 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
 
     @Config("trusted_roles", ["admin"])
     private trustedRoles: string[] = ["admin"];
+
+    /** Gmail-style `user+tag@domain` plus-addressing - a recipient typed that way is looked up as `user@domain`, the mailbox
+     * mail to it is delivered to (`BaseMailIngestRoute`). */
+    @Config("mail:plus_addressing:enabled", true)
+    private plusAddressingEnabled: boolean = true;
 
     @Inject("DnsResolver")
     private dnsResolver?: DnsResolver;
@@ -132,6 +147,12 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
             this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
+            });
+        }
+        if (!this.keyVaultRepo) {
+            this.keyVaultRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.keyVaultClass.name,
+                args: [this.keyVaultClass],
             });
         }
         if (!this.contactRepo) {
@@ -158,6 +179,27 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
      */
     protected contactEmailQuery(address: string): any {
         return { "emails.address": ModelUtils.literal(address) };
+    }
+
+    /**
+     * The query value matching one element of `Mailbox.aliasAddresses` - a literal on MongoDB (implicit array-element
+     * equality). `KeyLookupRouteSQL` overrides it: the SQL backend stores the array as a serialized `simple-json` column, see
+     * `BaseMailIngestRoute.aliasQueryValue()`, which this mirrors exactly.
+     */
+    protected aliasQueryValue(address: string): any {
+        return ModelUtils.literal(address);
+    }
+
+    /** How `discoverAndMergeKeys()` reaches this deployment's own mailboxes, so a recipient that lives here is never sent
+     * out to DNS and HTTP (`util/LocalKeyDiscoveryUtils.ts`). */
+    private localKeyDiscovery(): LocalKeyDiscovery {
+        return {
+            mailboxRepo: this.mailboxRepo!,
+            keyVaultRepo: this.keyVaultRepo!,
+            domainNames: () => getVerifiedDomainNames(this._objectFactory!, this.domainClass),
+            aliasQueryValue: (address) => this.aliasQueryValue(address),
+            plusAddressing: this.plusAddressingEnabled,
+        };
     }
 
     private toPublic(contact: C): PublicKeyLookupResult {
@@ -214,8 +256,8 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         return writeContactKeys(target, merge);
     }
 
-    // This endpoint drives an outbound DNS lookup plus an HTTPS fetch to a remote, attacker-influenced host
-    // on every cache-miss call (`util/KeyDiscoveryClient.ts`'s `fetchRemoteKeys()`) - unlike
+    // For an address that isn't local, this endpoint drives an outbound DNS lookup plus an HTTPS fetch to a remote,
+    // attacker-influenced host on every cache-miss call (`util/KeyDiscoveryClient.ts`'s `fetchRemoteKeys()`) - unlike
     // `BaseKeyDiscoveryRoute`'s public endpoint (which already carries `@RateLimit()` for the same reason),
     // this one had none, making it an unthrottled request-amplification/SSRF-probing primitive for any
     // authenticated caller with `UPDATE` on a mailbox.
@@ -239,7 +281,7 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
             mailbox,
             addr,
             user,
-            async (existing) => (await discoverAndMergeKeys(this.dnsResolver!, addr, existing)) as Partial<C> | undefined,
+            async (existing) => (await discoverAndMergeKeys(this.dnsResolver!, addr, existing, Date.now(), this.localKeyDiscovery())) as Partial<C> | undefined,
         );
         if (!contact) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "No keys could be discovered for this address.");

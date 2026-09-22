@@ -10,6 +10,7 @@ import * as x509 from "@peculiar/x509";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { resolveFederationPolicy } from "./FederationUtils.js";
 import { fetchRemoteKeys, parseKeyDiscoveryAddress, parseKeyDiscoveryResponse } from "./KeyDiscoveryClient.js";
+import { discoverLocalKeys, type LocalKeyDiscovery } from "./LocalKeyDiscoveryUtils.js";
 import { parseContactKey } from "./SignerCertificateUtils.js";
 import { Contact, EncryptionPreference, KeyConflict, KeyDiscoveryResponse, PreviousKey, PublicKey, RejectedKey } from "../models/types.js";
 
@@ -332,25 +333,38 @@ export function applyDiscoveredKeys(
 }
 
 /**
- * Server-side Discovery (`specs/end-to-end_encryption.md`'s "Discovery is Server-Side" section): resolves
- * `address`'s domain federation policy (`util/FederationUtils.ts`), fetches its discovery endpoint
- * (`util/KeyDiscoveryClient.ts`), and merges the result into `existing` via `applyDiscoveredKeys()`.
+ * Server-side Discovery (`specs/end-to-end_encryption.md`'s "Discovery is Server-Side" section): finds `address`'s
+ * published keys and merges them into `existing` via `applyDiscoveredKeys()`.
  *
- * Returns `undefined` - not a "no-op" `KeyringUpdate` - when the domain isn't a federated peer at all (no
- * `_rapidmx` record) or the fetch failed with nothing cached, so a caller can distinguish "nothing to update"
- * from "this address isn't running RapidMX", which `GET /keys/lookup` (Group E2) surfaces differently (e.g. a
- * `404`) than "found the peer, no conflict".
+ * An address that lives on THIS deployment (`local`, see `discoverLocalKeys()`) is answered from its own mailbox - the
+ * same `KeyDiscoveryResponse` the public endpoint serves, with no DNS lookup and no HTTP request. Anything else resolves
+ * `address`'s domain federation policy (`util/FederationUtils.ts`) and fetches that peer's discovery endpoint
+ * (`util/KeyDiscoveryClient.ts`).
+ *
+ * Returns `undefined` - not a "no-op" `KeyringUpdate` - when there is nothing to merge: the domain isn't a federated peer
+ * at all (no `_rapidmx` record), the fetch failed with nothing cached, or the address is of this deployment's own domain
+ * but no mailbox has it. A caller can thereby distinguish "nothing to update" from "this address isn't running
+ * RapidMX", which `GET /keys/lookup` (Group E2) surfaces differently (e.g. a `404`) than "found the peer, no conflict".
  *
  * @param source `"discovery"` for `GET /keys/lookup` (Group E2); `"header"` callers (Group E3) call
  * `applyDiscoveredKeys()` directly instead, since they already have a `KeyDiscoveryResponse`-shaped payload
  * from the `RapidMX-Key` header rather than needing this function's own DNS/HTTP lookup.
+ * @param local How to reach this deployment's own mailboxes. Omitted, every address is resolved through federation.
  */
 export async function discoverAndMergeKeys(
     dnsResolver: DnsResolver,
     address: string,
     existing: ContactKeyState | undefined,
     observedAt: number = Date.now(),
+    local?: LocalKeyDiscovery,
 ): Promise<KeyringUpdate | undefined> {
+    if (local) {
+        const found = await discoverLocalKeys(local, address);
+        if (found) {
+            // The mailbox's primary address is what its certificates name, whichever alias or plus-tagged form was asked for.
+            return found.response ? applyDiscoveredKeys(existing, found.response, observedAt, "discovery", found.address) : undefined;
+        }
+    }
     // The same parser `fetchRemoteKeys()` uses, so the policy is resolved for exactly the domain keys are fetched for
     // (e.g. `a@evil.example@victim.example` is rejected rather than split differently by each step).
     const parsed = parseKeyDiscoveryAddress(address);

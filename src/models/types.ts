@@ -1648,6 +1648,19 @@ export enum AuditAction {
      * with no newer non-revoked one already enrolled - detection only, this server can't originate a fresh
      * CSR itself (the signing key pair is always client-side). */
     SIGNING_CERT_EXPIRING = "key_vault.signing_cert_expiring",
+    /** `AcmeEnrollmentDriverJob`'s own record that the certificate authority (or the ACME account) could not be reached or refused, for the configured number of
+     * checks in a row (`mail:jobs:acme_enrollment_driver:failure_audit_after`, default 3) - written once per run of failures, so an administrator sees it in the
+     * audit log rather than only in a server log. `details` carries `consecutiveFailures`, `firstFailureAt` and the sanitized `error` (no URLs, tokens or key material). */
+    SIGNING_ENROLLMENT_CA_UNREACHABLE = "signing_enrollment.ca_unreachable",
+    /** `GET /admin/signing-enrollments` - an administrator listed the pending signing-certificate requests (metadata only). */
+    SIGNING_ENROLLMENT_ADMIN_LIST = "signing_enrollment.admin_list",
+    /** `GET /admin/signing-enrollments/:id/csr` - an administrator downloaded a request's CSR (public information). `details` carries the address. */
+    SIGNING_ENROLLMENT_ADMIN_CSR = "signing_enrollment.admin_csr",
+    /** `POST /admin/signing-enrollments/:id/certificate` - an administrator uploaded the certificate a CA issued for a request. `details` carries the address,
+     * the certificate's serial number and expiry. */
+    SIGNING_ENROLLMENT_ADMIN_UPLOAD = "signing_enrollment.admin_upload",
+    /** `POST /admin/signing-enrollments/:id/reject` - an administrator refused a request. `details` carries the address and the reason the owner sees. */
+    SIGNING_ENROLLMENT_ADMIN_REJECT = "signing_enrollment.admin_reject",
     ESCROW_SCOPE_CREATE = "escrow_scope.create",
     ESCROW_SCOPE_UPDATE = "escrow_scope.update",
     ESCROW_SCOPE_DELETE = "escrow_scope.delete",

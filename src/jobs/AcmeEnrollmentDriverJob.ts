@@ -8,6 +8,7 @@ import { asEntity } from "../util/EntityUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { publicKeyFromCertificatePem, supersedeKeys } from "../util/CertificateInstallUtils.js";
 import { AuditAction, KeyVault, Mailbox, PublicKey, WrappedPrivateKey } from "../models/types.js";
+import type { HealthUpdate, SigningEnrollmentHealth } from "../pki/SigningEnrollmentHealth.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -19,10 +20,13 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
  * of this - a deployment running either simply never has anything in `listPendingEnrollments()`). */
 interface AcmeDrivenEnrollment {
     listPendingEnrollments?(): Promise<Array<{ enrollmentId: string; identity: string; status: "pending" | "issued" | "failed" }>>;
-    advanceEnrollment?(enrollmentId: string): Promise<void>;
+    /** Resolves `true` when the step spoke to the CA and it answered. An error it throws carries `enrollmentPhase: "ca" | "reply"`. */
+    advanceEnrollment?(enrollmentId: string): Promise<boolean | void>;
     getIssuedMaterial?(enrollmentId: string): Promise<IssuedMaterial | undefined>;
     markInstalled?(enrollmentId: string): Promise<void>;
     cancelEnrollment?(enrollmentId: string, reason: string): Promise<void>;
+    /** How the CA contacts have gone, where the provider keeps that (the RFC 8823 one). */
+    health?: Pick<SigningEnrollmentHealth, "record">;
 }
 
 /** An issued enrollment's certificate and the client's wrapped private key, plus - when recorded at
@@ -77,6 +81,11 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
     @Config("mail:jobs:acme_enrollment_driver:expiry_warning_days", 30)
     private expiryWarningDays: number = 30;
 
+    /** How many checks in a row must fail to reach the CA (or be refused by it) before a `SIGNING_ENROLLMENT_CA_UNREACHABLE` audit entry is written - once
+     * per run of failures. The failure itself is logged once (at warn) when it first happens and whenever its text changes, not on every tick. */
+    @Config("mail:jobs:acme_enrollment_driver:failure_audit_after", 3)
+    private failureAuditAfter: number = 3;
+
     // No key = the whole config object, the same decorator `ModelRoute.config`/`DomainVerificationJob.config`
     // itself use - needed by `recordAuditLog()`, which constructs a real `Event(config, ...)`.
     @Config()
@@ -125,10 +134,24 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
         }
 
         const pending = await this.signingCertificateEnrollment.listPendingEnrollments();
+        let caAnswered: number = 0;
+        let caFailure: { error: unknown; count: number } | undefined;
         for (const { enrollmentId, identity, status } of pending) {
             try {
                 if (status === "pending") {
-                    await this.signingCertificateEnrollment.advanceEnrollment(enrollmentId);
+                    try {
+                        if ((await this.signingCertificateEnrollment.advanceEnrollment(enrollmentId)) === true) {
+                            caAnswered++;
+                        }
+                    } catch (err: any) {
+                        if (err?.enrollmentPhase !== "ca" || !this.signingCertificateEnrollment.health) {
+                            throw err;
+                        }
+                        // The CA (or the ACME account) failed this attempt: the enrollment itself records `lastError`; what the deployment shows is the
+                        // summary below - one warning per distinct failure, not one line per enrollment per tick.
+                        caFailure = { error: caFailure?.error ?? err, count: (caFailure?.count ?? 0) + 1 };
+                        continue;
+                    }
                 }
                 const material = await this.signingCertificateEnrollment.getIssuedMaterial(enrollmentId);
                 const outcome: InstallOutcome | undefined = material ? await this.installCertificate(identity, material) : undefined;
@@ -141,6 +164,49 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
             } catch (err: any) {
                 this.logger?.error(`AcmeEnrollmentDriverJob: failed to advance enrollment '${enrollmentId}' for '${identity}': ${err.message}`);
             }
+        }
+        await this.reportCaHealth(caAnswered, caFailure);
+    }
+
+    /**
+     * Records how this run's contacts with the CA went (`SigningEnrollmentHealth`, which `GET /system/signing-enrollment` reports) and surfaces a failure
+     * once instead of on every tick: a warning when a run of failures begins or its error text changes, an info line when the CA answers again, and - when
+     * `failure_audit_after` checks have failed in a row - one `SIGNING_ENROLLMENT_CA_UNREACHABLE` audit entry for the run. A run that did not need the CA
+     * (nothing to advance) records nothing. Never throws: recording health must not fail a run that already did its work.
+     */
+    private async reportCaHealth(answered: number, failure: { error: unknown; count: number } | undefined): Promise<void> {
+        const health: AcmeDrivenEnrollment["health"] = this.signingCertificateEnrollment?.health;
+        if (!health || (!failure && answered === 0)) {
+            return;
+        }
+        try {
+            const update: HealthUpdate = failure
+                ? await health.record({ ok: false, error: failure.error }, { auditAfter: this.failureAuditAfter })
+                : await health.record({ ok: true });
+            if (failure && update.newFailure) {
+                this.logger?.warn(
+                    `AcmeEnrollmentDriverJob: the certificate authority could not complete the check of ${failure.count} signing certificate request(s): ${update.error}. ` +
+                        `It is retried on every run (this is logged again only if the error changes); the state is on GET /system/signing-enrollment.`,
+                );
+            }
+            if (update.recovered) {
+                this.logger?.info("AcmeEnrollmentDriverJob: the certificate authority answers again.");
+            }
+            if (update.auditDue) {
+                await recordAuditLog(
+                    this._objectFactory!,
+                    this.auditLogClass,
+                    { config: this.config, logger: this.logger },
+                    {
+                        action: AuditAction.SIGNING_ENROLLMENT_CA_UNREACHABLE,
+                        targetType: "SigningEnrollment",
+                        targetUid: "ca",
+                        details: { consecutiveFailures: update.consecutiveFailures, firstFailureAt: update.firstFailureAt, error: update.error },
+                    },
+                );
+            }
+        } catch (err: any) {
+            this.logger?.warn(`AcmeEnrollmentDriverJob: could not record the certificate authority's health: ${err?.message}`);
         }
     }
 

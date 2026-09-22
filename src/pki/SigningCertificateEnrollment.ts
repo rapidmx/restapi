@@ -3,6 +3,24 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 
+/** How a deployment obtains signing certificates: `manual` (an administrator uploads what a CA issued), `rfc8823` (automatic, through a
+ * public CA's `email-reply-00` ACME), `none` (disabled). Every enrollment status carries the first two as `provider`. */
+export type SigningProviderKind = "manual" | "rfc8823";
+export type SigningBackendKind = SigningProviderKind | "none";
+
+/** Which provider `enrollment` is, for the `provider` of a status it reports: its `kind`, else guessed from its `name` (an implementation that says nothing
+ * about itself is most likely the manual one). */
+export function providerKindOf(enrollment: { kind?: SigningBackendKind; name?: string }): SigningProviderKind {
+    if (enrollment.kind === "manual" || enrollment.kind === "rfc8823") {
+        return enrollment.kind;
+    }
+    return enrollment.name === "rfc8823-acme" ? "rfc8823" : "manual";
+}
+
+/** The `code` of the 404 answered for an enrollment id the active provider does not know (typically one left over from another backend):
+ * a client clears the stale id and lets the user request again. */
+export const SIGNING_ENROLLMENT_UNKNOWN = "signing-enrollment-unknown";
+
 /** The current outcome of a signing-certificate enrollment started via `startEnrollment()`. */
 export interface EnrollmentResult {
     status: "pending" | "issued" | "failed";
@@ -35,6 +53,9 @@ export interface EnrollmentStageStatus {
  * only reads `status`/`certificate`/`error` keeps working.
  */
 export interface EnrollmentProgress extends EnrollmentResult {
+    /** Which provider handles this enrollment: `"rfc8823"` is issued automatically by a public CA, `"manual"` waits for an administrator to
+     * upload the certificate a CA issued - what a client needs to word its status truthfully. */
+    provider: SigningProviderKind;
     /** The stage in progress; `"issued"` or `"failed"` once it ended. */
     stage: EnrollmentStage;
     /** Every stage of this implementation's flow, in order. */
@@ -108,6 +129,16 @@ export interface SigningCertificateEnrollment {
      * convention). */
     readonly name: string;
 
+    /** Which backend this is (`SigningBackendInfo.backend`, and the `provider` of every status it reports). Absent on an implementation that
+     * says nothing - treated as `"none"`. */
+    readonly kind?: SigningBackendKind;
+
+    /** What the info endpoint reports about this backend (see `SigningBackendInfo`). Implementations without it report `{ backend: kind ?? "none" }`. */
+    describeBackend?(): Promise<SigningBackendInfo>;
+
+    /** The pending (and issued-but-not-installed) requests, metadata only, for `GET /admin/signing-enrollments`. */
+    listAdminEnrollments?(): Promise<AdminEnrollmentSummary[]>;
+
     /**
      * Begins enrollment of `identity`'s signing public key, carried in `csr`, for a certificate from a
      * publicly-trusted CA. Returns immediately with an identifier to poll via `checkStatus()` - never the
@@ -169,6 +200,55 @@ export interface SigningCertificateEnrollment {
     /** Every enrollment this implementation knows of (metadata only), so the endpoint that finds a mailbox's current one can pick
      * among them. */
     listEnrollments?(): Promise<EnrollmentSummary[]>;
+}
+
+/** What `GET /system/signing-enrollment` reports: which backend issues signing certificates and how it is doing. */
+export interface SigningBackendInfo {
+    backend: SigningBackendKind;
+    /** Whether certificates are issued without a person doing anything (only `rfc8823`). */
+    automatic: boolean;
+    /** The certificate authority's host name - the directory URL's host only, never a path or query. */
+    ca?: { host: string };
+    /** The address the ACME account was registered with (the CA may write to it). */
+    contactEmail?: string;
+    /** A typical time from request to issued certificate, in minutes (`rfc8823` only) - an estimate for wording, not a promise. */
+    typicalDurationMinutes?: number;
+    /** Whether an administrator can upload a certificate for a pending request (`.../admin/signing-enrollments`). */
+    adminUpload: boolean;
+    /** How the background job's last contacts with the CA went (`rfc8823` only). */
+    health?: SigningEnrollmentHealthReport;
+}
+
+/** The persisted outcome of the CA contacts the background job (and a new request) made, as the info endpoint reports it. */
+export interface SigningEnrollmentHealthReport {
+    /** `false` while the most recent contact failed. */
+    ok: boolean;
+    /** When the CA was last contacted, with any outcome (ISO 8601). */
+    checkedAt?: string;
+    /** When the CA last answered as it should (ISO 8601). */
+    lastSuccessAt?: string;
+    /** What went wrong last, sanitized (no URLs, tokens or key material) and length-capped. Cleared by the next success. */
+    lastError?: string;
+}
+
+/** One request an administrator can see in `GET /admin/signing-enrollments` - metadata only, never the CSR, key or certificate. */
+export interface AdminEnrollmentSummary {
+    enrollmentId: string;
+    /** The mailbox address the certificate is for. */
+    identity: string;
+    mailboxUid?: string;
+    /** When it was requested (ISO 8601). */
+    requestedAt: string;
+    status: EnrollmentResult["status"];
+    provider: SigningProviderKind;
+    /** How far an automatic request has come (`EnrollmentStage`); a manual one is `submitted` until uploaded. */
+    stage?: EnrollmentStage;
+    /** Why it is held up, when the last attempt failed (sanitized). */
+    lastError?: string;
+    /** Whether an administrator can upload a certificate for it (manual, pending, and the mailbox's key is stored to install it). */
+    canUpload: boolean;
+    /** When `canUpload` is `false` for a pending request: why. */
+    uploadBlockedReason?: string;
 }
 
 /** What `describeEnrollment()` reports about the mailbox an enrollment belongs to. */

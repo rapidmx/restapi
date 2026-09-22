@@ -12,6 +12,7 @@ import {
     FocusedInboxOverrideSQL,
     FolderSQL,
     IngestQueueEntrySQL,
+    KeyVaultSQL,
     MailboxSQL,
     MailFilterRuleSQL,
     MessageSQL,
@@ -47,6 +48,14 @@ export class ScanQueueJobSQL extends ScanQueueJob<
     protected focusedInboxOverrideClass: any = FocusedInboxOverrideSQL;
     protected contactClass: any = ContactSQL;
     protected domainClass: any = DomainSQL;
+    protected keyVaultClass: any = KeyVaultSQL;
+
+    /** `MailboxSQL.aliasAddresses` is a serialized `simple-json` column - see `MailIngestRouteSQL.aliasQueryValue()`, whose
+     * anchored, `ESCAPE`d LIKE this repeats. */
+    protected aliasQueryValue(address: string): any {
+        const escaped: string = address.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+        return Raw((alias) => `${alias} LIKE :pattern ESCAPE '\\'`, { pattern: `%"${escaped}"%` });
+    }
 
     /**
      * `ContactSQL.emails` is a `simple-json` column (one serialized JSON string), so the base class's

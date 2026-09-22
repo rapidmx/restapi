@@ -2922,3 +2922,130 @@ NOTES 2026-09-21) sandboxes and re-sanitizes, but can only show what the server 
   `src/routes/BaseMessageRoute.ts` (`content()` + `sanitizedHtmlOf()`, `attachmentClass`, 3 `@Config`), `src/routes/{mongo/MessageRouteMongo,sql/MessageRouteSQL}.ts` (`attachmentClass`), `package.json`/`yarn.lock`
   (`htmlparser2`); tests `test/scan/{HtmlSanitizer,CssSanitizer,MailUrlRules,HtmlPreview,SanitizedBody}.test.ts`, `test/scan/fixtures/{mailCorpus,inert}.ts`, `test/scan/ScanPipeline.test.ts`,
   `test/routes/sanitizedContentSuite.ts` + `{mongo,sql}/MessageSanitizedContent.test.ts`, `test/jobs/htmlMailSuite.ts` (+2 calls in `ScanQueueJob{Mongo,SQL}.test.ts`), `test/routes/mailAuthzRound3Suite.ts` (one CSP string).
+
+## 2026-09-21 (later) - Signing certificates: honest status, an admin route to complete manual requests, CA health (R6)
+
+JP's live report: requested a signature key over an hour ago, no key, no status/failure info anywhere. **Diagnosis (verified live, from the report and the code):** the deployment ran the default
+`mail.pki.signing_enrollment.backend: "manual"` (`server/src/config.{mongo,sql}.ts`), whose enrollment sat `status: "pending"` in `/var/lib/rapidmx/pki/manual-enrollments.json` waiting for a human
+to upload a certificate - but there was **no admin route for that upload step at all** (`ManualSigningCertificateEnrollment`'s own doc comment: "intentionally not part of this pass"), while the
+Encryption settings page told the user a public CA issues it automatically in the background - true only for `rfc8823`, a separately built backend never turned on by default. JP decided: switch the
+live deployment to automatic issuance (`rfc8823`) - the CA's directory is reachable over HTTPS with no external-account-binding requirement - and build the manual-completion path too (the honest
+fallback / escape hatch), plus make every future failure of either path visible. A real CA e-mail exchange could not be exercised here; everything is proven against the existing fake-ACME test
+doubles (`test/pki/acmeTestDoubles.ts`) and new ones (`test/pki/signingCertTestUtils.ts`, a real self-signed test CA for certificate validation).
+
+- **`provider` on every status** (`EnrollmentProgress.provider: "manual" | "rfc8823"`, additive). `SigningCertificateEnrollment` gained an optional `kind` (`"manual"|"rfc8823"|"none"`) each
+  implementation sets; `BaseKeyVaultRoute.enrollmentProgress()` stamps it from the implementation's own report or, if it says nothing, `providerKindOf()` (its `kind`, else guessed from `name` -
+  `"rfc8823-acme"` is `rfc8823`, else `manual`) - so even an implementation that predates this feature (or a test double) always carries a provider.
+- **`GET /system/signing-enrollment`** (new `BaseSigningEnrollmentInfoRoute`, mounted by the server at `system/signing-enrollment`; any signed-in user) answers `SigningBackendInfo`:
+  `{ backend, automatic, ca?: { host }, contactEmail?, typicalDurationMinutes?, adminUpload, health? }`. `ca.host` is deliberately `new URL(directoryUrl).host` only - never the path/query, which on a
+  self-hosted CA could carry something private. `typicalDurationMinutes` for `rfc8823` is a constant (`TYPICAL_DURATION_MINUTES = 20`, documented 10-30: the CA's e-mail arrives in a minute or two,
+  then one 5-minute-tick step per stage - answer, finalize, download - plus the install tick). Each `SigningCertificateEnrollment` implements `describeBackend()`; the route degrades to
+  `{ backend: kind ?? "none", automatic: kind === "rfc8823", adminUpload: false }` if it throws or has none, so a broken store never blanks the whole page.
+- **`SigningEnrollmentHealth`** (`src/pki/SigningEnrollmentHealth.ts`) is the one place a CA outcome is recorded: `record({ ok } | { ok: false, error, code? }, { auditAfter? })` returns whether this is a
+  *new* failure (first of a run, or the text changed - worth one log line), a *recovery*, and whether an *audit entry is due* (the run just reached `auditAfter`, written once per run via a
+  `streakAudited` flag cleared on success). Persisted as `health.json` next to the RFC 8823 enrollment store (survives a restart, shared by every process on the volume) plus an in-memory fallback if
+  the write fails. `sanitizeErrorText()` (also exported) strips PEM blocks, reduces every URL to `[url <host>]` (credentials removed), strips `Bearer` tokens and any 32+ char token-like run, collapses
+  whitespace and caps at 300 chars - used everywhere an error reaches a client or the audit log (the RFC 8823 provider's `lastError`, the admin list's `lastError`, the health report).
+- **`AcmeEnrollmentDriverJob`** now tags a failure from `advanceEnrollment()` with `err.enrollmentPhase` (`"ca"` from `Rfc8823AcmeSigningCertificateEnrollment.advance()`, `"reply"` if the outbound
+  e-mail relay failed) and, only for `"ca"` failures on a provider that exposes `health`, swallows them into one summary per run instead of one `logger.error` per enrollment: `reportCaHealth()` calls
+  `health.record()` once, logs a `warn` only when `newFailure`, an `info` line once on recovery, and writes `AuditAction.SIGNING_ENROLLMENT_CA_UNREACHABLE` (`targetType: "SigningEnrollment"`,
+  `targetUid: "ca"`, `details: { consecutiveFailures, firstFailureAt, error }`) when `auditDue`. New `mail:jobs:acme_enrollment_driver:failure_audit_after` (default 3). `advanceEnrollment()` itself now
+  returns `boolean` (whether it spoke to the CA and got an answer) instead of `void` - both providers updated, `AcmeDrivenEnrollment`'s local interface loosened to `Promise<boolean | void>` so an
+  older/test implementation returning `void` still type-checks.
+- **Startup line, no network call.** Both providers gained `@Init logStartup()`: the manual one logs once that requests wait for an administrator; the RFC 8823 one logs the CA host and whether an
+  ACME account is already registered - read from the local store (`account.url`) only, so a CA that is down at boot never delays or fails startup.
+- **Unknown enrollment id -> `404 signing-enrollment-unknown`, and idempotent cancel.** New `SIGNING_ENROLLMENT_UNKNOWN` error code, thrown by both providers' `requireEnrollment()` for any unknown id
+  (was the framework's generic `NOT_FOUND`) and by `BaseKeyVaultRoute.requireEnrollmentOf()` for one that doesn't belong to the path mailbox - deliberately the SAME code for "this backend doesn't know
+  it" and "it's someone else's", so which one it is stays private. `findEnrollmentOf()` now returns a three-way `"own" | "other" | "unknown"` (was boolean) so `cancelSignEnrollment()` can special-case
+  `"unknown"`: instead of 404 it answers 200 with `unknownEnrollmentProgress()` - a synthesized `{ status: "failed", errorCode: "cancelled", retryable: true, stage: "failed", stages: [], progress: 0 }`
+  - so a client holding a stale id from a backend the deployment switched away from clears it and offers "request again" instead of showing a dead end. `"other"` still 404s as before.
+- **The manual provider can now be completed.** `ManualSigningCertificateEnrollment` gained everything the RFC 8823 one already had for the driver job - `attachWrappedKey()`, `listPendingEnrollments()`,
+  `advanceEnrollment()` (always a no-op `false` - there is no CA to poll), `getIssuedMaterial()`, `markInstalled()` - so `BaseKeyVaultRoute.startSignEnrollment()` submitting a wrapped key up front
+  works identically regardless of backend, and `AcmeEnrollmentDriverJob.installCertificate()` (unmodified) installs a manually-uploaded certificate into the mailbox's `KeyVault` exactly as it does an
+  automatic one. New `getRequest()` (CSR + status + mailboxUid + hasWrappedKey, never the key), `uploadValidatedCertificate()` (validates then calls the existing `uploadCertificate()`),
+  `rejectEnrollment()` (`errorCode: "rejected"`), `listAdminEnrollments()`. A pre-existing enrollment with no wrapped key (started before this pass, or via a caller that never attached one) reports
+  `canUpload: false` with `uploadBlockedReason` telling the admin to have the owner cancel and request again - uploading a certificate for it would strand it (no key to install).
+- **`IssuedCertificateValidation.ts` (`validateIssuedCertificate(csrPem, identity, certificatePem, now?)`)** - the real check behind an admin's upload, all refusals 400 with a plain-English message:
+  parses a PEM chain (leaf first, up to 8 certificates); the leaf's public key must match the CSR's (a wrong chain order that puts an issuer first, when a later certificate DOES match, gets a specific
+  "put the end-entity certificate first" message); `emailProtection` EKU required, `digitalSignature` key usage checked only if the extension is present; the leaf must name `identity`
+  (`certificateEmailIdentities()`, case-insensitive, SAN `rfc822Name` else subject `emailAddress` - reused from `util/SignerCertificateUtils.ts`); not expired, not valid-in-the-future beyond 5 minutes
+  of clock skew. Returns `{ chainLength, subject, issuer, serialNumber, notBefore, notAfter }` for the audit entry and the response.
+- **`BaseSigningEnrollmentAdminRoute`** (new, mounted by the server Mongo+SQL at `admin/signing-enrollments`): `GET /` (`listAdminEnrollments()` from whichever provider is active - metadata only,
+  `AdminEnrollmentSummary[]`), `GET /:id/csr` (PEM download, `content-disposition: attachment`), `POST /:id/certificate` (`{ certificate }` -> `validateIssuedCertificate()` + store, answers
+  `CertificateUploadResult`), `POST /:id/reject` (`{ reason }`, 1-500 chars, control characters stripped). Every call `assertAdminScope()` (trusted role AND elevated - the same gate the mailbox admin
+  scope and the plugin purge route use) and audited (`recordAuditLog`, new `AuditAction.SIGNING_ENROLLMENT_ADMIN_{LIST,CSR,UPLOAD,REJECT}`). On the `rfc8823` provider (which has no
+  `getRequest`/`uploadValidatedCertificate`/`rejectEnrollment`) every write answers 409 with an explanation; the list still works (`listAdminEnrollments()` is on both providers, the RFC 8823 one
+  read-only: `canUpload: false`, `uploadBlockedReason` explains why).
+- **What could NOT be verified here:** a real CA e-mail exchange (challenge received, reply sent and accepted, certificate actually issued) - only the fake `acme-client` doubles. The CA's directory
+  reachability/EAB-free-ness was checked live per the brief but the automated flow's real challenge round-trip was not.
+- Files: new `src/pki/{SigningEnrollmentHealth,IssuedCertificateValidation}.ts`, `src/routes/{BaseSigningEnrollmentInfoRoute,BaseSigningEnrollmentAdminRoute}.ts` + their Mongo/SQL concrete classes;
+  changed `src/pki/{SigningCertificateEnrollment,ManualSigningCertificateEnrollment,Rfc8823AcmeSigningCertificateEnrollment,NullSigningCertificateEnrollment}.ts`, `src/jobs/AcmeEnrollmentDriverJob.ts`,
+  `src/routes/BaseKeyVaultRoute.ts`, `src/models/types.ts` (5 new `AuditAction`s); tests `test/pki/{IssuedCertificateValidation,SigningEnrollmentHealth,ManualSigningCertificateEnrollment.admin,
+  Rfc8823AcmeSigningCertificateEnrollment.backend}.test.ts`, `test/pki/signingCertTestUtils.ts`, `test/jobs/caHealthSuite.ts` (+1 call each in `AcmeEnrollmentDriverJob{Mongo,SQL}.test.ts`),
+  `test/routes/signingEnrollmentAdminSuite.ts` + `{mongo,sql}/SigningEnrollmentAdmin.test.ts`, one addition to `test/routes/mailAccessRouteTable.ts`.
+
+## 2026-09-21 (R5) - "failed to discover the recipient's key" between two accounts on the same server (live report)
+
+JP: two `powerlevel.gg` mailboxes, each with one published internal-CA encryption certificate, could not encrypt to each other -
+`GET /mailbox/:id/keys/lookup?addr=<other>` answered 404 both directions. **Root cause:** `BaseKeyLookupRoute.lookup()` always went
+through `discoverAndMergeKeys()`, which only ever does federation - resolve the address's domain `_rapidmx` TXT policy
+(`FederationUtils.resolveFederationPolicy()`), then fetch that peer's public discovery endpoint (`KeyDiscoveryClient.fetchRemoteKeys()`).
+There was no path at all for "the address is a mailbox this deployment itself hosts" - a same-server, same-domain pair (or any
+deployment whose own domain publishes no `_rapidmx` record, which no deployment needs to) always fell through to "not a federated
+peer" and 404'd, no matter how thoroughly its keys were set up.
+
+**Fix: one shared builder, checked before any DNS/HTTP.** `util/LocalKeyDiscoveryUtils.ts` (new) has `buildKeyDiscoveryResponse()` -
+the exact response shape (`{ encryptPreference, keys, escrow }`) a mailbox publishes, escrow computed from its `KeyVault`'s wraps the
+same way the timing-safe "one KeyVault lookup either way" logic always did - extracted out of `BaseKeyDiscoveryRoute` (the public
+`.well-known` endpoint) so both callers build it from literally the same function and can never drift; `BaseKeyDiscoveryRoute` itself
+is now a thin caller of it. `discoverLocalKeys()` resolves `addr` to a mailbox the way inbound delivery does (`findMailboxByAddress()`-
+equivalent: exact `primarySmtpAddress`, then `aliasAddresses`, then - if plus-addressing is enabled - the same two tiers against the
+plus-stripped address; case-insensitive via `normalizeAddress()`), and reports the mailbox's *primary* address as the key's identity
+(what its certificate actually names) alongside the response - `undefined` (fall through to federation, unchanged) for an address
+that's neither a local mailbox nor of one of this deployment's own domains, and `{ address, response: undefined }` (no mailbox, no
+DNS - straight to `KeyringUtils`'s existing "nothing discoverable" / Anti-Downgrade path, same as a remote 404) for an address of a
+served domain nobody has. `discoverAndMergeKeys()` takes an optional `local: LocalKeyDiscovery` and checks it first; every existing
+caller (`BaseKeyLookupRoute`, `ScanQueueJob.maybeRefreshRotatedKey()` for the MDN rotation-hint path) now passes its own mailbox/
+KeyVault repos and `aliasQueryValue()` so a peer who happens to live on this deployment is never sent out to DNS/HTTP from either
+call site - `ScanQueueJob`'s in-band `RapidMX-Key` header path (`processInboundRapidMxKeyHeader()`) needed no change: it already has
+a `KeyDiscoveryResponse`-shaped payload from the header itself and calls `applyDiscoveredKeys()` directly, never `discoverAndMergeKeys()`.
+`BaseDirectoryRoute`/`ContactKeyUtils` don't call either function and have no analogous gap. New abstract `keyVaultClass`/`domainClass`
+(lookup route) and `keyVaultClass` (ScanQueueJob) on the Mongo/SQL concrete classes, mirroring the existing `mailboxClass` pattern.
+
+**Proven with a real client, real internal CA, real send/receive** (sandbox: `mongodb-memory-server` 7.0.14 + a real Windows Redis
+binary on fixed local ports, `NODE_ENV=development` so the dev-only scan-bypass/local-delivery wrappers apply, `node dist/src/worker.js`
+production build of server+restapi+react-shared+web-client all built from source and overlaid into `node_modules/@rapidmx/*` as copies,
+a stub identity service for `users/me`/`profiles/me`/`aliases`/`logout`, real headless Chromium via `playwright-core`): two mailboxes
+(`alice@qa.test`, `bob@qa.test`, plus an alias `robert@qa.test`) each ran Settings > Encryption "Set up" for real - client-generated
+P-256 keypair + CSR, `LocalX509CertificateAuthority` issued a real certificate chained to a freshly generated local CA. Compose showed
+"bob@qa.test supports encryption" from the live (fixed) lookup with **no DNS call at all**; Alice sent encrypted (`{background:true}`
+send path); the message delivered through the fake-sendmail-less dev local-delivery transport (`DevLocalDeliveryTransportMongo`,
+`src/dev/DevLocalDeliveryTransport.ts` in `server`, no server-side change needed) straight into Bob's Inbox as a locked "Encrypted
+message" with a lock icon; Bob unlocked with his password and read the real plaintext; Alice's Sent Items copy decrypted too (see the
+`MessageDetailPane.tsx` fix below); a third mailbox with no key (`carol@qa.test`) produced "This message can't be encrypted for
+everyone: carol@qa.test has no encryption key on file... or send the whole message in plaintext" with a working "Send without
+encryption" fallback, not a crash - Carol received and read that plaintext copy. Alias-addressed and case-insensitive lookups verified
+both via the API directly and (alias) via `discoverLocalKeys()`'s own unit tests. Not verified: RFC 8823 real public-CA signing
+enrollment (needs a live e-mail round trip with a real ACME CA) and cross-deployment federation against a second real server - both
+exercised here only against the existing fake-DNS/fake-fetch test doubles, unchanged by this fix.
+
+**One client defect the round trip found, fixed at the source (in scope per this task - not one of `web-client`'s W-D-owned files):**
+Alice's own Sent Items copy of an encrypted message she sent to Bob decrypted fine but showed a confusing banner - "The recipients
+this message was signed or encrypted for don't include this mailbox... you may have been Bcc'd" - because `evaluateMessageSecurity()`'s
+`notAddressedToReader` compares the reader's address against the message's protected (signed/encrypted-for) `To`/`Cc` headers, which
+for an ordinary message never include the sender's own address. Fixed by gating the notice's own render in `MessageDetailPane.tsx` on
+`!isSentItems` (the same signal the Recall button already uses) rather than touching the shared `messageSecurity.ts` logic the Inbox/
+other-folder cases still need unchanged - a genuine Bcc/forwarded-verbatim notice still shows everywhere else. One new test
+(`MessageDetailPane.test.tsx`).
+
+Files: new `src/util/LocalKeyDiscoveryUtils.ts`; changed `src/routes/BaseKeyDiscoveryRoute.ts`, `src/routes/BaseKeyLookupRoute.ts`,
+`src/routes/mongo/KeyLookupRouteMongo.ts`, `src/routes/sql/KeyLookupRouteSQL.ts`, `src/util/KeyringUtils.ts`, `src/jobs/ScanQueueJob.ts`,
+`src/jobs/mongo/ScanQueueJobMongo.ts`, `src/jobs/sql/ScanQueueJobSQL.ts`; tests: new `test/util/LocalKeyDiscoveryUtils.test.ts`,
+`test/routes/keyLocalDiscoverySuite.ts` + `{mongo,sql}/KeyLocalDiscovery.test.ts`, plus the local-peer-no-DNS/no-fetch case added to
+`ScanQueueJob{Mongo,SQL}.test.ts`'s rotation-notification describe block. `yarn tsc --noEmit` and `yarn lint` clean. Every test file
+touched or added passes in isolation with 100% statement/line/function and 98.84% branch coverage on the four changed/added source
+files (`--coverage.include` scoped run); a genuinely exclusive whole-repo run could not be obtained this session - a second agent
+(R6) ran the full restapi suite back-to-back essentially the entire time, and two full-suite attempts both showed the documented
+contamination signature (`MongoNetworkError: read ECONNRESET` on the shared port-9999 instance; SQL ACL/contact-count mismatches
+consistent with the shared sqlite file) in files outside this diff - no failure in either run named any file this fix touches for a
+reason that reproduced in isolation.

@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
-import { EnrollmentBinding, EnrollmentProgress, EnrollmentResult, EnrollmentSummary, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
+import { EnrollmentBinding, EnrollmentProgress, EnrollmentResult, EnrollmentSummary, SigningBackendInfo, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
 
 /**
  * The default `SigningCertificateEnrollment` - throws rather than silently doing nothing.
@@ -25,6 +25,12 @@ import { EnrollmentBinding, EnrollmentProgress, EnrollmentResult, EnrollmentSumm
  */
 export class NullSigningCertificateEnrollment implements SigningCertificateEnrollment {
     public readonly name: string = "null";
+    public readonly kind = "none" as const;
+
+    /** Signing certificates are disabled (or not configured): nothing issues them and nobody can upload one. */
+    public async describeBackend(): Promise<SigningBackendInfo> {
+        return { backend: "none", automatic: false, adminUpload: false };
+    }
 
     public async startEnrollment(_identity: string, _csr: string): Promise<{ enrollmentId: string }> {
         throw new ApiError(

@@ -114,6 +114,44 @@ moment end up with one. Nothing waits for the first send or the first spam.
   (`ca-unreachable`, `reply-not-sent`, `rate-limited`, `ca-error`) is shown the same way with `retryable: true` and is retried by the next tick.
 - The manual-CA enrollment reports a single stage (`submitted`, waiting for an administrator to upload the certificate), then `issued` or `failed`; the
   default (disabled) enrollment has none (404 for the current enrollment).
+- **`provider`** (`"manual" | "rfc8823"`) is on every status/progress object above, additive - a client uses it to word a request truthfully ("waiting for
+  an administrator" vs. "issued automatically by \<CA\>") instead of assuming automatic issuance. `GET /system/signing-enrollment` (below) says which
+  provider a deployment runs before a mailbox ever starts a request.
+- **An enrollment id the active backend does not recognize** - typically one left over from a different backend a deployment used before switching -
+  answers **404** `{ code: "signing-enrollment-unknown" }` on the status/check endpoints above (the same code a request for another mailbox's real
+  enrollment gets, so which is which is never revealed); `DELETE .../sign-enrollment/:enrollmentId` (cancel) on such an id instead succeeds idempotently,
+  answering a synthesized `{ status: "failed", errorCode: "cancelled", retryable: true }` with nothing further to show - a client clears the id and lets
+  the user request again.
+
+## Which backend issues signing certificates, and how it is doing
+
+`GET /system/signing-enrollment` (any signed-in user) answers `SigningBackendInfo`:
+
+```json
+{ "backend": "rfc8823", "automatic": true, "ca": { "host": "acme.castle.cloud" }, "contactEmail": "pki@example.com", "typicalDurationMinutes": 20, "adminUpload": false, "health": { "ok": true, "checkedAt": "...", "lastSuccessAt": "..." } }
+```
+
+`backend` is `"manual"`, `"rfc8823"` or `"none"` (signing certificates disabled); `ca.host` is the ACME directory URL's **host only**, never a path or
+query; `health` (`rfc8823` only) is the background job's last contact with the certificate authority - `ok`, `checkedAt`, `lastSuccessAt` and a sanitized
+`lastError` (no URLs, tokens or key material, length-capped) - persisted so it survives a restart; `adminUpload` says whether an administrator can
+complete a request by hand right now (see below).
+
+## Completing a signing-certificate request by hand (the manual backend, and an escape hatch for `rfc8823`)
+
+`BaseSigningEnrollmentAdminRoute` (mounted at `admin/signing-enrollments`) is how a deployment running the `manual` backend actually finishes a request,
+and a way to see an `rfc8823` request that has stalled. Every call needs a **trusted role AND an elevated token** (`assertAdminScope()` - the same gate
+`/mailboxes?scope=admin` uses) and is audited; nothing here reads a mailbox's mail, keys, or grants access to one.
+
+- `GET /admin/signing-enrollments` - every pending (and issued-but-not-yet-installed) request across every mailbox, metadata only:
+  `{ enrollmentId, identity, mailboxUid?, requestedAt, status, provider, stage?, lastError?, canUpload, uploadBlockedReason? }`. Never a CSR, key or
+  certificate. For the `rfc8823` provider the same list is read-only (`canUpload: false`).
+- `GET /admin/signing-enrollments/:id/csr` - the request's CSR as a PEM file (manual provider only; `409` on `rfc8823`).
+- `POST /admin/signing-enrollments/:id/certificate` `{ certificate: "<PEM, or a PEM chain leaf-first>" }` - validates it against the request (it carries
+  this CSR's public key, an `emailProtection` extended key usage, names the mailbox's address, and is currently valid) and stores it; the certificate is
+  then installed into the mailbox's key vault - together with the wrapped private key submitted when the request was started - by the same background job
+  that installs an automatic one, on its next run. A `400` names exactly what is wrong (wrong key, not for e-mail, wrong address, expired, ...); `409` when
+  the request can no longer be completed (already issued/failed, or predates the mailbox's key being kept with it).
+- `POST /admin/signing-enrollments/:id/reject` `{ reason: "..." }` - fails the request; `reason` is what the mailbox's owner sees on their own status.
 
 ## Delivery failures
 

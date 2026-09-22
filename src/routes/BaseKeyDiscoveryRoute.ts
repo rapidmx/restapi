@@ -8,22 +8,11 @@
 import * as crypto from "crypto";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors, type HttpRequest, type HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { EncryptionPreference, KeyVault, Mailbox, PublicKey } from "../models/types.js";
+import { KeyDiscoveryResponse, KeyVault, Mailbox } from "../models/types.js";
 import { isValidKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
+import { buildKeyDiscoveryResponse } from "../util/LocalKeyDiscoveryUtils.js";
 const { Config } = ObjectDecorators;
 const { Get, Param, Query, RateLimit, Request, Response } = RouteDecorators;
-
-/** The all-defaults response served for a mailbox that either doesn't exist, or exists but has published
- * nothing - `specs/end-to-end_encryption.md` requires these to be byte-for-byte indistinguishable, since this
- * endpoint is otherwise a directory-harvesting oracle. Reuses `Mailbox.encryptPreference`/`Mailbox.keys`'s own
- * class-level defaults (`BaseMailboxRoute`), so a real mailbox that has simply never enrolled a key produces
- * this exact object with no special-casing - the "indistinguishable" property falls out of the data model
- * rather than needing to be maintained by hand here. */
-const NOT_PUBLISHED_RESPONSE = {
-    encryptPreference: { preferEncrypt: "nopreference" } as EncryptionPreference,
-    keys: [] as PublicKey[],
-    escrow: false,
-};
 
 /**
  * Implements `specs/end-to-end_encryption.md`'s public discovery endpoint
@@ -44,7 +33,11 @@ const NOT_PUBLISHED_RESPONSE = {
  * plain boolean) is its own deferred follow-up roadmap - this is only the boolean the spec's current "Public
  * Endpoint" section already requires, unaffected by that deferral.
  *
- * **Timing.** `buildResponse()` always performs exactly one `KeyVault` lookup, even when no mailbox was found
+ * **One builder.** The response body is `buildKeyDiscoveryResponse()` (`util/LocalKeyDiscoveryUtils.ts`), which
+ * `GET /mailbox/:id/keys/lookup` also uses for a recipient that lives on this deployment, so what a remote peer is served and
+ * what a local caller discovers can never drift.
+ *
+ * **Timing.** `buildKeyDiscoveryResponse()` always performs exactly one `KeyVault` lookup, even when no mailbox was found
  * (using a `mailboxUid` no real mailbox can ever have) - so the not-found and no-keys-published cases pay the
  * identical number/shape of DB round trips, closing the timing side channel an attacker could otherwise use
  * to test candidate addresses against this "indistinguishable" endpoint (the spec calls this out explicitly:
@@ -97,21 +90,6 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
         }
     }
 
-    private async buildResponse(mailbox: M | undefined): Promise<typeof NOT_PUBLISHED_RESPONSE> {
-        // Always exactly one `KeyVault` lookup, found or not (see this class's own "Timing" doc comment) - a
-        // mailbox `uid` is derived from a real address (`BaseMailboxRoute.create()`), so `""` can never
-        // collide with a genuine one, and querying by it simply returns no rows.
-        const vaults: K[] = await this.keyVaultRepo!.find({ mailboxUid: mailbox?.uid ?? "" } as any, {
-            ignoreACL: true,
-            limit: 1,
-        });
-        if (!mailbox) {
-            return NOT_PUBLISHED_RESPONSE;
-        }
-        const escrow: boolean = !!vaults[0]?.masterKeyWraps.some((w) => w.method === "escrow");
-        return { encryptPreference: mailbox.encryptPreference ?? NOT_PUBLISHED_RESPONSE.encryptPreference, keys: mailbox.keys ?? [], escrow };
-    }
-
     /** The domain to scope the lookup to: the `domain` query parameter when present (lowercased), otherwise
      * the `Host` header with any `:port` suffix stripped, lowercased - `req.headers.host` on an HTTP/1.1
      * request, or the `:authority` pseudo-header's value as `HttpRequest` normalizes it for HTTP/2. A repeated
@@ -152,7 +130,7 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
         const match: M | undefined = domain
             ? candidates.find((m) => m.primarySmtpAddress?.split("@")[1]?.toLowerCase() === domain)
             : undefined;
-        const body = await this.buildResponse(match);
+        const body: KeyDiscoveryResponse = await buildKeyDiscoveryResponse(this.keyVaultRepo!, match);
 
         const etag = `"${crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")}"`;
         res.setHeader("etag", etag).setHeader("cache-control", `max-age=${this.maxAgeSeconds}`);

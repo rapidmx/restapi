@@ -198,7 +198,7 @@ describe("BaseKeyVaultRoute Tests (findOrCreateKeyVault() TOCTOU race and MAX_*_
             checkStatus,
             describeEnrollment: vi.fn().mockResolvedValue({ identity: "A@example.com" }),
         };
-        await expect(route.checkSignEnrollmentStatus("mailbox-1", "enrollment-1", user)).resolves.toEqual({ status: "pending" });
+        await expect(route.checkSignEnrollmentStatus("mailbox-1", "enrollment-1", user)).resolves.toEqual({ status: "pending", provider: "manual" });
         const cancelled: any = await route.cancelSignEnrollment("mailbox-1", "enrollment-1", user).catch((err) => err);
         expect(cancelled?.status).toBe(404);
     });

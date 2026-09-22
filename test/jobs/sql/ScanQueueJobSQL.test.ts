@@ -30,6 +30,7 @@ import { MailFilterRuleSQL } from "../../../src/models/sql/MailFilterRuleSQL.js"
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
 import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
+import { KeyVaultSQL } from "../../../src/models/sql/KeyVaultSQL.js";
 import { FocusedInboxOverrideSQL } from "../../../src/models/sql/FocusedInboxOverrideSQL.js";
 import { OofReplySuppressionSQL } from "../../../src/models/sql/OofReplySuppressionSQL.js";
 import { DataSubjectErasureRequestSQL } from "../../../src/models/sql/DataSubjectErasureRequestSQL.js";
@@ -282,6 +283,7 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         models.set("FocusedInboxOverrideSQL", FocusedInboxOverrideSQL);
         models.set("ContactSQL", ContactSQL);
         models.set("DomainSQL", DomainSQL);
+        models.set("KeyVaultSQL", KeyVaultSQL);
         models.set("DataSubjectErasureRequestSQL", DataSubjectErasureRequestSQL);
         await connectionManager.connect(config.get("datastores"), models);
 
@@ -338,6 +340,12 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
 
     it("Exposes the configured cron schedule.", () => {
         expect(job.schedule).toBe(config.get("mail:jobs:scan_queue:schedule"));
+    });
+
+    it("Matches an alias as a whole JSON string element, with LIKE wildcards escaped (mirrors MailboxAccessRouteSQL.aliasQueryValue()).", () => {
+        const raw: any = (new ScanQueueJobSQL() as any).aliasQueryValue("a_b%c@example.com");
+        expect(raw.getSql("aliases")).toBe("aliases LIKE :pattern ESCAPE '\\'");
+        expect(raw.objectLiteralParameters).toEqual({ pattern: '%"a\\_b\\%c@example.com"%' });
     });
 
     it("start() and stop() are no-ops beyond init().", async () => {
@@ -2881,6 +2889,51 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             await job.run();
 
             expect(mockFetch).toHaveBeenCalled();
+        });
+
+        it("Reads the peer's keys from its own mailbox, with no DNS lookup and no fetch, when the peer lives on this deployment.", async () => {
+            await createMailbox();
+            const localCert = await makeCertBase64("local-peer");
+            const localFingerprint = new nodeCrypto.X509Certificate(Buffer.from(localCert, "base64")).fingerprint256.replace(/:/g, "").toLowerCase();
+            await mailboxRepo.save(new MailboxSQL({
+                    primarySmtpAddress: "bob-local@example.com",
+                    aliasAddresses: ["robert-local@example.com"],
+                    displayName: "Local Peer",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                    keys: [{ publicKey: localCert, type: "x509", useType: "encrypt", fingerprint: "ignored", notBefore: 0, notAfter: Date.now() + 1_000_000 }],
+                    encryptPreference: { preferEncrypt: "mutual", lastSeen: 5 },
+                }));
+            const dnsResolver = objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!;
+            const resolveTxt = vi.spyOn(dnsResolver, "resolveTxt");
+
+            let mdn: Buffer = await buildDispositionNotification({
+                from: { address: "robert-local@example.com" },
+                to: "recipient@example.com",
+                subject: "Read: Hello",
+                finalRecipient: "robert-local@example.com",
+                originalMessageId: "no-such-message@example.com",
+                dispositionType: "read",
+                reportingUa: "mail.example.com; RapidMX",
+                rotatedKeyFingerprint: "claimed-fp-not-to-be-trusted",
+            });
+            mdn = Buffer.concat([Buffer.from("Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\n"), mdn]);
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, mdn);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "robert-local@example.com" });
+
+            await job.run();
+
+            expect(mockFetch).not.toHaveBeenCalled();
+            expect(resolveTxt).not.toHaveBeenCalled();
+            vi.restoreAllMocks();
+            const contacts = (await contactRepo.find({ where: { mailboxUid } })).filter((c) => c.emails.some((e) => e.address === "robert-local@example.com"));
+            expect(contacts).toHaveLength(1);
+            expect(contacts[0].keys).toHaveLength(1);
+            expect(contacts[0].keys![0].fingerprint).toBe(localFingerprint);
+            expect(contacts[0].encryptPreference?.preferEncrypt).toBe("mutual");
         });
 
         it("Does not call fetch at all when the MDN carries neither extension field.", async () => {

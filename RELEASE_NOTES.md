@@ -36,6 +36,28 @@
 
 ### Fixes
 
+- **Encrypted messages between accounts on the same server failed with "the client shows the error that it failed to discover the recipient's key" even with both keys published.** `GET /mailbox/:id/keys/lookup`
+  only ever performed remote federation (DNS `_rapidmx` lookup + a peer's public discovery endpoint) - a recipient on this same deployment (any domain it hosts, including a plain same-server, same-domain
+  pair) had no path at all and always 404'd. It's now answered from the local mailbox first (its primary address, an alias, or a plus-tagged address, case-insensitively), with the exact response shape the
+  public `.well-known/rapidmx/keys` endpoint would serve - built from one shared function (`util/LocalKeyDiscoveryUtils.ts`) so the two can never disagree - merged into the caller's contact identically to a
+  remote result (TOFU pinning, conflict recording, Anti-Downgrade). No DNS or HTTP call is made for a local address, so a deployment whose own domain publishes no `_rapidmx` record still encrypts between its
+  own accounts. A remote recipient's discovery is unaffected.
+- **A signing-certificate request had nowhere to go wrong visibly - now every status names its provider, and a stale id is answered so a client can recover from it.** With the default `manual`
+  backend a request sat `pending` forever with no admin route to complete it (`ManualSigningCertificateEnrollment`'s upload step was never wired to a route); the Encryption settings page still said a
+  public CA issues it automatically, which was only true for the (separately shippable) `rfc8823` backend. Every `EnrollmentProgress` now carries `provider: "manual" | "rfc8823"`, so a client words a
+  request truthfully instead of assuming automation. An enrollment id the active backend does not know (typically one left over from a backend a deployment used before switching) now answers `404`
+  `signing-enrollment-unknown` on `GET .../sign-enrollment/:id` and `.../check` - not a 500 or a wrong-mailbox 404 that looks the same as someone else's request - and `DELETE` (cancel) on such an id
+  succeeds idempotently (a cancelled, retryable answer with nothing further to show), so a client clears the id and lets the user request again rather than getting stuck.
+- **The manual backend can now actually be completed - `BaseSigningEnrollmentAdminRoute` (`/admin/signing-enrollments`, trusted role AND an elevated token, audited).** `GET /` lists pending requests
+  (address, mailbox, when, status, provider - metadata only, never a key); `GET /:id/csr` downloads the CSR; `POST /:id/certificate` validates an uploaded certificate (or chain) against the request -
+  it is for this CSR's key, for e-mail (`emailProtection` EKU, `digitalSignature` key usage), for this address, and currently valid - with a plain-English refusal otherwise, then stores it for
+  `AcmeEnrollmentDriverJob` to install (with the mailbox's own wrapped key, submitted upfront and now kept by the manual store too) on its next run; `POST /:id/reject` fails a request with a reason
+  its owner sees. For the `rfc8823` backend the same list is read-only (`canUpload: false`) - a way to see an automatic request that has stalled, not a second way to complete one.
+- **An unreachable certificate authority was silent beyond a debug log line - it now surfaces.** `AcmeEnrollmentDriverJob` records every contact with the CA (`SigningEnrollmentHealth`, persisted
+  alongside the enrollment store so it survives a restart): a warning is logged once when a run of failures starts and again only if the error text changes (not every 5-minute tick), an info line once
+  the CA answers again, and after `mail:jobs:acme_enrollment_driver:failure_audit_after` (default 3) checks fail in a row, one `SIGNING_ENROLLMENT_CA_UNREACHABLE` audit entry for the run (`details`:
+  `consecutiveFailures`, `firstFailureAt`, a sanitized `error` - no URLs, tokens or key material, length-capped). The RFC 8823 provider also records a health outcome for `startEnrollment()` itself
+  (opening the account/order) and logs the CA's host and whether an ACME account is already registered once at startup (from the local store, no network call).
 - **A grant on a shared mailbox typed as a username never applied to anyone - sharing now resolves who it grants to.** On a live host the shared mailbox `hello@` ("Support") was granted to `jean-philippe`: the console's Sharing form stored the text typed, and an ACL record matches only a token's user uid or a role of that name, so the mailbox appeared for nobody (it only ever showed up to a
   token that bypassed ACLs, which the privacy fix above removes). `PUT /mail/mailboxes/:id/access/:principal` now takes a mailbox address (its owner), an auth-server username or e-mail alias, or a user uid the server knows, and stores only the resolved uid; a name that resolves to nobody is 400 `No user found for "<x>".` and nothing is stored, an unreachable identity service is 502. New
   `GET /mail/mailboxes/:id/access/resolve?principal=` answers who a principal is (`{ userUid, displayName?, address? }`) for a sharing screen to confirm; the member list marks an entry that is not a user uid with `noEffect: true`; `GET /mail/mailboxes` and `GET /:id` carry `accessRole: "owner" | "delegate"` to label shared mailboxes. Usernames are deliberately never matched against uids: they can be released and claimed
@@ -119,6 +141,12 @@
     it never saw start.
   - `SigningCertificateEnrollment` gained the optional `describeProgress()`, `checkNow()` and `listEnrollments()`; the manual-CA implementation reports a single stage, the default one has no enrollments.
     New config `mail:pki:rfc8823:poll_interval_seconds` (300, only what `nextCheckAt` is computed from - keep it equal to the driver job's schedule) and `mail:pki:rfc8823:max_pending_hours`.
+- **A new `GET /system/signing-enrollment` (any signed-in user) says which backend issues signing certificates and how it is doing** - `{ backend: "manual"|"rfc8823"|"none", automatic, ca?: { host },
+  contactEmail?, typicalDurationMinutes?, adminUpload, health? }`. `ca.host` is the ACME directory URL's host only, never a path or query; `health` (`rfc8823` only) is the background job's last contact
+  with the CA - `ok`, `checkedAt`, `lastSuccessAt`, a sanitized `lastError` - from the same persisted record `AcmeEnrollmentDriverJob` writes. `adminUpload` says whether an administrator can complete a
+  request by hand right now (`true` for `manual`). What the Encryption settings page needs to word a request's status truthfully instead of assuming automatic issuance.
+- **`AuditAction` gains `SIGNING_ENROLLMENT_CA_UNREACHABLE`, `SIGNING_ENROLLMENT_ADMIN_LIST`, `SIGNING_ENROLLMENT_ADMIN_CSR`, `SIGNING_ENROLLMENT_ADMIN_UPLOAD` and `SIGNING_ENROLLMENT_ADMIN_REJECT`**
+  for the health alert and the new admin route above.
 
 ## v0.16.0
 

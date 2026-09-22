@@ -8,12 +8,27 @@ import "reflect-metadata";
 import * as x509 from "@peculiar/x509";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
+import { WrappedPrivateKey } from "../models/types.js";
 import { readFileIfExists, updateJsonFile } from "./FileStoreUtils.js";
 import { computeManualStages } from "./EnrollmentStages.js";
-import { EnrollmentBinding, EnrollmentProgress, EnrollmentResult, EnrollmentSummary, SigningCertificateEnrollment } from "./SigningCertificateEnrollment.js";
-const { Config, Logger } = ObjectDecorators;
+import { validateIssuedCertificate, ValidatedCertificate } from "./IssuedCertificateValidation.js";
+import {
+    AdminEnrollmentSummary,
+    EnrollmentBinding,
+    EnrollmentProgress,
+    EnrollmentResult,
+    EnrollmentSummary,
+    SIGNING_ENROLLMENT_UNKNOWN,
+    SigningBackendInfo,
+    SigningCertificateEnrollment,
+} from "./SigningCertificateEnrollment.js";
+const { Config, Init, Logger } = ObjectDecorators;
 
 x509.cryptoProvider.set(crypto);
+
+/** Why an administrator cannot complete a request that holds no wrapped key (a record from before the key was kept with it). */
+const NO_KEY_REASON =
+    "This request was made before the mailbox's key was stored with it, so an uploaded certificate could not be installed. Ask the user to cancel it in Settings > Encryption and request again.";
 
 interface PendingEnrollment {
     identity: string;
@@ -26,15 +41,26 @@ interface PendingEnrollment {
     updatedAt?: string;
     issuedAt?: string;
     failedAt?: string;
+    /** Why it failed: `rejected` (an administrator refused it) or `cancelled` (its owner abandoned it). */
+    errorCode?: string;
+    /** The client's own already-wrapped private key for the CSR's key pair, held so the driver job can install the issued certificate and this key
+     * into the mailbox with no further client action - the same E2E boundary the RFC 8823 provider keeps (`attachWrappedKey()`). Absent on a record
+     * from before this was kept: an administrator can't complete such a request (`uploadValidatedCertificate()`). */
+    wrappedKey?: Omit<WrappedPrivateKey, "fingerprint" | "useType">;
+    /** The mailbox that attached `wrappedKey`, and its vault's master-key generation then (see `PendingEnrollment` in the RFC 8823 provider). */
+    mailboxUid?: string;
+    masterKeyGeneration?: number;
+    /** Set once the driver job installed the issued certificate into the mailbox's key vault. */
+    installedAt?: string;
 }
 
 /**
- * The real, CA-agnostic `SigningCertificateEnrollment` default - works with any publicly-trusted CA an admin
- * chooses, since it never talks to a CA over the network itself. `startEnrollment()` records a pending
- * enrollment (surfacing the CSR for an admin to paste into that CA's own portal by hand); once the CA issues
- * a certificate, `uploadCertificate()` - a method specific to this class, not part of the shared interface,
- * since no other implementation needs a human-upload step - records it, after which `checkStatus()` reflects
- * it as `"issued"`.
+ * The real, CA-agnostic `SigningCertificateEnrollment` for a deployment that does not (or cannot) use RFC 8823 automation - works with any
+ * publicly-trusted CA an administrator chooses, since it never talks to a CA over the network itself. `startEnrollment()` records a pending
+ * enrollment (surfacing the CSR for an admin to paste into that CA's own portal by hand); once the CA issues a certificate,
+ * `uploadValidatedCertificate()` - a method specific to this class, not part of the shared interface, since no other implementation needs a
+ * human-upload step - records it, after which `checkStatus()` reflects it as `"issued"` and `AcmeEnrollmentDriverJob` installs it (with the wrapped
+ * key `attachWrappedKey()` kept) into the mailbox.
  *
  * State is persisted as a small local JSON file, the same "own a small piece of local state on disk" shape
  * `LocalX509CertificateAuthority`'s CA key and `OpenBaoPkiCertificateAuthority`'s serial-number map already
@@ -42,21 +68,34 @@ interface PendingEnrollment {
  * rarely repeated), not the kind of collection this codebase otherwise models as a full dual-backend
  * database entity.
  *
- * A REST admin route for the upload step is intentionally not part of this pass - `startEnrollment()` has no
- * caller yet (the eventual key-vault enrollment endpoint, Group D, hasn't been built), so a route with
- * nothing driving traffic to it would be premature infrastructure, the same reasoning already applied to this
- * roadmap's `I4` item. It is added once Group D wires up a real trigger.
+ * The administrator's side of the upload is `BaseSigningEnrollmentAdminRoute` (`/admin/signing-enrollments`: list, download the CSR, upload the
+ * certificate, reject).
  *
  * @author Jean-Philippe Steinmetz
  */
 export class ManualSigningCertificateEnrollment implements SigningCertificateEnrollment {
     public readonly name: string = "manual";
+    public readonly kind = "manual" as const;
 
     @Config("mail:pki:manual_enrollment:store_path", "/var/lib/rapidmx/pki/manual-enrollments.json")
     private storePath: string = "/var/lib/rapidmx/pki/manual-enrollments.json";
 
     @Logger
     private logger: any;
+
+    /** Logs, once at startup, that signing certificates here are completed by an administrator - so a reader of the log knows why a request stays
+     * pending and where to look (the Signing Certificates admin page). */
+    @Init
+    public logStartup(): void {
+        this.logger?.info(
+            "Signing certificates are issued manually: a request waits for an administrator to upload the certificate a CA issued (Admin > Signing Certificates).",
+        );
+    }
+
+    /** See `SigningCertificateEnrollment.describeBackend()`. */
+    public async describeBackend(): Promise<SigningBackendInfo> {
+        return { backend: "manual", automatic: false, adminUpload: true };
+    }
 
     private async loadStore(): Promise<Record<string, PendingEnrollment>> {
         const raw: string | undefined = await readFileIfExists(this.storePath);
@@ -74,7 +113,7 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
     private async requireEnrollment(store: Record<string, PendingEnrollment>, enrollmentId: string): Promise<PendingEnrollment> {
         const enrollment: PendingEnrollment | undefined = store[enrollmentId];
         if (!enrollment) {
-            throw new ApiError(ApiErrors.NOT_FOUND, 404, `No enrollment found with id '${enrollmentId}'.`);
+            throw new ApiError(SIGNING_ENROLLMENT_UNKNOWN, 404, `No enrollment found with id '${enrollmentId}'.`);
         }
         return enrollment;
     }
@@ -105,21 +144,22 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
         return { status: enrollment.status, certificate: enrollment.certificate, error: enrollment.error };
     }
 
-    /** See `SigningCertificateEnrollment.describeEnrollment()` - this store keeps only the identity. */
+    /** See `SigningCertificateEnrollment.describeEnrollment()` - the identity, and the mailbox uid when `attachWrappedKey()` recorded one. */
     public async describeEnrollment(enrollmentId: string): Promise<EnrollmentBinding> {
         const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
-        return { identity: enrollment.identity };
+        return { identity: enrollment.identity, ...(enrollment.mailboxUid ? { mailboxUid: enrollment.mailboxUid } : {}) };
     }
 
     /**
      * A manual enrollment has one thing to wait for - an administrator obtaining the certificate from a CA by hand and uploading it
-     * (`uploadCertificate()`) - so it reports a single stage (`submitted`, active) until then, then `issued` or `failed`. There is no
+     * (`uploadValidatedCertificate()`) - so it reports a single stage (`submitted`, active) until then, then `issued` or `failed`. There is no
      * CA to poll, hence no `checkNow()` (the endpoint that would call it answers with this instead), no `nextCheckAt`, no `lastCheckedAt`.
      */
     public async describeProgress(enrollmentId: string): Promise<EnrollmentProgress> {
         const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
         const { stage, stages, progress } = computeManualStages(enrollment);
         return {
+            provider: "manual",
             status: enrollment.status,
             certificate: enrollment.certificate,
             error: enrollment.error,
@@ -129,7 +169,8 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
             requestedAt: enrollment.createdAt,
             updatedAt: enrollment.updatedAt ?? enrollment.createdAt,
             ...(enrollment.issuedAt ? { issuedAt: enrollment.issuedAt } : {}),
-            ...(enrollment.status === "failed" ? { errorCode: "failed", retryable: true } : {}),
+            ...(enrollment.installedAt ? { installedAt: enrollment.installedAt } : {}),
+            ...(enrollment.status === "failed" ? { errorCode: enrollment.errorCode ?? "failed", retryable: true } : {}),
         };
     }
 
@@ -138,20 +179,167 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
         return Object.entries(await this.loadStore()).map(([enrollmentId, enrollment]) => ({
             enrollmentId,
             identity: enrollment.identity,
+            ...(enrollment.mailboxUid ? { mailboxUid: enrollment.mailboxUid } : {}),
             status: enrollment.status,
             createdAt: enrollment.createdAt,
+            ...(enrollment.installedAt ? { installedAt: enrollment.installedAt } : {}),
         }));
     }
 
-    /** See `SigningCertificateEnrollment.cancelEnrollment()` - only a still-pending enrollment changes. */
+    /** See `SigningCertificateEnrollment.cancelEnrollment()` - a pending, or issued but not yet installed, enrollment changes. */
     public async cancelEnrollment(enrollmentId: string, reason: string): Promise<void> {
         await this.updateStore(async (store) => {
             const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
-            if (enrollment.status === "pending") {
+            // An uploaded certificate that has no key to install with stays as it is: cancelling could not stop anything.
+            if (enrollment.status === "pending" || (enrollment.status === "issued" && enrollment.installedAt === undefined && enrollment.wrappedKey !== undefined)) {
                 enrollment.status = "failed";
                 enrollment.error = reason;
+                enrollment.errorCode = "cancelled";
                 enrollment.failedAt = enrollment.updatedAt = new Date().toISOString();
             }
+        });
+    }
+
+    /**
+     * Records the client's already-wrapped private key for this enrollment's CSR (and the mailbox and master-key generation it belongs to), submitted with the
+     * request by `BaseKeyVaultRoute.startSignEnrollment()`: what lets `AcmeEnrollmentDriverJob` install the certificate an administrator uploads, together with
+     * this key, into the mailbox with no further client action.
+     *
+     * @throws If `enrollmentId` is not recognized.
+     */
+    public async attachWrappedKey(
+        enrollmentId: string,
+        wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">,
+        binding?: { mailboxUid: string; masterKeyGeneration: number },
+    ): Promise<void> {
+        await this.updateStore(async (store) => {
+            const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+            enrollment.wrappedKey = wrappedKey;
+            if (binding) {
+                enrollment.mailboxUid = binding.mailboxUid;
+                enrollment.masterKeyGeneration = binding.masterKeyGeneration;
+            }
+        });
+    }
+
+    /** Every enrollment `AcmeEnrollmentDriverJob` still has work for: pending ones (nothing to do but wait for the upload) and uploaded ones not yet installed. */
+    public async listPendingEnrollments(): Promise<
+        Array<{ enrollmentId: string; identity: string; status: PendingEnrollment["status"]; mailboxUid?: string; hasWrappedKey: boolean }>
+    > {
+        return Object.entries(await this.loadStore())
+            .filter(([, enrollment]) => enrollment.status === "pending" || (enrollment.status === "issued" && enrollment.installedAt === undefined))
+            .map(([enrollmentId, enrollment]) => ({
+                enrollmentId,
+                identity: enrollment.identity,
+                status: enrollment.status,
+                mailboxUid: enrollment.mailboxUid,
+                hasWrappedKey: !!enrollment.wrappedKey,
+            }));
+    }
+
+    /** Nothing to advance: there is no CA to talk to - a pending request moves only when an administrator uploads the certificate. Never contacts anything. */
+    public async advanceEnrollment(_enrollmentId: string): Promise<boolean> {
+        return false;
+    }
+
+    /** The certificate and wrapped key to install for an uploaded enrollment (`undefined` until uploaded, or when no key was attached - see `PendingEnrollment.wrappedKey`). */
+    public async getIssuedMaterial(
+        enrollmentId: string,
+    ): Promise<
+        | { certificate: string; wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">; mailboxUid?: string; masterKeyGeneration?: number }
+        | undefined
+    > {
+        const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
+        if (enrollment.status !== "issued" || !enrollment.certificate || !enrollment.wrappedKey) {
+            return undefined;
+        }
+        return {
+            certificate: enrollment.certificate,
+            wrappedKey: enrollment.wrappedKey,
+            mailboxUid: enrollment.mailboxUid,
+            masterKeyGeneration: enrollment.masterKeyGeneration,
+        };
+    }
+
+    /** Records that the driver job installed the uploaded certificate into the mailbox's key vault. */
+    public async markInstalled(enrollmentId: string): Promise<void> {
+        await this.updateStore(async (store) => {
+            const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+            enrollment.installedAt = enrollment.updatedAt = new Date().toISOString();
+        });
+    }
+
+    /** See `SigningCertificateEnrollment.listAdminEnrollments()`. */
+    public async listAdminEnrollments(): Promise<AdminEnrollmentSummary[]> {
+        return Object.entries(await this.loadStore())
+            .filter(([, enrollment]) => enrollment.status === "pending" || (enrollment.status === "issued" && enrollment.installedAt === undefined))
+            .map(([enrollmentId, enrollment]) => {
+                const canUpload: boolean = enrollment.status === "pending" && enrollment.wrappedKey !== undefined;
+                return {
+                    enrollmentId,
+                    identity: enrollment.identity,
+                    ...(enrollment.mailboxUid ? { mailboxUid: enrollment.mailboxUid } : {}),
+                    requestedAt: enrollment.createdAt,
+                    status: enrollment.status,
+                    provider: "manual" as const,
+                    stage: enrollment.status === "pending" ? ("submitted" as const) : ("issued" as const),
+                    canUpload,
+                    ...(enrollment.status === "pending" && !canUpload ? { uploadBlockedReason: NO_KEY_REASON } : {}),
+                };
+            })
+            .sort((a, b) => Date.parse(b.requestedAt) - Date.parse(a.requestedAt));
+    }
+
+    /** What an administrator needs of one request to make its certificate: the CSR (public information) and the address, mailbox and state around it. Never the wrapped key. */
+    public async getRequest(
+        enrollmentId: string,
+    ): Promise<{ identity: string; csr: string; status: PendingEnrollment["status"]; mailboxUid?: string; hasWrappedKey: boolean }> {
+        const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
+        return {
+            identity: enrollment.identity,
+            csr: enrollment.csr,
+            status: enrollment.status,
+            mailboxUid: enrollment.mailboxUid,
+            hasWrappedKey: enrollment.wrappedKey !== undefined,
+        };
+    }
+
+    /**
+     * An administrator's upload: `uploadCertificate()` after checking the certificate for everything that would make it useless to the mailbox
+     * (`validateIssuedCertificate()`: it is for this request's key, for e-mail, for this address and currently valid) and that the request can still be
+     * completed - it is pending, and holds the mailbox's wrapped key, which is what lets the driver job install the certificate.
+     *
+     * @throws `ApiError` 404 for an unknown id, 409 when the request is no longer pending or holds no key, 400 (a message a person can act on) when the
+     * certificate does not validate.
+     */
+    public async uploadValidatedCertificate(enrollmentId: string, certificatePem: unknown): Promise<ValidatedCertificate> {
+        const request = await this.getRequest(enrollmentId);
+        if (request.status !== "pending") {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, `This request is already ${request.status === "issued" ? "issued" : "closed"}.`);
+        }
+        if (!request.hasWrappedKey) {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, NO_KEY_REASON);
+        }
+        const validated: ValidatedCertificate = await validateIssuedCertificate(request.csr, request.identity, certificatePem);
+        await this.uploadCertificate(enrollmentId, certificatePem as string);
+        return validated;
+    }
+
+    /**
+     * An administrator refuses a pending request: it fails with `reason`, which the mailbox's owner sees, and `errorCode: "rejected"`.
+     *
+     * @throws `ApiError` 404 for an unknown id, 409 when it is no longer pending.
+     */
+    public async rejectEnrollment(enrollmentId: string, reason: string): Promise<void> {
+        await this.updateStore(async (store) => {
+            const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+            if (enrollment.status !== "pending") {
+                throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, `This request is already ${enrollment.status === "issued" ? "issued" : "closed"}.`);
+            }
+            enrollment.status = "failed";
+            enrollment.error = reason;
+            enrollment.errorCode = "rejected";
+            enrollment.failedAt = enrollment.updatedAt = new Date().toISOString();
         });
     }
 
@@ -160,15 +348,19 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
      * the uploaded certificate's public key actually matches the CSR's own public key - a real check, not
      * ceremony: it catches an admin pasting in the wrong file (e.g. a different mailbox's certificate) before
      * that mistake becomes a mailbox unable to sign with the key it thinks it has a certificate for.
+     * (`uploadValidatedCertificate()` adds the rest of the checks an administrator's upload needs.)
      *
      * @param enrollmentId An identifier previously returned by `startEnrollment()`.
      * @param certificatePem The PEM-encoded certificate the CA issued.
-     * @throws If `enrollmentId` is not recognized, the certificate cannot be parsed, or its public key does
+     * @throws If `enrollmentId` is not recognized, it is no longer pending (409), the certificate cannot be parsed, or its public key does
      * not match the original CSR's.
      */
     public async uploadCertificate(enrollmentId: string, certificatePem: string): Promise<void> {
         await this.updateStore(async (store) => {
             const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
+            if (enrollment.status !== "pending") {
+                throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, `This enrollment is already ${enrollment.status === "issued" ? "issued" : "closed"}.`);
+            }
 
             let certificate: x509.X509Certificate;
             try {
@@ -209,6 +401,7 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
             const enrollment: PendingEnrollment = await this.requireEnrollment(store, enrollmentId);
             enrollment.status = "failed";
             enrollment.error = reason;
+            enrollment.errorCode = "rejected";
             enrollment.failedAt = enrollment.updatedAt = new Date().toISOString();
         });
     }

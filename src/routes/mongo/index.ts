@@ -42,3 +42,5 @@ export * from "./SearchRouteMongo.js";
 export * from "./TaskListRouteMongo.js";
 export * from "./TaskRouteMongo.js";
 export * from "./TransportRuleRouteMongo.js";
+export * from "./SigningEnrollmentAdminRouteMongo.js";
+export * from "./SigningEnrollmentInfoRouteMongo.js";

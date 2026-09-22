@@ -42,3 +42,5 @@ export * from "./SearchRouteSQL.js";
 export * from "./TaskListRouteSQL.js";
 export * from "./TaskRouteSQL.js";
 export * from "./TransportRuleRouteSQL.js";
+export * from "./SigningEnrollmentAdminRouteSQL.js";
+export * from "./SigningEnrollmentInfoRouteSQL.js";

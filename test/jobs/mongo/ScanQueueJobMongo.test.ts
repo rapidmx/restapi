@@ -34,6 +34,7 @@ import { MailFilterRuleMongo } from "../../../src/models/mongo/MailFilterRuleMon
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
 import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
 import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
+import { KeyVaultMongo } from "../../../src/models/mongo/KeyVaultMongo.js";
 import { FocusedInboxOverrideMongo } from "../../../src/models/mongo/FocusedInboxOverrideMongo.js";
 import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySuppressionMongo.js";
 import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSubjectErasureRequestMongo.js";
@@ -290,6 +291,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         models.set("FocusedInboxOverrideMongo", FocusedInboxOverrideMongo);
         models.set("ContactMongo", ContactMongo);
         models.set("DomainMongo", DomainMongo);
+        models.set("KeyVaultMongo", KeyVaultMongo);
         models.set("DataSubjectErasureRequestMongo", DataSubjectErasureRequestMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
@@ -3060,6 +3062,51 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             await job.run();
 
             expect(mockFetch).toHaveBeenCalled();
+        });
+
+        it("Reads the peer's keys from its own mailbox, with no DNS lookup and no fetch, when the peer lives on this deployment.", async () => {
+            await createMailbox();
+            const localCert = await makeCertBase64("local-peer");
+            const localFingerprint = new nodeCrypto.X509Certificate(Buffer.from(localCert, "base64")).fingerprint256.replace(/:/g, "").toLowerCase();
+            await mailboxRepo.save(new MailboxMongo({
+                    primarySmtpAddress: "bob-local@example.com",
+                    aliasAddresses: ["robert-local@example.com"],
+                    displayName: "Local Peer",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                    keys: [{ publicKey: localCert, type: "x509", useType: "encrypt", fingerprint: "ignored", notBefore: 0, notAfter: Date.now() + 1_000_000 }],
+                    encryptPreference: { preferEncrypt: "mutual", lastSeen: 5 },
+                }));
+            const dnsResolver = objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!;
+            const resolveTxt = vi.spyOn(dnsResolver, "resolveTxt");
+
+            let mdn: Buffer = await buildDispositionNotification({
+                from: { address: "robert-local@example.com" },
+                to: "recipient@example.com",
+                subject: "Read: Hello",
+                finalRecipient: "robert-local@example.com",
+                originalMessageId: "no-such-message@example.com",
+                dispositionType: "read",
+                reportingUa: "mail.example.com; RapidMX",
+                rotatedKeyFingerprint: "claimed-fp-not-to-be-trusted",
+            });
+            mdn = Buffer.concat([Buffer.from("Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\n"), mdn]);
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, mdn);
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "robert-local@example.com" });
+
+            await job.run();
+
+            expect(mockFetch).not.toHaveBeenCalled();
+            expect(resolveTxt).not.toHaveBeenCalled();
+            vi.restoreAllMocks();
+            const contacts = await contactRepo.find({ mailboxUid, "emails.address": "robert-local@example.com" }).toArray();
+            expect(contacts).toHaveLength(1);
+            expect(contacts[0].keys).toHaveLength(1);
+            expect(contacts[0].keys![0].fingerprint).toBe(localFingerprint);
+            expect(contacts[0].encryptPreference?.preferEncrypt).toBe("mutual");
         });
 
         it("Does not call fetch at all when the MDN carries neither extension field.", async () => {

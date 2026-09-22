@@ -22,14 +22,18 @@ import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { createFileExclusive, lockKeyForPath, readFileIfExists, updateJsonFile, withLock, writeFileAtomic } from "./FileStoreUtils.js";
 import { AcmeMilestones, classifyOrderFailure, classifyTransientFailure, computeStages, FailureClass } from "./EnrollmentStages.js";
+import { sanitizeErrorText, SigningEnrollmentHealth } from "./SigningEnrollmentHealth.js";
 import {
+    AdminEnrollmentSummary,
     EnrollmentBinding,
     EnrollmentProgress,
     EnrollmentResult,
     EnrollmentSummary,
+    SIGNING_ENROLLMENT_UNKNOWN,
+    SigningBackendInfo,
     SigningCertificateEnrollment,
 } from "./SigningCertificateEnrollment.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 x509.cryptoProvider.set(crypto);
 
@@ -41,6 +45,14 @@ const DEFAULT_CHECK_TIMEOUT_MS = 8_000;
 
 /** How soon after one `checkNow()` the same enrollment refuses another (429). */
 const DEFAULT_CHECK_MIN_INTERVAL_MS = 10_000;
+
+/**
+ * How long a request typically takes from submit to an issued certificate, in minutes (`SigningBackendInfo.typicalDurationMinutes`): the
+ * CA's e-mail arrives within a minute or two, and then the background job takes one step per 5-minute tick - answer the challenge, see the
+ * order ready and finalize, download the certificate - about 15, and the install into the key vault is one more. An estimate for wording,
+ * never a promise; "check now" skips the wait for a tick.
+ */
+export const TYPICAL_DURATION_MINUTES = 20;
 
 /** The lowercased domain part of an email address (bare `local@domain`, or a trailing `<local@domain>`), or
  * `undefined` if `address` doesn't look like a single address at all. */
@@ -190,6 +202,7 @@ interface PendingEnrollment {
  */
 export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertificateEnrollment {
     public readonly name: string = "rfc8823-acme";
+    public readonly kind = "rfc8823" as const;
 
     @Config("mail:pki:rfc8823:directory_url", "https://acme.castle.cloud/acme/directory")
     private directoryUrl: string = "https://acme.castle.cloud/acme/directory";
@@ -222,6 +235,51 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
+
+    /** How the CA contacts of this deployment have gone (`health.json` in the store directory) - written by `AcmeEnrollmentDriverJob` and by
+     * `startEnrollment()`, read for `describeBackend()`. */
+    public readonly health: SigningEnrollmentHealth = new SigningEnrollmentHealth(() => path.join(this.storeDir, "health.json"));
+
+    /**
+     * Logs, once at startup, which CA this deployment enrolls signing certificates with and whether its ACME account already exists in the
+     * store - so a log reader sees that automatic issuance is on (and where a request goes) without waiting for one. Reads a local file
+     * only: no network call, so a CA that is down never delays or fails boot.
+     */
+    @Init
+    public async logStartup(): Promise<void> {
+        try {
+            const registered: boolean = (await readFileIfExists(this.accountUrlPath()))?.trim() ? true : false;
+            this.logger?.info(
+                `Signing certificates are issued automatically (RFC 8823) by the CA at ${this.caHost() ?? "an unparsable directory URL"}; ` +
+                    (registered ? "an ACME account is already registered." : "no ACME account is registered yet (it is registered with the first request)."),
+            );
+        } catch (err: any) {
+            this.logger?.warn(`Rfc8823AcmeSigningCertificateEnrollment: could not read the ACME account state in '${this.storeDir}': ${sanitizeErrorText(err)}`);
+        }
+    }
+
+    /** The host of the directory URL - never the path or query (which may carry something private on a self-hosted CA). */
+    private caHost(): string | undefined {
+        try {
+            return new URL(this.directoryUrl).host || undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** See `SigningCertificateEnrollment.describeBackend()`. */
+    public async describeBackend(): Promise<SigningBackendInfo> {
+        const host: string | undefined = this.caHost();
+        return {
+            backend: "rfc8823",
+            automatic: true,
+            ...(host ? { ca: { host } } : {}),
+            ...(this.contactEmail ? { contactEmail: this.contactEmail } : {}),
+            typicalDurationMinutes: TYPICAL_DURATION_MINUTES,
+            adminUpload: false,
+            health: await this.health.report(),
+        };
+    }
 
     private accountKeyPath(): string {
         return path.join(this.storeDir, "account.key.pem");
@@ -322,7 +380,7 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
     private async requireEnrollment(store: Record<string, PendingEnrollment>, enrollmentId: string): Promise<PendingEnrollment> {
         const enrollment: PendingEnrollment | undefined = store[enrollmentId];
         if (!enrollment) {
-            throw new ApiError(ApiErrors.NOT_FOUND, 404, `No enrollment found with id '${enrollmentId}'.`);
+            throw new ApiError(SIGNING_ENROLLMENT_UNKNOWN, 404, `No enrollment found with id '${enrollmentId}'.`);
         }
         return enrollment;
     }
@@ -338,9 +396,17 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The provided CSR's self-signature does not verify.");
         }
 
-        const client: acme.Client = await this.ensureAccount();
-        const order: acme.Order = await client.createOrder({ identifiers: [{ type: "email", value: identity }] });
-        const [authorization] = await client.getAuthorizations(order);
+        let client: acme.Client;
+        let order: acme.Order;
+        let authorization: Awaited<ReturnType<acme.Client["getAuthorizations"]>>[number];
+        try {
+            client = await this.ensureAccount();
+            order = await client.createOrder({ identifiers: [{ type: "email", value: identity }] });
+            [authorization] = await client.getAuthorizations(order);
+        } catch (err: any) {
+            await this.health.record({ ok: false, error: err }).catch(() => undefined);
+            throw err;
+        }
         // `email-reply-00` isn't part of `acme-client`'s own `rfc8555.Challenge` union (it only models
         // `http-01`/`dns-01`) - the object is real at runtime (any RFC 8823-compliant CA returns it),
         // just not typed by this dependency, hence the cast.
@@ -348,8 +414,11 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
             authorization.challenges as unknown as Array<{ type: string; url: string; from?: string; token?: string }>
         ).find((c) => c.type === "email-reply-00");
         if (!challenge?.from || !challenge.token) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The certificate authority did not offer an email-reply-00 challenge.");
+            const refusal: ApiError = new ApiError(ApiErrors.INVALID_REQUEST, 400, "The certificate authority did not offer an email-reply-00 challenge.");
+            await this.health.record({ ok: false, error: refusal, code: "no-email-challenge" }).catch(() => undefined);
+            throw refusal;
         }
+        await this.health.record({ ok: true }).catch(() => undefined);
 
         const enrollmentId: string = crypto.randomUUID();
         const { from: challengeFrom, token: tokenPart2 } = challenge;
@@ -622,9 +691,13 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * branch on its `status`: `"invalid"` marks this enrollment `"failed"`; `"pending"`/`"processing"`
      * does nothing (still waiting on the CA); `"ready"` finalizes with the original CSR; `"valid"`
      * downloads the certificate and marks this enrollment `"issued"`.
+     *
+     * Resolves `true` when the step spoke to the CA and it answered (what `AcmeEnrollmentDriverJob` records as the CA being healthy), `false` when there
+     * was nothing to do or nothing needed the CA. An error thrown for a failure of the CA side carries `enrollmentPhase: "ca"` (`"reply"` for the
+     * reply e-mail not being relayed), so the job can tell an unreachable CA from a mail problem.
      */
-    public async advanceEnrollment(enrollmentId: string): Promise<void> {
-        await this.advance(enrollmentId, false);
+    public async advanceEnrollment(enrollmentId: string): Promise<boolean> {
+        return await this.advance(enrollmentId, false);
     }
 
     /**
@@ -635,11 +708,11 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * also asks the CA about the order while the challenge e-mail hasn't arrived, which is how a request the CA has already
      * given up on is noticed before the e-mail is ever due.
      */
-    private async advance(enrollmentId: string, peekOrder: boolean): Promise<void> {
-        await this.withEnrollmentLock(enrollmentId, async () => {
+    private async advance(enrollmentId: string, peekOrder: boolean): Promise<boolean> {
+        return await this.withEnrollmentLock(enrollmentId, async (): Promise<boolean> => {
             const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
             if (enrollment.status !== "pending") {
-                return;
+                return false;
             }
             if (this.hasExpired(enrollment, Date.now())) {
                 await this.mutateEnrollment(enrollmentId, (current) => {
@@ -648,14 +721,14 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
                         retryable: true,
                     });
                 });
-                return;
+                return false;
             }
 
             await this.mutateEnrollment(enrollmentId, (current) => {
                 current.lastCheckedAt = new Date().toISOString();
             });
             if (enrollment.digest === undefined && !peekOrder) {
-                return;
+                return false;
             }
 
             let phase: "reply" | "ca" = "ca";
@@ -678,6 +751,9 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
                 }
             } catch (err: any) {
                 await this.recordTransientFailure(enrollmentId, err, phase);
+                if (err && typeof err === "object") {
+                    err.enrollmentPhase = phase;
+                }
                 throw err;
             }
             if (enrollment.lastError) {
@@ -685,6 +761,8 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
                     delete current.lastError;
                 });
             }
+            // Every branch above that reaches here made a request the CA answered (the getOrder(), completeChallenge() or finalizeOrder() call).
+            return true;
         });
     }
 
@@ -734,7 +812,7 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
         try {
             const failure: FailureClass = classifyTransientFailure(err, phase);
             await this.mutateEnrollment(enrollmentId, (current) => {
-                current.lastError = { code: failure.errorCode, message: String(err?.message ?? err), at: new Date().toISOString() };
+                current.lastError = { code: failure.errorCode, message: sanitizeErrorText(err), at: new Date().toISOString() };
             });
         } catch (writeErr: any) {
             this.logger?.warn(`Rfc8823AcmeSigningCertificateEnrollment: could not record the failure of enrollment '${enrollmentId}': ${writeErr?.message}`);
@@ -847,6 +925,28 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
         }));
     }
 
+    /** See `SigningCertificateEnrollment.listAdminEnrollments()` - read-only here: an automatic request is never uploaded to or rejected by hand. */
+    public async listAdminEnrollments(): Promise<AdminEnrollmentSummary[]> {
+        return Object.entries(await this.loadStore())
+            .filter(([, enrollment]) => enrollment.status === "pending" || (enrollment.status === "issued" && enrollment.installedAt === undefined))
+            .map(([enrollmentId, enrollment]) => {
+                const progress: EnrollmentProgress = this.toProgress(enrollment);
+                return {
+                    enrollmentId,
+                    identity: enrollment.identity,
+                    ...(enrollment.mailboxUid ? { mailboxUid: enrollment.mailboxUid } : {}),
+                    requestedAt: enrollment.createdAt,
+                    status: enrollment.status,
+                    provider: "rfc8823" as const,
+                    stage: progress.stage,
+                    ...(enrollment.lastError ? { lastError: sanitizeErrorText(enrollment.lastError.message) } : {}),
+                    canUpload: false,
+                    ...(enrollment.status === "pending" ? { uploadBlockedReason: "This request is issued automatically by the certificate authority; a certificate cannot be uploaded for it." } : {}),
+                };
+            })
+            .sort((a, b) => Date.parse(b.requestedAt) - Date.parse(a.requestedAt));
+    }
+
     /** The `EnrollmentProgress` of `enrollment` - see `pki/EnrollmentStages.ts` for the stages and `EnrollmentProgress` for each field. */
     private toProgress(enrollment: PendingEnrollment): EnrollmentProgress {
         const milestones: AcmeMilestones = {
@@ -862,6 +962,7 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
         };
         const { stage, stages, progress } = computeStages(milestones);
         const result: EnrollmentProgress = {
+            provider: "rfc8823",
             status: enrollment.status,
             certificate: enrollment.certificate,
             error: enrollment.error,

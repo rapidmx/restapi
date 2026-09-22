@@ -19,7 +19,14 @@ import {
     RouteDecorators,
 } from "@rapidrest/service-core";
 import { EncryptionCertificateAuthority } from "../pki/EncryptionCertificateAuthority.js";
-import { EnrollmentBinding, EnrollmentProgress, EnrollmentSummary, SigningCertificateEnrollment } from "../pki/SigningCertificateEnrollment.js";
+import {
+    EnrollmentBinding,
+    EnrollmentProgress,
+    EnrollmentSummary,
+    providerKindOf,
+    SIGNING_ENROLLMENT_UNKNOWN,
+    SigningCertificateEnrollment,
+} from "../pki/SigningCertificateEnrollment.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import {
@@ -719,9 +726,12 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     /** The enrollment's status with its progress - `describeProgress()` where the implementation has it, else the plain status. */
     private async enrollmentProgress(enrollmentId: string): Promise<EnrollmentProgress> {
         const enrollment: SigningCertificateEnrollment = this.signingCertificateEnrollment!;
-        return typeof enrollment.describeProgress === "function"
-            ? await enrollment.describeProgress(enrollmentId)
-            : ((await enrollment.checkStatus(enrollmentId)) as EnrollmentProgress);
+        const progress: EnrollmentProgress =
+            typeof enrollment.describeProgress === "function"
+                ? await enrollment.describeProgress(enrollmentId)
+                : ((await enrollment.checkStatus(enrollmentId)) as EnrollmentProgress);
+        // `provider` on every status: an implementation that reports its own wins, the others are told apart by what they are.
+        return { ...progress, provider: progress.provider ?? providerKindOf(enrollment) };
     }
 
     /**
@@ -738,7 +748,15 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         this.requireMailboxOwner(mailbox, user);
-        await this.requireEnrollmentOf(mailbox, enrollmentId);
+        const found: "own" | "other" | "unknown" = await this.findEnrollmentOf(mailbox, enrollmentId);
+        if (found === "unknown") {
+            // Cancelling is idempotent: an id this backend doesn't know (typically one left over from the backend a deployment used before) is already as
+            // cancelled as it can be. Answered in the shape of a cancelled request, so a client clears its stale id and offers a new request.
+            return this.unknownEnrollmentProgress();
+        }
+        if (found === "other") {
+            throw new ApiError(SIGNING_ENROLLMENT_UNKNOWN, 404, "No signing certificate request with this id exists for this mailbox.");
+        }
         if (typeof this.signingCertificateEnrollment!.cancelEnrollment !== "function") {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
@@ -753,6 +771,16 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
      * on an implementation that can't say (`describeEnrollment()` absent).
      */
     private async requireEnrollmentOf(mailbox: M, enrollmentId: string): Promise<void> {
+        if ((await this.findEnrollmentOf(mailbox, enrollmentId)) !== "own") {
+            // Always this code, for an id the active backend doesn't know and for another mailbox's alike (which one it is stays private): the client
+            // clears its stale id and lets the user request again.
+            throw new ApiError(SIGNING_ENROLLMENT_UNKNOWN, 404, "No signing certificate request with this id exists for this mailbox.");
+        }
+    }
+
+    /** Whether `enrollmentId` is an enrollment of the active backend that belongs to `mailbox` (`"own"`), belongs to another (`"other"`), or is not one the
+     * backend knows (`"unknown"`). A failure of the backend itself (5xx, e.g. the `Null` default's "not available") propagates. */
+    private async findEnrollmentOf(mailbox: M, enrollmentId: string): Promise<"own" | "other" | "unknown"> {
         const describe = this.signingCertificateEnrollment?.describeEnrollment;
         let binding: EnrollmentBinding | undefined;
         try {
@@ -764,9 +792,27 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             }
             binding = undefined;
         }
-        if (!binding || !this.enrollmentBelongsTo(binding, mailbox)) {
-            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        if (!binding) {
+            return "unknown";
         }
+        return this.enrollmentBelongsTo(binding, mailbox) ? "own" : "other";
+    }
+
+    /** The answer to cancelling a request the backend does not know: a cancelled, retryable one with nothing left to show. */
+    private unknownEnrollmentProgress(): EnrollmentProgress {
+        const now: string = new Date().toISOString();
+        return {
+            provider: providerKindOf(this.signingCertificateEnrollment!),
+            status: "failed",
+            error: "This request no longer exists.",
+            stage: "failed",
+            stages: [],
+            progress: 0,
+            requestedAt: now,
+            updatedAt: now,
+            errorCode: "cancelled",
+            retryable: true,
+        };
     }
 
     private enrollmentBelongsTo(binding: { identity: string; mailboxUid?: string }, mailbox: M): boolean {

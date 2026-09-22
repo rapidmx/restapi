@@ -11,6 +11,7 @@ import {
     FocusedInboxOverrideMongo,
     FolderMongo,
     IngestQueueEntryMongo,
+    KeyVaultMongo,
     MailboxMongo,
     MailFilterRuleMongo,
     MessageMongo,
@@ -46,4 +47,5 @@ export class ScanQueueJobMongo extends ScanQueueJob<
     protected focusedInboxOverrideClass: any = FocusedInboxOverrideMongo;
     protected contactClass: any = ContactMongo;
     protected domainClass: any = DomainMongo;
+    protected keyVaultClass: any = KeyVaultMongo;
 }

@@ -72,6 +72,8 @@ export const ROUTE_TABLE: Record<string, RouteRow> = {
     PluginRoute: { kind: "admin", base: "BasePluginRoute", gate: "trusted; audited" },
     RetentionPolicyRoute: { kind: "admin", base: "BaseRetentionPolicyRoute", gate: "trusted; audited" },
     SetupRoute: { kind: "admin", base: "BaseSetupRoute", gate: "trusted (first-run wizard); audited" },
+    SigningEnrollmentAdminRoute: { kind: "admin", base: "BaseSigningEnrollmentAdminRoute", gate: "trusted AND elevated (assertAdminScope) on every call; request metadata, CSRs and issued certificates only - never a key, and nothing of any mailbox; audited" },
+    SigningEnrollmentInfoRoute: { kind: "admin", base: "BaseSigningEnrollmentInfoRoute", gate: "any signed-in user reads which backend issues signing certificates and how it is doing; nothing per mailbox or per request" },
     TransportRuleRoute: { kind: "admin", base: "BaseTransportRuleRoute", gate: "trusted manages org transport rules; audited" },
     // --- public / machine ------------------------------------------------------------------------------------------
     KeyDiscoveryRoute: { kind: "public", base: "BaseKeyDiscoveryRoute", gate: "anonymous, rate limited: the published public keys of a mailbox, by hash" },
