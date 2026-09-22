@@ -36,6 +36,11 @@
 
 ### Fixes
 
+- **Autodiscover never actually worked on any deployment.** `mail:autodiscover:public_url` - the setting `@rapidmx/autodiscover-plugin` needs to answer a client at all - had no server-side default and no
+  mapping into `DnsSetupUtils`'s checklist, so even a deployment with perfect DNS got a silent 404/warning. The domain DNS setup checklist now recommends the two records that actually make a real client
+  succeed once the plugin's own setting is configured: an `autodiscover.<domain>` `CNAME`/`A` record (`autodiscover_cname`, needs its own TLS coverage) and a `_autodiscover._tcp.<domain>` `SRV` record
+  (`autodiscover_srv`, points at the same already-certed host, so it needs no second certificate - the one to prefer on a Let's-Encrypt-rate-limited deployment). Both are omitted entirely when the
+  Autodiscover plugin isn't active. New `DnsResolver.resolveCname()`/`resolveSrv()`.
 - **Encrypted messages between accounts on the same server failed with "the client shows the error that it failed to discover the recipient's key" even with both keys published.** `GET /mailbox/:id/keys/lookup`
   only ever performed remote federation (DNS `_rapidmx` lookup + a peer's public discovery endpoint) - a recipient on this same deployment (any domain it hosts, including a plain same-server, same-domain
   pair) had no path at all and always 404'd. It's now answered from the local mailbox first (its primary address, an alias, or a plus-tagged address, case-insensitively), with the exact response shape the

@@ -9,6 +9,14 @@ export interface DnsMxRecord {
     exchange: string;
 }
 
+/** One SRV record (RFC 2782) - the priority/weight-ordered target host and port a service is advertised on. */
+export interface DnsSrvRecord {
+    priority: number;
+    weight: number;
+    port: number;
+    target: string;
+}
+
 /**
  * A pluggable DNS lookup, used by `Domain` ownership verification (`util/DomainVerificationUtils.ts`)
  * and DNS setup checks (`util/DnsSetupUtils.ts`). Kept behind an interface - like
@@ -32,4 +40,22 @@ export interface DnsResolver {
      * @throws if the lookup fails (NXDOMAIN, no MX records, network error, etc.)
      */
     resolveMx(hostname: string): Promise<DnsMxRecord[]>;
+
+    /**
+     * Resolves the CNAME records for `hostname` - used to check the `autodiscover.<domain>` alias
+     * recommended for MS-OXDISCO client discovery (see `util/DnsSetupUtils.ts`'s
+     * `checkAutodiscoverCname()`).
+     *
+     * @throws if the lookup fails (NXDOMAIN, no CNAME records, network error, etc.)
+     */
+    resolveCname(hostname: string): Promise<string[]>;
+
+    /**
+     * Resolves the SRV records for `hostname` - used to check the `_autodiscover._tcp.<domain>` record
+     * recommended for MS-OXDISCO client discovery (see `util/DnsSetupUtils.ts`'s
+     * `checkAutodiscoverSrv()`).
+     *
+     * @throws if the lookup fails (NXDOMAIN, no SRV records, network error, etc.)
+     */
+    resolveSrv(hostname: string): Promise<DnsSrvRecord[]>;
 }

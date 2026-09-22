@@ -17,10 +17,12 @@ function makeDomain(overrides?: Partial<Domain>): Domain {
     } as Domain;
 }
 
-function makeResolver(overrides?: { resolveTxt?: any; resolveMx?: any }) {
+function makeResolver(overrides?: { resolveTxt?: any; resolveMx?: any; resolveCname?: any; resolveSrv?: any }) {
     return {
         resolveTxt: overrides?.resolveTxt ?? vi.fn().mockRejectedValue(new Error("no records")),
         resolveMx: overrides?.resolveMx ?? vi.fn().mockRejectedValue(new Error("no records")),
+        resolveCname: overrides?.resolveCname ?? vi.fn().mockRejectedValue(new Error("no records")),
+        resolveSrv: overrides?.resolveSrv ?? vi.fn().mockRejectedValue(new Error("no records")),
     };
 }
 
@@ -29,12 +31,22 @@ function findCheck(checks: Awaited<ReturnType<typeof checkDnsSetup>>, type: stri
 }
 
 describe("checkDnsSetup() Tests", () => {
-    it("Returns all 5 record types.", async () => {
+    it("Returns the 5 base record types when no autodiscover hostname is given (plugin not active).", async () => {
         const resolver = makeResolver();
 
         const checks = await checkDnsSetup(resolver, makeDomain(), "");
 
         expect(checks.map((c) => c.type).sort()).toEqual(["dkim", "dmarc", "mx", "ownership", "spf"].sort());
+    });
+
+    it("Also returns the 2 autodiscover record types once an autodiscover hostname (even empty) is given.", async () => {
+        const resolver = makeResolver();
+
+        const checks = await checkDnsSetup(resolver, makeDomain(), "", "");
+
+        expect(checks.map((c) => c.type).sort()).toEqual(
+            ["autodiscover_cname", "autodiscover_srv", "dkim", "dmarc", "mx", "ownership", "spf"].sort(),
+        );
     });
 
     describe("ownership", () => {
@@ -242,6 +254,152 @@ describe("checkDnsSetup() Tests", () => {
             const dmarc = findCheck(checks, "dmarc");
             expect(dmarc.found).toBe(false);
             expect(dmarc.matches).toBe(false);
+        });
+    });
+
+    describe("autodiscover_cname", () => {
+        it("Is left out of the result entirely when no autodiscover hostname is given (plugin not active).", async () => {
+            const resolver = makeResolver();
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "");
+
+            expect(checks.find((c) => c.type === "autodiscover_cname")).toBeUndefined();
+        });
+
+        it("Is not configured when the autodiscover hostname is empty (plugin active, public_url unset).", async () => {
+            const resolver = makeResolver();
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "", "");
+
+            const cname = findCheck(checks, "autodiscover_cname");
+            expect(cname.configured).toBe(false);
+            expect(cname.found).toBe(false);
+            expect(cname.matches).toBe(false);
+            expect(cname.recommendedValue).toBeUndefined();
+            expect(resolver.resolveCname).not.toHaveBeenCalled();
+        });
+
+        it("Recommends autodiscover.<domain> pointing at the configured hostname.", async () => {
+            const resolver = makeResolver();
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "", "mail.example.com");
+
+            const cname = findCheck(checks, "autodiscover_cname");
+            expect(cname.configured).toBe(true);
+            expect(cname.recordName).toBe("autodiscover.example.com");
+            expect(cname.recommendedValue).toBe("mail.example.com");
+        });
+
+        it("Matches when the live CNAME target equals the configured hostname.", async () => {
+            const resolver = makeResolver({ resolveCname: vi.fn().mockResolvedValue(["mail.example.com."]) });
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "", "mail.example.com");
+
+            const cname = findCheck(checks, "autodiscover_cname");
+            expect(cname.found).toBe(true);
+            expect(cname.matches).toBe(true);
+            expect(cname.actualValue).toBe("mail.example.com.");
+        });
+
+        it("Does not match when the live CNAME points elsewhere.", async () => {
+            const resolver = makeResolver({ resolveCname: vi.fn().mockResolvedValue(["other.example.com"]) });
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "", "mail.example.com");
+
+            const cname = findCheck(checks, "autodiscover_cname");
+            expect(cname.found).toBe(true);
+            expect(cname.matches).toBe(false);
+        });
+
+        it("Treats a resolver failure as not found/not matching, without throwing.", async () => {
+            const resolver = makeResolver({ resolveCname: vi.fn().mockRejectedValue(new Error("NXDOMAIN")) });
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "", "mail.example.com");
+
+            const cname = findCheck(checks, "autodiscover_cname");
+            expect(cname.found).toBe(false);
+            expect(cname.matches).toBe(false);
+        });
+    });
+
+    describe("autodiscover_srv", () => {
+        it("Is left out of the result entirely when no autodiscover hostname is given (plugin not active).", async () => {
+            const resolver = makeResolver();
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "");
+
+            expect(checks.find((c) => c.type === "autodiscover_srv")).toBeUndefined();
+        });
+
+        it("Is not configured when the autodiscover hostname is empty (plugin active, public_url unset).", async () => {
+            const resolver = makeResolver();
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "", "");
+
+            const srv = findCheck(checks, "autodiscover_srv");
+            expect(srv.configured).toBe(false);
+            expect(srv.found).toBe(false);
+            expect(srv.matches).toBe(false);
+            expect(srv.recommendedValue).toBeUndefined();
+            expect(resolver.resolveSrv).not.toHaveBeenCalled();
+        });
+
+        it("Recommends _autodiscover._tcp.<domain> pointing at the configured hostname on port 443.", async () => {
+            const resolver = makeResolver();
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "", "mail.example.com");
+
+            const srv = findCheck(checks, "autodiscover_srv");
+            expect(srv.configured).toBe(true);
+            expect(srv.recordName).toBe("_autodiscover._tcp.example.com");
+            expect(srv.recommendedValue).toBe("0 0 443 mail.example.com");
+        });
+
+        it("Matches when a live SRV record's target and port equal the recommendation.", async () => {
+            const resolver = makeResolver({
+                resolveSrv: vi.fn().mockResolvedValue([{ priority: 0, weight: 0, port: 443, target: "mail.example.com." }]),
+            });
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "", "mail.example.com");
+
+            const srv = findCheck(checks, "autodiscover_srv");
+            expect(srv.found).toBe(true);
+            expect(srv.matches).toBe(true);
+            expect(srv.actualValue).toBe("0 0 443 mail.example.com.");
+        });
+
+        it("Does not match when the live SRV record points at a different target.", async () => {
+            const resolver = makeResolver({
+                resolveSrv: vi.fn().mockResolvedValue([{ priority: 0, weight: 0, port: 443, target: "other.example.com" }]),
+            });
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "", "mail.example.com");
+
+            const srv = findCheck(checks, "autodiscover_srv");
+            expect(srv.found).toBe(true);
+            expect(srv.matches).toBe(false);
+        });
+
+        it("Does not match when the live SRV record's port differs, even at the right target.", async () => {
+            const resolver = makeResolver({
+                resolveSrv: vi.fn().mockResolvedValue([{ priority: 0, weight: 0, port: 8443, target: "mail.example.com" }]),
+            });
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "", "mail.example.com");
+
+            const srv = findCheck(checks, "autodiscover_srv");
+            expect(srv.found).toBe(true);
+            expect(srv.matches).toBe(false);
+        });
+
+        it("Treats a resolver failure as not found/not matching, without throwing.", async () => {
+            const resolver = makeResolver({ resolveSrv: vi.fn().mockRejectedValue(new Error("NXDOMAIN")) });
+
+            const checks = await checkDnsSetup(resolver, makeDomain(), "", "mail.example.com");
+
+            const srv = findCheck(checks, "autodiscover_srv");
+            expect(srv.found).toBe(false);
+            expect(srv.matches).toBe(false);
         });
     });
 

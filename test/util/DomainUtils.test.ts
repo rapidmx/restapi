@@ -5,7 +5,13 @@
 // Isolated unit tests for getVerifiedDomainNames() - objectFactory/repo are hand-built mocks, no real DB,
 // same rationale as test/util/AuditLogUtils.test.ts (a fresh stub class per test so the module-level
 // repo-cache WeakMap can't leak between tests).
-import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames, isInternalAddress } from "../../src/util/DomainUtils.js";
+import {
+    classifyRecipientTier,
+    createFederatedPeerCheck,
+    extractPublicHostname,
+    getVerifiedDomainNames,
+    isInternalAddress,
+} from "../../src/util/DomainUtils.js";
 
 function makeStubClass(): any {
     return class StubDomain {
@@ -161,5 +167,32 @@ describe("createFederatedPeerCheck() Tests", () => {
 
         expect(result).toBe(false);
         expect(resolver.resolveTxt).not.toHaveBeenCalled();
+    });
+});
+
+describe("extractPublicHostname() Tests", () => {
+    it("Returns the hostname of a valid https:// URL.", () => {
+        expect(extractPublicHostname("https://mail.example.com")).toBe("mail.example.com");
+    });
+
+    it("Returns the hostname of a valid https:// URL with a path.", () => {
+        expect(extractPublicHostname("https://mail.example.com/some/path")).toBe("mail.example.com");
+    });
+
+    it("Returns '' for an empty or whitespace-only value.", () => {
+        expect(extractPublicHostname("")).toBe("");
+        expect(extractPublicHostname("   ")).toBe("");
+    });
+
+    it("Returns '' for a value that isn't a parseable URL at all.", () => {
+        expect(extractPublicHostname("not a url")).toBe("");
+    });
+
+    it("Returns '' for a plain http:// URL (not https).", () => {
+        expect(extractPublicHostname("http://mail.example.com")).toBe("");
+    });
+
+    it("Returns '' for a URL carrying credentials.", () => {
+        expect(extractPublicHostname("https://user:pass@mail.example.com")).toBe("");
     });
 });

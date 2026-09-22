@@ -15,7 +15,7 @@
 import "reflect-metadata";
 import * as x509 from "@peculiar/x509";
 import type { BlobPutOptions, BlobRange, BlobStore } from "../src/blob/BlobStore.js";
-import type { DnsMxRecord, DnsResolver } from "../src/dns/DnsResolver.js";
+import type { DnsMxRecord, DnsResolver, DnsSrvRecord } from "../src/dns/DnsResolver.js";
 import type {
     CandidateQuery,
     CandidateResultPage,
@@ -255,6 +255,8 @@ export class RecordingMailTransport implements MailTransport {
 export class StaticDnsResolver implements DnsResolver {
     public records: Map<string, string[][]> = new Map();
     public mxRecords: Map<string, DnsMxRecord[]> = new Map();
+    public cnameRecords: Map<string, string[]> = new Map();
+    public srvRecords: Map<string, DnsSrvRecord[]> = new Map();
 
     public async resolveTxt(hostname: string): Promise<string[][]> {
         const records: string[][] | undefined = this.records.get(hostname);
@@ -268,6 +270,22 @@ export class StaticDnsResolver implements DnsResolver {
         const records: DnsMxRecord[] | undefined = this.mxRecords.get(hostname);
         if (!records) {
             throw new Error(`StaticDnsResolver: no MX records for '${hostname}'`);
+        }
+        return records;
+    }
+
+    public async resolveCname(hostname: string): Promise<string[]> {
+        const records: string[] | undefined = this.cnameRecords.get(hostname);
+        if (!records) {
+            throw new Error(`StaticDnsResolver: no CNAME records for '${hostname}'`);
+        }
+        return records;
+    }
+
+    public async resolveSrv(hostname: string): Promise<DnsSrvRecord[]> {
+        const records: DnsSrvRecord[] | undefined = this.srvRecords.get(hostname);
+        if (!records) {
+            throw new Error(`StaticDnsResolver: no SRV records for '${hostname}'`);
         }
         return records;
     }

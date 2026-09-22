@@ -15,17 +15,22 @@ import {
 } from "@rapidrest/service-core";
 import type { DkimKeyProvider } from "../dkim/DkimKeyProvider.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
+import { PluginRegistry } from "../plugins/PluginRegistry.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { checkDnsSetup, type DnsRecordCheck } from "../util/DnsSetupUtils.js";
 import { checkDomainVerification } from "../util/DomainVerificationUtils.js";
-import { isReservedDomainName } from "../util/DomainUtils.js";
+import { extractPublicHostname, isReservedDomainName } from "../util/DomainUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
 import { AuditAction, Domain } from "../models/types.js";
 const { Get, Param, Post, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 const { Config, Inject } = ObjectDecorators;
 
 const DMARC_POLICIES = new Set(["none", "quarantine", "reject"]);
+
+/** The plugin package the Autodiscover DNS setup checklist entries (`autodiscover_cname`/`autodiscover_srv`)
+ * are gated on - mirrors `BaseAutodiscoverRoute`'s own `ACTIVESYNC_PLUGIN`/`MAPI_PLUGIN` gating constants. */
+const AUTODISCOVER_PLUGIN = "@rapidmx/autodiscover-plugin";
 
 /** The fields only this class (and `DomainVerificationJob`) ever set - see `update()`. */
 const SERVER_MANAGED_DOMAIN_FIELDS: string[] = ["uid", "verified", "verificationToken", "verifiedAt", "lastCheckedAt"];
@@ -72,6 +77,13 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
      * pattern as `mail:auth_server_url`. */
     @Config("mail:dns:mx_hostname", "")
     private mxHostname: string = "";
+
+    /** The same `mail:autodiscover:public_url` `@rapidmx/autodiscover-plugin` itself reads (see
+     * `BaseAutodiscoverRoute`) - used only to derive the hostname `dnsSetup()` recommends for the
+     * `autodiscover.<domain>` CNAME and `_autodiscover._tcp.<domain>` SRV records, and only while that
+     * plugin is active. */
+    @Config("mail:autodiscover:public_url", "")
+    private autodiscoverPublicUrl: string = "";
 
     private newVerificationToken(): string {
         return crypto.randomBytes(32).toString("base64url");
@@ -347,11 +359,13 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
 
     /**
      * Read-only DNS setup status for `domain` - computes and live-checks every mail-related DNS record
-     * this server recommends (ownership TXT, MX, SPF, DKIM, DMARC - see `checkDnsSetup()`'s own doc
-     * comment for the exact per-type logic) so an admin console can show a single "here's what to add to
-     * your DNS, and whether it's live yet" checklist. Unlike `verify()`, this never mutates the domain or
-     * writes an `AuditLogEntry` - nothing here has ownership verification's security consequence, it's
-     * purely diagnostic and always computed fresh.
+     * this server recommends (ownership TXT, MX, SPF, DKIM, DMARC, and, only while
+     * `@rapidmx/autodiscover-plugin` is active, the `autodiscover.<domain>` CNAME and
+     * `_autodiscover._tcp.<domain>` SRV records - see `checkDnsSetup()`'s own doc comment for the exact
+     * per-type logic) so an admin console can show a single "here's what to add to your DNS, and whether
+     * it's live yet" checklist. Unlike `verify()`, this never mutates the domain or writes an
+     * `AuditLogEntry` - nothing here has ownership verification's security consequence, it's purely
+     * diagnostic and always computed fresh.
      */
     @RequiresTrustedRole()
     @Get("/:id/dns-setup")
@@ -379,6 +393,9 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
             }
         }
 
-        return await checkDnsSetup(this.dnsResolver!, domain, this.mxHostname);
+        const autodiscoverHostname: string | undefined = PluginRegistry.isActive(AUTODISCOVER_PLUGIN)
+            ? extractPublicHostname(this.autodiscoverPublicUrl)
+            : undefined;
+        return await checkDnsSetup(this.dnsResolver!, domain, this.mxHostname, autodiscoverHostname);
     }
 }

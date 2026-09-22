@@ -3049,3 +3049,33 @@ files (`--coverage.include` scoped run); a genuinely exclusive whole-repo run co
 contamination signature (`MongoNetworkError: read ECONNRESET` on the shared port-9999 instance; SQL ACL/contact-count mismatches
 consistent with the shared sqlite file) in files outside this diff - no failure in either run named any file this fix touches for a
 reason that reproduced in isolation.
+
+### 2026-09-22 - Autodiscover never worked on any deployment: the setting was never wired, and the DNS checklist never mentioned it
+
+Two independent gaps, both closed. (1) `@rapidmx/autodiscover-plugin`'s `BaseAutodiscoverRoute` has always needed `mail:autodiscover:public_url`
+to answer anything - the plugin's own `package.json` already declared it as an admin-console setting, but server's `config.mongo.ts`/`config.sql.ts`
+had no default block for it at all (unlike every other plugin setting of this shape, e.g. `mail:booking:public_url`), so it sat unset on every
+real deployment; fixed by adding the matching `autodiscover: { public_url: "" }` block. The plugin's own stale doc-comment example (describing
+an old subclass-override design `BaseAutodiscoverRoute` no longer uses) was also rewritten to describe the real, current config-driven mechanism.
+(2) `util/DnsSetupUtils.ts`'s `DnsRecordType` never had an Autodiscover entry, so an administrator setting up a domain had no idea anything else
+was needed even once `public_url` is set - real client discovery (MS-OXDISCO) also needs `autodiscover.<domain>` reachable. New `autodiscover_cname`
+(`autodiscover.<domain>` CNAME/A to the same host `public_url` names - needs its own TLS coverage) and `autodiscover_srv` (`_autodiscover._tcp.<domain>`
+SRV to the same host, `0 0 443 <host>` - needs **no** extra certificate, since the target is already correctly certed; the one to recommend first on
+a Let's-Encrypt-rate-limited deployment). Both are entirely omitted from `checkDnsSetup()`'s result when `@rapidmx/autodiscover-plugin` isn't active
+(`PluginRegistry.isActive()`, checked live per request via a new `AUTODISCOVER_PLUGIN` constant in `BaseDomainRoute.ts`); when active but `public_url`
+is unset/invalid they appear with `configured: false`. New `DnsResolver.resolveCname()`/`resolveSrv()` (and their `NodeDnsResolver`/`DohDnssecDnsResolver`
+implementations - the latter over DoH, since that's the DNSSEC-validating resolver real deployments actually run). `extractPublicHostname()` lives in
+`util/DomainUtils.ts` (a pure helper, directly unit-testable) rather than inline in the route, matching that file's existing convention.
+
+Operator runbook for `powerlevel.gg` once this ships: set the Autodiscover plugin's **Public server URL** setting to this deployment's real
+`https://` host (saving restarts servers one at a time); add `_autodiscover._tcp.powerlevel.gg` **SRV** `0 0 443 <that host>` (no new certificate
+needed - do this one first); add `autodiscover.powerlevel.gg` **CNAME** to the same host as a follow-up once its own TLS coverage is sorted (a SAN
+on the existing certificate, or its own).
+
+Files: new `test/routes/mongo/DomainRouteAutodiscoverConfigured.test.ts`, `test/routes/sql/DomainRouteAutodiscoverConfigured.test.ts` (a real
+`public_url` value needs its own server instance - `@Config` binds at route construction, before `server.start()`, so it can't vary per-test in
+the shared server the way `PluginRegistry.isActive()` can); changed `src/dns/DnsResolver.ts`, `src/dns/NodeDnsResolver.ts`, `src/routes/BaseDomainRoute.ts`,
+`src/util/DnsSetupUtils.ts`, `src/util/DomainUtils.ts`, `test/dns/NodeDnsResolver.test.ts`, `test/routes/{mongo,sql}/DomainRoute.test.ts`,
+`test/testDoubles.ts` (`StaticDnsResolver` gains `cnameRecords`/`srvRecords`), `test/util/DnsSetupUtils.test.ts`, `test/util/DomainUtils.test.ts`.
+`yarn build` (lint + tsc) and `yarn test:prod` both clean: 296/296 files, 7469/7469 tests, 100/97.25/100/100 (stmts/branch/func/lines).
+

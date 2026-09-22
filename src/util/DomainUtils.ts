@@ -39,6 +39,32 @@ export function isReservedDomainName(name: string): boolean {
 }
 
 /**
+ * Extracts just the hostname to recommend for the Autodiscover DNS setup checklist entries
+ * (`util/DnsSetupUtils.ts`'s `checkAutodiscoverCname()`/`checkAutodiscoverSrv()`, called from
+ * `BaseDomainRoute.dnsSetup()`) from a `mail:autodiscover:public_url` value, or `""` when it's unset or not
+ * a safe `https://` URL to advertise. This intentionally duplicates only the narrow https-only/
+ * no-credentials shape of `BaseAutodiscoverRoute`'s own (stricter) `baseUrl` validation in the
+ * `@rapidmx/autodiscover-plugin` package - this value is never used to answer a client here, only to
+ * display a DNS recommendation, so a simple hostname extraction is enough.
+ */
+export function extractPublicHostname(value: string): string {
+    const trimmed: string = value.trim();
+    if (!trimmed) {
+        return "";
+    }
+    let url: URL;
+    try {
+        url = new URL(trimmed);
+    } catch {
+        return "";
+    }
+    if (url.protocol !== "https:" || url.username || url.password) {
+        return "";
+    }
+    return url.hostname;
+}
+
+/**
  * Returns the names of every `Domain` that is both `enabled` and `verified` - the one definition of
  * "this server's domains" consumed by `BaseMailboxRoute`, `BaseDistributionListRoute`, and
  * `BaseMailIngestRoute` alike. An empty result means "unconfigured, no restriction" everywhere it's

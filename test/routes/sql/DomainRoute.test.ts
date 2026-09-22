@@ -11,6 +11,7 @@ import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { AuditAction } from "../../../src/models/types.js";
+import { PluginRegistry } from "../../../src/plugins/PluginRegistry.js";
 import { buildVerificationTxtValue } from "../../../src/util/DomainVerificationUtils.js";
 import { registerTestDoubles, StaticDnsResolver } from "../../testDoubles.js";
 
@@ -346,6 +347,45 @@ describe("Route:DomainSQL Tests", () => {
             expect(result.status).toBe(200);
             const dkim = result.body.find((c: any) => c.type === "dkim");
             expect(dkim.configured).toBe(false);
+        });
+
+        // `mail:autodiscover:public_url` is read via `@Config` at route construction (like `mxHostname`
+        // above it), not live - so the "public_url actually set" happy path needs its own dedicated server
+        // with that value set before `server.start()`, the same pattern `KeyVaultRoute.
+        // SignEnrollmentProgress.test.ts` uses for `mail:pki:rfc8823:store_dir`. See
+        // `DomainRouteAutodiscoverConfigured.test.ts`. Only `PluginRegistry.isActive()` (checked live on
+        // every request) can vary per test in this shared server, which is what these two cover.
+        describe("autodiscover", () => {
+            afterEach(() => {
+                PluginRegistry.setLoaded([]);
+            });
+
+            it("Leaves out the autodiscover checklist entries entirely while the plugin isn't active.", async () => {
+                const domain = await createDomain({ name: "no-autodiscover-plugin.com" });
+
+                const result = await request(server.getApplication())
+                    .get(`${baseUrl}/${domain.uid}/dns-setup`)
+                    .set("Authorization", "jwt " + adminToken);
+
+                expect(result.status).toBe(200);
+                expect(result.body.find((c: any) => c.type === "autodiscover_cname")).toBeUndefined();
+                expect(result.body.find((c: any) => c.type === "autodiscover_srv")).toBeUndefined();
+            });
+
+            it("Reports the autodiscover entries as not configured once the plugin is active but public_url is unset.", async () => {
+                PluginRegistry.setLoaded([{ name: "@rapidmx/autodiscover-plugin", version: "1.0.0" }]);
+                const domain = await createDomain({ name: "autodiscover-unconfigured.com" });
+
+                const result = await request(server.getApplication())
+                    .get(`${baseUrl}/${domain.uid}/dns-setup`)
+                    .set("Authorization", "jwt " + adminToken);
+
+                expect(result.status).toBe(200);
+                const cname = result.body.find((c: any) => c.type === "autodiscover_cname");
+                const srv = result.body.find((c: any) => c.type === "autodiscover_srv");
+                expect(cname.configured).toBe(false);
+                expect(srv.configured).toBe(false);
+            });
         });
 
         it("Returns 404 for a domain that doesn't exist.", async () => {
