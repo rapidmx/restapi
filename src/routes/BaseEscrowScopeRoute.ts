@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, type JWTUser } from "@rapidrest/core";
+import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import {
     ApiErrorMessages,
     ApiErrors,
@@ -16,9 +16,19 @@ import {
 } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { evaluateEscrowApprovals, exactInFilter, resolveEscrowApprovalTtlHours } from "../util/EscrowUtils.js";
+import {
+    LOOKUP_MAX_ATTEMPTS,
+    LOOKUP_WINDOW_SECONDS,
+    MAX_PRINCIPAL_LENGTH,
+    principalNotFoundMessage,
+    resolvePrincipal,
+    type PrincipalResolutionContext,
+    type ResolvedPrincipal,
+} from "../util/PrincipalResolutionUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
 import { AuditAction, EscrowAccessRequest, EscrowScope, EscrowScopePublicKey, Mailbox, Matter } from "../models/types.js";
-const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
+const { Config } = ObjectDecorators;
+const { Get, Param, Query, RateLimit, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /** Page size for scanning a scope's matters and their access requests - see `hasActiveApprovals()`. */
 const SCAN_PAGE_SIZE = 500;
@@ -165,6 +175,19 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
      * scope. */
     protected abstract mailboxClass: any;
 
+    /** Base URL of auth-server, whose `GET /api/aliases` resolves a username or e-mail alias to a user uid (see
+     * `resolveHolder()`) - the same setting `BaseMailboxAccessRoute`'s own resolution reads. Empty: none. */
+    @Config("mail:auth_server_url", "")
+    private authServerUrl: string = "";
+
+    /** The caller's own usernames when there is no auth-server at all (local development) - the same setting as
+     * `BaseMailboxAccessRoute`'s. */
+    @Config("mail:auto_provision:static_aliases", [] as string[])
+    private staticAliases: string[] = [];
+
+    @Config("mail:auto_provision:timeout_ms", 10_000)
+    private authTimeoutMs: number = 10_000;
+
     private matterRepo?: RepoUtils<Matter>;
 
     private mailboxRepo?: RepoUtils<Mailbox>;
@@ -177,6 +200,25 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
             });
         }
         return this.mailboxRepo;
+    }
+
+    /** The query value matching one element of `Mailbox.aliasAddresses` - mirrors `BaseMailIngestRoute.
+     * aliasQueryValue()`'s identical Mongo/SQL split (`EscrowScopeRouteSQL` overrides this the same way
+     * `MailboxAccessRouteSQL` does), needed here only because `resolveHolder()` resolves a person the same way
+     * `BaseMailboxAccessRoute` does - by an owned `Mailbox`'s address, not anything about `EscrowScope` itself. */
+    protected aliasQueryValue(address: string): any {
+        return ModelUtils.literal(address);
+    }
+
+    /** This route's own `PrincipalResolutionContext` (see `resolveHolder()`). */
+    private async principalResolutionContext(): Promise<PrincipalResolutionContext> {
+        return {
+            mailboxRepo: await this.getMailboxRepo(),
+            aliasQueryValue: (address) => this.aliasQueryValue(address),
+            authServerUrl: this.authServerUrl,
+            staticAliases: this.staticAliases,
+            authTimeoutMs: this.authTimeoutMs,
+        };
     }
 
     private accessRequestRepo?: RepoUtils<EscrowAccessRequest>;
@@ -253,6 +295,32 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
                 return false;
             }
         }
+    }
+
+    /**
+     * Who `principal` - a mailbox address, an auth-server username or e-mail alias, or a user uid - is, without
+     * making them a holder: `{ userUid, displayName?, address? }`, for the escrow-scope admin screen to show the
+     * person before saving. 404 for nobody.
+     *
+     * Trusted-role-only, matching `create()`/`update()`'s own gate on `holderUserUids` - never weaker than the write
+     * it feeds: an escrow-scope holder is a highly sensitive grant (dual-control access to escrow-wrapped key
+     * material and eDiscovery `Matter`s), so resolving a candidate can never be reachable by anyone who couldn't
+     * already set the field outright. Mirrors `BaseMailboxAccessRoute.resolve()`'s exact contract (exact-match, same
+     * rate limit, same 404 wording) - see `util/PrincipalResolutionUtils.ts` for the shared resolution logic both
+     * routes call.
+     */
+    @RequiresTrustedRole()
+    @RateLimit({ perUser: true, maxAttempts: LOOKUP_MAX_ATTEMPTS, windowSeconds: LOOKUP_WINDOW_SECONDS })
+    @Get("/resolve-holder")
+    public async resolveHolder(@Query("principal") principal: unknown, @AuthUser user?: JWTUser, @Request req?: HttpRequest): Promise<ResolvedPrincipal> {
+        if (typeof principal !== "string" || principal.trim().length === 0 || principal.length > MAX_PRINCIPAL_LENGTH) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The 'principal' query parameter must be an address, username or user uid.");
+        }
+        const resolved: ResolvedPrincipal | undefined = await resolvePrincipal(await this.principalResolutionContext(), principal, user, req);
+        if (!resolved) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, principalNotFoundMessage(principal.trim()));
+        }
+        return resolved;
     }
 
     @RequiresTrustedRole()

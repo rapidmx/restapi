@@ -22,8 +22,10 @@ import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { computeKeyDiscoveryHash } from "../../../src/util/KeyDiscoveryClient.js";
+import { LOOKUP_MAX_ATTEMPTS } from "../../../src/util/PrincipalResolutionUtils.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { principalResolveEndpointSuite } from "../principalResolveEndpointSuite.js";
 
 describe("Route:MailboxSQL Tests", () => {
     const logger = Logger();
@@ -1166,5 +1168,20 @@ describe("Route:MailboxSQL Tests", () => {
         expect(result.body.uid).toBe(address.toLowerCase());
         expect(result.body.primarySmtpAddress).toBe(address.toLowerCase());
         expect(result.body.aliasAddresses).toEqual(["alias.case@example.com"]);
+    });
+
+    principalResolveEndpointSuite({
+        app: () => server.getApplication(),
+        url: `${baseUrl}/resolve-owner`,
+        trustedToken: adminToken,
+        nonTrustedToken: otherUserToken,
+        maxAttempts: LOOKUP_MAX_ATTEMPTS,
+        createOwnedMailbox: async () => {
+            const freshOwnerUid: string = uuid.v4();
+            const alias = `alias_${uuid.v4()}@example.com`;
+            const mailbox: MailboxSQL = await createMailboxSQL({ aliasAddresses: [alias] }, freshOwnerUid);
+            return { ownerUid: freshOwnerUid, address: mailbox.primarySmtpAddress, alias, displayName: mailbox.displayName };
+        },
+        freshTrustedToken: () => JWTUtils.createTokenSync(config.get("auth"), { uid: uuid.v4(), roles: ["admin"], elevated: Date.now() }),
     });
 });

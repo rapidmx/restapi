@@ -26,11 +26,20 @@ import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { hasAddressLikeDisplayName } from "../util/MimeHeaderUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { DEFAULT_MAILBOX_QUOTA_BYTES, findOrSeedMailboxPolicy } from "../util/MailboxPolicyUtils.js";
+import {
+    LOOKUP_MAX_ATTEMPTS,
+    LOOKUP_WINDOW_SECONDS,
+    MAX_PRINCIPAL_LENGTH,
+    principalNotFoundMessage,
+    resolvePrincipal,
+    type PrincipalResolutionContext,
+    type ResolvedPrincipal,
+} from "../util/PrincipalResolutionUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { normalizeUserUid } from "../util/UserUidUtils.js";
 import { coerceDateFields } from "../util/DateCoercionUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
-const { Auth, Delete, Get, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
+const { Auth, Delete, Get, Param, Post, Query, RateLimit, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /** One mailbox's owner change: `ownerUserUid` before (`previous`) and after (`next`) the update; `undefined` for none. */
 interface OwnerChange {
@@ -645,6 +654,43 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'ownerUserUid' must be a user uid.");
         }
         return uid;
+    }
+
+    /** This route's own `PrincipalResolutionContext` (see `resolveOwner()`) - `this.repoUtils` IS the mailbox repo
+     * here (unlike `BaseMailboxAccessRoute`, which builds one lazily), so no `init()` step is needed first. */
+    private principalResolutionContext(): PrincipalResolutionContext {
+        return {
+            mailboxRepo: this.repoUtils!,
+            aliasQueryValue: (address) => this.aliasQueryValue(address),
+            authServerUrl: this.authServerUrl,
+            staticAliases: this.staticAliases,
+            authTimeoutMs: this.autoProvisionTimeoutMs,
+        };
+    }
+
+    /**
+     * Who `principal` - a mailbox address, an auth-server username or e-mail alias, or a user uid - is, without
+     * assigning anything: `{ userUid, displayName?, address? }`, for an administrator naming a mailbox's owner (at
+     * creation, or a future reassignment) to confirm before saving. 404 for nobody.
+     *
+     * Trusted-role-only, matching `TRUSTED_ONLY_FIELDS`'s own gate on `ownerUserUid` (`validateTrustedOnlyFields()`
+     * refuses a non-trusted caller's change to it outright) - a non-trusted caller can only ever be the owner of their
+     * own newly self-created mailbox anyway (`create()` forces it), so has no legitimate use for resolving anyone.
+     * Mirrors `BaseMailboxAccessRoute.resolve()`'s exact contract (exact-match, same rate limit, same 404 wording) -
+     * see `util/PrincipalResolutionUtils.ts` for the shared resolution logic both routes call.
+     */
+    @RequiresTrustedRole()
+    @RateLimit({ perUser: true, maxAttempts: LOOKUP_MAX_ATTEMPTS, windowSeconds: LOOKUP_WINDOW_SECONDS })
+    @Get("/resolve-owner")
+    public async resolveOwner(@Query("principal") principal: unknown, @AuthUser user?: JWTUser, @Request req?: HttpRequest): Promise<ResolvedPrincipal> {
+        if (typeof principal !== "string" || principal.trim().length === 0 || principal.length > MAX_PRINCIPAL_LENGTH) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The 'principal' query parameter must be an address, username or user uid.");
+        }
+        const resolved: ResolvedPrincipal | undefined = await resolvePrincipal(this.principalResolutionContext(), principal, user, req);
+        if (!resolved) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, principalNotFoundMessage(principal.trim()));
+        }
+        return resolved;
     }
 
     /**

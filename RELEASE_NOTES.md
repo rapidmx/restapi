@@ -41,6 +41,10 @@
   succeed once the plugin's own setting is configured: an `autodiscover.<domain>` `CNAME`/`A` record (`autodiscover_cname`, needs its own TLS coverage) and a `_autodiscover._tcp.<domain>` `SRV` record
   (`autodiscover_srv`, points at the same already-certed host, so it needs no second certificate - the one to prefer on a Let's-Encrypt-rate-limited deployment). Both are omitted entirely when the
   Autodiscover plugin isn't active. New `DnsResolver.resolveCname()`/`resolveSrv()`.
+- **Granting a mailbox's ownership or an escrow scope's key holders took a raw user uid with no way to know whose it was.** New `GET /mail/mailboxes/resolve-owner` and `GET /escrow/scopes/resolve-holder`
+  (exact-match only, same address/username/alias/uid resolution `mail/mailboxes/:id/access/resolve` already used - now shared via `util/PrincipalResolutionUtils.ts` - never a fuzzy directory search),
+  each gated at least as strictly as the write it feeds (`ownerUserUid`: a trusted role; escrow `holderUserUids`: a trusted role, matching `create()`/`update()`). A typed uid was previously only checked
+  for being UUID-shaped, never resolved to a real person.
 - **Encrypted messages between accounts on the same server failed with "the client shows the error that it failed to discover the recipient's key" even with both keys published.** `GET /mailbox/:id/keys/lookup`
   only ever performed remote federation (DNS `_rapidmx` lookup + a peer's public discovery endpoint) - a recipient on this same deployment (any domain it hosts, including a plain same-server, same-domain
   pair) had no path at all and always 404'd. It's now answered from the local mailbox first (its primary address, an alias, or a plus-tagged address, case-insensitively), with the exact response shape the

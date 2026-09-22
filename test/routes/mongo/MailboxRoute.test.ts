@@ -21,9 +21,11 @@ import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { computeKeyDiscoveryHash } from "../../../src/util/KeyDiscoveryClient.js";
+import { LOOKUP_MAX_ATTEMPTS } from "../../../src/util/PrincipalResolutionUtils.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { principalResolveEndpointSuite } from "../principalResolveEndpointSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -1208,5 +1210,20 @@ describe("Route:MailboxMongo Tests", () => {
         expect(result.body.uid).toBe(address.toLowerCase());
         expect(result.body.primarySmtpAddress).toBe(address.toLowerCase());
         expect(result.body.aliasAddresses).toEqual(["alias.case@example.com"]);
+    });
+
+    principalResolveEndpointSuite({
+        app: () => server.getApplication(),
+        url: `${baseUrl}/resolve-owner`,
+        trustedToken: adminToken,
+        nonTrustedToken: otherUserToken,
+        maxAttempts: LOOKUP_MAX_ATTEMPTS,
+        createOwnedMailbox: async () => {
+            const freshOwnerUid: string = uuid.v4();
+            const alias = `alias_${uuid.v4()}@example.com`;
+            const mailbox: MailboxMongo = await createMailboxMongo({ aliasAddresses: [alias] }, freshOwnerUid);
+            return { ownerUid: freshOwnerUid, address: mailbox.primarySmtpAddress, alias, displayName: mailbox.displayName };
+        },
+        freshTrustedToken: () => JWTUtils.createTokenSync(config.get("auth"), { uid: uuid.v4(), roles: ["admin"], elevated: Date.now() }),
     });
 });

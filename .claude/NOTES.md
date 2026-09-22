@@ -3079,3 +3079,27 @@ the shared server the way `PluginRegistry.isActive()` can); changed `src/dns/Dns
 `test/testDoubles.ts` (`StaticDnsResolver` gains `cnameRecords`/`srvRecords`), `test/util/DnsSetupUtils.test.ts`, `test/util/DomainUtils.test.ts`.
 `yarn build` (lint + tsc) and `yarn test:prod` both clean: 296/296 files, 7469/7469 tests, 100/97.25/100/100 (stmts/branch/func/lines).
 
+### 2026-09-22 - Resolving who a mailbox owner or an escrow scope's key holder is, instead of typing a raw uid blind
+
+An administrator reassigning a mailbox's `ownerUserUid` or an escrow scope's `holderUserUids` had nothing but a bare text field - `parseOwnerUserUid()`
+only ever checked the value was UUID-*shaped*, never that it named a real person, and `validateEscrowScope()` only checked "non-empty strings, no
+duplicates". Lifted `BaseMailboxAccessRoute`'s private `resolvePrincipal()` (address, username, e-mail alias or uid -> the one person it names, or
+nothing - deliberately exact-match only, never a fuzzy/partial directory search, matching this session's privacy posture throughout) into a shared,
+DI-parameterized `util/PrincipalResolutionUtils.ts` (the same interface-of-injected-repos/callbacks convention `LocalKeyDiscoveryUtils.ts` established),
+with `BaseMailboxAccessRoute` now calling it too - zero behavior change, confirmed against its own full suite plus `test/routes/mailPrincipalSuite.ts`'s
+much more thorough branch coverage (real auth-server fetch/502/timeout paths included), which caught one genuine regression in an early draft (a shared
+`principalNotFoundMessage()` that trimmed the principal unconditionally, where the original `noUserFound()` never did) before it shipped. Two new
+endpoints, both mirroring `resolve()`'s exact contract (exact-match, 400 on bad input, 404 `No user found for "..."`, rate-limited at 300/60s):
+`GET /mail/mailboxes/resolve-owner` (`BaseMailboxRoute.resolveOwner()`, gated `@RequiresTrustedRole()` matching `ownerUserUid`'s own write gate) and
+`GET /escrow/scopes/resolve-holder` (`BaseEscrowScopeRoute.resolveHolder()`, gated the same as `create()`/`update()`). Neither endpoint is gated more
+strictly than the write it feeds by design - a stricter read-side gate than the write itself would add no real security, since the same caller could
+just call the write directly.
+
+Explicitly out of this pass's scope, confirmed rather than assumed: mailbox sharing's own `PrincipalPicker` (already fine); escrow access requests
+(approvals always act on the caller's own JWT uid, never a typed field); distribution list membership (legitimately free-text addresses, not an
+internal-uid problem); legal hold/matter custodians (mailbox uids, a different picker problem, left untouched); retention policy (a global singleton,
+no user/mailbox targeting at all); admin impersonation (already a searchable mailbox list, not a blind uid box).
+
+Files: new `src/util/PrincipalResolutionUtils.ts`, `test/routes/principalResolveEndpointSuite.ts`; changed `src/routes/BaseMailboxAccessRoute.ts`,
+`src/routes/BaseMailboxRoute.ts`, `src/routes/BaseEscrowScopeRoute.ts`, `src/routes/sql/EscrowScopeRouteSQL.ts`, `test/routes/{mongo,sql}/MailboxRoute.test.ts`,
+`test/routes/{mongo,sql}/EscrowScopeRoute.test.ts`. Full suite (combined with the Autodiscover work above, both landed in the same working tree): clean.

@@ -13,7 +13,9 @@ import { EscrowScopeSQL } from "../../../src/models/sql/EscrowScopeSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { AuditAction } from "../../../src/models/types.js";
+import { LOOKUP_MAX_ATTEMPTS } from "../../../src/util/PrincipalResolutionUtils.js";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { principalResolveEndpointSuite } from "../principalResolveEndpointSuite.js";
 
 describe("Route:EscrowScopeSQL Tests", () => {
     const logger = Logger();
@@ -353,5 +355,30 @@ describe("Route:EscrowScopeSQL Tests", () => {
             .set("Authorization", "jwt " + adminToken);
 
         expect(result.status).toBe(404);
+    });
+
+    principalResolveEndpointSuite({
+        app: () => server.getApplication(),
+        url: `${baseUrl}/resolve-holder`,
+        trustedToken: adminToken,
+        nonTrustedToken: userToken,
+        maxAttempts: LOOKUP_MAX_ATTEMPTS,
+        createOwnedMailbox: async () => {
+            const ownerUid: string = uuid.v4();
+            const alias = `alias_${uuid.v4()}@example.com`;
+            const mailbox: MailboxSQL = await mailboxRepo.save(
+                new MailboxSQL({
+                    ownerUserUid: ownerUid,
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [alias],
+                    displayName: "Candidate Holder",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                }),
+            );
+            return { ownerUid, address: mailbox.primarySmtpAddress, alias, displayName: mailbox.displayName };
+        },
+        freshTrustedToken: () => JWTUtils.createTokenSync(config.get("auth"), { uid: uuid.v4(), roles: ["admin"], elevated: Date.now() }),
     });
 });

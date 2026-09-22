@@ -12,8 +12,10 @@ import { EscrowScopeMongo } from "../../../src/models/mongo/EscrowScopeMongo.js"
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { AuditAction } from "../../../src/models/types.js";
+import { LOOKUP_MAX_ATTEMPTS } from "../../../src/util/PrincipalResolutionUtils.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { principalResolveEndpointSuite } from "../principalResolveEndpointSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -367,5 +369,30 @@ describe("Route:EscrowScopeMongo Tests", () => {
             .set("Authorization", "jwt " + adminToken);
 
         expect(result.status).toBe(404);
+    });
+
+    principalResolveEndpointSuite({
+        app: () => server.getApplication(),
+        url: `${baseUrl}/resolve-holder`,
+        trustedToken: adminToken,
+        nonTrustedToken: userToken,
+        maxAttempts: LOOKUP_MAX_ATTEMPTS,
+        createOwnedMailbox: async () => {
+            const ownerUid: string = uuid.v4();
+            const alias = `alias_${uuid.v4()}@example.com`;
+            const mailbox: MailboxMongo = await mailboxRepo.save(
+                new MailboxMongo({
+                    ownerUserUid: ownerUid,
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [alias],
+                    displayName: "Candidate Holder",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                }),
+            );
+            return { ownerUid, address: mailbox.primarySmtpAddress, alias, displayName: mailbox.displayName };
+        },
+        freshTrustedToken: () => JWTUtils.createTokenSync(config.get("auth"), { uid: uuid.v4(), roles: ["admin"], elevated: Date.now() }),
     });
 });
