@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-22
+
+### Added
+- Added per-user appearance preferences with a background image upload that checks the bytes and refuses SVG, served owner-only and immutable
+- Added a background option to send, which answers 202 after the cheap checks and relays from a bounded in-process queue with retries and crash recovery, publishes send-succeeded, send-retrying and send-failed, and treats a permanent failure as final on the first attempt
+- Added stages, progress, timestamps, a check-now endpoint and a current-enrollment lookup to the signing certificate status, and fail an enrollment the CA never answers as order-expired
+- Added provider-aware signing certificate status, so every enrollment names its backend (manual or rfc8823) instead of a client assuming automatic issuance, and a stale enrollment id now answers 404 signing-enrollment-unknown on status/check with an idempotent cancel, instead of a dead end
+- Added BaseSigningEnrollmentAdminRoute at /admin/signing-enrollments, so a trusted administrator with an elevated token can list pending manual requests, download a request's CSR, upload and validate a certificate against it, or reject a request with a reason its owner sees
+- Added CA health tracking to AcmeEnrollmentDriverJob, logging a failing run once instead of on every tick, auditing SIGNING_ENROLLMENT_CA_UNREACHABLE after repeated failures, and surfacing it through the new GET /system/signing-enrollment for any signed-in user
+
+### Changed
+- Test the access matrix for owner, delegate, unrelated user, elevated administrator and impersonation on MongoDB and SQL with a guard for new routes, principal resolution, well-known folders, the appearance and background send routes, the enrollment stages and a corpus of 127 hostile HTML payloads
+- Document the changes in the README, the release notes and NOTES, including the route audit and the rollout
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Document the changes in the README, release notes and NOTES
+
+### Fixed
+- Fixed an administrator with an elevated token reading every user's mail, by allowing a mailbox's owner or an explicit ACL grant only, with the trusted roles stripped, in every mailbox-scoped route and in live push subscriptions, and add ?scope=admin, which needs an elevated trusted token, returns administrative metadata only and is audited
+- Fixed a shared mailbox granted to a username matching nobody, by resolving what is typed to a user id through a mailbox address or the auth-server's aliases, rejecting anything unresolvable, flagging existing entries that have no effect and adding accessRole to a mailbox
+- Fixed new accounts missing folders until a refresh, by creating all 11 well-known folders with the mailbox, healing missing ones on read and publishing a Folder create event for every creation, and fix a race that could create a second folder of the same type
+- Fixed HTML mail losing all its styling and images, by replacing the default sanitizer with one that keeps allow-listed presentation, CSS and cid images and drops scripts, forms, frames, SVG and every URL that could run or leak, and re-sanitize stored mail from its raw source when it is opened
+- Fixed encrypted messages between two mailboxes on the same deployment failing key discovery, by resolving a local address (primary, alias, or plus-tagged, case-insensitively) before ever attempting DNS federation, sharing one response builder with the public discovery endpoint so the two can never disagree
+
 ## [0.16.0] - 2026-09-21
 
 ### Added
@@ -995,7 +1018,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/RapidMX/restapi/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/RapidMX/restapi/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/RapidMX/restapi/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/RapidMX/restapi/compare/v0.13.0...v0.14.0
