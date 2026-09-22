@@ -187,6 +187,23 @@ describe("CalendarReminderJobMongo Tests (real DB + DI)", () => {
         }
     });
 
+    it("Carries the event's own location in the reminder, verbatim.", async () => {
+        const now = Date.now();
+        const event = await createEvent({
+            startDate: new Date(now + 5 * 60 * 1000),
+            reminderMinutesBeforeStart: 4.5,
+            location: "https://meet.example.com/room/abc",
+        });
+
+        await job.run();
+
+        expect(fakeRedis.published).toHaveLength(2);
+        for (const entry of fakeRedis.published) {
+            const parsed = JSON.parse(entry.message);
+            expect(parsed.data.location).toBe("https://meet.example.com/room/abc");
+        }
+    });
+
     it("Skips an event with no reminderMinutesBeforeStart configured.", async () => {
         const now = Date.now();
         await createEvent({ startDate: new Date(now + 5 * 60 * 1000), reminderMinutesBeforeStart: undefined });

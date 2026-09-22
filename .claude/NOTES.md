@@ -3184,6 +3184,27 @@ Files: new `src/models/mongo/CalendarEventAttendeeLinkMongo.ts`, `src/models/sql
 both new classes are importable by a plugin the moment this builds. `server` does not subclass `MeetingSchedulingJob` (it only re-exports
 `MeetingSchedulingJob{Mongo,SQL}` from `src/{mongo,sql}/Jobs.ts`), so nothing there needs rebuilding for this.
 
+### 2026-09-22 (later still) - `CalendarReminderJob`'s push event also carries `location`
+
+Small, standalone addition, requested for a web-client tweak: a meeting reminder pop-up wants a "Join Meeting" button
+when the event's own `location` looks like a URL. `sendMessage()`'s payload gains `location: event.location` alongside
+`eventUid`/`title`/`startDate` - plain, undecorated text, verbatim, exactly as `location` is already shown anywhere
+else in this codebase. Confirmed safe to read directly: field-level encryption of `location` is deferred, future work
+(see `CalendarEvent.encryptionOrigin`'s own doc comment) - nothing here reads ciphertext, because there isn't any yet.
+
+One real Mongo-vs-SQL difference this surfaced: a fresh SQL read of an unset nullable `text` column comes back `null`,
+not `undefined`, so the reminder payload's `location` is `null` on SQL for an event with none, while Mongo's is
+genuinely absent (`JSON.stringify()` drops an `undefined` key entirely). Both existing tests that assert the full
+payload shape needed updating for SQL's `location: null`; a new test on each backend proves a real `location` value
+comes through unchanged.
+
+Files: changed `src/jobs/CalendarReminderJob.ts`, `test/jobs/{mongo,sql}/CalendarReminderJob{Mongo,SQL}.test.ts`.
+Scoped verification (this repo's own uncommitted working tree currently also carries an unrelated domain-aliasing
+feature from a peer session, whose pre-existing lint errors in files this change never touches block a plain
+`yarn test:prod` - verified this change in isolation instead): `npx eslint` on every file this touches, clean; scoped
+coverage on `CalendarReminderJob.ts` alone, 100%/96.82%/100%/100% (the two uncovered branches are pre-existing,
+unrelated to this change - confirmed by line number).
+
 ### 2026-09-22 (later still) - Pure domain aliases: a `Domain` with no mailboxes of its own
 
 JP's ask: `plc.gg` as a shorthand alias of `powerlevel.gg`, so `jean-philippe@powerlevel.gg` can receive AND send as

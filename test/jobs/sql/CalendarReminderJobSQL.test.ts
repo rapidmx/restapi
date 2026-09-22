@@ -170,8 +170,27 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
             expect(parsed).toEqual({
                 type: "CalendarEvent",
                 action: "reminder",
-                data: { eventUid: event.uid, title: event.title, startDate: event.startDate.toISOString() },
+                // A fresh SQL read of an unset nullable `text` column comes back `null`, not `undefined` - unlike
+                // Mongo, where the field is genuinely absent and JSON.stringify() drops it from the payload entirely.
+                data: { eventUid: event.uid, title: event.title, startDate: event.startDate.toISOString(), location: null },
             });
+        }
+    });
+
+    it("Carries the event's own location in the reminder, verbatim.", async () => {
+        const now = Date.now();
+        const event = await createEvent({
+            startDate: new Date(now + 5 * 60 * 1000),
+            reminderMinutesBeforeStart: 4.5,
+            location: "https://meet.example.com/room/abc",
+        });
+
+        await job.run();
+
+        expect(fakeRedis.published).toHaveLength(2);
+        for (const entry of fakeRedis.published) {
+            const parsed = JSON.parse(entry.message);
+            expect(parsed.data.location).toBe("https://meet.example.com/room/abc");
         }
     });
 
@@ -406,6 +425,9 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
             eventUid: event.uid,
             title: event.title,
             startDate: occurrenceStart.toISOString(),
+            // A fresh SQL read of an unset nullable `text` column comes back `null`, not `undefined` - unlike
+            // Mongo, where the field is genuinely absent and JSON.stringify() drops it from the payload entirely.
+            location: null,
         });
     });
 

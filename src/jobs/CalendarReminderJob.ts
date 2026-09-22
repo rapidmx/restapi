@@ -13,7 +13,12 @@ const MS_PER_MINUTE = 60 * 1000;
 
 /**
  * Dispatches a `"reminder"` push notification (to the event's folder and mailbox channels) when an event
- * occurrence's reminder fire time (`occurrence start - reminderMinutesBeforeStart`) comes due.
+ * occurrence's reminder fire time (`occurrence start - reminderMinutesBeforeStart`) comes due. The payload carries
+ * the event's own `location` verbatim (`{ eventUid, title, startDate, location }`) - plain, undecorated text a
+ * client is free to read as a join link when it looks like one (e.g. a video-conferencing URL), same as anywhere
+ * else `location` is already shown as-is. Not actually encrypted today regardless of `encryptionOrigin` (see that
+ * field's own doc comment on `CalendarEvent` - field-level encryption of `location` is deferred, future work), so
+ * there is nothing to decrypt here.
  *
  * **Fire window.** Each run fires every occurrence whose fire time falls in `(watermark, now + window_seconds]`,
  * then advances the in-memory watermark to `now + window_seconds`. Firing up to `window_seconds` ahead keeps a
@@ -270,6 +275,7 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
             eventUid: event.uid,
             title: event.title,
             startDate: occurrence.start,
+            location: event.location,
         });
     }
 
