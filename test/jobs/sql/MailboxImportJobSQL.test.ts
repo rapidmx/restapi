@@ -178,6 +178,19 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
         expect(updated!.errorMessage).toContain("no longer exists");
     });
 
+    it("Deletes the already-uploaded source blob even when the target mailbox is gone before the job ever reads it - not just on a successful/quota-rejected import.", async () => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        await blobStore.put(sourceBlobKey, buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01")));
+        const request = await createRequest({ mailboxUid: uuid.v4(), sourceBlobKey });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("failed");
+        expect(await blobStore.exists(sourceBlobKey)).toBe(false);
+    });
+
     it("Imports every message from an mbox source into the target folder, bumping its counters.", async () => {
         const mailbox = await createMailbox();
         const folder = await createFolder(mailbox.uid);
@@ -222,6 +235,10 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
 
         const entries = await auditLogRepo.find({ where: { action: AuditAction.MAILBOX_IMPORT_COMPLETED } });
         expect(entries.length).toBe(1);
+        // The uploaded source blob is removed once this request completes successfully - the only other
+        // caller that ever deletes a sourceBlobKey blob is ErasureExecutionJob, on GDPR erasure alone, not
+        // ordinary import completion, so this job must clean up its own upload itself.
+        expect(await blobStore.exists(sourceBlobKey)).toBe(false);
     });
 
     it("Preserves a message's own real Date: header as sentDate/receivedDate, rather than stamping import time.", async () => {
@@ -697,6 +714,10 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
         expect(updated!.importedCount).toBe(1);
         expect((await messageRepo.find({ where: { folderUid: folder.uid } })).length).toBe(1);
         expect((await auditLogRepo.find({ where: { action: AuditAction.MAILBOX_IMPORT_FAILED } })).length).toBe(1);
+        // The uploaded source blob is removed once this request is done being processed, quota-rejected or
+        // not - otherwise every quota-rejected import would permanently orphan its uploaded file in storage.
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        expect(await blobStore.exists(sourceBlobKey)).toBe(false);
     });
 
     it("Translates the shared chargeMailboxQuota()'s MailboxQuotaExceededError into this job's own type/message when the AUTHORITATIVE charge catches it, not just assertWithinQuota()'s own cheap local pre-check.", async () => {
@@ -796,9 +817,17 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
         expect((await messageRepo.find({ where: { folderUid: folder.uid, messageId: "new@example.com" } })).length).toBe(1);
     });
 
-    it("Leaves a 'processing' import alone while its lease is still fresh, and fails one abandoned max_attempts times.", async () => {
+    it("Leaves a 'processing' import alone while its lease is still fresh, and fails one abandoned max_attempts times - deleting its uploaded source blob too, the one terminal outcome processRequest() itself never sees.", async () => {
         const fresh = await createRequest({ status: "processing", processingAttempts: 1 });
-        const exhausted = await createRequest({ status: "processing", processingAttempts: 3, dateModified: new Date(Date.now() - 3 * 60 * 60_000) });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const exhaustedSourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        await blobStore.put(exhaustedSourceBlobKey, buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01")));
+        const exhausted = await createRequest({
+            status: "processing",
+            processingAttempts: 3,
+            dateModified: new Date(Date.now() - 3 * 60 * 60_000),
+            sourceBlobKey: exhaustedSourceBlobKey,
+        });
 
         await job.run();
 
@@ -808,6 +837,7 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
         const exhaustedAfter = await requestRepo.findOne({ where: { uid: exhausted.uid } });
         expect(exhaustedAfter!.status).toBe("failed");
         expect(exhaustedAfter!.errorMessage).toContain("did not complete after 3 attempt(s)");
+        expect(await blobStore.exists(exhaustedSourceBlobKey)).toBe(false);
     });
 
     it("Aborts without completing when its lease is lost mid-import (another replica reclaimed the request).", async () => {

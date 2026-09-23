@@ -64,7 +64,11 @@ export class S3BlobStore implements BlobStore {
     @Config("mail:blob:s3:secret_access_key")
     private secretAccessKey?: string;
 
-    /** Part size for a streamed `put()` - see its doc comment. S3 requires at least 5 MiB for every part but the last. */
+    /** Part size for a streamed `put()` - see its doc comment. S3 requires at least 5 MiB for every part but the
+     * last, and caps a single multipart upload at 10,000 parts total - at the 8 MiB default, that's an 80 GiB
+     * object before hitting it, comfortably above `BaseMailboxImportRoute`'s own 50 GiB `mail:import:max_bytes`
+     * default, but an operator who lowers this well below the default while also raising `mail:import:max_bytes`
+     * could still hit the 10,000-part ceiling on a large upload - not otherwise validated or cross-checked here. */
     @Config("mail:blob:s3:multipart_part_size_bytes", 8 * 1024 * 1024)
     private multipartPartSizeBytes: number = 8 * 1024 * 1024;
 

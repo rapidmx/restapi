@@ -11,6 +11,7 @@ import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { exactInFilter } from "../util/EscrowUtils.js";
 import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
@@ -193,13 +194,19 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
      * Validates format/targetFolderUid, a `Content-Length` (when the client sends one) up front against
      * `maxImportBytes` - before `req.bodyStream` is touched, or any mailbox/folder lookup runs, same
      * ordering `create()` has always had - then resolves and validates the target mailbox/folder (still with
-     * no upload cost) before finally consuming `req.bodyStream`: it's piped through a small byte-counting
-     * wrapper straight into `this.blobStore.put()` (both `LocalFsBlobStore` and `S3BlobStore` already stream
-     * a `NodeJS.ReadableStream` argument to their own backing store, never buffering it into memory either),
+     * no upload cost). A cheap, read-only quota gate runs next: rejected outright if the target mailbox is
+     * already at/over its `quotaBytes`, and `Content-Length` (when sent) is also checked against whatever
+     * quota remains - neither of these is a real charge, just a sanity check against the mailbox's own
+     * already-fetched row (see the inline comment above `quotaBytes`/`usedBytes` below for why the real,
+     * accurate charge stays exclusively `MailboxImportJob`'s own, per extracted message). Only then is
+     * `req.bodyStream` finally consumed: piped through a small byte-counting wrapper straight into
+     * `this.blobStore.put()` (both `LocalFsBlobStore` and `S3BlobStore` already stream a
+     * `NodeJS.ReadableStream` argument to their own backing store, never buffering it into memory either),
      * aborting mid-stream - and cleaning up the partial blob - the moment the running count exceeds
-     * `maxImportBytes`, regardless of what `Content-Length` claimed or whether one was sent at all. An
-     * empty upload (no bytes ever counted) is rejected the same way `Content-Length: 0` already is, just
-     * discovered at the end of the stream instead of before it starts.
+     * whichever of `maxImportBytes`/the mailbox's remaining quota is smaller, regardless of what
+     * `Content-Length` claimed or whether one was sent at all. An empty upload (no bytes ever counted) is
+     * rejected the same way `Content-Length: 0` already is, just discovered at the end of the stream instead
+     * of before it starts.
      */
     @Post()
     @StreamingBody()
@@ -262,9 +269,34 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         if (!folder || folder.mailboxUid !== mailboxUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "targetFolderUid must name a folder belonging to the target mailbox.");
         }
+        // A cheap, read-only, upfront sanity gate - NOT a charge (nothing is written to `usedBytes` here,
+        // and never will be by this method): `MailboxImportJob.persistImportedMessage()` remains the one
+        // place that actually charges quota, per extracted message, once real content sizes are known (an
+        // uploaded PST's raw byte count has no fixed relationship to its eventual reconstructed message
+        // sizes, so charging against the raw upload here would double-count against that later, accurate
+        // charge, not merely approximate it). This exists only to stop the "obviously already over quota"
+        // case from streaming a pointless multi-GB upload before the first per-message charge, days later
+        // (this job runs on its own schedule), would have rejected it anyway - see this class's own doc
+        // comment on `DEFAULT_MAX_IMPORT_BYTES`.
+        const quotaBytes: number = mailbox.quotaBytes ?? 0;
+        const usedBytes: number = mailbox.usedBytes ?? 0;
+        if (quotaBytes > 0 && usedBytes >= quotaBytes) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 413, "This mailbox has reached its storage quota.");
+        }
+        // `Infinity` when unlimited (`quotaBytes <= 0`) or not yet provisioned - `Math.min()` below then just
+        // reduces to `maxImportBytes` alone, the same as if this mailbox had no quota check applied at all.
+        const remainingQuota: number = quotaBytes > 0 ? Math.max(0, quotaBytes - usedBytes) : Infinity;
+        if (declaredLength !== undefined && declaredLength > remainingQuota) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 413, "This mailbox does not have enough remaining storage quota for a file this large.");
+        }
 
         const sourceBlobKey = `mailbox-imports/${crypto.randomUUID()}`;
-        const counted = withByteLimit(req.bodyStream, this.maxImportBytes);
+        // The SMALLER of the two ceilings applies - still just one running byte count, `withByteLimit()`
+        // itself has no notion of "why" its limit is what it is (see the quota pre-check above for why this
+        // is a coarse mid-stream sanity bound, not a real charge).
+        const effectiveMaxBytes: number = Math.min(this.maxImportBytes, remainingQuota);
+        const quotaIsTighterLimit: boolean = remainingQuota < this.maxImportBytes;
+        const counted = withByteLimit(req.bodyStream, effectiveMaxBytes);
         try {
             await this.blobStore.put(sourceBlobKey, counted.stream, {
                 contentType: format === "pst" ? "application/vnd.ms-outlook" : "application/mbox",
@@ -272,6 +304,9 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         } catch (err: any) {
             await this.blobStore.delete(sourceBlobKey).catch(() => undefined);
             if (counted.exceeded()) {
+                if (quotaIsTighterLimit) {
+                    throw new ApiError(ApiErrors.INVALID_REQUEST, 413, "This mailbox does not have enough remaining storage quota for a file this large.");
+                }
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 413, `The uploaded file is larger than the ${this.maxImportBytes} bytes allowed.`);
             }
             throw err;
@@ -324,8 +359,13 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
             (m) => m.uid,
         );
         const visible: any[] = [{ requestedByUserUid: `eq(${user.uid})` }];
-        if (ownedMailboxUids.length > 0) {
-            visible.push({ mailboxUid: `in(${ownedMailboxUids.join(",")})` });
+        // `exactInFilter()`, not a raw `in(${...join(",")})`: `ModelUtils.splitListOperand()` splits an
+        // `in(...)` operand on unescaped commas, so a client-chosen mailbox `uid` containing one (nothing
+        // strips `uid` on `BaseMailboxRoute.create()` today) could otherwise widen this filter to match a
+        // mailbox its owner never listed here at all - see `BaseDataExportRoute.find()`'s identical fix.
+        const ownedMailboxFilter: string | undefined = exactInFilter(ownedMailboxUids);
+        if (ownedMailboxFilter) {
+            visible.push({ mailboxUid: ownedMailboxFilter });
         }
         return await this.requestRepo!.find({ $or: visible, ...paging } as any, { ignoreACL: true, limit, page });
     }

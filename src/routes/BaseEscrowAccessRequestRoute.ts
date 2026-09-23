@@ -179,11 +179,15 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         if (!user) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
+        // Holder-gated BEFORE the state check below (matches `deny()`/`findById()`'s already-correct order in
+        // this same class): a non-holder must get the exact same 403 regardless of whether the matter happens
+        // to be open or closed, rather than a 400 revealing the matter's own state to someone who isn't
+        // entitled to know it at all.
         const matter: M = await this.requireMatter(body.matterId);
+        const scope = await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
         if (matter.closedAt) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This matter is closed.");
         }
-        const scope = await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
 
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(body.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
@@ -234,12 +238,15 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
     @Post("/:id/approve")
     public async approve(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<R> {
         await this.init();
+        // Holder-gated BEFORE any state check below (matches `deny()`/`findById()`'s already-correct order in
+        // this same class): otherwise this request's own pending/not-pending status is a distinguishable-409
+        // oracle for anyone who knows or guesses its id, holder or not.
         const request: R = await this.requireRequest(id);
+        const matter: M = await this.requireMatter(request.matterId);
+        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
         if (request.status !== "pending") {
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This request is not pending approval.");
         }
-        const matter: M = await this.requireMatter(request.matterId);
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
         if (matter.closedAt) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This matter is closed.");
         }
@@ -323,12 +330,16 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
     @Get("/:id/material")
     public async material(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<EscrowAccessMaterial> {
         await this.init();
+        // Holder-gated BEFORE any state check below (matches `deny()`/`findById()`'s already-correct order in
+        // this same class): otherwise this request's own approval status is a distinguishable-403 oracle for
+        // anyone who knows or guesses its id, holder or not - precisely learning when someone else's mailbox
+        // met its dual-control release threshold, without being a holder of anything at all.
         const request: R = await this.requireRequest(id);
+        const matter: M = await this.requireMatter(request.matterId);
+        const scope: EscrowScope = await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
         if (request.status !== "approved" && request.status !== "fulfilled") {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Dual control threshold not yet met.");
         }
-        const matter: M = await this.requireMatter(request.matterId);
-        const scope: EscrowScope = await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
         if (matter.closedAt) {
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This matter is closed.");
         }

@@ -116,6 +116,17 @@ describe("Route:MatterSearchMongo Tests", () => {
         expect(result.status).toBe(400);
     });
 
+    it("Rejects a repeated structured-filter query key (400) instead of crashing - the framework parses a duplicate key into a real array at runtime, which .split(',') would otherwise throw an uncaught TypeError on.", async () => {
+        const scope = await createEscrowScope();
+        const matter = await createMatter(scope.uid);
+        for (const duplicated of ["types=message&types=contact", "is=flagged&is=unread", "label=a&label=b"]) {
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}?matterId=${matter.uid}&q=hello&${duplicated}`)
+                .set("Authorization", "jwt " + holderToken);
+            expect(result.status).toBe(400);
+        }
+    });
+
     it("Returns 404 for a nonexistent matter.", async () => {
         const result = await request(server.getApplication())
             .get(`${baseUrl}?matterId=${uuid.v4()}&q=hello`)
@@ -194,8 +205,10 @@ describe("Route:MatterSearchMongo Tests", () => {
         expect(result.status).toBe(200);
         expect(searchSpy).toHaveBeenCalled();
         for (const call of searchSpy.mock.calls) {
-            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime());
-            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime());
+            // +1ms/-1ms past the matter's own boundary: every SearchProvider's before/after is EXCLUSIVE,
+            // while matter coverage itself is INCLUSIVE on both ends - see search()'s own inline comment.
+            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime() + 1);
+            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime() - 1);
         }
     });
 
@@ -212,8 +225,8 @@ describe("Route:MatterSearchMongo Tests", () => {
 
         expect(result.status).toBe(200);
         for (const call of searchSpy.mock.calls) {
-            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime());
-            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime());
+            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime() + 1);
+            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime() - 1);
         }
     });
 
@@ -257,9 +270,10 @@ describe("Route:MatterSearchMongo Tests", () => {
             expect(call[0].hasAttachment).toBe(true);
             expect(call[0].flags).toEqual(["flagged"]);
             expect(call[0].labels).toEqual(["urgent"]);
-            // An unparseable before/after is treated the same as absent - clamped to the matter's own range.
-            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime());
-            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime());
+            // An unparseable before/after is treated the same as absent - clamped to the matter's own range
+            // (+1ms/-1ms past the boundary itself - see the earlier clamp test's own comment).
+            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime() + 1);
+            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime() - 1);
         }
     });
 

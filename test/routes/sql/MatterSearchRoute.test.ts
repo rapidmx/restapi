@@ -188,8 +188,10 @@ describe("Route:MatterSearchSQL Tests", () => {
         expect(result.status).toBe(200);
         expect(searchSpy).toHaveBeenCalled();
         for (const call of searchSpy.mock.calls) {
-            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime());
-            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime());
+            // +1ms/-1ms past the matter's own boundary: every SearchProvider's before/after is EXCLUSIVE,
+            // while matter coverage itself is INCLUSIVE on both ends - see search()'s own inline comment.
+            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime() + 1);
+            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime() - 1);
         }
     });
 
@@ -206,8 +208,8 @@ describe("Route:MatterSearchSQL Tests", () => {
 
         expect(result.status).toBe(200);
         for (const call of searchSpy.mock.calls) {
-            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime());
-            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime());
+            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime() + 1);
+            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime() - 1);
         }
     });
 
@@ -251,9 +253,10 @@ describe("Route:MatterSearchSQL Tests", () => {
             expect(call[0].hasAttachment).toBe(true);
             expect(call[0].flags).toEqual(["flagged"]);
             expect(call[0].labels).toEqual(["urgent"]);
-            // An unparseable before/after is treated the same as absent - clamped to the matter's own range.
-            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime());
-            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime());
+            // An unparseable before/after is treated the same as absent - clamped to the matter's own range
+            // (+1ms/-1ms past the boundary itself - see the earlier clamp test's own comment).
+            expect(call[0].before!.getTime()).toBe(matter.dateRangeEnd.getTime() + 1);
+            expect(call[0].after!.getTime()).toBe(matter.dateRangeStart.getTime() - 1);
         }
     });
 

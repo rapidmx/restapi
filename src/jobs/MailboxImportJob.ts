@@ -250,6 +250,12 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                 if (attempts >= this.maxAttempts) {
                     this.logger?.warn(`MailboxImportJob: import request ${request.uid} abandoned after ${attempts} attempt(s); marking failed.`);
                     await this.transitionToFailed(request, `The import did not complete after ${attempts} attempt(s) - processing was interrupted each time.`);
+                    // This is the one terminal outcome `processRequest()`'s own delete-on-every-outcome
+                    // `finally` never sees (a request repeatedly interrupted before finishing never runs it) -
+                    // same best-effort, log-don't-throw posture as that one.
+                    await this.blobStore!.delete(request.sourceBlobKey).catch((err: any) => {
+                        this.logger?.warn(`MailboxImportJob: failed to delete source blob ${request.sourceBlobKey} for abandoned request ${request.uid}: ${err.message}`);
+                    });
                 } else {
                     this.logger?.warn(`MailboxImportJob: reclaiming abandoned import request ${request.uid} (attempt ${attempts} of ${this.maxAttempts}).`);
                     await this.requestRepo!.update(
@@ -279,6 +285,29 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     }
 
     private async processRequest(request: MIR): Promise<void> {
+        try {
+            await this.doProcessRequest(request);
+        } finally {
+            // The uploaded source blob (`BaseMailboxImportRoute.create()`'s own `blobStore.put()`) is never
+            // needed again once this request has been attempted - successfully, or failed for ANY reason,
+            // including a target mailbox/folder that no longer exists or a quota rejection - so it's removed
+            // here regardless of outcome, not on just the happy path. Without this, every attempted import
+            // permanently orphans its (potentially many-GB, now that uploads are genuinely streamed rather
+            // than size-limited by buffering) uploaded blob in storage forever: the only other caller that
+            // ever deletes a `sourceBlobKey` blob is `ErasureExecutionJob`, which runs solely on GDPR
+            // erasure, not on ordinary import completion. Best-effort: a delete failure here must not turn
+            // an otherwise-successful (or already-failed-for-its-own-reason) request into something worse -
+            // just logged, the same "don't let cleanup mask the real outcome" posture
+            // `resolveLocalSourcePath()`'s own temp-file `cleanup()` already has. `reclaimAbandonedRequests()`
+            // has the one other terminal outcome this doesn't cover (giving up after `maxAttempts` - it never
+            // calls this method at all) and deletes the same way at its own call site.
+            await this.blobStore!.delete(request.sourceBlobKey).catch((err: any) => {
+                this.logger?.warn(`MailboxImportJob: failed to delete source blob ${request.sourceBlobKey} for request ${request.uid}: ${err.message}`);
+            });
+        }
+    }
+
+    private async doProcessRequest(request: MIR): Promise<void> {
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(request.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
             await this.markFailed(request, "The target mailbox no longer exists.");

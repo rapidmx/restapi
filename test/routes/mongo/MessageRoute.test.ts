@@ -23,7 +23,7 @@ import {
     RecipientType,
 } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
-import { registerTestDoubles, InMemoryBlobStore, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
+import { registerTestDoubles, InMemoryBlobStore, NoopSearchProvider, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -1347,6 +1347,40 @@ describe("Route:MessageMongo Tests", () => {
             expect(stillExists).toBeFalsy();
         });
 
+        it("Removes a purged message from the search index too - a permanently deleted message must not remain a live search hit forever.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid);
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            await searchProvider.index({ entityType: "message", entityUid: message.uid, mailboxUid: mailbox.uid, subject: "hello world" });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${message.uid}?purge=true`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            const searchResult = await searchProvider.search({ mailboxUid: mailbox.uid, text: "hello" });
+            expect(searchResult.results.length).toBe(0);
+        });
+
+        it("Does NOT remove a merely soft-deleted (non-purge) message from the search index - it stays recoverable, so it stays indexed too.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid);
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            await searchProvider.index({ entityType: "message", entityUid: message.uid, mailboxUid: mailbox.uid, subject: "hello world" });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            const searchResult = await searchProvider.search({ mailboxUid: mailbox.uid, text: "hello" });
+            expect(searchResult.results.length).toBe(1);
+        });
+
         it("Allows a purge once the matter is closed.", async () => {
             const mailbox = await createMailbox(owner.uid);
             const folder = await createFolder(mailbox.uid, FolderType.INBOX);
@@ -1391,6 +1425,23 @@ describe("Route:MessageMongo Tests", () => {
             const stillExists = await messageRepo.findOne({ uid: message.uid } as any);
             expect(stillExists).toBeFalsy();
         });
+
+        it("Removes every truncated message from the search index too - truncate() is always a hard, permanent delete.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid);
+            const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+            await searchProvider.index({ entityType: "message", entityUid: message.uid, mailboxUid: mailbox.uid, subject: "hello world" });
+
+            const result = await request(server.getApplication())
+                .delete(`${baseUrl}?folderUid=${folder.uid}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            const searchResult = await searchProvider.search({ mailboxUid: mailbox.uid, text: "hello" });
+            expect(searchResult.results.length).toBe(0);
+        });
     });
 
     describe("mailboxUid integrity", () => {
@@ -1429,6 +1480,69 @@ describe("Route:MessageMongo Tests", () => {
             expect(result.status).toBe(200);
             expect(result.body.folderUid).toBe(destinationFolder.uid);
             expect(result.body.mailboxUid).toBe(mailbox.uid);
+        });
+    });
+
+    describe("search index freshness (searchIndexedAt cleared on move/flag/label change)", () => {
+        it("Clears searchIndexedAt when a message is moved to another folder, so SearchIndexJob re-indexes it under the new folder on its next pass.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const destinationFolder = await createFolder(mailbox.uid, FolderType.ARCHIVE);
+            const message = await createMessage(mailbox.uid, folder.uid, { searchIndexedAt: new Date() });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, folderUid: destinationFolder.uid });
+
+            expect(result.status).toBe(200);
+            const persisted = await messageRepo.findOne({ uid: message.uid } as any);
+            expect(persisted!.searchIndexedAt).toBeFalsy();
+        });
+
+        it("Clears searchIndexedAt when a message's flags change (e.g. marked read), so is:unread/is:flagged stay accurate in search.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, { searchIndexedAt: new Date() });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, flags: { read: true, flagged: false, answered: false, forwarded: false } });
+
+            expect(result.status).toBe(200);
+            const persisted = await messageRepo.findOne({ uid: message.uid } as any);
+            expect(persisted!.searchIndexedAt).toBeFalsy();
+        });
+
+        it("Clears searchIndexedAt when a message's labelUids change, so label: search filters stay accurate.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, { searchIndexedAt: new Date() });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, labelUids: [uuid.v4()] });
+
+            expect(result.status).toBe(200);
+            const persisted = await messageRepo.findOne({ uid: message.uid } as any);
+            expect(persisted!.searchIndexedAt).toBeFalsy();
+        });
+
+        it("Does NOT clear searchIndexedAt on an update that touches neither folderUid, flags, nor labelUids (e.g. only subject) - avoids unnecessary re-indexing.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid, FolderType.INBOX);
+            const message = await createMessage(mailbox.uid, folder.uid, { searchIndexedAt: new Date() });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${message.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: message.uid, version: message.version, subject: "Updated subject" });
+
+            expect(result.status).toBe(200);
+            const persisted = await messageRepo.findOne({ uid: message.uid } as any);
+            expect(persisted!.searchIndexedAt).toBeTruthy();
         });
     });
 

@@ -195,6 +195,25 @@ describe("Route:EscrowAccessRequestMongo Tests", () => {
             expect(result.status).toBe(403);
         });
 
+        it("Rejects an unauthenticated or non-holder caller against a CLOSED matter with the exact same uniform 403 as an open one - never revealing the matter's own open/closed state to someone with no access to it at all (the holder-gate now runs before the closedAt check).", async () => {
+            const scope = await createEscrowScope();
+            const mailbox = await createMailbox({ escrowScopeId: scope.uid });
+            const matter = await createMatter(scope.uid, [mailbox.uid], { closedAt: new Date() });
+
+            const unauthResult = await request(server.getApplication())
+                .post(baseUrl)
+                .send({ matterId: matter.uid, mailboxUid: mailbox.uid });
+            expect(unauthResult.status).toBe(403);
+            expect(unauthResult.body.message).toBe("User does not have permission to perform this action.");
+
+            const nonHolderResult = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + nonHolderToken)
+                .send({ matterId: matter.uid, mailboxUid: mailbox.uid });
+            expect(nonHolderResult.status).toBe(403);
+            expect(nonHolderResult.body.message).toBe("User does not have permission to perform this action.");
+        });
+
         it("A trusted admin who is not a holder gets 403 - proves separation of duties.", async () => {
             const scope = await createEscrowScope();
             const mailbox = await createMailbox({ escrowScopeId: scope.uid });
@@ -400,6 +419,50 @@ describe("Route:EscrowAccessRequestMongo Tests", () => {
                 .post(`${baseUrl}/${createResult.body.uid}/approve`)
                 .set("Authorization", "jwt " + holderCToken);
             expect(approveC.body.status).toBe("approved");
+        });
+    });
+
+    describe("Authorization ordering (holder-gate must run before any state check, matching deny()/findById()'s already-correct order in this class)", () => {
+        it("approve(): a non-holder/unauthenticated caller against an already-approved (non-pending) request gets the same uniform 403 as a pending one - never revealing the request's own status.", async () => {
+            const scope = await createEscrowScope({ requiredHolders: 1, holderUserUids: [holderA.uid] });
+            const mailbox = await createMailbox({ escrowScopeId: scope.uid });
+            const matter = await createMatter(scope.uid, [mailbox.uid]);
+            const createResult = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + holderAToken)
+                .send({ matterId: matter.uid, mailboxUid: mailbox.uid });
+            expect(createResult.body.status).toBe("approved"); // requiredHolders: 1, so already non-pending
+
+            const unauthResult = await request(server.getApplication()).post(`${baseUrl}/${createResult.body.uid}/approve`);
+            expect(unauthResult.status).toBe(403);
+            expect(unauthResult.body.message).toBe("User does not have permission to perform this action.");
+
+            const nonHolderResult = await request(server.getApplication())
+                .post(`${baseUrl}/${createResult.body.uid}/approve`)
+                .set("Authorization", "jwt " + nonHolderToken);
+            expect(nonHolderResult.status).toBe(403);
+            expect(nonHolderResult.body.message).toBe("User does not have permission to perform this action.");
+        });
+
+        it("material(): a non-holder/unauthenticated caller against a not-yet-approved (pending) request gets the same uniform 403 as an approved one - never revealing whether the dual-control threshold has been met.", async () => {
+            const scope = await createEscrowScope({ requiredHolders: 2, holderUserUids: [holderA.uid, holderB.uid] });
+            const mailbox = await createMailbox({ escrowScopeId: scope.uid });
+            const matter = await createMatter(scope.uid, [mailbox.uid]);
+            const createResult = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + holderAToken)
+                .send({ matterId: matter.uid, mailboxUid: mailbox.uid });
+            expect(createResult.body.status).toBe("pending"); // requiredHolders: 2, only 1 approval so far
+
+            const unauthResult = await request(server.getApplication()).get(`${baseUrl}/${createResult.body.uid}/material`);
+            expect(unauthResult.status).toBe(403);
+            expect(unauthResult.body.message).toBe("User does not have permission to perform this action.");
+
+            const nonHolderResult = await request(server.getApplication())
+                .get(`${baseUrl}/${createResult.body.uid}/material`)
+                .set("Authorization", "jwt " + nonHolderToken);
+            expect(nonHolderResult.status).toBe(403);
+            expect(nonHolderResult.body.message).toBe("User does not have permission to perform this action.");
         });
     });
 

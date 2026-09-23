@@ -26,6 +26,20 @@ function parseDateParam(value: string | undefined): Date | undefined {
     return Number.isNaN(date.getTime()) ? undefined : date;
 }
 
+/** Rejects (400) a structured search filter param given more than once - mirrors `BaseSearchRoute.ts`'s
+ * identical helper/rationale: a repeated query key parses to a real array at runtime regardless of this
+ * param's `string | undefined` type annotation, which every `.split(",")` use below would otherwise throw
+ * an uncaught `TypeError` (an opaque 500) on, rather than the clean 400 a malformed request deserves. */
+function assertSingleStringParam(value: unknown, name: string): string | undefined {
+    if (value === undefined) {
+        return undefined;
+    }
+    if (typeof value !== "string") {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${name}' must be given at most once.`);
+    }
+    return value;
+}
+
 /**
  * eDiscovery review search: full-text search across every one of a `Matter`'s custodian mailboxes at
  * once, for a holder of its `EscrowScope` - the second of the two gaps this roadmap's Group F closes
@@ -38,7 +52,10 @@ function parseDateParam(value: string | undefined): Date | undefined {
  *
  * `before`/`after` are ALWAYS clamped to the matter's own `dateRangeStart`/`dateRangeEnd` - regardless of
  * what the caller supplies (including nothing at all) - so a holder can never widen review beyond the
- * litigation hold's own defined scope. Unlike `BaseSearchRoute`, this first pass offers no `cursor`-based
+ * litigation hold's own defined scope. The clamp itself is nudged 1ms past each boundary before being
+ * handed to a `SearchProvider`, since every provider's `before`/`after` are EXCLUSIVE while this codebase's
+ * own authoritative `matterCovers()` is INCLUSIVE on both ends - see `search()`'s own inline comment. Unlike
+ * `BaseSearchRoute`, this first pass offers no `cursor`-based
  * pagination (a single opaque cursor can't meaningfully paginate several independent per-mailbox result
  * sets at once) or a Tier 3 `/candidates` mode - both real, disclosed scope narrowings, not oversights,
  * left for a future pass if reviewing beyond one page per custodian turns out to matter in practice.
@@ -126,6 +143,9 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
         if (!matterId) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "matterId is required.");
         }
+        typesParam = assertSingleStringParam(typesParam, "types");
+        isParam = assertSingleStringParam(isParam, "is");
+        labelParam = assertSingleStringParam(labelParam, "label");
         const hasStructuredFilter: boolean =
             from !== undefined ||
             to !== undefined ||
@@ -151,10 +171,20 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
         // were coerced on write holds ISO strings (see `util/DateCoercionUtils.ts`).
         const rangeEnd: Date = new Date(matter.dateRangeEnd);
         const rangeStart: Date = new Date(matter.dateRangeStart);
+        // This route's own authoritative definition of matter coverage (`LegalHoldUtils.matterCovers()`) is
+        // INCLUSIVE on both ends (`>= dateRangeStart && <= dateRangeEnd`), but every `SearchProvider` treats
+        // `before`/`after` as EXCLUSIVE (`< before`, `> after` - confirmed by reading each provider's own
+        // query-building code, not assumed). Clamping straight to `rangeEnd`/`rangeStart` would silently drop
+        // a message dated exactly on either boundary day from review search, even though it's genuinely within
+        // the hold's scope - a real completeness gap for a compliance feature. Nudging the clamp boundaries by
+        // 1ms compensates for the exclusive comparison without changing what a caller's OWN (already-narrower)
+        // `before`/`after` means.
+        const rangeEndInclusive: Date = new Date(rangeEnd.getTime() + 1);
+        const rangeStartInclusive: Date = new Date(rangeStart.getTime() - 1);
         const requestedBefore: Date | undefined = parseDateParam(beforeParam);
         const requestedAfter: Date | undefined = parseDateParam(afterParam);
-        const before: Date = requestedBefore && requestedBefore.getTime() < rangeEnd.getTime() ? requestedBefore : rangeEnd;
-        const after: Date = requestedAfter && requestedAfter.getTime() > rangeStart.getTime() ? requestedAfter : rangeStart;
+        const before: Date = requestedBefore && requestedBefore.getTime() < rangeEndInclusive.getTime() ? requestedBefore : rangeEndInclusive;
+        const after: Date = requestedAfter && requestedAfter.getTime() > rangeStartInclusive.getTime() ? requestedAfter : rangeStartInclusive;
 
         const entityTypes: SearchEntityType[] | undefined = typesParam ? (typesParam.split(",") as SearchEntityType[]) : undefined;
 

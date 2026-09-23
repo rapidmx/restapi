@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ObjectDecorators, type JWTUser } from "@rapidrest/core";
-import { BasePushRoute } from "@rapidrest/service-core";
+import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
+import { ApiErrors, BasePushRoute } from "@rapidrest/service-core";
 import { stripTrustedRoles } from "../util/MailAccessUtils.js";
 const { Config } = ObjectDecorators;
 
@@ -19,6 +19,10 @@ const { Config } = ObjectDecorators;
  * (`util/MailAccessUtils.ts`), so a channel is granted only if it is the caller's own uid (always implicit) or the uid of a
  * mailbox/folder whose ACL gives THEM `READ` - by ownership or an explicit delegate record. An impersonation token is the
  * target user's own identity and works like theirs.
+ *
+ * **A published message's own `from` field (when present) can't claim a different identity than the authenticated
+ * caller.** `CREATE` on the channel only ever authorizes publishing TO it - nothing about that authorizes a message
+ * BODY claiming to have come from somebody else. `send()` below rejects (400) a mismatch - see its own doc comment.
  *
  * **Channels are bare entity uids** — a `Mailbox.uid` or a `Folder.uid`, the same uid `ACLUtils.hasPermission()`
  * is checked against everywhere else in this library — NOT a prefixed name like `"mailbox:<uid>"`.
@@ -66,8 +70,22 @@ export class MailPushRoute extends BasePushRoute {
     }
 
     /** `BasePushRoute.send()` for the caller without their trusted roles: publishing to a channel needs `CREATE` on it as
-     * an ordinary user would. */
+     * an ordinary user would. Also rejects a published message whose own `msg.from` field (when present at all) doesn't
+     * equal the authenticated caller's real uid - `BasePushRoute.send()` itself (read directly, not assumed) forwards
+     * `msg` to every subscriber completely verbatim, with no validation of its contents whatsoever, only a permission
+     * check on the CHANNEL being published to. Nothing stops an authenticated caller from claiming to BE someone else
+     * inside the message body itself - at least one real consumer of this shared push channel (a WebRTC-signaling
+     * plugin) trusts a message's own `from` field as the identity of whoever sent it, with no check of its own, letting
+     * any channel participant forge a `bye`/presenter-claim/offer "from" another participant and have every other
+     * client apply it as genuine. Deliberately property-agnostic - this checks `from` alone, never any consumer-
+     * specific field name or message `type` - so it protects every current and future consumer of this route, not
+     * just that one. Rejects rather than silently overwriting the field, matching `assertSenderAllowed()`'s identical
+     * "loudly refuse a claimed identity that doesn't match the authenticated caller" convention elsewhere in this
+     * library, rather than quietly rewriting a value a caller explicitly sent. */
     public async send(id: string, msg: any, user: any): Promise<void> {
+        if (msg !== null && typeof msg === "object" && "from" in msg && msg.from !== (user as JWTUser | undefined)?.uid) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A published message's own 'from' field must match the authenticated caller's uid.");
+        }
         return super.send(id, msg, stripTrustedRoles(user as JWTUser, this.trustedRoles));
     }
 }

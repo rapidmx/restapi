@@ -9,6 +9,7 @@ import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/
 import { ApiErrorMessages, ApiErrors, HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { exactInFilter } from "../util/EscrowUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, DataExportFormat, DataExportRequest, Mailbox } from "../models/types.js";
@@ -159,8 +160,15 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
             (m) => m.uid,
         );
         const visible: any[] = [{ requestedByUserUid: `eq(${user.uid})` }];
-        if (ownedMailboxUids.length > 0) {
-            visible.push({ mailboxUid: `in(${ownedMailboxUids.join(",")})` });
+        // `exactInFilter()`, not a raw `in(${...join(",")})`: `ModelUtils.splitListOperand()` splits an
+        // `in(...)` operand on unescaped commas, so a client-chosen mailbox `uid` containing one (nothing
+        // strips `uid` on `BaseMailboxRoute.create()` today - see this route's own doc comment) could
+        // otherwise widen this filter to match a mailbox its owner never listed here at all - the same class
+        // of bug `BaseMatterExportRequestRoute.find()`/`BaseEscrowAccessRequestRoute.find()` already guard
+        // against with this identical helper.
+        const ownedMailboxFilter: string | undefined = exactInFilter(ownedMailboxUids);
+        if (ownedMailboxFilter) {
+            visible.push({ mailboxUid: ownedMailboxFilter });
         }
         return await this.requestRepo!.find({ $or: visible, ...paging } as any, { ignoreACL: true, limit, page });
     }

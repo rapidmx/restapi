@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, UserUtils, type JWTUser } from "@rapidrest/core";
+import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import {
     ACLAction,
     ApiErrorMessages,
@@ -17,10 +17,13 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { AuditAction, type CalendarShareLink } from "../models/types.js";
+import type { SearchEntityType, SearchProvider } from "../search/SearchProvider.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { coerceDateFields } from "../util/DateCoercionUtils.js";
 import { assertAdminScope, hasMailAccess, isAdminScope, isTrustedUser } from "../util/MailAccessUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
+import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
+const { Inject } = ObjectDecorators;
 const { Delete, Get, Head, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /**
@@ -142,6 +145,18 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
 
     /** The concrete `AuditLogEntry` class (supplied by the Mongo/SQL subclasses of an `adminScope` route). */
     protected auditLogClass?: any;
+
+    /** Set by a subclass whose entity is independently full-text-indexed (currently only `BaseMessageRoute`,
+     * `"message"` - `SearchEntityType` also names `"contact"`/`"calendarEvent"`/`"note"`/`"task"` for future
+     * use, but `SearchIndexJob` doesn't populate the index for any of those yet). `undefined` (the default)
+     * means "not search-indexed at all" - `delete()`/`truncate()` below skip the search-index removal call
+     * entirely rather than asking a `SearchProvider` to remove an entity type it never indexed in the first
+     * place. */
+    protected readonly searchEntityType?: SearchEntityType;
+
+    /** Only actually used when a concrete subclass sets `searchEntityType` - see `delete()`/`truncate()`. */
+    @Inject("SearchProvider")
+    private searchProvider?: SearchProvider;
 
     /** Fields only server-side code sets. Dropped from a non-trusted caller's create/update body, so a full object
      * round-tripped back keeps the stored values. */
@@ -483,6 +498,14 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         }
         await this.repoUtils.delete(existing.uid, { user, version, purge: purgeRequested, ignoreACL: true });
         this.notify(this.scopeUidOf(existing), "delete", { uid: existing.uid });
+        if (purgeRequested && this.searchEntityType) {
+            // Only on an actual purge (permanently gone from the primary datastore) - a plain soft-delete
+            // stays recoverable, so it stays indexed too, same as `SearchIndexUtils.removeFromSearchIndex()`'s
+            // own "after their entities were purged" contract. Without this, a purged message's subject/body/
+            // attachment text/participants stay a live search hit - including OpenSearch serving a snippet
+            // built from content that's already gone - forever, since nothing else ever revisits it.
+            await removeFromSearchIndex(this.searchProvider, this.searchEntityType, existing.uid, this.logger);
+        }
     }
 
     @Head("/:id")
@@ -619,6 +642,16 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         for (let i = 0; i < matched.length; i += TRUNCATE_BATCH_SIZE) {
             const uids: string[] = matched.slice(i, i + TRUNCATE_BATCH_SIZE).map((existing) => existing.uid);
             await this.repoUtils.truncate({ uid: ModelUtils.literal(uids, "in") } as any, { user, ignoreACL: true });
+        }
+        if (this.searchEntityType) {
+            // `truncate()` is always a hard, permanent delete (see this method's own doc comment above) - same
+            // "stays a live search hit forever otherwise" gap `delete()`'s own purge path closes above.
+            await removeFromSearchIndex(
+                this.searchProvider,
+                this.searchEntityType,
+                matched.map((existing) => existing.uid),
+                this.logger,
+            );
         }
     }
 

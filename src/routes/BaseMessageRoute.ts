@@ -259,6 +259,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
     protected readonly listQueryParams: readonly string[] = MESSAGE_LIST_QUERY_PARAMS;
 
+    /** `Message` is the one entity type `SearchIndexJob` actually indexes today - see `BaseScopedChildRoute.
+     * searchEntityType`'s own doc comment. */
+    protected readonly searchEntityType = "message" as const;
+
     /**
      * Translates the mail list's own `?filter=`/`?sortBy=`/`?sortOrder=` vocabulary (`util/MessageListUtils.ts`)
      * into the query `RepoUtils.find()`/`count()` understand, for `GET /` and `HEAD /` alike - so the count shown
@@ -524,6 +528,17 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         syncMessageListFields(obj, existing);
         if (typeof obj.folderUid === "string" && obj.folderUid !== existing.folderUid) {
             BaseMessageRoute.assertNotInFlight(existing);
+        }
+        // A folder move / flags change / label change all leave the search index stale: every provider's
+        // index document embeds folderUid/flags/labelUids directly rather than re-reading them live at query
+        // time (see `SearchIndexJob.buildDocument()`), and nothing else ever re-triggers a re-index once one
+        // has already happened - a message indexed once under its old folder/flags/labels stays that way in
+        // `in:`/`is:unread`/`is:flagged`/`label:` search results forever otherwise. Clearing `searchIndexedAt`
+        // (the same signal `AttachmentExtractionJob` already uses to force a re-index on new attachment text)
+        // makes `SearchIndexJob` pick this message back up on its next pass. Applies for every caller, trusted
+        // included - a trusted admin's move/flag change goes stale exactly the same way a self-service one does.
+        if ((typeof obj.folderUid === "string" && obj.folderUid !== existing.folderUid) || "flags" in obj || "labelUids" in obj) {
+            obj.searchIndexedAt = null;
         }
         if (this.isTrusted(user)) {
             return;

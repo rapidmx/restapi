@@ -22,6 +22,23 @@ function parseDateParam(value: string | undefined): Date | undefined {
     return Number.isNaN(date.getTime()) ? undefined : date;
 }
 
+/** Rejects (400) a structured search filter param that was given more than once. Every `@Query(...)`
+ * parameter here is typed `string | undefined`, but that's only ever true for a WELL-FORMED request - the
+ * framework's own query-string parser turns a repeated key (e.g. `?subject=a&subject=b`) into a real
+ * array at runtime regardless of what the type annotation claims (`BaseScopedChildRoute.ts` guards the
+ * identical mismatch elsewhere with the same `typeof x !== "string"` check). Every param this is applied to
+ * below is later passed to `.split(",")`, which throws an uncaught `TypeError` (an opaque 500) on an array
+ * rather than the clean 400 a malformed request deserves - caught here, before that call, instead. */
+function assertSingleStringParam(value: unknown, name: string): string | undefined {
+    if (value === undefined) {
+        return undefined;
+    }
+    if (typeof value !== "string") {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${name}' must be given at most once.`);
+    }
+    return value;
+}
+
 /**
  * Exposes full-text search across a mailbox's messages/contacts/calendar events/notes/tasks. Unlike every
  * other route in this library, this is NOT a `ModelRoute`/`CRUDRoute` subclass — `RepoUtils.find()` has no
@@ -123,6 +140,9 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
         if (!this.searchProvider) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
+        typesParam = assertSingleStringParam(typesParam, "types");
+        isParam = assertSingleStringParam(isParam, "is");
+        labelParam = assertSingleStringParam(labelParam, "label");
         const hasStructuredFilter: boolean =
             from !== undefined ||
             to !== undefined ||
@@ -194,6 +214,10 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
         if (!this.searchProvider) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
+        typesParam = assertSingleStringParam(typesParam, "types");
+        participantsParam = assertSingleStringParam(participantsParam, "participants");
+        isParam = assertSingleStringParam(isParam, "is");
+        labelParam = assertSingleStringParam(labelParam, "label");
 
         const mailboxUid: string = await this.requireCallerMailboxUid(user, mailboxUidParam);
 

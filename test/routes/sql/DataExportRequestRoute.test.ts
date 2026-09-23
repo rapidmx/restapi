@@ -206,6 +206,37 @@ describe("Route:DataExportRequestSQL Tests", () => {
             expect(result.status).toBe(200);
             expect(result.body).toEqual([]);
         });
+
+        it("A crafted comma-containing mailbox uid can't widen the visible-mailbox filter to another user's mailbox (in()-injection guard).", async () => {
+            const victimMailbox = await createMailbox(otherUser.uid);
+            // Simulates a client-supplied `uid` landing in the mailbox row unstripped - `BaseMailboxRoute.
+            // create()` doesn't currently strip a client-supplied `uid` the way `BaseMatterRoute.create()`/
+            // `BaseEscrowScopeRoute.create()` do (a separate, bigger issue flagged but not fixed here). This
+            // test proves `find()`'s own `in(...)` construction can't be widened by such a uid regardless of
+            // how it got onto a row, rather than relying on `create()` to be the only thing standing in the way.
+            await mailboxRepo.save(
+                new MailboxSQL({
+                    uid: `,${victimMailbox.uid}`,
+                    ownerUserUid: owner.uid,
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Attacker Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                }),
+            );
+            const victimRequest = await requestRepo.save(
+                new DataExportRequestSQL({ mailboxUid: victimMailbox.uid, requestedByUserUid: otherUser.uid, format: "json", status: "pending" }),
+            );
+
+            const result = await request(server.getApplication())
+                .get(baseUrl)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body.map((r: any) => r.uid)).not.toContain(victimRequest.uid);
+        });
     });
 
     describe("GET /data-export-requests/:id", () => {

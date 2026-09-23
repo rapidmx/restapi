@@ -3782,3 +3782,193 @@ Files: changed `package.json`/`yarn.lock` (`@rapidrest/service-core` `^2.1.0` ->
 `withByteLimit()`, `DEFAULT_MAX_IMPORT_BYTES` 200 MiB -> 50 GiB, `maxBodySize`/its `init()` warning removed
 as no longer applicable to a streaming route), `RELEASE_NOTES.md`. New:
 `test/routes/BaseMailboxImportRoute.streaming.test.ts`.
+
+### 2026-09-23 - Round 4: three separate reviewer sweeps landed in one sitting after the streaming-upload work (4643757, 3ae2b5f) - blob leak + quota bypass, IDOR/auth-order bugs, search-subsystem gaps, and a push-notification identity-spoofing bug - all folded into one follow-up commit
+
+Four separate rounds of review feedback arrived in quick succession while this session was still verifying
+the streaming-upload commits. All addressed here rather than as separate commits, per instruction.
+
+**1. [HIGH] `MailboxImportJob` never deleted the raw uploaded blob, on ANY outcome.** `BaseMailboxImportRoute.
+create()` writes the streamed upload to `blobStore.put("mailbox-imports/<uuid>", ...)` and stores that key as
+`sourceBlobKey`; `MailboxImportJob` reads it back (`resolveLocalSourcePath()`) but never called
+`blobStore.delete()` - success, failure, and quota-rejection all permanently orphaned it. The ONLY other
+caller that ever deletes a `sourceBlobKey` blob is `ErasureExecutionJob`, on GDPR erasure alone - not
+ordinary import completion. Raising `DEFAULT_MAX_IMPORT_BYTES` to 50 GiB in the immediately-prior commit
+(justified purely by the streaming fix's memory-safety win) multiplied the blast radius ~250x: an
+authenticated self-service user, no per-user pending-request cap existing either, could fire off unbounded
+concurrent 50 GiB uploads, each permanently consuming real storage regardless of outcome. Fixed by
+restructuring `MailboxImportJob.processRequest()` into a thin wrapper (`processRequest()`) around the
+original logic (renamed `doProcessRequest()`), with a `finally` that deletes `request.sourceBlobKey`
+(best-effort, logged on failure) - covers every outcome `doProcessRequest()` can produce: mailbox/folder
+gone, success, per-message failure, quota rejection. The ONE terminal outcome that never calls
+`processRequest()` at all - `reclaimAbandonedRequests()` giving up after `maxAttempts` - deletes the blob the
+same way at its own call site instead. New tests (both backends): source blob deleted after a successful
+import, after a quota-rejected one, after "mailbox no longer exists" (an early-return path that previously
+never even tried), and after the abandoned-after-max-attempts path.
+
+**2. [MEDIUM] Mailbox quota was bypassed entirely at import-UPLOAD time.** `BaseMailboxImportRoute.create()`
+only ever enforced the flat `mail:import:max_bytes` ceiling - never the target mailbox's own real
+`quotaBytes`/`usedBytes`. A mailbox already at/over quota could still have up to 50 GiB streamed into blob
+storage (real disk/S3/egress/wall-clock cost) before `MailboxImportJob.persistImportedMessage()`'s own per-
+message quota check got its first chance to reject anything, potentially not for ~30s (this job's own
+schedule). Added a cheap, READ-ONLY sanity gate in `create()`, deliberately NOT a real charge (that stays
+exclusively `MailboxImportJob`'s own per-message job, since a raw upload's byte count has no fixed
+relationship to its eventual reconstructed message sizes - charging here would double-count): reject
+outright if `quotaBytes > 0 && usedBytes >= quotaBytes`; reject a declared `Content-Length` that exceeds
+remaining quota before `req.bodyStream` is ever touched; the existing `withByteLimit()` wrapper's ceiling
+becomes `Math.min(maxImportBytes, remainingQuota)` so the running byte count during the stream itself aborts
+(cleaning up the partial blob) the moment it would clearly exceed what's left, with the abort's own error
+message correctly attributing quota vs. the flat ceiling depending on which one was actually tighter. New
+tests (both backends): an at-quota mailbox rejected before any blob write, and a `Content-Length` exceeding
+remaining (but not total) quota rejected before any blob write.
+
+**3. [documentation only] S3 multipart 10,000-part ceiling.** At the default 8 MiB
+`mail:blob:s3:multipart_part_size_bytes`, 50 GiB is ~6,400 parts - comfortably under S3's 10,000-part cap -
+but an operator who lowers the part size well below default while also raising `mail:import:max_bytes`
+further could still hit it. Documented in `S3BlobStore.ts`'s own `multipartPartSizeBytes` doc comment and
+`RELEASE_NOTES.md`; not cross-validated in code (a footgun flagged, not fixed).
+
+**4. [HIGH] `in(...)`-operand injection in `BaseDataExportRoute.find()`/`BaseMailboxImportRoute.find()`.**
+Both built `mailboxUid: \`in(${ownedMailboxUids.join(",")})\`` directly - a raw join, unlike every sibling
+route in this family (`BaseMatterRoute`, `BaseEscrowAccessRequestRoute.find()`, `BaseEscrowAuditLogRoute`,
+`BaseMatterExportRequestRoute.find()`), which all already use `exactInFilter()`/`isQuerySafeUid()` (`util/
+EscrowUtils.ts`) specifically because `ModelUtils.splitListOperand()` splits an `in(...)` operand on
+unescaped commas. Confirmed exploitable: `BaseMailboxRoute.create()` doesn't strip a client-supplied `uid`
+(unlike `BaseMatterRoute.create()`/`BaseEscrowScopeRoute.create()`, which explicitly `delete (o as any).uid`
+for exactly this reason) - a self-service caller creates their own mailbox with `uid: ",<victim-uid>"`, then
+`GET /data-export-requests` (or `/mailbox-import-requests`) matches the victim's mailbox via the parsed
+`["", "<victim-uid>"]`, leaking every request made for it (status, format, dates, `blobKey`). Fixed both
+routes with `exactInFilter(ownedMailboxUids)`, mirroring the sibling routes exactly (confirmed via `grep` that
+these were the ONLY two remaining raw-join call sites in `src/routes/` - `BaseEscrowAuditLogRoute.ts`'s own
+apparent raw join is safe, its `visibleMatterIds` are pre-filtered through `isQuerySafeUid()` before ever
+being joined). New tests (both routes, mongo+sql): a mailbox row created directly via the repo with a crafted
+`uid: ",<victim-mailbox-uid>"`, asserting the victim's request never appears in the attacker's list. NOT
+fixed in this pass (flagged as the bigger, separate root enabler, coordinator's own call to defer): `
+BaseMailboxRoute.create()` still doesn't strip a client-supplied `uid`.
+
+**5. [HIGH] Authorization-ordering bug in `BaseEscrowAccessRequestRoute` - state checked before the holder-
+gate in 3 of 4 comparable methods.** `create()`/`approve()`/`material()` all checked request/matter STATE
+(closed/pending/approved) BEFORE calling `requireEscrowHolder()`, unlike `deny()`/`findById()` in the same
+class (holder-check first) and every sibling class (`BaseMatterRoute`, `BaseMatterExportRequestRoute`,
+`BaseMatterSearchRoute` - all holder-check-then-state-check). `create()` had no `!user` guard and revealed
+matter open/closed via 400-vs-proceeding before any holder check; `approve()` had no `!user` guard and
+revealed pending/not-pending via a distinguishable 409 before any holder check (a status oracle for anyone
+who knows/guesses a request id); `material()` had no `!user` guard and revealed whether the dual-control
+approval threshold has been met (distinguishable 403 messages: "Dual control threshold not yet met." vs. the
+generic `AUTH_PERMISSION_FAILURE` from `requireEscrowHolder()`) before any holder check - anyone could learn
+precisely when someone else's escrow key-material release conditions were met, without being a holder of
+anything. Fixed by reordering all three to call `requireMatter()`/`requireEscrowHolder()` first (this also
+incidentally subsumes the missing `!user` guards, since `requireEscrowHolder()` itself already throws 403 for
+`user === undefined`). New tests (both backends): each of the three methods, against BOTH an unauthenticated
+and a non-holder caller, hitting the "interesting" state (closed matter / non-pending request / not-yet-
+approved request) and asserting the exact generic `AUTH_PERMISSION_FAILURE` message, not the state-revealing
+one. `deny()`'s own separate inconsistency (doesn't reject a closed matter, unlike the other three) was
+flagged too but is intentional - "holders can clean up stragglers" - confirmed as a real, deliberate design
+choice rather than an oversight; documented in `RELEASE_NOTES.md`, no code change.
+
+**6. [HIGH] `MailPushRoute.send()` republished a message body verbatim with zero content validation.**
+Discovered via `meet-plugin`'s WebRTC signaling, which POSTs a self-declared `from` field through this exact
+route with no server-side binding to the authenticated caller's real identity - but the gap is in the SHARED
+push route (`@rapidrest/service-core`'s `BasePushRoute.send()`, read directly: only checks `CREATE` on the
+channel, then `JSON.stringify()`s `msg` straight to every subscriber, no validation of its contents at all),
+not `meet-plugin`-specific. Any authenticated participant (including a low-trust anonymous guest) could POST
+`{"type":"video-meeting-signal","kind":"bye","from":"<victim-uid>"}` and every client applies it as genuine -
+closing the victim's real connection, dropping them from a call without their knowledge; the same applies to
+forged presenter-claims and offers/answers. Fixed in `MailPushRoute.send()` (the one override point restapi
+already has for this route): rejects (400) when `msg` is an object with a `from` property that doesn't equal
+`(user as JWTUser)?.uid`. Deliberately property-agnostic (`from` alone, never `type` or any consumer-specific
+field), rejecting rather than silently overwriting (matches `assertSenderAllowed()`'s established "loudly
+refuse a claimed identity mismatch" convention elsewhere in this library, rather than quietly rewriting a
+caller-sent value). New tests in `test/push/MailPushRoute.test.ts`: no `from` field passes through unchanged;
+`from` matching the caller passes through unchanged; `from` claiming a different uid is rejected (400) and
+never reaches `BasePushRoute.send()` at all - using the exact `video-meeting-signal`/`bye`/`from` message
+shape `meet-plugin`'s own signaling sends, so this directly exercises the vulnerability at the shared-route
+layer `meet-plugin` depends on (its own repo/tests are out of scope for this commit).
+
+**7. [HIGH] Permanently-deleted mail stayed searchable forever.** `BaseScopedChildRoute`'s `delete()` (on
+`?purge=true`) and `truncate()` (always a hard delete per its own doc comment) never called `util/
+SearchIndexUtils.ts`'s `removeFromSearchIndex()` at all - confirmed via `grep`, only `BaseSearchRoute.ts`/
+`BaseMatterSearchRoute.ts` reference `SearchProvider` under `src/routes`. That util's own doc comment already
+says every hard-delete/purge path must call it (erasure/retention/quarantine-retention/recall already do),
+but the two most ordinary paths - an individual route-level delete and a bulk truncate - didn't: a purged
+message's subject/body/attachment text/participants stayed a live search hit indefinitely (OpenSearch even
+serving a snippet built from content that no longer existed), with nothing ever revisiting it. Fixed with a
+new opt-in `BaseScopedChildRoute.searchEntityType?: SearchEntityType` (`undefined` by default - most
+subclasses, e.g. `Attachment`/`CalendarShareLink`/`Label`/`MailFilterRule`/`QuarantineEntry`, aren't
+independently search-indexed at all) plus a new `@Inject("SearchProvider")` field, both only actually used
+when a subclass sets `searchEntityType` - `BaseMessageRoute` sets it to `"message"`, the one entity type
+`SearchIndexJob` actually populates today (`SearchEntityType` also names `"contact"`/`"calendarEvent"`/
+`"note"`/`"task"` for future use, none populated yet - confirmed via `grep`, not assumed). `delete()` calls
+`removeFromSearchIndex()` only when `purgeRequested` (an ordinary soft-delete stays recoverable, so it stays
+indexed too - matches `removeFromSearchIndex()`'s own "after PURGED" contract); `truncate()` always does,
+since it's always a hard delete. New tests in `test/routes/mongo/MessageRoute.test.ts`: a purged message is
+gone from `NoopSearchProvider`'s index afterward; a merely soft-deleted one is NOT (still findable); a
+truncated one is gone too. (SQL-side mirrors of these three deferred for time - same shared base-class code
+path, lower marginal risk than the mongo coverage already proves.)
+
+**8. [MEDIUM] Search results went stale after a message moved, was flagged, or was labeled.**
+`Message.searchIndexedAt` was only ever cleared by `AttachmentExtractionJob`; `BaseScopedChildRoute.update()`/
+`BaseMessageRoute.prepareUpdate()` never touched it, and `SearchIndexJob` only re-indexes on
+`searchIndexedAt: null`. Since each provider's index document embeds `folderUid`/`flags`/`labelUids` directly
+(not re-read live at query time), a folder move left a message findable under `in:<old folder>` and invisible
+under `in:<new folder>` forever, and a flag/label change left `is:unread`/`is:flagged`/`label:` permanently
+wrong. Fixed in `BaseMessageRoute.prepareUpdate()`: clears `obj.searchIndexedAt = null` whenever `folderUid`
+actually changes, or `obj` touches `flags`/`labelUids` at all (for every caller, trusted included). New tests
+in `MessageRoute.test.ts` (mongo): each of the three triggers clears `searchIndexedAt`; an update touching
+none of them (e.g. only `subject`) does NOT clear it, so this doesn't force unnecessary re-indexing.
+
+**9. [MEDIUM, cheap] eDiscovery review search silently dropped messages dated exactly on a hold's boundary
+day.** `BaseMatterSearchRoute.search()` clamps `before`/`after` to the matter's own `dateRangeEnd`/
+`dateRangeStart`, but confirmed (by reading each provider's own query-building code) every `SearchProvider`
+treats them as EXCLUSIVE (`date_for_sort < before`, `> after` in `PostgresFullTextSearchProvider.ts`, same
+shape in the Mongo/OpenSearch providers), while this codebase's own authoritative `LegalHoldUtils.
+matterCovers()` is INCLUSIVE on both ends (`>= dateRangeStart && <= dateRangeEnd`). Fixed by nudging the
+clamp boundaries 1ms past the matter's own range (`rangeEnd.getTime() + 1`/`rangeStart.getTime() - 1`) before
+comparing against/falling back from a caller-supplied value - a caller's own narrower `before`/`after` is
+untouched, only the matter-boundary fallback itself is adjusted. Updated the 3 existing `MatterSearchRoute.
+test.ts` tests that asserted the old (buggy) exact-boundary clamp values to the new `+1`/`-1` ones instead.
+
+**10. [LOW, cheap] Structured search filter query params weren't type-checked before use.** A duplicate query
+key (`?subject=a&subject=b`) parses to a real array at runtime regardless of these routes' own
+`string | undefined` parameter types, and `BaseSearchRoute.ts`/`BaseMatterSearchRoute.ts` immediately handed
+`types`/`is`/`label`/`participants` straight to `.split(",")`, throwing an uncaught `TypeError` (an opaque
+500) instead of a clean 400 - `BaseScopedChildRoute.ts` already guards the identical mismatch elsewhere with
+a `typeof x !== "string"` check. Added a local `assertSingleStringParam()` helper to each file (small,
+self-contained, not worth a new shared util module for two call sites), applied to every param later
+`.split(",")`'d in both `search()` and `candidates()`. New tests (mongo, both routes): a repeated `types`/
+`is`/`label`/`participants` key now 400s instead of crashing.
+
+**Explicitly deferred, not fixed this round** (both noted in `RELEASE_NOTES.md`'s Known Issues, per
+instruction when told to include only if there's capacity): `BaseAttachmentRoute.ts` still reads fully-
+buffered `req.rawBody` (same class of fix as the mailbox-import streaming work, just not yet applied - high-
+frequency/multi-tenant unlike PST import's rare admin-gated bulk op, so real but lower urgency); search
+result pagination has no secondary sort key (bulk-imported same-timestamp mail can duplicate/skip across
+pages); `from:`/`to:`/`cc:` search filters are case-sensitive against this codebase's established case-
+insensitive-address convention; `BaseMatterSearchRoute.search()`'s per-custodian loop is sequential, not
+parallelized, with no cap on `custodianMailboxUids.length`.
+
+Files: changed `src/jobs/MailboxImportJob.ts` (`processRequest()`/`doProcessRequest()` split, blob delete in
+`finally`, `reclaimAbandonedRequests()`'s own delete), `src/routes/BaseMailboxImportRoute.ts` (quota pre-
+check + mid-stream quota abort), `src/blob/S3BlobStore.ts` (doc comment only), `src/routes/
+BaseDataExportRoute.ts`, `src/routes/BaseEscrowAccessRequestRoute.ts`, `src/push/MailPushRoute.ts`, `src/
+routes/BaseScopedChildRoute.ts` (`searchEntityType`, `SearchProvider` injection, `delete()`/`truncate()`),
+`src/routes/BaseMessageRoute.ts` (`searchEntityType = "message"`, `prepareUpdate()`'s `searchIndexedAt`
+clear), `src/routes/BaseMatterSearchRoute.ts` (inclusive-boundary clamp, `assertSingleStringParam()`),
+`src/routes/BaseSearchRoute.ts` (`assertSingleStringParam()`), `RELEASE_NOTES.md`, and new/changed tests in
+`test/jobs/{mongo,sql}/MailboxImportJob{Mongo,SQL}.test.ts`, `test/routes/{mongo,sql}/
+MailboxImportRequestRoute.test.ts`, `test/routes/{mongo,sql}/DataExportRequestRoute.test.ts`, `test/routes/
+{mongo,sql}/EscrowAccessRequestRoute.test.ts`, `test/push/MailPushRoute.test.ts`, `test/routes/mongo/
+MessageRoute.test.ts`, `test/routes/mongo/SearchRoute.test.ts`, `test/routes/mongo/MatterSearchRoute.test.ts`.
+
+**Pickup after an interrupted session (same day):** the above was left uncommitted when the prior session was
+killed. Independently re-verified every fix against the actual diff (not just this write-up) - all nine numbered
+items were genuinely implemented as described, `tsc --noEmit` and `yarn lint` both clean. One real gap found:
+`test/routes/sql/MatterSearchRoute.test.ts` was never updated for item 9's `+1`/`-1`ms inclusive-boundary clamp
+(only the mongo mirror was) - its 3 boundary assertions still expected the old exact-boundary values and failed
+for real (not a flake) against the already-fixed route code. Fixed to match the mongo file exactly. Separately,
+this repo's real-DB (mongodb-memory-server + SQL) full suite proved noticeably flaky under repeated back-to-back
+full runs in this sandbox - `MongoNetworkError: read ECONNRESET` and occasional stray `findOne()` null reads
+cascading across unrelated test files, worse on each successive run (consistent with OS-level connection/handle
+pressure from re-running the ~7,700-test real-DB suite four times in under two hours, not a code defect): none of
+those failures reproduced in isolation, none touched a file this round changed, and a focused run of exactly the
+13 test files this round's changes touch (380 tests) passed cleanly with zero flakes. Committed on that basis.

@@ -199,6 +199,16 @@ describe("Route:SearchRouteMongo Tests", () => {
         expect(result.status).toBe(400);
     });
 
+    it("Rejects a repeated structured-filter query key (400) instead of crashing - the framework parses a duplicate key into a real array at runtime, which .split(',') would otherwise throw an uncaught TypeError on.", async () => {
+        await createMailbox(owner.uid);
+        for (const duplicated of ["types=message&types=contact", "is=flagged&is=unread", "label=a&label=b"]) {
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}?q=hello&${duplicated}`)
+                .set("Authorization", "jwt " + ownerToken);
+            expect(result.status).toBe(400);
+        }
+    });
+
     it("Applies from/hasAttachment structured filters alongside free text.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
@@ -259,6 +269,16 @@ describe("Route:SearchRouteMongo Tests", () => {
                 .get(`${baseUrl}/candidates`)
                 .set("Authorization", "jwt " + ownerToken);
             expect(result.status).toBe(404);
+        });
+
+        it("Rejects a repeated structured-filter query key (400) instead of crashing.", async () => {
+            await createMailbox(owner.uid);
+            for (const duplicated of ["types=message&types=contact", "participants=a@x.com&participants=b@x.com", "is=flagged&is=unread", "label=a&label=b"]) {
+                const result = await request(server.getApplication())
+                    .get(`${baseUrl}/candidates?${duplicated}`)
+                    .set("Authorization", "jwt " + ownerToken);
+                expect(result.status).toBe(400);
+            }
         });
 
         it("Returns identifiers only, scoped to the caller's own mailbox, with no q required.", async () => {

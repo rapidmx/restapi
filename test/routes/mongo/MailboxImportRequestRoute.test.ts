@@ -138,6 +138,62 @@ describe("Route:MailboxImportRequestMongo Tests", () => {
             expect(await requestRepo.find({}).toArray()).toEqual([]);
         });
 
+        it("Rejects an import upload outright when the target mailbox has already reached its storage quota (413), before touching blob storage.", async () => {
+            const mailbox = await mailboxRepo.save(
+                new MailboxMongo({
+                    ownerUserUid: owner.uid,
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Full Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 100,
+                    usedBytes: 100,
+                }),
+            );
+            const folder = await createFolder(mailbox.uid);
+            const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const putSpy = vi.spyOn(blobStore, "put");
+
+            const result = await request(server.getApplication())
+                .post(importUrl({ format: "mbox", targetFolderUid: folder.uid }))
+                .set("Authorization", "jwt " + ownerToken)
+                .set("Content-Type", "application/mbox")
+                .send(Buffer.from("From x\r\n\r\n"));
+
+            expect(result.status).toBe(413);
+            expect(await requestRepo.find({}).toArray()).toEqual([]);
+            expect(putSpy).not.toHaveBeenCalled();
+            putSpy.mockRestore();
+        });
+
+        it("Rejects an upload whose declared Content-Length exceeds the mailbox's remaining storage quota (413), before touching blob storage - even though it's well under mail:import:max_bytes.", async () => {
+            const mailbox = await mailboxRepo.save(
+                new MailboxMongo({
+                    ownerUserUid: owner.uid,
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Nearly Full Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000,
+                    usedBytes: 999_900,
+                }),
+            );
+            const folder = await createFolder(mailbox.uid);
+            const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const putSpy = vi.spyOn(blobStore, "put");
+
+            const result = await request(server.getApplication())
+                .post(importUrl({ format: "mbox", targetFolderUid: folder.uid }))
+                .set("Authorization", "jwt " + ownerToken)
+                .set("Content-Type", "application/mbox")
+                .send(Buffer.alloc(200)); // only 100 bytes of quota remain
+
+            expect(result.status).toBe(413);
+            expect(await requestRepo.find({}).toArray()).toEqual([]);
+            expect(putSpy).not.toHaveBeenCalled();
+            putSpy.mockRestore();
+        });
+
         it("Returns 404 when the caller owns no mailbox.", async () => {
             const result = await request(server.getApplication())
                 .post(importUrl({ format: "mbox", targetFolderUid: uuid.v4() }))
@@ -363,6 +419,45 @@ describe("Route:MailboxImportRequestMongo Tests", () => {
             const result = await request(server.getApplication()).get(baseUrl);
             expect(result.status).toBe(200);
             expect(result.body).toEqual([]);
+        });
+
+        it("A crafted comma-containing mailbox uid can't widen the visible-mailbox filter to another user's mailbox (in()-injection guard).", async () => {
+            const victimMailbox = await createMailbox(otherUser.uid);
+            const victimFolder = await createFolder(victimMailbox.uid);
+            // Simulates a client-supplied `uid` landing in the mailbox row unstripped - `BaseMailboxRoute.
+            // create()` doesn't currently strip a client-supplied `uid` the way `BaseMatterRoute.create()`/
+            // `BaseEscrowScopeRoute.create()` do (a separate, bigger issue flagged but not fixed here). This
+            // test proves `find()`'s own `in(...)` construction can't be widened by such a uid regardless of
+            // how it got onto a row, rather than relying on `create()` to be the only thing standing in the way.
+            await mailboxRepo.save(
+                new MailboxMongo({
+                    uid: `,${victimMailbox.uid}`,
+                    ownerUserUid: owner.uid,
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Attacker Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                }),
+            );
+            const victimRequest = await requestRepo.save(
+                new MailboxImportRequestMongo({
+                    mailboxUid: victimMailbox.uid,
+                    requestedByUserUid: otherUser.uid,
+                    targetFolderUid: victimFolder.uid,
+                    format: "mbox",
+                    sourceBlobKey: "k1",
+                    status: "pending",
+                }),
+            );
+
+            const result = await request(server.getApplication())
+                .get(baseUrl)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body.map((r: any) => r.uid)).not.toContain(victimRequest.uid);
         });
     });
 

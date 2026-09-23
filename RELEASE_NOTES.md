@@ -50,6 +50,63 @@
   the moment it exceeds `mail:import:max_bytes`, so a client that lies about (or omits) `Content-Length` is still bounded. `DEFAULT_MAX_IMPORT_BYTES` is raised from 200 MiB to 50 GiB now that the
   memory-safety reason for a small number no longer applies - a genuine 20GB+, never-archived PST is not unusual, and this ceiling now exists only to cap disk usage and upload duration, not to
   protect process memory. This route never used `@Validate`/`before`/`after` (which don't see `req.body` on a streaming route), so no validation needed to move.
+- **The uploaded source blob behind a mailbox import request is now actually deleted once the request is done being processed, on every outcome.** `MailboxImportJob` read the blob back
+  (`resolveLocalSourcePath()`) but never deleted it - success, failure, or quota rejection all left it permanently orphaned in blob storage forever (the only other caller that ever deletes a
+  `sourceBlobKey` blob is `ErasureExecutionJob`, on GDPR erasure alone). Raising `mail:import:max_bytes` to 50 GiB in the streaming-upload fix above made this dramatically worse in the same
+  change that fixed the memory problem: an authenticated self-service user could already fire off unbounded concurrent uploads with no per-user pending-request cap, and each one now permanently
+  consumed up to 50 GiB of real storage regardless of what happened to the request. `processRequest()` now deletes the source blob in a `finally` block covering every outcome (mailbox/folder
+  gone, success, per-message failure, quota rejection); `reclaimAbandonedRequests()`'s own separate "gave up after max_attempts" terminal path - the one outcome that never calls
+  `processRequest()` at all - deletes it the same way at its own call site.
+- **Mailbox storage quota is no longer bypassed entirely at import-upload time.** `BaseMailboxImportRoute.create()` only ever enforced the flat `mail:import:max_bytes` ceiling - never the
+  target mailbox's own `quotaBytes`/`usedBytes` - so a mailbox already at or near its quota could still have up to 50 GiB streamed into blob storage (consuming real disk/S3/egress/wall-clock
+  time) before `MailboxImportJob.persistImportedMessage()`'s own per-message quota check got its first chance to reject even one message, potentially not for another ~30 seconds (this job's own
+  schedule). `create()` now rejects outright (413) when the target mailbox has already reached its quota, and separately rejects a declared `Content-Length` that exceeds the mailbox's remaining
+  quota, both before `req.bodyStream` is ever touched; a running byte count during the stream itself aborts (cleaning up the partial blob) the moment it would clearly exceed what remains. This
+  is deliberately a coarse, read-only sanity gate against the mailbox's already-fetched row, not a real charge - `MailboxImportJob`'s own per-message charge remains the one accurate place
+  `Mailbox.usedBytes` is actually written for an import, since a raw PST's upload byte count has no fixed relationship to its eventual reconstructed message sizes.
+- **Note for operators:** `S3BlobStore`'s streamed `put()` (used for both attachment/message blobs and, since the change above, mailbox imports) uses S3's multipart upload, capped by S3 itself
+  at 10,000 parts per object. At the default 8 MiB `mail:blob:s3:multipart_part_size_bytes`, that's an 80 GiB object before hitting it - comfortably above the new 50 GiB `mail:import:max_bytes`
+  default - but an operator who lowers the part size well below its default while also raising `mail:import:max_bytes` further could still hit the 10,000-part ceiling on a large upload; neither
+  value is cross-validated against the other.
+- **Closed an `in(...)`-operand injection in `BaseDataExportRoute.find()`/`BaseMailboxImportRoute.find()`.** Both built their own visible-mailbox filter as a raw `` `in(${ownedMailboxUids.join(",")})` `` -
+  unlike every sibling route in this family (`BaseMatterRoute`, `BaseEscrowAccessRequestRoute.find()`, `BaseEscrowAuditLogRoute`, `BaseMatterExportRequestRoute.find()`), which all use
+  `exactInFilter()`/`isQuerySafeUid()` specifically because `ModelUtils.splitListOperand()` splits an `in(...)` operand on unescaped commas. Confirmed exploitable, not just defense-in-depth:
+  `BaseMailboxRoute.create()` doesn't strip a client-supplied `uid` field, so a self-service caller could create their own mailbox with `uid: ",<victim-mailbox-uid>"`, then `GET
+  /data-export-requests` (or `/mailbox-import-requests`) - the resulting filter parses as `["", "<victim-uid>"]`, matching the victim's mailbox exactly and leaking every export/import request
+  made for it (status, format, dates, `blobKey` included). Both routes now build this filter with `exactInFilter()`, the same guard the sibling routes already use. Not fixed in this pass (flagged
+  as the bigger, separate root enabler): `BaseMailboxRoute.create()` still doesn't strip a client-supplied `uid` the way `BaseMatterRoute.create()`/`BaseEscrowScopeRoute.create()` do.
+- **Fixed an authorization-ordering bug in `BaseEscrowAccessRequestRoute`** where `create()`/`approve()`/`material()` checked request/matter STATE (closed/pending/approved) BEFORE calling
+  `requireEscrowHolder()`, unlike `deny()`/`findById()` in the same class and every sibling class (`BaseMatterRoute`, `BaseMatterExportRequestRoute`, `BaseMatterSearchRoute` - all holder-check-
+  then-state-check). This turned all three into oracles for anyone who knew or guessed a request/matter id, holder or not: `create()` revealed a matter's open/closed state via 400-vs-proceeding,
+  `approve()` revealed a request's pending/not-pending status via a distinguishable 409, and `material()` revealed precisely when someone else's mailbox met its dual-control key-release threshold
+  via a distinguishable 403 message - all before any holder check ran. All three now call `requireMatter()`/`requireEscrowHolder()` first, matching `deny()`/`findById()`'s already-correct order -
+  a non-holder now gets the exact same uniform 403 regardless of the underlying state. (`deny()` itself deliberately still allows denying a request under a closed matter - "holders can clean up
+  stragglers" - a pre-existing, intentional inconsistency with the other three, not a bug; left as-is.)
+- **`MailPushRoute.send()` no longer republishes a message's own `from` field unchecked.** `BasePushRoute.send()` (`@rapidrest/service-core`) forwards a published message to every channel
+  subscriber completely verbatim once the publisher holds `CREATE` on the channel - nothing validates the message BODY itself. At least one real consumer of this shared push channel (a WebRTC-
+  signaling plugin) trusts a message's own `from` field as the identity of whoever sent it, with no check of its own - letting any channel participant (including a low-trust anonymous guest)
+  forge a `bye`/presenter-claim/offer "from" another participant, with every other client applying it as genuine (e.g. silently dropping the victim from a call). `send()` now rejects (400) a
+  message whose `from` field (when present at all) doesn't equal the authenticated caller's own uid - property-agnostic (checks `from` alone, never any consumer-specific field or message
+  `type`), so it protects every current and future consumer of this route, not just that one.
+- **Permanently-deleted mail no longer stays searchable forever.** `BaseScopedChildRoute`'s `delete()` (on `?purge=true`) and `truncate()` (always a hard delete) never removed the deleted
+  record from the full-text search index - `util/SearchIndexUtils.ts`'s own doc comment already says every hard-delete/purge path must do this (erasure/retention/quarantine-retention/recall
+  already did), but the two most ordinary paths, an individual route-level delete and a bulk truncate, didn't. A purged message's subject/body/attachment text/participants stayed a live search
+  hit indefinitely, with OpenSearch even serving a snippet built from content that no longer existed - nothing ever revisited it. New opt-in `BaseScopedChildRoute.searchEntityType` (set by
+  `BaseMessageRoute` to `"message"`, the one entity type actually indexed today; every other `BaseScopedChildRoute` subclass leaves it unset and is unaffected) drives a
+  `removeFromSearchIndex()` call from both paths. An ordinary (non-purge) `delete()` is deliberately left alone - it's still recoverable, so it stays indexed too.
+- **Search results no longer go stale after a message is moved, flagged, or labeled.** `Message.searchIndexedAt` was only ever cleared by `AttachmentExtractionJob` (new attachment text to
+  index) - `BaseScopedChildRoute.update()`/`BaseMessageRoute.prepareUpdate()` never touched it, and `SearchIndexJob` only re-indexes a message once, on `searchIndexedAt: null`. Since each
+  provider's index document embeds `folderUid`/`flags`/`labelUids` directly rather than re-reading them live at query time, moving a message to another folder left it findable under `in:<old
+  folder>` and invisible under `in:<new folder>` forever, and marking read/unread/flagged or changing labels left `is:unread`/`is:flagged`/`label:` permanently wrong. `prepareUpdate()` now
+  clears `searchIndexedAt` whenever `folderUid`/`flags`/`labelUids` actually change, so `SearchIndexJob` picks the message back up on its next pass.
+- **eDiscovery review search (`BaseMatterSearchRoute.search()`) no longer silently drops messages dated exactly on a legal hold's boundary day.** It clamps a caller's `before`/`after` to the
+  matter's own `dateRangeStart`/`dateRangeEnd`, but every `SearchProvider` treats `before`/`after` as EXCLUSIVE (`< before`, `> after`), while this codebase's own authoritative definition of
+  matter coverage (`LegalHoldUtils.matterCovers()`) is INCLUSIVE on both ends - a message dated exactly at the boundary was silently excluded from a holder's review search even though it was
+  genuinely within scope. The clamp now nudges 1ms past each boundary before handing it to the provider, compensating for the exclusive comparison without changing what a caller's own
+  (already-narrower) `before`/`after` means.
+- **`BaseSearchRoute`/`BaseMatterSearchRoute` no longer 500 on a repeated structured-filter query key.** `?types=a&types=b` (or `is=`/`label=`/`participants=`) parses to a real array at runtime
+  regardless of these routes' own `string | undefined` parameter types, and every one of them was immediately handed to `.split(",")`, throwing an uncaught `TypeError`. Both routes now reject
+  (400) a structured filter param that isn't a single string, the same `typeof x !== "string"` guard `BaseScopedChildRoute.ts` already uses elsewhere for the identical mismatch.
 - **A `DistributionList`'s `aliasAddresses` are now validated exactly like a `Mailbox`'s.** `BaseDistributionListRoute` accepted `aliasAddresses` with no domain check, no alias-domain check and
   no collision check at all, even though `BaseMailIngestRoute` resolves and trusts a distribution list's `aliasAddresses` identically to a mailbox's - a caller could add any address on any
   domain (including another mailbox's or list's existing address, or a pure alias domain that should never carry its own addresses) to a distribution list's `aliasAddresses` with no
@@ -88,6 +145,15 @@
 - `decideResourceBooking()` has a TOCTOU window that can double-book a resource mailbox under genuine concurrent processing (two iTIP REQUESTs for overlapping times, processed by two workers at
   once, can both read "no conflict" before either commits). Closing it needs a short-lived advisory lock keyed on the resource mailbox, which has no existing reusable primitive in this codebase
   today - deferred as its own follow-up rather than introducing a new schema-level lock construct in this pass.
+- `BaseAttachmentRoute.ts` (email attachment upload) still reads the fully-buffered `req.rawBody`, the same class of problem the mailbox-import streaming work above solved, just not yet applied
+  here. Default cap is `mail:attachments:max_bytes` (50 MiB) - unlike PST import (rare, admin-gated bulk op), attachment upload is routine and high-frequency/multi-tenant, so many concurrent
+  uploads near the ceiling create real cumulative memory pressure. Migrating it to `@StreamingBody()`/`req.bodyStream` the same way `BaseMailboxImportRoute.create()` was migrated is a real,
+  scoped follow-up - deferred from this pass for time, not for any technical blocker.
+- A few lower-priority search-subsystem findings from the same review round were deferred for time, not fixed: no secondary sort key (e.g. `uid`) in any of the three `SearchProvider`
+  implementations' `search()`/`candidates()` cursor sorting, so bulk-imported mail sharing a timestamp (or hits tying on relevance score) can duplicate/skip results across a paged search
+  (message listing already has this exact fix - `receivedDate`+`uid` tiebreakers - documented elsewhere in this file); `from:`/`to:`/`cc:` search filters are case-sensitive in all three
+  providers, against this codebase's established case-insensitive-address convention everywhere else; `BaseMatterSearchRoute.search()`'s per-custodian-mailbox loop is sequential
+  (`findOne`+`search()` one custodian at a time, no `Promise.all`, no cap on `custodianMailboxUids.length`) rather than parallelized.
 
 ## v0.19.0
 
