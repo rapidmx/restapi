@@ -1268,7 +1268,7 @@ __metadata:
     "@opensearch-project/opensearch": "npm:^3.6.0"
     "@peculiar/x509": "npm:^2.1.0"
     "@rapidrest/core": "npm:^5.2.2"
-    "@rapidrest/service-core": "npm:^2.1.0"
+    "@rapidrest/service-core": "npm:^2.2.0"
     "@swc/core": "npm:^1.16.2"
     "@types/html-to-text": "npm:^9.0.4"
     "@types/mailparser": "npm:^3.4.6"
@@ -1319,7 +1319,7 @@ __metadata:
     "@aws-sdk/client-sesv2": 3.x
     "@opensearch-project/opensearch": ">=3.0.0"
     "@rapidrest/core": 5.x
-    "@rapidrest/service-core": ^2.1.0
+    "@rapidrest/service-core": ^2.2.0
     mammoth: ">=1.8.0"
     pdf-parse: ">=1.1.1"
   peerDependenciesMeta:
@@ -1361,9 +1361,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@rapidrest/service-core@npm:^2.1.0":
-  version: 2.1.0
-  resolution: "@rapidrest/service-core@npm:2.1.0"
+"@rapidrest/service-core@npm:^2.2.0":
+  version: 2.2.0
+  resolution: "@rapidrest/service-core@npm:2.2.0"
   dependencies:
     axios: "npm:^1.20.0"
     dayjs: "npm:^1.11.23"
@@ -1393,7 +1393,7 @@ __metadata:
       optional: true
     uWebSockets.js:
       optional: true
-  checksum: 10c0/4b2a7615d41ff51ca67c17c9506b851a472ce6a51d4d6d04cd7b9c76a7aca38656082247049fd682307efc7bb533ded68be96ce6d9ad125af62b51ad8515d3fa
+  checksum: 10c0/d2e3d590febad51ffefe049c4af6b2ea437f0e12bde44f64b8a7bfd58a4cac19dea2ff5dfb9a47b9fe703226f690d1c2a185d43268d41c56af1bda948463456c
   languageName: node
   linkType: hard
 

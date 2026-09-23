@@ -3696,3 +3696,89 @@ Files: changed `src/blob/BlobStore.ts` (new optional `localPath()`), `src/blob/L
 `src/util/PstImportUtils.ts`, `src/util/MboxUtils.ts`, `src/routes/BaseMailboxImportRoute.ts`
 (`DEFAULT_MAX_IMPORT_BYTES` 90 MiB -> 200 MiB, doc comment rewritten), `RELEASE_NOTES.md`, and the test files
 listed above.
+
+### 2026-09-23 - Phase B: `service-core` 2.2.0's real streaming-upload API lands, closing the PST-import size limitation out fully
+
+Picked up a dead agent session's own uncommitted Phase A work (previous entry above) mid-task after a system
+restart. Independently re-verified all of it before touching anything further:
+
+- Read every changed file end to end rather than trusting the diff was correct because it existed. Confirmed
+  `pst-extractor`'s `PSTFile` really does support a file-path constructor and a real `close()` (read its
+  `.d.ts`/`.js`, not assumed), confirmed `parseMbox()`'s streaming rewrite handles a separator split across
+  `fs.createReadStream()` chunk boundaries correctly (traced the synthetic-leading-`"\n"` unification by
+  hand), and confirmed every existing `MailboxImportJob` test still passed unmodified (proving the fallback
+  temp-file path is exactly what they'd already been exercising).
+- Found one real gap: `MailboxImportJob.resolveLocalSourcePath()`'s temp-file path had no cleanup if the
+  `pipeline()` download itself failed partway through (e.g. a dropped `S3BlobStore.getStream()` connection) -
+  the function threw before ever returning its `cleanup` closure, so nothing removed the partially-written
+  temp file. Fixed with a try/catch around the download that removes the temp file on failure before
+  rethrowing; added a dedicated regression test per backend (mongo/sql) using a stream that writes real bytes
+  then errors mid-download, proving both the temp file is cleaned up and the request is marked `failed`.
+- `DEFAULT_MAX_IMPORT_BYTES` (200 MiB) and its reasoning were sound as left - a deliberate interim number,
+  not a re-introduction of either previous broken value. Used as-is.
+- Ran `tsc --noEmit`, `yarn lint` and the full suite (`vitest run --coverage`) clean before committing Phase A
+  as its own commit (`4643757`), separate from Phase B below - required reconstructing the exact Phase-A-only
+  state of `src/routes/BaseMailboxImportRoute.ts`/`RELEASE_NOTES.md` first (both files this round's own Phase
+  B work also touches) by reverting this round's Phase B edits, staging/committing, then re-applying them,
+  since the two phases needed separate commits but touched the same files.
+
+**Phase B itself**: `@rapidrest/service-core` 2.2.0 published with opt-in streaming request bodies
+(`{ streamingBody: true }`/`@StreamingBody()`, exposing `req.bodyStream` - a backpressure-aware `Readable` -
+instead of buffering into `req.body`/`req.rawBody`; `maxBodySize`'s 413 rejection is skipped for a streaming
+route, left to the handler). This is the real fix Phase A's own "Known Issues" entry pointed at: the mailbox
+import UPLOAD itself was still fully buffered by the framework even after Phase A fixed `MailboxImportJob`'s
+own processing footprint.
+
+- Bumped `@rapidrest/service-core` to `^2.2.0` in both `peerDependencies` and `devDependencies` (matching this
+  repo's existing caret-range convention) - `yarn install`/`yarn build`/the full suite all confirm nothing
+  else broke, as expected for a purely additive/opt-in framework change.
+- `BaseMailboxImportRoute.create()` is now `@StreamingBody()` and reads `req.bodyStream` instead of
+  `req.rawBody`, piping it through a small `withByteLimit()` wrapper (a `Readable.from()`-wrapped async
+  generator counting bytes as they pass through, throwing once `maxImportBytes` is exceeded - which also
+  destroys the underlying `req.bodyStream` via the async-iterator protocol's `return()`) straight into
+  `this.blobStore.put()`. Verified against Phase A's own blob-store changes that this still holds for BOTH
+  backends: `LocalFsBlobStore.put()`/`S3BlobStore.put()` already stream a `NodeJS.ReadableStream` argument to
+  their own backing store (S3's already-tested multipart-upload path for a large stream, a single buffered
+  `PutObjectCommand` only for a short one - S3's own API constraint, not a buffering regression reintroduced
+  here).
+- Size enforcement moved from a post-buffering `req.rawBody.length` check to two layers: a `Content-Length`
+  header pre-check (when the client sends one) before `req.bodyStream` is touched or any mailbox/folder
+  lookup runs - preserving `create()`'s existing "before any mailbox/folder lookup or blob write" ordering
+  exactly, so every existing real-HTTP test (`test/routes/{mongo,sql}/MailboxImportRequestRoute.test.ts`,
+  which sends `Buffer` bodies that axios always attaches a real `Content-Length` to) kept passing unmodified -
+  plus the running-byte-count check during the stream itself for a client that lies about or omits
+  `Content-Length` (chunked transfer). An empty upload with no declared length is only discovered once the
+  stream ends (0 bytes counted), by which point `put()` has already created an empty blob - cleaned back up
+  with `blobStore.delete()` before the 400 is thrown, same as the mid-stream-exceeded 413 path cleans up its
+  own partial blob.
+- Checked `@StreamingBody()`'s documented "not combinable with `@Validate`/`before`/`after`" limitation
+  against this route: moot here, since `BaseMailboxImportRoute` never used any of those in the first place -
+  every check already lived inline in `create()`'s own body, so nothing needed to move.
+- `DEFAULT_MAX_IMPORT_BYTES` raised from 200 MiB to 50 GiB - the memory-safety reason for a small number no
+  longer applies now that the upload is genuinely streamed end to end; 50 GiB is a deliberately generous
+  ceiling for a real 20GB+ PST, existing now only to cap disk usage/upload duration.
+- New tests: `test/routes/BaseMailboxImportRoute.streaming.test.ts` (new file) - a focused unit-style suite
+  (objectFactory-scaffolded route instance, DI wiring done by hand, mirroring `BaseFolderRoute.test.ts`'s own
+  established pattern for internals-focused coverage a real HTTP server test wouldn't add anything to)
+  proving the route streams - never buffers into a `Buffer` first - against a REAL `LocalFsBlobStore` (temp
+  dir) and a REAL `S3BlobStore` with `@aws-sdk/client-s3` mocked (same `mockSend`/command-mock pattern
+  `test/blob/S3BlobStore.test.ts` already uses), plus the mid-stream-413/empty-body-400/cleanup and the
+  Content-Length-alone-413-before-touching-the-stream-at-all cases. `test/routes/{mongo,sql}/
+  MailboxImportRequestRoute.test.ts` needed and received zero changes - confirming the real end-to-end
+  request/response contract (400/413/403/404/etc, self-service upload storing the exact uploaded bytes) is
+  unaffected by the internal buffering-vs-streaming switch.
+- A client-disconnect-mid-upload scenario is covered indirectly: `withByteLimit()`'s `for await` loop over
+  `req.bodyStream` propagates any error the stream emits (including one from the framework's own documented
+  "stream is destroyed on a client disconnect mid-upload" behavior) straight into `blobStore.put()`'s own
+  rejection, which `create()`'s `catch` block already handles by cleaning up the partial blob - the same
+  mechanics this file's own mid-stream-413 test already exercises for a different trigger (the byte limit,
+  not a disconnect), rather than a separate dedicated real-socket-abort test.
+- Updated `RELEASE_NOTES.md`: added a new bullet closing out the mailbox-import-upload story referencing the
+  `service-core` 2.2.0 dependency, and removed the now-resolved "still fully buffered" Known Issues entry
+  Phase A's own commit had added.
+
+Files: changed `package.json`/`yarn.lock` (`@rapidrest/service-core` `^2.1.0` -> `^2.2.0`),
+`src/routes/BaseMailboxImportRoute.ts` (`@StreamingBody()`, `req.bodyStream`, `parseContentLength()`/
+`withByteLimit()`, `DEFAULT_MAX_IMPORT_BYTES` 200 MiB -> 50 GiB, `maxBodySize`/its `init()` warning removed
+as no longer applicable to a streaming route), `RELEASE_NOTES.md`. New:
+`test/routes/BaseMailboxImportRoute.streaming.test.ts`.

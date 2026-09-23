@@ -6,6 +6,7 @@
 // (see `BaseDataExportRoute`/`BaseMailIngestRoute`'s identical note) - every method here is defined
 // relative to that.
 import * as crypto from "crypto";
+import { Readable } from "stream";
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
@@ -15,48 +16,80 @@ import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, Folder, Mailbox, MailboxImportFormat, MailboxImportRequest } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
-const { Get, Param, Post, Query, Request, User: AuthUser } = RouteDecorators;
+const { Get, Param, Post, Query, Request, StreamingBody, User: AuthUser } = RouteDecorators;
 
 const VALID_FORMATS: ReadonlySet<string> = new Set<MailboxImportFormat>(["mbox", "pst"]);
 
 /**
- * Default `mail:import:max_bytes` - 200 MiB, an interim number, not a solved problem. Two genuinely separate
- * things are true at once here.
+ * Default `mail:import:max_bytes` - 50 GiB. `create()` is now registered with `@StreamingBody()`
+ * (`@rapidrest/service-core` 2.2.0+ - see its `RELEASE_NOTES.md`'s "v2.2.0" entry), so the upload itself is
+ * no longer buffered into one Node `Buffer` before this route runs: `req.bodyStream` is consumed and piped
+ * straight into `BlobStore.put()` (see `create()`'s own doc comment), which both `LocalFsBlobStore` and
+ * `S3BlobStore` already stream to their own backing store rather than holding it all in memory either. That
+ * was the actual constraint the previous 90 MiB, then 200 MiB, "interim" values existed to work around
+ * (`req.rawBody`/`max_body_size` capping what a buffered upload path could survive) - it no longer applies,
+ * so this value can finally reflect the real-world size of the files this route exists to accept: a genuine
+ * 20GB+, never-archived PST is not unusual. 50 GiB is a deliberately generous ceiling with headroom above
+ * that, not a number tuned to sit just under some other constraint the way the previous two were.
  *
- * `MailboxImportJob`'s own memory footprint for a large PST/Mbox is fixed (see `MailboxImportJob`'s own doc
- * comment on `resolveLocalSourcePath()`) - it now parses directly off a file path with no corresponding
- * in-memory buffer, so a multi-GB *stored* import file no longer OOMs the process during processing.
- *
- * The UPLOAD that gets a file into storage in the first place is NOT fixed: `req.rawBody` is still fully
- * buffered into one Node `Buffer` by `@rapidrest/service-core`'s own HTTP layer before this route (or any
- * route) ever runs, with no way for a route to opt into streaming that body instead - confirmed by reading
- * the framework's own uWS/Bun adapters, not assumed. Fixing this half needs a real streaming API added to
- * `@rapidrest/service-core` itself (tracked separately, out of scope for this route) - a presigned/direct-
- * to-blob-store upload would also work but was deliberately not chosen as a workaround, since a genuine
- * framework fix is the one actually being pursued.
- *
- * Until that lands, whatever this value is set to is moot beyond whatever the deployment's own
- * `max_body_size` (see `FRAMEWORK_DEFAULT_MAX_BODY_SIZE` below) already allows through - whichever is
- * SMALLER is what an uploader will actually experience, and no value here can exceed the buffered-request
- * reality that constrains it. 200 MiB is a deliberately round, comfortably-sized number for what today's
- * buffered upload path can still support without needing an unusually large `max_body_size` override - not
- * a number tuned to sit just under any one reference deployment's own value (a previous version of this
- * constant did that, at 90 MiB, which solved nothing: it just meant EVERY deployment needed as large a
- * `max_body_size` as this route wanted regardless, the same underlying problem from the other direction).
- * `init()` below still logs a one-time warning if an operator's own `mail:import:max_bytes` override ends up
- * at or above whatever `max_body_size` is actually configured - genuinely useful regardless of what number
- * either side settles on, since it flags exactly the "this check can never fire" condition either way. */
-export const DEFAULT_MAX_IMPORT_BYTES = 200 * 1024 * 1024;
+ * This is enforced DURING the stream, not against an already-buffered length: a `Content-Length` header (when
+ * the client sends one) is checked up front, before `req.bodyStream` is touched at all or any mailbox/folder
+ * lookup runs - `create()`'s existing "before any mailbox/folder lookup or blob write" ordering, unchanged.
+ * Independently, a running byte count kept while consuming `req.bodyStream` aborts the upload (cleaning up
+ * the partial blob) the moment it's exceeded, so a client that lies about (or omits) `Content-Length` is
+ * still bounded to `maxImportBytes` - never however much memory or disk it manages to send before the
+ * connection is cut. `MailboxImportJob` (see its own doc comment on `resolveLocalSourcePath()`) processes
+ * whatever is accepted here with a bounded footprint regardless of its size, so this ceiling exists only to
+ * cap disk usage and upload duration, not to protect process memory the way the old buffered-path values had
+ * to. */
+export const DEFAULT_MAX_IMPORT_BYTES = 50 * 1024 * 1024 * 1024;
 
-/** `@rapidrest/service-core`'s own hard-coded fallback for `max_body_size` (`DEFAULT_MAX_BODY_SIZE` in its
- * `http/uWS/Adapters.js`) - used here only as the assumed value when an operator hasn't set `max_body_size`
- * explicitly, so the sanity check in `init()` still has something concrete to compare against. */
-const FRAMEWORK_DEFAULT_MAX_BODY_SIZE = 10 * 1024 * 1024;
+/** Parses an HTTP `Content-Length` header value (as `HttpRequest.headers` may hand it back - a single
+ * string, an array from a proxy that split/duplicated it, or absent entirely) into a byte count. Returns
+ * `undefined` for anything absent or unparseable - callers must treat that as "length unknown," never as 0,
+ * since a chunked-transfer-encoded request legitimately sends no `Content-Length` at all. */
+function parseContentLength(value: string | string[] | undefined): number | undefined {
+    const raw: string | undefined = Array.isArray(value) ? value[0] : value;
+    if (raw === undefined) {
+        return undefined;
+    }
+    const parsed: number = Number(raw);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/**
+ * Wraps `source` (`create()`'s `req.bodyStream`) in a new `Readable` that passes every chunk through
+ * unchanged but destroys itself - and, since `for await` propagates a thrown error back into `source`'s own
+ * consumption, `source` too - the moment the running total exceeds `maxBytes`, rather than only being able
+ * to tell the upload was oversized after buffering the whole thing first. `total()`/`exceeded()` let the
+ * caller distinguish an intentional size-limit abort from a genuine downstream failure (e.g. the client
+ * disconnecting mid-upload) after `BlobStore.put()` rejects - from the outside, both just look like the
+ * stream it was reading from erroring.
+ */
+function withByteLimit(source: Readable, maxBytes: number): { stream: Readable; total: () => number; exceeded: () => boolean } {
+    let total = 0;
+    let exceeded = false;
+    const stream: Readable = Readable.from(
+        (async function* (): AsyncGenerator<Buffer> {
+            for await (const chunk of source) {
+                const buffer: Buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                total += buffer.length;
+                if (total > maxBytes) {
+                    exceeded = true;
+                    throw new Error(`mailbox import upload exceeded the ${maxBytes}-byte limit mid-stream`);
+                }
+                yield buffer;
+            }
+        })(),
+    );
+    return { stream, total: () => total, exceeded: () => exceeded };
+}
 
 /**
  * A GDPR data-portability *import* request - the counterpart to `BaseDataExportRoute` - taking an
- * uploaded Mbox or PST file (via `req.rawBody`, the same raw-byte-upload convention
- * `BaseMailIngestRoute.deliver()` uses) and queuing it for `MailboxImportJob` to process. Bespoke class
+ * uploaded Mbox or PST file (via `req.bodyStream`, a genuine stream - see `create()`'s own doc comment; NOT
+ * the `req.rawBody` raw-byte-upload convention `BaseMailIngestRoute.deliver()` uses, deliberately, given how
+ * large a real upload here can be) and queuing it for `MailboxImportJob` to process. Bespoke class
  * (own `init()`-built `RepoUtils`, no `@Model`-driven CRUD), same permission shape as
  * `BaseDataExportRoute`: visibility is "the requester, the target mailbox's own owner, or a trusted
  * admin" - not a class of grant this platform's record-level ACL model expresses.
@@ -93,15 +126,10 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
     private aclUtils?: ACLUtils;
 
     /** The largest source file `create()` accepts, in bytes (413 beyond) - see `DEFAULT_MAX_IMPORT_BYTES`'s
-     * own doc comment for why this exists at all. */
+     * own doc comment for why this exists at all, and `create()`'s own doc comment for exactly how it's
+     * enforced against a streamed (not buffered) upload. */
     @Config("mail:import:max_bytes", DEFAULT_MAX_IMPORT_BYTES)
     private maxImportBytes: number = DEFAULT_MAX_IMPORT_BYTES;
-
-    /** The framework's own `max_body_size` (see `DEFAULT_MAX_IMPORT_BYTES`'s doc comment) - read here only
-     * to sanity-check `maxImportBytes` against it in `init()`, never to enforce anything itself (the
-     * framework already enforces its own value before this route ever runs). */
-    @Config("max_body_size", FRAMEWORK_DEFAULT_MAX_BODY_SIZE)
-    private maxBodySize: number = FRAMEWORK_DEFAULT_MAX_BODY_SIZE;
 
     /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
     @Config()
@@ -112,18 +140,6 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
 
     private async init(): Promise<void> {
         if (!this.requestRepo) {
-            // One-time sanity check (this branch only ever runs once per instance, guarded by the same
-            // `!this.requestRepo` as the rest of this block's lazy setup): if `mail:import:max_bytes` is
-            // configured at or above `max_body_size`, this route's own 413 check can never fire - every
-            // oversized upload would already have been rejected by the framework first, silently making
-            // the operator's configured `mail:import:max_bytes` meaningless. See `DEFAULT_MAX_IMPORT_BYTES`.
-            if (this.maxImportBytes >= this.maxBodySize) {
-                this.logger?.warn(
-                    `BaseMailboxImportRoute: mail:import:max_bytes (${this.maxImportBytes}) is >= max_body_size ` +
-                        `(${this.maxBodySize}) - the framework will reject oversized uploads before this route's own ` +
-                        `check can ever run, making mail:import:max_bytes ineffective. Configure it below max_body_size.`,
-                );
-            }
             this.requestRepo = await this._objectFactory!.newInstance(RepoUtils, {
                 name: this.mailboxImportRequestClass.name,
                 args: [this.mailboxImportRequestClass],
@@ -165,7 +181,28 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         return !!mailbox && (mailbox as any).ownerUserUid === user.uid;
     }
 
+    /**
+     * `@StreamingBody()` (`@rapidrest/service-core` 2.2.0+) means `req.bodyStream` (a Node `Readable`) is
+     * populated instead of `req.body`/`req.rawBody` - the framework never buffers this route's upload into
+     * memory at all, and (per `@StreamingBody()`'s own doc comment) skips its own `max_body_size` 413
+     * rejection entirely for this route, leaving size enforcement to this method alone. NOT combinable with
+     * `@Validate`/`before`/`after` expecting `req.body` - moot here, since this class never used any of
+     * those in the first place; every check has always lived in this method's own body, unaffected by the
+     * switch to a streamed body.
+     *
+     * Validates format/targetFolderUid, a `Content-Length` (when the client sends one) up front against
+     * `maxImportBytes` - before `req.bodyStream` is touched, or any mailbox/folder lookup runs, same
+     * ordering `create()` has always had - then resolves and validates the target mailbox/folder (still with
+     * no upload cost) before finally consuming `req.bodyStream`: it's piped through a small byte-counting
+     * wrapper straight into `this.blobStore.put()` (both `LocalFsBlobStore` and `S3BlobStore` already stream
+     * a `NodeJS.ReadableStream` argument to their own backing store, never buffering it into memory either),
+     * aborting mid-stream - and cleaning up the partial blob - the moment the running count exceeds
+     * `maxImportBytes`, regardless of what `Content-Length` claimed or whether one was sent at all. An
+     * empty upload (no bytes ever counted) is rejected the same way `Content-Length: 0` already is, just
+     * discovered at the end of the stream instead of before it starts.
+     */
     @Post()
+    @StreamingBody()
     public async create(
         @Request req: HttpRequest,
         @Query("targetFolderUid") targetFolderUid: string | undefined,
@@ -180,23 +217,28 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         if (!this.blobStore) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
+        if (!req.bodyStream) {
+            // Should be unreachable in production - `@StreamingBody()` always populates this for a POST -
+            // but the framework technically declares it optional, so this is defensive, not dead code.
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
         if (!format || !VALID_FORMATS.has(format)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "format must be one of: mbox, pst.");
         }
         if (!targetFolderUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "targetFolderUid is required.");
         }
-        const raw: Buffer | undefined = req.rawBody;
-        if (!raw || raw.length === 0) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
-        }
-        // Checked before any other work (DB lookups, the blob write) - rejects an oversized upload up front
-        // rather than after paying for the rest of this handler, though `req.rawBody` is already fully
-        // buffered into memory by the time this handler runs at all (a framework-level concern, not this
-        // route's - see `DEFAULT_MAX_IMPORT_BYTES`'s own doc comment for the real risk this closes: what
-        // `MailboxImportJob` does with the upload afterward).
-        if (raw.length > this.maxImportBytes) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 413, `The uploaded file is larger than the ${this.maxImportBytes} bytes allowed.`);
+        // Free (no stream reads at all) whenever the client sends a Content-Length - which every real
+        // browser/HTTP-client upload of a known-size file does; only a chunked-transfer-encoded request
+        // with no declared length skips straight to the running-count check below instead.
+        const declaredLength: number | undefined = parseContentLength(req.headers["content-length"]);
+        if (declaredLength !== undefined) {
+            if (declaredLength === 0) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+            }
+            if (declaredLength > this.maxImportBytes) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 413, `The uploaded file is larger than the ${this.maxImportBytes} bytes allowed.`);
+            }
         }
 
         const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);
@@ -222,9 +264,22 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         }
 
         const sourceBlobKey = `mailbox-imports/${crypto.randomUUID()}`;
-        await this.blobStore.put(sourceBlobKey, raw, {
-            contentType: format === "pst" ? "application/vnd.ms-outlook" : "application/mbox",
-        });
+        const counted = withByteLimit(req.bodyStream, this.maxImportBytes);
+        try {
+            await this.blobStore.put(sourceBlobKey, counted.stream, {
+                contentType: format === "pst" ? "application/vnd.ms-outlook" : "application/mbox",
+            });
+        } catch (err: any) {
+            await this.blobStore.delete(sourceBlobKey).catch(() => undefined);
+            if (counted.exceeded()) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 413, `The uploaded file is larger than the ${this.maxImportBytes} bytes allowed.`);
+            }
+            throw err;
+        }
+        if (counted.total() === 0) {
+            await this.blobStore.delete(sourceBlobKey).catch(() => undefined);
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
 
         const created: T = await this.requestRepo!.create(
             new this.mailboxImportRequestClass({

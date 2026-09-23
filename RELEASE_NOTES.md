@@ -41,6 +41,15 @@
   `LocalFsBlobStore` returns the blob's own real path directly, `S3BlobStore` returns `undefined`, falling back to one streamed-to-a-temp-file pass instead of a full buffer either way). A
   multi-GB *stored* import file no longer needs a correspondingly large amount of memory resident at once to process - only the getting of the file into storage in the first place remains
   memory-bound, tracked separately (see "Known Issues").
+- **The mailbox import upload itself is now genuinely streamed, closing out the PST-import size limitation for good.** Bumped `@rapidrest/service-core` to `^2.2.0`, which adds opt-in streaming
+  request bodies (`{ streamingBody: true }`/`@StreamingBody()`, exposing the raw body as a backpressure-aware `req.bodyStream` instead of buffering it into `req.body`/`req.rawBody` first).
+  `BaseMailboxImportRoute.create()` is now decorated `@StreamingBody()` and pipes `req.bodyStream` straight into `BlobStore.put()` (both `LocalFsBlobStore` and `S3BlobStore` already stream a
+  `NodeJS.ReadableStream` argument to their own backing store) - the upload is never buffered into a Node `Buffer` at any point, for either backend. Size is enforced against the actual streamed
+  byte count rather than a post-buffering check that no longer exists: a `Content-Length` header, when the client sends one, is checked up front (before `req.bodyStream` is touched or any
+  mailbox/folder lookup runs, the same ordering this check has always had); independently, a running byte count kept while consuming the stream aborts the upload - cleaning up the partial blob -
+  the moment it exceeds `mail:import:max_bytes`, so a client that lies about (or omits) `Content-Length` is still bounded. `DEFAULT_MAX_IMPORT_BYTES` is raised from 200 MiB to 50 GiB now that the
+  memory-safety reason for a small number no longer applies - a genuine 20GB+, never-archived PST is not unusual, and this ceiling now exists only to cap disk usage and upload duration, not to
+  protect process memory. This route never used `@Validate`/`before`/`after` (which don't see `req.body` on a streaming route), so no validation needed to move.
 - **A `DistributionList`'s `aliasAddresses` are now validated exactly like a `Mailbox`'s.** `BaseDistributionListRoute` accepted `aliasAddresses` with no domain check, no alias-domain check and
   no collision check at all, even though `BaseMailIngestRoute` resolves and trusts a distribution list's `aliasAddresses` identically to a mailbox's - a caller could add any address on any
   domain (including another mailbox's or list's existing address, or a pure alias domain that should never carry its own addresses) to a distribution list's `aliasAddresses` with no
@@ -79,13 +88,6 @@
 - `decideResourceBooking()` has a TOCTOU window that can double-book a resource mailbox under genuine concurrent processing (two iTIP REQUESTs for overlapping times, processed by two workers at
   once, can both read "no conflict" before either commits). Closing it needs a short-lived advisory lock keyed on the resource mailbox, which has no existing reusable primitive in this codebase
   today - deferred as its own follow-up rather than introducing a new schema-level lock construct in this pass.
-- **A mailbox import upload is still fully buffered into memory before this route ever sees it** - `MailboxImportJob`'s own processing no longer needs a large in-memory footprint (see above),
-  but getting a large PST/Mbox file INTO storage in the first place still does: `req.rawBody` is read entirely into one Node `Buffer` by `@rapidrest/service-core`'s own HTTP layer (both its uWS
-  and Bun adapters) before any route code runs, with no way for a route to opt into a streaming request body instead - confirmed by reading the framework's own source, not assumed. Real 20GB+
-  PST files exist in practice; buffering that much per request, especially under concurrent imports, is untenable regardless of what `mail:import:max_bytes`/`max_body_size` are configured to.
-  The actual fix - a real streaming upload API in `@rapidrest/service-core` itself - is tracked and being worked separately (not a presigned/direct-to-blob-store workaround, which would sidestep
-  the framework rather than fix it); `BaseMailboxImportRoute` will be wired onto it once it lands. Until then, `mail:import:max_bytes`'s default (200 MiB) and whatever `max_body_size` a
-  deployment configures are the only real ceiling on what can be imported at all, full stop.
 
 ## v0.19.0
 
