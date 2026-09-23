@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.20.0
+
 ### Security
 
 - **Closed a federation key-discovery SSRF bypass via decimal/octal/hex IP notation.** `util/KeyDiscoveryClient.ts`'s `isSafeDiscoveryHost()` rejected an IP-literal `host` (from a remote domain's

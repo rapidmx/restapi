@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-23
+
+### Added
+- Added regression tests for ScanQueueJob's iTIP retry-on-409 and deterministic-uid dedup fixes, covering a retry that succeeds, a retry that exhausts all attempts, and two concurrent REQUESTs colliding on the same CalendarEvent uid
+- Added BlobStore.localPath() (optional; LocalFsBlobStore returns the blob's own real path, S3BlobStore returns undefined) and MailboxImportJob.resolveLocalSourcePath(), which uses it directly when available or otherwise streams the blob once to a temp file, cleaning that file up on both success and failure of the download itself
+- Added unit-style coverage (mirroring BaseFolderRoute.test.ts's own internals-focused pattern) proving the route streams - never buffers into a Buffer - against a real LocalFsBlobStore and a mocked-S3BlobStore, plus the mid-stream-413/empty-body-400/blob-cleanup and defensive-guard branches, and document the change in RELEASE_NOTES.md/NOTES.md, closing out the PST-import size-limitation issue
+- Added regression tests for each of the above across both backends where applicable and document the findings in NOTES.md/RELEASE_NOTES.md
+
+### Changed
+- Close an SSRF bypass in federation key-discovery via decimal/octal/hex IP notation, re-checking net.isIP() against the URL-parser-normalized host and restricting discovery ports to an allow-list
+- Apply the same non-alias-domain restriction to aliasAddresses supplied at mailbox create time, for both trusted and self-service callers
+- Resolve alias domains in the public federation key-discovery endpoint so a peer querying an alias-domain address finds the primary mailbox's published keys
+- Extract MailboxImportJob's quota charge/refund loop into a shared util/MailboxQuotaUtils.ts and wire it into BaseAttachmentRoute.upload(), enforcing mailbox storage quota and a max-upload-size ceiling at write time
+- Cap BaseMailboxImportRoute.create()'s upload size before any processing starts, closing an OOM risk from buffering an unbounded PST/mbox file into memory
+- Switch RetentionEnforcementJob.purgeSortedBatches() from offset to keyset pagination on uid, fixing a bug where a post-commit delete failure could silently skip a due row
+- Retry ScanQueueJob's iTIP REPLY/CANCEL/REQUEST-update handlers on a version conflict instead of silently dropping the mutation, and derive a deterministic CalendarEvent uid for new iTIP REQUESTs to prevent duplicate-delivery double-booking
+- Flag __proto__/constructor/prototype as unsafe keys in RequestBodyUtils.isPathKey(), defense-in-depth alongside the existing dotted-path/$-operator checks
+- Make BaseMatterRoute/BaseEscrowAccessRequestRoute/BaseEscrowAuditLogRoute's client-query $-operator stripping segment-aware, matching every other route in this codebase
+- Percent-decode X-Envelope-From/X-Envelope-To in BaseMailIngestRoute.deliver(), matching the MTA ingest client's own new encoding of each envelope address
+- Validate DistributionList.aliasAddresses (domain restriction and cross-mailbox/list collision check) exactly like Mailbox.aliasAddresses, which had no validation at all
+- Re-enable ScanQueueJob inbound-delivery mailbox quota enforcement, this time skipping the charge (rather than failing delivery) when chargeMailboxQuota() finds no Mailbox row, fixing the 75 test failures that caused the prior revert
+- Lower BaseMailboxImportRoute's DEFAULT_MAX_IMPORT_BYTES from 500 MiB to 90 MiB and warn once if mail:import:max_bytes is configured at or above the framework's own max_body_size, since the prior default sat above the reference deployment's max_body_size and could never actually reject anything
+- Close this project's 100%-coverage gate: add tests for ScanQueueJob's quota-exceeded quarantine and unexpected-charge-error propagation, four updateCalendarEventWithRetry() stale-on-retry edge cases per backend, MailboxImportJob's authoritative (not just cached) quota-exceeded path, BaseMailIngestRoute's malformed-percent-encoding fallback, and KeyDiscoveryClient's URL-parse-failure fallback
+- Stop MailboxImportJob from buffering an entire PST/mbox upload (or every reconstructed message) into memory: extractPstMessages()/parseMbox() are now AsyncGenerators reading and yielding one message at a time directly off a file path instead of returning a Buffer[] built from a fully-buffered source
+- Have PSTFile read off pst-extractor's own file-path constructor (a real file descriptor, bounded/random-access reads) instead of an in-memory Buffer, closing its own fd once extraction finishes
+- Raise BaseMailboxImportRoute's DEFAULT_MAX_IMPORT_BYTES from 90 MiB to 200 MiB now that MailboxImportJob's own memory footprint is fixed, an interim number pending a real streaming-upload fix since the upload itself is still fully buffered by the framework
+- Bump @rapidrest/service-core to ^2.2.0 for its new opt-in streaming request bodies (streamingBody/@StreamingBody(), req.bodyStream)
+- Register BaseMailboxImportRoute.create() with @StreamingBody() and pipe req.bodyStream straight into BlobStore.put() instead of buffering the whole upload into req.rawBody first, closing the "upload itself is still fully buffered" gap Phase A's own commit left open
+- Enforce mail:import:max_bytes against the actual streamed byte count: a Content-Length pre-check before req.bodyStream is ever touched or any mailbox/folder lookup runs, plus a running byte count during the stream that aborts (cleaning up the partial blob) the moment it's exceeded regardless of what Content-Length claimed
+- Raise DEFAULT_MAX_IMPORT_BYTES from 200 MiB to 50 GiB now that the upload is genuinely streamed end to end for both LocalFsBlobStore and S3BlobStore, and drop the now-inapplicable max_body_size cross-check a streaming route's framework-level size enforcement no longer runs
+- Reject a published push message whose own 'from' field claims a different identity than the authenticated caller in MailPushRoute.send(), closing a WebRTC-signaling identity-forgery gap in the shared BasePushRoute channel
+- Reorder BaseEscrowAccessRequestRoute's create()/approve()/material() to call requireEscrowHolder() before any request/matter state check, matching deny()/findById()'s already-correct order and closing three state-oracle leaks for non-holders
+- Delete a mailbox import's uploaded source blob in a finally block covering every outcome of MailboxImportJob.processRequest(), plus at reclaimAbandonedRequests()'s own max-attempts terminal path, closing a permanent storage leak now that imports can be up to 50 GiB
+- Reject a mailbox-import upload upfront in BaseMailboxImportRoute.create() when the target mailbox is already at quota or a declared Content-Length exceeds its remaining quota, and cap the mid-stream byte limit to whichever of mail:import:max_bytes/remaining quota is smaller
+- Document S3BlobStore's multipart 10,000-part ceiling relative to the new 50 GiB import default
+- Clear Message.searchIndexedAt in BaseMessageRoute.prepareUpdate() whenever folderUid/flags/labelUids actually change, so a moved/flagged/labeled message gets re-indexed instead of going stale in search results
+- Nudge BaseMatterSearchRoute.search()'s date-range clamp 1ms past the matter's own boundary before handing it to a SearchProvider, since every provider treats before/after as exclusive while matter coverage itself is inclusive on both ends
+- Reject a repeated structured-filter query key (e.g. ?subject=a&subject=b) with 400 instead of crashing with 500 in BaseSearchRoute/BaseMatterSearchRoute via a new assertSingleStringParam() guard
+- Mirror test/routes/sql/MatterSearchRoute.test.ts's date-boundary assertions to the mongo file's +1ms/-1ms inclusive-clamp fix, closing the one gap left by the prior interrupted session (its own SQL test file was never updated for that fix)
+- Upgraded deps
+
+### Fixed
+- Fixed BaseMailboxRoute.validateAliasChange() using getVerifiedDomainNames() instead of getPrimaryDomainNames(), which let a caller hijack mail by claiming an address on a pure alias domain
+- Fixed stale @rapidmx/videoconf-plugin doc references to @rapidmx/meet-plugin
+- Fixed an in(...)-operand injection in BaseDataExportRoute.find()/BaseMailboxImportRoute.find() by building the visible-mailbox filter with exactInFilter() instead of a raw comma-joined string, closing an IDOR that let a crafted comma-containing mailbox uid leak another mailbox's export/import requests
+
+### Removed
+- Removed a purged or truncated entity from the search index via a new opt-in BaseScopedChildRoute.searchEntityType (set by BaseMessageRoute to "message"), so a permanently deleted message no longer stays searchable forever
+
 ## [0.19.0] - 2026-09-22
 
 ### Added
@@ -1069,7 +1118,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/RapidMX/restapi/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/RapidMX/restapi/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/RapidMX/restapi/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/RapidMX/restapi/compare/v0.16.0...v0.17.0
