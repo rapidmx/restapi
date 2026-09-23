@@ -7,6 +7,11 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ModelUtils, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
 import { refreshFolderCounts } from "../util/FolderCountUtils.js";
+import {
+    chargeMailboxQuota,
+    MailboxQuotaExceededError as SharedMailboxQuotaExceededError,
+    refundMailboxQuota,
+} from "../util/MailboxQuotaUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline, ScanPipelineResult } from "../scan/ScanPipeline.js";
 import { boundIndexedValue, deriveConversationId } from "../util/ConversationUtils.js";
@@ -40,9 +45,6 @@ interface ImportQuota {
     quotaBytes: number;
     usedBytes: number;
 }
-
-/** How many times a `Mailbox.usedBytes` charge/refund is retried on an optimistic-lock conflict. */
-const MAX_QUOTA_ATTEMPTS = 5;
 
 /** The lease a running attempt holds on its request row - see `DataExportJob`'s identical scheme. */
 interface ImportLease<MIR> {
@@ -530,60 +532,38 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     }
 
     /**
-     * Atomically checks and charges `bytes` against the mailbox's persisted quota: re-reads the mailbox (uncached),
-     * throws `MailboxQuotaExceededError` if `usedBytes + bytes` would exceed its current `quotaBytes`, and otherwise
-     * writes the incremented `usedBytes` with a version-checked update (`asEntity()` - an unversioned Mongo write
-     * would silently overwrite a concurrent charge). A conflict re-reads and retries, up to `MAX_QUOTA_ATTEMPTS`.
-     * Refreshes `quota` from what was read, for the next message's cheap pre-check.
+     * Atomically checks and charges `bytes` against the mailbox's persisted quota - delegates the actual
+     * re-read/version-checked-write/retry loop to the shared `chargeMailboxQuota()` (see its own doc comment),
+     * so this job's quota accounting stays byte-for-byte identical to `BaseAttachmentRoute.upload()`'s and
+     * `ScanQueueJob`'s inbound delivery's. Refreshes `quota` from what the shared function read, for the next
+     * message's cheap local pre-check (`assertWithinQuota()`), and translates the shared function's own
+     * `MailboxQuotaExceededError` into this job's - same exception type `processRequest()`'s catch already
+     * matches on, same "Import stopped: ..." message shape `assertWithinQuota()`'s pre-check throws.
      */
     private async chargeQuota(quota: ImportQuota, bytes: number): Promise<void> {
-        let lastError: unknown;
-        for (let attempt = 0; attempt < MAX_QUOTA_ATTEMPTS; attempt++) {
-            const current: MB | undefined = await this.mailboxRepo!.findOne(quota.mailboxUid, { ignoreACL: true, skipCache: true });
-            if (!current) {
-                throw new Error("The target mailbox no longer exists.");
-            }
-            quota.quotaBytes = current.quotaBytes ?? 0;
-            quota.usedBytes = current.usedBytes ?? 0;
-            this.assertWithinQuota(quota, bytes);
-            try {
-                await this.mailboxRepo!.update(
-                    { uid: current.uid, version: (current as any).version, usedBytes: quota.usedBytes + bytes } as any,
-                    asEntity(this.mailboxRepo!, current),
-                    { ignoreACL: true, skipPush: true },
+        try {
+            const result = await chargeMailboxQuota(this.mailboxRepo!, quota.mailboxUid, bytes);
+            quota.quotaBytes = result.quotaBytes;
+            quota.usedBytes = result.usedBytes;
+        } catch (err) {
+            if (err instanceof SharedMailboxQuotaExceededError) {
+                quota.quotaBytes = err.quotaBytes;
+                quota.usedBytes = err.usedBytes;
+                throw new MailboxQuotaExceededError(
+                    `Import stopped: the mailbox quota of ${quota.quotaBytes} bytes would be exceeded by the next message.`,
                 );
-                quota.usedBytes += bytes;
-                return;
-            } catch (err) {
-                lastError = err;
             }
+            throw err;
         }
-        throw lastError;
     }
 
-    /** Best-effort reversal of `chargeQuota()` for a message that failed to store - same versioned retry loop. A
-     * refund that can't be written is logged; `MailboxQuotaRecalcJob` corrects the over-count later. */
+    /** Best-effort reversal of `chargeQuota()` for a message that failed to store - delegates to the shared
+     * `refundMailboxQuota()`, logging on total failure the same way this job's own retry loop used to. */
     private async refundQuota(quota: ImportQuota, bytes: number): Promise<void> {
-        let lastError: any;
-        for (let attempt = 0; attempt < MAX_QUOTA_ATTEMPTS; attempt++) {
-            try {
-                const current: MB | undefined = await this.mailboxRepo!.findOne(quota.mailboxUid, { ignoreACL: true, skipCache: true });
-                if (!current) {
-                    return;
-                }
-                const usedBytes: number = Math.max(0, (current.usedBytes ?? 0) - bytes);
-                await this.mailboxRepo!.update(
-                    { uid: current.uid, version: (current as any).version, usedBytes } as any,
-                    asEntity(this.mailboxRepo!, current),
-                    { ignoreACL: true, skipPush: true },
-                );
-                quota.usedBytes = usedBytes;
-                return;
-            } catch (err) {
-                lastError = err;
-            }
-        }
-        this.logger?.warn(`MailboxImportJob: failed to refund ${bytes} quota bytes to mailbox ${quota.mailboxUid}: ${lastError?.message}`);
+        await refundMailboxQuota(this.mailboxRepo!, quota.mailboxUid, bytes, (lastError: any) => {
+            this.logger?.warn(`MailboxImportJob: failed to refund ${bytes} quota bytes to mailbox ${quota.mailboxUid}: ${lastError?.message}`);
+        });
+        quota.usedBytes = Math.max(0, quota.usedBytes - bytes);
     }
 
     private assertWithinQuota(quota: ImportQuota, additionalBytes: number): void {

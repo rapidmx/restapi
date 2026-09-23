@@ -530,6 +530,36 @@ describe("Route:MailboxMongo Tests", () => {
             expect(result.status).toBe(200);
             expect(result.body).toEqual(["powerlevel.gg"]);
         });
+
+        it("Rejects creating a mailbox whose aliasAddresses includes an address on a pure alias domain (400), even though the primary address is on the domain it aliases.", async () => {
+            await seedAlias();
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({
+                    primarySmtpAddress: `${uuid.v4()}@powerlevel.gg`,
+                    aliasAddresses: [`boss@plc.gg`],
+                    displayName: "Alias In Aliases",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects adding an alias-domain address to an existing mailbox's aliasAddresses via PUT (400) - this would hijack mail for the primary-domain mailbox the alias resolves to.", async () => {
+            await seedAlias();
+            const obj = await createMailboxMongo({ primarySmtpAddress: `${uuid.v4()}@powerlevel.gg` });
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: obj.uid, version: obj.version, aliasAddresses: ["boss@plc.gg"] });
+
+            expect(result.status).toBe(400);
+        });
     });
 
     it("Refuses (403) a non-trusted owner renaming primarySmtpAddress to an address that isn't one of their own usernames - by PUT, property PUT or bulk PUT - leaving it unchanged. (Renames onto the owner's own username: see mailboxSelfServiceCreateSuite.ts.)", async () => {

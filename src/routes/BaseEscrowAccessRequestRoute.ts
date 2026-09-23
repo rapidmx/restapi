@@ -414,7 +414,10 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         }
         const filter: Record<string, any> = {};
         for (const [key, value] of Object.entries(query ?? {})) {
-            if (!key.startsWith("$") && !["matterId", "limit", "page", "sort"].includes(key)) {
+            // Segment-aware, not just top-level - matches the check `BaseScopedChildRoute`/`BaseFolderRoute`/
+            // `BaseMailboxRoute`/`BaseAttachmentRoute` already use, so a nested operator key like
+            // `escrowScopeId.$where` can't slip past this route's own filtering unstripped.
+            if (!key.split(".").some((segment) => segment.startsWith("$")) && !["matterId", "limit", "page", "sort"].includes(key)) {
                 filter[key] = value;
             }
         }

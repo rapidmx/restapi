@@ -9,6 +9,7 @@ import * as crypto from "crypto";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors, type HttpRequest, type HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { KeyDiscoveryResponse, KeyVault, Mailbox } from "../models/types.js";
+import { resolveDomainAliasName } from "../util/DomainUtils.js";
 import { isValidKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { buildKeyDiscoveryResponse } from "../util/LocalKeyDiscoveryUtils.js";
 const { Config } = ObjectDecorators;
@@ -50,7 +51,11 @@ const { Get, Param, Query, RateLimit, Request, Response } = RouteDecorators;
  * `_rapidmx` TXT record (e.g. `mail.acme.com`), which on a shared multi-domain server names neither domain.
  * For an older client that omits `domain`, the `Host` header (port stripped, lowercased) is used instead, the
  * previous behavior. `lookup()` fetches every mailbox matching the hash and picks the one whose
- * `primarySmtpAddress` domain matches, never an arbitrary first match.
+ * `primarySmtpAddress` domain matches, never an arbitrary first match. When the requested domain is a pure
+ * alias `Domain` (`Domain.aliasOf`) with no literal match of its own, it's resolved to its primary domain
+ * (`resolveDomainAliasName()`) and retried once - a mailbox is never addressed on an alias domain, so
+ * without this a query for an alias-domain address would always answer "key not published" even though the
+ * primary-domain mailbox it resolves to has one published.
  *
  * **Input validation.** `:hash` must be exactly 52 z-base32 characters (`computeKeyDiscoveryHash()`'s output
  * shape) or the request is rejected with `400` - a syntactic check on a value no real address can fail, so it
@@ -62,6 +67,12 @@ const { Get, Param, Query, RateLimit, Request, Response } = RouteDecorators;
 export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVault> {
     protected abstract mailboxClass: any;
     protected abstract keyVaultClass: any;
+    /** Lets `lookup()` resolve a requested domain that's a pure alias (`Domain.aliasOf`) to the primary
+     * domain a mailbox's `primarySmtpAddress` can actually be on (see `getPrimaryDomainNames()`'s own doc
+     * comment - no mailbox is ever addressed on an alias domain) - without this, a peer querying for an
+     * address on an alias domain always gets a false "key not published", even though the primary-domain
+     * mailbox it resolves to has one. */
+    protected abstract domainClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -127,9 +138,19 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
             limit: 20,
         });
         const domain: string = this.requestedDomain(domainParam, req);
-        const match: M | undefined = domain
-            ? candidates.find((m) => m.primarySmtpAddress?.split("@")[1]?.toLowerCase() === domain)
-            : undefined;
+        const matchesDomain = (d: string): M | undefined => candidates.find((m) => m.primarySmtpAddress?.split("@")[1]?.toLowerCase() === d);
+        // Literal match first (the common case - the requested domain IS a mailbox's own primary domain).
+        // Only when that misses do we ask whether `domain` is a pure alias `Domain` (`Domain.aliasOf`) and
+        // retry against the primary domain it resolves to - no mailbox's `primarySmtpAddress` is ever on an
+        // alias domain (`getPrimaryDomainNames()`), so without this fallback a remote peer asking about an
+        // address on an alias domain always gets a false "key not published" here.
+        let match: M | undefined = domain ? matchesDomain(domain) : undefined;
+        if (!match && domain) {
+            const primaryDomain: string | undefined = await resolveDomainAliasName(this._objectFactory!, this.domainClass, domain);
+            if (primaryDomain) {
+                match = matchesDomain(primaryDomain);
+            }
+        }
         const body: KeyDiscoveryResponse = await buildKeyDiscoveryResponse(this.keyVaultRepo!, match);
 
         const etag = `"${crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")}"`;

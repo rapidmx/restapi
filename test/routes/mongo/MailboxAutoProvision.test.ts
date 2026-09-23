@@ -469,6 +469,66 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
         expect(result.status).toBe(400);
     });
 
+    describe("pure alias domain", () => {
+        const seedAlias = async (): Promise<void> => {
+            // Each test in this `describe` seeds the same alias domain - clear any prior copy first so a
+            // second/third test doesn't collide on `uid`, the same reuse-a-fixed-address convention this
+            // file's own header comment already documents for mailboxes.
+            await domainRepo.deleteMany({ uid: "plc.gg" }).catch(() => undefined);
+            await domainRepo.save(new DomainMongo({ name: "plc.gg", enabled: true, verified: true, aliasOf: "example.com", uid: "plc.gg" }));
+        };
+
+        it("create() rejects an alias-domain address in aliasAddresses even for a trusted (admin) caller, though the primary address is on a real verified domain.", async () => {
+            await seedAlias();
+
+            const result = await withAuth(request(server.getApplication()).post(baseUrl), adminToken).send({
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: ["boss@plc.gg"],
+                displayName: "Admin Alias-domain Alias",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+            });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("self-service create() refuses an alias-domain address, even one matching the caller's own username, since a pure alias domain has no mailboxes of its own.", async () => {
+            await seedAlias();
+            mockAliasList(["jsteinmetz"]);
+
+            const result = await withAuth(request(server.getApplication()).post(baseUrl), userToken).send({
+                primarySmtpAddress: "jsteinmetz@plc.gg",
+                aliasAddresses: [],
+                displayName: "Mine On Alias Domain",
+                timezone: "UTC",
+            });
+
+            expect(result.status).toBe(403);
+            expect(await repo.find({}).toArray()).toEqual([]);
+        });
+
+        it("self-service PUT refuses adding an alias-domain address to aliasAddresses, even one matching the caller's own username.", async () => {
+            await seedAlias();
+            mockAliasList(["jsteinmetz"]);
+            const created = await withAuth(request(server.getApplication()).post(baseUrl), userToken).send({
+                primarySmtpAddress: "jsteinmetz@example.com",
+                aliasAddresses: [],
+                displayName: "Mine",
+                timezone: "UTC",
+            });
+            expect(created.status).toBe(200);
+
+            const result = await withAuth(request(server.getApplication()).put(`${baseUrl}/${created.body.uid}`), userToken).send({
+                uid: created.body.uid,
+                version: created.body.version,
+                aliasAddresses: ["jsteinmetz@plc.gg"],
+            });
+
+            expect(result.status).toBe(400);
+        });
+    });
+
     mailboxSelfServiceCreateSuite({
         app: () => server.getApplication(),
         baseUrl,

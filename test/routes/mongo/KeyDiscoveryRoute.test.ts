@@ -7,6 +7,7 @@ import { request } from "@rapidrest/service-core/test";
 import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager, RateLimiter } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
+import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { KeyVaultMongo } from "../../../src/models/mongo/KeyVaultMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { computeKeyDiscoveryHash } from "../../../src/util/KeyDiscoveryClient.js";
@@ -24,6 +25,7 @@ describe("Route:KeyDiscoveryMongo Tests", () => {
     const baseUrl = "/mongo/.well-known/rapidmx/keys";
     let mailboxRepo: MongoRepository<MailboxMongo>;
     let keyVaultRepo: MongoRepository<KeyVaultMongo>;
+    let domainRepo: MongoRepository<DomainMongo>;
 
     const createMailbox = async function (data?: Partial<MailboxMongo>): Promise<MailboxMongo> {
         const primarySmtpAddress = `${uuid.v4()}@example.com`;
@@ -51,6 +53,7 @@ describe("Route:KeyDiscoveryMongo Tests", () => {
         if (conn instanceof MongoConnection) {
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
             keyVaultRepo = conn.getMongoRepository("KeyVaultMongo");
+            domainRepo = conn.getMongoRepository("DomainMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -63,7 +66,7 @@ describe("Route:KeyDiscoveryMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const r of [mailboxRepo, keyVaultRepo]) {
+        for (const r of [mailboxRepo, keyVaultRepo, domainRepo]) {
             try {
                 await r.clear();
             } catch (err: any) {
@@ -220,6 +223,40 @@ describe("Route:KeyDiscoveryMongo Tests", () => {
         const result = await request(server.getApplication()).get(`${baseUrl}/${hash}`).set("Host", "ACME.example:8443");
 
         expect(result.body.keys).toEqual([key]);
+    });
+
+    it("Resolves a requested alias domain (Domain.aliasOf) to its primary domain, so a peer asking about an alias-domain address still finds the primary mailbox's published keys.", async () => {
+        await domainRepo.save(new DomainMongo({ uid: "powerlevel.gg", name: "powerlevel.gg", enabled: true, verified: true }));
+        await domainRepo.save(new DomainMongo({ uid: "plc.gg", name: "plc.gg", enabled: true, verified: true, aliasOf: "powerlevel.gg" }));
+        const localPart = `boss-${uuid.v4()}`;
+        const hash = computeKeyDiscoveryHash(localPart);
+        const key = { publicKey: "b64", type: "x509", useType: "encrypt" as const, fingerprint: "alias-fp", notBefore: 0, notAfter: 1 };
+        // No mailbox is ever addressed on a pure alias domain - the mailbox lives on the primary domain.
+        await createMailbox({ primarySmtpAddress: `${localPart}@powerlevel.gg`, keyDiscoveryHash: hash, keys: [key] });
+
+        const result = await request(server.getApplication()).get(`${baseUrl}/${hash}?domain=plc.gg`);
+
+        expect(result.status).toBe(200);
+        expect(result.body.keys).toEqual([key]);
+    });
+
+    it("Never leaks a disabled/dangling alias domain into a match - falls back to the all-defaults response.", async () => {
+        await domainRepo.save(new DomainMongo({ uid: "powerlevel.gg", name: "powerlevel.gg", enabled: true, verified: true }));
+        await domainRepo.save(
+            new DomainMongo({ uid: "disabled-alias.gg", name: "disabled-alias.gg", enabled: false, verified: true, aliasOf: "powerlevel.gg" }),
+        );
+        const localPart = `boss2-${uuid.v4()}`;
+        const hash = computeKeyDiscoveryHash(localPart);
+        await createMailbox({
+            primarySmtpAddress: `${localPart}@powerlevel.gg`,
+            keyDiscoveryHash: hash,
+            keys: [{ publicKey: "b64", type: "x509", useType: "encrypt" as const, fingerprint: "fp", notBefore: 0, notAfter: 1 }],
+        });
+
+        const result = await request(server.getApplication()).get(`${baseUrl}/${hash}?domain=disabled-alias.gg`);
+
+        expect(result.status).toBe(200);
+        expect(result.body).toEqual({ encryptPreference: { preferEncrypt: "nopreference" }, keys: [], escrow: false });
     });
 
     it("Rate limits repeated requests for the same hash (429).", async () => {

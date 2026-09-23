@@ -14,11 +14,23 @@ import {
 } from "../../src/util/RequestBodyUtils.js";
 
 describe("RequestBodyUtils", () => {
-    it("isPathKey() flags dotted and $ keys only", () => {
+    it("isPathKey() flags dotted, $, and prototype-pollution-shaped keys", () => {
         expect(isPathKey("aliasAddresses.0")).toBe(true);
         expect(isPathKey("$set")).toBe(true);
+        expect(isPathKey("__proto__")).toBe(true);
+        expect(isPathKey("constructor")).toBe(true);
+        expect(isPathKey("prototype")).toBe(true);
         expect(isPathKey("aliasAddresses")).toBe(false);
         expect(isPathKey("a$b")).toBe(false);
+    });
+
+    it("assertNoPathKeys() refuses a JSON-parsed body carrying an own __proto__/constructor/prototype key", () => {
+        // A plain object LITERAL `{ __proto__: {...} }` sets the actual prototype rather than creating an own
+        // enumerable property - `JSON.parse()` (what a real HTTP body goes through) does not special-case it,
+        // so this is the shape an actual malicious request body takes.
+        expect(() => assertNoPathKeys(JSON.parse('{"__proto__":{"polluted":true}}'))).toThrow(/not a valid field name/);
+        expect(() => assertNoPathKeys(JSON.parse('{"constructor":{"polluted":true}}'))).toThrow(/not a valid field name/);
+        expect(() => assertNoPathKeys(JSON.parse('{"prototype":{"polluted":true}}'))).toThrow(/not a valid field name/);
     });
 
     it("assertNoPathKeys() refuses a path key at the top level of an object or of any array element", () => {
@@ -42,6 +54,11 @@ describe("RequestBodyUtils", () => {
         const single: any = { _id: "x", version: 3, dateCreated: "d", dateModified: "d", "a.b": 1, $set: {}, name: "kept" };
         expect(stripClientCreateFields(single)).toBe(single);
         expect(single).toEqual({ name: "kept" });
+
+        const polluted: any = JSON.parse('{"__proto__":{"polluted":true},"constructor":1,"prototype":1,"name":"kept"}');
+        stripClientCreateFields(polluted);
+        expect(polluted).toEqual({ name: "kept" });
+        expect(({} as any).polluted).toBeUndefined();
 
         const many: any[] = [{ _id: "x", name: "a" }, { version: 1, name: "b" }, 7];
         stripClientCreateFields(many);

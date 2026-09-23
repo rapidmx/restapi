@@ -2104,6 +2104,50 @@ export abstract class ScanQueueJob<
         return rows.length > 0 && rows.every((row) => normalizeAddress(row.organizer?.address ?? "") === sender);
     }
 
+    /**
+     * Re-reads `CalendarEvent` `uid` and writes `mutate`'s patch onto it with a version-checked update,
+     * retrying (up to `attempts`, default 3) on a version conflict - the same shape `claimDeliveryReceipt()`/
+     * `writeContactKeys()` already use elsewhere in this file for exactly this race. Without this, two
+     * attendees replying to the same invite near-simultaneously (an ordinary, common occurrence) means the
+     * loser of the optimistic-lock race on a plain `update()` throws a 409 that iTIP processing's own
+     * `try`/`catch` only ever `logger.warn()`'d - the ingest entry still closed `DELIVERED`, so the RSVP was
+     * silently, permanently dropped with no retry at all.
+     *
+     * `mutate` receives the freshly-read row on every attempt (not the possibly-stale row the caller first
+     * looked at) and returns the fields to patch, or `undefined` to mean "nothing to do any more" (the
+     * caller's own business-logic check - e.g. a staleness/SEQUENCE comparison - re-evaluated against the
+     * now-current row no longer holds), in which case this returns `undefined` without writing anything.
+     * Returns `undefined` too when `uid` no longer exists.
+     */
+    private async updateCalendarEventWithRetry(
+        uid: string,
+        mutate: (current: CE) => Record<string, any> | undefined,
+        options: { skipPush?: boolean } = {},
+        attempts: number = 3,
+    ): Promise<CE | undefined> {
+        for (let attempt = 1; ; attempt++) {
+            const current: CE | undefined = await this.calendarEventRepo!.findOne(uid, { ignoreACL: true });
+            if (!current) {
+                return undefined;
+            }
+            const patch: Record<string, any> | undefined = mutate(current);
+            if (!patch) {
+                return undefined;
+            }
+            try {
+                return await this.calendarEventRepo!.update(
+                    { uid: current.uid, version: (current as any).version, ...patch } as any,
+                    asEntity(this.calendarEventRepo!, current),
+                    { ignoreACL: true, ...options },
+                );
+            } catch (err: any) {
+                if (attempt >= attempts || err?.status !== 409) {
+                    throw err;
+                }
+            }
+        }
+    }
+
     /** `encrypted` is only ever consulted on the create branch below - an existing row's own
      * `encryptionOrigin` (set once, from whichever REQUEST first created it) is deliberately never
      * overwritten by a later update, per the spec's "sticky" encryption-state rule
@@ -2155,6 +2199,13 @@ export abstract class ScanQueueJob<
             const folder: F = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, mailboxUid, FolderType.CALENDAR);
             row = await this.calendarEventRepo!.create(
                 new this.calendarEventClass({
+                    // Deterministic, not random - the same `(mailboxUid, icalUid, recurrenceId)` a duplicate-
+                    // delivered REQUEST (ordinary SMTP at-least-once retry semantics) always derives the same
+                    // uid, so two `IngestQueueEntry` rows for the same REQUEST processed concurrently collide
+                    // on the unique index instead of both succeeding and double-booking/double-replying.
+                    // Mirrors `processEntry()`'s own `targetUid = nameBasedUuid('ingest:' + entry.uid +
+                    // ':target')` derivation for ordinary message delivery.
+                    uid: nameBasedUuid(`itip:${mailboxUid}:${parsed.uid}:${parsed.recurrenceId ? parsed.recurrenceId.toISOString() : "master"}`),
                     folderUid: folder.uid,
                     mailboxUid,
                     title: parsed.summary ?? "",
@@ -2182,22 +2233,30 @@ export abstract class ScanQueueJob<
                 { ignoreACL: true },
             );
         } else {
-            row = await this.calendarEventRepo!.update(
-                {
-                    uid: existing.uid,
-                    version: (existing as any).version,
-                    title: parsed.summary ?? existing.title,
+            // Re-fetch-and-retry on a version conflict (`updateCalendarEventWithRetry()`) - two REQUESTs for
+            // the same event processed concurrently by two workers must not let the loser's 409 be silently
+            // swallowed. The staleness check is re-evaluated against each freshly-read row too, since a
+            // concurrent update could have already applied a same-or-newer SEQUENCE by the time of a retry.
+            const updated: CE | undefined = await this.updateCalendarEventWithRetry(existing.uid, (current) => {
+                if (parsed.sequence <= current.sequence) {
+                    return undefined;
+                }
+                return {
+                    title: parsed.summary ?? current.title,
                     location: parsed.location,
-                    startDate: parsed.startDate ?? existing.startDate,
-                    endDate: parsed.endDate ?? existing.endDate,
+                    startDate: parsed.startDate ?? current.startDate,
+                    endDate: parsed.endDate ?? current.endDate,
                     attendees,
-                    recurrenceRule: parsed.recurrenceRule ?? existing.recurrenceRule,
+                    recurrenceRule: parsed.recurrenceRule ?? current.recurrenceRule,
                     sequence: parsed.sequence,
                     inviteSequenceSent: parsed.sequence,
-                } as any,
-                asEntity(this.calendarEventRepo!, existing),
-                { ignoreACL: true },
-            );
+                };
+            });
+            if (!updated) {
+                // Gone, or a concurrent update already applied this same-or-newer revision - nothing left to do.
+                return;
+            }
+            row = updated;
         }
 
         if (mailbox && decision !== undefined) {
@@ -2450,14 +2509,14 @@ export abstract class ScanQueueJob<
      * events it hasn't stamped, and this mailbox isn't the organizer, so it has nothing to send.
      */
     private async deleteReceivedEventCopy(row: CE): Promise<void> {
-        const current: CE | undefined = await this.calendarEventRepo!.findOne(row.uid, { ignoreACL: true });
-        if (current && !current.cancelNoticeSentAt) {
-            await this.calendarEventRepo!.update(
-                { uid: current.uid, version: (current as any).version, cancelNoticeSentAt: new Date() } as any,
-                asEntity(this.calendarEventRepo!, current),
-                { ignoreACL: true, skipPush: true },
-            );
-        }
+        // Re-fetch-and-retry on a version conflict, same as every other calendar-event mutation in this
+        // pipeline (see `updateCalendarEventWithRetry()`'s own doc comment) - a concurrent REPLY/REQUEST
+        // touching this exact row shouldn't be able to make this stamp silently fail to write.
+        await this.updateCalendarEventWithRetry(
+            row.uid,
+            (current) => (current.cancelNoticeSentAt ? undefined : { cancelNoticeSentAt: new Date() }),
+            { skipPush: true },
+        );
         await this.calendarEventRepo!.delete(row.uid, { ignoreACL: true });
     }
 
@@ -2480,14 +2539,19 @@ export abstract class ScanQueueJob<
             return;
         }
 
-        const attendees = existing.attendees.map((attendee) =>
-            normalizeAddress(attendee.address) === sender ? { ...attendee, responseStatus: replyingAttendee.partstat! } : attendee,
-        );
-        await this.calendarEventRepo!.update(
-            { uid: existing.uid, version: (existing as any).version, attendees } as any,
-            asEntity(this.calendarEventRepo!, existing),
-            { ignoreACL: true },
-        );
+        // Re-fetch-and-retry on a version conflict - two attendees replying to the same invite
+        // near-simultaneously must not let the loser's 409 be silently dropped (see
+        // `updateCalendarEventWithRetry()`'s own doc comment). The staleness check is re-evaluated against
+        // each freshly-read row too, since a concurrent REQUEST/REPLY could have already bumped `sequence`.
+        await this.updateCalendarEventWithRetry(existing.uid, (current) => {
+            if ((parsed.sequence ?? 0) < (current.sequence ?? 0)) {
+                return undefined;
+            }
+            const attendees = current.attendees.map((attendee) =>
+                normalizeAddress(attendee.address) === sender ? { ...attendee, responseStatus: replyingAttendee.partstat! } : attendee,
+            );
+            return { attendees };
+        });
     }
 
     /** Applies the organizer's CANCEL - only from the organizer on record for this mailbox's copy of the event. */
@@ -2521,12 +2585,16 @@ export abstract class ScanQueueJob<
             // unmodified series.
             const master: CE | undefined = rows.find((row) => !row.recurrenceId);
             if (master?.recurrenceRule) {
-                const exceptions = [...(master.recurrenceRule.exceptions ?? []), parsed.recurrenceId];
-                await this.calendarEventRepo!.update(
-                    { uid: master.uid, version: (master as any).version, recurrenceRule: { ...master.recurrenceRule, exceptions } } as any,
-                    asEntity(this.calendarEventRepo!, master),
-                    { ignoreACL: true },
-                );
+                // Re-fetch-and-retry on a version conflict (see `updateCalendarEventWithRetry()`'s own doc
+                // comment) - re-derives `exceptions` from the freshly-read row each attempt, not the
+                // possibly-stale `master` object from the read above.
+                await this.updateCalendarEventWithRetry(master.uid, (current) => {
+                    if (!current.recurrenceRule) {
+                        return undefined;
+                    }
+                    const exceptions = [...(current.recurrenceRule.exceptions ?? []), parsed.recurrenceId!];
+                    return { recurrenceRule: { ...current.recurrenceRule, exceptions } };
+                });
             }
             return;
         }

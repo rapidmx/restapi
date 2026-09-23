@@ -2103,7 +2103,7 @@ export interface CalendarEvent extends RecoverableBaseEntity {
 
     /**
      * The identifier of the video meeting a compose client linked to this event, if any - e.g. a
-     * `@rapidmx/videoconf-plugin` `VideoMeeting.uid`, named here generically and by name only: this library
+     * `@rapidmx/meet-plugin` `VideoMeeting.uid`, named here generically and by name only: this library
      * never imports a plugin's package, and nothing in this library resolves this value against any plugin's
      * own tables. A plain, nullable string with no foreign-key enforcement, exactly like `Task.assignedTo`/
      * `Task.taskListUid` - a value naming a meeting that no longer exists (or whose plugin was uninstalled) is
@@ -2181,7 +2181,7 @@ export interface CalendarShareLink extends BaseEntity {
  * — the dependency direction always runs the other way: a plugin depends on `@rapidmx/restapi`, never the
  * reverse — so a plugin that needs this library to mail something per-attendee writes it here (through its own
  * `RepoUtils` over `CalendarEventAttendeeLinkMongo`/`CalendarEventAttendeeLinkSQL`, the same way
- * `videoconf-plugin`'s routes already build one over the imported `MailboxMongo`/`MailboxSQL`) instead of this
+ * `meet-plugin`'s routes already build one over the imported `MailboxMongo`/`MailboxSQL`) instead of this
  * library reading the plugin's own tables directly, which it has no way to even name.
  *
  * Written and read only by trusted server-side code: there is no `ApiRoute` for it and its `AccessControlList`

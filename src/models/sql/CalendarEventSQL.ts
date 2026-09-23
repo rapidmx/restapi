@@ -184,7 +184,7 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
     @Column({ nullable: true })
     @Description(
         "The identifier of the video meeting a compose client linked to this event, if any (e.g. a " +
-            "`@rapidmx/videoconf-plugin` `VideoMeeting.uid`). No foreign-key enforcement.",
+            "`@rapidmx/meet-plugin` `VideoMeeting.uid`). No foreign-key enforcement.",
     )
     @Nullable
     public videoMeetingUid?: string;

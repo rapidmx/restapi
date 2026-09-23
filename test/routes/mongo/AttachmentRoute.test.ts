@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import config from "../../config.js";
+// Small enough to make the max-content-length test below fast/cheap, large enough that every other
+// test's small uploads (well under 1 KB) never come close to tripping it - vitest isolates each test
+// file's module graph (see MailboxAutoProvision.test.ts's identical note), so this can't leak elsewhere.
+config.set("mail:attachments:max_bytes", 1_000);
 import { request } from "@rapidrest/service-core/test";
 import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
@@ -181,6 +185,110 @@ describe("Route:AttachmentMongo Tests", () => {
         const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
         const stored: Buffer = await blobStore.get(result.body.blobKey);
         expect(stored.toString()).toBe("hello world");
+    });
+
+    it("Charges an uploaded attachment's size against the mailbox's usedBytes.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const message = await createMessage(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/upload?messageUid=${message.uid}&filename=test.txt&mimeType=text/plain`)
+            .set("Authorization", "jwt " + ownerToken)
+            .set("Content-Type", "application/octet-stream")
+            .send(Buffer.from("hello world"));
+
+        expect(result.status).toBeGreaterThanOrEqual(200);
+        expect(result.status).toBeLessThan(300);
+        const updated = await mailboxRepo.findOne({ uid: mailbox.uid } as any);
+        expect(updated!.usedBytes).toBe(11);
+    });
+
+    it("Rejects an upload that would exceed the mailbox's storage quota (413), charging nothing and creating no Attachment.", async () => {
+        const mailbox = await mailboxRepo.save(
+            new MailboxMongo({
+                ownerUserUid: owner.uid,
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Small Mailbox",
+                timezone: "UTC",
+                quotaBytes: 5,
+                usedBytes: 0,
+            }),
+        );
+        await aclRepo.save({
+            uid: mailbox.uid,
+            dateCreated: new Date(),
+            dateModified: new Date(),
+            version: 0,
+            records: [{ userOrRoleId: owner.uid, actions: ["*"] }],
+            parentUid: "Mailbox",
+        });
+        const folder = await createFolder(mailbox.uid);
+        const message = await createMessage(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/upload?messageUid=${message.uid}&filename=test.txt&mimeType=text/plain`)
+            .set("Authorization", "jwt " + ownerToken)
+            .set("Content-Type", "application/octet-stream")
+            .send(Buffer.from("hello world")); // 11 bytes > quotaBytes: 5
+
+        expect(result.status).toBe(413);
+        const updated = await mailboxRepo.findOne({ uid: mailbox.uid } as any);
+        expect(updated!.usedBytes).toBe(0);
+        expect(await attachmentRepo.find({ messageUid: message.uid }).toArray()).toEqual([]);
+    });
+
+    it("Rejects an upload larger than the configured max upload size (413), before ever touching the mailbox's quota.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const message = await createMessage(mailbox.uid, folder.uid);
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/upload?messageUid=${message.uid}&filename=test.txt&mimeType=text/plain`)
+            .set("Authorization", "jwt " + ownerToken)
+            .set("Content-Type", "application/octet-stream")
+            .send(Buffer.alloc(1_001)); // one byte over the 1,000-byte test config limit
+
+        expect(result.status).toBe(413);
+        const updated = await mailboxRepo.findOne({ uid: mailbox.uid } as any);
+        expect(updated!.usedBytes).toBe(0);
+    });
+
+    it("Propagates a non-quota error from the quota charge (e.g. the mailbox disappeared) rather than swallowing it, creating no Attachment.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const message = await createMessage(mailbox.uid, folder.uid);
+        await mailboxRepo.deleteOne({ uid: mailbox.uid });
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/upload?messageUid=${message.uid}&filename=test.txt&mimeType=text/plain`)
+            .set("Authorization", "jwt " + ownerToken)
+            .set("Content-Type", "application/octet-stream")
+            .send(Buffer.from("hello world"));
+
+        expect(result.status).toBe(500);
+        expect(await attachmentRepo.find({ messageUid: message.uid }).toArray()).toEqual([]);
+    });
+
+    it("Refunds the quota charge when storing the attachment afterward fails, and still fails the request.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const message = await createMessage(mailbox.uid, folder.uid);
+        const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const putSpy = vi.spyOn(blobStore, "put").mockRejectedValueOnce(new Error("simulated blob store failure"));
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/upload?messageUid=${message.uid}&filename=test.txt&mimeType=text/plain`)
+            .set("Authorization", "jwt " + ownerToken)
+            .set("Content-Type", "application/octet-stream")
+            .send(Buffer.from("hello world"));
+
+        expect(result.status).toBe(500);
+        putSpy.mockRestore();
+        const updated = await mailboxRepo.findOne({ uid: mailbox.uid } as any);
+        expect(updated!.usedBytes).toBe(0);
+        expect(await attachmentRepo.find({ messageUid: message.uid }).toArray()).toEqual([]);
     });
 
     it("Strips CR/LF from an uploaded filename (header-injection hardening) before storing it.", async () => {

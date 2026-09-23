@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import config from "../../config.sql.js";
+// Small enough to make the oversized-upload test below fast/cheap, large enough that every other test's
+// small uploads never come close to tripping it - vitest isolates each test file's module graph (see
+// MailboxAutoProvision.test.ts's identical note), so this can't leak elsewhere.
+config.set("mail:import:max_bytes", 1_000);
 import { request } from "@rapidrest/service-core/test";
 import { AccessControlListSQL, Server, ObjectFactory, ConnectionManager, isSqlDataSource } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
@@ -116,6 +120,16 @@ describe("Route:MailboxImportRequestSQL Tests", () => {
                 .set("Content-Type", "application/mbox")
                 .send(Buffer.alloc(0));
             expect(result.status).toBe(400);
+        });
+
+        it("Rejects an upload larger than the configured max import size (413), before any mailbox/folder lookup or blob write.", async () => {
+            const result = await request(server.getApplication())
+                .post(importUrl({ format: "mbox", targetFolderUid: uuid.v4() }))
+                .set("Authorization", "jwt " + ownerToken)
+                .set("Content-Type", "application/mbox")
+                .send(Buffer.alloc(1_001)); // one byte over the 1,000-byte test config limit
+            expect(result.status).toBe(413);
+            expect(await requestRepo.find()).toEqual([]);
         });
 
         it("Returns 404 when the caller owns no mailbox.", async () => {

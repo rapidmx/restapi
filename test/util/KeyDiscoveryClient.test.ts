@@ -231,6 +231,19 @@ describe("fetchRemoteKeys() Tests", () => {
         expect(result).toBeUndefined();
     });
 
+    it("Rejects decimal/octal/hex-encoded IP-literal hosts that `net.isIP()` alone doesn't recognize but the WHATWG URL parser (and so `fetch()`) would normalize to a real IP with no DNS lookup.", async () => {
+        // `2852039166` (decimal), `0xA9FEA9FE` (hex) and `0251.0376.0251.0376` (octal) all normalize to
+        // `169.254.169.254` - the cloud metadata address - via `new URL()`, and `017700000001` (octal)
+        // normalizes to the loopback `127.0.0.1`. None of these are recognized as an IP literal by
+        // `net.isIP()` on the raw string, so without re-checking the URL-normalized hostname they would
+        // sail past the syntax check as "just a hostname".
+        for (const host of ["2852039166", "0xA9FEA9FE", "0251.0376.0251.0376", "017700000001"]) {
+            const result = await fetchRemoteKeys(host, "alice@numeric-ip-host.example");
+            expect(result).toBeUndefined();
+        }
+        expect(mockFetch).not.toHaveBeenCalled();
+    });
+
     it("Reads a real streamed response body and parses it once complete (the non-test-double path).", async () => {
         const body = makeDiscoveryResponse({ escrow: true });
         const encoded = new TextEncoder().encode(JSON.stringify(body));

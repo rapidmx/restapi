@@ -50,6 +50,26 @@ describe("BaseAttachmentRoute Tests (repoUtils/blobStore guard clauses only)", (
         await expect(route.upload(req, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
     });
 
+    it("Logs a warning when a post-store-failure quota refund itself fails every retry attempt (round 7).", async () => {
+        const route = objectFactory.newInstance<TestAttachmentRoute>(TestAttachmentRoute, { initialize: false });
+        (route as any).repoUtils = {};
+        (route as any).aclUtils = { hasPermission: vi.fn().mockResolvedValue(true) };
+        (route as any).messageRepo = { findOne: vi.fn().mockResolvedValue({ uid: "m1", folderUid: "f1", mailboxUid: "mb" }) };
+        (route as any).mailboxRepo = {
+            findOne: vi.fn().mockResolvedValue({ uid: "mb", version: 0, quotaBytes: 1000, usedBytes: 0 }),
+            // The charge itself succeeds; every subsequent call (the refund's own retry loop) then fails.
+            update: vi.fn().mockResolvedValueOnce({ uid: "mb", version: 1 }).mockRejectedValue(new Error("simulated persistent conflict")),
+        };
+        (route as any).blobStore = { put: vi.fn().mockRejectedValue(new Error("simulated blob store failure")) };
+        const warn = vi.fn();
+        (route as any).logger = { warn };
+        const req = makeReq({ query: { messageUid: "m1", filename: "test.txt", mimeType: "text/plain" }, rawBody: Buffer.from("hello") });
+
+        await expect(route.upload(req, { uid: "user-1" } as any)).rejects.toThrow(/simulated blob store failure/);
+
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("failed to refund"));
+    });
+
     it("download() throws INTERNAL_ERROR when repoUtils/blobStore are not set.", async () => {
         const route = objectFactory.newInstance<TestAttachmentRoute>(TestAttachmentRoute, { initialize: false });
         const res = makeRes();

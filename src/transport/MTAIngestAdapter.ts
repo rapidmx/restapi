@@ -29,7 +29,13 @@
  * ### `POST /internal/mta/deliver`
  * Called by the MTA's content-filter/pipe once it has accepted a message. The request body is the raw,
  * unparsed RFC 5322 message; envelope-from/envelope-to are carried as `X-Envelope-From`/`X-Envelope-To`
- * headers. The handler does only the minimum synchronous work — persist the raw bytes to the `BlobStore` and
+ * headers, with `X-Envelope-To` a comma-joined list for a multi-recipient transaction. **Each envelope
+ * address must be individually percent-encoded (`encodeURIComponent`) by the ingest client before joining** -
+ * otherwise a `,` legitimately occurring inside a quoted local part would be indistinguishable from the
+ * list's own separator, corrupting the recipient count/addresses `BaseMailIngestRoute.deliver()` parses back
+ * out (it `decodeURIComponent()`s each split segment). A plain ASCII address with nothing to encode
+ * round-trips unchanged, so this is backward compatible with an ingest client that predates the convention.
+ * The handler does only the minimum synchronous work — persist the raw bytes to the `BlobStore` and
  * create an `IngestQueueEntry` — then returns `202` immediately, deferring parsing/scanning/delivery to
  * `ScanQueueJob`. This bounds SMTP-transaction latency and lets the MTA's own queue (not this library's) own
  * retry/backpressure semantics.

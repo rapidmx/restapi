@@ -647,10 +647,10 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
 
-        const envelopeFrom: string = firstHeader(req, "x-envelope-from") ?? "";
+        const envelopeFrom: string = decodeEnvelopeAddress(firstHeader(req, "x-envelope-from") ?? "");
         const envelopeFromNormalized: string = normalizeAddress(envelopeFrom);
         const envelopeToHeader: string | undefined = firstHeader(req, "x-envelope-to");
-        let envelopeTo: string[] = envelopeToHeader ? envelopeToHeader.split(",").map((a) => a.trim()) : [];
+        let envelopeTo: string[] = envelopeToHeader ? envelopeToHeader.split(",").map((a) => decodeEnvelopeAddress(a.trim())) : [];
         let raw: Buffer | undefined = req.rawBody;
 
         if (!raw || raw.length === 0 || envelopeTo.length === 0) {
@@ -821,4 +821,21 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
 function firstHeader(req: HttpRequest, name: string): string | undefined {
     const value: string | string[] | undefined = req.headers[name];
     return Array.isArray(value) ? value[0] : value;
+}
+
+/** Decodes one percent-encoded envelope address from `X-Envelope-From`/`X-Envelope-To` (see
+ * `MTAIngestAdapter.ts`'s own doc comment) - the MTA-side ingest client percent-encodes each envelope
+ * address before joining them into these headers, so a `,` inside a quoted local part (or any other
+ * character that would otherwise collide with the header's own comma-separated-list/HTTP-header syntax)
+ * can never be mistaken for a delimiter or corrupt the header. Backward compatible: a plain ASCII address
+ * with no percent-encoded bytes round-trips through `decodeURIComponent()` unchanged, so an ingest client
+ * that never encodes still works exactly as before. `value` is attacker-adjacent (it comes from the SMTP
+ * envelope of a message this server didn't originate) - malformed percent-encoding falls back to the raw
+ * segment rather than throwing and failing delivery over one bad byte sequence. */
+function decodeEnvelopeAddress(value: string): string {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
 }

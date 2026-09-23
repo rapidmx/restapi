@@ -15,9 +15,16 @@ import { ApiErrors } from "@rapidrest/service-core";
  * set, so a client `_id` replaces whichever document already has it - another mailbox's message, say.
  */
 
-/** Whether `key` is a dotted path or starts with `$` - never a plain field name. */
+/** Prototype-pollution-shaped keys - not currently exploitable (every write path here uses object spread,
+ * not `Object.assign`/direct property assignment onto a shared prototype), but flagged anyway as
+ * defense-in-depth against this function's own documented contract ("never a plain field name") and against
+ * a future write path that assigns onto an object literal without spreading first. */
+const UNSAFE_PROTO_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
+
+/** Whether `key` is a dotted path, starts with `$`, or is a prototype-pollution-shaped key (`__proto__`,
+ * `constructor`, `prototype`) - never a plain field name. */
 export function isPathKey(key: string): boolean {
-    return key.includes(".") || key.startsWith("$");
+    return key.includes(".") || key.startsWith("$") || UNSAFE_PROTO_KEYS.has(key);
 }
 
 /** Refuses (400) a body (or each element of an array body) with any top-level key that is a dotted path or starts

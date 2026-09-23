@@ -8,6 +8,7 @@ import { Server, ObjectFactory, ConnectionManager, isSqlDataSource, RateLimiter 
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
+import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { KeyVaultSQL } from "../../../src/models/sql/KeyVaultSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { computeKeyDiscoveryHash } from "../../../src/util/KeyDiscoveryClient.js";
@@ -20,6 +21,7 @@ describe("Route:KeyDiscoverySQL Tests", () => {
     const baseUrl = "/sql/.well-known/rapidmx/keys";
     let mailboxRepo: Repository<MailboxSQL>;
     let keyVaultRepo: Repository<KeyVaultSQL>;
+    let domainRepo: Repository<DomainSQL>;
 
     const createMailbox = async function (data?: Partial<MailboxSQL>): Promise<MailboxSQL> {
         const primarySmtpAddress = `${uuid.v4()}@example.com`;
@@ -46,6 +48,7 @@ describe("Route:KeyDiscoverySQL Tests", () => {
         if (isSqlDataSource(conn)) {
             mailboxRepo = conn.getRepository(MailboxSQL);
             keyVaultRepo = conn.getRepository(KeyVaultSQL);
+            domainRepo = conn.getRepository(DomainSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -59,6 +62,7 @@ describe("Route:KeyDiscoverySQL Tests", () => {
     beforeEach(async () => {
         await mailboxRepo.clear();
         await keyVaultRepo.clear();
+        await domainRepo.clear();
     });
 
     it("Returns the all-defaults response, with a 200 (not 404), for a hash matching no mailbox - indistinguishable from a real mailbox with nothing published.", async () => {
@@ -207,6 +211,48 @@ describe("Route:KeyDiscoverySQL Tests", () => {
         const result = await request(server.getApplication()).get(`${baseUrl}/${hash}`).set("Host", "ACME.example:8443");
 
         expect(result.body.keys).toEqual([key]);
+    });
+
+    it("Resolves a requested alias domain (Domain.aliasOf) to its primary domain, so a peer asking about an alias-domain address still finds the primary mailbox's published keys.", async () => {
+        await domainRepo.save(new DomainSQL({ uid: "powerlevel.gg", name: "powerlevel.gg", enabled: true, verified: true } as any));
+        await domainRepo.save(
+            new DomainSQL({ uid: "plc.gg", name: "plc.gg", enabled: true, verified: true, aliasOf: "powerlevel.gg" } as any),
+        );
+        const localPart = `boss-${uuid.v4()}`;
+        const hash = computeKeyDiscoveryHash(localPart);
+        const key = { publicKey: "b64", type: "x509", useType: "encrypt" as const, fingerprint: "alias-fp", notBefore: 0, notAfter: 1 };
+        // No mailbox is ever addressed on a pure alias domain - the mailbox lives on the primary domain.
+        await createMailbox({ primarySmtpAddress: `${localPart}@powerlevel.gg`, keyDiscoveryHash: hash, keys: [key] });
+
+        const result = await request(server.getApplication()).get(`${baseUrl}/${hash}?domain=plc.gg`);
+
+        expect(result.status).toBe(200);
+        expect(result.body.keys).toEqual([key]);
+    });
+
+    it("Never leaks a disabled/dangling alias domain into a match - falls back to the all-defaults response.", async () => {
+        await domainRepo.save(new DomainSQL({ uid: "powerlevel.gg", name: "powerlevel.gg", enabled: true, verified: true } as any));
+        await domainRepo.save(
+            new DomainSQL({
+                uid: "disabled-alias.gg",
+                name: "disabled-alias.gg",
+                enabled: false,
+                verified: true,
+                aliasOf: "powerlevel.gg",
+            } as any),
+        );
+        const localPart = `boss2-${uuid.v4()}`;
+        const hash = computeKeyDiscoveryHash(localPart);
+        await createMailbox({
+            primarySmtpAddress: `${localPart}@powerlevel.gg`,
+            keyDiscoveryHash: hash,
+            keys: [{ publicKey: "b64", type: "x509", useType: "encrypt" as const, fingerprint: "fp", notBefore: 0, notAfter: 1 }],
+        });
+
+        const result = await request(server.getApplication()).get(`${baseUrl}/${hash}?domain=disabled-alias.gg`);
+
+        expect(result.status).toBe(200);
+        expect(result.body).toEqual({ encryptPreference: { preferEncrypt: "nopreference" }, keys: [], escrow: false });
     });
 
     it("Rate limits repeated requests for the same hash (429).", async () => {

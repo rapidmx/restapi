@@ -19,6 +19,12 @@ const { Get, Param, Post, Query, Request, User: AuthUser } = RouteDecorators;
 
 const VALID_FORMATS: ReadonlySet<string> = new Set<MailboxImportFormat>(["mbox", "pst"]);
 
+/** Default `mail:import:max_bytes` - 500 MiB. `MailboxImportJob`/`PstImportUtils` read the whole uploaded
+ * file into one in-memory `Buffer` before `PstAllocationBudget` (which only bounds *extracted/reconstructed*
+ * output, not input size) ever runs - a large upload accepted here with no ceiling at all could OOM-crash
+ * the whole Node process, which every other `BackgroundService` job shares. */
+export const DEFAULT_MAX_IMPORT_BYTES = 524_288_000;
+
 /**
  * A GDPR data-portability *import* request - the counterpart to `BaseDataExportRoute` - taking an
  * uploaded Mbox or PST file (via `req.rawBody`, the same raw-byte-upload convention
@@ -57,6 +63,11 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
+
+    /** The largest source file `create()` accepts, in bytes (413 beyond) - see `DEFAULT_MAX_IMPORT_BYTES`'s
+     * own doc comment for why this exists at all. */
+    @Config("mail:import:max_bytes", DEFAULT_MAX_IMPORT_BYTES)
+    private maxImportBytes: number = DEFAULT_MAX_IMPORT_BYTES;
 
     /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
     @Config()
@@ -132,6 +143,14 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         const raw: Buffer | undefined = req.rawBody;
         if (!raw || raw.length === 0) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        // Checked before any other work (DB lookups, the blob write) - rejects an oversized upload up front
+        // rather than after paying for the rest of this handler, though `req.rawBody` is already fully
+        // buffered into memory by the time this handler runs at all (a framework-level concern, not this
+        // route's - see `DEFAULT_MAX_IMPORT_BYTES`'s own doc comment for the real risk this closes: what
+        // `MailboxImportJob` does with the upload afterward).
+        if (raw.length > this.maxImportBytes) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 413, `The uploaded file is larger than the ${this.maxImportBytes} bytes allowed.`);
         }
 
         const isTrusted: boolean = UserUtils.hasRoles(user, this.trustedRoles);

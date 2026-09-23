@@ -219,6 +219,13 @@ const HOSTNAME_PATTERN = /^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!
  * ability to stream an unbounded body into this process's memory. */
 const MAX_RESPONSE_BYTES = 1_000_000;
 
+/** Ports a discovery `host` may specify. A remote domain's own `_rapidmx` TXT record has no legitimate reason
+ * to point key discovery at anything other than standard/alternate HTTPS - allowing the full 1-65535 range
+ * needlessly widens the set of internal services (databases, admin panels, etc.) a malicious record could
+ * probe. `443` is the implicit default (no `:port` at all); `8443` is kept as the one common alternate-HTTPS
+ * port operators sometimes front discovery with. */
+const ALLOWED_DISCOVERY_PORTS: ReadonlySet<string> = new Set(["443", "8443"]);
+
 /**
  * Validates that `host` (the `host` attribute of a remote domain's `_rapidmx` TXT record - attacker-influenced,
  * since it comes from a DNS record the requesting server does not control) is safe to interpolate directly
@@ -240,6 +247,15 @@ const MAX_RESPONSE_BYTES = 1_000_000;
  * with an address-lookup method this function could pre-validate against, or a custom low-level connect hook
  * - both larger, separate changes from the syntax/redirect/IP-literal hardening this function and
  * `fetchRemoteKeys()`'s `redirect: "error"` provide today.
+ *
+ * **IP-literal check is applied to the WHATWG-normalized host, not the raw string.** `net.isIP()` only
+ * recognizes dotted-quad IPv4 (`a.b.c.d`) and colon-hex IPv6 - it does NOT recognize the decimal, octal, or
+ * hex encodings of an IPv4 address that browsers/`URL`/`fetch()` still accept and normalize (e.g. the decimal
+ * form `2852039166` is `169.254.169.254`, the cloud metadata address). Checking only the raw `host` string
+ * against `net.isIP()` would let such an encoding sail through as "just a hostname" while `fetch()` connects
+ * straight to the real IP with no DNS lookup at all. Constructing a `URL` from the candidate and re-checking
+ * `net.isIP()` against its `.hostname` catches every encoding the platform itself would normalize, regardless
+ * of base.
  */
 function isSafeDiscoveryHost(host: string): boolean {
     const parts: string[] = host.split(":");
@@ -248,13 +264,24 @@ function isSafeDiscoveryHost(host: string): boolean {
         return false;
     }
     const [withoutPort, port] = parts;
-    if (port !== undefined && (!/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535)) {
+    if (port !== undefined && (!/^\d{1,5}$/.test(port) || !ALLOWED_DISCOVERY_PORTS.has(String(Number(port))))) {
         return false;
     }
     if (net.isIP(withoutPort) !== 0) {
         return false;
     }
-    return HOSTNAME_PATTERN.test(withoutPort);
+    if (!HOSTNAME_PATTERN.test(withoutPort)) {
+        return false;
+    }
+    // Re-check against the URL-parser-normalized hostname to catch decimal/octal/hex IP-literal encodings
+    // `net.isIP()` alone would miss (see doc comment above).
+    let normalizedHostname: string;
+    try {
+        normalizedHostname = new URL(`https://${withoutPort}/`).hostname;
+    } catch {
+        return false;
+    }
+    return net.isIP(normalizedHostname) === 0;
 }
 
 /** An email address split into its local part and (lowercased) domain - see `parseKeyDiscoveryAddress()`. */

@@ -20,7 +20,7 @@ import { AuditAction, DistributionList, EscrowScope, Mailbox } from "../models/t
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
 import { assertAdminScope, hasMailAccess, isAdminScope, isTrustedUser, stripTrustedRoles } from "../util/MailAccessUtils.js";
-import { getPrimaryDomainNames, getVerifiedDomainNames } from "../util/DomainUtils.js";
+import { getPrimaryDomainNames } from "../util/DomainUtils.js";
 import { ensureWellKnownFolders } from "../util/FolderUtils.js";
 import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { hasAddressLikeDisplayName } from "../util/MimeHeaderUtils.js";
@@ -705,7 +705,10 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             autoProvisionEnabled: this.autoProvisionEnabled,
             autoProvisionQuotaBytes: this.autoProvisionQuotaBytes,
         }, this.logger, true);
-        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        // A pure alias `Domain` (`Domain.aliasOf`) has no mailboxes of its own by design - a self-service
+        // caller must not be able to claim an address on one any more than a trusted caller can (see
+        // `createMailboxes()`'s own `getPrimaryDomainNames()` check below, which this mirrors).
+        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
         const hasAliasSource: boolean = this.staticAliases.length > 0 || !!this.authServerUrl;
         if (!policy.autoProvisionEnabled || domains.length === 0 || !hasAliasSource) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Creating your own mailbox is not enabled on this server.");
@@ -749,6 +752,18 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             for (const o of objs) {
                 const domain = o.primarySmtpAddress?.split("@")[1]?.toLowerCase();
                 if (!domain || !domains.includes(domain)) {
+                    throw new ApiError(
+                        ApiErrors.INVALID_REQUEST,
+                        400,
+                        `Mailbox addresses must be on one of this server's verified domains: ${domains.join(", ")}.`,
+                    );
+                }
+                // `aliasAddresses` supplied at create time must be held to the same non-alias-domain rule as
+                // the primary address - otherwise a caller could sidestep `validateAliasChange()`'s equivalent
+                // check entirely by supplying the alias-domain address at creation instead of via a later
+                // `PUT .../aliasAddresses`.
+                const aliasDomains: string[] = (o.aliasAddresses ?? []).map((alias) => alias.split("@")[1]?.toLowerCase());
+                if (aliasDomains.some((aliasDomain) => !aliasDomain || !domains.includes(aliasDomain))) {
                     throw new ApiError(
                         ApiErrors.INVALID_REQUEST,
                         400,
@@ -957,7 +972,11 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         assertPlainAddresses(candidates);
         const added: string[] = candidates as string[];
-        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        // Must exclude alias `Domain`s the same way `createMailboxes()` does - a pure alias domain has no
+        // mailboxes of its own, so letting one through here would let a caller add e.g. `boss@plc.gg` (a pure
+        // alias of `powerlevel.gg`) directly to their OWN mailbox's `aliasAddresses`, hijacking mail/send-as/
+        // key-discovery for whatever mailbox `boss@powerlevel.gg` actually resolves to via `resolveDomainAlias()`.
+        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
         if (domains.length > 0 && added.some((alias) => !domains.includes(alias.split("@")[1]))) {
             throw new ApiError(
                 ApiErrors.INVALID_REQUEST,

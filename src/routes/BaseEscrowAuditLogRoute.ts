@@ -100,7 +100,10 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
         }
         const filter: any = {};
         for (const [key, value] of Object.entries(query ?? {})) {
-            if (!key.startsWith("$") && key !== "matterId") {
+            // Segment-aware, not just top-level - matches the check `BaseScopedChildRoute`/`BaseFolderRoute`/
+            // `BaseMailboxRoute`/`BaseAttachmentRoute` already use, so a nested operator key like
+            // `escrowScopeId.$where` can't slip past this route's own filtering unstripped.
+            if (!key.split(".").some((segment) => segment.startsWith("$")) && key !== "matterId") {
                 filter[key] = value;
             }
         }

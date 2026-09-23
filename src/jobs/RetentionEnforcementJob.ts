@@ -54,9 +54,10 @@ const RETENTION_POLICY_UID = "retention-policy";
  *
  * Message content blobs are shared between recipient mailboxes (and mail-filter copies), so a blob is only
  * deleted once no other row references it - see `util/BlobReferenceUtils.ts`. Each run reads expired rows
- * oldest first in a stable order and pages past rows it skipped (held, or failed to purge), so a stuck row
- * never blocks the rows behind it; mailboxes under any open hold are left out of the message query altogether
- * (holds are loaded once per page via `loadLegalHoldIndex()`, not re-read per record).
+ * via keyset pagination on `uid` (see `purgeSortedBatches()`'s own doc comment) and advances past every row
+ * a page reads, purged or not, so a stuck (held, or failed-to-purge) row never blocks the rows behind it and
+ * is naturally retried on a later run; mailboxes under any open hold are left out of the message query
+ * altogether (holds are loaded once per page via `loadLegalHoldIndex()`, not re-read per record).
  *
  * Every run, with or without a policy, also releases draft bodies kept for a legal hold (`Message.retainedBodyBlobKeys`)
  * once no open `Matter` holds their mailbox - see `releaseRetainedDraftBodies()` and `util/DraftBodyRetentionUtils.ts`.
@@ -340,12 +341,21 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
     }
 
     /**
-     * Purges up to `batchSize` rows whose `dateField` is before `cutoff`, oldest first. Rows that are skipped
-     * (under a legal hold) or fail to purge stay in place and keep their position in the stable
-     * `(dateField, uid)` order, so the remaining result set is always "every row skipped so far, then rows not
-     * yet looked at" - each next page is read past the skipped count instead of re-reading the same stuck rows
-     * forever. Holds are reloaded once per page (one `Matter` read per page rather than per record). Returns
-     * how many rows were purged.
+     * Purges up to `batchSize` rows whose `dateField` is before `cutoff`, using keyset pagination on `uid`
+     * (`uid > <last uid of the previous page>`, sorted `uid` ASC - the same cursor pattern
+     * `util/MailboxContentUtils.ts`'s `findPagesByUid()` uses) rather than offset paging. Traversal order is
+     * therefore by `uid`, not oldest-`dateField`-first - `dateField < cutoff` is still the query's own filter,
+     * so which rows are eligible is unaffected, only the order they're visited in within one run.
+     *
+     * This previously paged by offset (`page = floor(skipped/pageSize)`, slicing away `skipped % pageSize` rows
+     * assumed still at the front of the result set) which was fragile: if a `purge()` call threw AFTER its
+     * delete had actually committed (e.g. a network timeout post-commit), the next page's leading FRESH row
+     * got sliced away as if it were the phantom skip, so it was silently never examined that run (self-healing
+     * only on a later run, once its `dateField` was re-evaluated against a fresh query - but a real, avoidable
+     * gap in the meantime). Keyset pagination has no such assumption: the cursor advances past every row a
+     * page actually read, purged or not, so a row physically gone by the time the next page queries simply
+     * isn't found again - it can never shift what a later page sees. Holds are reloaded once per page (one
+     * `Matter` read per page rather than per record). Returns how many rows were purged.
      */
     private async purgeSortedBatches<T extends { uid: string }>(
         repo: RepoUtils<T>,
@@ -361,35 +371,32 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
         // Bounds a run that finds nothing but skipped rows, so a large held backlog can't make one run unbounded.
         const maxExamined: number = pageSize * 20;
         let purged = 0;
-        let skipped = 0;
         let examined = 0;
+        let after: string | undefined;
         while (purged < budget && examined < maxExamined) {
             const holds: LegalHoldIndex = await loadLegalHoldIndex(this._objectFactory!, this.matterClass);
-            const page: number = Math.floor(skipped / pageSize);
-            const rows: T[] = await repo.find(
-                {
-                    ...queryExclusions(holds),
-                    [dateField]: `lt(${cutoff.toISOString()})`,
-                    sort: { [dateField]: "ASC", uid: "ASC" },
-                    limit: pageSize,
-                    page,
-                } as any,
-                { ignoreACL: true, limit: pageSize, page, skipCache: true },
-            );
-            // The first `skipped % pageSize` rows of this page are rows already skipped on an earlier page.
-            const fresh: T[] = rows.slice(skipped % pageSize);
-            if (fresh.length === 0) {
+            const query: Record<string, any> = {
+                ...queryExclusions(holds),
+                [dateField]: `lt(${cutoff.toISOString()})`,
+                sort: { uid: "ASC" },
+                limit: pageSize,
+            };
+            if (after !== undefined) {
+                query.uid = `gt(${after})`;
+            }
+            const rows: T[] = await repo.find(query as any, { ignoreACL: true, limit: pageSize, skipCache: true });
+            if (rows.length === 0) {
                 break;
             }
-            for (const row of fresh) {
+            for (const row of rows) {
                 if (purged >= budget) {
                     break;
                 }
                 examined++;
                 if (isHeld(holds, row)) {
                     // Under an active hold - skip, don't error. Retried automatically on a later run once the
-                    // matter closes.
-                    skipped++;
+                    // matter closes (the cursor still advances past it below, same as a purged row - it's
+                    // simply not re-examined again THIS run either way).
                     continue;
                 }
                 try {
@@ -397,12 +404,14 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
                     purged++;
                 } catch (err: any) {
                     onError(row, err);
-                    skipped++;
                 }
             }
-            if (rows.length < pageSize) {
+            const last: string = rows[rows.length - 1].uid;
+            // Defensive: a cursor that doesn't advance (a backend ignoring the `gt(...)` filter) would loop forever.
+            if (rows.length < pageSize || !(after === undefined || last > after)) {
                 break;
             }
+            after = last;
         }
         return purged;
     }

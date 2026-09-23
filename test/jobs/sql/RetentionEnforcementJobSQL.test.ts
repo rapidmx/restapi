@@ -8,7 +8,7 @@
 import { ACLUtils, AccessControlListSQL, ConnectionManager, NotificationUtils, ObjectFactory, isSqlDataSource } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
-import { Repository } from "typeorm";
+import { In, Repository } from "typeorm";
 import config from "../../config.sql.js";
 import { RetentionEnforcementJobSQL } from "../../../src/jobs/sql/RetentionEnforcementJobSQL.js";
 import { AttachmentSQL } from "../../../src/models/sql/AttachmentSQL.js";
@@ -582,6 +582,37 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
 
         const remaining = await messageRepo.find({ where: { sentDate: oldDate } });
         expect(remaining.length).toBe(1);
+    });
+
+    it("Does not skip a fresh row when an earlier row's delete actually committed but the call itself reported failure (keyset pagination on uid has no offset/skip-count reconciliation to get wrong).", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
+        (job as any).batchSize = 3;
+        const messages: MessageSQL[] = [];
+        for (let i = 0; i < 6; i++) {
+            // Explicit, lexically-ordered uids: `purgeSortedBatches()` pages by `uid` ASC, so this pins which
+            // rows land on which page instead of depending on whatever uid a real backend would assign.
+            messages.push(await createMessage({ uid: `msg-${i}`, sentDate: new Date(Date.now() - (60 - i) * DAY_MS) }));
+        }
+        const repoUtils = (job as any).messageRepo;
+        const originalDelete = repoUtils.delete.bind(repoUtils);
+        vi.spyOn(repoUtils, "delete").mockImplementation(async (uid: any, opts: any) => {
+            const result = await originalDelete(uid, opts);
+            if (uid === messages[0].uid) {
+                // The delete committed, but the call still reported failure (e.g. a timeout after the write).
+                throw new Error("simulated post-commit failure");
+            }
+            return result;
+        });
+
+        await job.run();
+
+        // Page 0 = [msg-0, msg-1, msg-2]: msg-0 "fails" (really gone, but not counted as purged), msg-1 and
+        // msg-2 purge (2 of the 3-row budget used). The cursor advances to msg-2 regardless of msg-0's
+        // reported failure, so page 1 queries `uid > msg-2` = [msg-3, msg-4, msg-5] with nothing sliced away
+        // as a phantom skip - msg-3 purges (budget reached) and the run stops there, never silently skipping
+        // msg-3 the way offset pagination used to.
+        const remaining = (await messageRepo.find({ where: { uid: In(messages.map((m) => m.uid)) } })).map((m) => m.uid);
+        expect(remaining.sort()).toEqual([messages[4].uid, messages[5].uid].sort());
     });
 
     it("Logs a warning and continues purging subsequent messages when one delete throws.", async () => {

@@ -258,6 +258,34 @@ describe("Route:MailIngestRouteSQL Tests", () => {
         expect(entries[0].envelopeFrom).toBe("sender@example.com");
     });
 
+    it("Decodes percent-encoded X-Envelope-From/X-Envelope-To addresses (the ingest client's own encoding), so a comma inside an address isn't mistaken for the recipient-list separator and a non-ASCII local part survives intact.", async () => {
+        const mailbox = await createMailbox();
+        const weirdSender = "josé,doe@example.com"; // comma AND non-ASCII in one address, deliberately.
+        const weirdRecipient = "weird,recipient@example.com"; // unresolvable, but must arrive as ONE recipient.
+        const raw = Buffer.from("From: sender@example.com\r\nTo: " + mailbox.primarySmtpAddress + "\r\n\r\nHello\r\n");
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", encodeURIComponent(weirdSender))
+            .set("X-Envelope-To", [encodeURIComponent(mailbox.primarySmtpAddress), encodeURIComponent(weirdRecipient)].join(","))
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        // Exactly two recipients - the embedded comma in the second, percent-encoded address must not have
+        // been mistaken for the list separator and split it into a bogus third (garbled) entry.
+        expect(result.body.results).toEqual([
+            { rcpt: mailbox.primarySmtpAddress, queued: true },
+            { rcpt: weirdRecipient, queued: false },
+        ]);
+
+        const entries: IngestQueueEntrySQL[] = await ingestQueueRepo.find({ where: { mailboxUid: mailbox.uid } });
+        expect(entries.length).toBe(1);
+        // The decoded sender - comma and non-ASCII character intact - not the raw percent-encoded header value.
+        expect(entries[0].envelopeFrom).toBe(weirdSender);
+    });
+
     describe("domain alias", () => {
         it("Accepts the /domain relay check for a pure alias domain, same as any other verified domain.", async () => {
             await createDomain({ name: "powerlevel.gg" });

@@ -124,29 +124,20 @@ export async function getAliasDomainNames(objectFactory: ObjectFactory, domainCl
 }
 
 /**
- * Rewrites `address` from an alias domain onto its primary domain, for inbound address resolution
- * (`BaseMailIngestRoute.findExactMailboxByAddress()`/`findDistributionListByAddress()`) and local key
- * discovery (`util/LocalKeyDiscoveryUtils.ts`). Returns `undefined` when no rewrite applies: `address` has
- * no `@`, its domain isn't a currently enabled-and-verified alias `Domain`, or the `Domain` it names via
- * `aliasOf` isn't itself currently enabled-and-verified (a dangling/disabled reference resolves to nothing
- * rather than silently misrouting mail) - the caller falls back to treating `address` as-is in every case.
- * A single point (indexed `findOne` lookups, not a full domain scan) so every caller pays for at most two
- * lookups regardless of how many domains exist. `domainClass` itself is falsy only for a lightweight test
- * double that never wires one up (every real Mongo/SQL route subclass always supplies it) - treated the
- * same as "nothing to rewrite" rather than throwing, matching this module's `DkimKeyProvider`-style
- * tolerance of an unwired optional dependency elsewhere in this library.
+ * Resolves a bare domain name (no local part) to its primary domain name, when `domainName` is a currently
+ * enabled-and-verified alias `Domain` whose `aliasOf` target is itself currently enabled-and-verified.
+ * Returns `undefined` when there's nothing to resolve - `domainName` isn't an alias, or its `aliasOf`
+ * reference is dangling/disabled (never silently misroutes) - the caller then treats `domainName` as-is.
+ * The domain-name-only half of `resolveDomainAlias()` below, factored out for callers (like
+ * `BaseKeyDiscoveryRoute`'s public federation endpoint) that only ever have a bare domain in hand - the
+ * public endpoint never sees a real local part, since `:hash` is a one-way hash of it.
  */
-export async function resolveDomainAlias(objectFactory: ObjectFactory, domainClass: any, address: string): Promise<string | undefined> {
+export async function resolveDomainAliasName(objectFactory: ObjectFactory, domainClass: any, domainName: string): Promise<string | undefined> {
     if (!domainClass) {
         return undefined;
     }
-    const atIndex: number = address.lastIndexOf("@");
-    if (atIndex < 0) {
-        return undefined;
-    }
-    const domainName: string = address.slice(atIndex + 1).toLowerCase();
     const repo = await getDomainRepo(objectFactory, domainClass);
-    const domain = await repo.findOne(domainName, { ignoreACL: true });
+    const domain = await repo.findOne(domainName.toLowerCase(), { ignoreACL: true });
     if (!domain?.enabled || !domain.verified || !domain.aliasOf) {
         return undefined;
     }
@@ -154,7 +145,26 @@ export async function resolveDomainAlias(objectFactory: ObjectFactory, domainCla
     if (!primary?.enabled || !primary.verified) {
         return undefined;
     }
-    return `${address.slice(0, atIndex)}@${primary.name.toLowerCase()}`;
+    return primary.name.toLowerCase();
+}
+
+/**
+ * Rewrites `address` from an alias domain onto its primary domain, for inbound address resolution
+ * (`BaseMailIngestRoute.findExactMailboxByAddress()`/`findDistributionListByAddress()`) and local key
+ * discovery (`util/LocalKeyDiscoveryUtils.ts`). Returns `undefined` when no rewrite applies: `address` has
+ * no `@`, or its domain doesn't resolve via `resolveDomainAliasName()` above - the caller falls back to
+ * treating `address` as-is in every case.
+ */
+export async function resolveDomainAlias(objectFactory: ObjectFactory, domainClass: any, address: string): Promise<string | undefined> {
+    const atIndex: number = address.lastIndexOf("@");
+    if (atIndex < 0) {
+        return undefined;
+    }
+    const primaryDomainName: string | undefined = await resolveDomainAliasName(objectFactory, domainClass, address.slice(atIndex + 1));
+    if (!primaryDomainName) {
+        return undefined;
+    }
+    return `${address.slice(0, atIndex)}@${primaryDomainName}`;
 }
 
 /**

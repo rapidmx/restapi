@@ -12,16 +12,18 @@ import {
     HttpRequest,
     HttpResponse,
     ModelUtils,
+    RepoUtils,
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
+import { chargeMailboxQuota, MailboxQuotaExceededError, refundMailboxQuota } from "../util/MailboxQuotaUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
-import { Attachment, Message } from "../models/types.js";
-const { Inject } = ObjectDecorators;
+import { Attachment, Mailbox, Message } from "../models/types.js";
+const { Config, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Delete, Get, Head, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
@@ -122,10 +124,23 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
     /** The class of the owning `Message` entity, supplied by the Mongo/SQL concrete subclass. */
     protected abstract messageClass: any;
 
+    /** The class of the owning `Mailbox` entity, supplied by the Mongo/SQL concrete subclass - `upload()` charges
+     * an attachment's size against it (`chargeMailboxQuota()`), the same accounting `MailboxQuotaRecalcJob`'s
+     * hourly pass and `MailboxImportJob`'s historical import both already apply. */
+    protected abstract mailboxClass: any;
+
     private messageRepo?: RecoverableRepoUtils<M>;
+    private mailboxRepo?: RepoUtils<Mailbox>;
 
     /** Page size for the folder-scoped scans that filter or re-stamp in memory (`count()`/`truncate()`). */
     protected folderScanPageSize: number = 500;
+
+    /** The largest single attachment `upload()` accepts, in bytes (413 beyond) - bounds how much of an
+     * upload this route buffers into memory (`req.rawBody`, read whole before this check ever runs - the
+     * HTTP server's own `max_body_size` is the outer, coarser bound already applied to every request body,
+     * not specific to this endpoint) before ever touching the `BlobStore` or the mailbox's quota. */
+    @Config("mail:attachments:max_bytes", 50 * 1024 * 1024)
+    private maxUploadBytes: number = 50 * 1024 * 1024;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -138,6 +153,16 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
             });
         }
         return this.messageRepo;
+    }
+
+    private async getMailboxRepo(): Promise<RepoUtils<Mailbox>> {
+        if (!this.mailboxRepo) {
+            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
+        return this.mailboxRepo;
     }
 
 
@@ -393,6 +418,14 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         if (!raw || raw.length === 0 || Array.isArray(messageUid) || !messageUid || Array.isArray(filename) || !filename) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
+        // Checked before anything else touches `raw` - a basic backstop on how large a single attachment this
+        // route will ever try to persist, independent of the HTTP server's own (coarser, whole-request)
+        // `max_body_size`. `req.rawBody` is already fully buffered into memory by the time this handler runs
+        // (a framework-level concern, not this route's), but this at least stops an oversized upload from
+        // going any further - written to the `BlobStore` or charged against the mailbox's quota.
+        if (raw.length > this.maxUploadBytes) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 413, `The attachment is larger than the ${this.maxUploadBytes} bytes allowed.`);
+        }
 
         // `folderUid`/`mailboxUid` are ALWAYS derived from the owning `Message` record here, never taken from
         // the client — `Attachment.folderUid`/`mailboxUid`'s own doc comment describes them as "denormalized
@@ -413,25 +446,51 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
-        const blobKey: string = `attachments/${crypto.randomUUID()}`;
-        await this.blobStore.put(blobKey, raw, {
-            contentType: Array.isArray(mimeType) ? mimeType[0] : mimeType,
-        });
+        // Charged (persisted) before anything is stored, mirroring `MailboxImportJob`'s own
+        // charge-before-store ordering - `MailboxQuotaRecalcJob`'s hourly pass was previously the ONLY thing
+        // that ever reconciled `usedBytes` against an attachment's actual size, which only ever caught an
+        // over-quota mailbox after the fact rather than blocking the write that caused it.
+        const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
+        try {
+            await chargeMailboxQuota(mailboxRepo, message.mailboxUid, raw.length);
+        } catch (err) {
+            if (err instanceof MailboxQuotaExceededError) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 413, "This mailbox has reached its storage quota.");
+            }
+            throw err;
+        }
 
-        const created: T = await this.doCreateObject(
-            {
-                messageUid,
-                folderUid: message.folderUid,
-                mailboxUid: message.mailboxUid,
-                filename: sanitizeFilename(filename),
-                mimeType: (Array.isArray(mimeType) ? mimeType[0] : mimeType) ?? "application/octet-stream",
-                sizeBytes: raw.length,
-                blobKey,
-                contentId: Array.isArray(contentId) ? contentId[0] : contentId,
-                isInline,
-            } as any,
-            { user, ignoreACL: true },
-        );
+        const blobKey: string = `attachments/${crypto.randomUUID()}`;
+        let created: T;
+        try {
+            await this.blobStore.put(blobKey, raw, {
+                contentType: Array.isArray(mimeType) ? mimeType[0] : mimeType,
+            });
+
+            created = await this.doCreateObject(
+                {
+                    messageUid,
+                    folderUid: message.folderUid,
+                    mailboxUid: message.mailboxUid,
+                    filename: sanitizeFilename(filename),
+                    mimeType: (Array.isArray(mimeType) ? mimeType[0] : mimeType) ?? "application/octet-stream",
+                    sizeBytes: raw.length,
+                    blobKey,
+                    contentId: Array.isArray(contentId) ? contentId[0] : contentId,
+                    isInline,
+                } as any,
+                { user, ignoreACL: true },
+            );
+        } catch (err) {
+            // The charge above already landed - refund it rather than leaving the mailbox permanently
+            // over-counted for content that was never actually stored.
+            await refundMailboxQuota(mailboxRepo, message.mailboxUid, raw.length, (refundErr) => {
+                this.logger?.warn(
+                    `BaseAttachmentRoute: failed to refund ${raw.length} quota bytes to mailbox ${message.mailboxUid}: ${(refundErr as any)?.message}`,
+                );
+            });
+            throw err;
+        }
         await this.syncMessageHasAttachments(message.uid);
         return created;
     }

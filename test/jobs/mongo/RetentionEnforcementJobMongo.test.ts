@@ -607,12 +607,14 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
         expect(remaining.length).toBe(1);
     });
 
-    it("Stops mid-page at the batch size when a row counted as skipped vanished underneath the page offset.", async () => {
+    it("Does not skip a fresh row when an earlier row's delete actually committed but the call itself reported failure (keyset pagination on uid has no offset/skip-count reconciliation to get wrong).", async () => {
         await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", messageRetentionDays: 30 }));
         (job as any).batchSize = 3;
         const messages: MessageMongo[] = [];
         for (let i = 0; i < 6; i++) {
-            messages.push(await createMessage({ sentDate: new Date(Date.now() - (60 - i) * DAY_MS) }));
+            // Explicit, lexically-ordered uids: `purgeSortedBatches()` pages by `uid` ASC, so this pins which
+            // rows land on which page instead of depending on whatever uid a real backend would assign.
+            messages.push(await createMessage({ uid: `msg-${i}`, sentDate: new Date(Date.now() - (60 - i) * DAY_MS) }));
         }
         const repoUtils = (job as any).messageRepo;
         const originalDelete = repoUtils.delete.bind(repoUtils);
@@ -627,10 +629,13 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
 
         await job.run();
 
-        // Page 0 = [0, 1, 2]: 0 "fails" (skipped, yet really gone), 1 and 2 purge. Page 0 re-read = [3, 4, 5],
-        // whose first row is treated as the already-skipped one; 4 purges and the run stops before 5.
+        // Page 0 = [msg-0, msg-1, msg-2]: msg-0 "fails" (really gone, but not counted as purged), msg-1 and
+        // msg-2 purge (2 of the 3-row budget used). The cursor advances to msg-2 regardless of msg-0's
+        // reported failure, so page 1 queries `uid > msg-2` = [msg-3, msg-4, msg-5] with nothing sliced away
+        // as a phantom skip - msg-3 purges (budget reached) and the run stops there, never silently skipping
+        // msg-3 the way offset pagination used to.
         const remaining = (await messageRepo.find({ uid: { $in: messages.map((m) => m.uid) } } as any).toArray()).map((m) => m.uid);
-        expect(remaining.sort()).toEqual([messages[3].uid, messages[5].uid].sort());
+        expect(remaining.sort()).toEqual([messages[4].uid, messages[5].uid].sort());
     });
 
     it("Logs a warning and continues purging subsequent messages when one delete throws.", async () => {

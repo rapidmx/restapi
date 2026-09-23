@@ -3297,3 +3297,186 @@ picker/display/edit/column (full suite 273/273 files, 4180/4180 tests). Neither 
 entry) - `web-client`'s own `tsc --noEmit` won't go green on the new `aliasOf` usages until `react-shared` actually
 publishes and `web-client` bumps its dependency, same release order every prior cross-repo client addition in this log
 has followed. No `package.json` version bumped anywhere, nothing committed.
+
+### 2026-09-22 (later still) - Adversarial-review pass: SSRF/hijack/quota/pagination/iTIP-race fixes
+
+An external adversarial review round (several passes, including self-delegated sub-agents) against this repo turned
+up a priority-ordered list of confirmed issues. Worked through in severity order; here's what actually landed, in the
+same order.
+
+**1. [CRITICAL] SSRF bypass in `KeyDiscoveryClient.isSafeDiscoveryHost()` via numeric IP notation.** It rejected an
+IP-literal `host` via `net.isIP(withoutPort) !== 0`, but `net.isIP()` doesn't recognize decimal/octal/hex IPv4 forms
+(`2852039166` = `169.254.169.254`) that Node's `fetch()`/the WHATWG `URL` parser still normalize to the real
+dotted-quad with no DNS lookup - verified directly (`new URL('https://2852039166/x').hostname ===
+'169.254.169.254'`). Fixed by re-checking `net.isIP()` against `new URL(\`https://${host}/\`).hostname` (the
+URL-parser-normalized form) after the syntax check passes, closing the bypass regardless of encoding base. Also added
+a port allow-list (`443`/`8443` - `ALLOWED_DISCOVERY_PORTS`) in place of the previous unrestricted 1-65535 range. The
+existing DNS-rebinding residual-gap doc comment is preserved verbatim, per the review's own explicit instruction not
+to touch it - that gap needs real DNS pinning, a separate, larger undertaking.
+
+**2. [HIGH] `BaseMailboxRoute.validateAliasChange()` used `getVerifiedDomainNames()` (includes alias domains)
+instead of `getPrimaryDomainNames()`.** Every sibling check in this file was correctly updated when `Domain.aliasOf`
+landed (see the entry above) except this one - a caller could add e.g. `boss@plc.gg` (alias of `powerlevel.gg`) to
+their OWN mailbox's `aliasAddresses`, hijacking mail/send-as/key-discovery for whatever mailbox `boss@powerlevel.gg`
+actually resolves to (`findExactMailboxByAddressRaw()`/`LocalKeyDiscoveryUtils.findMailbox()` both match
+`aliasAddresses` by exact literal BEFORE `resolveDomainAlias()` ever runs). Fixed the one line. Also closed the
+related pre-existing gap `createMailboxes()` had: it only ever validated `primarySmtpAddress`'s domain at create
+time, never `aliasAddresses`' - added the same `getPrimaryDomainNames()` check there too, for both the trusted and
+self-service (`assertSelfServiceCreate()`) paths (the latter's own `domains` list was itself still
+`getVerifiedDomainNames()`-derived - fixed to `getPrimaryDomainNames()` as well, which changes its ownership-check
+denominator too, not just create()'s own explicit domain gate).
+
+**3. [MEDIUM] `BaseKeyDiscoveryRoute` (the public `.well-known/rapidmx/keys/:hash` endpoint) never resolved alias
+domains** - it had no `domainClass` at all (only `mailboxClass`/`keyVaultClass`), so a peer querying `?domain=plc.gg`
+for an address whose mailbox actually lives at `you@powerlevel.gg` always got the indistinguishable-from-real
+"nothing published" response, which could make a compose client send unencrypted. Factored the domain-name-only half
+of `resolveDomainAlias()` out into a new `resolveDomainAliasName(objectFactory, domainClass, domainName)` (bare
+domain in, primary domain name or `undefined` out - no local part involved, since `:hash` is a one-way hash of it and
+the public endpoint never sees a real local part at all) and wired a new `domainClass` into `BaseKeyDiscoveryRoute`
+plus both Mongo/SQL subclasses. `lookup()` tries the literal domain match first (unchanged), and only on a miss
+resolves `?domain=`/`Host` via `resolveDomainAliasName()` and retries against the primary. This route had real tests
+already (contrary to the review's belief it had none) - added the alias-domain-lookup case plus a
+disabled/dangling-alias no-op case to both backends' files.
+
+**4. [MEDIUM] Mailbox storage quota was never enforced at write time on attachment upload** - only
+`MailboxImportJob`'s own `chargeQuota()` did; `BaseAttachmentRoute.upload()` and `ScanQueueJob`'s inbound delivery
+both wrote first and let `MailboxQuotaRecalcJob`'s hourly pass reconcile the drift after the fact. Extracted
+`MailboxImportJob`'s charge/refund loop into a new shared `util/MailboxQuotaUtils.ts`
+(`chargeMailboxQuota()`/`refundMailboxQuota()`, generic over any `RepoUtils<Mailbox>`) - `MailboxImportJob` itself
+now delegates to it with no behavior change (its own `MailboxQuotaExceededError`/`assertWithinQuota()` pre-check
+stay local, translating the shared function's own exceeded-error into the same "Import stopped: ..." message
+existing tests already assert on). Wired the shared function into `BaseAttachmentRoute.upload()`: charges before
+`blobStore.put()`, 413s on `MailboxQuotaExceededError`, refunds on any failure after a successful charge. Also added
+a `mail:attachments:max_bytes` (default 50 MiB) ceiling checked before anything else touches the uploaded bytes.
+
+**Not done: `ScanQueueJob`'s inbound delivery path.** First attempt wired the identical charge-before-file pattern
+into `deliverMessage()`, gating it on a genuinely-new-primary-filing check (`!alreadyFiled && !filterResult.deleted`)
+and quarantining (new `QuarantineReason.QUOTA_EXCEEDED`) instead of filing on `MailboxQuotaExceededError`. A full,
+uncontended `vitest run` of `test/jobs/mongo/ScanQueueJobMongo.test.ts` came back **75/214 failed** - the vast
+majority of this file's test fixtures stage `IngestQueueEntry` rows against a `mailboxUid` with NO corresponding
+`Mailbox` row ever created (delivery never needed one to exist before), and `chargeMailboxQuota()`'s own
+`mailboxRepo.findOne()` throwing "The target mailbox no longer exists." on a genuinely absent mailbox turned that
+into a hard failure across dozens of unrelated tests instead of the intended narrow quota check. Reverted the
+`ScanQueueJob.ts`/`models/types.ts` (`QuarantineReason.QUOTA_EXCEEDED`) changes entirely rather than either (a)
+retrofitting a real `Mailbox` row into 75+ existing test cases across two ~5,000-line files, disproportionate for
+this pass, or (b) special-casing "mailbox not found" to silently skip the quota check, which would quietly reopen
+the exact gap this fix exists to close for any genuinely-missing-mailbox edge case. Documented as a Known Issue in
+`RELEASE_NOTES.md` and left for a dedicated follow-up. **Lesson for next time touching this file**: check whether a
+new required lookup's target row actually exists in this file's own test fixtures BEFORE wiring the lookup in, not
+after - this file's sheer size (10k+ lines across both backends) makes a full run the only reliable signal, and it's
+slow enough that mid-run edits to files it's actively reading produce misleading stale-content failures (see below).
+
+**5. [HIGH] `BaseMailboxImportRoute.create()` had no upload-size ceiling at all** - `MailboxImportJob`/
+`PstImportUtils` read the whole file into one `Buffer` before `PstAllocationBudget` (bounds *extracted* output only)
+ever runs, so a large authenticated upload could OOM-crash the whole Node process every `BackgroundService` job
+shares. Added a `mail:import:max_bytes` (default 500 MiB, `DEFAULT_MAX_IMPORT_BYTES`) check immediately after the
+existing empty-body check, before any mailbox/folder DB lookup or the blob write.
+
+**6. [MEDIUM] `RetentionEnforcementJob.purgeSortedBatches()`'s offset pagination could silently skip a due row** -
+`page = floor(skipped/pageSize)` plus slicing away `skipped % pageSize` rows assumed those rows were still
+physically at the front of the result set; a `delete()` that threw AFTER actually committing (e.g. post-commit
+timeout) broke that assumption and sliced away a fresh, never-examined row instead. Switched to keyset pagination on
+`uid` (`uid > <last page's last uid>`, sorted `uid` ASC - the same cursor shape `util/MailboxContentUtils.ts`'s
+`findPagesByUid()` already uses), which advances past every row a page reads regardless of what happened to it, so a
+physically-vanished row can never shift what a later page sees. Traversal order changes from oldest-`dateField`-first
+to `uid`-order (the `dateField < cutoff` filter is unaffected - only visitation order within one run changes). The
+existing test that PINNED the buggy behavior (`test/jobs/mongo/RetentionEnforcementJobMongo.test.ts`, "Stops mid-page
+at the batch size when a row counted as skipped vanished underneath the page offset") is rewritten to assert the
+CORRECT behavior, using explicit lexically-ordered `uid`s (`msg-0`..`msg-5`) so the new uid-based traversal order is
+deterministic in the test rather than depending on whatever uid a real backend assigns. Added the identical SQL-side
+test (there wasn't one before).
+
+**7. [MEDIUM-HIGH, silent data loss] iTIP REPLY/CANCEL/REQUEST-update version conflicts were silently swallowed.**
+`maybeProcessItipMessage()`'s outer `try/catch` only ever `logger.warn()`'d a version conflict from a plain
+`update()` inside `processItipReply()`, `processItipCancel()` (via `deleteReceivedEventCopy()`) and the
+REQUEST-update branch of `processItipRequest()` - two attendees replying to the same invite near-simultaneously (an
+ordinary race, not a hypothetical) meant the loser's RSVP was permanently dropped while the ingest entry still
+closed `DELIVERED`. Added a new private `updateCalendarEventWithRetry(uid, mutate, options?, attempts=3)` helper
+(same re-fetch-and-retry-on-409 shape `claimDeliveryReceipt()`/`writeContactKeys()` already use elsewhere in this
+file) and routed all four call sites through it; `mutate` receives the freshly-read row on every attempt so the
+staleness/SEQUENCE check is re-evaluated against current data each retry, not just the caller's original (possibly
+stale) read.
+
+**8. [MEDIUM] `decideResourceBooking()` TOCTOU double-booking - not fixed.** Two concurrent iTIP REQUESTs for
+overlapping times on the same resource, processed by two workers, can both read "no conflict" before either commits.
+A real fix needs mutual exclusion across the read-decide-commit span for one resource mailbox, and this codebase has
+no reusable lock/lease primitive for an arbitrary keyed resource today (`ScheduledSendJob`/`ScanQueueJob`'s own
+"lease" fields are all claims on the ROW BEING PROCESSED itself, e.g. `scanLeaseExpiresAt` on `IngestQueueEntry`,
+not a generic "lock resource X" construct). Introducing one would mean a new persisted lease field on `Mailbox`
+across both Mongo and SQL models plus a restructure spanning `decideResourceBooking()`+`processItipRequest()`'s
+commit - a bigger, separate undertaking than this pass's remaining budget allowed for safely, especially against
+this same large `ScanQueueJob.ts` file (see finding 4's own lesson above). Documented as a Known Issue.
+
+**9. [MEDIUM-LOW] New-`CalendarEvent` branch of `processItipRequest()` used a random uid.** Unlike the
+message-delivery path's `nameBasedUuid('ingest:' + entry.uid + ':target')`, a duplicate-delivered REQUEST processed
+as two concurrent `IngestQueueEntry` rows could create two `CalendarEvent` rows for the same meeting and double-fire
+booking replies. Uid is now `nameBasedUuid(\`itip:${mailboxUid}:${parsed.uid}:${parsed.recurrenceId?.toISOString()
+?? "master"}\`)` - deterministic per `(mailbox, icalUid, recurrenceId)`, so a second concurrent create collides on
+the unique index and throws (caught by the same outer `try/catch` that already logs-and-continues), rather than a
+duplicate row and a duplicate reply.
+
+**10. [LOW, defense-in-depth] `isPathKey()` now also flags `__proto__`/`constructor`/`prototype`.** Not currently
+exploitable (every write path here spreads rather than `Object.assign`s), but closes the gap against this function's
+own documented "never a plain field name" contract. Test uses `JSON.parse('{"__proto__":...}')` rather than an
+object literal - a literal `{ __proto__: {...} }` sets the actual prototype instead of creating an own enumerable
+property, but `JSON.parse()` (what a real HTTP body goes through) does create one, which is the actual attack shape.
+
+**11. [LOW, doc-only] Stale `@rapidmx/videoconf-plugin` prose** in `models/types.ts`/`CalendarEventMongo.ts`/
+`CalendarEventSQL.ts` doc comments, from before the plugin was renamed `@rapidmx/meet-plugin` - updated, no
+functional change.
+
+**Two items folded in mid-task from a second reviewer pass, same session:**
+- **Three routes' `$`-key stripping was top-level-only** (`BaseMatterRoute.stripClientQuery()`,
+  `BaseEscrowAccessRequestRoute.find()`, `BaseEscrowAuditLogRoute.buildFilter()` all used
+  `!key.startsWith("$")`) instead of the segment-aware `!key.split(".").some((s) => s.startsWith("$"))` every other
+  route in this codebase uses (`BaseScopedChildRoute`/`BaseFolderRoute`/`BaseMailboxRoute`/`BaseAttachmentRoute`) -
+  a nested key like `escrowScopeId.$where` could slip past unstripped. Not currently exploitable (`service-core`
+  2.1.0's `ModelUtils` independently re-validates with the identical segment-aware check before a query could ever
+  see it), but a real inconsistency - all three now match. No dedicated regression test added (the fix is a pure
+  belt-and-suspenders duplicate of a check `ModelUtils` already enforces downstream, so a black-box HTTP test can't
+  observe a behavior difference pre/post-fix - both paths already 400 via `ModelUtils`); verified by full existing
+  suites for all three routes staying green (161/161) plus `tsc`/`eslint` clean.
+- **`postfix-bridge` started percent-encoding each envelope address before joining `X-Envelope-From`/
+  `X-Envelope-To`** (its own fix for a recipient-list-ambiguity bug), which needed a companion decode on this side
+  to actually restore full address fidelity rather than just correct recipient count. `BaseMailIngestRoute.deliver()`
+  did a naive `.split(",")` on `X-Envelope-To` with no decoding at all (confirmed by reading the code before
+  touching it). Added a `decodeEnvelopeAddress()` helper (try/decode, fall back to the raw segment on malformed
+  percent-encoding rather than failing the whole delivery) applied to both the single `X-Envelope-From` header and
+  each `X-Envelope-To` segment after splitting - backward compatible, since a plain ASCII address with nothing
+  percent-encoded round-trips through `decodeURIComponent()` unchanged. Updated `transport/MTAIngestAdapter.ts`'s
+  own contract doc to document the encoding requirement. New test in both `MailIngestRoute.test.ts` backends
+  covers a comma-AND-non-ASCII address in one, asserting it arrives as exactly one recipient with the comma and
+  non-ASCII character both intact, not split or mangled.
+
+**A process note on editing files while a full suite runs in the background**: mid-task, a background
+`vitest run --coverage` was kicked off to get a clean baseline before committing, and (incorrectly) 5 more files
+were edited for findings 6/9/10 while it was still in flight. That run came back with 7 failures, every single one
+in a file edited during the run (`RequestBodyUtils.test.ts`, both `RetentionEnforcementJob*.test.ts`, both
+`MailboxImportRequestRoute.test.ts`) - a stale-read artifact of vitest transforming/loading a file mid-edit, not a
+real regression (confirmed: every one of those 5 files passes clean, individually, once the background run had
+actually finished and nothing was mid-edit). Re-ran a second, fully clean, uncontended full suite afterward before
+committing - this file's own SQLite/mongod concurrent-run hazards, already documented elsewhere in this log, extend
+to "don't edit files a long-running suite hasn't gotten to yet" too, not just "don't run two suites at once."
+
+New/changed tests: `test/util/KeyDiscoveryClient.test.ts` (decimal/octal/hex IP-literal rejection), `test/routes/
+{mongo,sql}/MailboxRoute.test.ts` (`aliasAddresses` PUT/create rejected on an alias domain, both directly and via
+`aliasAddresses`), `test/routes/{mongo,sql}/MailboxAutoProvision.test.ts` (self-service create/PUT alias-domain
+rejection, trusted create's `aliasAddresses` domain check), `test/routes/{mongo,sql}/KeyDiscoveryRoute.test.ts`
+(alias-domain lookup, disabled/dangling-alias no-op), `test/routes/{mongo,sql}/AttachmentRoute.test.ts` (quota
+charge on upload, quota-exceeded 413, max-upload-size 413), `test/jobs/{mongo,sql}/MailboxImportJob{Mongo,SQL}
+.test.ts` (unchanged behavior after the `MailboxQuotaUtils` refactor - all pre-existing quota tests still pass
+verbatim), `test/routes/{mongo,sql}/MailboxImportRequestRoute.test.ts` (oversized-upload 413), `test/jobs/
+{mongo,sql}/RetentionEnforcementJob{Mongo,SQL}.test.ts` (rewritten pinned test + new SQL-side equivalent),
+`test/routes/{mongo,sql}/MailIngestRoute.test.ts` (percent-encoded envelope address decoding), `test/util/
+RequestBodyUtils.test.ts` (`__proto__`/`constructor`/`prototype` rejection via `JSON.parse()`).
+
+Files: changed `src/util/KeyDiscoveryClient.ts`, `src/routes/BaseMailboxRoute.ts`, `src/routes/
+BaseKeyDiscoveryRoute.ts`, `src/routes/mongo/KeyDiscoveryRouteMongo.ts`, `src/routes/sql/KeyDiscoveryRouteSQL.ts`,
+`src/util/DomainUtils.ts` (new `resolveDomainAliasName()`), `src/util/MailboxQuotaUtils.ts` (new),
+`src/jobs/MailboxImportJob.ts`, `src/routes/BaseAttachmentRoute.ts`, `src/routes/mongo/AttachmentRouteMongo.ts`,
+`src/routes/sql/AttachmentRouteSQL.ts`, `src/routes/BaseMailboxImportRoute.ts`, `src/jobs/RetentionEnforcementJob.ts`,
+`src/jobs/ScanQueueJob.ts` (findings 7/9 only - finding 4's ScanQueueJob change was reverted), `src/util/
+RequestBodyUtils.ts`, `src/routes/BaseMatterRoute.ts`, `src/routes/BaseEscrowAccessRequestRoute.ts`, `src/routes/
+BaseEscrowAuditLogRoute.ts`, `src/routes/BaseMailIngestRoute.ts`, `src/transport/MTAIngestAdapter.ts`,
+`src/models/types.ts` (doc-only), `src/models/mongo/CalendarEventMongo.ts` (doc-only), `src/models/sql/
+CalendarEventSQL.ts` (doc-only), `RELEASE_NOTES.md`, and the test files listed above.

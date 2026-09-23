@@ -57,7 +57,12 @@ function validateMatter(o: Partial<Matter>): void {
 function stripClientQuery(query: any, forcedKeys: readonly string[]): Record<string, any> {
     const result: Record<string, any> = {};
     for (const [key, value] of Object.entries(query ?? {})) {
-        if (!key.startsWith("$") && !forcedKeys.includes(key)) {
+        // Segment-aware, not just top-level - matches the same check `BaseScopedChildRoute`/`BaseFolderRoute`/
+        // `BaseMailboxRoute`/`BaseAttachmentRoute` already use, so a nested operator key like
+        // `escrowScopeId.$where` can't slip past this route's own filtering unstripped (defense-in-depth:
+        // `service-core`'s `ModelUtils` independently re-validates with the same check before it could ever
+        // reach a real query).
+        if (!key.split(".").some((segment) => segment.startsWith("$")) && !forcedKeys.includes(key)) {
             result[key] = value;
         }
     }
