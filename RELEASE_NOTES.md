@@ -17,23 +17,38 @@
   literally, with no way to resolve an alias domain to its primary - since no mailbox is ever addressed on a pure alias domain, a remote peer querying for `you@plc.gg` always got a false "key not
   published" even though `you@powerlevel.gg` has one published, which could cause a compose client to send unencrypted. The route now falls back to resolving `?domain=` via `Domain.aliasOf`
   (`resolveDomainAliasName()`, a new `util/DomainUtils.ts` export factored out of `resolveDomainAlias()`) and re-matching against the primary domain when the literal match misses.
-- **Mailbox storage quota is now enforced at write time on attachment upload, not just reconciled hourly after the fact.** New `util/MailboxQuotaUtils.ts` (`chargeMailboxQuota()`/
-  `refundMailboxQuota()`) extracts and generalizes `MailboxImportJob`'s own version-checked charge/refund loop; `BaseAttachmentRoute.upload()` now charges an attachment's size against its
-  mailbox before writing to the `BlobStore`, rejecting (413) once the mailbox's quota would be exceeded and refunding the charge if the write then fails, and also rejects (413) a single upload
-  above a new configurable `mail:attachments:max_bytes` ceiling before ever touching the blob store or the quota. `MailboxImportJob` itself is refactored onto the shared utility with no behavior
-  change. (`ScanQueueJob`'s inbound-delivery path is not yet wired to this - see Known Issues.)
-- **A mailbox import upload is now capped in size before any processing starts.** `BaseMailboxImportRoute.create()` accepted an uploaded PST/mbox file of any size (only a non-empty check), and
-  `MailboxImportJob`/`PstImportUtils` read the whole file into one in-memory `Buffer` before `PstAllocationBudget` (which only bounds *extracted* output, not input size) ever ran - a large upload
-  could OOM-crash the whole Node process, which every other `BackgroundService` job shares. A new configurable `mail:import:max_bytes` ceiling (default 500 MiB) now rejects (413) an oversized
-  upload up front.
+- **Mailbox storage quota is now enforced at write time on attachment upload and inbound mail delivery, not just reconciled hourly after the fact.** New `util/MailboxQuotaUtils.ts`
+  (`chargeMailboxQuota()`/`refundMailboxQuota()`) extracts and generalizes `MailboxImportJob`'s own version-checked charge/refund loop; `BaseAttachmentRoute.upload()` now charges an attachment's
+  size against its mailbox before writing to the `BlobStore`, rejecting (413) once the mailbox's quota would be exceeded and refunding the charge if the write then fails, and also rejects (413)
+  a single upload above a new configurable `mail:attachments:max_bytes` ceiling before ever touching the blob store or the quota. `ScanQueueJob`'s inbound-delivery path (`deliverMessage()`) now
+  charges the same way before filing an inbound message - previously the exact same unauthenticated-sender vector `BaseAttachmentRoute.upload()`'s own fix closes for an authenticated caller was
+  left wide open on the inbound side, where no authentication is required at all and any external sender could flood a mailbox past quota. An inbound message that would exceed quota is
+  quarantined (new `QuarantineReason.QUOTA_EXCEEDED`) rather than silently dropped or filed over quota; a `mailboxUid` with no current `Mailbox` row (a handful of ingest paths never required
+  one before this) skips quota enforcement gracefully instead of failing delivery outright, logged at `debug`. `MailboxImportJob` itself is refactored onto the shared utility with no behavior
+  change.
+- **A mailbox import upload is now actually capped in size before any processing starts.** `BaseMailboxImportRoute.create()` accepted an uploaded PST/mbox file of any size (only a non-empty
+  check), and `MailboxImportJob`/`PstImportUtils` read the whole file into one in-memory `Buffer` before `PstAllocationBudget` (which only bounds *extracted* output, not input size) ever ran - a
+  large upload could OOM-crash the whole Node process, which every other `BackgroundService` job shares. A new configurable `mail:import:max_bytes` ceiling now rejects (413) an oversized upload
+  up front - but the first version of this fix shipped a default (500 MiB) comfortably ABOVE the reference `server` deployment's own framework-level `max_body_size` (100 MiB), which is enforced
+  on every request's raw body before this route's own check - or any route code at all - ever runs; every upload large enough to hit the 500 MiB check would already have been rejected by that
+  coarser, generic 413 first, making the new check protect against nothing in the shipped default configuration. The default is now 90 MiB, safely below the reference deployment's
+  `max_body_size` so this check is the one that actually fires, and `BaseMailboxImportRoute.init()` now logs a one-time warning if an operator's own `mail:import:max_bytes` override still ends
+  up at or above whatever `max_body_size` is actually configured, so this class of misconfiguration doesn't go silently unnoticed again.
+- **A `DistributionList`'s `aliasAddresses` are now validated exactly like a `Mailbox`'s.** `BaseDistributionListRoute` accepted `aliasAddresses` with no domain check, no alias-domain check and
+  no collision check at all, even though `BaseMailIngestRoute` resolves and trusts a distribution list's `aliasAddresses` identically to a mailbox's - a caller could add any address on any
+  domain (including another mailbox's or list's existing address, or a pure alias domain that should never carry its own addresses) to a distribution list's `aliasAddresses` with no
+  validation whatsoever. `create()`/`update()` now apply the same `getPrimaryDomainNames()`-based domain restriction and cross-mailbox/cross-list collision check `BaseMailboxRoute` already
+  applies to its own `aliasAddresses`.
 - **Fixed a `RetentionEnforcementJob` pagination bug that could silently skip a due row.** `purgeSortedBatches()`'s offset-based pagination (`page = floor(skipped/pageSize)`, slicing away
   `skipped % pageSize` rows assumed still at the front of the result set) broke when a `delete()` call threw AFTER its write had actually committed (e.g. a network timeout post-commit): the next
   page's leading fresh row got sliced away as if it were the phantom skip, so it was never examined that run. Switched to keyset pagination on `uid` (the same cursor pattern
   `util/MailboxContentUtils.ts`'s `findPagesByUid()` already uses elsewhere in this file), which has no such assumption to get wrong.
-- **iTIP REPLY/CANCEL/REQUEST-update version conflicts are no longer silently dropped.** Two attendees replying to the same invite near-simultaneously (an ordinary race) meant the optimistic-lock
-  loser's 409 on a plain `update()` was only ever `logger.warn()`'d - the RSVP/cancellation was permanently, silently lost even though the ingest entry closed `DELIVERED`. `ScanQueueJob`'s
-  `processItipReply()`, `processItipCancel()` (including `deleteReceivedEventCopy()`) and the REQUEST-update branch of `processItipRequest()` now re-fetch and retry (up to 3 attempts) on a
-  version conflict, the same shape `claimDeliveryReceipt()`/`writeContactKeys()` already use elsewhere in this file for exactly this race.
+- **An iTIP REPLY/CANCEL/REQUEST-update version conflict is now significantly less likely to be silently dropped under contention.** Two attendees replying to the same invite near-simultaneously
+  (an ordinary race) meant the optimistic-lock loser's 409 on a plain `update()` was only ever `logger.warn()`'d - the RSVP/cancellation was silently lost even though the ingest entry closed
+  `DELIVERED`. `ScanQueueJob`'s `processItipReply()`, `processItipCancel()` (including `deleteReceivedEventCopy()`) and the REQUEST-update branch of `processItipRequest()` now re-fetch and retry
+  (up to 3 attempts) on a version conflict, the same shape `claimDeliveryReceipt()`/`writeContactKeys()` already use elsewhere in this file for exactly this race - this closes the common case but
+  not the underlying possibility: sustained contention that exhausts all 3 attempts still ends in the same outcome as before (the ingest entry still closes `DELIVERED`, the update is still
+  lost), now logged at `logger.error()` instead of `logger.warn()` so it's operator-visible/alertable rather than silent, but not otherwise different in effect.
 - **A duplicate-delivered iTIP REQUEST can no longer create two `CalendarEvent` rows.** The new-event branch of `processItipRequest()` used a random `uid`, unlike the ordinary message-delivery
   path's deterministic `nameBasedUuid('ingest:' + entry.uid + ':target')` - a duplicate-delivered REQUEST (ordinary SMTP at-least-once retry semantics), processed concurrently as two
   `IngestQueueEntry` rows, could create two `CalendarEvent` rows for the same meeting and double-fire booking accept/decline replies. The uid is now derived deterministically from
@@ -51,9 +66,9 @@
 
 ### Known Issues
 
-- `ScanQueueJob`'s inbound mail delivery path does not yet enforce mailbox storage quota at write time (only `BaseAttachmentRoute.upload()` and `MailboxImportJob` do) - the hourly
-  `MailboxQuotaRecalcJob` reconciliation remains the only backstop for inbound mail. Deferred: wiring this in safely touches the same large, heavily-tested delivery pipeline `processEntry()`/
-  `deliverMessage()` implement, and needs its own dedicated pass.
+- An iTIP REPLY/CANCEL/REQUEST-update that loses the optimistic-lock race on all 3 retry attempts (sustained contention) still closes its ingest entry `DELIVERED` with the update itself
+  silently lost - now logged at `logger.error()` (operator-visible/alertable) rather than `logger.warn()`, but the outcome for the RSVP/cancellation/update itself is unchanged. Actually fixing
+  this outcome (rather than just its visibility) would need e.g. a dead-letter/reprocess queue for exhausted iTIP retries, out of scope for this pass.
 - `decideResourceBooking()` has a TOCTOU window that can double-book a resource mailbox under genuine concurrent processing (two iTIP REQUESTs for overlapping times, processed by two workers at
   once, can both read "no conflict" before either commits). Closing it needs a short-lived advisory lock keyed on the resource mailbox, which has no existing reusable primitive in this codebase
   today - deferred as its own follow-up rather than introducing a new schema-level lock construct in this pass.

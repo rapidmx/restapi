@@ -960,6 +960,57 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         expect(quarantineEntries[0].reason).toBe(QuarantineReason.INFECTED);
     });
 
+    describe("Mailbox storage quota enforcement on inbound delivery", () => {
+        it("Quarantines a message that would exceed the target mailbox's quota (reason QUOTA_EXCEEDED), instead of filing it or charging usedBytes.", async () => {
+            await createMailbox({ quotaBytes: 1, usedBytes: 0 });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage());
+            const entry = await createIngestEntry({ rawBlobKey });
+
+            await job.run();
+
+            const updated = await ingestQueueRepo.findOne({ where: { uid: entry.uid } });
+            expect(updated!.status).toBe(IngestStatus.DELIVERED);
+
+            const messages = await messageRepo.find({ where: { mailboxUid } });
+            expect(messages.length).toBe(0);
+
+            const quarantineEntries = await quarantineEntryRepo.find({ where: { mailboxUid } });
+            expect(quarantineEntries.length).toBe(1);
+            expect(quarantineEntries[0].reason).toBe(QuarantineReason.QUOTA_EXCEEDED);
+            expect(quarantineEntries[0].rawBlobKey).toBe(rawBlobKey);
+
+            // Rejected before the charge was ever applied - usedBytes stays exactly where it started.
+            const mailbox = await mailboxRepo.findOne({ where: { uid: mailboxUid } });
+            expect(mailbox!.usedBytes).toBe(0);
+        });
+
+        it("Propagates an unexpected (non-quota, non-missing-mailbox) error from quota charging as a real processing failure, marking the entry FAILED rather than silently swallowing or skipping it.", async () => {
+            await createMailbox();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage());
+            const entry = await createIngestEntry({ rawBlobKey });
+
+            // Neither MailboxQuotaExceededError nor MailboxNotFoundError - chargeMailboxQuota() exhausts its
+            // own retry loop against this and re-throws it verbatim, which chargeMailboxQuotaForDelivery()
+            // must also let through rather than treating as one of its two known, specifically-handled cases.
+            const updateSpy = vi
+                .spyOn((job as any).mailboxRepo, "update")
+                .mockRejectedValue(new Error("simulated unexpected quota-charge failure"));
+            try {
+                await expect(job.run()).resolves.toBeUndefined();
+            } finally {
+                updateSpy.mockRestore();
+            }
+
+            const updated = await ingestQueueRepo.findOne({ where: { uid: entry.uid } });
+            expect(updated!.status).toBe(IngestStatus.FAILED);
+            expect(updated!.errorMessage).toContain("simulated unexpected quota-charge failure");
+        });
+    });
+
     it("Marks an entry FAILED with the error message when processing throws, without crashing the whole run.", async () => {
         // No blob was ever put at this key, so `blobStore.get()` rejects with a real "no blob" error.
         const entry = await createIngestEntry({ rawBlobKey: `raw/${uuid.v4()}` });
@@ -1556,6 +1607,263 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
 
             const updated = await calendarEventRepo.findOne({ where: { uid: organizerCopy.uid } });
             expect(updated!.attendees[0].responseStatus).toBe(AttendeeResponseStatus.ACCEPTED);
+        });
+
+        it("Applies a REPLY on retry after the first update attempt loses an optimistic-lock race (409) - the RSVP is not silently dropped.", async () => {
+            const icalUid = uuid.v4();
+            const organizerCopy = await calendarEventRepo.save(
+                new CalendarEventSQL({
+                    folderUid: "organizer-calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [
+                        { address: "attendee@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+                    ],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const repoUtils = (job as any).calendarEventRepo;
+            const originalUpdate = repoUtils.update.bind(repoUtils);
+            let attempts = 0;
+            const updateSpy = vi.spyOn(repoUtils, "update").mockImplementation(async (...args: any[]) => {
+                attempts++;
+                if (attempts === 1) {
+                    throw Object.assign(new Error("simulated version conflict"), { status: 409 });
+                }
+                return originalUpdate(...args);
+            });
+
+            const replyIcs = buildEventIcs(makeIcsEventFixture({ icalUid }), "REPLY", {
+                onlyAttendee: { address: "attendee@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.ACCEPTED, isOrganizer: false },
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(replyIcs, { from: "attendee@example.com", to: "organizer@example.com" }));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "attendee@example.com", envelopeTo: ["organizer@example.com"] });
+
+            await job.run();
+
+            expect(attempts).toBeGreaterThanOrEqual(2);
+            const updated = await calendarEventRepo.findOne({ where: { uid: organizerCopy.uid } });
+            expect(updated!.attendees[0].responseStatus).toBe(AttendeeResponseStatus.ACCEPTED);
+            updateSpy.mockRestore();
+        });
+
+        it("Gives up (logs, doesn't throw the whole run) after every retry attempt on a REPLY keeps losing the optimistic-lock race - the entry still closes DELIVERED, but the RSVP is not applied.", async () => {
+            const icalUid = uuid.v4();
+            const organizerCopy = await calendarEventRepo.save(
+                new CalendarEventSQL({
+                    folderUid: "organizer-calendar-folder",
+                    mailboxUid,
+                    title: "Team Sync",
+                    timezone: "UTC",
+                    organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                    attendees: [
+                        { address: "attendee@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+                    ],
+                    status: CalendarEventStatus.CONFIRMED,
+                    busyStatus: BusyStatus.BUSY,
+                    icalUid,
+                    startDate: new Date(),
+                    endDate: new Date(),
+                }),
+            );
+
+            const repoUtils = (job as any).calendarEventRepo;
+            const updateSpy = vi.spyOn(repoUtils, "update").mockRejectedValue(Object.assign(new Error("simulated persistent conflict"), { status: 409 }));
+            const errorSpy = vi.spyOn(logger, "error");
+
+            const replyIcs = buildEventIcs(makeIcsEventFixture({ icalUid }), "REPLY", {
+                onlyAttendee: { address: "attendee@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.ACCEPTED, isOrganizer: false },
+            });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(replyIcs, { from: "attendee@example.com", to: "organizer@example.com" }));
+            const entry = await createIngestEntry({ rawBlobKey, envelopeFrom: "attendee@example.com", envelopeTo: ["organizer@example.com"] });
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("failed to process iTIP REPLY"));
+            const updated = await calendarEventRepo.findOne({ where: { uid: organizerCopy.uid } });
+            expect(updated!.attendees[0].responseStatus).toBe(AttendeeResponseStatus.NEEDS_ACTION);
+            const updatedEntry = await ingestQueueRepo.findOne({ where: { uid: entry.uid } });
+            expect(updatedEntry!.status).toBe(IngestStatus.DELIVERED);
+            updateSpy.mockRestore();
+            errorSpy.mockRestore();
+        });
+
+        it("A duplicate-delivered iTIP REQUEST (two concurrent IngestQueueEntry rows for the same meeting) collides on the deterministic CalendarEvent uid instead of creating a second row.", async () => {
+            const icalUid = uuid.v4();
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid }), "REQUEST");
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKeyA = `raw/${uuid.v4()}`;
+            const rawBlobKeyB = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKeyA, makeItipRawMessage(ics));
+            await blobStore.put(rawBlobKeyB, makeItipRawMessage(ics));
+            await createIngestEntry({ rawBlobKey: rawBlobKeyA, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            await createIngestEntry({ rawBlobKey: rawBlobKeyB, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await expect(job.run()).resolves.toBeUndefined();
+
+            const events = await calendarEventRepo.find({ where: { mailboxUid, icalUid } });
+            expect(events.length).toBe(1);
+            const entries = await ingestQueueRepo.find({ where: { mailboxUid, envelopeFrom: "organizer@example.com" } });
+            expect(entries.every((e) => e.status === IngestStatus.DELIVERED)).toBe(true);
+        });
+
+        describe("updateCalendarEventWithRetry() edge cases - the row or the field it checks can legitimately be gone by the time of its own re-fetch, not just conflicted", () => {
+            it("Gives up cleanly, without throwing, when the CalendarEvent row is deleted between the initial read and updateCalendarEventWithRetry's own re-fetch.", async () => {
+                const icalUid = uuid.v4();
+                await calendarEventRepo.save(
+                    new CalendarEventSQL({
+                        folderUid: "organizer-calendar-folder",
+                        mailboxUid,
+                        title: "Team Sync",
+                        timezone: "UTC",
+                        organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                        attendees: [
+                            { address: "attendee@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+                        ],
+                        status: CalendarEventStatus.CONFIRMED,
+                        busyStatus: BusyStatus.BUSY,
+                        icalUid,
+                        sequence: 0,
+                        startDate: new Date(),
+                        endDate: new Date(),
+                    }),
+                );
+
+                const repoUtils = (job as any).calendarEventRepo;
+                const findOneSpy = vi.spyOn(repoUtils, "findOne").mockResolvedValue(undefined);
+
+                const replyIcs = buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 0 }), "REPLY", {
+                    onlyAttendee: { address: "attendee@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.ACCEPTED, isOrganizer: false },
+                });
+                const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+                const rawBlobKey = `raw/${uuid.v4()}`;
+                await blobStore.put(rawBlobKey, makeItipRawMessage(replyIcs, { from: "attendee@example.com", to: "organizer@example.com" }));
+                const entry = await createIngestEntry({ rawBlobKey, envelopeFrom: "attendee@example.com", envelopeTo: ["organizer@example.com"] });
+
+                await expect(job.run()).resolves.toBeUndefined();
+                findOneSpy.mockRestore();
+
+                const updated = await ingestQueueRepo.findOne({ where: { uid: entry.uid } });
+                expect(updated!.status).toBe(IngestStatus.DELIVERED);
+            });
+
+            it("A REPLY that's stale by the time of updateCalendarEventWithRetry's own re-fetch (a concurrent update already applied a same-or-newer sequence) is a no-op, not a throw.", async () => {
+                const icalUid = uuid.v4();
+                const organizerCopy = await calendarEventRepo.save(
+                    new CalendarEventSQL({
+                        folderUid: "organizer-calendar-folder",
+                        mailboxUid,
+                        title: "Team Sync",
+                        timezone: "UTC",
+                        organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                        attendees: [
+                            { address: "attendee@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+                        ],
+                        status: CalendarEventStatus.CONFIRMED,
+                        busyStatus: BusyStatus.BUSY,
+                        icalUid,
+                        sequence: 0,
+                        startDate: new Date(),
+                        endDate: new Date(),
+                    }),
+                );
+
+                const repoUtils = (job as any).calendarEventRepo;
+                const findOneSpy = vi.spyOn(repoUtils, "findOne").mockResolvedValue({ ...organizerCopy, sequence: 1 });
+
+                const replyIcs = buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 0 }), "REPLY", {
+                    onlyAttendee: { address: "attendee@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.ACCEPTED, isOrganizer: false },
+                });
+                const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+                const rawBlobKey = `raw/${uuid.v4()}`;
+                await blobStore.put(rawBlobKey, makeItipRawMessage(replyIcs, { from: "attendee@example.com", to: "organizer@example.com" }));
+                const entry = await createIngestEntry({ rawBlobKey, envelopeFrom: "attendee@example.com", envelopeTo: ["organizer@example.com"] });
+
+                await expect(job.run()).resolves.toBeUndefined();
+                findOneSpy.mockRestore();
+
+                const updated = await ingestQueueRepo.findOne({ where: { uid: entry.uid } });
+                expect(updated!.status).toBe(IngestStatus.DELIVERED);
+                const stillUnapplied = await calendarEventRepo.findOne({ where: { uid: organizerCopy.uid } });
+                expect(stillUnapplied!.attendees[0].responseStatus).toBe(AttendeeResponseStatus.NEEDS_ACTION);
+            });
+
+            it("A REQUEST-update that's stale by the time of updateCalendarEventWithRetry's own re-fetch (a concurrent update already applied a same-or-newer sequence) is a no-op, not a throw.", async () => {
+                const icalUid = uuid.v4();
+                const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+
+                const firstRawBlobKey = `raw/${uuid.v4()}`;
+                await blobStore.put(firstRawBlobKey, makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 0 }), "REQUEST")));
+                await createIngestEntry({ rawBlobKey: firstRawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+                await job.run();
+                const created = (await calendarEventRepo.find({ where: { mailboxUid, icalUid } }))[0];
+
+                const repoUtils = (job as any).calendarEventRepo;
+                const findOneSpy = vi.spyOn(repoUtils, "findOne").mockResolvedValue({ ...created, sequence: 1 });
+
+                const secondRawBlobKey = `raw/${uuid.v4()}`;
+                await blobStore.put(
+                    secondRawBlobKey,
+                    makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, sequence: 1, title: "Team Sync (moved)" }), "REQUEST")),
+                );
+                const entry = await createIngestEntry({ rawBlobKey: secondRawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+                await expect(job.run()).resolves.toBeUndefined();
+                findOneSpy.mockRestore();
+
+                const updated = await ingestQueueRepo.findOne({ where: { uid: entry.uid } });
+                expect(updated!.status).toBe(IngestStatus.DELIVERED);
+                const events = await calendarEventRepo.find({ where: { mailboxUid, icalUid } });
+                expect(events.length).toBe(1);
+                expect(events[0].title).toBe("Team Sync");
+            });
+
+            it("A single-occurrence CANCEL whose master's recurrenceRule is gone by the time of updateCalendarEventWithRetry's own re-fetch (a concurrent series-wide CANCEL already ran) is a no-op, not a throw.", async () => {
+                const icalUid = uuid.v4();
+                const recurrenceId = new Date(Math.floor((Date.now() + 60 * 60 * 1000) / 1000) * 1000);
+                const master = await calendarEventRepo.save(
+                    new CalendarEventSQL({
+                        folderUid: "calendar-folder",
+                        mailboxUid,
+                        title: "Team Sync",
+                        timezone: "UTC",
+                        organizer: { address: "organizer@example.com", type: RecipientType.TO },
+                        attendees: [],
+                        recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+                        status: CalendarEventStatus.CONFIRMED,
+                        busyStatus: BusyStatus.BUSY,
+                        icalUid,
+                        startDate: new Date(),
+                        endDate: new Date(),
+                    }),
+                );
+
+                const repoUtils = (job as any).calendarEventRepo;
+                const findOneSpy = vi.spyOn(repoUtils, "findOne").mockResolvedValue({ ...master, recurrenceRule: undefined });
+
+                const ics = buildEventIcs(makeIcsEventFixture({ icalUid, recurrenceId }), "CANCEL");
+                const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+                const rawBlobKey = `raw/${uuid.v4()}`;
+                await blobStore.put(rawBlobKey, makeItipRawMessage(ics));
+                const entry = await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+                await expect(job.run()).resolves.toBeUndefined();
+                findOneSpy.mockRestore();
+
+                const updated = await ingestQueueRepo.findOne({ where: { uid: entry.uid } });
+                expect(updated!.status).toBe(IngestStatus.DELIVERED);
+            });
         });
 
         it("Soft-deletes the mailbox's own copy from a whole-series inbound CANCEL (no recurrenceId).", async () => {

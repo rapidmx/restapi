@@ -2338,6 +2338,10 @@ export enum QuarantineReason {
     INFECTED = "infected",
     SPAM_POLICY = "spam_policy",
     TRANSPORT_RULE = "transport_rule",
+    /** The target mailbox's storage quota would have been exceeded by filing this message as a real
+     * `Message` - held for review/cleanup instead of either silently dropping it or writing it anyway and
+     * letting `Mailbox.usedBytes` run over. See `ScanQueueJob.deliverMessage()`. */
+    QUOTA_EXCEEDED = "quota_exceeded",
     OTHER = "other",
 }
 

@@ -244,6 +244,19 @@ describe("fetchRemoteKeys() Tests", () => {
         expect(mockFetch).not.toHaveBeenCalled();
     });
 
+    it("Rejects a host that passes the hostname syntax check but that the WHATWG URL parser itself can't parse (e.g. an all-digit label too long to be a valid IPv4 address) - the re-check's own `new URL()` call can throw, not just disagree.", async () => {
+        // A 63-character all-digit label is valid per HOSTNAME_PATTERN (letters/digits/hyphens, <=63 chars per
+        // label) and unrecognized by `net.isIP()` (not a dotted-quad), but the WHATWG URL parser tries to parse an
+        // all-numeric host as an IPv4 address and throws "Invalid URL" rather than accepting it as a hostname -
+        // exactly the `catch` this file's own re-check (`isSafeDiscoveryHost()`) must fail closed on, not just the
+        // "disagrees with net.isIP()" case above.
+        const host = "9".repeat(63);
+        const result = await fetchRemoteKeys(host, "alice@all-digit-host.example");
+
+        expect(result).toBeUndefined();
+        expect(mockFetch).not.toHaveBeenCalled();
+    });
+
     it("Reads a real streamed response body and parses it once complete (the non-test-double path).", async () => {
         const body = makeDiscoveryResponse({ escrow: true });
         const encoded = new TextEncoder().encode(JSON.stringify(body));

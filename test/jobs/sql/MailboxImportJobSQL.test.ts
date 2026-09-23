@@ -605,6 +605,37 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
         expect((await auditLogRepo.find({ where: { action: AuditAction.MAILBOX_IMPORT_FAILED } })).length).toBe(1);
     });
 
+    it("Translates the shared chargeMailboxQuota()'s MailboxQuotaExceededError into this job's own type/message when the AUTHORITATIVE charge catches it, not just assertWithinQuota()'s own cheap local pre-check.", async () => {
+        const raw = makeRawMessage();
+        const mailbox = await mailboxRepo.save(
+            new MailboxSQL({
+                ownerUserUid: uuid.v4(),
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Tiny Mailbox",
+                timezone: "UTC",
+                quotaBytes: 1,
+                usedBytes: 0,
+            }),
+        );
+        const folder = await createFolder(mailbox.uid);
+        const sourceBlobKey = await putMbox([buildMboxEntry(raw, "alice@example.com", new Date("2020-01-01"))]);
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+
+        // Bypasses the job's own cheap local pre-check (assertWithinQuota(), against its in-memory ImportQuota
+        // cache) so the real, authoritative chargeMailboxQuota() call - re-reading the persisted Mailbox row -
+        // is what actually catches this, exercising chargeQuota()'s own catch-and-translate branch rather than
+        // assertWithinQuota()'s separate throw of the same error type.
+        vi.spyOn(job as any, "assertWithinQuota").mockImplementation(() => undefined);
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("failed");
+        expect(updated!.errorMessage).toContain("mailbox quota");
+        expect(updated!.importedCount).toBe(0);
+    });
+
     it("Treats a quotaBytes of 0 as unlimited.", async () => {
         const mailbox = await mailboxRepo.save(
             new MailboxSQL({

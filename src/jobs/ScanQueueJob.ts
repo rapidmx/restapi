@@ -16,6 +16,7 @@ import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames, resolveDomainAlias } from "../util/DomainUtils.js";
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
+import { chargeMailboxQuota, MailboxNotFoundError, MailboxQuotaExceededError } from "../util/MailboxQuotaUtils.js";
 import { isHeaderOversignedByAlignedDkim, topmostTrustedAuthenticationResults } from "../util/DkimOversignUtils.js";
 import { refreshFolderCounts, type FolderCountsContext } from "../util/FolderCountUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
@@ -787,7 +788,10 @@ export abstract class ScanQueueJob<
             // case `tryCorrelateAcmeChallenge()` itself returns `false` and this branch is never taken, so
             // the message falls through to ordinary delivery below rather than being silently dropped.
         } else {
-            await this.deliverMessage(claim, raw, targetUid, scanResult, result, verdict === "junk");
+            // `false` means the message was quarantined instead of filed (its mailbox's storage quota would
+            // have been exceeded) - see `deliverMessage()`'s own doc comment. Nothing was actually delivered
+            // to the Inbox/Junk folder in that case, so auto-reply/iTIP below must not run either.
+            const delivered: boolean = await this.deliverMessage(claim, raw, targetUid, scanResult, result, verdict === "junk");
 
             // Mail filter rules, automatic replies, and iTIP processing only apply to mail actually delivered
             // to the Inbox - matching Exchange's own behavior, junk-routed mail never runs any of them. An
@@ -795,7 +799,7 @@ export abstract class ScanQueueJob<
             // by whether this attempt filed the message - so a retry of an attempt that filed the message but failed
             // before replying still replies. iTIP processing is idempotent (sequence/state checks), so a retry re-applies
             // it safely.
-            if (verdict === "deliver") {
+            if (verdict === "deliver" && delivered) {
                 await this.maybeSendAutoReplyOnce(entry, raw, result);
                 await this.maybeProcessItipMessage(entry, raw, result);
             }
@@ -869,6 +873,12 @@ export abstract class ScanQueueJob<
      * the send is recorded on that row (`deliveryReceiptSentAt`/`deliveryReceiptPending`), which is what a retry
      * checks: see `completeDeliveryReceipt()`. A rule forward is likewise relayed at most once per entry, whether
      * or not the rule also deleted the message: see `forwardByRuleOnce()`.
+     *
+     * Returns `false` when the primary message was quarantined instead of filed because the mailbox's storage
+     * quota would have been exceeded (`QuarantineReason.QUOTA_EXCEEDED`) - `processEntry()` uses this to skip
+     * the auto-reply/iTIP processing a genuinely delivered message gets, since nothing was actually delivered
+     * to the Inbox/Junk folder in that case. `true` otherwise (including the discarded-with-no-copy case,
+     * which isn't quota-related at all).
      */
     private async deliverMessage(
         claim: EntryClaim<Q>,
@@ -877,7 +887,7 @@ export abstract class ScanQueueJob<
         scanResult: SR,
         result: ScanPipelineResult,
         isJunk: boolean,
-    ): Promise<void> {
+    ): Promise<boolean> {
         const entry: Q = claim.row;
         // Who this message was actually addressed to, and who sent it, as its own headers say - shared by the
         // primary row and any rule copy below. The SMTP envelope names only the single mailbox this copy is
@@ -935,7 +945,47 @@ export abstract class ScanQueueJob<
             // matching rule's forward still applies (Exchange's "forward, then delete" rule combination).
             await this.renewLeaseIfDue(claim);
             await this.forwardByRuleOnce(entry, raw, result, filterResult.forwardTo);
-            return;
+            return true;
+        }
+
+        // Charged against the mailbox's persisted quota BEFORE this message is actually filed - the one place
+        // in this whole delivery pipeline that ever counts a delivered message's bytes against `Mailbox.
+        // usedBytes` at write time (previously nothing did; only `MailboxQuotaRecalcJob`'s hourly pass ever
+        // reconciled it, well after the fact - the vector this whole enforcement pass exists to close, since
+        // an external sender needs no authentication at all to reach this path, unlike `BaseAttachmentRoute.
+        // upload()`'s own enforcement, which requires an authenticated caller with UPDATE access to an
+        // existing message). Only for a genuinely NEW primary filing - `alreadyFiled` means an earlier attempt
+        // at this same entry already charged it (a retry must not double-charge), and a discarded-with-copy
+        // message's primary row is never created at all (only its rule copies are, which this doesn't
+        // additionally charge for - a rule that copies the same inbound message into several of the mailbox's
+        // own folders is a narrower, less common case than the ordinary single-filing path this closes; not
+        // charging for those extra copies is a known, deliberately accepted gap, not a silent one).
+        // Deliberately placed before `storeAttachmentBlobs()` so an over-quota mailbox never has this
+        // message's attachments written to the `BlobStore` at all.
+        if (!alreadyFiled && !filterResult.deleted) {
+            const messageBytes: number = raw.length + result.attachments.reduce((sum, a) => sum + a.content.length, 0);
+            const withinQuota: boolean = await this.chargeMailboxQuotaForDelivery(entry.mailboxUid, messageBytes);
+            if (!withinQuota) {
+                // Over quota - held for review instead of either silently dropping it or filing it anyway and
+                // running the mailbox's usedBytes over its own configured limit. Same "held out of normal
+                // delivery" mechanism `processEntry()`'s own AV/spam/transport-rule quarantine branch uses -
+                // this message just discovers the need for it slightly later, once its real stored size (raw
+                // plus every attachment) is known.
+                if (!(await this.quarantineEntryRepo!.findOne(targetUid, { ignoreACL: true }))) {
+                    await this.quarantineEntryRepo!.create(
+                        new this.quarantineEntryClass({
+                            uid: targetUid,
+                            mailboxUid: entry.mailboxUid,
+                            reason: QuarantineReason.QUOTA_EXCEEDED,
+                            scanResultUid: scanResult.uid,
+                            rawBlobKey: entry.rawBlobKey,
+                        }),
+                        { ignoreACL: true },
+                    );
+                }
+                await this.renewLeaseIfDue(claim);
+                return false;
+            }
         }
 
         const storedAttachments: StoredAttachment[] = await this.storeAttachmentBlobs(result.attachments, targetUid);
@@ -1064,6 +1114,33 @@ export abstract class ScanQueueJob<
 
         await this.renewLeaseIfDue(claim);
         await this.forwardByRuleOnce(entry, raw, result, filterResult.forwardTo);
+        return true;
+    }
+
+    /**
+     * Charges `bytes` against `mailboxUid`'s persisted quota for inbound delivery (`chargeMailboxQuota()`),
+     * but treats a missing target `Mailbox` row as "nothing to enforce against" - delivery proceeds
+     * uncharged - rather than failing an otherwise-deliverable message outright over it. A real deployment's
+     * `mailboxUid` always names an existing row (an `IngestQueueEntry` is only ever created by resolving a
+     * real address to a real `Mailbox` first - see `BaseMailIngestRoute`), so this only matters for the
+     * genuine race of the mailbox being deleted between resolution and delivery, not for the ordinary case.
+     * Returns `true` if delivery should proceed (charged, or nothing to charge against), `false` if the
+     * charge would exceed the mailbox's quota (the caller quarantines instead of filing).
+     */
+    private async chargeMailboxQuotaForDelivery(mailboxUid: string, bytes: number): Promise<boolean> {
+        try {
+            await chargeMailboxQuota(this.mailboxRepo!, mailboxUid, bytes);
+            return true;
+        } catch (err) {
+            if (err instanceof MailboxQuotaExceededError) {
+                return false;
+            }
+            if (err instanceof MailboxNotFoundError) {
+                this.logger?.debug(`ScanQueueJob: skipping quota enforcement for mailbox ${mailboxUid} - no Mailbox row found.`);
+                return true;
+            }
+            throw err;
+        }
     }
 
     /**
@@ -2080,7 +2157,17 @@ export abstract class ScanQueueJob<
                     break;
             }
         } catch (err: any) {
-            this.logger?.warn(`ScanQueueJob: failed to process iTIP ${parsed.method} for event ${parsed.uid}: ${err.message}`);
+            // A version-checked update exhausting `updateCalendarEventWithRetry()`'s retries, or a duplicate
+            // iTIP REQUEST losing the unique-index race on its deterministic uid (see `processItipRequest()`'s
+            // own doc comment), both surface here as a 409 - logged at `error`, not `warn`: unlike every other
+            // early-return in the three `processItip*()` methods (a stale SEQUENCE, an unverified sender, no
+            // matching event, ...), which are ordinary "ignored, nothing to do" outcomes that never throw at
+            // all, a 409 here means this message's effect genuinely was NOT applied. The retry significantly
+            // reduces how often sustained near-simultaneous contention reaches this point at all, but doesn't
+            // eliminate it - this is the one signal an operator's error-level alerting can actually catch when
+            // it does.
+            const severity: "error" | "warn" = err?.status === 409 ? "error" : "warn";
+            this.logger?.[severity](`ScanQueueJob: failed to process iTIP ${parsed.method} for event ${parsed.uid}: ${err.message}`);
         }
     }
 

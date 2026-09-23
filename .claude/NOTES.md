@@ -3480,3 +3480,129 @@ RequestBodyUtils.ts`, `src/routes/BaseMatterRoute.ts`, `src/routes/BaseEscrowAcc
 BaseEscrowAuditLogRoute.ts`, `src/routes/BaseMailIngestRoute.ts`, `src/transport/MTAIngestAdapter.ts`,
 `src/models/types.ts` (doc-only), `src/models/mongo/CalendarEventMongo.ts` (doc-only), `src/models/sql/
 CalendarEventSQL.ts` (doc-only), `RELEASE_NOTES.md`, and the test files listed above.
+
+### 2026-09-22 (later still, round 2) - Follow-up: DistributionList alias validation, ScanQueueJob quota re-fix (the actual root cause), iTIP retry regression tests, mailbox-import size cap that now has teeth
+
+A second reviewer pass on the round above found the finding-4 revert (ScanQueueJob quota enforcement) needed a
+real second attempt rather than staying reverted, plus 4 more items. All addressed in one follow-up commit:
+
+**1. [HIGH] `BaseDistributionListRoute`'s `aliasAddresses` had ZERO validation** - not the alias-domain check, not
+the ordinary domain check, no collision check - even though `BaseMailIngestRoute` resolves and trusts a
+distribution list's `aliasAddresses` identically to a mailbox's. Fixed by mirroring `BaseMailboxRoute`'s already-
+fixed pattern exactly: a new `aliasQueryValue()` (Mongo: `ModelUtils.literal()`; SQL: the same `Raw()` LIKE-pattern
+override `MailboxRouteSQL` uses for its serialized `simple-json` column), `validateAliasAddresses()`
+(`getPrimaryDomainNames()`-based domain check + collision check against every other Mailbox/DistributionList's
+uid/primary/alias) called from `create()`, and `validateAliasAddressChange()` (diffs against the existing value so
+only *newly added* aliases get re-validated on `update()`) called from `update()`. New tests in both
+`test/routes/{mongo,sql}/DistributionListDomains.test.ts` (5 each): plain-domain rejection, alias-domain rejection
+on create, acceptance on a verified non-alias domain, PUT rejection, 409 on collision with an existing
+mailbox/list address.
+
+**2. [MEDIUM, the actual priority item] ScanQueueJob quota enforcement was reverted in the first pass over 75
+test failures - re-investigated instead of leaving it reverted, and the reviewer's hypothesis was exactly right.**
+`chargeMailboxQuota()` requires an existing `Mailbox` row and threw a plain `Error` when none was found; almost
+every `ScanQueueJobMongo.test.ts`/`ScanQueueJobSQL.test.ts` fixture stages an `IngestQueueEntry` against a
+`mailboxUid` with no real `Mailbox` row, since ordinary delivery never needed one before. Root-caused and fixed
+properly this time:
+- `MailboxQuotaUtils.ts` gets a new `MailboxNotFoundError` (distinct type, not a message-string match) thrown
+  instead of a plain `Error` when `mailboxUid` names no current row.
+- `ScanQueueJob.deliverMessage()` now returns `Promise<boolean>` (`false` = quarantined instead of filed) and
+  calls a new private `chargeMailboxQuotaForDelivery()` wrapper: `MailboxQuotaExceededError` -> `false`
+  (quarantine, new `QuarantineReason.QUOTA_EXCEEDED`, re-added to `models/types.ts`); `MailboxNotFoundError` ->
+  `true` with a `logger.debug()` note (gracefully skip enforcement rather than fail an otherwise-deliverable
+  message over a row that was never required before); anything else re-thrown as a real failure. This is the
+  key distinction the first attempt got wrong - it treated every non-quota-exceeded error as fatal.
+- `processEntry()` only fires `maybeSendAutoReplyOnce()`/`maybeProcessItipMessage()` when `deliverMessage()`
+  actually returned `true` (a quarantined message gets neither).
+- This closes the actual vector this whole review round exists for: `BaseAttachmentRoute.upload()` needs an
+  authenticated caller with UPDATE access; `ScanQueueJob`'s inbound delivery needs nothing at all, so before this
+  fix any external sender could flood a mailbox past quota with zero authentication, completely unmitigated
+  except by the hourly `MailboxQuotaRecalcJob` reconciliation (after the fact, not preventative).
+- Verified clean: `ScanQueueJobMongo.test.ts` 75/214 failing -> 217/217 passing (214 + 3 new, below), 
+  `ScanQueueJobSQL.test.ts` 198/198 -> 201/201, both AcmeChallenge variants 20/20, with no other regressions.
+
+**3. [HIGH] The mailbox-import size check (`mail:import:max_bytes`, added in the first pass) had no practical
+effect under the reference deployment.** `server/src/config.defaults.ts` sets the framework's own `max_body_size`
+(enforced on every request's raw body before ANY route code runs, including this one) to 100 MiB
+(`DEFAULT_MAX_BODY_SIZE_BYTES`), while restapi's own `DEFAULT_MAX_IMPORT_BYTES` defaulted to 500 MiB - every
+upload large enough to reach the new check would already have been rejected one layer up first, so the new check
+protected against nothing in the shipped default configuration. Fixed two ways:
+- Lowered `DEFAULT_MAX_IMPORT_BYTES` to 90 MiB - safely below the reference deployment's `max_body_size` so this
+  check is actually the one that fires (and gives a specific, on-brand 413 message instead of the framework's
+  generic one).
+- Discovered `@rapidrest/service-core`'s `Server.js` reads `max_body_size` via `this.config.get("max_body_size")`
+  (confirmed by reading `node_modules/@rapidrest/service-core/dist/lib/Server.js` directly) - an ordinary,
+  unnamespaced top-level config key, readable via the exact same `@Config()` decorator this codebase already uses
+  everywhere else. `BaseMailboxImportRoute` now injects it (`@Config("max_body_size", FRAMEWORK_DEFAULT_MAX_BODY_SIZE)`,
+  falling back to the framework's own hardcoded 10 MiB default - `DEFAULT_MAX_BODY_SIZE` in
+  `http/uWS/Adapters.js` - when unset) and `init()` logs a one-time `logger.warn()` if `mail:import:max_bytes`
+  ends up configured at or above it, so this class of misconfiguration doesn't go silently unnoticed a second
+  time. No test added for the warning itself (it's a log-line side effect of config values, not an HTTP-observable
+  behavior change) - covered by `tsc`/`eslint` staying clean and the existing `MailboxImportRequestRoute.test.ts`
+  suites (44/44) staying green, since both set `mail:import:max_bytes` well under the 10 MiB fallback and never
+  trigger the new warning path.
+- Updated `RELEASE_NOTES.md` to describe the real vulnerability (the first version protected against nothing) and
+  the real fix, not just "added a cap."
+
+**4. [MEDIUM] The iTIP retry (`updateCalendarEventWithRetry`-shaped fixes) and dedup-uid fixes from the first-pass
+commit had zero regression tests** - confirmed by `git show <first-pass-commit> --stat` touching no
+`test/jobs/*/ScanQueueJob*.test.ts` file at all. Added 3 new tests to each of `ScanQueueJobMongo.test.ts`/
+`ScanQueueJobSQL.test.ts`:
+- A REPLY that loses the optimistic-lock race (409) on attempt 1 but succeeds on retry - asserts the final
+  `responseStatus` reflects the RSVP and `attempts >= 2`.
+- A REPLY that loses the race on every retry attempt - asserts `logger.error()` was called (see item 5 below),
+  the attendee's `responseStatus` stays unchanged, and the ingest entry still closes `DELIVERED` (documenting the
+  known remaining limitation, not just the fix).
+- Two concurrent `IngestQueueEntry` rows for the same iTIP REQUEST (same `icalUid`/`recurrenceId`, different raw
+  blob keys, same ICS body) processed in one `job.run()` - asserts exactly one `CalendarEvent` row exists
+  afterward and both ingest entries close `DELIVERED` (the second collides on the deterministic uid instead of
+  creating a duplicate).
+
+**5. [MEDIUM] Docs overclaimed what the iTIP retry fix actually does, and the exhausted-retry failure mode was
+unchanged from before the fix.** After all 3 retries fail, `maybeProcessItipMessage()`'s catch still only logged
+and `processEntry()` still called `markDelivered(claim)` right after - on sustained contention the outcome is
+byte-for-byte the same silent-warn-and-still-`DELIVERED` behavior as before, so "no longer silently dropped" in
+the first-pass `RELEASE_NOTES.md`/this file overstated the fix. Corrected the wording in both to "significantly
+less likely to be silently dropped under contention," and made the one safe, quick improvement available: the
+catch in `maybeProcessItipMessage()` now logs at `logger.error()` (was `logger.warn()`) specifically for a 409
+that survived every retry (`err?.status === 409 ? "error" : "warn"`), so it's operator-visible/alertable instead
+of silent - the actual outcome for the lost update itself is still unchanged, and `RELEASE_NOTES.md`'s "Known
+Issues" section now says so plainly instead of leaving the old (now-fixed-sounding) bullet in place.
+
+**Verification**: full clean `vitest run --coverage` run (no concurrent file edits mid-run, per the standing
+lesson above), `tsc --noEmit` clean, `eslint` clean.
+
+**Coverage gate follow-up, same pass**: the project's 100%-statements/lines/functions coverage gate was
+failing on this full run - some of it from code THIS round added with no dedicated test yet (the new
+`aliasAddresses` validators in `BaseDistributionListRoute.ts`/`DistributionListRouteSQL.ts`, the new quota-
+quarantine branch and `chargeMailboxQuotaForDelivery()` in `ScanQueueJob.ts`), and some of it pre-existing
+debt from the FIRST commit of this whole review chain (`2b3c5a3`) that had apparently never actually been run
+clean before landing: `MailboxImportJob.chargeQuota()`'s own catch-and-translate branch (only reachable when
+the AUTHORITATIVE `chargeMailboxQuota()` charge - not `assertWithinQuota()`'s cheap local-cache pre-check -
+is what detects the overage, e.g. a concurrent writer having already used up room the job's own cache still
+thinks is free), `BaseMailIngestRoute.ts`'s `decodeEnvelopeAddress()` malformed-percent-encoding fallback, and
+`KeyDiscoveryClient.ts`'s `isSafeDiscoveryHost()` catch branch for a host that passes the hostname-syntax
+regex but that the WHATWG `URL` parser itself can't parse (an all-digit 63-character label - valid per the
+regex, unrecognized by `net.isIP()`, but `new URL()` tries to read an all-numeric host as an IPv4 address and
+throws "Invalid URL" rather than accepting it as a hostname). Closed all of it with new regression tests
+(`DistributionListDomains.test.ts` x2: malformed-`aliasAddresses`-shape rejection, PUT-resubmit-unchanged
+no-op; `ScanQueueJob{Mongo,SQL}.test.ts`: quota-exceeded quarantine, an unexpected non-quota/non-missing-
+mailbox charge error propagating as a real FAILED rather than being swallowed, plus 4 `updateCalendarEventWithRetry()`
+edge-case tests per backend - row-deleted-mid-retry, and each of the three call sites' own "stale by the time
+of the retry-fetch" mutate-returns-undefined branch, using `vi.spyOn(repoUtils, "findOne")` to make the
+internal re-fetch (not the initial existence check, which uses `.find()`) return an already-advanced row
+without needing to actually force a real concurrent write; `MailboxImportJob{Mongo,SQL}.test.ts`: quota
+exceeded via the authoritative charge with `assertWithinQuota()` spied to a no-op; `MailIngestRoute.test.ts`
+x2: malformed `X-Envelope-From` percent-encoding falls back to the raw value; `KeyDiscoveryClient.test.ts`:
+the all-digit-label host rejection above). Full suite re-run clean afterward: 7654/7654 tests passing, 100%
+statements/lines/functions, 97%+ branches (branches only ever need 95%).
+
+Files: changed `src/routes/BaseDistributionListRoute.ts`, `src/routes/sql/DistributionListRouteSQL.ts`,
+`src/util/MailboxQuotaUtils.ts` (`MailboxNotFoundError`), `src/models/types.ts` (`QuarantineReason.QUOTA_EXCEEDED`
+re-added), `src/jobs/ScanQueueJob.ts` (quota charge + quarantine fallback, `deliverMessage()` return type,
+`maybeProcessItipMessage()` logging severity), `src/routes/BaseMailboxImportRoute.ts` (`DEFAULT_MAX_IMPORT_BYTES`
+lowered to 90 MiB, `max_body_size` cross-check + one-time warning), `RELEASE_NOTES.md`, and new/changed tests in
+`test/routes/{mongo,sql}/DistributionListDomains.test.ts`, `test/jobs/{mongo,sql}/ScanQueueJob{Mongo,SQL}.test.ts`,
+`test/jobs/{mongo,sql}/MailboxImportJob{Mongo,SQL}.test.ts`, `test/routes/{mongo,sql}/MailIngestRoute.test.ts`,
+`test/util/KeyDiscoveryClient.test.ts` (the last three closing pre-existing coverage-gate gaps from `2b3c5a3`,
+unrelated to this round's own 5 items but blocking this commit's own required clean coverage run).

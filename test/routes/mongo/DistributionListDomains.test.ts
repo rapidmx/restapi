@@ -88,4 +88,142 @@ describe("Route:DistributionListMongo domain-restriction Tests", () => {
 
         expect(result.status).toBe(400);
     });
+
+    describe("aliasAddresses (previously unvalidated entirely)", () => {
+        const seedAlias = async (): Promise<void> => {
+            await domainRepo.deleteMany({ uid: { $in: ["powerlevel.gg", "plc.gg"] } } as any).catch(() => undefined);
+            await domainRepo.save(new DomainMongo({ name: "powerlevel.gg", enabled: true, verified: true, uid: "powerlevel.gg" }));
+            await domainRepo.save(
+                new DomainMongo({ uid: "plc.gg", name: "plc.gg", enabled: true, verified: true, aliasOf: "powerlevel.gg" }),
+            );
+        };
+
+        it("Rejects creating a distribution list whose aliasAddresses includes an address on a domain that isn't verified (400).", async () => {
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ primarySmtpAddress: `${uuid.v4()}@example.com`, name: "Sales", memberAddresses: [], aliasAddresses: ["sales@not-allowed.com"] });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects creating a distribution list whose aliasAddresses includes an address on a pure alias domain (400), even though the primary address is on the domain it aliases.", async () => {
+            await seedAlias();
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({
+                    primarySmtpAddress: `${uuid.v4()}@powerlevel.gg`,
+                    name: "Sales",
+                    memberAddresses: [],
+                    aliasAddresses: ["boss@plc.gg"],
+                });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Accepts creating a distribution list whose aliasAddresses are all on verified, non-alias domains.", async () => {
+            const primaryAddress = `${uuid.v4()}@example.com`;
+            const aliasAddress = `${uuid.v4()}@example.org`;
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ primarySmtpAddress: primaryAddress, name: "Sales", memberAddresses: [], aliasAddresses: [aliasAddress] });
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.aliasAddresses).toEqual([aliasAddress.toLowerCase()]);
+        });
+
+        it("Rejects adding an alias-domain address to an existing list's aliasAddresses via PUT (400).", async () => {
+            await seedAlias();
+            const created = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ primarySmtpAddress: `${uuid.v4()}@powerlevel.gg`, name: "Sales", memberAddresses: [], aliasAddresses: [] });
+            expect(created.status).toBeGreaterThanOrEqual(200);
+            expect(created.status).toBeLessThan(300);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${created.body.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: created.body.uid, version: created.body.version, aliasAddresses: ["boss@plc.gg"] });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Rejects creating a distribution list whose aliasAddresses collides with an existing Mailbox's address (409).", async () => {
+            // No mailbox fixture is set up in this file - collision-checked against a fresh, guaranteed-real
+            // address instead: the list's own primarySmtpAddress from a list already created above, re-used as
+            // an alias on a second list, which must collide against the first list's primary address.
+            const first = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ primarySmtpAddress: `${uuid.v4()}@example.com`, name: "First", memberAddresses: [] });
+            expect(first.status).toBeGreaterThanOrEqual(200);
+            expect(first.status).toBeLessThan(300);
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    name: "Second",
+                    memberAddresses: [],
+                    aliasAddresses: [first.body.primarySmtpAddress],
+                });
+
+            expect(result.status).toBe(409);
+        });
+
+        it("Rejects creating a distribution list whose aliasAddresses contains a malformed entry (not a list, or an entry with no '@') - 400.", async () => {
+            const malformedArray = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ primarySmtpAddress: `${uuid.v4()}@example.com`, name: "Sales", memberAddresses: [], aliasAddresses: "not-an-array" });
+            expect(malformedArray.status).toBe(400);
+
+            const malformedEntry = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ primarySmtpAddress: `${uuid.v4()}@example.com`, name: "Sales", memberAddresses: [], aliasAddresses: ["not-an-email"] });
+            expect(malformedEntry.status).toBe(400);
+        });
+
+        it("Rejects a PUT that sets aliasAddresses to something other than a list (400).", async () => {
+            const created = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ primarySmtpAddress: `${uuid.v4()}@example.com`, name: "Sales", memberAddresses: [], aliasAddresses: [] });
+            expect(created.status).toBeGreaterThanOrEqual(200);
+            expect(created.status).toBeLessThan(300);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${created.body.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: created.body.uid, version: created.body.version, aliasAddresses: "not-an-array" });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Accepts a PUT that resubmits aliasAddresses unchanged - no newly-added alias means nothing to re-validate.", async () => {
+            const aliasAddress = `${uuid.v4()}@example.org`;
+            const created = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ primarySmtpAddress: `${uuid.v4()}@example.com`, name: "Sales", memberAddresses: [], aliasAddresses: [aliasAddress] });
+            expect(created.status).toBeGreaterThanOrEqual(200);
+            expect(created.status).toBeLessThan(300);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${created.body.uid}`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ uid: created.body.uid, version: created.body.version, aliasAddresses: [aliasAddress] });
+
+            expect(result.status).toBeGreaterThanOrEqual(200);
+            expect(result.status).toBeLessThan(300);
+            expect(result.body.aliasAddresses).toEqual([aliasAddress.toLowerCase()]);
+        });
+    });
 });

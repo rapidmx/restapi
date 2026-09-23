@@ -19,11 +19,26 @@ const { Get, Param, Post, Query, Request, User: AuthUser } = RouteDecorators;
 
 const VALID_FORMATS: ReadonlySet<string> = new Set<MailboxImportFormat>(["mbox", "pst"]);
 
-/** Default `mail:import:max_bytes` - 500 MiB. `MailboxImportJob`/`PstImportUtils` read the whole uploaded
+/** Default `mail:import:max_bytes` - 90 MiB. `MailboxImportJob`/`PstImportUtils` read the whole uploaded
  * file into one in-memory `Buffer` before `PstAllocationBudget` (which only bounds *extracted/reconstructed*
  * output, not input size) ever runs - a large upload accepted here with no ceiling at all could OOM-crash
- * the whole Node process, which every other `BackgroundService` job shares. */
-export const DEFAULT_MAX_IMPORT_BYTES = 524_288_000;
+ * the whole Node process, which every other `BackgroundService` job shares.
+ *
+ * Deliberately kept BELOW the reference `server` deployment's own `max_body_size` (100 MiB, see
+ * `server/src/config.defaults.ts`'s `DEFAULT_MAX_BODY_SIZE_BYTES`) rather than comfortably above it. That
+ * framework-level cap is enforced on every request's raw body before ANY route code runs - including this
+ * one - so a `mail:import:max_bytes` value at or above it can never actually reject anything itself: every
+ * upload big enough to hit this check would already have been rejected with a generic 413 one layer up.
+ * This value used to be 500 MiB, which was exactly that: a ceiling nothing could ever reach in the shipped
+ * default configuration, protecting against nothing in practice. `init()` below logs a one-time warning if
+ * an operator's own `mail:import:max_bytes` override still ends up at or above whatever `max_body_size` the
+ * framework is actually enforcing, so this misconfiguration doesn't go silently unnoticed a second time. */
+export const DEFAULT_MAX_IMPORT_BYTES = 90 * 1024 * 1024;
+
+/** `@rapidrest/service-core`'s own hard-coded fallback for `max_body_size` (`DEFAULT_MAX_BODY_SIZE` in its
+ * `http/uWS/Adapters.js`) - used here only as the assumed value when an operator hasn't set `max_body_size`
+ * explicitly, so the sanity check in `init()` still has something concrete to compare against. */
+const FRAMEWORK_DEFAULT_MAX_BODY_SIZE = 10 * 1024 * 1024;
 
 /**
  * A GDPR data-portability *import* request - the counterpart to `BaseDataExportRoute` - taking an
@@ -69,6 +84,12 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
     @Config("mail:import:max_bytes", DEFAULT_MAX_IMPORT_BYTES)
     private maxImportBytes: number = DEFAULT_MAX_IMPORT_BYTES;
 
+    /** The framework's own `max_body_size` (see `DEFAULT_MAX_IMPORT_BYTES`'s doc comment) - read here only
+     * to sanity-check `maxImportBytes` against it in `init()`, never to enforce anything itself (the
+     * framework already enforces its own value before this route ever runs). */
+    @Config("max_body_size", FRAMEWORK_DEFAULT_MAX_BODY_SIZE)
+    private maxBodySize: number = FRAMEWORK_DEFAULT_MAX_BODY_SIZE;
+
     /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
     @Config()
     private config: any;
@@ -78,6 +99,18 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
 
     private async init(): Promise<void> {
         if (!this.requestRepo) {
+            // One-time sanity check (this branch only ever runs once per instance, guarded by the same
+            // `!this.requestRepo` as the rest of this block's lazy setup): if `mail:import:max_bytes` is
+            // configured at or above `max_body_size`, this route's own 413 check can never fire - every
+            // oversized upload would already have been rejected by the framework first, silently making
+            // the operator's configured `mail:import:max_bytes` meaningless. See `DEFAULT_MAX_IMPORT_BYTES`.
+            if (this.maxImportBytes >= this.maxBodySize) {
+                this.logger?.warn(
+                    `BaseMailboxImportRoute: mail:import:max_bytes (${this.maxImportBytes}) is >= max_body_size ` +
+                        `(${this.maxBodySize}) - the framework will reject oversized uploads before this route's own ` +
+                        `check can ever run, making mail:import:max_bytes ineffective. Configure it below max_body_size.`,
+                );
+            }
             this.requestRepo = await this._objectFactory!.newInstance(RepoUtils, {
                 name: this.mailboxImportRequestClass.name,
                 args: [this.mailboxImportRequestClass],

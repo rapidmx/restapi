@@ -286,6 +286,26 @@ describe("Route:MailIngestRouteSQL Tests", () => {
         expect(entries[0].envelopeFrom).toBe(weirdSender);
     });
 
+    it("Falls back to the raw header value, rather than failing delivery, when X-Envelope-From is malformed percent-encoding.", async () => {
+        const mailbox = await createMailbox();
+        const malformedSender = "%zz-not-valid-percent-encoding@example.com";
+        const raw = Buffer.from("From: sender@example.com\r\nTo: " + mailbox.primarySmtpAddress + "\r\n\r\nHello\r\n");
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", malformedSender)
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntrySQL[] = await ingestQueueRepo.find({ where: { mailboxUid: mailbox.uid } });
+        expect(entries.length).toBe(1);
+        // decodeURIComponent() throws on this - the raw, undecoded header value is used as-is instead.
+        expect(entries[0].envelopeFrom).toBe(malformedSender);
+    });
+
     describe("domain alias", () => {
         it("Accepts the /domain relay check for a pure alias domain, same as any other verified domain.", async () => {
             await createDomain({ name: "powerlevel.gg" });

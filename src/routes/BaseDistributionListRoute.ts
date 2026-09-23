@@ -9,6 +9,7 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    ModelUtils,
     RepoUtils,
     RouteDecorators,
     type UpdateObject,
@@ -104,6 +105,80 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         }
     }
 
+    /** The query value matching one element of an `aliasAddresses` column - a literal on Mongo (array-element
+     * equality); the SQL subclass overrides it for the serialized `simple-json` column
+     * (`DistributionListSQL.aliasAddresses`), exactly like `BaseMailboxRoute.aliasQueryValue()`. */
+    protected aliasQueryValue(address: string): any {
+        return ModelUtils.literal(address);
+    }
+
+    /**
+     * Refuses (409) any of `addresses` already used by another mailbox or distribution list - as its uid, its
+     * primary address, or one of its aliases. Mirrors `BaseMailboxRoute.assertAddressesAvailable()` exactly:
+     * mail is delivered by exact primary/alias match (`BaseMailIngestRoute.findDistributionListByAddressRaw()`/
+     * `findMailboxByAddressRaw()`), so a duplicate anywhere would hijack the other recipient's mail.
+     */
+    private async assertAliasAddressesAvailable(addresses: string[]): Promise<void> {
+        const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
+        for (const address of new Set(addresses)) {
+            const [listByUid, mailboxByUid, listsByPrimary, listsByAlias, mailboxesByPrimary, mailboxesByAlias] = await Promise.all([
+                this.repoUtils!.findOne(address, { ignoreACL: true, includeDeleted: true }),
+                mailboxRepo.findOne(address, { ignoreACL: true }),
+                this.repoUtils!.find({ primarySmtpAddress: ModelUtils.literal(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }),
+                this.repoUtils!.find({ aliasAddresses: this.aliasQueryValue(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }),
+                mailboxRepo.find({ primarySmtpAddress: ModelUtils.literal(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }),
+                mailboxRepo.find({ aliasAddresses: this.aliasQueryValue(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }),
+            ]);
+            if (
+                listByUid ||
+                mailboxByUid ||
+                listsByPrimary.length > 0 ||
+                listsByAlias.length > 0 ||
+                mailboxesByPrimary.length > 0 ||
+                mailboxesByAlias.length > 0
+            ) {
+                throw new ApiError(
+                    ApiErrors.IDENTIFIER_EXISTS,
+                    409,
+                    "This address is already in use by another mailbox or distribution list.",
+                );
+            }
+        }
+    }
+
+    /**
+     * Validates a candidate list's `aliasAddresses` - previously not validated AT ALL (not the alias-domain
+     * check `primarySmtpAddress` gets via `assignUidAndCheckCollision()`/`validateAddressChange()`, not even a
+     * collision check), even though `DistributionList.aliasAddresses` is consumed identically to `Mailbox.
+     * aliasAddresses` by `BaseMailIngestRoute`'s address resolution (exact-literal match, then the
+     * alias-domain-rewrite retry) - the same mail-hijack-via-alias-domain class of bug just fixed on
+     * `BaseMailboxRoute.validateAliasChange()`/`createMailboxes()`, left open on this sibling route. Each
+     * address's domain must be one of this server's verified, non-alias `Domain`s (once at least one exists -
+     * same rule as `primarySmtpAddress`), and each must not collide with any other mailbox/list's uid, primary
+     * address, or alias.
+     */
+    private async validateAliasAddresses(domains: string[], aliasAddresses: unknown): Promise<void> {
+        if (aliasAddresses === undefined) {
+            return;
+        }
+        if (!Array.isArray(aliasAddresses) || aliasAddresses.some((alias) => typeof alias !== "string" || !alias.includes("@"))) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'aliasAddresses' must be a list of addresses.");
+        }
+        for (const alias of aliasAddresses as string[]) {
+            const domain: string | undefined = alias.split("@")[1]?.toLowerCase();
+            if (domains.length > 0 && (!domain || !domains.includes(domain))) {
+                throw new ApiError(
+                    ApiErrors.INVALID_REQUEST,
+                    400,
+                    `Distribution list addresses must be on one of this server's configured domains: ${domains.join(", ")}.`,
+                );
+            }
+        }
+        if (aliasAddresses.length > 0) {
+            await this.assertAliasAddressesAvailable(aliasAddresses as string[]);
+        }
+    }
+
     @RequiresTrustedRole()
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
@@ -114,6 +189,7 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
             // `_id` would replace another document on Mongo - see `util/RequestBodyUtils.ts`.
             stripClientCreateFields(o);
             await this.assignUidAndCheckCollision(o, domains);
+            await this.validateAliasAddresses(domains, o.aliasAddresses);
             if (seenUids.has((o as any).uid)) {
                 throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "Duplicate address within the same request.");
             }
@@ -178,6 +254,25 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         }
     }
 
+    /**
+     * Re-validates only the NEWLY ADDED entries of an `aliasAddresses` update against `validateAliasAddresses()`'s
+     * domain/collision rules - removing an alias needs no validation, and an alias already on the list was
+     * already checked when it was first added. Mirrors `BaseMailboxRoute.validateAliasChange()`'s identical
+     * current-vs-incoming diffing.
+     */
+    private async validateAliasAddressChange(existing: T, newAliasAddresses: unknown): Promise<void> {
+        if (!Array.isArray(newAliasAddresses)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'aliasAddresses' must be a list of addresses.");
+        }
+        const current: Set<string> = new Set((existing.aliasAddresses ?? []).map((alias) => normalizeAddress(alias)));
+        const added: unknown[] = newAliasAddresses.filter((alias) => typeof alias !== "string" || !current.has(normalizeAddress(alias)));
+        if (added.length === 0) {
+            return;
+        }
+        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
+        await this.validateAliasAddresses(domains, added);
+    }
+
     /** Runs for the inherited `updateBulk()` (per element) and `updateProperty()` - refuses path keys there too. */
     protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser): Promise<void> {
         assertNoPathKeys(obj);
@@ -207,6 +302,9 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         // not start failing because e.g. a domain was un-verified after the fact.
         if (obj.primarySmtpAddress !== undefined && obj.primarySmtpAddress !== existing.primarySmtpAddress) {
             await this.validateAddressChange(existing, obj.primarySmtpAddress);
+        }
+        if (obj.aliasAddresses !== undefined) {
+            await this.validateAliasAddressChange(existing, obj.aliasAddresses);
         }
         const updated: T = await this.repoUtils!.update(obj, existing, { user, version: (obj as any).version, ignoreACL: true });
 

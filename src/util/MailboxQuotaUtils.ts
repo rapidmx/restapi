@@ -23,6 +23,14 @@ export class MailboxQuotaExceededError extends Error {
     }
 }
 
+/** Thrown by `chargeMailboxQuota()`/`refundMailboxQuota()` when `mailboxUid` names no current `Mailbox` row.
+ * A distinct type (rather than a plain `Error`) so a caller that wants to treat "mailbox not found"
+ * differently from any other charge failure - e.g. `ScanQueueJob`'s inbound delivery, which would rather
+ * skip quota enforcement than fail an otherwise-deliverable message outright over it (see
+ * `ScanQueueJob.chargeMailboxQuotaForDelivery()`) - can distinguish it with `instanceof` instead of
+ * string-matching `message`. */
+export class MailboxNotFoundError extends Error {}
+
 /** How many times a `Mailbox.usedBytes` charge/refund is retried on an optimistic-lock conflict. Shared by
  * every caller of `chargeMailboxQuota()`/`refundMailboxQuota()` below. */
 const MAX_QUOTA_ATTEMPTS = 5;
@@ -59,7 +67,7 @@ export async function chargeMailboxQuota<MB extends Mailbox>(
     for (let attempt = 0; attempt < MAX_QUOTA_ATTEMPTS; attempt++) {
         const current: MB | undefined = await mailboxRepo.findOne(mailboxUid, { ignoreACL: true, skipCache: true });
         if (!current) {
-            throw new Error("The target mailbox no longer exists.");
+            throw new MailboxNotFoundError("The target mailbox no longer exists.");
         }
         const quotaBytes: number = current.quotaBytes ?? 0;
         const usedBytes: number = current.usedBytes ?? 0;
