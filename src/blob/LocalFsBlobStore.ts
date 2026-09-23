@@ -61,6 +61,13 @@ export class LocalFsBlobStore implements BlobStore {
         return await fs.readFile(this.resolvePath(key));
     }
 
+    /** The blob's own real path on disk - see `BlobStore.localPath()`'s own doc comment. Never checks
+     * existence itself, matching `resolvePath()`'s other callers - a caller that opens the returned path
+     * directly gets the same natural ENOENT a missing key would already produce elsewhere in this class. */
+    public async localPath(key: string): Promise<string | undefined> {
+        return this.resolvePath(key);
+    }
+
     public async getStream(key: string, range?: BlobRange): Promise<NodeJS.ReadableStream> {
         const filePath: string = this.resolvePath(key);
         // Fail fast with a consistent "does not exist" error rather than deferring to the first read of the

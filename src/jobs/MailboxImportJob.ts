@@ -3,6 +3,11 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
+import * as fs from "fs/promises";
+import { createWriteStream } from "fs";
+import * as os from "os";
+import * as path from "path";
+import { pipeline } from "stream/promises";
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ModelUtils, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
@@ -58,11 +63,21 @@ interface ImportLease<MIR> {
  * thousands of items and (for PST) requires a synchronous, potentially slow parse - `batchSize` defaults
  * to processing one uploaded file per run rather than `DataExportJob`'s 10, deliberately.
  *
- * Both formats are first reduced to the same shape - an array of raw RFC 5322 message buffers
- * (`util/MboxUtils.ts`'s `parseMbox()` for `"mbox"`, `util/PstImportUtils.ts`'s `extractPstMessages()` for
- * `"pst"`, which reconstructs one via `nodemailer`'s `MimeNode` from a PST item's structured properties,
- * since PST doesn't store an already-assembled MIME byte stream the way Mbox does) - so a single
- * `persistImportedMessage()` step handles both. That step deliberately does NOT reuse `ScanQueueJob.
+ * Both formats are first reduced to the same shape - raw RFC 5322 message buffers, yielded one at a time via
+ * an `AsyncGenerator` (`util/MboxUtils.ts`'s `parseMbox()` for `"mbox"`, `util/PstImportUtils.ts`'s
+ * `extractPstMessages()` for `"pst"`, which reconstructs one via `nodemailer`'s `MimeNode` from a PST item's
+ * structured properties, since PST doesn't store an already-assembled MIME byte stream the way Mbox does) -
+ * so a single `persistImportedMessage()` step handles both, `for await`-ed here rather than collected into an
+ * array of every extracted message up front. Deliberate: this class used to `blobStore.get()` the WHOLE
+ * source file into one `Buffer` and eagerly build every reconstructed message into a second, equally large
+ * (or, for PST, often larger) array before importing any of them - fine for a small attachment-scale file,
+ * untenable for a genuinely large real-world PST (tens of GB is not unusual for a never-archived mailbox).
+ * `resolveLocalSourcePath()` below gets a real file path instead of a `Buffer` (directly from the `BlobStore`
+ * when it's filesystem-backed, or via one streamed-to-a-temp-file pass otherwise), and both parsers now read
+ * and yield off that path incrementally - see their own doc comments for exactly how each keeps its own
+ * memory bounded. The upload that FILLS `sourceBlobKey` in the first place is a separate, larger problem
+ * this doesn't address - see `RELEASE_NOTES.md`'s current "Known Issues" entry on `BaseMailboxImportRoute`.
+ * That step deliberately does NOT reuse `ScanQueueJob.
  * deliverMessage()`: that method is entangled with live-mail-only concerns (quarantine-folder routing,
  * inbound `RapidMX-Key` processing, delivery receipts, iTIP calendar processing, auto-replies) that make no
  * sense for historical mail already delivered somewhere else years ago. It DOES reuse the shared
@@ -291,36 +306,41 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
         const processing: MIR = lease.held;
 
         try {
-            const source: Buffer = await this.blobStore!.get(processing.sourceBlobKey);
-            const rawMessages: Buffer[] = processing.format === "mbox" ? parseMbox(source) : await extractPstMessages(source);
-
-            const quota: ImportQuota = { mailboxUid: mailbox.uid, quotaBytes: mailbox.quotaBytes ?? 0, usedBytes: mailbox.usedBytes ?? 0 };
+            const { path: sourcePath, cleanup } = await this.resolveLocalSourcePath(processing.sourceBlobKey);
             let importedCount = 0;
             let failedCount = 0;
             let quotaError: string | undefined;
-            for (const raw of rawMessages) {
-                // Deliberately outside the per-message try/catch below: a lost lease must abort the whole run.
-                await this.renewLease(lease);
-                try {
-                    if (attempt > 1 && (await this.alreadyImported(raw, folder))) {
-                        // Persisted by an earlier attempt that died before completing - see this class's doc comment.
-                        importedCount++;
-                        continue;
-                    }
-                    const persisted: boolean = await this.persistImportedMessage(raw, mailbox, folder, quota);
-                    if (persisted) {
-                        importedCount++;
-                    } else {
+            try {
+                const rawMessages: AsyncGenerator<Buffer> =
+                    processing.format === "mbox" ? parseMbox(sourcePath) : extractPstMessages(sourcePath);
+
+                const quota: ImportQuota = { mailboxUid: mailbox.uid, quotaBytes: mailbox.quotaBytes ?? 0, usedBytes: mailbox.usedBytes ?? 0 };
+                for await (const raw of rawMessages) {
+                    // Deliberately outside the per-message try/catch below: a lost lease must abort the whole run.
+                    await this.renewLease(lease);
+                    try {
+                        if (attempt > 1 && (await this.alreadyImported(raw, folder))) {
+                            // Persisted by an earlier attempt that died before completing - see this class's doc comment.
+                            importedCount++;
+                            continue;
+                        }
+                        const persisted: boolean = await this.persistImportedMessage(raw, mailbox, folder, quota);
+                        if (persisted) {
+                            importedCount++;
+                        } else {
+                            failedCount++;
+                        }
+                    } catch (err: any) {
+                        if (err instanceof MailboxQuotaExceededError) {
+                            quotaError = err.message;
+                            break;
+                        }
+                        this.logger?.warn(`MailboxImportJob: failed to import one message for request ${processing.uid}: ${err.message}`);
                         failedCount++;
                     }
-                } catch (err: any) {
-                    if (err instanceof MailboxQuotaExceededError) {
-                        quotaError = err.message;
-                        break;
-                    }
-                    this.logger?.warn(`MailboxImportJob: failed to import one message for request ${processing.uid}: ${err.message}`);
-                    failedCount++;
                 }
+            } finally {
+                await cleanup();
             }
 
             // The folder's counts are derived from its messages, so they are recomputed (and published) once, here, rather
@@ -372,6 +392,45 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
         } catch (err: any) {
             await this.markFailed(lease.held, err.message);
         }
+    }
+
+    /**
+     * Resolves `blobKey`'s content to a real path on the LOCAL filesystem, without ever loading the whole
+     * blob into a Node `Buffer` first - `extractPstMessages()`/`parseMbox()` both now parse directly off a
+     * file path (PST specifically needs `pst-extractor`'s own random-access reader; both formats can then
+     * scale to a multi-GB source with no correspondingly large in-memory footprint - see this class's own
+     * doc comment on the bigger memory picture this addresses).
+     *
+     * `BlobStore.localPath()` (implemented by a filesystem-backed store like `LocalFsBlobStore`) hands back
+     * the blob's own real path directly - no copy needed, and `cleanup()` is a no-op since that file isn't
+     * this job's to delete. Anything else (`S3BlobStore`, any other non-local implementation, or simply not
+     * implementing the optional method at all) is instead streamed ONCE to a fresh temp file - still only
+     * ever one write pass, never a full in-memory buffer - which `cleanup()` removes once this request is
+     * done with it either way (success or failure), so a run never leaks a temp file per attempt. The
+     * download itself is wrapped in its own try/catch for exactly the same reason: a `pipeline()` failure
+     * partway through (source stream error, disk full, etc.) can still leave a partially-written temp file
+     * on disk, and since that failure happens before this method ever returns a `cleanup` closure to its
+     * caller, nothing else would otherwise be left to remove it.
+     */
+    private async resolveLocalSourcePath(blobKey: string): Promise<{ path: string; cleanup: () => Promise<void> }> {
+        const direct: string | undefined = await this.blobStore!.localPath?.(blobKey);
+        if (direct) {
+            return { path: direct, cleanup: async () => undefined };
+        }
+        const tempPath: string = path.join(os.tmpdir(), `mailbox-import-${crypto.randomUUID()}.tmp`);
+        try {
+            const stream: NodeJS.ReadableStream = await this.blobStore!.getStream(blobKey);
+            await pipeline(stream, createWriteStream(tempPath));
+        } catch (err) {
+            await fs.rm(tempPath, { force: true });
+            throw err;
+        }
+        return {
+            path: tempPath,
+            cleanup: async () => {
+                await fs.rm(tempPath, { force: true });
+            },
+        };
     }
 
     /** Whether a message with `raw`'s own `Message-ID` already exists in `folder` - used only on a retried

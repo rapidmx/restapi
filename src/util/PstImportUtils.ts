@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import * as fs from "fs/promises";
 import MimeNode from "nodemailer/lib/mime-node/index.js";
 import { PSTAttachment, PSTFile, PSTFolder, PSTMessage } from "pst-extractor";
 
@@ -73,21 +74,39 @@ export class PstAllocationBudget {
     }
 }
 
-export async function extractPstMessages(pstBuffer: Buffer, maxTotalBytes: number = defaultPstExtractionBudget(pstBuffer.length)): Promise<Buffer[]> {
-    const pstFile = new PSTFile(pstBuffer);
-    const messages: PSTMessage[] = [];
-    collectMailItems(pstFile.getRootFolder(), messages);
+/**
+ * Extracts every real mail item from the PST file at `pstFilePath`, yielding each as a raw RFC 5322 message
+ * buffer one at a time rather than collecting them all up front - `pst-extractor`'s `PSTFile` reads directly
+ * off a file descriptor via random access (its own constructor accepts a file path as an alternative to a
+ * full in-memory `Buffer` - confirmed by reading `pst-extractor`'s own source, not assumed), so a multi-GB
+ * PST never needs its whole content resident in memory at once, only whatever one message's own
+ * reconstruction currently needs. `MailboxImportJob` (the only caller) consumes this via `for await`,
+ * persisting and discarding one message before the next is built - see `MailboxImportJob.
+ * resolveLocalSourcePath()` for how a non-file-backed `BlobStore` (e.g. `S3BlobStore`) gets a real path to
+ * pass in here in the first place.
+ */
+export async function* extractPstMessages(pstFilePath: string, maxTotalBytes?: number): AsyncGenerator<Buffer> {
+    const fileSize: number = (await fs.stat(pstFilePath)).size;
+    const budget = new PstAllocationBudget(maxTotalBytes ?? defaultPstExtractionBudget(fileSize));
+    const pstFile = new PSTFile(pstFilePath);
+    try {
+        const messages: PSTMessage[] = [];
+        collectMailItems(pstFile.getRootFolder(), messages);
 
-    const budget = new PstAllocationBudget(maxTotalBytes);
-    const raw: Buffer[] = [];
-    for (const message of messages) {
-        // An attachment can never legitimately be larger than the PST file containing it - bounding
-        // `readAttachmentContent()`'s allocation by this file's own size is what keeps a corrupted or
-        // maliciously crafted `filesize` property from driving an unbounded `Buffer.alloc()`. `budget` bounds
-        // the running total across every item.
-        raw.push(await buildRawMimeFromPstMessage(message, pstBuffer.length, budget));
+        for (const message of messages) {
+            // An attachment can never legitimately be larger than the PST file containing it - bounding
+            // `readAttachmentContent()`'s allocation by this file's own size is what keeps a corrupted or
+            // maliciously crafted `filesize` property from driving an unbounded `Buffer.alloc()`. `budget`
+            // bounds the running total across every item.
+            yield await buildRawMimeFromPstMessage(message, fileSize, budget);
+        }
+    } finally {
+        // Releases the file descriptor `new PSTFile(pstFilePath)` opened above - never held before this
+        // function accepted a real path instead of an already-in-memory `Buffer` (which needed no fd at
+        // all), so this is new cleanup this function alone is responsible for, not something the caller
+        // could do on its behalf.
+        pstFile.close();
     }
-    return raw;
 }
 
 /** Recursively walks every folder in the PST (its hierarchy is discarded - see this module's own doc

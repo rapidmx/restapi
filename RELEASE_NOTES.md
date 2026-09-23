@@ -27,13 +27,20 @@
   one before this) skips quota enforcement gracefully instead of failing delivery outright, logged at `debug`. `MailboxImportJob` itself is refactored onto the shared utility with no behavior
   change.
 - **A mailbox import upload is now actually capped in size before any processing starts.** `BaseMailboxImportRoute.create()` accepted an uploaded PST/mbox file of any size (only a non-empty
-  check), and `MailboxImportJob`/`PstImportUtils` read the whole file into one in-memory `Buffer` before `PstAllocationBudget` (which only bounds *extracted* output, not input size) ever ran - a
-  large upload could OOM-crash the whole Node process, which every other `BackgroundService` job shares. A new configurable `mail:import:max_bytes` ceiling now rejects (413) an oversized upload
-  up front - but the first version of this fix shipped a default (500 MiB) comfortably ABOVE the reference `server` deployment's own framework-level `max_body_size` (100 MiB), which is enforced
-  on every request's raw body before this route's own check - or any route code at all - ever runs; every upload large enough to hit the 500 MiB check would already have been rejected by that
-  coarser, generic 413 first, making the new check protect against nothing in the shipped default configuration. The default is now 90 MiB, safely below the reference deployment's
-  `max_body_size` so this check is the one that actually fires, and `BaseMailboxImportRoute.init()` now logs a one-time warning if an operator's own `mail:import:max_bytes` override still ends
-  up at or above whatever `max_body_size` is actually configured, so this class of misconfiguration doesn't go silently unnoticed again.
+  check). A new configurable `mail:import:max_bytes` ceiling now rejects (413) an oversized upload up front - but the first version of this fix shipped a default (500 MiB) comfortably ABOVE
+  the reference `server` deployment's own framework-level `max_body_size` (100 MiB), which is enforced on every request's raw body before this route's own check - or any route code at all -
+  ever runs; every upload large enough to hit the 500 MiB check would already have been rejected by that coarser, generic 413 first, making the new check protect against nothing in the shipped
+  default configuration. `BaseMailboxImportRoute.init()` logs a one-time warning if an operator's own `mail:import:max_bytes` override ends up at or above whatever `max_body_size` is actually
+  configured, so this class of misconfiguration doesn't go silently unnoticed. The default is now 200 MiB - an interim, deliberately round number, not a fix for the underlying constraint: see
+  the new "Known Issues" entry below on the upload itself still being fully buffered into memory regardless of this value.
+- **`MailboxImportJob`'s own memory footprint for a large PST/Mbox import is fixed - separately from the upload issue above.** `MailboxImportJob.run()` used to `blobStore.get()` the WHOLE
+  source file into one `Buffer`, then `PstImportUtils.extractPstMessages()`/`MboxUtils.parseMbox()` eagerly reconstructed and collected EVERY extracted message into a second, often-larger
+  `Buffer[]` before importing any of them - untenable for a genuinely large real-world PST (tens of GB is not unusual for a never-archived mailbox). `extractPstMessages()`/`parseMbox()` are now
+  `AsyncGenerator`s, `for await`-ed one message at a time and immediately persisted-or-discarded rather than collected; both now read directly off a real file path instead of a `Buffer`
+  (`pst-extractor`'s own `PSTFile` already supports random-access reads straight off a file descriptor - confirmed by reading its source, not assumed) via a new `BlobStore.localPath()` (optional;
+  `LocalFsBlobStore` returns the blob's own real path directly, `S3BlobStore` returns `undefined`, falling back to one streamed-to-a-temp-file pass instead of a full buffer either way). A
+  multi-GB *stored* import file no longer needs a correspondingly large amount of memory resident at once to process - only the getting of the file into storage in the first place remains
+  memory-bound, tracked separately (see "Known Issues").
 - **A `DistributionList`'s `aliasAddresses` are now validated exactly like a `Mailbox`'s.** `BaseDistributionListRoute` accepted `aliasAddresses` with no domain check, no alias-domain check and
   no collision check at all, even though `BaseMailIngestRoute` resolves and trusts a distribution list's `aliasAddresses` identically to a mailbox's - a caller could add any address on any
   domain (including another mailbox's or list's existing address, or a pure alias domain that should never carry its own addresses) to a distribution list's `aliasAddresses` with no
@@ -72,6 +79,13 @@
 - `decideResourceBooking()` has a TOCTOU window that can double-book a resource mailbox under genuine concurrent processing (two iTIP REQUESTs for overlapping times, processed by two workers at
   once, can both read "no conflict" before either commits). Closing it needs a short-lived advisory lock keyed on the resource mailbox, which has no existing reusable primitive in this codebase
   today - deferred as its own follow-up rather than introducing a new schema-level lock construct in this pass.
+- **A mailbox import upload is still fully buffered into memory before this route ever sees it** - `MailboxImportJob`'s own processing no longer needs a large in-memory footprint (see above),
+  but getting a large PST/Mbox file INTO storage in the first place still does: `req.rawBody` is read entirely into one Node `Buffer` by `@rapidrest/service-core`'s own HTTP layer (both its uWS
+  and Bun adapters) before any route code runs, with no way for a route to opt into a streaming request body instead - confirmed by reading the framework's own source, not assumed. Real 20GB+
+  PST files exist in practice; buffering that much per request, especially under concurrent imports, is untenable regardless of what `mail:import:max_bytes`/`max_body_size` are configured to.
+  The actual fix - a real streaming upload API in `@rapidrest/service-core` itself - is tracked and being worked separately (not a presigned/direct-to-blob-store workaround, which would sidestep
+  the framework rather than fix it); `BaseMailboxImportRoute` will be wired onto it once it lands. Until then, `mail:import:max_bytes`'s default (200 MiB) and whatever `max_body_size` a
+  deployment configures are the only real ceiling on what can be imported at all, full stop.
 
 ## v0.19.0
 

@@ -175,6 +175,13 @@ export class S3BlobStore implements BlobStore {
         return await toBuffer(await this.getStream(key));
     }
 
+    /** Never local - see `BlobStore.localPath()`'s own doc comment. A caller that needs random-access/file-
+     * path-based reads of an S3-backed blob (e.g. `MailboxImportJob.resolveLocalSourcePath()`) falls back to
+     * streaming it once to a temp file instead. */
+    public async localPath(_key: string): Promise<string | undefined> {
+        return undefined;
+    }
+
     public async getStream(key: string, range?: BlobRange): Promise<NodeJS.ReadableStream> {
         const sdk = await importAwsClientS3();
         const client = await this.getClient(sdk);

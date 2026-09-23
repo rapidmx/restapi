@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { createReadStream } from "fs";
 
 /**
  * Builds and parses the Mbox mailbox format - a simple, fully-documented, universally-supported plain-text
@@ -56,37 +57,70 @@ export function buildMboxEntry(rawMime: Buffer, fromAddress: string, date: Date)
     return Buffer.from(separator + escapedBody + "\n", "latin1");
 }
 
+/** Reverses `buildMboxEntry()`'s mboxo escaping and (for the LAST message only - see `parseMbox()`'s own doc
+ * comment) strips the one trailing separator-blank-line byte that isn't actually part of the original raw
+ * content. */
+function finalizeMboxMessage(raw: string, isLast: boolean): Buffer {
+    const unescaped = raw.replace(/^> From /gm, "From ");
+    const trimmed = isLast && unescaped.endsWith("\n") ? unescaped.slice(0, -1) : unescaped;
+    return Buffer.from(trimmed, "latin1");
+}
+
 /**
- * Splits a complete mbox file's content back into each message's raw RFC 5322 source, reversing
- * `buildMboxEntry()`'s own escaping. Every `From ` separator line - and only a genuine separator line, never
- * an escaped `> From ` one - starts a new message.
+ * Splits a complete mbox file back into each message's raw RFC 5322 source, reversing `buildMboxEntry()`'s
+ * own escaping - reading and yielding one message at a time (an `AsyncGenerator`, consumed via `for await`)
+ * rather than loading the whole file into one `Buffer` and materializing every message simultaneously, so a
+ * multi-GB mbox export never needs more memory resident at once than roughly its single largest message (see
+ * `MailboxImportJob.resolveLocalSourcePath()` for how a `mboxFilePath` is obtained from whatever `BlobStore`
+ * actually holds it). Every `From ` separator line - and only a genuine separator line, never an escaped
+ * `> From ` one - starts a new message.
+ *
+ * Incremental-parsing note: the original (whole-buffer) implementation matched a separator via
+ * `/(?:^|\n)From [^\n]*\n/` - true file start OR a preceding newline. Streaming a growing, periodically-
+ * trimmed buffer means "true file start" can no longer be told apart from "start of whatever's left after
+ * trimming" by position alone, so a single synthetic leading `"\n"` is prepended once, up front, unifying
+ * both cases into one plain `/\nFrom [^\n]*\n/` match - the real file start behaves exactly like any other
+ * `\n`-preceded separator from then on, with nothing further to special-case.
  */
-export function parseMbox(mbox: Buffer): Buffer[] {
-    const text = mbox.toString("latin1");
-    if (text.length === 0) {
-        return [];
+export async function* parseMbox(mboxFilePath: string): AsyncGenerator<Buffer> {
+    let text = "\n";
+    // Offset into `text` where the in-progress (not yet fully seen) message's own content begins - `undefined`
+    // until the first separator is found (a leading fragment before it, i.e. a malformed file, is discarded,
+    // matching the original implementation's `parts.slice(1)`).
+    let messageStart: number | undefined;
+    const separatorPattern = /\nFrom [^\n]*\n/g;
+
+    function* drainCompleteMessages(): Generator<Buffer> {
+        for (;;) {
+            separatorPattern.lastIndex = messageStart ?? 0;
+            const match = separatorPattern.exec(text);
+            if (!match) {
+                return;
+            }
+            if (messageStart === undefined) {
+                // The very first separator - nothing to emit yet, just record where its message begins.
+                messageStart = match.index + match[0].length;
+                continue;
+            }
+            yield finalizeMboxMessage(text.slice(messageStart, match.index), false);
+            messageStart = match.index + match[0].length;
+            // Compact away everything already consumed, so `text` never grows past roughly one message's
+            // worth (plus whatever's been read ahead so far) rather than the whole file.
+            text = text.slice(messageStart);
+            messageStart = 0;
+        }
     }
-    // Split on a `From ` line that begins the string or immediately follows a newline - the same boundary
-    // `buildMboxEntry()`'s separator always occupies, never matching an escaped `> From ` body line since
-    // that one has a `>` immediately before `From` with no intervening newline.
-    const parts = text.split(/(?:^|\n)From [^\n]*\n/);
-    // `split()`'s first element is whatever precedes the first separator - empty for a well-formed mbox file
-    // (which always starts with one), so drop it; a real leading fragment (a malformed file) is intentionally
-    // discarded rather than mistaken for a message with no separator of its own.
-    const messages = parts.slice(1);
-    return messages.map((entry, index) => {
-        const unescaped = entry.replace(/^> From /gm, "From ");
-        // `buildMboxEntry()` appends exactly one blank-line `\n` after each message's own raw content, to
-        // serve as the separator's leading blank line. For every message but the last, that `\n` is
-        // consumed by the NEXT message's own `(?:^|\n)From ...\n` separator match - it never appears in
-        // THIS message's own captured segment at all, which is therefore already byte-identical to the
-        // original raw content and must NOT be touched further. Only the last message has no following
-        // separator to consume its own trailing `\n`, so it alone needs it stripped back off (previously
-        // this stripped one trailing `\n` from EVERY message, silently truncating the final byte of every
-        // non-last message's own raw content whenever that content itself ended in `\n` - true of virtually
-        // every real RFC 5322 message, whose last body line ends `\r\n`).
-        const isLast = index === messages.length - 1;
-        const trimmed = isLast && unescaped.endsWith("\n") ? unescaped.slice(0, -1) : unescaped;
-        return Buffer.from(trimmed, "latin1");
-    });
+
+    for await (const chunk of createReadStream(mboxFilePath)) {
+        text += (chunk as Buffer).toString("latin1");
+        yield* drainCompleteMessages();
+    }
+    // EOF: whatever remains from the last found separator onward is the final message - the only one whose
+    // own trailing separator-blank-line byte was never consumed by a following separator match, so it alone
+    // needs it stripped back off (see `finalizeMboxMessage()`). A file with no separator at all (malformed,
+    // or genuinely empty) leaves `messageStart` `undefined` here, yielding nothing - matching the original
+    // implementation's empty-array result for the same inputs.
+    if (messageStart !== undefined) {
+        yield finalizeMboxMessage(text.slice(messageStart), true);
+    }
 }

@@ -81,6 +81,22 @@ describe("LocalFsBlobStore Tests", () => {
         expect(result.toString()).toBe("789");
     });
 
+    it("localPath() returns the same real on-disk path put()/get() use, without requiring the blob to already exist.", async () => {
+        const key = "localpath-key";
+        const data = Buffer.from("content for localPath()");
+        await store.put(key, data);
+
+        const resolved: string | undefined = await store.localPath(key);
+
+        expect(resolved).toBe((store as any).resolvePath(key));
+        expect((await fs.readFile(resolved!)).equals(data)).toBe(true);
+    });
+
+    it("localPath() still returns a path for a key with no stored blob - existence isn't checked, matching get()'s own let-the-read-fail-naturally contract.", async () => {
+        const resolved: string | undefined = await store.localPath("never-put-key");
+        expect(resolved).toBe((store as any).resolvePath("never-put-key"));
+    });
+
     it("delete() removes a stored blob.", async () => {
         const key = "delete-key";
         await store.put(key, Buffer.from("to be deleted"));

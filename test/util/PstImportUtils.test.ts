@@ -23,6 +23,17 @@ import {
 
 const FIXTURE_PATH = path.join(process.cwd(), "node_modules/pst-extractor/example/testdata/enron.pst");
 
+/** Drains an `AsyncGenerator` into an array - `extractPstMessages()` now yields one message at a time
+ * rather than returning them all as a `Buffer[]` (see its own doc comment for why), but most assertions
+ * below just want the full set to check length/contents against, same as before. */
+async function collectAsync<T>(gen: AsyncGenerator<T>): Promise<T[]> {
+    const out: T[] = [];
+    for await (const item of gen) {
+        out.push(item);
+    }
+    return out;
+}
+
 function findFolder(folder: PSTFolder, name: string): PSTFolder | undefined {
     if (folder.displayName === name) {
         return folder;
@@ -41,8 +52,7 @@ function findFolder(folder: PSTFolder, name: string): PSTFolder | undefined {
 describe("PstImportUtils Tests", () => {
     describe("extractPstMessages() (real PST fixture)", () => {
         it("Extracts every real IPM.Note item in the fixture as a raw RFC 5322 buffer.", async () => {
-            const buffer = fs.readFileSync(FIXTURE_PATH);
-            const messages = await extractPstMessages(buffer);
+            const messages = await collectAsync(extractPstMessages(FIXTURE_PATH));
 
             expect(messages.length).toBe(71);
             for (const raw of messages) {
@@ -364,10 +374,12 @@ describe("PstImportUtils Tests", () => {
         });
 
         it("extractPstMessages() fails the real fixture when given a total budget too small for its content, and succeeds with the default.", async () => {
-            const buffer = fs.readFileSync(FIXTURE_PATH);
-            await expect(extractPstMessages(buffer, 1_000_000)).rejects.toThrow("PST import exceeds the maximum total extracted size of 1000000 bytes.");
+            await expect(collectAsync(extractPstMessages(FIXTURE_PATH, 1_000_000))).rejects.toThrow(
+                "PST import exceeds the maximum total extracted size of 1000000 bytes.",
+            );
             // The default (4x file size, >= 64 MiB) comfortably fits a genuine PST - the 71-message test above.
-            expect(defaultPstExtractionBudget(buffer.length)).toBeGreaterThanOrEqual(buffer.length * 4);
+            const fileSize = fs.statSync(FIXTURE_PATH).size;
+            expect(defaultPstExtractionBudget(fileSize)).toBeGreaterThanOrEqual(fileSize * 4);
         });
     });
 });

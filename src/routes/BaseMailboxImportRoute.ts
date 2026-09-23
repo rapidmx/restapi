@@ -19,21 +19,34 @@ const { Get, Param, Post, Query, Request, User: AuthUser } = RouteDecorators;
 
 const VALID_FORMATS: ReadonlySet<string> = new Set<MailboxImportFormat>(["mbox", "pst"]);
 
-/** Default `mail:import:max_bytes` - 90 MiB. `MailboxImportJob`/`PstImportUtils` read the whole uploaded
- * file into one in-memory `Buffer` before `PstAllocationBudget` (which only bounds *extracted/reconstructed*
- * output, not input size) ever runs - a large upload accepted here with no ceiling at all could OOM-crash
- * the whole Node process, which every other `BackgroundService` job shares.
+/**
+ * Default `mail:import:max_bytes` - 200 MiB, an interim number, not a solved problem. Two genuinely separate
+ * things are true at once here.
  *
- * Deliberately kept BELOW the reference `server` deployment's own `max_body_size` (100 MiB, see
- * `server/src/config.defaults.ts`'s `DEFAULT_MAX_BODY_SIZE_BYTES`) rather than comfortably above it. That
- * framework-level cap is enforced on every request's raw body before ANY route code runs - including this
- * one - so a `mail:import:max_bytes` value at or above it can never actually reject anything itself: every
- * upload big enough to hit this check would already have been rejected with a generic 413 one layer up.
- * This value used to be 500 MiB, which was exactly that: a ceiling nothing could ever reach in the shipped
- * default configuration, protecting against nothing in practice. `init()` below logs a one-time warning if
- * an operator's own `mail:import:max_bytes` override still ends up at or above whatever `max_body_size` the
- * framework is actually enforcing, so this misconfiguration doesn't go silently unnoticed a second time. */
-export const DEFAULT_MAX_IMPORT_BYTES = 90 * 1024 * 1024;
+ * `MailboxImportJob`'s own memory footprint for a large PST/Mbox is fixed (see `MailboxImportJob`'s own doc
+ * comment on `resolveLocalSourcePath()`) - it now parses directly off a file path with no corresponding
+ * in-memory buffer, so a multi-GB *stored* import file no longer OOMs the process during processing.
+ *
+ * The UPLOAD that gets a file into storage in the first place is NOT fixed: `req.rawBody` is still fully
+ * buffered into one Node `Buffer` by `@rapidrest/service-core`'s own HTTP layer before this route (or any
+ * route) ever runs, with no way for a route to opt into streaming that body instead - confirmed by reading
+ * the framework's own uWS/Bun adapters, not assumed. Fixing this half needs a real streaming API added to
+ * `@rapidrest/service-core` itself (tracked separately, out of scope for this route) - a presigned/direct-
+ * to-blob-store upload would also work but was deliberately not chosen as a workaround, since a genuine
+ * framework fix is the one actually being pursued.
+ *
+ * Until that lands, whatever this value is set to is moot beyond whatever the deployment's own
+ * `max_body_size` (see `FRAMEWORK_DEFAULT_MAX_BODY_SIZE` below) already allows through - whichever is
+ * SMALLER is what an uploader will actually experience, and no value here can exceed the buffered-request
+ * reality that constrains it. 200 MiB is a deliberately round, comfortably-sized number for what today's
+ * buffered upload path can still support without needing an unusually large `max_body_size` override - not
+ * a number tuned to sit just under any one reference deployment's own value (a previous version of this
+ * constant did that, at 90 MiB, which solved nothing: it just meant EVERY deployment needed as large a
+ * `max_body_size` as this route wanted regardless, the same underlying problem from the other direction).
+ * `init()` below still logs a one-time warning if an operator's own `mail:import:max_bytes` override ends up
+ * at or above whatever `max_body_size` is actually configured - genuinely useful regardless of what number
+ * either side settles on, since it flags exactly the "this check can never fire" condition either way. */
+export const DEFAULT_MAX_IMPORT_BYTES = 200 * 1024 * 1024;
 
 /** `@rapidrest/service-core`'s own hard-coded fallback for `max_body_size` (`DEFAULT_MAX_BODY_SIZE` in its
  * `http/uWS/Adapters.js`) - used here only as the assumed value when an operator hasn't set `max_body_size`

@@ -200,6 +200,11 @@ describe("S3BlobStore Tests", () => {
         await expect(store.getStream("key")).rejects.toThrow("s3 error");
     });
 
+    it("localPath() always returns undefined - never a local filesystem, so callers needing a real path (e.g. MailboxImportJob.resolveLocalSourcePath()) must fall back to streaming a temp file instead.", async () => {
+        await expect(store.localPath("any-key")).resolves.toBeUndefined();
+        expect(mockSend).not.toHaveBeenCalled();
+    });
+
     it("delete() succeeds with no throw for both an existing and a nonexistent key (S3 delete is idempotent).", async () => {
         mockSend.mockResolvedValueOnce(undefined);
         await expect(store.delete("existing")).resolves.toBeUndefined();

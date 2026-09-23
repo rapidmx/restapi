@@ -6,6 +6,7 @@
 // QuarantineRetentionJobMongo.test.ts's file headers for the full rationale (bypasses `Server`, wires a
 // real ObjectFactory/ConnectionManager directly).
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { ACLUtils, NotificationUtils, ConnectionManager, MongoConnection, MongoRepository, ObjectFactory } from "@rapidrest/service-core";
@@ -13,6 +14,7 @@ import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import config from "../../config.js";
 import { MailboxImportJobMongo } from "../../../src/jobs/mongo/MailboxImportJobMongo.js";
+import { LocalFsBlobStore } from "../../../src/blob/LocalFsBlobStore.js";
 import { AttachmentMongo } from "../../../src/models/mongo/AttachmentMongo.js";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
@@ -334,6 +336,98 @@ describe("MailboxImportJobMongo Tests (real DB + DI)", () => {
         const attachments = await attachmentRepo.find({ folderUid: folder.uid }).toArray();
         expect(attachments.length).toBeGreaterThan(0);
     }, 30000);
+
+    describe("resolveLocalSourcePath() - reading the source file without a full in-memory buffer", () => {
+        it("Uses BlobStore.localPath() directly - no getStream()/temp-file download at all - when the store is filesystem-backed.", async () => {
+            const mailbox = await createMailbox();
+            const folder = await createFolder(mailbox.uid);
+            const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "restapi-localfs-blobstore-test-"));
+            const localStore = new LocalFsBlobStore();
+            (localStore as any).root = tempRoot;
+            const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+            await localStore.put(sourceBlobKey, buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01")));
+            const getStreamSpy = vi.spyOn(localStore, "getStream");
+            const getSpy = vi.spyOn(localStore, "get");
+
+            const originalBlobStore = (job as any).blobStore;
+            (job as any).blobStore = localStore;
+            try {
+                const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+
+                await job.run();
+
+                const updated = await requestRepo.findOne({ uid: request.uid } as any);
+                expect(updated!.status).toBe("completed");
+                expect(updated!.importedCount).toBe(1);
+                // Read directly off the blob's own real path - never a full get() buffer, never a getStream()
+                // download-to-temp-file (that fallback is only for a store with no local path to offer at all).
+                expect(getStreamSpy).not.toHaveBeenCalled();
+                expect(getSpy).not.toHaveBeenCalled();
+            } finally {
+                (job as any).blobStore = originalBlobStore;
+                await fs.promises.rm(tempRoot, { recursive: true, force: true });
+            }
+        });
+
+        it("Streams to a temp file (never a full get() buffer) when the store has no localPath() (e.g. S3BlobStore), and cleans the temp file up again once the request is done.", async () => {
+            const mailbox = await createMailbox();
+            const folder = await createFolder(mailbox.uid);
+            const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+            await blobStore.put(sourceBlobKey, buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01")));
+            // `MailboxImportJob` itself must never call `get()` directly (a full-buffer read) - only
+            // `getStream()`. `InMemoryBlobStore.getStream()` happens to be implemented via its own internal
+            // `get()` call (a test-double-only implementation detail, unlike a real streaming `getStream()`
+            // such as `S3BlobStore`'s own), so `get()` is deliberately not asserted un-called here - only
+            // that the JOB reaches the blob through `getStream()`, not by calling `get()` on it itself.
+            const getStreamSpy = vi.spyOn(blobStore, "getStream");
+            const tempFilesBefore = (await fs.promises.readdir(os.tmpdir())).filter((f) => f.startsWith("mailbox-import-"));
+
+            const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+            await job.run();
+
+            expect(getStreamSpy).toHaveBeenCalledWith(sourceBlobKey);
+            const updated = await requestRepo.findOne({ uid: request.uid } as any);
+            expect(updated!.status).toBe("completed");
+            expect(updated!.importedCount).toBe(1);
+            // The temp file used mid-import is removed once the request is done, whether it succeeded or not - no leak.
+            const tempFilesAfter = (await fs.promises.readdir(os.tmpdir())).filter((f) => f.startsWith("mailbox-import-"));
+            expect(tempFilesAfter.length).toBe(tempFilesBefore.length);
+        });
+
+        it("Cleans up the partially-written temp file (and marks the request failed) when the download itself fails partway through, not just when processing afterward fails.", async () => {
+            const mailbox = await createMailbox();
+            const folder = await createFolder(mailbox.uid);
+            const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+            await blobStore.put(sourceBlobKey, buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01")));
+            // A stream that writes some real bytes (so `createWriteStream()` has already created and
+            // started filling the temp file) before erroring, so `pipeline()` itself rejects - simulating a
+            // dropped connection partway through a real `S3BlobStore.getStream()` download, as opposed to
+            // `getStream()` itself rejecting up front (already covered by the "reading the source blob
+            // throws" test elsewhere in this file, which never gets as far as creating a temp file at all).
+            const { Readable } = await import("stream");
+            vi.spyOn(blobStore, "getStream").mockImplementationOnce(async () => {
+                return new Readable({
+                    read() {
+                        this.push(Buffer.from("partial content that will never be completed"));
+                        process.nextTick(() => this.destroy(new Error("simulated connection drop mid-download")));
+                    },
+                });
+            });
+            const tempFilesBefore = (await fs.promises.readdir(os.tmpdir())).filter((f) => f.startsWith("mailbox-import-"));
+
+            const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+            await expect(job.run()).resolves.toBeUndefined();
+
+            const updated = await requestRepo.findOne({ uid: request.uid } as any);
+            expect(updated!.status).toBe("failed");
+            expect(updated!.errorMessage).toContain("simulated connection drop mid-download");
+            // The partially-written temp file must not survive the failed download.
+            const tempFilesAfter = (await fs.promises.readdir(os.tmpdir())).filter((f) => f.startsWith("mailbox-import-"));
+            expect(tempFilesAfter.length).toBe(tempFilesBefore.length);
+        });
+    });
 
     it("Logs a warning and continues importing the rest when one message fails.", async () => {
         const mailbox = await createMailbox();

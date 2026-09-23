@@ -3606,3 +3606,93 @@ lowered to 90 MiB, `max_body_size` cross-check + one-time warning), `RELEASE_NOT
 `test/jobs/{mongo,sql}/MailboxImportJob{Mongo,SQL}.test.ts`, `test/routes/{mongo,sql}/MailIngestRoute.test.ts`,
 `test/util/KeyDiscoveryClient.test.ts` (the last three closing pre-existing coverage-gate gaps from `2b3c5a3`,
 unrelated to this round's own 5 items but blocking this commit's own required clean coverage run).
+
+### 2026-09-22 (later still, round 3) - PST-import size cap was the wrong fix: investigated true streaming, found the framework can't do it, shipped Phase A (the job's own memory footprint) while Phase B (a real streaming upload API) is designed in `service-core` separately
+
+The user flagged that the previous round's PST-import size-cap fix (`DEFAULT_MAX_IMPORT_BYTES` 500 MiB -> 90
+MiB) was solving the wrong problem: real PST files are routinely 20GB+, and no size-cap number makes buffering
+that much per request, under concurrent imports, tenable - the actual fix is to stop buffering entirely.
+
+**Investigation first (no code touched), reported back before implementing anything:**
+1. Read `@rapidrest/service-core`'s actual dist code (both `http/uWS/Adapters.js`'s `readBody()` and
+   `http/bun/BunAdapters.js`'s `readBunBody()`, plus their respective `Router.js`/`BunRouter.js` call sites) -
+   confirmed BOTH adapters unconditionally fully buffer the entire request body into one `Buffer` before ANY
+   route/middleware runs, with zero per-route opt-out and no streaming API exposed to route code on either
+   adapter (`BunRequest` doesn't even retain the native `Request` object; uWS's raw `uwsApp` is technically
+   reachable via an undocumented public property but is uWS-only and not a real API contract). True streaming
+   pass-through needs a `service-core` code change - confirmed, not assumed.
+2. Read `src/blob/BlobStore.ts`/`LocalFsBlobStore.ts`/`S3BlobStore.ts` - `put()` already accepts and properly
+   streams a `NodeJS.ReadableStream` in both implementations (`LocalFsBlobStore` via `pipeline()` to a temp
+   file then rename; `S3BlobStore` via a real multipart upload, ~1 part in memory at a time). This layer was
+   never the bottleneck.
+3. Grepped for any existing presigned/direct-upload precedent - none found anywhere in this codebase.
+4. Looked one layer past the upload, into what `MailboxImportJob` does with a stored blob - found it ALSO
+   fully buffers: `blobStore.get()` (not `getStream()`) loads the whole file, then `extractPstMessages()`/
+   `parseMbox()` eagerly built and returned a `Buffer[]` of EVERY reconstructed message before importing any
+   of them - a second, often-larger-than-the-source memory cost, on top of the upload's own. Checked
+   `pst-extractor`'s actual `.d.ts` (not assumed) and found `PSTFile`'s constructor is overloaded - accepts a
+   file path as an alternative to a `Buffer`, with its own `read()`/`readSync()` explicitly documented as
+   "read from either file system, or in memory buffer," backed by a real file descriptor for random-access
+   reads. No new dependency needed to fix this half.
+
+Reported all of this back with a phased plan (Phase A: fix the job's own footprint, no framework changes;
+Phase B: a real upload-side fix) before writing any code, per instruction. User decision: ship Phase A now;
+for Phase B, pursue the REAL fix (true streaming added to `@rapidrest/service-core` itself, checked out
+locally at `d:\github\rapidrest\service-core`) via a separate, parallel effort - not the presigned-S3
+workaround floated as an alternative, and not just raising the buffered-path limit further.
+
+**Phase A, implemented this round:**
+- New optional `BlobStore.localPath(key): Promise<string | undefined>` (optional so existing `BlobStore`
+  implementers elsewhere in the rapidmx workspace - `activesync`/`autodiscover`/`booking-plugin`/`mapi`'s own
+  test doubles, all `implements BlobStore` - keep compiling with no changes needed; this codebase's own
+  `InMemoryBlobStore` test double also implements nothing new, so every existing `MailboxImportJob` test
+  automatically exercises the "no local path" fallback with zero test changes). `LocalFsBlobStore.localPath()`
+  returns the blob's own real on-disk path (no existence check, matching `get()`'s own "let a missing key fail
+  naturally" contract); `S3BlobStore.localPath()` always returns `undefined`.
+- `MailboxImportJob.resolveLocalSourcePath()` (new): uses `blobStore.localPath?.()` directly when available
+  (no download, `cleanup()` is a no-op since that file isn't this job's to delete); otherwise streams ONCE via
+  `getStream()` + `pipeline()` to a fresh OS temp file (`os.tmpdir()/mailbox-import-<uuid>.tmp`), `cleanup()`
+  removing it in a `finally` after the request either succeeds or fails - no leaked temp file either way.
+- `extractPstMessages()` (`PstImportUtils.ts`) and `parseMbox()` (`MboxUtils.ts`) are now `AsyncGenerator<Buffer>`s
+  reading directly off a file path (not a `Buffer` parameter at all anymore) and yielding one reconstructed
+  message at a time; `MailboxImportJob.run()`'s loop is `for await` instead of collecting into an array first.
+  `extractPstMessages()` now `fs.stat()`s the path for its own file-size-scaled default budget (previously
+  read off `pstBuffer.length`) and `pstFile.close()`s the fd it opens in a `finally` (new cleanup responsibility
+  that didn't exist for the old Buffer-only constructor, which held no fd at all).
+- `parseMbox()`'s streaming rewrite is the trickier one to get exactly right: the ORIGINAL whole-buffer
+  algorithm matched a separator via `/(?:^|\n)From [^\n]*\n/` - true file start OR a preceding newline. Once
+  the accumulated buffer is periodically trimmed/rebased for a streaming version, "true file start" can no
+  longer be told apart from "start of whatever's left after trimming" by position alone - solved by
+  prepending a single synthetic leading `"\n"` once, up front, unifying both cases into one plain
+  `/\nFrom [^\n]*\n/` match with nothing left to special-case. Verified against a new dedicated test with
+  messages far larger than `fs.createReadStream()`'s default 64 KiB chunk size, to actually exercise the
+  multi-chunk/compaction code path, not just the single-small-buffer happy path every other test happens to take.
+- `DEFAULT_MAX_IMPORT_BYTES` moved again, this time from 90 MiB to 200 MiB - the 90 MiB pick from the prior
+  round was itself part of the wrong fix (tuning a number to sit just under one reference deployment's
+  `max_body_size`, rather than addressing why the buffering existed), so it's now a deliberately round,
+  reasonably generous "interim, not solved" number, with the doc comment explicit that this value is still
+  moot beyond whatever `max_body_size` the deployment allows through until Phase B lands. `RELEASE_NOTES.md`'s
+  "Known Issues" now carries this as its own explicit, honest entry rather than something the earlier fix's
+  wording implied was handled.
+- New/updated tests: `test/util/PstImportUtils.test.ts` (`extractPstMessages()` calls updated to pass the real
+  fixture PATH instead of a pre-read `Buffer`, collected via a small `collectAsync()` helper since it's now a
+  generator), `test/util/MboxUtils.test.ts` (every `parseMbox()` call now goes through a `parseMboxBuffer()`
+  helper that writes to a temp file first; added a malformed-no-separator-at-all case and the large-message
+  multi-chunk case above), `test/blob/LocalFsBlobStore.test.ts` / `test/blob/S3BlobStore.test.ts`
+  (`localPath()` coverage for both), `test/jobs/{mongo,sql}/MailboxImportJob{Mongo,SQL}.test.ts` (two new
+  tests each: a real `LocalFsBlobStore` instance swapped into the job proving `getStream()`/`get()` are never
+  called when `localPath()` is available, and an `InMemoryBlobStore` case proving the temp-file fallback is
+  used - and cleaned up - when it isn't). Every PRE-EXISTING `MailboxImportJob` test kept passing with zero
+  changes, confirming the fallback path is exactly what they were already exercising all along.
+
+**Explicitly NOT done this round (Phase B, by design)**: no presigned/direct-to-S3 upload, no changes to
+`BaseMailboxImportRoute.create()`'s own upload handling, no `service-core` changes from this side - that work
+is being designed/implemented directly in `service-core` (checked out at `d:\github\rapidrest\service-core`)
+by a separate, parallel effort, and `BaseMailboxImportRoute` will be wired onto whatever streaming API it
+produces once it lands.
+
+Files: changed `src/blob/BlobStore.ts` (new optional `localPath()`), `src/blob/LocalFsBlobStore.ts`,
+`src/blob/S3BlobStore.ts`, `src/jobs/MailboxImportJob.ts` (`resolveLocalSourcePath()`, `for await` loop),
+`src/util/PstImportUtils.ts`, `src/util/MboxUtils.ts`, `src/routes/BaseMailboxImportRoute.ts`
+(`DEFAULT_MAX_IMPORT_BYTES` 90 MiB -> 200 MiB, doc comment rewritten), `RELEASE_NOTES.md`, and the test files
+listed above.

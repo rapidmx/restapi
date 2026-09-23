@@ -48,6 +48,23 @@ export interface BlobStore {
     getStream(key: string, range?: BlobRange): Promise<NodeJS.ReadableStream>;
 
     /**
+     * Returns a real, directly-readable path on the LOCAL filesystem for the blob stored under `key`, if this
+     * implementation is itself backed by one (e.g. `LocalFsBlobStore`) - `undefined` otherwise (e.g.
+     * `S3BlobStore`, or any other non-local-filesystem-backed implementation). Optional: an implementation
+     * that never has a local path to offer (or simply doesn't implement this method at all) is exactly
+     * equivalent to always returning `undefined`.
+     *
+     * Exists so a caller that needs true random-access reads over a potentially very large blob (e.g.
+     * `MailboxImportJob`'s PST import, which needs `pst-extractor`'s own random-access `PSTFile` reader, not
+     * a full `Buffer`) can use the blob's own on-disk file directly instead of paying for a full `get()`
+     * read into memory - see `MailboxImportJob.resolveLocalSourcePath()`'s own doc comment for the "no local
+     * path available" fallback (stream once to a temp file instead). The returned path is not guaranteed to
+     * exist if `key` itself doesn't name a real blob - same "let the read fail naturally" contract `get()`
+     * already has for a missing key.
+     */
+    localPath?(key: string): Promise<string | undefined>;
+
+    /**
      * Removes the blob stored under `key`. A no-op if no blob exists at `key`.
      */
     delete(key: string): Promise<void>;
