@@ -15,6 +15,7 @@ import { BaseCalendarEventRoute } from "../../src/routes/BaseCalendarEventRoute.
 
 class TestCalendarEventRoute extends BaseCalendarEventRoute<any> {
     protected mailboxClass: any = class {};
+    protected messageClass: any = class {};
 }
 
 describe("BaseCalendarEventRoute Tests (dependency guard clause only)", () => {
@@ -34,5 +35,16 @@ describe("BaseCalendarEventRoute Tests (dependency guard clause only)", () => {
         const route = objectFactory.newInstance<TestCalendarEventRoute>(TestCalendarEventRoute, { initialize: false });
 
         await expect(route.respond("event-1", { responseStatus: "accepted" }, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
+    });
+
+    it("The invitation endpoints throw INTERNAL_ERROR when repoUtils/blobStore are not set.", async () => {
+        const route = objectFactory.newInstance<TestCalendarEventRoute>(TestCalendarEventRoute, { initialize: false });
+        const user: any = { uid: "user-1" };
+
+        await expect(route.getInvite("message-1", user)).rejects.toThrow(/internal error/i);
+        await expect(route.respondToInvite("message-1", { responseStatus: "accepted" }, user)).rejects.toThrow(/internal error/i);
+        await expect(route.removeInvite("message-1", user)).rejects.toThrow(/internal error/i);
+        await expect(route.proposeNewTime("message-1", {}, user)).rejects.toThrow(/internal error/i);
+        await expect(route.acceptProposal("message-1", user)).rejects.toThrow(/internal error/i);
     });
 });

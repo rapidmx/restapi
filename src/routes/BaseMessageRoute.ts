@@ -107,6 +107,11 @@ export interface ConversationSummary {
     latestPreview: string;
     /** The most recent message's `folderUid`, so a collapsed row can show where the conversation last moved. */
     latestFolderUid: string;
+    /** The most recent message's `meetingMethod` (the iTIP `METHOD` of the calendar file it carries), so a collapsed conversation row can show
+     * an RSVP button without expanding. Absent when the most recent message carries none. */
+    latestMeetingMethod?: string;
+    /** The most recent message's `meetingResponse` - what the mailbox owner answered to its invitation. Absent until they answer. */
+    latestMeetingResponse?: "accepted" | "tentative" | "declined";
 }
 
 /** `Message` fields only server-side code sets (ingest/scan, send, receipts, recall, indexing, compose). A non-trusted
@@ -125,6 +130,8 @@ const SERVER_MANAGED_MESSAGE_FIELDS = [
     "readReceiptSentAt",
     "readReceiptPending",
     "readReceiptDeclined",
+    "meetingResponse",
+    "meetingMethod",
     "deliveryReceiptSentAt",
     "deliveryReceiptPending",
     "deliveryReceiptDeclined",
@@ -235,6 +242,8 @@ function summarizeConversation(conversationId: string, messages: Message[]): Con
         latestFrom: latest.from,
         latestPreview: latest.bodyPreview,
         latestFolderUid: latest.folderUid,
+        latestMeetingMethod: latest.meetingMethod,
+        latestMeetingResponse: latest.meetingResponse,
     };
 }
 

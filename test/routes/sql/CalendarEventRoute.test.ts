@@ -19,8 +19,10 @@ import { Repository } from "typeorm";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
-import { AttendeeResponseStatus, AttendeeRole, BusyStatus, CalendarEventStatus, FolderType, RecipientType } from "../../../src/models/types.js";
-import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
+import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
+import { AttendeeResponseStatus, AttendeeRole, BusyStatus, CalendarEventStatus, FolderType, MessageImportance, RecipientType } from "../../../src/models/types.js";
+import { calendarInviteSuite } from "../calendarInviteSuite.js";
+import { registerTestDoubles, RecordingMailTransport, type InMemoryBlobStore } from "../../testDoubles.js";
 
 describe("Route:CalendarEventSQL Tests", () => {
     const logger = Logger();
@@ -30,6 +32,7 @@ describe("Route:CalendarEventSQL Tests", () => {
     let mailboxRepo: Repository<MailboxSQL>;
     let folderRepo: Repository<FolderSQL>;
     let calendarEventRepo: Repository<CalendarEventSQL>;
+    let messageRepo: Repository<MessageSQL>;
     let aclRepo: Repository<AccessControlListSQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -126,6 +129,7 @@ describe("Route:CalendarEventSQL Tests", () => {
             mailboxRepo = conn.getRepository(MailboxSQL);
             folderRepo = conn.getRepository(FolderSQL);
             calendarEventRepo = conn.getRepository(CalendarEventSQL);
+            messageRepo = conn.getRepository(MessageSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -138,6 +142,7 @@ describe("Route:CalendarEventSQL Tests", () => {
 
     beforeEach(async () => {
         await calendarEventRepo.clear();
+        await messageRepo.clear();
         await folderRepo.clear();
         await mailboxRepo.clear();
         (objectFactory.getInstance<RecordingMailTransport>("MailTransport")!).sent = [];
@@ -810,5 +815,40 @@ describe("Route:CalendarEventSQL Tests", () => {
             expect(result.status).toBe(200);
             expect(result.body).toEqual([]);
         });
+    });
+
+    calendarInviteSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        ownerToken,
+        otherToken: otherUserToken,
+        ownerUid: owner.uid,
+        blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        transport: () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!,
+        createMailbox,
+        createFolder: (mailboxUid, type) => createFolder(mailboxUid, { type, name: type }),
+        createCalendarEvent,
+        createMessage: async (mailboxUid, folderUid, data) =>
+            await messageRepo.save(
+                new MessageSQL({
+                    mailboxUid,
+                    folderUid,
+                    messageId: `${uuid.v4()}@example.com`,
+                    subject: "Invitation: Video Test",
+                    from: { address: "owner@example.com", type: RecipientType.TO },
+                    recipients: [{ address: "recipient@example.com", type: RecipientType.TO }],
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey: `bodies/${uuid.v4()}`,
+                    bodyPreview: "Hello",
+                    flags: { read: false, flagged: false, answered: false, forwarded: false },
+                    importance: MessageImportance.NORMAL,
+                    references: [],
+                    hasAttachments: false,
+                    ...data,
+                }),
+            ),
+        findMessage: async (uid) => (await messageRepo.findOne({ where: { uid } }))!,
+        findEvents: async (mailboxUid) => (await calendarEventRepo.find({ where: { mailboxUid } })).filter((row: any) => !row.deleted),
     });
 });

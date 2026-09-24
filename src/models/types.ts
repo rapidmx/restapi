@@ -1141,6 +1141,20 @@ export interface Message extends RecoverableBaseEntity {
     readReceiptDeclined: boolean;
 
     /**
+     * What the mailbox's owner answered to the meeting invitation this message carries (`POST /calendar-events/invite/:messageUid/respond`):
+     * `accepted`, `tentative` or `declined`. Kept on the message because a decline leaves nothing on the calendar to read it from.
+     * Unset until they answer. Server-managed.
+     */
+    meetingResponse?: "accepted" | "tentative" | "declined";
+
+    /**
+     * The iTIP `METHOD` of the calendar file this message carries (`REQUEST`, `REPLY`, `CANCEL`, `PUBLISH`, `COUNTER`, or `""` for a file that
+     * names none), set when it is delivered. Lets a client show a meeting card - the RSVP button in a message list - without opening every
+     * message to find out. Unset for a message with no calendar file. Server-managed.
+     */
+    meetingMethod?: string;
+
+    /**
      * The per-recipient delivery/read roster - **the client-visible indicator**, shown on the *original sent*
      * message instead of a separate visible receipt email (see this library's whole receipt design). Seeded
      * by `send()` with one entry per address in `recipients` (both timestamps unset) whenever a receipt was

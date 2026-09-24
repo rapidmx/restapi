@@ -325,6 +325,17 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
 
     @Column()
     @Description(
+        "What the mailbox owner answered to the meeting invitation this message carries: accepted, tentative or declined. " +
+            "Unset until they answer.",
+    )
+    public meetingResponse?: "accepted" | "tentative" | "declined";
+
+    @Column()
+    @Description("The iTIP METHOD of the calendar file this message carries (REQUEST, REPLY, CANCEL, PUBLISH, COUNTER), set on delivery.")
+    public meetingMethod?: string;
+
+    @Column()
+    @Description(
         "The per-recipient delivery/read roster - the client-visible indicator shown on the original sent " +
             "message. undefined (not an empty array) when no receipt was ever requested for this message.",
     )
@@ -385,6 +396,8 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.readReceiptDeclined =
                 other.readReceiptDeclined !== undefined ? other.readReceiptDeclined : this.readReceiptDeclined;
             this.receiptStatus = "receiptStatus" in other ? other.receiptStatus : this.receiptStatus;
+            this.meetingResponse = "meetingResponse" in other ? other.meetingResponse : this.meetingResponse;
+            this.meetingMethod = "meetingMethod" in other ? other.meetingMethod : this.meetingMethod;
         }
 
         // Always derived, never copied from `other`: these are server-managed mirrors of `flags`/`from`/

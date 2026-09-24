@@ -18,9 +18,11 @@ import * as uuid from "uuid";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
-import { AttendeeResponseStatus, AttendeeRole, BusyStatus, CalendarEventStatus, FolderType, RecipientType } from "../../../src/models/types.js";
+import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
+import { AttendeeResponseStatus, AttendeeRole, BusyStatus, CalendarEventStatus, FolderType, MessageImportance, RecipientType } from "../../../src/models/types.js";
+import { calendarInviteSuite } from "../calendarInviteSuite.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
-import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
+import { registerTestDoubles, RecordingMailTransport, type InMemoryBlobStore } from "../../testDoubles.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -37,6 +39,7 @@ describe("Route:CalendarEventMongo Tests", () => {
     let mailboxRepo: MongoRepository<MailboxMongo>;
     let folderRepo: MongoRepository<FolderMongo>;
     let calendarEventRepo: MongoRepository<CalendarEventMongo>;
+    let messageRepo: MongoRepository<MessageMongo>;
     let aclRepo: MongoRepository<any>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -132,6 +135,7 @@ describe("Route:CalendarEventMongo Tests", () => {
             mailboxRepo = conn.getMongoRepository("MailboxMongo");
             folderRepo = conn.getMongoRepository("FolderMongo");
             calendarEventRepo = conn.getMongoRepository("CalendarEventMongo");
+            messageRepo = conn.getMongoRepository("MessageMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -144,7 +148,7 @@ describe("Route:CalendarEventMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, folderRepo, calendarEventRepo]) {
+        for (const repo of [mailboxRepo, folderRepo, calendarEventRepo, messageRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -828,5 +832,40 @@ describe("Route:CalendarEventMongo Tests", () => {
             expect(result.status).toBe(200);
             expect(result.body).toEqual([]);
         });
+    });
+
+    calendarInviteSuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        ownerToken,
+        otherToken: otherUserToken,
+        ownerUid: owner.uid,
+        blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        transport: () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!,
+        createMailbox,
+        createFolder: (mailboxUid, type) => createFolder(mailboxUid, { type, name: type }),
+        createCalendarEvent,
+        createMessage: async (mailboxUid, folderUid, data) =>
+            await messageRepo.save(
+                new MessageMongo({
+                    mailboxUid,
+                    folderUid,
+                    messageId: `${uuid.v4()}@example.com`,
+                    subject: "Invitation: Video Test",
+                    from: { address: "owner@example.com", type: RecipientType.TO },
+                    recipients: [{ address: "recipient@example.com", type: RecipientType.TO }],
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey: `bodies/${uuid.v4()}`,
+                    bodyPreview: "Hello",
+                    flags: { read: false, flagged: false, answered: false, forwarded: false },
+                    importance: MessageImportance.NORMAL,
+                    references: [],
+                    hasAttachments: false,
+                    ...data,
+                }),
+            ),
+        findMessage: async (uid) => (await messageRepo.findOne({ uid } as any))!,
+        findEvents: async (mailboxUid) => (await calendarEventRepo.find({ mailboxUid } as any).toArray()).filter((row: any) => !row.deleted),
     });
 });

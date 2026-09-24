@@ -443,7 +443,7 @@ function parseRrule(value: string, tzid?: string): RecurrenceRule {
  * the whole list. See this module's own doc comment for the recurring-meeting (`RECURRENCE-ID` vs.
  * `RRULE`/`EXDATE`) and line-folding conventions.
  */
-export function buildEventIcs(event: CalendarEvent, method: "REQUEST" | "CANCEL" | "REPLY", options?: { onlyAttendee?: Attendee }): string {
+export function buildEventIcs(event: CalendarEvent, method: "REQUEST" | "CANCEL" | "REPLY" | "COUNTER", options?: { onlyAttendee?: Attendee }): string {
     const lines: string[] = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//RapidMX//Mail Server//EN", `METHOD:${method}`, "BEGIN:VEVENT"];
     lines.push(`UID:${stripControlChars(event.icalUid)}`);
     lines.push(`DTSTAMP:${formatDateUtc(new Date())}`);
@@ -469,7 +469,7 @@ export function buildEventIcs(event: CalendarEvent, method: "REQUEST" | "CANCEL"
         }
     }
 
-    const attendeesToEmit = method === "REPLY" ? (options?.onlyAttendee ? [options.onlyAttendee] : []) : event.attendees;
+    const attendeesToEmit = method === "REPLY" || method === "COUNTER" ? (options?.onlyAttendee ? [options.onlyAttendee] : []) : event.attendees;
     for (const attendee of attendeesToEmit) {
         const cn = attendee.displayName ? `;CN=${quoteParamValue(attendee.displayName)}` : "";
         const partstat = `;PARTSTAT=${RESPONSE_STATUS_TO_PARTSTAT[attendee.responseStatus]}`;

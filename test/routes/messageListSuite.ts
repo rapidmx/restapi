@@ -369,6 +369,28 @@ export function messageListSuite(ctx: MessageListSuiteContext): void {
     });
 
     describe("conversations()", () => {
+        it("carries the most recent message's meeting method and the owner's answer, so a collapsed row can show an RSVP button", async () => {
+            const mailbox = await ctx.saveMailbox(owner.uid);
+            const inbox = await ctx.saveFolder(mailbox.uid, FolderType.INBOX);
+            await ctx.saveMessage(mailbox.uid, inbox.uid, { conversationId: "meeting", subject: "Invitation: Sync", receivedDate: day(0), meetingMethod: "REQUEST" });
+            await ctx.saveMessage(mailbox.uid, inbox.uid, { conversationId: "plain", subject: "Hello", receivedDate: day(1) });
+            await ctx.saveMessage(mailbox.uid, inbox.uid, {
+                conversationId: "answered",
+                subject: "Invitation: Standup",
+                receivedDate: day(2),
+                meetingMethod: "REQUEST",
+                meetingResponse: "declined",
+            });
+
+            const all = await get(`/conversations?mailboxUid=${mailbox.uid}`);
+
+            const bySubject = (subject: string) => all.body.find((row: any) => row.subject === subject);
+            expect(bySubject("Invitation: Sync")).toMatchObject({ latestMeetingMethod: "REQUEST" });
+            expect(bySubject("Invitation: Sync").latestMeetingResponse ?? undefined).toBeUndefined();
+            expect(bySubject("Hello").latestMeetingMethod ?? undefined).toBeUndefined();
+            expect(bySubject("Invitation: Standup")).toMatchObject({ latestMeetingMethod: "REQUEST", latestMeetingResponse: "declined" });
+        });
+
         it("reports the fields a collapsed conversation row shows, and restricts to one folder on request", async () => {
             const mailbox = await ctx.saveMailbox(owner.uid);
             const inbox = await ctx.saveFolder(mailbox.uid, FolderType.INBOX);

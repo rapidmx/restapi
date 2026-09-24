@@ -10,20 +10,47 @@ import {
     ApiErrors,
     DocDecorators,
     HttpRequest,
+    ModelUtils,
     RepoUtils,
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
+import { asEntity } from "../util/EntityUtils.js";
 import { boundIndexedValue } from "../util/ConversationUtils.js";
 import { coerceCalendarEventDates } from "../util/DateCoercionUtils.js";
-import { getMailboxUidForFolder } from "../util/FolderUtils.js";
-import { buildEventIcs } from "../util/IcsUtils.js";
+import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
+import { buildEventIcs, expandOccurrences, type ParsedIcsEvent } from "../util/IcsUtils.js";
+import {
+    describeInvite,
+    type InviteScheduleEntry,
+    extractIcsFromRaw,
+    inviteIsAllDay,
+    mailboxAddressSet,
+    messageMayCarryInvite,
+    parseInviteIcs,
+    sameRecurrenceId,
+    type InviteResponse,
+    type MessageInvite,
+} from "../util/MeetingInviteUtils.js";
+import { normalizeAddress } from "../util/AddressUtils.js";
 import { isPlainAddress, safeDisplayName } from "../util/MimeHeaderUtils.js";
+import { nameBasedUuid } from "../util/UuidUtils.js";
+import { BlobStore } from "../blob/BlobStore.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
-import { Attendee, AttendeeResponseStatus, CalendarEvent, Mailbox } from "../models/types.js";
+import {
+    Attendee,
+    AttendeeResponseStatus,
+    AttendeeRole,
+    BusyStatus,
+    CalendarEvent,
+    CalendarEventStatus,
+    FolderType,
+    Mailbox,
+    RecipientType,
+} from "../models/types.js";
 const { Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
-const { Param, Post, Request, User: AuthUser } = RouteDecorators;
+const { Get, Param, Post, Request, User: AuthUser } = RouteDecorators;
 
 /** Most attendees an event written through this route may list - the compose cap of mapi and activesync, and
  * `MeetingSchedulingJob`'s default `max_attendees`. */
@@ -73,10 +100,19 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * `resolveMailboxUidFor()` below. */
     protected abstract folderClass: any;
 
+    /** The concrete `Message` entity class, supplied by the Mongo/SQL concrete subclass - the invitation endpoints read a
+     * message's calendar file and record the reader's answer on it. */
+    protected abstract messageClass: any;
+
     private mailboxRepo?: RepoUtils<any>;
+    private messageRepo?: RepoUtils<any>;
+    private folderRepo?: RepoUtils<any>;
 
     @Inject("MailTransport")
     private mailTransport?: any;
+
+    @Inject("BlobStore")
+    private blobStore?: BlobStore;
 
     /** `icalUid` is bounded (`boundIndexedValue()`) for every caller: an update is written as a patch without the model
      * constructor that normally bounds it, and an over-long value would fail the write on MySQL/MariaDB `varchar(255)`. */
@@ -127,6 +163,16 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             });
         }
         return this.mailboxRepo;
+    }
+
+    private async getMessageRepo(): Promise<RepoUtils<any>> {
+        this.messageRepo ??= await this._objectFactory!.newInstance(RepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
+        return this.messageRepo;
+    }
+
+    private async getFolderRepo(): Promise<RepoUtils<any>> {
+        this.folderRepo ??= await this._objectFactory!.newInstance(RepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
+        return this.folderRepo;
     }
 
     /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `CalendarEvent` carries its
@@ -234,27 +280,501 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             );
         }
 
+        await this.sendItipReply(event, mailbox, respondingAttendee, body.responseStatus, ics);
+
+        return result;
+    }
+
+    /**
+     * Mails the organizer of `event` the iTIP `REPLY` (`ics`) for `responder`'s answer. Best effort: a failure is logged and never
+     * undoes the answer already recorded. The organizer comes from the event (an inbound invite, for an attendee copy): only one plain
+     * address is mailed. The mailbox's display name is left out when it's address-like.
+     */
+    private async sendItipReply(
+        event: Pick<CalendarEvent, "uid" | "title" | "organizer">,
+        mailbox: Mailbox | undefined,
+        responder: Attendee,
+        answer: "accepted" | "declined" | "tentative",
+        ics: string,
+    ): Promise<void> {
+        await this.sendItipMail(
+            event,
+            mailbox,
+            responder,
+            `${answer === "declined" ? "Declined" : answer === "tentative" ? "Tentative" : "Accepted"}: ${event.title}`,
+            `${responder.displayName ?? responder.address} has responded ${answer} to: ${event.title}`,
+            "reply",
+            ics,
+        );
+    }
+
+    /** Mails the organizer of `event` an iTIP message (`ics`, whose method is `method`) from `responder`. Best effort - see `sendItipReply()`. */
+    private async sendItipMail(
+        event: Pick<CalendarEvent, "uid" | "title" | "organizer">,
+        mailbox: Mailbox | undefined,
+        responder: Attendee,
+        subject: string,
+        text: string,
+        method: "reply" | "counter",
+        ics: string,
+    ): Promise<void> {
         try {
-            // The organizer comes from the event (an inbound invite, for an attendee copy): only one plain address is
-            // mailed. The mailbox's display name is left out when it's address-like.
             if (!isPlainAddress(event.organizer?.address)) {
                 throw new Error("the organizer's address isn't one plain email address");
             }
             const fromName: string | undefined = safeDisplayName(mailbox?.displayName);
             const composed: Buffer = await new MailComposer({
-                from: fromName ? { name: fromName, address: respondingAttendee.address } : respondingAttendee.address,
+                from: fromName ? { name: fromName, address: responder.address } : responder.address,
                 to: event.organizer.address,
-                subject: `${body.responseStatus === "declined" ? "Declined" : body.responseStatus === "tentative" ? "Tentative" : "Accepted"}: ${event.title}`,
-                text: `${respondingAttendee.displayName ?? respondingAttendee.address} has responded ${body.responseStatus} to: ${event.title}`,
-                icalEvent: { method: "reply", content: ics },
+                subject,
+                text,
+                icalEvent: { method, content: ics },
             })
                 .compile()
                 .build();
-            await this.mailTransport.send({ raw: composed, envelopeFrom: respondingAttendee.address, envelopeTo: [event.organizer.address] });
+            await this.mailTransport.send({ raw: composed, envelopeFrom: responder.address, envelopeTo: [event.organizer.address] });
         } catch (err: any) {
-            this.logger?.warn(`BaseCalendarEventRoute: failed to send iTIP REPLY for event ${event.uid}: ${err.message}`);
+            this.logger?.warn(`BaseCalendarEventRoute: failed to send iTIP ${method.toUpperCase()} for event ${event.uid}: ${err.message}`);
+        }
+    }
+
+    // ---- The meeting invitation in a message (what a mail client's Accept / Tentative / Decline card is built from) ----
+
+    /**
+     * The invitation a message carries, for the mailbox that received it. The message's calendar file is read from its stored raw
+     * message (a `text/calendar` part or an `.ics` attachment - the one the ingest scan reads), so nothing here trusts what a client
+     * says the invitation is. `404` when the message has none, can't be read (an encrypted body is ciphertext to the server), or the
+     * caller can't see it. A meeting on the calendar already, or a decision the reader made, is folded in - see `MessageInvite`.
+     */
+    @Summary("Read the meeting invitation in a message")
+    @Description(
+        "Reports the calendar invitation a message carries - what it is, who organized it, whether it is on the caller's calendar " +
+            "and what they answered - and which of Accept/Tentative/Decline, Add to calendar or Remove from calendar apply.",
+    )
+    @Returns([Object])
+    @Get("/invite/:messageUid")
+    public async getInvite(@Param("messageUid") messageUid: string, @AuthUser user?: JWTUser): Promise<MessageInvite> {
+        const context = await this.loadInvite(messageUid, user, ACLAction.READ);
+        return await this.describe(context);
+    }
+
+    /**
+     * Answers the invitation in a message as the mailbox that received it, as a mail client's Accept / Tentative / Decline does:
+     *
+     * **Accepted / tentative**: the meeting is put on the calendar (from the message's own calendar file, at the deterministic uid
+     * inbound processing uses, so the two never make two copies) or, if it is there already, the reader's answer on it is updated;
+     * an iTIP `REPLY` is mailed to the organizer. **Declined**: nothing is put on the calendar - a copy already there is removed -
+     * and the `REPLY` is mailed all the same.
+     *
+     * The answer is remembered on the message (`Message.meetingResponse`), so a decline, which leaves nothing on the calendar, is still
+     * shown as one. A `PUBLISH` (or method-less) file can only be added (`accepted`, no reply - there is no one to answer). Answering
+     * your own invitation, a cancellation or a reply is a `400`. Returns the invitation as `getInvite()` then reports it.
+     */
+    @Summary("Answer the meeting invitation in a message")
+    @Description(
+        "Accepts, tentatively accepts or declines the calendar invitation a message carries: accepting puts the meeting on the " +
+            "calendar, declining does not (and removes it if it was there), and an iTIP REPLY is mailed to the organizer either way.",
+    )
+    @Returns([Object])
+    @Post("/invite/:messageUid/respond")
+    public async respondToInvite(
+        @Param("messageUid") messageUid: string,
+        body: { responseStatus?: InviteResponse } | undefined,
+        @AuthUser user?: JWTUser,
+    ): Promise<MessageInvite> {
+        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE);
+        const answer: InviteResponse | undefined = body?.responseStatus;
+        const status: AttendeeResponseStatus | undefined = answer ? RESPOND_STATUS_MAP[answer] : undefined;
+        if (!answer || !status) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'responseStatus' must be accepted, tentative or declined.");
+        }
+        const view: MessageInvite = await this.describe(context);
+        const adding: boolean = view.canAdd && answer === "accepted";
+        if (!view.canRespond && !adding) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                view.isOrganizer ? "You organized this meeting." : "This message's calendar file isn't an invitation that can be answered.",
+            );
         }
 
-        return result;
+        const { parsed, mailbox, message } = context;
+        const listed = parsed.attendees.find((attendee) => context.addresses.has(normalizeAddress(attendee.address)));
+        const responder: Attendee = {
+            address: listed?.address ?? mailbox.primarySmtpAddress,
+            displayName: listed?.displayName ?? safeDisplayName(mailbox.displayName),
+            role: AttendeeRole.REQUIRED,
+            responseStatus: status,
+            isOrganizer: false,
+        };
+
+        if (status === AttendeeResponseStatus.DECLINED) {
+            if (context.existing) {
+                await this.repoUtils!.delete(context.existing.uid, { user, ignoreACL: true });
+            }
+        } else {
+            await this.putInviteOnCalendar(context, responder, user);
+        }
+
+        if (view.method === "REQUEST" && parsed.organizer) {
+            const event = this.eventFromInvite(parsed, [responder], mailbox.uid);
+            const ics: string = buildEventIcs(event, "REPLY", { onlyAttendee: responder });
+            await this.sendItipReply(event, mailbox, responder, answer, ics);
+        }
+
+        await this.recordInviteAnswer(message, answer);
+        message.meetingResponse = answer;
+        const remaining = await this.findInviteRow(mailbox.uid, parsed);
+        return await this.describe(context, { existing: remaining, message });
     }
+
+    /**
+     * Takes the meeting of a cancellation (`METHOD:CANCEL`) off the calendar, as Outlook's "Remove from Calendar" does. Nothing is mailed:
+     * a cancellation isn't answered. `400` for any other kind of message.
+     */
+    @Summary("Remove a cancelled meeting from the calendar")
+    @Description("Deletes the caller's calendar copy of the meeting a cancellation message names.")
+    @Returns([Object])
+    @Post("/invite/:messageUid/remove")
+    public async removeInvite(@Param("messageUid") messageUid: string, @AuthUser user?: JWTUser): Promise<MessageInvite> {
+        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE);
+        const view: MessageInvite = await this.describe(context);
+        if (!view.canRemove || !context.existing) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This message isn't a cancellation of a meeting on your calendar.");
+        }
+        await this.repoUtils!.delete(context.existing.uid, { user, ignoreACL: true });
+        return await this.describe(context, { existing: undefined });
+    }
+
+    /**
+     * Proposes another time for the meeting in a message, as Outlook's "Propose New Time" does: mails the organizer an iTIP `COUNTER`
+     * (with the attendee as the proposer, tentative, and the proposed start and end) and a plain-text note carrying the optional comment.
+     * Nothing changes on the caller's calendar - the organizer decides. `400` unless the message is an invitation the reader can answer.
+     */
+    @Summary("Propose a new time for the meeting in a message")
+    @Description("Mails the organizer an iTIP COUNTER proposing another start and end for the meeting; the caller's calendar is unchanged.")
+    @Returns([Object])
+    @Post("/invite/:messageUid/propose")
+    public async proposeNewTime(
+        @Param("messageUid") messageUid: string,
+        body: { startDate?: string; endDate?: string; comment?: string } | undefined,
+        @AuthUser user?: JWTUser,
+    ): Promise<MessageInvite> {
+        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE);
+        const view: MessageInvite = await this.describe(context);
+        if (!view.canPropose) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This message isn't an invitation you can propose another time for.");
+        }
+        const startDate: Date = new Date(body?.startDate ?? "");
+        const endDate: Date = new Date(body?.endDate ?? "");
+        if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || endDate.getTime() <= startDate.getTime()) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'startDate' and 'endDate' must be ISO 8601 date/times, the end after the start.");
+        }
+        const { parsed, mailbox } = context;
+        const listed = parsed.attendees.find((attendee) => context.addresses.has(normalizeAddress(attendee.address)));
+        const proposer: Attendee = {
+            address: listed?.address ?? mailbox.primarySmtpAddress,
+            displayName: listed?.displayName ?? safeDisplayName(mailbox.displayName),
+            role: AttendeeRole.REQUIRED,
+            responseStatus: AttendeeResponseStatus.TENTATIVE,
+            isOrganizer: false,
+        };
+        const event: CalendarEvent = { ...this.eventFromInvite(parsed, [proposer], mailbox.uid), startDate, endDate, allDay: false };
+        const comment: string = String(body?.comment ?? "")
+            // eslint-disable-next-line no-control-regex
+            .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+            .trim()
+            .slice(0, 2000);
+        const text: string =
+            `${proposer.displayName ?? proposer.address} proposed a new time for: ${event.title}\n\n` +
+            `Proposed: ${startDate.toUTCString()} - ${endDate.toUTCString()}` +
+            (comment ? `\n\n${comment}` : "");
+        await this.sendItipMail(event, mailbox, proposer, `New Time Proposed: ${event.title}`, text, "counter", buildEventIcs(event, "COUNTER", { onlyAttendee: proposer }));
+        return view;
+    }
+
+    /**
+     * Accepts an attendee's proposed time (a `COUNTER` message) for a meeting the reader organizes: moves the meeting to the proposed start and
+     * end, bumps its `SEQUENCE` - so the scheduling job mails every attendee the updated invitation - and resets the other attendees' answers,
+     * since they answered another time. The proposer is marked accepted. `400` unless `canAcceptProposal`.
+     */
+    @Summary("Accept a proposed new time")
+    @Description("Moves the meeting to the time an attendee proposed (an iTIP COUNTER) and re-invites the attendees.")
+    @Returns([Object])
+    @Post("/invite/:messageUid/accept-proposal")
+    public async acceptProposal(@Param("messageUid") messageUid: string, @AuthUser user?: JWTUser): Promise<MessageInvite> {
+        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE);
+        const view: MessageInvite = await this.describe(context);
+        const existing: CalendarEvent | undefined = context.existing;
+        if (!view.canAcceptProposal || !existing || !context.parsed.startDate || !context.parsed.endDate) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This message isn't a proposed time for a meeting you organize.");
+        }
+        const proposer: string = normalizeAddress(view.reply!.address);
+        const patch: any = {
+            uid: existing.uid,
+            version: (existing as any).version,
+            startDate: context.parsed.startDate,
+            endDate: context.parsed.endDate,
+            sequence: existing.sequence + 1,
+            attendees: existing.attendees.map((attendee) =>
+                normalizeAddress(attendee.address) === proposer
+                    ? { ...attendee, responseStatus: AttendeeResponseStatus.ACCEPTED }
+                    : attendee.isOrganizer
+                      ? attendee
+                      : { ...attendee, responseStatus: AttendeeResponseStatus.NEEDS_ACTION },
+            ),
+        };
+        const updated: CalendarEvent = await this.repoUtils!.update(patch, existing as any, { user, ignoreACL: true });
+        await this.recordInviteAnswer(context.message, "accepted");
+        context.message.meetingResponse = "accepted";
+        return await this.describe(context, { existing: updated });
+    }
+
+    /** The `MessageInvite` for `context`, with the schedule around it read from the mailbox's calendar. `overrides` replaces the calendar row or message it describes. */
+    private async describe(context: InviteContext, overrides?: { existing?: CalendarEvent | undefined; message?: any }): Promise<MessageInvite> {
+        const existing: CalendarEvent | undefined = overrides && "existing" in overrides ? overrides.existing : context.existing;
+        const schedule: InviteScheduleEntry[] = await this.loadSchedule(context.mailbox, context.parsed, context.addresses);
+        return describeInvite(context.parsed, context.addresses, existing, overrides?.message ?? context.message, schedule);
+    }
+
+    /**
+     * The reader's own events from 12 hours before the invitation starts to 12 hours after it ends, recurring series expanded, without the
+     * meeting itself. Bounded reads (200 rows each of what overlaps the window and of the recurring masters): a mailbox with more than that
+     * gets a partial schedule, never a failure - it only decorates the card.
+     */
+    private async loadSchedule(mailbox: Mailbox, parsed: ParsedIcsEvent, addresses: Set<string>): Promise<InviteScheduleEntry[]> {
+        if (!parsed.startDate) {
+            return [];
+        }
+        const HOUR: number = 60 * 60 * 1000;
+        const windowStart: Date = new Date(parsed.startDate.getTime() - 12 * HOUR);
+        const windowEnd: Date = new Date((parsed.endDate ?? parsed.startDate).getTime() + 12 * HOUR);
+        const own: string = boundIndexedValue(parsed.uid);
+        try {
+            const overlapping: CalendarEvent[] = await this.repoUtils!.find(
+                { mailboxUid: mailbox.uid, startDate: `lt(${windowEnd.toISOString()})`, endDate: `gt(${windowStart.toISOString()})`, limit: 200 } as any,
+                { ignoreACL: true, limit: 200 },
+            );
+            const masters: CalendarEvent[] = await this.repoUtils!.find({ mailboxUid: mailbox.uid, recurrenceRule: "ne(null)", limit: 200 } as any, {
+                ignoreACL: true,
+                limit: 200,
+            });
+            const rows: Map<string, CalendarEvent> = new Map();
+            for (const row of [...overlapping, ...masters.filter((row) => !row.recurrenceId)]) {
+                rows.set(row.uid, row);
+            }
+            const entries: InviteScheduleEntry[] = [];
+            for (const row of rows.values()) {
+                if (row.icalUid === own || row.status === CalendarEventStatus.CANCELLED) {
+                    continue;
+                }
+                const isMaster: boolean = !!row.recurrenceRule && !row.recurrenceId;
+                const exclude: Date[] | undefined = isMaster
+                    ? [
+                          ...(row.recurrenceRule?.exceptions ?? []),
+                          ...[...rows.values()].filter((other) => other.icalUid === row.icalUid && other.recurrenceId).map((other) => other.recurrenceId!),
+                      ]
+                    : undefined;
+                const mine = row.attendees?.find((attendee) => addresses.has(normalizeAddress(attendee.address)));
+                for (const occurrence of expandOccurrences(
+                    { startDate: row.startDate, endDate: row.endDate, recurrenceRule: row.recurrenceRule, timezone: row.timezone, allDay: row.allDay },
+                    windowStart,
+                    windowEnd,
+                    exclude,
+                )) {
+                    entries.push({
+                        uid: row.uid,
+                        title: row.title ?? "",
+                        startDate: occurrence.start.toISOString(),
+                        endDate: occurrence.end.toISOString(),
+                        allDay: !!row.allDay,
+                        busy: row.busyStatus !== BusyStatus.FREE && mine?.responseStatus !== AttendeeResponseStatus.DECLINED,
+                        tentative: row.busyStatus === BusyStatus.TENTATIVE || mine?.responseStatus === AttendeeResponseStatus.NEEDS_ACTION || mine?.responseStatus === AttendeeResponseStatus.TENTATIVE,
+                    });
+                }
+            }
+            return entries.sort((a, b) => a.startDate.localeCompare(b.startDate)).slice(0, 200);
+        } catch (err: any) {
+            this.logger?.warn(`BaseCalendarEventRoute: couldn't read the schedule around invitation ${parsed.uid}: ${err.message}`);
+            return [];
+        }
+    }
+
+    /** What the invitation endpoints work from: the message, its mailbox, the calendar file's event and the calendar row that already stands for it. */
+    private async loadInvite(messageUid: string, user: JWTUser | undefined, action: string): Promise<InviteContext> {
+        if (!this.repoUtils || !this.blobStore) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const message: any = await (await this.getMessageRepo()).findOne(messageUid, { ignoreACL: true });
+        if (!message) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        if (!(await this.hasMailAccess(user, message.folderUid, action))) {
+            // Reading what isn't yours is as good as not finding it; writing to it is refused.
+            throw action === ACLAction.READ
+                ? new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND)
+                : new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+        const noInvite = (): ApiError => new ApiError(ApiErrors.NOT_FOUND, 404, "This message has no calendar invitation the server can read.");
+        if (!messageMayCarryInvite(message) || !message.bodyBlobKey) {
+            throw noInvite();
+        }
+        let raw: Buffer;
+        try {
+            raw = await this.blobStore.get(message.bodyBlobKey);
+        } catch {
+            throw noInvite();
+        }
+        const ics: string | undefined = await extractIcsFromRaw(raw);
+        const parsed: ParsedIcsEvent | undefined = ics ? parseInviteIcs(ics) : undefined;
+        if (!parsed) {
+            throw noInvite();
+        }
+        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        return { message, mailbox, parsed, addresses: mailboxAddressSet(mailbox), existing: await this.findInviteRow(mailbox.uid, parsed) };
+    }
+
+    /** The mailbox's calendar row for this invitation's own occurrence (or the series, for no `RECURRENCE-ID`), if it has one. The `UID` is a
+     * sender's value and is matched as a literal, exactly: a value like `ne(x)` would otherwise be read as a query operator. */
+    private async findInviteRow(mailboxUid: string, parsed: ParsedIcsEvent): Promise<CalendarEvent | undefined> {
+        const key: string = boundIndexedValue(parsed.uid);
+        const rows: T[] = await this.repoUtils!.find({ mailboxUid, icalUid: ModelUtils.literal(key), limit: 50 } as any, { ignoreACL: true, limit: 50 });
+        return rows.filter((row) => row.icalUid === key).find((row) => sameRecurrenceId(row.recurrenceId, parsed.recurrenceId));
+    }
+
+    /** A calendar-event value for `parsed` - the calendar row to create from it, or the event an iTIP reply is built for. */
+    private eventFromInvite(parsed: ParsedIcsEvent, attendees: Attendee[], mailboxUid: string): CalendarEvent {
+        const start: Date = parsed.startDate ?? new Date();
+        return {
+            mailboxUid,
+            title: parsed.summary ?? "",
+            location: parsed.location,
+            startDate: start,
+            endDate: parsed.endDate ?? start,
+            allDay: inviteIsAllDay(parsed),
+            timezone: parsed.timezone ?? "UTC",
+            organizer: parsed.organizer
+                ? { address: parsed.organizer.address, displayName: parsed.organizer.displayName, type: RecipientType.TO }
+                : { address: "", type: RecipientType.TO },
+            attendees,
+            recurrenceRule: parsed.recurrenceRule,
+            recurrenceId: parsed.recurrenceId,
+            status: CalendarEventStatus.CONFIRMED,
+            busyStatus: BusyStatus.BUSY,
+            icalUid: parsed.uid,
+            sequence: parsed.sequence,
+        } as unknown as CalendarEvent;
+    }
+
+    /** Puts the invitation on the mailbox's calendar with `responder` as the reader's answer, or updates the answer on the copy that is there. */
+    private async putInviteOnCalendar(context: InviteContext, responder: Attendee, user: JWTUser | undefined): Promise<void> {
+        const { parsed, mailbox, addresses } = context;
+        const withAnswer = (attendees: Attendee[]): Attendee[] => {
+            const present = attendees.some((attendee) => addresses.has(normalizeAddress(attendee.address)));
+            return present
+                ? attendees.map((attendee) => (addresses.has(normalizeAddress(attendee.address)) ? { ...attendee, responseStatus: responder.responseStatus } : attendee))
+                : [...attendees, responder];
+        };
+        const busyStatus: BusyStatus = responder.responseStatus === AttendeeResponseStatus.TENTATIVE ? BusyStatus.TENTATIVE : BusyStatus.BUSY;
+
+        for (let attempt = 1; ; attempt++) {
+            const existing: CalendarEvent | undefined = attempt === 1 ? context.existing : await this.findInviteRow(mailbox.uid, parsed);
+            if (existing) {
+                const newer: boolean = parsed.sequence > existing.sequence;
+                const patch: any = {
+                    uid: existing.uid,
+                    version: (existing as any).version,
+                    attendees: withAnswer(existing.attendees),
+                    busyStatus,
+                    ...(newer
+                        ? {
+                              title: parsed.summary ?? existing.title,
+                              location: parsed.location,
+                              startDate: parsed.startDate ?? existing.startDate,
+                              endDate: parsed.endDate ?? existing.endDate,
+                              recurrenceRule: parsed.recurrenceRule ?? existing.recurrenceRule,
+                              sequence: parsed.sequence,
+                              inviteSequenceSent: parsed.sequence,
+                          }
+                        : {}),
+                };
+                try {
+                    await this.repoUtils!.update(patch, existing as any, { user, ignoreACL: true });
+                    return;
+                } catch (err: any) {
+                    if (attempt >= 3 || err?.status !== 409) {
+                        throw err;
+                    }
+                    continue;
+                }
+            }
+
+            const folder = await findOrCreateWellKnownFolder(await this.getFolderRepo(), this.folderClass, mailbox.uid, FolderType.CALENDAR);
+            const attendees: Attendee[] = withAnswer(
+                parsed.attendees.map((attendee) => ({
+                    address: attendee.address,
+                    displayName: attendee.displayName,
+                    role: AttendeeRole.REQUIRED,
+                    responseStatus: attendee.partstat ?? AttendeeResponseStatus.NEEDS_ACTION,
+                    isOrganizer: false,
+                })),
+            );
+            const Entity = this.modelClass;
+            try {
+                await this.repoUtils!.create(
+                    new Entity({
+                        ...this.eventFromInvite(parsed, attendees, mailbox.uid),
+                        // The uid inbound processing (`ScanQueueJob`) derives for the same invitation, so the two can't make two copies.
+                        uid: nameBasedUuid(`itip:${mailbox.uid}:${parsed.uid}:${parsed.recurrenceId ? parsed.recurrenceId.toISOString() : "master"}`),
+                        folderUid: folder.uid,
+                        busyStatus,
+                        // Somebody else's invitation: marked as already sent, so the scheduling job never mails it again as though this mailbox organized it.
+                        inviteSequenceSent: parsed.sequence,
+                    }),
+                    { user, ignoreACL: true },
+                );
+                return;
+            } catch (err: any) {
+                // Inbound processing filed its copy between the lookup and here: answer on that one.
+                if (attempt >= 3 || err?.status !== 409) {
+                    throw err;
+                }
+            }
+        }
+    }
+
+    /** Remembers the reader's answer on the message, retrying once on a version conflict. A failure is logged: the answer itself already stands. */
+    private async recordInviteAnswer(message: any, answer: InviteResponse): Promise<void> {
+        const repo: RepoUtils<any> = await this.getMessageRepo();
+        try {
+            for (let attempt = 1; ; attempt++) {
+                const current: any = attempt === 1 ? message : await repo.findOne(message.uid, { ignoreACL: true });
+                if (!current) {
+                    return;
+                }
+                try {
+                    await repo.update({ uid: current.uid, version: current.version, meetingResponse: answer } as any, asEntity(repo, current), { ignoreACL: true });
+                    return;
+                } catch (err: any) {
+                    if (attempt >= 2 || err?.status !== 409) {
+                        throw err;
+                    }
+                }
+            }
+        } catch (err: any) {
+            this.logger?.warn(`BaseCalendarEventRoute: couldn't record the answer to the invitation in message ${message.uid}: ${err.message}`);
+        }
+    }
+}
+
+/** What the invitation endpoints read from a message and its mailbox. */
+interface InviteContext {
+    message: any;
+    mailbox: Mailbox;
+    parsed: ParsedIcsEvent;
+    addresses: Set<string>;
+    existing: CalendarEvent | undefined;
 }

@@ -346,6 +346,17 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
     @Description("Same as deliveryReceiptDeclined, for a read receipt.")
     public readReceiptDeclined: boolean = false;
 
+    @Column({ type: "varchar", length: 16, nullable: true })
+    @Description(
+        "What the mailbox owner answered to the meeting invitation this message carries: accepted, tentative or declined. " +
+            "Unset until they answer.",
+    )
+    public meetingResponse?: "accepted" | "tentative" | "declined";
+
+    @Column({ type: "varchar", length: 16, nullable: true })
+    @Description("The iTIP METHOD of the calendar file this message carries (REQUEST, REPLY, CANCEL, PUBLISH, COUNTER), set on delivery.")
+    public meetingMethod?: string;
+
     @Column({ type: "simple-json", nullable: true })
     @Description(
         "The per-recipient delivery/read roster - the client-visible indicator shown on the original sent " +
@@ -408,6 +419,8 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
             this.readReceiptDeclined =
                 other.readReceiptDeclined !== undefined ? other.readReceiptDeclined : this.readReceiptDeclined;
             this.receiptStatus = "receiptStatus" in other ? other.receiptStatus : this.receiptStatus;
+            this.meetingResponse = "meetingResponse" in other ? other.meetingResponse : this.meetingResponse;
+            this.meetingMethod = "meetingMethod" in other ? other.meetingMethod : this.meetingMethod;
         }
 
         // Always derived, never copied from `other`: these are server-managed mirrors of `flags`/`from`/

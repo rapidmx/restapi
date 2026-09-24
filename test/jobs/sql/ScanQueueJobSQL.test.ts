@@ -1485,6 +1485,11 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             expect(events[0].encryptionOrigin).toBe("none");
             const calendarFolder = await folderRepo.findOne({ where: { mailboxUid, type: FolderType.CALENDAR } });
             expect(events[0].folderUid).toBe(calendarFolder!.uid);
+            // The delivered message records the calendar file's METHOD, so a client can show its RSVP card without opening it.
+            const inbox = await folderRepo.findOne({ where: { mailboxUid, type: FolderType.INBOX } });
+            const messages = await messageRepo.find({ where: { folderUid: inbox!.uid } });
+            expect(messages).toHaveLength(1);
+            expect(messages[0].meetingMethod).toBe("REQUEST");
         });
 
         it("Preserves encryptionOrigin: 'derived' on an existing event when a later resent REQUEST updates it - encryption state is sticky, never recomputed from the current message.", async () => {

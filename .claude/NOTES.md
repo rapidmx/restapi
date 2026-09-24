@@ -3972,3 +3972,17 @@ cascading across unrelated test files, worse on each successive run (consistent 
 pressure from re-running the ~7,700-test real-DB suite four times in under two hours, not a code defect): none of
 those failures reproduced in isolation, none touched a file this round changed, and a focused run of exactly the
 13 test files this round's changes touch (380 tests) passed cleanly with zero flakes. Committed on that basis.
+
+### 2026-09-24 - Meeting invitations in messages (Accept / Tentative / Decline, RSVP, propose a new time)
+
+JP: an invitation mail with an `.ics` only offered a download; Outlook offers Accept/Decline (and an RSVP button in the list) and mails the sender. Built server-side in restapi, UI in react-shared/web-client.
+
+- **Design.** The endpoints live on `BaseCalendarEventRoute` (`/calendar-events/invite/:messageUid[...]`), not on the message route, because they change the calendar. The route reads the raw message from the `BlobStore` and parses the calendar file itself (`util/MeetingInviteUtils.ts`); a client's word is never used. `messageClass` is a new abstract member (Mongo/SQL subclasses set it).
+- **Same uid as inbound processing.** Accepting creates the calendar row at `nameBasedUuid("itip:<mailbox>:<UID>:<recurrenceId|master>")` with `inviteSequenceSent = SEQUENCE`, exactly what `ScanQueueJob.processItipRequest()` does, so whichever runs first wins and the other updates that row (a 409 on create retries as an update). `inviteSequenceSent` also stops `MeetingSchedulingJob` mailing someone else's invitation as if this mailbox organized it.
+- **Decline** adds nothing (removes a copy that was there) but still mails the `REPLY`; the answer is stored on `Message.meetingResponse`, since there is no calendar row to hold it. Tentative adds the row with `busyStatus: tentative`.
+- **Method-less `.ics`** (`parseIcsEvent()` needs a `METHOD`): `parseInviteIcs()` retries with `METHOD:PUBLISH` inserted, so an exported event can be added. Only `REQUEST` (not own meeting, not cancelled) can be answered; `PUBLISH` can only be added.
+- **REPLY seen from the organizer's side** is an ordinary message; `describeInvite()` reports it as `reply` (who and what) with no buttons. Inbound REPLY processing (`ScanQueueJob.processItipReply()`) already updated the attendee's status - JP's "not parsed" was the mail view showing a bare, nameless attachment.
+- **COUNTER** (propose a new time): outbound built with `buildEventIcs(..., "COUNTER")` (one ATTENDEE, tentative). Inbound COUNTER is not applied automatically; the organizer accepts it with `POST .../accept-proposal`, which only works for an attendee the meeting lists and the message's own `from` (a stranger's forged proposal is a 400). Nothing mails a `DECLINECOUNTER`.
+- **Schedule/conflicts** are computed per GET (three bounded queries: overlapping rows, recurring masters; `expandOccurrences()`), so a mailbox with more than 200 rows in the window gets a partial schedule, never an error.
+- **`Message.meetingMethod`** is set in `ScanQueueJob` at both delivery sites from `result.icsPart`, for any sender (display only - applying an iTIP message still needs a DKIM-verified sender).
+- **Tests.** `test/routes/calendarInviteSuite.ts` runs against both backends from `{mongo,sql}/CalendarEventRoute.test.ts`; `test/util/MeetingInviteUtils.test.ts` covers the pure parts.

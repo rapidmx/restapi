@@ -29,6 +29,7 @@ import { ERASURE_IN_PROGRESS } from "./ErasureExecutionJob.js";
 import { writeContactKeys } from "../util/ContactKeyUtils.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
+import { meetingMethodOf } from "../util/MeetingInviteUtils.js";
 import { extractHeader, extractHeaders, prepareRelayCopy, prependHeaders, safeDisplayName, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
 import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
@@ -1037,6 +1038,7 @@ export abstract class ScanQueueJob<
                     conversationId,
                     inferenceClassification,
                     hasAttachments: storedAttachments.length > 0,
+                    meetingMethod: meetingMethodOf(result.icsPart),
                     labelUids: filterResult.labelUidsToApply,
                     encrypted: result.encrypted,
                     scanResultUid: scanResult.uid,
@@ -1101,6 +1103,7 @@ export abstract class ScanQueueJob<
                     conversationId: copyConversationId,
                     inferenceClassification: copyClassification,
                     hasAttachments: storedAttachments.length > 0,
+                    meetingMethod: meetingMethodOf(result.icsPart),
                     labelUids: filterResult.labelUidsToApply,
                     encrypted: result.encrypted,
                     scanResultUid: scanResult.uid,
