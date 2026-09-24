@@ -6,6 +6,7 @@
 // for the branch a real wired server can never exercise (DI always populates `blobStore` before a
 // request can reach the route). Every other behavior is exercised via real HTTP+DB requests in
 // test/routes/{mongo,sql}/MailboxImportRequestRoute.test.ts.
+import { Readable } from "stream";
 import config from "../config.js";
 import { ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
@@ -30,7 +31,7 @@ describe("BaseMailboxImportRoute Tests (blobStore guard clause only)", () => {
         (route as any).requestRepo = {};
         (route as any).mailboxRepo = {};
         (route as any).folderRepo = {};
-        const req: any = { rawBody: Buffer.from("From x\r\n\r\n") };
+        const req: any = { headers: {}, bodyStream: Readable.from([Buffer.from("From x\r\n\r\n")]) };
 
         await expect(
             route.create(req, "folder-1", "mbox", undefined, { uid: "user-1" } as any),

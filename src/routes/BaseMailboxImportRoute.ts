@@ -58,6 +58,57 @@ function parseContentLength(value: string | string[] | undefined): number | unde
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
+/** Largest request body `create()` will read-and-discard before answering a rejected upload - see `discardSmallBody()`. */
+const MAX_DISCARDED_BODY_BYTES = 1024 * 1024;
+/** Longest `discardSmallBody()` will wait on a client that stalls mid-body before giving up and answering anyway. */
+const DISCARD_BODY_TIMEOUT_MS = 5_000;
+
+/**
+ * Reads and throws away whatever remains of a rejected upload's request body, so the error `create()` is about to
+ * throw actually reaches the client. `@rapidrest/service-core` 2.3.0+ force-closes the connection of a
+ * `@StreamingBody()` route that responds before uWS has received the entire declared body (a defence against a
+ * client that declares a huge `Content-Length` and never sends it) - which, for a route that rejects before ever
+ * touching `req.bodyStream` (a 400/403/404/413 from the checks ahead of the blob write), means the client sees a
+ * bare `ECONNRESET` / "socket hang up" instead of the JSON error. Draining lets a small (or already-arrived) body
+ * finish so the response goes out gracefully.
+ *
+ * Bounded on purpose - this must never turn a rejection into the very multi-GB read the streaming upload exists to
+ * avoid buffering: nothing is read at all when `Content-Length` declares more than `MAX_DISCARDED_BODY_BYTES`, and
+ * for a chunked (undeclared-length) body reading stops once that many bytes have gone by, or after
+ * `DISCARD_BODY_TIMEOUT_MS`. In each of those cases the framework's forced close applies, as it should for an
+ * upload nobody is going to finish sending.
+ */
+async function discardSmallBody(stream: Readable | undefined, declaredLength: number | undefined): Promise<void> {
+    if (!stream || stream.destroyed || stream.readableEnded) {
+        return;
+    }
+    if (declaredLength !== undefined && declaredLength > MAX_DISCARDED_BODY_BYTES) {
+        return;
+    }
+    await new Promise<void>((resolve) => {
+        let discarded = 0;
+        const timer: NodeJS.Timeout = setTimeout(finish, DISCARD_BODY_TIMEOUT_MS);
+        function onData(chunk: Buffer | string): void {
+            discarded += chunk.length;
+            if (discarded > MAX_DISCARDED_BODY_BYTES) {
+                finish();
+            }
+        }
+        function finish(): void {
+            clearTimeout(timer);
+            stream!.off("data", onData);
+            stream!.off("end", finish);
+            stream!.off("error", finish);
+            stream!.off("close", finish);
+            resolve();
+        }
+        stream.on("data", onData);
+        stream.once("end", finish);
+        stream.once("error", finish);
+        stream.once("close", finish);
+    });
+}
+
 /**
  * Wraps `source` (`create()`'s `req.bodyStream`) in a new `Readable` that passes every chunk through
  * unchanged but destroys itself - and, since `for await` propagates a thrown error back into `source`'s own
@@ -218,6 +269,31 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         @AuthUser user?: JWTUser,
     ): Promise<T> {
         await this.init();
+        let target: { mailboxUid: string; remainingQuota: number };
+        try {
+            target = await this.resolveUploadTarget(req, targetFolderUid, format, mailboxUidParam, user);
+        } catch (err: any) {
+            // Every rejection ahead of the blob write funnels through here - see `discardSmallBody()` for why the
+            // (small) unread body has to be dealt with before the error can reach the client at all.
+            await discardSmallBody(req.bodyStream, parseContentLength(req.headers["content-length"]));
+            throw err;
+        }
+        const { mailboxUid, remainingQuota } = target;
+        return await this.storeUpload(req.bodyStream!, targetFolderUid!, format!, mailboxUid, remainingQuota, user!);
+    }
+
+    /**
+     * Everything `create()` checks before a single byte of `req.bodyStream` is consumed: the caller, format,
+     * `targetFolderUid`, `Content-Length` and mailbox/folder/quota gates described on `create()` itself. Returns
+     * the resolved target mailbox and how much quota it has left, or throws the `ApiError` `create()` answers with.
+     */
+    private async resolveUploadTarget(
+        req: HttpRequest,
+        targetFolderUid: string | undefined,
+        format: MailboxImportFormat | undefined,
+        mailboxUidParam: string | undefined,
+        user: JWTUser | undefined,
+    ): Promise<{ mailboxUid: string; remainingQuota: number }> {
         if (!user) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
@@ -289,20 +365,36 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         if (declaredLength !== undefined && declaredLength > remainingQuota) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 413, "This mailbox does not have enough remaining storage quota for a file this large.");
         }
+        return { mailboxUid, remainingQuota };
+    }
 
+    /**
+     * The part of `create()` that finally consumes `bodyStream`: streams it into the blob store under the smaller of
+     * `maxImportBytes`/`remainingQuota`, then queues the `MailboxImportRequest` for `MailboxImportJob`. Any failure
+     * here has already consumed (or destroyed) the stream, so unlike `resolveUploadTarget()`'s rejections there's
+     * nothing left to discard before answering.
+     */
+    private async storeUpload(
+        bodyStream: Readable,
+        targetFolderUid: string,
+        format: MailboxImportFormat,
+        mailboxUid: string,
+        remainingQuota: number,
+        user: JWTUser,
+    ): Promise<T> {
         const sourceBlobKey = `mailbox-imports/${crypto.randomUUID()}`;
         // The SMALLER of the two ceilings applies - still just one running byte count, `withByteLimit()`
         // itself has no notion of "why" its limit is what it is (see the quota pre-check above for why this
         // is a coarse mid-stream sanity bound, not a real charge).
         const effectiveMaxBytes: number = Math.min(this.maxImportBytes, remainingQuota);
         const quotaIsTighterLimit: boolean = remainingQuota < this.maxImportBytes;
-        const counted = withByteLimit(req.bodyStream, effectiveMaxBytes);
+        const counted = withByteLimit(bodyStream, effectiveMaxBytes);
         try {
-            await this.blobStore.put(sourceBlobKey, counted.stream, {
+            await this.blobStore!.put(sourceBlobKey, counted.stream, {
                 contentType: format === "pst" ? "application/vnd.ms-outlook" : "application/mbox",
             });
         } catch (err: any) {
-            await this.blobStore.delete(sourceBlobKey).catch(() => undefined);
+            await this.blobStore!.delete(sourceBlobKey).catch(() => undefined);
             if (counted.exceeded()) {
                 if (quotaIsTighterLimit) {
                     throw new ApiError(ApiErrors.INVALID_REQUEST, 413, "This mailbox does not have enough remaining storage quota for a file this large.");
@@ -312,7 +404,7 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
             throw err;
         }
         if (counted.total() === 0) {
-            await this.blobStore.delete(sourceBlobKey).catch(() => undefined);
+            await this.blobStore!.delete(sourceBlobKey).catch(() => undefined);
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
 

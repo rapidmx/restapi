@@ -9,8 +9,9 @@
 //
 // Deliberately NOT a real-HTTP test: test/routes/{mongo,sql}/MailboxImportRequestRoute.test.ts already
 // cover the full request/response contract (400/413/403/404/etc) end to end against a real server and the
-// InMemoryBlobStore test double, and still pass unmodified (Content-Length is present for every Buffer body
-// they `.send()`, so the pre-stream size/empty checks fire exactly where they always did). What's new here -
+// InMemoryBlobStore test double, and still pass (Content-Length is present for every Buffer body they `.send()`, so the
+// pre-stream size/empty checks fire exactly where they always did, and a rejected small body is drained first -
+// see discardSmallBody()). What's new here -
 // that the internal bodyStream -> blobStore.put(stream) data flow genuinely streams, never buffers, against
 // each REAL blob store backend - doesn't need a real HTTP round-trip to prove, only a real BlobStore on one
 // side and a synthetic `req.bodyStream` on the other (mirroring BaseFolderRoute.test.ts's own established
@@ -228,7 +229,7 @@ describe("BaseMailboxImportRoute.create() streaming upload (req.bodyStream, @Str
         });
     });
 
-    it("rejects an oversized upload (413) from Content-Length alone, before req.bodyStream is ever read at all.", async () => {
+    it("rejects an oversized upload (413) from Content-Length alone, without ever reading a huge declared body - and never writes a blob.", async () => {
         const store = new LocalFsBlobStore();
         const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "restapi-mailbox-import-route-streaming-cl-"));
         (store as any).root = tempRoot;
@@ -237,9 +238,102 @@ describe("BaseMailboxImportRoute.create() streaming upload (req.bodyStream, @Str
             const stream = chunkedStream([Buffer.alloc(10)]);
             const readSpy = vi.spyOn(stream, "read");
 
-            await expect(route.create(makeReq(stream, 1_000), folder.uid, "mbox", undefined, user)).rejects.toMatchObject({ status: 413 });
+            // 2 MiB declared: past what discardSmallBody() is willing to read-and-discard, so the stream is left
+            // entirely alone (the framework force-closes that connection instead - see discardSmallBody()'s doc).
+            await expect(route.create(makeReq(stream, 2 * 1024 * 1024), folder.uid, "mbox", undefined, user)).rejects.toMatchObject({ status: 413 });
 
             expect(readSpy).not.toHaveBeenCalled();
+            expect(await listFiles(tempRoot)).toEqual([]);
+        } finally {
+            await fs.rm(tempRoot, { recursive: true, force: true });
+        }
+    });
+
+    describe("discarding the unread body of a rejected upload (@rapidrest/service-core 2.3.0 force-closes a streaming route's connection if it responds first)", () => {
+        it("reads a small rejected body to its end before throwing, so the error can reach the client instead of a reset connection.", async () => {
+            const route = makeRoute(new LocalFsBlobStore(), 100);
+            const stream = chunkedStream([Buffer.alloc(60, 1), Buffer.alloc(60, 2)]);
+
+            await expect(route.create(makeReq(stream, 120), folder.uid, "mbox", undefined, user)).rejects.toMatchObject({ status: 413 });
+
+            expect(stream.readableEnded).toBe(true);
+        });
+
+        it("does the same for a validation failure (400) and for a chunked body with no Content-Length at all.", async () => {
+            const route = makeRoute(new LocalFsBlobStore());
+            const stream = chunkedStream([Buffer.from("hello "), Buffer.from("world")]);
+
+            await expect(route.create(makeReq(stream), folder.uid, "nope" as any, undefined, user)).rejects.toMatchObject({ status: 400 });
+
+            expect(stream.readableEnded).toBe(true);
+        });
+
+        it("stops reading a chunked body that keeps going past the discard limit, rather than draining an arbitrarily large upload just to answer 400.", async () => {
+            const route = makeRoute(new LocalFsBlobStore());
+            // 4 x 600 KiB with no Content-Length: the 1 MiB discard cap is crossed on the 2nd chunk.
+            const chunks = [1, 2, 3, 4].map((n) => Buffer.alloc(600 * 1024, n));
+            const stream = chunkedStream(chunks);
+
+            await expect(route.create(makeReq(stream), folder.uid, "nope" as any, undefined, user)).rejects.toMatchObject({ status: 400 });
+
+            expect(stream.readableEnded).toBe(false);
+            stream.destroy();
+        });
+
+        it("gives up on a client that stalls mid-body after the discard timeout and still answers.", async () => {
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+            try {
+                const route = makeRoute(new LocalFsBlobStore());
+                const stalled = new Readable({ read() { /* never pushes anything, never ends */ } });
+                const pending = route.create(makeReq(stalled, 10), folder.uid, "nope" as any, undefined, user);
+                const assertion = expect(pending).rejects.toMatchObject({ status: 400 });
+
+                await vi.advanceTimersByTimeAsync(5_000);
+
+                await assertion;
+                stalled.destroy();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it("answers even when the body stream errors while being discarded.", async () => {
+            const route = makeRoute(new LocalFsBlobStore());
+            const broken = new Readable({
+                read() {
+                    this.destroy(new Error("client disconnected"));
+                },
+            });
+
+            await expect(route.create(makeReq(broken, 10), folder.uid, "nope" as any, undefined, user)).rejects.toMatchObject({ status: 400 });
+        });
+
+        it("does not touch a body stream that has already ended or been destroyed.", async () => {
+            const route = makeRoute(new LocalFsBlobStore());
+            const ended = Readable.from([]);
+            await new Promise((resolve) => ended.resume().on("end", resolve));
+            const destroyed = new Readable({ read() { /* never reached - destroyed below */ } });
+            destroyed.destroy();
+
+            await expect(route.create(makeReq(ended, 10), folder.uid, "nope" as any, undefined, user)).rejects.toMatchObject({ status: 400 });
+            await expect(route.create(makeReq(destroyed, 10), folder.uid, "nope" as any, undefined, user)).rejects.toMatchObject({ status: 400 });
+        });
+    });
+
+    it("aborts mid-stream (413, quota message) when the running byte count exceeds the mailbox's remaining quota - tighter than maxImportBytes - even with no Content-Length declared, leaving no blob behind.", async () => {
+        const store = new LocalFsBlobStore();
+        const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "restapi-mailbox-import-route-streaming-quota-"));
+        (store as any).root = tempRoot;
+        try {
+            const route = makeRoute(store);
+            const quotaMailbox: any = { uid: mailbox.uid, ownerUserUid: user.uid, quotaBytes: 100, usedBytes: 40 }; // 60 bytes left
+            (route as any).mailboxRepo.findOne = vi.fn(async () => quotaMailbox);
+            const chunks = [Buffer.alloc(40, 1), Buffer.alloc(40, 2)]; // 80 > 60 remaining, far under maxImportBytes
+
+            const err: any = await route.create(makeReq(chunkedStream(chunks)), folder.uid, "mbox", undefined, user).catch((e) => e);
+
+            expect(err.status).toBe(413);
+            expect(err.message).toMatch(/remaining storage quota/);
             expect(await listFiles(tempRoot)).toEqual([]);
         } finally {
             await fs.rm(tempRoot, { recursive: true, force: true });

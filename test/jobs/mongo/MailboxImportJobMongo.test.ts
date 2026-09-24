@@ -898,6 +898,53 @@ describe("MailboxImportJobMongo Tests (real DB + DI)", () => {
         expect(await blobStore.exists(exhaustedSourceBlobKey)).toBe(false);
     });
 
+    it("Still records a failed import's own outcome when deleting its uploaded source blob afterward itself fails - a cleanup failure is logged, never surfaced in place of the real result.", async () => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        await blobStore.put(sourceBlobKey, buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01")));
+        const request = await createRequest({ mailboxUid: uuid.v4(), sourceBlobKey });
+        const deleteSpy = vi.spyOn(blobStore, "delete").mockRejectedValue(new Error("simulated blob delete failure"));
+
+        let deleteCalls: any[][];
+        try {
+            await job.run();
+        } finally {
+            deleteCalls = [...deleteSpy.mock.calls];
+            deleteSpy.mockRestore();
+        }
+
+        expect(deleteCalls).toContainEqual([sourceBlobKey]);
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.status).toBe("failed");
+        expect(updated!.errorMessage).toContain("no longer exists");
+    });
+
+    it("Still marks an abandoned import failed after max_attempts when deleting its uploaded source blob itself fails - logged, not a reason to leave the request stuck 'processing'.", async () => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const sourceBlobKey = `mailbox-imports/${uuid.v4()}`;
+        await blobStore.put(sourceBlobKey, buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01")));
+        const exhausted = await createRequest({
+            status: "processing",
+            processingAttempts: 3,
+            dateModified: new Date(Date.now() - 3 * 60 * 60_000),
+            sourceBlobKey,
+        });
+        const deleteSpy = vi.spyOn(blobStore, "delete").mockRejectedValue(new Error("simulated blob delete failure"));
+
+        let deleteCalls: any[][];
+        try {
+            await job.run();
+        } finally {
+            deleteCalls = [...deleteSpy.mock.calls];
+            deleteSpy.mockRestore();
+        }
+
+        expect(deleteCalls).toContainEqual([sourceBlobKey]);
+        const updated = await requestRepo.findOne({ uid: exhausted.uid } as any);
+        expect(updated!.status).toBe("failed");
+        expect(updated!.errorMessage).toContain("did not complete after 3 attempt(s)");
+    });
+
     it("Aborts without completing when its lease is lost mid-import (another replica reclaimed the request).", async () => {
         const mailbox = await createMailbox();
         const folder = await createFolder(mailbox.uid);
