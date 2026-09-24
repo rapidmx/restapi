@@ -312,12 +312,48 @@ export function matchesAllowedPackage(name: string, patterns: string[]): boolean
     });
 }
 
-/** The value each of `manifest`'s settings starts with: its declared default, where it has one. */
-export function defaultPluginSettings(manifest: PluginManifest): Record<string, string | number | boolean> {
+/** Stands for this server's own host name inside a string setting's default, such as `https://<host>/meet`. It's filled
+ * in when the plugin is installed (see `defaultPluginSettings()`) and offered by the admin console's form until then. */
+export const PLUGIN_HOST_PLACEHOLDER = "<host>";
+
+/** Whether `setting`'s default needs the host filled in (see `PLUGIN_HOST_PLACEHOLDER`). */
+export function hasHostPlaceholder(setting: Pick<PluginSettingDefinition, "default">): boolean {
+    return typeof setting.default === "string" && setting.default.includes(PLUGIN_HOST_PLACEHOLDER);
+}
+
+/** A host name with an optional port - what a `Host` header holds - lowercased, or `undefined` for anything else (so
+ * nothing but a plain host is ever put into a saved URL). */
+export function normalizePluginHost(value: unknown): string | undefined {
+    const host: string = typeof value === "string" ? value.trim().toLowerCase() : "";
+    return /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$/.test(host) ? host : undefined;
+}
+
+/** The host a request reached the server at: the first `X-Forwarded-Host` (a proxy in front, as the gateway is), else `Host`. */
+export function pluginHostOfRequest(headers: Record<string, unknown> | undefined): string | undefined {
+    const forwarded: unknown = headers?.["x-forwarded-host"];
+    const first: unknown = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.toString().split(",")[0];
+    return normalizePluginHost(first) ?? normalizePluginHost(headers?.host);
+}
+
+/** `setting`'s default with `host` filled in, or `undefined` when it needs a host that isn't known. */
+export function resolveHostDefault(setting: Pick<PluginSettingDefinition, "default">, host: string | undefined): string | undefined {
+    if (!hasHostPlaceholder(setting)) {
+        return undefined;
+    }
+    return host ? (setting.default as string).split(PLUGIN_HOST_PLACEHOLDER).join(host) : undefined;
+}
+
+/**
+ * The value each of `manifest`'s settings starts with: its declared default, where it has one. A default naming the host
+ * (`https://<host>/meet`) gets `host`, the address this server is reached at, so the plugin works as installed; with no
+ * host known it's left unset and the plugin's own default applies.
+ */
+export function defaultPluginSettings(manifest: PluginManifest, host?: string): Record<string, string | number | boolean> {
     const result: Record<string, string | number | boolean> = {};
     for (const setting of manifest.settings ?? []) {
-        if (setting.default !== undefined) {
-            result[setting.key] = setting.default;
+        const value: string | number | boolean | undefined = hasHostPlaceholder(setting) ? resolveHostDefault(setting, host) : setting.default;
+        if (value !== undefined) {
+            result[setting.key] = value;
         }
     }
     return result;

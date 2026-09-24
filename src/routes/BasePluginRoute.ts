@@ -44,6 +44,8 @@ import {
     PLUGIN_STATUS_KEY,
     PLUGIN_STATUS_MAX_AGE_MS,
     PluginInstanceStatus,
+    pluginHostOfRequest,
+    resolveHostDefault,
     validatePluginSettings,
 } from "../plugins/PluginUtils.js";
 const { Config, Logger } = ObjectDecorators;
@@ -523,7 +525,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
     }
 
     /** Creates, or revives the removed row of, a plugin at a resolved version, recording how to undo that. */
-    private async installRow(install: PlannedPluginInstall, user: JWTUser | undefined, undo: PluginUndo[]): Promise<T> {
+    private async installRow(install: PlannedPluginInstall, user: JWTUser | undefined, undo: PluginUndo[], host?: string): Promise<T> {
         const [found]: T[] = await this.pluginRepo!.find({ name: install.name } as any, { ignoreACL: true, limit: 1, skipCache: true });
         // An entity instance, so reviving the row below is version-checked (see `installedPlugins()`).
         const existing: T | undefined = found ? asEntity(this.pluginRepo!, found) : undefined;
@@ -537,7 +539,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
             integrity: install.integrity,
             enabled: true,
             removed: false,
-            settings: defaultPluginSettings(install.manifest),
+            settings: defaultPluginSettings(install.manifest, host),
             manifest: install.manifest,
         };
         const options = { user, ignoreACL: true };
@@ -577,7 +579,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
     private async applyPlan(plan: PluginChangePlan, installed: T[], req: HttpRequest, user: JWTUser | undefined, undo: PluginUndo[]): Promise<T[]> {
         const changed: T[] = [];
         for (const install of plan.install) {
-            const row: T = await this.installRow(install, user, undo);
+            const row: T = await this.installRow(install, user, undo, pluginHostOfRequest(req.headers));
             await this.audit(req, user, AuditAction.PLUGIN_INSTALL, row, { packageVersion: row.packageVersion });
             changed.push(row);
         }
@@ -682,9 +684,27 @@ export abstract class BasePluginRoute<T extends Plugin> {
         );
     }
 
+    /**
+     * `GET /registry?name=<package>[&packageVersion=<version>]` - the same lookup as `GET /registry/:name`, for a
+     * package name sent in the query string. A scoped name in the path needs its `/` escaped as `%2F`, which a proxy in
+     * front of the server (Envoy Gateway's default) unescapes and redirects to a path that matches no route.
+     */
+    @RequiresTrustedRole()
+    @Get("/registry")
+    public async lookupByName(@Query("name") name?: unknown, @Query("packageVersion") packageVersion?: string): Promise<PluginRegistryLookup> {
+        if (typeof name !== "string" || !name.trim()) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'name' is required.");
+        }
+        return this.lookupPackage(name.trim(), packageVersion);
+    }
+
     @RequiresTrustedRole()
     @Get("/registry/:name")
     public async lookup(@Param("name") name: string, @Query("packageVersion") packageVersion?: string): Promise<PluginRegistryLookup> {
+        return this.lookupPackage(name, packageVersion);
+    }
+
+    private async lookupPackage(name: string, packageVersion?: string): Promise<PluginRegistryLookup> {
         this.assertAllowed(name);
         const session: RegistrySession = this.registrySession();
         const pkg: RegistryPackage | undefined = await this.registryCall(() => session.getPackage(name));
@@ -750,7 +770,12 @@ export abstract class BasePluginRoute<T extends Plugin> {
 
         return this.applyChange(installed, this.changedNames(name, plan), async (undo) => {
             const dependencies: T[] = await this.applyPlan(plan, installed, req, user, undo);
-            const created: T = await this.installRow({ name, version: found.version, integrity: found.integrity, manifest: found.manifest }, user, undo);
+            const created: T = await this.installRow(
+                { name, version: found.version, integrity: found.integrity, manifest: found.manifest },
+                user,
+                undo,
+                pluginHostOfRequest(req.headers),
+            );
             await this.audit(req, user, AuditAction.PLUGIN_INSTALL, created, { packageVersion: found.version });
             return { plugin: created, dependencies };
         });
@@ -810,6 +835,16 @@ export abstract class BasePluginRoute<T extends Plugin> {
             const known: Set<string> = new Set(manifest.settings!.map((setting) => setting.key));
             const candidate: Record<string, unknown> =
                 obj?.settings ?? Object.fromEntries(Object.entries(existing.settings).filter(([key]) => known.has(key)));
+            if (obj?.settings === undefined) {
+                // A version whose manifest names the host in a setting's default (`https://<host>/meet`) starts using it when the
+                // setting has no value yet - the way a fresh install would.
+                for (const setting of manifest.settings!) {
+                    const suggested: string | undefined = resolveHostDefault(setting, pluginHostOfRequest(req.headers));
+                    if (suggested !== undefined && (candidate[setting.key] === undefined || candidate[setting.key] === "")) {
+                        candidate[setting.key] = suggested;
+                    }
+                }
+            }
             try {
                 patch.settings = validatePluginSettings(manifest, candidate);
             } catch (err: any) {

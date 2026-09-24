@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Looking a plugin package up by name failed behind Envoy Gateway.** `GET /system/plugins/registry/:name` carried a scoped package name as `%40rapidmx%2Fbooking-plugin` in the path, and Envoy Gateway's default (`escapedSlashesAction: UnescapeAndRedirect`) unescapes the `%2F` and redirects to `/registry/@rapidmx/booking-plugin`, which matches no route - so the admin console's "Add by name" answered "Request failed." for every scoped package. `GET /registry?name=<package>[&packageVersion=<version>]` (`lookupByName()`) is the same lookup with the name in the query string, as `GET /plan` already takes it; the path form stays for existing clients.
+
+### Added
+
+- **`POST /mailboxes/auto-provision` takes the caller's time zone.** A `timezone` in the body (an IANA name such as `America/Los_Angeles`, from the caller's device) becomes the new mailbox's time zone; one that isn't a time zone (`isValidTimeZone()`, new in `util/TimeZoneUtils.ts`) or none at all gives UTC as before.
+
+- **A string plugin setting's `default` may contain `<host>`** (`PLUGIN_HOST_PLACEHOLDER`), such as `https://<host>/meet`, so a plugin can work as installed. `POST /` (and a dependency it installs) saves the host the request reached - the first `X-Forwarded-Host`, else `Host`, checked to be a plain host name (`pluginHostOfRequest()`) - and `PUT /:id` does the same when a new version declares such a setting that has no value yet (or an empty one). `defaultPluginSettings(manifest, host?)` takes the host, for callers with none from a request (the server passes its configured host name when it seeds the default plugins); without one the setting is left unset, never saved as the literal placeholder.
+
 ## v0.20.1
 
 ### Fixed

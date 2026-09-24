@@ -320,6 +320,28 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
         expect(result.status).toBe(400);
     });
 
+    it("Gives the mailbox the time zone the caller's device reported, and UTC when there is none or it isn't one.", async () => {
+        mockAliasList(["jsteinmetz"]);
+        const created = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken).send({
+            alias: "jsteinmetz",
+            domain: "example.org",
+            timezone: "America/Los_Angeles",
+        });
+        expect(created.status).toBe(200);
+        expect(created.body.mailbox.timezone).toBe("America/Los_Angeles");
+    });
+
+    it("Falls back to UTC for a time zone that isn't one.", async () => {
+        mockAliasList(["jsteinmetz"]);
+        const created = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken).send({
+            alias: "jsteinmetz",
+            domain: "example.org",
+            timezone: "Mars/Olympus",
+        });
+        expect(created.status).toBe(200);
+        expect(created.body.mailbox.timezone).toBe("UTC");
+    });
+
     it("Creates the mailbox (with its well-known folders) for a valid chosen alias/domain, and returns status 'created'.", async () => {
         mockAliasList(["jsteinmetz"]);
 

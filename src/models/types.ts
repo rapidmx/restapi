@@ -2473,6 +2473,8 @@ export interface PluginSettingDefinition {
     label: string;
     type: PluginSettingType;
     help?: string;
+    /** A `string` default may contain `<host>` (`https://<host>/meet`), which is replaced by this server's host when the
+     * plugin is installed, so it works as installed. Left unset when the host isn't known. */
     default?: string | number | boolean;
     required?: boolean;
     /** Inclusive bounds for `number` settings. */

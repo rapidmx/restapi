@@ -22,6 +22,7 @@ import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
 import { assertAdminScope, hasMailAccess, isAdminScope, isTrustedUser, stripTrustedRoles } from "../util/MailAccessUtils.js";
 import { getPrimaryDomainNames } from "../util/DomainUtils.js";
 import { ensureWellKnownFolders } from "../util/FolderUtils.js";
+import { DEFAULT_TIME_ZONE, isValidTimeZone } from "../util/TimeZoneUtils.js";
 import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { hasAddressLikeDisplayName } from "../util/MimeHeaderUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
@@ -1346,7 +1347,8 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * and offers the caller the full cross product of those aliases against this server's verified
      * domains — a deployment can serve more than one domain, and the caller should get to pick which
      * (alias, domain) pair they want, not have one silently chosen for them even when there's only one
-     * possible combination. So with no `body.alias`/`body.domain`, this *always* returns `needs_selection`
+     * possible combination. A `body.timezone` (an IANA name, from the caller's device) becomes the mailbox's time zone,
+     * else UTC. So with no `body.alias`/`body.domain`, this *always* returns `needs_selection`
      * rather than creating anything; only a call that supplies both, validated fresh against the real
      * alias list and the verified domain list (never trusted blindly), actually creates the mailbox.
      *
@@ -1358,7 +1360,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     @Post("/auto-provision")
     public async autoProvision(
         @Request req: HttpRequest,
-        body: { alias?: string; domain?: string } | undefined,
+        body: { alias?: string; domain?: string; timezone?: string } | undefined,
         @AuthUser user?: JWTUser,
     ): Promise<MailboxAutoProvisionResult<T>> {
         if (!user) {
@@ -1410,7 +1412,8 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             primarySmtpAddress: `${body.alias}@${body.domain}`,
             displayName: body.alias,
             ownerUserUid: user.uid,
-            timezone: "UTC",
+            // The time zone the caller's device reports, when it is one (its owner can change it in their settings); UTC otherwise.
+            timezone: isValidTimeZone(body?.timezone) ? body.timezone : DEFAULT_TIME_ZONE,
             quotaBytes: policy.autoProvisionQuotaBytes,
         } as T;
         const mailbox = (await this.createMailboxes(requested, [requested], req, user, UserUtils.hasRoles(user, this.trustedRoles))) as T;

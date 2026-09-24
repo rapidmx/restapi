@@ -8,11 +8,15 @@ import {
     computePluginStateHash,
     defaultPluginSettings,
     findPluginNamespace,
+    hasHostPlaceholder,
     isExactVersion,
     isNewerVersion,
     missingRequiredSettings,
     isValidPackageName,
     normalizeAllowedPackages,
+    normalizePluginHost,
+    pluginHostOfRequest,
+    resolveHostDefault,
     normalizePluginNamespaces,
     matchesAllowedPackage,
     parsePluginManifest,
@@ -195,6 +199,48 @@ describe("defaultPluginSettings", () => {
     it("collects declared defaults", () => {
         expect(defaultPluginSettings(manifest)).toEqual({ "a:number": 5, "a:required": "dflt" });
         expect(defaultPluginSettings({ apiVersion: 1, displayName: "X" })).toEqual({});
+    });
+
+    it("fills a default that names the host with the host, and leaves it unset when there is none", () => {
+        const withHost: PluginManifest = {
+            apiVersion: PLUGIN_API_VERSION,
+            displayName: "Host",
+            settings: [
+                { key: "h:url", label: "URL", type: "string", default: "https://<host>/meet" },
+                { key: "h:other", label: "Other", type: "string", default: "https://example.com" },
+            ],
+        };
+        expect(defaultPluginSettings(withHost)).toEqual({ "h:other": "https://example.com" });
+        expect(defaultPluginSettings(withHost, "mail.example.com")).toEqual({ "h:url": "https://mail.example.com/meet", "h:other": "https://example.com" });
+        expect(hasHostPlaceholder(withHost.settings![0])).toBe(true);
+        expect(hasHostPlaceholder(withHost.settings![1])).toBe(false);
+        expect(hasHostPlaceholder({ default: 5 })).toBe(false);
+        expect(hasHostPlaceholder({})).toBe(false);
+    });
+});
+
+describe("host helpers", () => {
+    it("accepts only a plain host name, with an optional port, lowercased", () => {
+        expect(normalizePluginHost(" Mail.Example.COM ")).toBe("mail.example.com");
+        expect(normalizePluginHost("localhost:3000")).toBe("localhost:3000");
+        for (const bad of ["", undefined, 5, "a b", "a/b", "a@b", "https://a", "a.com:", "-a.com", "a.com/x?y", "[::1]"]) {
+            expect(normalizePluginHost(bad)).toBeUndefined();
+        }
+    });
+
+    it("reads the host a request reached: the first forwarded host, else Host", () => {
+        expect(pluginHostOfRequest({ host: "10.0.0.5:3000", "x-forwarded-host": "mail.example.com, proxy.internal" })).toBe("mail.example.com");
+        expect(pluginHostOfRequest({ host: "mail.example.com", "x-forwarded-host": ["a.example.com"] })).toBe("a.example.com");
+        expect(pluginHostOfRequest({ host: "mail.example.com", "x-forwarded-host": "not a host" })).toBe("mail.example.com");
+        expect(pluginHostOfRequest({ host: "mail.example.com" })).toBe("mail.example.com");
+        expect(pluginHostOfRequest({ host: "bad host" })).toBeUndefined();
+        expect(pluginHostOfRequest(undefined)).toBeUndefined();
+    });
+
+    it("resolves only a default that names the host", () => {
+        expect(resolveHostDefault({ default: "https://<host>/meet" }, "mail.example.com")).toBe("https://mail.example.com/meet");
+        expect(resolveHostDefault({ default: "https://<host>/meet" }, undefined)).toBeUndefined();
+        expect(resolveHostDefault({ default: "https://example.com" }, "mail.example.com")).toBeUndefined();
     });
 });
 

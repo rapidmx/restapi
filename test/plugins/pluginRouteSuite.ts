@@ -50,6 +50,15 @@ const EAS_MANIFEST = {
     ],
 };
 
+const HOST_MANIFEST = {
+    apiVersion: PLUGIN_API_VERSION,
+    displayName: "Hosted",
+    settings: [
+        { key: "mail:hosted:public_url", label: "Public URL", type: "string", default: "https://<host>/meet" },
+        { key: "mail:hosted:note", label: "Note", type: "string", default: "" },
+    ],
+};
+
 export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
     const admin: any = { uid: uuid.v4(), roles: ["admin"], elevated: Date.now() };
     const user: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -94,6 +103,7 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect((await auth(request(app).get(`${ctx.baseUrl}/status`))).status).toBe(403);
             expect((await auth(request(app).get(`${ctx.baseUrl}/plan?name=%40rapidmx%2Factivesync`))).status).toBe(403);
             expect((await auth(request(app).get(`${ctx.baseUrl}/registry/%40rapidmx%2Factivesync`))).status).toBe(403);
+            expect((await auth(request(app).get(`${ctx.baseUrl}/registry?name=%40rapidmx%2Factivesync`))).status).toBe(403);
             expect((await auth(request(app).post(ctx.baseUrl)).send({ name: "@rapidmx/activesync" })).status).toBe(403);
             expect((await auth(request(app).put(`${ctx.baseUrl}/x`)).send({ enabled: false })).status).toBe(403);
             expect((await auth(request(app).delete(`${ctx.baseUrl}/x`))).status).toBe(403);
@@ -266,6 +276,89 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
                 expect(result.body.message).toMatch(/is not a valid npm package name/);
             }
             expect(registryReads).toEqual([]);
+        });
+    });
+
+    describe("settings whose default names the host", () => {
+        beforeEach(() => {
+            publishFakePackage("@rapidmx/hosted", "1.0.0", { plugin: { ...HOST_MANIFEST, settings: [HOST_MANIFEST.settings[1]] } });
+            publishFakePackage("@rapidmx/hosted", "2.0.0", { plugin: HOST_MANIFEST });
+        });
+
+        it("saves the host the console was reached at on install, so the plugin works as installed", async () => {
+            const result = await asAdmin(request(ctx.app()).post(ctx.baseUrl))
+                .set("X-Forwarded-Host", "Mail.Example.com")
+                .set("Host", "10.0.0.5:3000")
+                .send({ name: "@rapidmx/hosted", packageVersion: "2.0.0" });
+            expect(result.status).toBe(200);
+            expect(result.body.plugin.settings).toEqual({ "mail:hosted:public_url": "https://mail.example.com/meet", "mail:hosted:note": "" });
+        });
+
+        it("falls back to the Host header, and saves nothing when the request has no usable host", async () => {
+            const direct = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).set("Host", "mail.example.com:8443").send({ name: "@rapidmx/hosted", packageVersion: "2.0.0" });
+            expect(direct.body.plugin.settings["mail:hosted:public_url"]).toBe("https://mail.example.com:8443/meet");
+
+            publishFakePackage("@rapidmx/hosted-too", "1.0.0", { plugin: HOST_MANIFEST });
+            const unusable = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).set("Host", "bad host").send({ name: "@rapidmx/hosted-too" });
+            expect(unusable.status).toBe(200);
+            expect(unusable.body.plugin.settings).toEqual({ "mail:hosted:note": "" });
+        });
+
+        it("fills it in when a version that declares it replaces one that didn't, unless a value was saved", async () => {
+            const added = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).set("Host", "mail.example.com").send({ name: "@rapidmx/hosted", packageVersion: "1.0.0" });
+            expect(added.body.plugin.settings).toEqual({ "mail:hosted:note": "" });
+            const upgraded = await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${added.body.plugin.uid}`))
+                .set("Host", "mail.example.com")
+                .send({ version: added.body.plugin.version, packageVersion: "2.0.0" });
+            expect(upgraded.status).toBe(200);
+            expect(upgraded.body.settings["mail:hosted:public_url"]).toBe("https://mail.example.com/meet");
+
+            // An administrator's own value is kept when the version changes again.
+            const saved = await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${added.body.plugin.uid}`))
+                .send({ version: upgraded.body.version, settings: { "mail:hosted:public_url": "https://elsewhere.example.com/join" } });
+            expect(saved.status).toBe(200);
+            const again = await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${added.body.plugin.uid}`))
+                .set("Host", "mail.example.com")
+                .send({ version: saved.body.version, packageVersion: "1.0.0" });
+            expect(again.status).toBe(200);
+            expect(again.body.settings).toEqual({});
+        });
+    });
+
+    describe("a value an older install seeded empty", () => {
+        it("is replaced by the host when the version that declares it is installed", async () => {
+            publishFakePackage("@rapidmx/hosted", "2.0.0", { plugin: HOST_MANIFEST });
+            const old = { ...HOST_MANIFEST, settings: [{ ...HOST_MANIFEST.settings[0], default: "" }] };
+            await ctx.insertPlugin({ name: "@rapidmx/hosted", packageVersion: "1.0.0", enabled: false, removed: false, settings: { "mail:hosted:public_url": "" }, manifest: old });
+            const [row] = (await asAdmin(request(ctx.app()).get(ctx.baseUrl))).body.filter((plugin: any) => plugin.name === "@rapidmx/hosted");
+            const upgraded = await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).set("Host", "mail.example.com").send({ version: row.version, packageVersion: "2.0.0" });
+            expect(upgraded.status).toBe(200);
+            expect(upgraded.body.settings["mail:hosted:public_url"]).toBe("https://mail.example.com/meet");
+        });
+    });
+
+    describe("GET /registry?name=", () => {
+        it("looks a package up by a name sent in the query string, at a version when given", async () => {
+            const latest = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry?name=${encodeURIComponent("@rapidmx/activesync")}`));
+            expect(latest.status).toBe(200);
+            expect(latest.body.package).toEqual({ name: "@rapidmx/activesync", latest: "1.1.0", versions: ["1.1.0", "1.0.0"] });
+            expect(latest.body.selected.version).toBe("1.1.0");
+            const pinned = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry?name=%40rapidmx%2Factivesync&packageVersion=1.0.0`));
+            expect(pinned.status).toBe(200);
+            expect(pinned.body.selected.version).toBe("1.0.0");
+        });
+
+        it("requires a single name, applies the allow-list, and reports what the registry lacks", async () => {
+            expect((await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry`))).status).toBe(400);
+            expect((await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry?name=`))).status).toBe(400);
+            expect((await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry?name=a&name=b`))).status).toBe(400);
+            expect((await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry?name=left-pad`))).status).toBe(400);
+            expect((await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry?name=%40rapidmx%2Fnope`))).status).toBe(404);
+        });
+
+        it("is only for a trusted caller", async () => {
+            const result = await request(ctx.app()).get(`${ctx.baseUrl}/registry?name=%40rapidmx%2Factivesync`).set("Authorization", "jwt " + userToken);
+            expect(result.status).toBe(403);
         });
     });
 
