@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-09-24
+
+### Added
+- Added tests for the drain behavior (small/chunked/over-limit/stalled/errored/already-ended bodies), the mid-stream quota-limit 413 in create(), and MailboxImportJob's best-effort source-blob delete failing after a request is attempted or abandoned (SQL and Mongo). Update BaseMailboxImportRoute.test.ts's stale req fixture to a realistic streaming request, and document the fix in RELEASE_NOTES.md.
+
+### Changed
+- Drain a small rejected upload body in BaseMailboxImportRoute.create() so its 4xx errors reach the client instead of a reset connection, and close the remaining coverage gaps
+- @rapidrest/service-core 2.3.0 force-closes a @StreamingBody() route's connection when it responds before the whole request body has arrived, so every rejection create() makes ahead of the blob write (400/403/404/413) surfaced as ECONNRESET / "socket hang up" instead of its JSON error. create() now reads and discards a small rejected body first (discardSmallBody(): nothing read when Content-Length declares more than 1 MiB, otherwise capped at 1 MiB and 5 s), leaving a huge or stalled upload to the framework's forced close. The pre-stream checks moved into resolveUploadTarget()/storeUpload() with unchanged behavior.
+
 ## [0.20.0] - 2026-09-23
 
 ### Added
@@ -1118,7 +1127,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/RapidMX/restapi/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/RapidMX/restapi/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/RapidMX/restapi/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/RapidMX/restapi/compare/v0.17.0...v0.18.0

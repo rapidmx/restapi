@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.20.1
+
 ### Fixed
 
 - **`POST /mailbox-import-requests` rejections reached clients as a reset connection instead of their JSON error.** `@rapidrest/service-core` 2.3.0 force-closes the connection of a `@StreamingBody()` route that responds before the whole request body has arrived, so every rejection `BaseMailboxImportRoute.create()` makes ahead of the blob write (400/403/404/413) surfaced as `ECONNRESET`/"socket hang up". `create()` now reads and discards a small rejected body first (`discardSmallBody()`: nothing read when `Content-Length` declares more than 1 MiB, capped at 1 MiB and 5 s otherwise), so the error is delivered while a huge or stalled upload still gets the framework's forced close. The pre-stream checks moved into `resolveUploadTarget()`/`storeUpload()` with unchanged behavior.
