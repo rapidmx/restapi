@@ -767,7 +767,30 @@ export interface Mailbox extends BaseEntity {
      * trusted administrator (see `BaseMailboxRoute.validateUpdate()`) - a mailbox's own owner never picks
      * their own escrow scope. */
     escrowScopeId?: string;
+
+    /**
+     * Who may see this mailbox's free/busy - the busy windows `POST /calendar-events/free-busy` reports (never titles,
+     * locations or attendees) to the "Find a time" view of a new meeting. One of `FreeBusyVisibility`:
+     *
+     * - `"domain"` (the default): any signed-in user who owns a mailbox in the same domain as this mailbox's primary address.
+     * - `"shared"`: only callers who already hold access on this mailbox or on one of its calendar folders (an ACL
+     * `read`, `list` or `freebusy` grant) - what the owner has chosen to share.
+     * - `"nobody"`: only this mailbox's owner and delegates with full access.
+     * - `"everyone"`: any signed-in user on this server.
+     *
+     * The owner (and a delegate with full access) always sees their own mailbox's free/busy whatever this says, and a caller
+     * who holds `read`/`list` access on the mailbox or a calendar folder sees it under `"domain"` too - they can read the
+     * events themselves. Changing it needs full access to the mailbox (`BaseMailboxRoute.validateUpdate()`): a delegate with
+     * plain update access cannot widen it, and an administrator with no grant of their own cannot change it (it is not one of
+     * the administrative fields). A row written before the field existed (absent on Mongo, `null` on SQL) reads as
+     * `"domain"`, and a write of anything else is a 400. Only the domain of `primarySmtpAddress` counts - an alias
+     * address's domain doesn't.
+     */
+    freeBusyVisibility?: FreeBusyVisibility;
 }
+
+/** Who may see a mailbox's free/busy - see `Mailbox.freeBusyVisibility`. */
+export type FreeBusyVisibility = "domain" | "shared" | "nobody" | "everyone";
 
 /**
  * Defines a single folder within a `Mailbox`. Folders form a hierarchy via `parentFolderUid` and hold
@@ -2130,7 +2153,74 @@ export interface CalendarEvent extends RecoverableBaseEntity {
      * compose-once-fan-out path they always have, with no extra query of any kind.
      */
     videoMeetingUid?: string;
+
+    /**
+     * The description of the event as plain text - what a person typed in an event dialog's description box, or the
+     * plain-text form of `descriptionHtml` (derived from it when a write gives only the HTML). Bounded (32,000 characters,
+     * `MAX_EVENT_DESCRIPTION_LENGTH`; a write over it is a `400`). The iCalendar `DESCRIPTION` of the event. A write that
+     * gives only plain text keeps it as it is and clears `descriptionHtml`.
+     */
+    description?: string;
+
+    /**
+     * The description of the event as **sanitized HTML** - rich text from an event dialog. Sanitized on every write, by the
+     * server, whatever the client sent (`util/EventDescriptionUtils.ts`, `sanitizeEventDescriptionHtml()`): only `b`/`strong`,
+     * `i`/`em`, `u`, `br`, `p`, `ul`/`ol`/`li` and `a` survive, the only attribute is an `a`'s `href` - `http`, `https` or
+     * `mailto` only, written with `rel="noopener noreferrer"` - and everything else (attributes, styles, images, scripts,
+     * `javascript:`/`data:` links) is removed, so a client may render it as it is. Bounded (64,000 characters, as sent and as
+     * sanitized; a write over it is a `400`). Travels in the invitation as `X-ALT-DESC;FMTTYPE=text/html` and is sanitized again
+     * when one is received, since an inbound invitation is never trusted. `undefined` when the description is plain text only.
+     */
+    descriptionHtml?: string;
+
+    /**
+     * Who may see this event's details. `"default"` (and a row written before this field existed, which reads as `"default"`)
+     * and `"public"` show the event in full to anyone who can read the calendar. `"private"` and `"confidential"` (iCalendar
+     * `CLASS:PRIVATE`/`CLASS:CONFIDENTIAL`; `"default"` omits `CLASS`) show it to a reader who is not the mailbox's owner or a
+     * delegate with full `UPDATE` - a shared-calendar grantee, or the holder of a calendar share link - only as a busy block:
+     * see `util/CalendarEventUtils.ts`, `redactEventForReader()`. The owner and delegates with `UPDATE` always see everything.
+     * An attendee's copy of an invitation keeps the visibility the organizer sent (`CLASS`).
+     */
+    visibility: EventVisibility;
+
+    /**
+     * Whether the guests (the attendees other than the organizer) may change the event. Default `false`. It travels in the
+     * invitation as `X-RAPIDMX-GUESTS-CAN-MODIFY:TRUE|FALSE` and is stored on each attendee's copy. A guest with it may ask the
+     * organizer to change the title, location, description or time (`POST /calendar-events/:id/request-change`), and when the
+     * organizer's mailbox is a RapidMX one the change is applied automatically. Only the organizer's own row is authoritative:
+     * a guest's copy of the flag is what tells their client which buttons to offer, and is never what decides a request.
+     * An update of it on a copy the caller does not organize is ignored.
+     */
+    guestsCanModify: boolean;
+
+    /**
+     * Whether the guests may add other guests (`POST /calendar-events/:id/request-change` with `addAttendees`). Default `true`.
+     * `X-RAPIDMX-GUESTS-CAN-INVITE`. Same authority and travel rules as `guestsCanModify`.
+     */
+    guestsCanInviteOthers: boolean;
+
+    /**
+     * Whether a guest may see who else was invited. Default `true`. `X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST`. When `false`,
+     * `MeetingSchedulingJob` mails each guest an invitation (and cancellation) naming only that guest and the organizer, so a
+     * guest's copy of the event lists only themselves; the organizer's own row still lists everyone.
+     */
+    guestsCanSeeGuestList: boolean;
+
+    /**
+     * Response-only, never stored: `true` on an event this reader may see only as a busy block (`visibility` `"private"` or
+     * `"confidential"` read through a shared calendar or a share link) - its `title` is then `"Busy"` and its location,
+     * description, attendees and organizer are removed. Also set on the live-update notification of such an event (every subscriber
+     * of the calendar's channel gets one payload), where the owner's own client should refetch the event by `uid` instead of storing
+     * the payload. Ignored on a write.
+     */
+    redacted?: boolean;
 }
+
+/**
+ * See `CalendarEvent.visibility`. Mirrors iCalendar `CLASS` (`"public"` = `PUBLIC`, `"private"` = `PRIVATE`,
+ * `"confidential"` = `CONFIDENTIAL`); `"default"` omits `CLASS`.
+ */
+export type EventVisibility = "default" | "public" | "private" | "confidential";
 
 /**
  * Governs behaviour on edit/update/duplication for an encrypted derived or originated entity - not a security

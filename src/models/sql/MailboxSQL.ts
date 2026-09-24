@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { EncryptionPreference, Mailbox, PublicKey } from "../types.js";
+import { EncryptionPreference, FreeBusyVisibility, Mailbox, PublicKey } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity, Index } = PersistenceDecorators;
@@ -195,6 +195,17 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     @Nullable
     public escrowScopeId?: string = undefined;
 
+    // Enum-like string-literal-union column - needs an explicit type, same as `resourceType`. `nullable: true` so `synchronize`
+    // can add the column to a table that already has rows; those rows read back `null`, which every reader takes as `domain`.
+    @Column({ type: "varchar", nullable: true })
+    @Description(
+        "Who may see this mailbox's free/busy: `domain` (the default - any signed-in user with a mailbox in the same domain), " +
+            "`shared` (callers who already hold access on it), `nobody` (only its owner and full-access delegates) or " +
+            "`everyone` (any signed-in user). A row without a value reads as `domain`.",
+    )
+    @Nullable
+    public freeBusyVisibility?: FreeBusyVisibility = "domain";
+
     constructor(other?: Partial<MailboxSQL>) {
         super(other);
 
@@ -240,6 +251,7 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
             this.keys = other.keys !== undefined ? other.keys : this.keys;
             this.keyDiscoveryHash = "keyDiscoveryHash" in other ? other.keyDiscoveryHash : this.keyDiscoveryHash;
             this.escrowScopeId = "escrowScopeId" in other ? other.escrowScopeId : this.escrowScopeId;
+            this.freeBusyVisibility = other.freeBusyVisibility !== undefined ? other.freeBusyVisibility : this.freeBusyVisibility;
         }
     }
 }

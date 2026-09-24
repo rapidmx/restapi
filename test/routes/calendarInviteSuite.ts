@@ -45,6 +45,8 @@ interface IcsOptions {
     organizer: string;
     attendees: { address: string; partstat?: string }[];
     status?: string;
+    /** More content lines of the event (`DESCRIPTION:...`, `CLASS:...`, `X-RAPIDMX-...`). */
+    extra?: string[];
 }
 
 /** A sent message as text, with quoted-printable soft line breaks and escapes undone, so the calendar file inside reads as written. */
@@ -64,6 +66,7 @@ const ics = (o: IcsOptions): string =>
         "SUMMARY:Video Test",
         `SEQUENCE:${o.sequence ?? 0}`,
         ...(o.status ? [`STATUS:${o.status}`] : []),
+        ...(o.extra ?? []),
         `ORGANIZER;CN=Boss:mailto:${o.organizer}`,
         ...o.attendees.map((a) => `ATTENDEE;ROLE=REQ-PARTICIPANT${a.partstat ? `;PARTSTAT=${a.partstat}` : ""}:mailto:${a.address}`),
         "END:VEVENT",
@@ -226,6 +229,144 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             const result = await as(ctx.otherToken)(request(ctx.app()).get(inviteUrl(message.uid)));
 
             expect(result.status).toBe(404);
+        });
+    });
+
+    describe("the event dialog's fields in an invitation", () => {
+        const dialogExtra = [
+            "DESCRIPTION:Agenda: budget",
+            'X-ALT-DESC;FMTTYPE=text/html:<p onclick=\\"x()\\">Agenda: <b>budget</b></p><script>alert(1)</script>',
+            "CLASS:PRIVATE",
+            "X-RAPIDMX-GUESTS-CAN-MODIFY:TRUE",
+            "X-RAPIDMX-GUESTS-CAN-INVITE:FALSE",
+            "X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST:FALSE",
+        ];
+        const everyone = (me: string) => [{ address: me, partstat: "NEEDS-ACTION" }, { address: "peer@example.com", partstat: "ACCEPTED" }, { address: "third@example.com" }];
+
+        it("Reports the description (sanitized), visibility and guest permissions, and offers a guest only the requests the organizer allows.", async () => {
+            const { mailbox, inbox, calendar, me } = await setup();
+            const message = await receive(mailbox.uid, inbox.uid, requestFor(me, { extra: dialogExtra }));
+
+            const before = await owner(request(ctx.app()).get(inviteUrl(message.uid)));
+            expect(before.body).toMatchObject({
+                description: "Agenda: budget",
+                descriptionHtml: "<p>Agenda: <b>budget</b></p>",
+                visibility: "private",
+                guestPermissions: { guestsCanModify: true, guestsCanInviteOthers: false, guestsCanSeeGuestList: false },
+                onCalendar: false,
+                canRequestChange: false,
+                canRequestInvite: false,
+            });
+
+            await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                icalUid: eventUid,
+                organizer: { address: "boss@boss.example.com", type: RecipientType.TO },
+                attendees: [{ address: me, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+            });
+            const after = await owner(request(ctx.app()).get(inviteUrl(message.uid)));
+            expect(after.body).toMatchObject({ onCalendar: true, canRequestChange: true, canRequestInvite: false });
+            expect(after.body.calendarEventUid).toBeTruthy();
+        });
+
+        it("Reports the defaults for an invitation that names none of them.", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const message = await receive(mailbox.uid, inbox.uid, requestFor(me));
+
+            const result = await owner(request(ctx.app()).get(inviteUrl(message.uid)));
+
+            expect(result.body.visibility).toBe("default");
+            expect(result.body.guestPermissions).toEqual({ guestsCanModify: false, guestsCanInviteOthers: true, guestsCanSeeGuestList: true });
+            expect(result.body.description).toBeUndefined();
+        });
+
+        it("Lists only the reader for a guest when the organizer hides the guest list, and everyone when it is visible or the reader organizes.", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const hidden = await receive(mailbox.uid, inbox.uid, requestFor(me, { extra: ["X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST:FALSE"], attendees: everyone(me) }));
+            const shown = await receive(mailbox.uid, inbox.uid, requestFor(me, { attendees: everyone(me) }));
+            const own = await receive(mailbox.uid, inbox.uid, requestFor(me, { organizer: me, extra: ["X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST:FALSE"], attendees: everyone("friend@example.com") }));
+
+            expect((await owner(request(ctx.app()).get(inviteUrl(hidden.uid)))).body.attendees.map((entry: any) => entry.address)).toEqual([me]);
+            expect((await owner(request(ctx.app()).get(inviteUrl(shown.uid)))).body.attendees).toHaveLength(3);
+            expect((await owner(request(ctx.app()).get(inviteUrl(own.uid)))).body.attendees).toHaveLength(3);
+        });
+
+        it("Files the description, visibility and guest permissions with the calendar copy an answer creates - and only the reader of a hidden guest list.", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const message = await receive(mailbox.uid, inbox.uid, requestFor(me, { extra: dialogExtra, attendees: everyone(me) }));
+
+            const result = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({ responseStatus: "accepted" });
+
+            expect(result.status).toBe(200);
+            const [row] = await ctx.findEvents(mailbox.uid);
+            expect(row).toMatchObject({
+                description: "Agenda: budget",
+                descriptionHtml: "<p>Agenda: <b>budget</b></p>",
+                visibility: "private",
+                guestsCanModify: true,
+                guestsCanInviteOthers: false,
+                guestsCanSeeGuestList: false,
+            });
+            expect(row.attendees.map((attendee: any) => attendee.address)).toEqual([me]);
+        });
+
+        it("Updates the description, visibility and guest permissions of the copy on the calendar from a newer invitation, and clears what it no longer has.", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const first = await receive(mailbox.uid, inbox.uid, requestFor(me, { extra: dialogExtra }));
+            await owner(request(ctx.app()).post(inviteUrl(first.uid, "/respond"))).send({ responseStatus: "accepted" });
+            const newer = await receive(mailbox.uid, inbox.uid, requestFor(me, { sequence: 3 }));
+
+            const result = await owner(request(ctx.app()).post(inviteUrl(newer.uid, "/respond"))).send({ responseStatus: "tentative" });
+
+            expect(result.status).toBe(200);
+            const [row] = await ctx.findEvents(mailbox.uid);
+            expect(row.description ?? undefined).toBeUndefined();
+            expect(row.descriptionHtml ?? undefined).toBeUndefined();
+            expect(row).toMatchObject({ visibility: "default", guestsCanModify: false, guestsCanInviteOthers: true, guestsCanSeeGuestList: true, sequence: 3 });
+        });
+
+        it("Mails the organizer a REPLY without any of the event's details, and a proposal without them either.", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const message = await receive(mailbox.uid, inbox.uid, requestFor(me, { extra: dialogExtra }));
+
+            await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({ responseStatus: "accepted" });
+            await owner(request(ctx.app()).post(inviteUrl(message.uid, "/propose"))).send({ startDate: new Date(start.getTime() + HOUR).toISOString(), endDate: new Date(end.getTime() + HOUR).toISOString() });
+
+            expect(ctx.transport().sent).toHaveLength(2);
+            for (const sent of ctx.transport().sent) {
+                const raw = decoded(sent.raw);
+                for (const property of ["DESCRIPTION:", "X-ALT-DESC", "CLASS:", "X-RAPIDMX-"]) {
+                    expect(raw).not.toContain(property);
+                }
+            }
+        });
+
+        it("Describes a guest's change request to the organizer: a proposal to accept while it is not applied, and an applied change once the message says so.", async () => {
+            const { mailbox, inbox, calendar, me } = await setup();
+            const guestAddress = "guest@example.com";
+            await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                icalUid: eventUid,
+                organizer: { address: me, type: RecipientType.TO },
+                attendees: [{ address: guestAddress, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.TENTATIVE, isOrganizer: false }],
+                guestsCanModify: true,
+            });
+            const counter = ics({
+                method: "COUNTER",
+                uid: eventUid,
+                start,
+                end,
+                organizer: me,
+                attendees: [{ address: guestAddress, partstat: "TENTATIVE" }, { address: "added@example.com" }],
+                extra: ["X-RAPIDMX-CHANGE-REQUEST:TRUE"],
+            });
+            const pending = await receive(mailbox.uid, inbox.uid, counter, "counter", { from: { address: guestAddress, type: RecipientType.TO } });
+
+            const before = await owner(request(ctx.app()).get(inviteUrl(pending.uid)));
+            expect(before.body).toMatchObject({ method: "COUNTER", changeRequest: { applied: false }, canAcceptProposal: true, isOrganizer: true });
+            expect(before.body.attendees.map((entry: any) => entry.address)).toEqual([guestAddress, "added@example.com"]);
+
+            const applied = await receive(mailbox.uid, inbox.uid, counter, "counter", { from: { address: guestAddress, type: RecipientType.TO }, meetingResponse: "accepted" });
+            const after = await owner(request(ctx.app()).get(inviteUrl(applied.uid)));
+            expect(after.body).toMatchObject({ changeRequest: { applied: true }, canAcceptProposal: false, response: "accepted" });
         });
     });
 

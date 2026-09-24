@@ -666,6 +666,12 @@ describe("Mongo model default construction", () => {
         expect(obj.sequence).toBe(0);
         expect(obj.encryptionOrigin).toBe("none");
         expect(obj.videoMeetingUid).toBeUndefined();
+        expect(obj.description).toBeUndefined();
+        expect(obj.descriptionHtml).toBeUndefined();
+        expect(obj.visibility).toBe("default");
+        expect(obj.guestsCanModify).toBe(false);
+        expect(obj.guestsCanInviteOthers).toBe(true);
+        expect(obj.guestsCanSeeGuestList).toBe(true);
     });
 
     it("CalendarEventMongo applies provided overrides when constructed with data.", () => {
@@ -699,6 +705,12 @@ describe("Mongo model default construction", () => {
             sequence: 2,
             encryptionOrigin: "originated",
             videoMeetingUid: "meeting-1",
+            description: "Plain text",
+            descriptionHtml: "<p>Plain text</p>",
+            visibility: "private",
+            guestsCanModify: true,
+            guestsCanInviteOthers: false,
+            guestsCanSeeGuestList: false,
         });
 
         expect(obj.folderUid).toBe("folder-1");
@@ -727,6 +739,12 @@ describe("Mongo model default construction", () => {
         expect(obj.sequence).toBe(2);
         expect(obj.encryptionOrigin).toBe("originated");
         expect(obj.videoMeetingUid).toBe("meeting-1");
+        expect(obj.description).toBe("Plain text");
+        expect(obj.descriptionHtml).toBe("<p>Plain text</p>");
+        expect(obj.visibility).toBe("private");
+        expect(obj.guestsCanModify).toBe(true);
+        expect(obj.guestsCanInviteOthers).toBe(false);
+        expect(obj.guestsCanSeeGuestList).toBe(false);
     });
 
     it("CalendarEventAttendeeLinkMongo falls back to class defaults when constructed with no data.", () => {

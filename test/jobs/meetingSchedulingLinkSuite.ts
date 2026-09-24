@@ -258,4 +258,159 @@ export function meetingSchedulingLinkSuite(ctx: MeetingSchedulingLinkSuiteContex
             expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("failed to send invite for event") && String(call[0]).includes(ALICE))).toBe(true);
         });
     });
+
+    describe("The event dialog's fields in the invitation: description, visibility, guest permissions and a hidden guest list", () => {
+        const rawTo = (address: string): string => {
+            const message = ctx.transport().sent.find((sent) => sent.envelopeTo.includes(address));
+            expect(message).toBeDefined();
+            return message!.raw.toString().replace(/=\r?\n/g, "").replace(/=3D/g, "=").replace(/\r\n /g, "");
+        };
+        const linkFindSpy = () => vi.spyOn(ctx.job().attendeeLinkRepo, "find");
+
+        beforeEach(async () => {
+            await ctx.clearLinks();
+        });
+
+        afterEach(() => {
+            vi.restoreAllMocks();
+        });
+
+        it("Mails the description (escaped DESCRIPTION, sanitized X-ALT-DESC, plain text in the body), the visibility and the changed guest permissions - one shared message for the default guest list.", async () => {
+            const spy = linkFindSpy();
+            await ctx.createEvent({
+                description: "Agenda, part 1; part 2",
+                descriptionHtml: "<p>Agenda, part 1; part 2</p>",
+                visibility: "private",
+                guestsCanModify: true,
+                guestsCanInviteOthers: false,
+                attendees: [attendee(ALICE), attendee(BOB)],
+            });
+
+            await ctx.job().run();
+
+            expect(spy).not.toHaveBeenCalled();
+            expect(ctx.transport().sent.map((sent) => sent.envelopeTo).sort()).toEqual([[ALICE], [BOB]]);
+            const alice = rawTo(ALICE);
+            expect(alice).toContain("DESCRIPTION:Agenda\\, part 1\\; part 2");
+            expect(alice).toContain("X-ALT-DESC;FMTTYPE=text/html:<p>Agenda\\, part 1\\; part 2</p>");
+            expect(alice).toContain("CLASS:PRIVATE");
+            expect(alice).toContain("X-RAPIDMX-GUESTS-CAN-MODIFY:TRUE");
+            expect(alice).toContain("X-RAPIDMX-GUESTS-CAN-INVITE:FALSE");
+            expect(alice).not.toContain("X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST");
+            expect(alice).toMatch(/You have been invited to: Team Sync\r?\n\r?\nAgenda, part 1; part 2/);
+            // One message composed for everybody: the same bytes to both.
+            expect(alice).toBe(rawTo(BOB));
+        });
+
+        it("Sends an event with the defaults exactly as before: none of the new properties, and the body without a description.", async () => {
+            await ctx.createEvent({ attendees: [attendee(ALICE)] });
+
+            await ctx.job().run();
+
+            const alice = rawTo(ALICE);
+            for (const property of ["DESCRIPTION", "X-ALT-DESC", "CLASS:", "X-RAPIDMX-"]) {
+                expect(alice).not.toContain(property);
+            }
+            expect(alice).toMatch(/You have been invited to: Team Sync\r?\n--/);
+        });
+
+        it("Sanitizes the HTML again before it is mailed, whatever was stored.", async () => {
+            await ctx.createEvent({ description: "Hi", descriptionHtml: '<p onclick="x()">Hi</p><script>alert(1)</script>', attendees: [attendee(ALICE)] });
+
+            await ctx.job().run();
+
+            const alice = rawTo(ALICE);
+            expect(alice).toContain("X-ALT-DESC;FMTTYPE=text/html:<p>Hi</p>");
+            expect(alice).not.toContain("<script");
+            expect(alice).not.toContain("onclick");
+        });
+
+        it("Mails each attendee an invitation naming only that attendee when the guests can't see the guest list - and the organizer's own entry - one message per attendee.", async () => {
+            const spy = linkFindSpy();
+            const event = await ctx.createEvent({
+                guestsCanSeeGuestList: false,
+                description: "Private agenda",
+                attendees: [attendee(ALICE), attendee(BOB), { ...attendee("organizer@example.com"), isOrganizer: true, responseStatus: AttendeeResponseStatus.ACCEPTED }],
+            });
+
+            await ctx.job().run();
+
+            // No video meeting: the link table is never consulted, even though this path is per attendee.
+            expect(spy).not.toHaveBeenCalled();
+            expect(ctx.transport().sent.map((sent) => sent.envelopeTo).sort()).toEqual([[ALICE], [BOB]]);
+            const alice = rawTo(ALICE);
+            const bob = rawTo(BOB);
+            expect(alice).toContain(`mailto:${ALICE}`);
+            expect(alice).not.toContain(`mailto:${BOB}`);
+            expect(alice).toContain("mailto:organizer@example.com");
+            expect(bob).toContain(`mailto:${BOB}`);
+            expect(bob).not.toContain(`mailto:${ALICE}`);
+            expect(alice).toContain("METHOD:REQUEST");
+            expect(alice).toContain("X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST:FALSE");
+            expect(alice).toContain("DESCRIPTION:Private agenda");
+            expect(alice).not.toBe(bob);
+            // The organizer's own row still lists everyone.
+            const stored = await ctx.reload(event.uid);
+            expect(stored.attendees.map((entry: any) => entry.address).sort()).toEqual([ALICE, BOB, "organizer@example.com"].sort());
+            expect(stored.inviteSequenceSent).toBe(0);
+        });
+
+        it("Mails a cancellation per attendee too, naming only that attendee, for a hidden guest list.", async () => {
+            await ctx.createEvent({
+                guestsCanSeeGuestList: false,
+                status: CalendarEventStatus.CANCELLED,
+                inviteSequenceSent: 0,
+                visibility: "confidential",
+                attendees: [attendee(ALICE), attendee(BOB)],
+            });
+
+            await ctx.job().run();
+
+            expect(ctx.transport().sent.map((sent) => sent.envelopeTo).sort()).toEqual([[ALICE], [BOB]]);
+            const alice = rawTo(ALICE);
+            expect(alice).toContain("METHOD:CANCEL");
+            expect(alice).toContain("Cancelled: Team Sync");
+            expect(alice).toContain(`mailto:${ALICE}`);
+            expect(alice).not.toContain(`mailto:${BOB}`);
+            expect(alice).toContain("CLASS:CONFIDENTIAL");
+            expect(rawTo(BOB)).not.toContain(`mailto:${ALICE}`);
+        });
+
+        it("Keeps a hidden guest list per attendee for an event that also has a linked video meeting, with each attendee's own link.", async () => {
+            const event = await ctx.createEvent({
+                guestsCanSeeGuestList: false,
+                videoMeetingUid: "meeting-1",
+                attendees: [attendee(ALICE), attendee(BOB)],
+            });
+            await ctx.createLink({ mailboxUid: ctx.mailboxUid(), calendarEventUid: event.uid, attendeeAddress: ALICE, url: ALICE_URL });
+            await ctx.createLink({ mailboxUid: ctx.mailboxUid(), calendarEventUid: event.uid, attendeeAddress: BOB, url: BOB_URL });
+
+            await ctx.job().run();
+
+            const alice = rawTo(ALICE);
+            expect(alice).toContain(`LOCATION:${ALICE_URL}`);
+            expect(alice).toContain(`Join the video call: ${ALICE_URL}`);
+            expect(alice).not.toContain(`mailto:${BOB}`);
+            expect(rawTo(BOB)).toContain(`LOCATION:${BOB_URL}`);
+            expect(rawTo(BOB)).not.toContain(`mailto:${ALICE}`);
+        });
+
+        it("Mails the description and the personalized link together in the body, and only the description for a hidden list with no link.", async () => {
+            const event = await ctx.createEvent({ description: "Notes", videoMeetingUid: "meeting-1", attendees: [attendee(ALICE), attendee(BOB)] });
+            await ctx.createLink({ mailboxUid: ctx.mailboxUid(), calendarEventUid: event.uid, attendeeAddress: ALICE, url: ALICE_URL });
+
+            await ctx.job().run();
+
+            expect(rawTo(ALICE)).toMatch(new RegExp(`Join the video call: ${ALICE_URL}\\r?\\n\\r?\\nNotes`));
+            expect(rawTo(BOB)).toMatch(/You have been invited to: Team Sync\r?\n\r?\nNotes/);
+        });
+
+        it("Never mails the organizer, or a stray attendee-less copy, on the hidden-list path.", async () => {
+            await ctx.createEvent({ guestsCanSeeGuestList: false, attendees: [{ ...attendee("organizer@example.com"), isOrganizer: true }, attendee(ALICE)] });
+
+            await ctx.job().run();
+
+            expect(ctx.transport().sent.map((sent) => sent.envelopeTo)).toEqual([[ALICE]]);
+        });
+    });
 }

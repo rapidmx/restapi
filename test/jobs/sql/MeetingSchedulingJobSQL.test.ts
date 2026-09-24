@@ -644,7 +644,8 @@ describe("MeetingSchedulingJobSQL Tests (real DB + DI)", () => {
             await job.run();
             const raw: string = mail().sent[0].raw.toString();
             expect(raw).toMatch(/^From: "?Organizer"? <organizer@example\.com>/m);
-            expect(raw).toContain(`ORGANIZER;CN=3D"Organizer":mailto:organizer@example.com`);
+            // (Every calendar line is folded to 75 octets now, so the file is 7bit rather than quoted-printable - `=3D` for `=`.)
+            expect(raw).toMatch(/ORGANIZER;CN=(?:3D)?"Organizer":mailto:organizer@example\.com/);
             expect(raw).not.toContain("bank.example");
 
             const spoofyUid = uuid.v4();

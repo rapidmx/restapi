@@ -290,6 +290,24 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         return {};
     }
 
+    /**
+     * Hook that refuses (throws) a `find()`/`count()` whose client `query` `effectiveUser` may not make - one that filters or sorts by
+     * a field they may not see in every record they may list. Runs after the LIST/COUNT permission check, before the read. A no-op by
+     * default; `BaseCalendarEventRoute` uses it so a shared-calendar reader can't search a private event's title.
+     */
+    protected async assertQueryAllowed(query: any, scopeUid: string, effectiveUser: JWTUser | undefined): Promise<void> {
+        // Nothing to refuse by default.
+    }
+
+    /**
+     * Hook that returns `records` (already read, and permitted by `find()`/`findById()`) as `effectiveUser` may see them - a record
+     * they may list but not read in full comes back redacted. Never modifies a record it was given. The records unchanged by default;
+     * `BaseCalendarEventRoute` uses it to show a private event to a shared-calendar reader as a busy block.
+     */
+    protected async redactReadRecords(records: T[], scopeUid: string, effectiveUser: JWTUser | undefined): Promise<T[]> {
+        return records;
+    }
+
     /** The data filter for a list-shaped request: the client query minus anything that could widen it
      * (`stripUnsafeQueryKeys()`) and minus this route's own `listQueryParams`, with `listQueryOverrides()` merged
      * over it and the permission-checked scope forced last as a `ModelUtils.literal()`, so the value is never
@@ -413,8 +431,17 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
            it is always truthy by the time `notify()` runs. The `string | undefined` parameter type (matching
            `scopeUidOf()`'s own return type) is what requires this guard to typecheck, not a real code path. */
         if (scopeUid) {
-            this.notificationUtils?.sendMessage(scopeUid, this.modelClass.name, action, data);
+            this.notificationUtils?.sendMessage(scopeUid, this.modelClass.name, action, this.pushPayload(data));
         }
+    }
+
+    /**
+     * Hook for what a live-update notification (`notify()`) carries of a record. Every subscriber of a folder or mailbox channel receives
+     * it, whatever they may read of the record, so a route whose records are only partly readable by every subscriber returns the part
+     * they all may see. The record itself by default; `BaseCalendarEventRoute` returns a busy block for a private event.
+     */
+    protected pushPayload(data: any): any {
+        return data;
     }
 
     @Head()
@@ -436,6 +463,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!admin && !(await this.hasMailAccess(effectiveUser, scopeUid, ACLAction.COUNT))) {
             return res.status(200).setHeader("content-length", 0);
         }
+        await this.assertQueryAllowed(query, scopeUid, effectiveUser);
         const result: number = await this.repoUtils.count(
             await this.listFilter(params, query, scopeUid, effectiveUser),
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
@@ -552,6 +580,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!admin && !(await this.hasMailAccess(effectiveUser, scopeUid, ACLAction.LIST))) {
             return [];
         }
+        await this.assertQueryAllowed(query, scopeUid, effectiveUser);
         const found: T[] = await this.repoUtils.find(
             await this.listFilter(params, query, scopeUid, effectiveUser),
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
@@ -559,7 +588,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (admin) {
             await this.auditAdminAccess(user, "list", scopeUid, found.length);
         }
-        return found;
+        return await this.redactReadRecords(found, scopeUid, effectiveUser);
     }
 
     @Get("/:id")
@@ -585,7 +614,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (admin) {
             await this.auditAdminAccess(user, "read", scopeUid);
         }
-        return existing!;
+        return (await this.redactReadRecords([existing!], scopeUid, effectiveUser))[0];
     }
 
     /** Fetches every page of `repoUtils.find(criteria, ...)` results - a bare, unpaginated `find()` call

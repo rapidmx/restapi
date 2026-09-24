@@ -16,6 +16,7 @@ import {
     CalendarEvent,
     CalendarEventStatus,
     EncryptionOrigin,
+    EventVisibility,
     Recipient,
     RecipientType,
     RecurrenceRule,
@@ -176,6 +177,48 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
     @Nullable
     public videoMeetingUid?: string;
 
+    @Column()
+    @Description(
+        "The description of the event as plain text (at most 32,000 characters). The plain-text form of `descriptionHtml` when only " +
+            "the HTML is written.",
+    )
+    @Nullable
+    public description?: string;
+
+    @Column()
+    @Description(
+        "The description of the event as HTML, sanitized by the server on every write (only b/strong, i/em, u, br, p, ul/ol/li and " +
+            "a with an http, https or mailto href survive; at most 64,000 characters).",
+    )
+    @Nullable
+    public descriptionHtml?: string;
+
+    @Column()
+    @Description(
+        "Who may see the event's details: `default`, `public`, `private` or `confidential` (iCalendar CLASS). A reader of the " +
+            "calendar who is not its owner or a delegate with UPDATE sees a private or confidential event only as a busy block.",
+    )
+    @Nullable
+    public visibility: EventVisibility = "default";
+
+    @Column()
+    @Description("Whether the guests may ask the organizer to change the event (X-RAPIDMX-GUESTS-CAN-MODIFY).")
+    @Nullable
+    public guestsCanModify: boolean = false;
+
+    @Column()
+    @Description("Whether the guests may ask the organizer to add other guests (X-RAPIDMX-GUESTS-CAN-INVITE).")
+    @Nullable
+    public guestsCanInviteOthers: boolean = true;
+
+    @Column()
+    @Description(
+        "Whether a guest may see who else was invited (X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST). When `false` each guest is mailed an " +
+            "invitation naming only themselves.",
+    )
+    @Nullable
+    public guestsCanSeeGuestList: boolean = true;
+
     constructor(other?: Partial<CalendarEventMongo>) {
         super(other);
 
@@ -207,6 +250,14 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
             this.reminderSentFor = "reminderSentFor" in other ? other.reminderSentFor : this.reminderSentFor;
             this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
             this.videoMeetingUid = "videoMeetingUid" in other ? other.videoMeetingUid : this.videoMeetingUid;
+            this.description = "description" in other ? other.description : this.description;
+            this.descriptionHtml = "descriptionHtml" in other ? other.descriptionHtml : this.descriptionHtml;
+            this.visibility = other.visibility !== undefined ? other.visibility : this.visibility;
+            this.guestsCanModify = other.guestsCanModify !== undefined ? other.guestsCanModify : this.guestsCanModify;
+            this.guestsCanInviteOthers =
+                other.guestsCanInviteOthers !== undefined ? other.guestsCanInviteOthers : this.guestsCanInviteOthers;
+            this.guestsCanSeeGuestList =
+                other.guestsCanSeeGuestList !== undefined ? other.guestsCanSeeGuestList : this.guestsCanSeeGuestList;
         }
     }
 }

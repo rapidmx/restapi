@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { simpleParser } from "mailparser";
-import { AttendeeResponseStatus, type CalendarEvent, type Message } from "../models/types.js";
+import { AttendeeResponseStatus, type CalendarEvent, type EventVisibility, type Message } from "../models/types.js";
 import { normalizeAddress } from "./AddressUtils.js";
+import { type GuestPermissions, guestPermissionsOf } from "./CalendarEventUtils.js";
 import { parseIcsEvent, type ParsedIcsEvent } from "./IcsUtils.js";
 
 /** What a reader can answer to an invitation. */
@@ -42,12 +43,24 @@ export interface MessageInvite {
     sequence: number;
     summary?: string;
     location?: string;
+    /** The description as plain text, when the invitation has one. */
+    description?: string;
+    /** The description as HTML, **already sanitized** (`sanitizeEventDescriptionHtml()`), when the invitation has one - safe to render as it is. */
+    descriptionHtml?: string;
+    /** The organizer's `CLASS` (`"default"` when the invitation names none). */
+    visibility: EventVisibility;
+    /** What the organizer allows the guests (`X-RAPIDMX-GUESTS-*`; each at its default when the invitation says nothing). */
+    guestPermissions: GuestPermissions;
     startDate?: string;
     endDate?: string;
     allDay: boolean;
     /** The IANA zone the organizer used. */
     timezone?: string;
     organizer?: { address: string; displayName?: string };
+    /**
+     * Who is invited. For a reader who is not the organizer of a meeting whose organizer hides the guest list (`guestPermissions.
+     * guestsCanSeeGuestList` `false`), only the reader's own entry, whatever the file lists.
+     */
     attendees: InviteParticipant[];
     recurring: boolean;
     /** The reader's mailbox is the organizer (their own sent invitation). */
@@ -68,8 +81,22 @@ export interface MessageInvite {
     canRemove: boolean;
     /** A `REQUEST` the reader can answer with "propose a new time" (an iTIP `COUNTER` to the organizer). */
     canPropose: boolean;
-    /** A `COUNTER` - an attendee's proposed time - for a meeting the reader organizes, which they can accept. */
+    /** A `COUNTER` - an attendee's proposed time - for a meeting the reader organizes, which they can accept (never once it is a change request that was applied). */
     canAcceptProposal: boolean;
+    /**
+     * A `REQUEST` on the reader's calendar, for a meeting whose organizer lets guests change it (`guestsCanModify`): the reader may
+     * ask for a change of title, location, description or time - `POST /calendar-events/<calendarEventUid>/request-change`.
+     */
+    canRequestChange: boolean;
+    /** The same, for asking to add guests (`guestsCanInviteOthers`). */
+    canRequestInvite: boolean;
+    /**
+     * Present on a `COUNTER` that is a guest's request to change the meeting (`X-RAPIDMX-CHANGE-REQUEST`) - the proposed values are the
+     * invitation's own fields, and the guests it names beyond the sender are the ones asked for. `applied` is `true` when the reader's
+     * server made the change (`Message.meetingResponse` is `"accepted"`), `false` when the flags didn't allow it or it was stale and it
+     * is left as a proposal.
+     */
+    changeRequest?: { applied: boolean };
     /** For a `REPLY` or `COUNTER`: the attendee who sent it and what they answered. */
     reply?: InviteParticipant;
     /** The reader's own busy events that overlap this invitation's time (not counting the meeting itself), so a client can say "Conflicts with ...". */
@@ -191,25 +218,35 @@ export function describeInvite(
     const replier = method === "REPLY" || method === "COUNTER" ? (proposer ?? parsed.attendees[0]) : undefined;
     const startDate: Date | undefined = parsed.startDate;
     const endDate: Date | undefined = parsed.endDate;
+    const guestPermissions: GuestPermissions = guestPermissionsOf(parsed);
+    const changeRequestApplied: boolean = method === "COUNTER" && !!parsed.changeRequest && message.meetingResponse === "accepted";
+    const canGuestAsk: boolean = method === "REQUEST" && !isOrganizer && !cancelled && !!existing;
     return {
         method,
         uid: parsed.uid,
         sequence: parsed.sequence,
         summary: parsed.summary,
         location: parsed.location,
+        description: parsed.description,
+        descriptionHtml: parsed.descriptionHtml,
+        visibility: parsed.visibility ?? "default",
+        guestPermissions,
         startDate: startDate?.toISOString(),
         endDate: endDate?.toISOString(),
         allDay: inviteIsAllDay(parsed),
         timezone: parsed.timezone,
         organizer: parsed.organizer,
-        attendees: parsed.attendees.map((attendee) => {
-            const known = existing?.attendees.find((row) => normalizeAddress(row.address) === normalizeAddress(attendee.address));
-            return {
-                address: attendee.address,
-                displayName: attendee.displayName,
-                responseStatus: participantStatusOf(known?.responseStatus ?? attendee.partstat),
-            };
-        }),
+        attendees: parsed.attendees
+            // A guest never sees the others of a hidden guest list, whatever the file names.
+            .filter((attendee) => isOrganizer || guestPermissions.guestsCanSeeGuestList || addresses.has(normalizeAddress(attendee.address)))
+            .map((attendee) => {
+                const known = existing?.attendees.find((row) => normalizeAddress(row.address) === normalizeAddress(attendee.address));
+                return {
+                    address: attendee.address,
+                    displayName: attendee.displayName,
+                    responseStatus: participantStatusOf(known?.responseStatus ?? attendee.partstat),
+                };
+            }),
         recurring: !!parsed.recurrenceRule || !!parsed.recurrenceId,
         isOrganizer,
         response,
@@ -226,7 +263,11 @@ export function describeInvite(
             isOrganizer &&
             !!existing &&
             !!proposer &&
+            !changeRequestApplied &&
             existing.attendees.some((attendee) => normalizeAddress(attendee.address) === sender),
+        canRequestChange: canGuestAsk && guestPermissions.guestsCanModify,
+        canRequestInvite: canGuestAsk && guestPermissions.guestsCanInviteOthers,
+        ...(method === "COUNTER" && parsed.changeRequest ? { changeRequest: { applied: changeRequestApplied } } : {}),
         reply: replier ? { address: replier.address, displayName: replier.displayName, responseStatus: participantStatusOf(replier.partstat) } : undefined,
         conflicts: conflictsOf(schedule, startDate, endDate),
         schedule,

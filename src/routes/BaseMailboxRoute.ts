@@ -22,6 +22,7 @@ import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
 import { assertAdminScope, hasMailAccess, isAdminScope, isTrustedUser, stripTrustedRoles } from "../util/MailAccessUtils.js";
 import { getPrimaryDomainNames } from "../util/DomainUtils.js";
 import { ensureWellKnownFolders } from "../util/FolderUtils.js";
+import { assertFreeBusyVisibility, effectiveFreeBusyVisibility } from "../util/FreeBusyLookupUtils.js";
 import { DEFAULT_TIME_ZONE, isValidTimeZone } from "../util/TimeZoneUtils.js";
 import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { hasAddressLikeDisplayName } from "../util/MimeHeaderUtils.js";
@@ -608,6 +609,12 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             delete (o as any).accessRole;
             coerceDateFields(o, MAILBOX_DATE_FIELDS);
             rejectServerManagedFields(o as Record<string, unknown>);
+            // Anybody may create a mailbox that shares its free/busy however they like; only a value that is no choice is refused.
+            if ((o as any).freeBusyVisibility === null) {
+                delete (o as any).freeBusyVisibility;
+            } else if ((o as any).freeBusyVisibility !== undefined) {
+                assertFreeBusyVisibility((o as any).freeBusyVisibility);
+            }
             // A brand-new mailbox always starts unscoped - assignment only ever happens afterward via
             // `update()`/`validateEscrowScopeAssignment()`, which also checks the referenced scope actually
             // exists. Rejected for every caller, trusted or not, rather than silently ignored.
@@ -908,6 +915,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             this.restrictToAdminFields(obj);
         }
         await this.validateEscrowScopeAssignment(id, obj, isTrusted);
+        await this.validateFreeBusyVisibilityChange(id, obj, user);
         rejectServerManagedFields(obj);
         await this.validateTrustedOnlyFields(id, obj, user, isTrusted);
         await this.validateDisplayNameChange(id, obj);
@@ -927,6 +935,29 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             (obj as any).keyDiscoveryHash = computeKeyDiscoveryHash(obj.primarySmtpAddress.split("@")[0]);
         }
         return super.validateUpdate(id, obj, user);
+    }
+
+    /**
+     * Who may see this mailbox's free/busy (`Mailbox.freeBusyVisibility`) is the owner's decision: a value that is not one of
+     * `FREE_BUSY_VISIBILITIES` is a 400, and a real change needs full access to the mailbox - the owner's own record or a
+     * "manager" delegate's - so a delegate with plain update access can't widen it (403). An unchanged value passes for
+     * everyone, so a full-object `PUT` round-tripping the current one still works, as does `null` (SQL's unset for a row
+     * from before the field existed; dropped from the patch). An administrator with no grant of their own never gets here
+     * with the field (`restrictToAdminFields()` drops it).
+     */
+    private async validateFreeBusyVisibilityChange(id: string, obj: Record<string, any>, user: JWTUser | undefined): Promise<void> {
+        if (obj.freeBusyVisibility === undefined) {
+            return;
+        }
+        if (obj.freeBusyVisibility === null) {
+            delete obj.freeBusyVisibility;
+            return;
+        }
+        assertFreeBusyVisibility(obj.freeBusyVisibility);
+        const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+        if (existing && effectiveFreeBusyVisibility(existing) !== obj.freeBusyVisibility && !(await this.hasMailAccess(user, id, ACLAction.FULL))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Only the mailbox's owner can change who sees its free/busy.");
+        }
     }
 
     /** `assertValidDisplayName()` on a `displayName` the patch actually changes - a full-object `PUT` round-tripping a
@@ -1529,7 +1560,12 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     /** `mailbox` with `accessRole` for `user`: `"owner"` for their own mailbox, `"delegate"` for one shared with them - so a
      * client can label the shared ones. Computed on the way out, never stored (and dropped from a body that echoes it). */
     private withAccessRole(mailbox: T, user: JWTUser): T {
-        return { ...mailbox, accessRole: sameOwner(mailbox.ownerUserUid, user.uid) ? "owner" : "delegate" };
+        // A row from before `freeBusyVisibility` existed reads as its default (`null` on SQL, absent on Mongo).
+        return {
+            ...mailbox,
+            freeBusyVisibility: effectiveFreeBusyVisibility(mailbox),
+            accessRole: sameOwner(mailbox.ownerUserUid, user.uid) ? "owner" : "delegate",
+        };
     }
 
     /** `find()` for `?scope=admin`: every mailbox's metadata, audited. */

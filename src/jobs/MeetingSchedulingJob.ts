@@ -8,6 +8,7 @@ import { ApiErrors, BackgroundService, ModelUtils, ObjectFactory, RepoUtils } fr
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
+import { guestPermissionsOf } from "../util/CalendarEventUtils.js";
 import { buildEventIcs } from "../util/IcsUtils.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { isPlainAddress, safeDisplayName } from "../util/MimeHeaderUtils.js";
@@ -44,16 +45,20 @@ interface InviteCursor {
  * activesync) mailable attendees isn't mailed at all (logged as an error).
  *
  * **How many messages are composed.** One message is composed and scanned per *event* - and relayed to each attendee on
- * its own envelope - for an event with no linked video meeting (the overwhelmingly common case, unchanged), and on any
- * cancellation whatsoever. One message is composed, scanned and relayed per *attendee* only for a `REQUEST` on an event
- * that has one (`CalendarEvent.videoMeetingUid` set), because then each attendee's copy carries their own personalized
- * `LOCATION`. That personalization is generic and plugin-agnostic: this job looks the event's own
+ * its own envelope - for an event with no linked video meeting whose guests can see the guest list (the overwhelmingly
+ * common case, unchanged), including its cancellation. One message is composed, scanned and relayed per *attendee* for a
+ * `REQUEST` on an event that has a linked video meeting (`CalendarEvent.videoMeetingUid` set), because then each attendee's
+ * copy carries their own personalized `LOCATION`; and for a `REQUEST` *and* a `CANCEL` on an event whose guests cannot see
+ * the guest list (`guestsCanSeeGuestList` `false`), because then each attendee's copy names only that attendee (and the
+ * organizer) - the organizer's own row still lists everyone. The invitation also carries the event's description
+ * (`DESCRIPTION`/`X-ALT-DESC`, plain text also in the mail body), visibility (`CLASS`) and guest permissions
+ * (`X-RAPIDMX-GUESTS-*`) - see `buildEventIcs()`. The video-link personalization is generic and plugin-agnostic: this job looks the event's own
  * `CalendarEventAttendeeLink` rows up by `calendarEventUid` and matches each attendee by normalized address - it has no
  * knowledge of, and never imports, whichever plugin wrote them (a plugin depends on this library, never the reverse).
  * An attendee with no matching row simply gets the event's own plain stored `location`, exactly as before, and so does
  * everyone when the lookup itself fails or returns nothing (a deleted meeting, an uninstalled plugin, a database error -
  * all logged as a warning, none of them ever aborting the send). A `CANCEL` never needs a join link, so the cancellation
- * path never looks anything up and is unconditionally byte-for-byte what it always was.
+ * path never looks anything up (it is per attendee only for a hidden guest list).
  *
  * **Recurring meetings**: a master row (`recurrenceRule` set) and any single-occurrence override rows
  * sharing its `icalUid` (`recurrenceId` set) are each their own independent `CalendarEvent` row with their
@@ -421,8 +426,8 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
      * attendee on its own envelope. A failure for one attendee is logged and the rest still go out (see this class's doc
      * comment for why the row stays claimed); a refused scan, or no attendee accepting it, throws.
      *
-     * The one exception is a `REQUEST` for an event carrying a `videoMeetingUid`, which is handed to
-     * `sendPersonalizedInvites()` instead - see its own doc comment. Everything above it here (the plain-address filter,
+     * The exceptions are a `REQUEST` for an event carrying a `videoMeetingUid`, and any `REQUEST`/`CANCEL` for an event whose guests
+     * can't see the guest list, which are handed to `sendPerAttendee()` instead - see its own doc comment. Everything above it here (the plain-address filter,
      * the deduplication that also excludes the organizer's own address, the attendee cap, the "nobody left to mail"
      * early return) is shared by both paths and deliberately identical for them.
      */
@@ -456,11 +461,12 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
             return;
         }
 
-        // The only new branch on the way to a send, and the only one an event with no linked video meeting ever
-        // evaluates: a plain field read of a row already in memory, no query. Everything below it - the whole
-        // compose-once, fan-out-by-envelope path - is untouched, and is still what every cancellation takes too.
-        if (method === "request" && event.videoMeetingUid) {
-            await this.sendPersonalizedInvites(event, organizer, listed, recipients, what);
+        // The only branches on the way to a send, and the only ones an event with no linked video meeting and a
+        // visible guest list ever evaluates: plain field reads of a row already in memory, no query. Everything below
+        // them - the whole compose-once, fan-out-by-envelope path - is untouched for such an event.
+        const hiddenGuestList: boolean = !guestPermissionsOf(event).guestsCanSeeGuestList;
+        if ((method === "request" && event.videoMeetingUid) || hiddenGuestList) {
+            await this.sendPerAttendee(event, organizer, listed, recipients, method, what, hiddenGuestList);
             return;
         }
 
@@ -470,7 +476,7 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
             from: organizer.displayName ? { name: organizer.displayName, address: event.organizer.address } : event.organizer.address,
             to: recipients,
             subject: method === "cancel" ? `Cancelled: ${event.title}` : `Invitation: ${event.title}`,
-            text: method === "cancel" ? `This meeting has been cancelled: ${event.title}` : `You have been invited to: ${event.title}`,
+            text: method === "cancel" ? `This meeting has been cancelled: ${event.title}` : `You have been invited to: ${event.title}${this.descriptionNote(event)}`,
             icalEvent: { method, content: ics },
         })
             .compile()
@@ -495,36 +501,58 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
         await scanAndRelay(composed, event.organizer.address, recipients, this.scanPipeline!, fanOut, this.blobStore!);
     }
 
+    /** The event's plain-text description as a paragraph to add to an invitation's body, or `""` when it has none. */
+    private descriptionNote(event: CE): string {
+        return event.description ? `\n\n${event.description}` : "";
+    }
+
     /**
-     * Mails a `REQUEST` for an event with a linked video meeting: one message composed, scanned and relayed *per
-     * attendee*, each carrying that attendee's own personalized link (their own `LOCATION`, and a line naming it in the
-     * body) from this event's `CalendarEventAttendeeLink` rows - see this class's doc comment for why that lookup is
-     * generic and knows nothing of whichever plugin wrote those rows.
+     * Mails an event's `method` (`REQUEST` or `CANCEL`) as one message composed, scanned and relayed *per attendee*, for the
+     * two events that can't share one message between everybody:
      *
-     * Every fallback here is graceful and per-attendee: a lookup that fails outright, one that returns nothing, and one
-     * that returns rows for only some attendees all end in the same place - an attendee with no matching row gets the
-     * event's own plain stored `location` and today's plain invite text, exactly what the shared path would have mailed
-     * them. `recipients` is the shared, already-deduplicated recipient list, which never contains the organizer's own
-     * address; a stray `CalendarEventAttendeeLink` row for the organizer therefore cannot cause a message to them, since
-     * this only ever mails addresses that list already holds.
+     * - **A `REQUEST` for an event with a linked video meeting**: each attendee's copy carries that attendee's own
+     * personalized link (their own `LOCATION`, and a line naming it in the body) from this event's `CalendarEventAttendeeLink`
+     * rows - see this class's doc comment for why that lookup is generic and knows nothing of whichever plugin wrote those rows.
+     * Every fallback here is graceful and per-attendee: a lookup that fails outright, one that returns nothing, and one that
+     * returns rows for only some attendees all end in the same place - an attendee with no matching row gets the event's own
+     * plain stored `location` and today's plain invite text, exactly what the shared path would have mailed them.
+     * - **An event whose guests can't see the guest list** (`CalendarEvent.guestsCanSeeGuestList` `false`; `hiddenGuestList`), a
+     * `REQUEST` *and* a `CANCEL`: each attendee's copy lists only that attendee (and the organizer's own attendee entry, if the
+     * event has one - the `ORGANIZER` line names the organizer regardless), so the copy that lands in their calendar never holds
+     * anyone else. The organizer's own row still lists everyone.
+     *
+     * `recipients` is the shared, already-deduplicated recipient list, which never contains the organizer's own address; a stray
+     * `CalendarEventAttendeeLink` row for the organizer therefore cannot cause a message to them, since this only ever mails
+     * addresses that list already holds.
      */
-    private async sendPersonalizedInvites(event: CE, organizer: MailboxIdentity, listed: Attendee[], recipients: string[], what: string): Promise<void> {
+    private async sendPerAttendee(
+        event: CE,
+        organizer: MailboxIdentity,
+        listed: Attendee[],
+        recipients: string[],
+        method: "request" | "cancel",
+        what: string,
+        hiddenGuestList: boolean,
+    ): Promise<void> {
         const links: Map<string, { url: string; label?: string }> = new Map();
         try {
-            // Bounded by the same cap the attendee list itself is bounded by - there can be no more useful rows
-            // than there are attendees this job is willing to mail.
-            const rows: CalendarEventAttendeeLink[] = await this.attendeeLinkRepo!.find(
-                { calendarEventUid: ModelUtils.literal(event.uid), limit: Number(this.maxAttendees) } as any,
-                { ignoreACL: true, limit: Number(this.maxAttendees) },
-            );
-            for (const row of rows) {
-                links.set(normalizeAddress(row.attendeeAddress), { url: row.url, label: row.label });
+            if (method === "request" && event.videoMeetingUid) {
+                // Bounded by the same cap the attendee list itself is bounded by - there can be no more useful rows
+                // than there are attendees this job is willing to mail.
+                const rows: CalendarEventAttendeeLink[] = await this.attendeeLinkRepo!.find(
+                    { calendarEventUid: ModelUtils.literal(event.uid), limit: Number(this.maxAttendees) } as any,
+                    { ignoreACL: true, limit: Number(this.maxAttendees) },
+                );
+                for (const row of rows) {
+                    links.set(normalizeAddress(row.attendeeAddress), { url: row.url, label: row.label });
+                }
             }
         } catch (err: any) {
             // Never abort the send over this: an empty map means every attendee falls back to the event's own
             // stored location, which is exactly what would have been mailed before personalization existed.
             this.logger?.warn(`MeetingSchedulingJob: failed to read personalized attendee links for event ${event.uid}: ${err.message}`);
         }
+        const organizerAddress: string = normalizeAddress(event.organizer.address);
 
         // Each attendee's own relay, through `sendOrThrow()` exactly like the shared path's fan-out - a transport
         // that reports its one recipient as rejected still counts as a failure.
@@ -537,19 +565,27 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
         for (const to of recipients) {
             try {
                 const link: { url: string; label?: string } | undefined = links.get(normalizeAddress(to));
+                const attendee: string = normalizeAddress(to);
                 const mailed: CE = {
                     ...event,
                     organizer: { ...event.organizer, displayName: organizer.displayName },
-                    attendees: listed,
+                    attendees: hiddenGuestList
+                        ? listed.filter((entry) => normalizeAddress(entry.address) === attendee || normalizeAddress(entry.address) === organizerAddress)
+                        : listed,
                     location: link ? link.url : event.location,
                 };
-                const ics: string = buildEventIcs(mailed, "REQUEST");
+                const ics: string = buildEventIcs(mailed, method === "cancel" ? "CANCEL" : "REQUEST");
                 const composed: Buffer = await new MailComposer({
                     from,
                     to: [to],
-                    subject: `Invitation: ${event.title}`,
-                    text: link ? `You have been invited to: ${event.title}\n\nJoin the video call: ${link.url}` : `You have been invited to: ${event.title}`,
-                    icalEvent: { method: "request", content: ics },
+                    subject: method === "cancel" ? `Cancelled: ${event.title}` : `Invitation: ${event.title}`,
+                    text:
+                        method === "cancel"
+                            ? `This meeting has been cancelled: ${event.title}`
+                            : link
+                              ? `You have been invited to: ${event.title}\n\nJoin the video call: ${link.url}${this.descriptionNote(event)}`
+                              : `You have been invited to: ${event.title}${this.descriptionNote(event)}`,
+                    icalEvent: { method, content: ics },
                 })
                     .compile()
                     .build();

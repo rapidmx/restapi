@@ -33,6 +33,26 @@ import {
     type MessageInvite,
 } from "../util/MeetingInviteUtils.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
+import {
+    MAX_EVENT_ATTENDEES,
+    MAX_REQUESTED_GUESTS,
+    effectiveVisibility,
+    eventDetailQueryError,
+    guestPermissionsOf,
+    hidesDetailsFromReaders,
+    queryNamesEventDetails,
+    redactEventForReader,
+    validateEventPolicyFields,
+    GUEST_PERMISSION_FIELDS,
+} from "../util/CalendarEventUtils.js";
+import { normalizeEventDescription } from "../util/EventDescriptionUtils.js";
+import {
+    FREE_BUSY_MAX_ATTEMPTS,
+    FREE_BUSY_WINDOW_SECONDS,
+    lookupFreeBusy,
+    parseFreeBusyRequest,
+    type FreeBusyResponse,
+} from "../util/FreeBusyLookupUtils.js";
 import { isPlainAddress, safeDisplayName } from "../util/MimeHeaderUtils.js";
 import { nameBasedUuid } from "../util/UuidUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
@@ -50,11 +70,7 @@ import {
 } from "../models/types.js";
 const { Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
-const { Get, Param, Post, Request, User: AuthUser } = RouteDecorators;
-
-/** Most attendees an event written through this route may list - the compose cap of mapi and activesync, and
- * `MeetingSchedulingJob`'s default `max_attendees`. */
-export const MAX_EVENT_ATTENDEES = 500;
+const { Auth, Get, Param, Post, RateLimit, Request, User: AuthUser } = RouteDecorators;
 
 const RESPOND_STATUS_MAP: Record<string, AttendeeResponseStatus> = {
     accepted: AttendeeResponseStatus.ACCEPTED,
@@ -79,6 +95,13 @@ const RESPOND_STATUS_MAP: Record<string, AttendeeResponseStatus> = {
  * `MeetingSchedulingJob`'s own doc comment). Declining soft-deletes the responder's own event copy rather
  * than just flipping a status flag, matching the exact precedent already implemented in `@rapidmx/
  * activesync`'s `MeetingResponseCommand` for the same underlying data.
+ * - **The event dialog's fields**: a write's `description`/`descriptionHtml` are sanitized and reconciled
+ * (`normalizeEventDescription()`), `visibility` and the guest permissions validated, all with a `400` for nonsense; a change of any
+ * of them bumps `sequence` (they travel in the invitation). `find()`/`findById()` show a `private`/`confidential` event to a reader who
+ * isn't the owner or a delegate with `UPDATE` only as a busy block (`redactReadRecords()`), and such a reader can't filter or sort by
+ * the hidden fields (`assertQueryAllowed()`). An edit of the guest permissions on a copy the mailbox doesn't organize is ignored.
+ * - **`POST /:id/request-change`** (`requestChange()`): a guest's request to the organizer to change the event or add guests, as
+ * the event's guest permissions allow.
  *
  * `mailboxClass` is supplied by the Mongo/SQL concrete subclasses so this class can resolve the responding
  * mailbox's own address(es) without depending on either backend directly.
@@ -122,12 +145,98 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (typeof obj.icalUid === "string") {
             obj.icalUid = boundIndexedValue(obj.icalUid);
         }
+        BaseCalendarEventRoute.normalizeDescriptionAndPolicy(obj, true);
+        if (GUEST_PERMISSION_FIELDS.some((field) => field in obj) && !(await this.isOrganizedByOwner(existing))) {
+            // An attendee's copy holds the permissions the organizer sent: an edit of them on a copy the mailbox doesn't organize is
+            // ignored (not refused, so a full object read back and written again still works).
+            for (const field of GUEST_PERMISSION_FIELDS) {
+                delete obj[field];
+            }
+        }
+        if (BaseCalendarEventRoute.changesInvitation(obj, existing) && !(typeof obj.sequence === "number" && obj.sequence > existing.sequence)) {
+            // The description, visibility and guest permissions travel in the invitation, so changing one is a scheduling-relevant change.
+            obj.sequence = existing.sequence + 1;
+        }
     }
 
-    /** Refuses (400) an event whose organizer or attendees can't be mailed safely - see `assertParticipants()`. */
+    /** Refuses (400) an event whose organizer or attendees can't be mailed safely - see `assertParticipants()` - and a bad description, visibility or guest permission. */
     protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
         await super.prepareCreate(obj, user);
         BaseCalendarEventRoute.assertParticipants(obj);
+        BaseCalendarEventRoute.normalizeDescriptionAndPolicy(obj, false);
+    }
+
+    /**
+     * Validates and normalizes the fields an event dialog adds, in a create/update body: the description (`normalizeEventDescription()` -
+     * the HTML is sanitized whatever the client sent, the plain text derived from it when only the HTML was written, a value over its bound
+     * a `400`), `visibility` and the three guest-permission flags (`validateEventPolicyFields()`), and `redacted` is dropped (a response-only
+     * marker). On a create a field cleared by `null` is left out; on an update it is written as `null`.
+     */
+    private static normalizeDescriptionAndPolicy(obj: any, update: boolean): void {
+        delete obj.redacted;
+        validateEventPolicyFields(obj);
+        const decision = normalizeEventDescription({ description: obj.description, descriptionHtml: obj.descriptionHtml });
+        for (const field of ["description", "descriptionHtml"] as const) {
+            if (field in decision && (update || decision[field] !== null)) {
+                obj[field] = decision[field];
+            } else {
+                delete obj[field];
+            }
+        }
+    }
+
+    /** Whether the update `obj` changes something that travels in the invitation but isn't among `isSchedulingRelevantChange()`'s fields. */
+    private static changesInvitation(obj: any, existing: CalendarEvent): boolean {
+        const before = guestPermissionsOf(existing);
+        return (
+            ("description" in obj && (obj.description ?? null) !== (existing.description ?? null)) ||
+            ("descriptionHtml" in obj && (obj.descriptionHtml ?? null) !== (existing.descriptionHtml ?? null)) ||
+            ("visibility" in obj && obj.visibility !== effectiveVisibility(existing)) ||
+            GUEST_PERMISSION_FIELDS.some((field) => field in obj && obj[field] !== before[field])
+        );
+    }
+
+    /** Whether `existing` is an event this mailbox organizes: it names no organizer (a plain personal event) or one of the mailbox's own addresses. */
+    private async isOrganizedByOwner(existing: CalendarEvent): Promise<boolean> {
+        const organizer: string = normalizeAddress(existing.organizer?.address ?? "");
+        if (!organizer) {
+            return true;
+        }
+        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(existing.mailboxUid, { ignoreACL: true });
+        return mailboxAddressSet(mailbox).has(organizer);
+    }
+
+    /** Whether `user` may read every event of the calendar `folderUid` in full: owner, or a delegate with `UPDATE` - see `redactReadRecords()`. */
+    private seesEventDetails(user: JWTUser | undefined, folderUid: string): Promise<boolean> {
+        return this.hasMailAccess(user, folderUid, ACLAction.UPDATE);
+    }
+
+    /** A reader who may not see events' details can't filter or sort by them either (see `eventDetailQueryError()`). */
+    protected async assertQueryAllowed(query: any, scopeUid: string, effectiveUser: JWTUser | undefined): Promise<void> {
+        if (queryNamesEventDetails(query) && !(await this.seesEventDetails(effectiveUser, scopeUid))) {
+            throw eventDetailQueryError();
+        }
+    }
+
+    /**
+     * A reader of the calendar who is not its owner or a delegate with `UPDATE` (a shared-calendar grantee with only `read`/`list`, or a
+     * share-link holder) sees a `private` or `confidential` event only as a busy block - `redactEventForReader()`. Applies to `find()` and
+     * `findById()`; the owner and delegates with `UPDATE` see every event in full.
+     */
+    protected async redactReadRecords(records: T[], scopeUid: string, effectiveUser: JWTUser | undefined): Promise<T[]> {
+        if (!records.some((record) => hidesDetailsFromReaders(record)) || (await this.seesEventDetails(effectiveUser, scopeUid))) {
+            return records;
+        }
+        return records.map((record) => redactEventForReader(record));
+    }
+
+    /**
+     * A live-update notification of a private or confidential event carries the busy block (`redactEventForReader()`, `redacted: true`):
+     * every subscriber of the calendar's channel - a read-only shared-calendar grantee included - receives the same payload, so it can
+     * hold nothing they may not read. The owner's client refetches an event whose notification says `redacted`.
+     */
+    protected pushPayload(data: any): any {
+        return redactEventForReader(data);
     }
 
     /**
@@ -224,6 +333,40 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         return false;
     }
 
+    /** The query value matching one element of `Mailbox.aliasAddresses` (`BaseMailboxAccessRoute.aliasQueryValue()`'s Mongo/SQL split -
+     * `CalendarEventRouteSQL` overrides it for the serialized `simple-json` column). */
+    protected aliasQueryValue(address: string): any {
+        return ModelUtils.literal(address);
+    }
+
+    @Summary("Find a time: other people's busy windows")
+    @Description(
+        "For up to 50 local mailbox addresses, the windows over start..end (at most 31 days) in which each is busy - " +
+            "never titles, locations or attendees. Each mailbox's owner chooses who may see it (`Mailbox.freeBusyVisibility`): " +
+            "`available` carries the busy windows, `restricted` is a mailbox that does not share with the caller (`unknown` " +
+            "to a caller who owns no mailbox here), `unknown` is an address that is not a local mailbox or a calendar too large " +
+            "to compute. Tentative events and unanswered invitations are marked `tentative`; what the owner declined is left out.",
+    )
+    @Returns([Object])
+    @Auth(["jwt"])
+    @RateLimit({ perUser: true, maxAttempts: FREE_BUSY_MAX_ATTEMPTS, windowSeconds: FREE_BUSY_WINDOW_SECONDS })
+    @Post("/free-busy")
+    public async freeBusy(body: { addresses: string[]; start: string; end: string }, @AuthUser user?: JWTUser): Promise<FreeBusyResponse> {
+        const request = parseFreeBusyRequest(body);
+        return await lookupFreeBusy(
+            {
+                caller: user!,
+                isTrusted: this.isTrusted(user),
+                mailboxRepo: await this.getMailboxRepo(),
+                folderRepo: await this.getFolderRepo(),
+                eventRepo: this.repoUtils!,
+                aliasQueryValue: (address) => this.aliasQueryValue(address),
+                hasAccess: (uid, action) => this.hasMailAccess(user, uid, action),
+            },
+            request,
+        );
+    }
+
     @Summary("Respond to a meeting invite")
     @Description(
         "Accepts, declines, or tentatively responds to this event as the calling mailbox's own attendee " +
@@ -317,7 +460,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         text: string,
         method: "reply" | "counter",
         ics: string,
-    ): Promise<void> {
+    ): Promise<boolean> {
         try {
             if (!isPlainAddress(event.organizer?.address)) {
                 throw new Error("the organizer's address isn't one plain email address");
@@ -333,9 +476,188 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                 .compile()
                 .build();
             await this.mailTransport.send({ raw: composed, envelopeFrom: responder.address, envelopeTo: [event.organizer.address] });
+            return true;
         } catch (err: any) {
             this.logger?.warn(`BaseCalendarEventRoute: failed to send iTIP ${method.toUpperCase()} for event ${event.uid}: ${err.message}`);
+            return false;
         }
+    }
+
+    /**
+     * Asks the organizer to change an event the caller is a guest of, as Google Calendar's "guests can modify the event" / "invite others"
+     * permissions allow: mails the organizer an iTIP `COUNTER` (`buildEventIcs(..., "COUNTER", { changeRequest: true })`, the requester as the
+     * one `ATTENDEE`, tentative, then any guests asked for) carrying the proposed values and `X-RAPIDMX-CHANGE-REQUEST:TRUE`, plus a
+     * plain-text note saying what is asked. **Nothing changes on the caller's calendar** - the organizer's change arrives as an ordinary
+     * `REQUEST` - and when the organizer's mailbox is a RapidMX one, `ScanQueueJob` applies the request itself if the organizer's own
+     * permission flags allow it (otherwise it stays a proposal the organizer can accept, `POST /invite/:messageUid/accept-proposal`).
+     *
+     * The caller must be able to update their own copy (`UPDATE` on its calendar), be a listed guest and not the organizer (`400`). The flags
+     * of *their copy* say what to allow here (`403` with the reason): a change of the title, location, description or time needs
+     * `guestsCanModify`, guests to add need `guestsCanInviteOthers`. The body's values are validated as a create would (`400`): `title` and
+     * `location` non-empty strings of at most 1000 characters (a request can set them, not clear them), the description as for a write
+     * (`description`/`descriptionHtml`, sanitized), `startDate`/`endDate` ISO 8601 with the end after the start (either may be given alone),
+     * `addAttendees` at most `MAX_REQUESTED_GUESTS` entries of one plain `address` and an optional `displayName`. A value equal to what the
+     * event has isn't a change; a request that changes nothing is a `400`. The id is the caller's own row, so a series master (whole series)
+     * or one occurrence's override row can be changed exactly as `respond()` addresses them; a bare occurrence of a series has no row of its
+     * own and can't be. `502` when the mail can't be sent.
+     */
+    @Summary("Ask the organizer to change an event")
+    @Description(
+        "Mails the organizer an iTIP COUNTER carrying the requested title, location, description, time and added guests, if the event's " +
+            "guest permissions allow the caller to ask; nothing changes on the caller's own calendar.",
+    )
+    @Returns([Object])
+    @Post("/:id/request-change")
+    public async requestChange(
+        @Param("id") id: string,
+        body: {
+            title?: string;
+            location?: string;
+            description?: string;
+            descriptionHtml?: string;
+            startDate?: string;
+            endDate?: string;
+            addAttendees?: { address: string; displayName?: string }[];
+        } | undefined,
+        @AuthUser user?: JWTUser,
+    ): Promise<{ requested: true; changes: string[]; addAttendees: { address: string; displayName?: string }[] }> {
+        if (!this.repoUtils || !this.mailTransport) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const event: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
+        if (!event) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        if (!(await this.hasMailAccess(user, event.folderUid, ACLAction.UPDATE))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+        const invalid = (message: string): ApiError => new ApiError(ApiErrors.INVALID_REQUEST, 400, message);
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+            throw invalid(ApiErrorMessages.INVALID_REQUEST);
+        }
+
+        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(event.mailboxUid, { ignoreACL: true });
+        const addresses: Set<string> = mailboxAddressSet(mailbox);
+        const guest: Attendee | undefined = event.attendees.find((attendee) => addresses.has(normalizeAddress(attendee.address)));
+        if (!guest || guest.isOrganizer || addresses.has(normalizeAddress(event.organizer?.address ?? ""))) {
+            throw invalid(guest ? "You organize this event: change it directly." : "You are not a guest of this event.");
+        }
+
+        // What is asked, validated: each `undefined` is "not asked".
+        const stringField = (name: "title" | "location"): string | undefined => {
+            const value: unknown = body[name];
+            if (value === undefined) {
+                return undefined;
+            }
+            if (typeof value !== "string" || value.trim() === "" || value.trim().length > 1000) {
+                throw invalid(`'${name}' must be a non-empty string of at most 1000 characters.`);
+            }
+            return value.trim();
+        };
+        const title: string | undefined = stringField("title");
+        const location: string | undefined = stringField("location");
+        const description = normalizeEventDescription({ description: body.description, descriptionHtml: body.descriptionHtml });
+        if (description.description === null && "descriptionHtml" in description && description.descriptionHtml === null) {
+            throw invalid("A change request can't clear the description.");
+        }
+        const date = (name: "startDate" | "endDate"): Date | undefined => {
+            if (body[name] === undefined) {
+                return undefined;
+            }
+            const value: Date = new Date(body[name]);
+            if (typeof body[name] !== "string" || Number.isNaN(value.getTime())) {
+                throw invalid(`'${name}' must be an ISO 8601 date/time.`);
+            }
+            return value;
+        };
+        const startDate: Date = date("startDate") ?? new Date(event.startDate);
+        const endDate: Date = date("endDate") ?? new Date(event.endDate);
+        if (endDate.getTime() <= startDate.getTime()) {
+            throw invalid("'endDate' must be after 'startDate'.");
+        }
+        const asked: unknown = body.addAttendees;
+        if (asked !== undefined && (!Array.isArray(asked) || asked.length > MAX_REQUESTED_GUESTS)) {
+            throw invalid(`'addAttendees' must be a list of at most ${MAX_REQUESTED_GUESTS} guests.`);
+        }
+        const known: Set<string> = new Set([...event.attendees.map((attendee) => normalizeAddress(attendee.address)), normalizeAddress(event.organizer?.address ?? "")]);
+        const added: Attendee[] = [];
+        for (const entry of (asked as { address: string; displayName?: string }[] | undefined) ?? []) {
+            if (!entry || typeof entry !== "object" || !isPlainAddress(entry.address)) {
+                throw invalid("Every guest to add must have one plain email address.");
+            }
+            if (!known.has(normalizeAddress(entry.address))) {
+                known.add(normalizeAddress(entry.address));
+                added.push({
+                    address: entry.address,
+                    displayName: safeDisplayName(typeof entry.displayName === "string" ? entry.displayName : undefined),
+                    role: AttendeeRole.REQUIRED,
+                    responseStatus: AttendeeResponseStatus.NEEDS_ACTION,
+                    isOrganizer: false,
+                });
+            }
+        }
+        if (event.attendees.length + added.length > MAX_EVENT_ATTENDEES) {
+            throw invalid(`The event can have at most ${MAX_EVENT_ATTENDEES} guests.`);
+        }
+
+        // What actually differs from the event, and so what needs the organizer's permission.
+        const changes: string[] = [];
+        if (title !== undefined && title !== event.title) {
+            changes.push("title");
+        }
+        if (location !== undefined && location !== event.location) {
+            changes.push("location");
+        }
+        if (
+            description.description !== undefined &&
+            ((description.description ?? null) !== (event.description ?? null) || (description.descriptionHtml ?? null) !== (event.descriptionHtml ?? null))
+        ) {
+            changes.push("description");
+        }
+        if (startDate.getTime() !== new Date(event.startDate).getTime() || endDate.getTime() !== new Date(event.endDate).getTime()) {
+            changes.push("time");
+        }
+        if (changes.length === 0 && added.length === 0) {
+            throw invalid("Nothing to change.");
+        }
+        const permissions = guestPermissionsOf(event);
+        if (changes.length > 0 && !permissions.guestsCanModify) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "The organizer doesn't allow guests to change this event.");
+        }
+        if (added.length > 0 && !permissions.guestsCanInviteOthers) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "The organizer doesn't allow guests to invite others.");
+        }
+
+        const proposer: Attendee = { ...guest, responseStatus: AttendeeResponseStatus.TENTATIVE };
+        const proposed: CalendarEvent = {
+            ...event,
+            // The title is always named (the organizer's card shows it); the location only when it is asked to change - a guest's own copy
+            // may hold a link of their own (`CalendarEventAttendeeLink`) that must never be mistaken for a request.
+            title: title ?? event.title,
+            location: changes.includes("location") ? location : undefined,
+            description: changes.includes("description") ? (description.description ?? undefined) : undefined,
+            descriptionHtml: changes.includes("description") ? (description.descriptionHtml ?? undefined) : undefined,
+            startDate,
+            endDate,
+        };
+        const lines: string[] = [
+            ...changes.map((change) => `- ${change === "time" ? `time: ${startDate.toUTCString()} - ${endDate.toUTCString()}` : change === "title" ? `title: ${title}` : change === "location" ? `location: ${location}` : "description"}`),
+            ...added.map((entry) => `- add guest: ${entry.displayName ? `${entry.displayName} <${entry.address}>` : entry.address}`),
+        ];
+        const note: string = `${proposer.displayName ?? proposer.address} asked to change: ${event.title}\n\n${lines.join("\n")}`;
+        const sent: boolean = await this.sendItipMail(
+            event,
+            mailbox,
+            proposer,
+            `Change requested: ${event.title}`,
+            note,
+            "counter",
+            buildEventIcs(proposed, "COUNTER", { onlyAttendee: proposer, changeRequest: true, extraAttendees: added }),
+        );
+        if (!sent) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 502, "The request couldn't be sent to the organizer.");
+        }
+        return { requested: true, changes, addAttendees: added.map((entry) => ({ address: entry.address, displayName: entry.displayName })) };
     }
 
     // ---- The meeting invitation in a message (what a mail client's Accept / Tentative / Decline card is built from) ----
@@ -652,6 +974,12 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             mailboxUid,
             title: parsed.summary ?? "",
             location: parsed.location,
+            description: parsed.description,
+            descriptionHtml: parsed.descriptionHtml,
+            visibility: parsed.visibility ?? "default",
+            guestsCanModify: parsed.guestsCanModify ?? false,
+            guestsCanInviteOthers: parsed.guestsCanInviteOthers ?? true,
+            guestsCanSeeGuestList: parsed.guestsCanSeeGuestList ?? true,
             startDate: start,
             endDate: parsed.endDate ?? start,
             allDay: inviteIsAllDay(parsed),
@@ -693,6 +1021,12 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                         ? {
                               title: parsed.summary ?? existing.title,
                               location: parsed.location,
+                              description: parsed.description ?? null,
+                              descriptionHtml: parsed.descriptionHtml ?? null,
+                              visibility: parsed.visibility ?? "default",
+                              guestsCanModify: parsed.guestsCanModify ?? false,
+                              guestsCanInviteOthers: parsed.guestsCanInviteOthers ?? true,
+                              guestsCanSeeGuestList: parsed.guestsCanSeeGuestList ?? true,
                               startDate: parsed.startDate ?? existing.startDate,
                               endDate: parsed.endDate ?? existing.endDate,
                               recurrenceRule: parsed.recurrenceRule ?? existing.recurrenceRule,
@@ -713,8 +1047,10 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             }
 
             const folder = await findOrCreateWellKnownFolder(await this.getFolderRepo(), this.folderClass, mailbox.uid, FolderType.CALENDAR);
+            // An organizer who hides the guest list names only this guest; anything more in the file is not kept.
+            const invited = parsed.guestsCanSeeGuestList === false ? parsed.attendees.filter((attendee) => addresses.has(normalizeAddress(attendee.address))) : parsed.attendees;
             const attendees: Attendee[] = withAnswer(
-                parsed.attendees.map((attendee) => ({
+                invited.map((attendee) => ({
                     address: attendee.address,
                     displayName: attendee.displayName,
                     role: AttendeeRole.REQUIRED,

@@ -16,6 +16,7 @@ import {
     CalendarEvent,
     CalendarEventStatus,
     EncryptionOrigin,
+    EventVisibility,
     Recipient,
     RecipientType,
     RecurrenceRule,
@@ -189,6 +190,52 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
     @Nullable
     public videoMeetingUid?: string;
 
+    // `text`, `nullable: true`: unbounded by the column type (the route bounds them) and added after the table already existed.
+    @Column({ type: "text", nullable: true })
+    @Description(
+        "The description of the event as plain text (at most 32,000 characters). The plain-text form of `descriptionHtml` when only " +
+            "the HTML is written.",
+    )
+    @Nullable
+    public description?: string;
+
+    @Column({ type: "text", nullable: true })
+    @Description(
+        "The description of the event as HTML, sanitized by the server on every write (only b/strong, i/em, u, br, p, ul/ol/li and " +
+            "a with an http, https or mailto href survive; at most 64,000 characters).",
+    )
+    @Nullable
+    public descriptionHtml?: string;
+
+    // `nullable: true` on this and the three booleans below, for the reason `encryptionOrigin` gives above: added after the table already
+    // existed in deployed installations, and `@Column` has no SQL-level `DEFAULT`. A legacy row's `NULL` reads as the field's default
+    // everywhere it matters (`util/CalendarEventUtils.ts`). `type: "varchar"` for a string-literal-union column, as `status` above.
+    @Column({ type: "varchar", nullable: true })
+    @Description(
+        "Who may see the event's details: `default`, `public`, `private` or `confidential` (iCalendar CLASS). A reader of the " +
+            "calendar who is not its owner or a delegate with UPDATE sees a private or confidential event only as a busy block.",
+    )
+    @Nullable
+    public visibility: EventVisibility = "default";
+
+    @Column({ nullable: true })
+    @Description("Whether the guests may ask the organizer to change the event (X-RAPIDMX-GUESTS-CAN-MODIFY).")
+    @Nullable
+    public guestsCanModify: boolean = false;
+
+    @Column({ nullable: true })
+    @Description("Whether the guests may ask the organizer to add other guests (X-RAPIDMX-GUESTS-CAN-INVITE).")
+    @Nullable
+    public guestsCanInviteOthers: boolean = true;
+
+    @Column({ nullable: true })
+    @Description(
+        "Whether a guest may see who else was invited (X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST). When `false` each guest is mailed an " +
+            "invitation naming only themselves.",
+    )
+    @Nullable
+    public guestsCanSeeGuestList: boolean = true;
+
     constructor(other?: Partial<CalendarEventSQL>) {
         super(other);
 
@@ -220,6 +267,14 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
             this.reminderSentFor = "reminderSentFor" in other ? other.reminderSentFor : this.reminderSentFor;
             this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
             this.videoMeetingUid = "videoMeetingUid" in other ? other.videoMeetingUid : this.videoMeetingUid;
+            this.description = "description" in other ? other.description : this.description;
+            this.descriptionHtml = "descriptionHtml" in other ? other.descriptionHtml : this.descriptionHtml;
+            this.visibility = other.visibility !== undefined ? other.visibility : this.visibility;
+            this.guestsCanModify = other.guestsCanModify !== undefined ? other.guestsCanModify : this.guestsCanModify;
+            this.guestsCanInviteOthers =
+                other.guestsCanInviteOthers !== undefined ? other.guestsCanInviteOthers : this.guestsCanInviteOthers;
+            this.guestsCanSeeGuestList =
+                other.guestsCanSeeGuestList !== undefined ? other.guestsCanSeeGuestList : this.guestsCanSeeGuestList;
         }
     }
 }

@@ -41,6 +41,7 @@ import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSu
 import { buildEventIcs } from "../../../src/util/IcsUtils.js";
 import { dsnDeliverySuite } from "../dsnDeliverySuite.js";
 import { htmlMailSuite } from "../htmlMailSuite.js";
+import { eventDialogItipSuite } from "../eventDialogItipSuite.js";
 import { sanitizeDiscoveredKey } from "../../../src/util/KeyringUtils.js";
 import { issueCertificate, makeTestIssuer } from "../../util/signerCertificates.js";
 import { buildDispositionNotification } from "../../../src/util/ReceiptUtils.js";
@@ -471,6 +472,23 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             return inbox ? await messageRepo.find({ folderUid: inbox.uid }).toArray() : [];
         },
         attachmentsOf: async (messageUid) => await attachmentRepo.find({ messageUid }).toArray(),
+    });
+
+    eventDialogItipSuite({
+        job: () => job as any,
+        createMailbox: async () => {
+            await createMailbox();
+        },
+        deliver: async (raw, envelopeFrom) => {
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await objectFactory.getInstance<any>("BlobStore")!.put(rawBlobKey, raw);
+            await createIngestEntry({ rawBlobKey, envelopeFrom, envelopeTo: ["recipient@example.com"] });
+            await job.run();
+        },
+        saveEvent: async (data) => await calendarEventRepo.save(new CalendarEventMongo({ mailboxUid, ...data })),
+        events: async (icalUid) => await calendarEventRepo.find({ mailboxUid, icalUid }).toArray(),
+        event: async (uid) => (await calendarEventRepo.findOne({ uid } as any))!,
+        messages: async () => await messageRepo.find({ mailboxUid }).toArray(),
     });
 
     describe("Delivered recipients and sender", () => {

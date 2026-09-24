@@ -37,6 +37,12 @@ describe("BaseCalendarEventRoute Tests (dependency guard clause only)", () => {
         await expect(route.respond("event-1", { responseStatus: "accepted" }, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
     });
 
+    it("requestChange() throws INTERNAL_ERROR when repoUtils/mailTransport are not set.", async () => {
+        const route = objectFactory.newInstance<TestCalendarEventRoute>(TestCalendarEventRoute, { initialize: false });
+
+        await expect(route.requestChange("event-1", { title: "New" }, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
+    });
+
     it("The invitation endpoints throw INTERNAL_ERROR when repoUtils/blobStore are not set.", async () => {
         const route = objectFactory.newInstance<TestCalendarEventRoute>(TestCalendarEventRoute, { initialize: false });
         const user: any = { uid: "user-1" };

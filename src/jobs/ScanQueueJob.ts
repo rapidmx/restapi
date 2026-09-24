@@ -29,8 +29,9 @@ import { ERASURE_IN_PROGRESS } from "./ErasureExecutionJob.js";
 import { writeContactKeys } from "../util/ContactKeyUtils.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
-import { meetingMethodOf } from "../util/MeetingInviteUtils.js";
-import { extractHeader, extractHeaders, prepareRelayCopy, prependHeaders, safeDisplayName, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
+import { MAX_EVENT_ATTENDEES, MAX_REQUESTED_GUESTS, guestPermissionsOf } from "../util/CalendarEventUtils.js";
+import { mailboxAddressSet, meetingMethodOf } from "../util/MeetingInviteUtils.js";
+import { extractHeader, extractHeaders, isPlainAddress, prepareRelayCopy, prependHeaders, safeDisplayName, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
 import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification, parseDispositionNotification } from "../util/ReceiptUtils.js";
@@ -2156,6 +2157,13 @@ export abstract class ScanQueueJob<
                 case "CANCEL":
                     await this.processItipCancel(entry.mailboxUid, parsed, sender);
                     break;
+                case "COUNTER":
+                    // Only a guest's change request (`X-RAPIDMX-CHANGE-REQUEST`) is ever acted on; any other COUNTER is a proposal
+                    // the organizer answers with `POST .../accept-proposal`, exactly as before.
+                    if (parsed.changeRequest && (await this.processItipChangeRequest(entry.mailboxUid, parsed, sender))) {
+                        await this.markChangeRequestApplied(nameBasedUuid(`ingest:${entry.uid}:target`));
+                    }
+                    break;
                 default:
                     break;
             }
@@ -2284,6 +2292,14 @@ export abstract class ScanQueueJob<
             );
         }
 
+        // An organizer who hides the guest list sends each guest an invitation naming only that guest (`MeetingSchedulingJob`); a sender that
+        // named more is still filed as the guest's own entry alone. With no entry of this mailbox's own to keep, the list is left as sent.
+        if (parsed.guestsCanSeeGuestList === false) {
+            const own: Set<string> = mailboxAddressSet(mailbox);
+            const self: Attendee[] = attendees.filter((attendee) => own.has(normalizeAddress(attendee.address)));
+            attendees = self.length > 0 ? self : attendees;
+        }
+
         let row: CE;
         if (!existing) {
             const folder: F = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, mailboxUid, FolderType.CALENDAR);
@@ -2300,6 +2316,13 @@ export abstract class ScanQueueJob<
                     mailboxUid,
                     title: parsed.summary ?? "",
                     location: parsed.location,
+                    // The description, visibility and guest permissions as the organizer sent them (already sanitized by `parseIcsEvent()`).
+                    description: parsed.description,
+                    descriptionHtml: parsed.descriptionHtml,
+                    visibility: parsed.visibility ?? "default",
+                    guestsCanModify: parsed.guestsCanModify ?? false,
+                    guestsCanInviteOthers: parsed.guestsCanInviteOthers ?? true,
+                    guestsCanSeeGuestList: parsed.guestsCanSeeGuestList ?? true,
                     startDate: parsed.startDate ?? new Date(),
                     endDate: parsed.endDate ?? new Date(),
                     allDay: false,
@@ -2334,6 +2357,13 @@ export abstract class ScanQueueJob<
                 return {
                     title: parsed.summary ?? current.title,
                     location: parsed.location,
+                    // Cleared (`null`) when the newer revision has none, so a removed description doesn't linger on the guest's copy.
+                    description: parsed.description ?? null,
+                    descriptionHtml: parsed.descriptionHtml ?? null,
+                    visibility: parsed.visibility ?? "default",
+                    guestsCanModify: parsed.guestsCanModify ?? false,
+                    guestsCanInviteOthers: parsed.guestsCanInviteOthers ?? true,
+                    guestsCanSeeGuestList: parsed.guestsCanSeeGuestList ?? true,
                     startDate: parsed.startDate ?? current.startDate,
                     endDate: parsed.endDate ?? current.endDate,
                     attendees,
@@ -2642,6 +2672,129 @@ export abstract class ScanQueueJob<
             );
             return { attendees };
         });
+    }
+
+    /**
+     * Applies a guest's request to change an event this mailbox organizes: an iTIP `COUNTER` carrying `X-RAPIDMX-CHANGE-REQUEST:TRUE` (built by
+     * `POST /calendar-events/:id/request-change`), returning whether it was applied. Anything less than every check below leaves the
+     * message an ordinary proposal - nothing is applied and nothing is refused, and the organizer can still accept a proposed time by hand:
+     *
+     * - the sender is DKIM-verified (`maybeProcessItipMessage()`), is a listed attendee of the event - not its organizer - and the `COUNTER`
+     * names them as the proposer;
+     * - this mailbox's own row of the event is the one that organizes it (its `organizer` is one of the mailbox's addresses), is not cancelled, and
+     * is not newer than the copy the guest saw (a lower `SEQUENCE` is stale);
+     * - **the organizer's own row decides the permission, never the flags in the message**: a change of title, location, description or time needs
+     * its `guestsCanModify`, and new guests need its `guestsCanInviteOthers`; a request with one change not allowed applies nothing at all.
+     *
+     * What the message carries is a value only when it is present (a request can set a title, location or description, not clear one) and
+     * different from the row's. Applied: the changed fields are written, new guests are added as required, needs-action attendees (deduplicated,
+     * plain addresses only, at most `MAX_REQUESTED_GUESTS` a request and `MAX_EVENT_ATTENDEES` in all), `SEQUENCE` is bumped so that
+     * `MeetingSchedulingJob` mails every guest the updated invitation, and - only when the time changed - every attendee but the organizer goes
+     * back to needs-action, except the guest who asked, who is accepted (as `POST .../accept-proposal` does for the proposer). Version-checked
+     * with a retry like every other iTIP update here.
+     */
+    private async processItipChangeRequest(mailboxUid: string, parsed: ParsedIcsEvent, sender: string): Promise<boolean> {
+        const existing: CE | undefined = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
+        if (!existing || !parsed.attendees.some((attendee) => normalizeAddress(attendee.address) === sender)) {
+            return false;
+        }
+        const mailbox: X | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
+        const own: Set<string> = mailboxAddressSet(mailbox);
+        if (!own.has(normalizeAddress(existing.organizer?.address ?? ""))) {
+            return false;
+        }
+
+        let applied = false;
+        await this.updateCalendarEventWithRetry(existing.uid, (current) => {
+            const listed: Attendee | undefined = current.attendees.find((attendee) => normalizeAddress(attendee.address) === sender);
+            if (!listed || listed.isOrganizer || own.has(sender) || current.status === CalendarEventStatus.CANCELLED || (parsed.sequence ?? 0) < (current.sequence ?? 0)) {
+                return undefined;
+            }
+            const patch: Record<string, any> = {};
+            const title: string | undefined = parsed.summary?.trim().slice(0, 1000);
+            if (title && title !== current.title) {
+                patch.title = title;
+            }
+            const location: string | undefined = parsed.location?.trim().slice(0, 1000);
+            if (location && location !== current.location) {
+                patch.location = location;
+            }
+            if (
+                (parsed.description !== undefined || parsed.descriptionHtml !== undefined) &&
+                ((parsed.description ?? null) !== (current.description ?? null) || (parsed.descriptionHtml ?? null) !== (current.descriptionHtml ?? null))
+            ) {
+                patch.description = parsed.description ?? null;
+                patch.descriptionHtml = parsed.descriptionHtml ?? null;
+            }
+            const timeChanged: boolean =
+                !!parsed.startDate &&
+                !!parsed.endDate &&
+                parsed.endDate.getTime() > parsed.startDate.getTime() &&
+                (parsed.startDate.getTime() !== new Date(current.startDate).getTime() || parsed.endDate.getTime() !== new Date(current.endDate).getTime());
+            if (timeChanged) {
+                patch.startDate = parsed.startDate;
+                patch.endDate = parsed.endDate;
+            }
+
+            // The guests asked for: not the requester, not already listed, not the organizer, plain addresses, each once.
+            const known: Set<string> = new Set([...current.attendees.map((attendee) => normalizeAddress(attendee.address)), normalizeAddress(current.organizer.address), sender]);
+            const added: Attendee[] = [];
+            for (const guest of parsed.attendees) {
+                const address: string = normalizeAddress(guest.address);
+                if (!isPlainAddress(guest.address) || known.has(address) || added.length >= MAX_REQUESTED_GUESTS || current.attendees.length + added.length >= MAX_EVENT_ATTENDEES) {
+                    continue;
+                }
+                known.add(address);
+                added.push({
+                    address: guest.address,
+                    displayName: safeDisplayName(guest.displayName),
+                    role: AttendeeRole.REQUIRED,
+                    responseStatus: AttendeeResponseStatus.NEEDS_ACTION,
+                    isOrganizer: false,
+                });
+            }
+
+            const permissions = guestPermissionsOf(current);
+            if ((Object.keys(patch).length > 0 && !permissions.guestsCanModify) || (added.length > 0 && !permissions.guestsCanInviteOthers)) {
+                return undefined;
+            }
+            if (Object.keys(patch).length === 0 && added.length === 0) {
+                return undefined;
+            }
+            const organizerAddress: string = normalizeAddress(current.organizer.address);
+            const attendees: Attendee[] = timeChanged
+                ? current.attendees.map((attendee) =>
+                      attendee.isOrganizer || normalizeAddress(attendee.address) === organizerAddress
+                          ? attendee
+                          : { ...attendee, responseStatus: normalizeAddress(attendee.address) === sender ? AttendeeResponseStatus.ACCEPTED : AttendeeResponseStatus.NEEDS_ACTION },
+                  )
+                : current.attendees;
+            applied = true;
+            return { ...patch, attendees: [...attendees, ...added], sequence: current.sequence + 1 };
+        });
+        return applied;
+    }
+
+    /** Marks the delivered message of an applied change request as answered (`Message.meetingResponse` `"accepted"`, as accepting a proposal does), so a client can say the change was applied. */
+    private async markChangeRequestApplied(messageUid: string): Promise<void> {
+        for (let attempt = 1; ; attempt++) {
+            const message: M | undefined = await this.messageRepo!.findOne(messageUid, { ignoreACL: true });
+            if (!message) {
+                return;
+            }
+            try {
+                await this.messageRepo!.update(
+                    { uid: message.uid, version: (message as any).version, meetingResponse: "accepted" } as any,
+                    asEntity(this.messageRepo!, message),
+                    { ignoreACL: true },
+                );
+                return;
+            } catch (err: any) {
+                if (attempt >= 3 || err?.status !== 409) {
+                    throw err;
+                }
+            }
+        }
     }
 
     /** Applies the organizer's CANCEL - only from the organizer on record for this mailbox's copy of the event. */

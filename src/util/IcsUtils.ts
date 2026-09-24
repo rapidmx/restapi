@@ -7,9 +7,12 @@ import {
     AttendeeResponseStatus,
     AttendeeRole,
     CalendarEvent,
+    EventVisibility,
     RecurrenceFrequency,
     RecurrenceRule,
 } from "../models/types.js";
+import { guestPermissionsOf } from "./CalendarEventUtils.js";
+import { sanitizeInboundDescription } from "./EventDescriptionUtils.js";
 
 /**
  * Hand-rolled RFC 5545/5546 iCalendar generation and parsing for this library's meeting-invite feature
@@ -21,15 +24,19 @@ import {
  * deliberately *not* a general RFC 5545 parser either - real-world invites arrive from arbitrary senders
  * (Outlook, Gmail, etc.), but this only ever needs a small, fixed set of properties
  * (`METHOD`/`UID`/`SEQUENCE`/`SUMMARY`/`LOCATION`/`STATUS`/`DTSTART`/`DTEND`/`ORGANIZER`/`ATTENDEE`+
- * `PARTSTAT`/`RRULE`/`EXDATE`/`RECURRENCE-ID`/`DTSTAMP`), so it unfolds lines and extracts exactly those, ignoring
- * everything else (`X-` extensions, etc.) rather than attempting to model the full standard. It does track
+ * `PARTSTAT`/`RRULE`/`EXDATE`/`RECURRENCE-ID`/`DTSTAMP`, plus `DESCRIPTION`, `X-ALT-DESC;FMTTYPE=text/html`, `CLASS` and
+ * this library's own `X-RAPIDMX-GUESTS-CAN-MODIFY`/`-INVITE`/`-SEE-GUEST-LIST` and `X-RAPIDMX-CHANGE-REQUEST`), so it
+ * unfolds lines and extracts exactly those, ignoring everything else (other `X-` extensions, etc.) rather than
+ * attempting to model the full standard. An inbound `X-ALT-DESC` is never trusted: it is sanitized (see
+ * `EventDescriptionUtils.sanitizeEventDescriptionHtml()`) before `parseIcsEvent()` returns it. It does track
  * `BEGIN`/`END` component nesting, so only properties directly inside a top-level `VEVENT` are read - a nested
  * `VALARM`'s `ATTENDEE`s or a `VTIMEZONE`'s `DTSTART`/`RRULE` are never mistaken for the event's own, and multiple
  * VEVENTs are never merged into one.
  *
  * Known, accepted limitations (a deliberate scope boundary, not an oversight):
- * - No RFC 5545 line-folding on generated output - folding is a SHOULD for writers, not a MUST for readers;
- * this library's own generated lines are short enough in practice that skipping it is safe.
+ * - Generated output folds every content line longer than 75 octets (RFC 5545 §3.1, `foldLine()` - never inside a
+ * multi-byte character), which matters now that `DESCRIPTION` and `X-ALT-DESC` can be tens of kilobytes; a line that
+ * is already short is emitted byte for byte as before.
  * - A `DTSTART`/`DTEND`/`RECURRENCE-ID`/`EXDATE`/`UNTIL` value with a `TZID` parameter is converted to UTC
  * via `Intl`'s built-in timezone database (no new dependency). `TZID` may be quoted (`TZID="America/New_York"`)
  * and may be a common Windows zone name (`"Pacific Standard Time"`, as classic Outlook emits) - see
@@ -55,6 +62,21 @@ export interface ParsedIcsEvent {
     sequence: number;
     summary?: string;
     location?: string;
+    /** `DESCRIPTION`, the plain text - or, when the file has only an `X-ALT-DESC;FMTTYPE=text/html`, its plain-text form. Bounded. */
+    description?: string;
+    /** `X-ALT-DESC;FMTTYPE=text/html`, **sanitized** (`sanitizeEventDescriptionHtml()`), and only when something is left of it. */
+    descriptionHtml?: string;
+    /** `CLASS` when it is `PUBLIC`, `PRIVATE` or `CONFIDENTIAL` (as `"public"`/`"private"`/`"confidential"`); absent for no or any other `CLASS`. */
+    visibility?: Exclude<EventVisibility, "default">;
+    /** `X-RAPIDMX-GUESTS-CAN-MODIFY`, when the file has one (a boolean value). Absent means the default (`false`). */
+    guestsCanModify?: boolean;
+    /** `X-RAPIDMX-GUESTS-CAN-INVITE`, when the file has one. Absent means the default (`true`). */
+    guestsCanInviteOthers?: boolean;
+    /** `X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST`, when the file has one. Absent means the default (`true`). */
+    guestsCanSeeGuestList?: boolean;
+    /** `X-RAPIDMX-CHANGE-REQUEST:TRUE` - the `COUNTER` is a guest's request to change the event, which the organizer's server may apply
+     * itself (see `ScanQueueJob.processItipCounter()`), not merely a proposed time. */
+    changeRequest?: boolean;
     startDate?: Date;
     endDate?: Date;
     /** The IANA zone `DTSTART`'s `TZID` resolved to (see `resolveTimeZone()`), if it had a recognizable one -
@@ -129,6 +151,32 @@ function stripControlChars(value: string): string {
 function isControlChar(ch: string): boolean {
     const code: number = ch.charCodeAt(0);
     return code < 0x20 || code === 0x7f;
+}
+
+/** Folds one content line at 75 octets (RFC 5545 §3.1): the rest goes on continuation lines that start with a space, so a
+ * continuation carries at most 74 octets of content. Never splits a multi-byte (UTF-8) character or a surrogate pair. A line of 75
+ * octets or fewer is returned as it is. */
+function foldLine(line: string): string {
+    if (Buffer.byteLength(line, "utf8") <= 75) {
+        return line;
+    }
+    const parts: string[] = [];
+    let current = "";
+    let octets = 0;
+    let limit = 75;
+    for (const ch of line) {
+        const size: number = Buffer.byteLength(ch, "utf8");
+        if (octets + size > limit) {
+            parts.push(current);
+            current = "";
+            octets = 0;
+            limit = 74;
+        }
+        current += ch;
+        octets += size;
+    }
+    parts.push(current);
+    return parts.join("\r\n ");
 }
 
 function unescapeText(value: string): string {
@@ -442,8 +490,20 @@ function parseRrule(value: string, tzid?: string): RecurrenceRule {
  * (`options.onlyAttendee`) - a real iTIP reply only ever reports the replying attendee's own status, never
  * the whole list. See this module's own doc comment for the recurring-meeting (`RECURRENCE-ID` vs.
  * `RRULE`/`EXDATE`) and line-folding conventions.
+ *
+ * `REQUEST` and `CANCEL` also carry the event's description (`DESCRIPTION` - plain text, escaped - and, when the event has HTML,
+ * `X-ALT-DESC;FMTTYPE=text/html`, sanitized again here), its visibility (`CLASS`, omitted for `"default"`) and the guest permissions
+ * that differ from their defaults (`X-RAPIDMX-GUESTS-CAN-MODIFY`/`-INVITE`/`-SEE-GUEST-LIST`, `TRUE`/`FALSE`; an omitted one means the
+ * default, so an update that goes back to the defaults says so by omission). A `REPLY` and an ordinary `COUNTER` (a proposed time) carry
+ * none of these. `options.changeRequest` makes a `COUNTER` a guest's request to change the event instead: it then carries those too - the
+ * proposed values - and `X-RAPIDMX-CHANGE-REQUEST:TRUE`, and `options.extraAttendees` (guests the requester asks to add) are listed after
+ * the requester's own `ATTENDEE`.
  */
-export function buildEventIcs(event: CalendarEvent, method: "REQUEST" | "CANCEL" | "REPLY" | "COUNTER", options?: { onlyAttendee?: Attendee }): string {
+export function buildEventIcs(
+    event: CalendarEvent,
+    method: "REQUEST" | "CANCEL" | "REPLY" | "COUNTER",
+    options?: { onlyAttendee?: Attendee; changeRequest?: boolean; extraAttendees?: Attendee[] },
+): string {
     const lines: string[] = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//RapidMX//Mail Server//EN", `METHOD:${method}`, "BEGIN:VEVENT"];
     lines.push(`UID:${stripControlChars(event.icalUid)}`);
     lines.push(`DTSTAMP:${formatDateUtc(new Date())}`);
@@ -454,6 +514,32 @@ export function buildEventIcs(event: CalendarEvent, method: "REQUEST" | "CANCEL"
     }
     if (event.location) {
         lines.push(`LOCATION:${escapeText(event.location)}`);
+    }
+    const carriesDetails: boolean = method === "REQUEST" || method === "CANCEL" || !!options?.changeRequest;
+    if (carriesDetails) {
+        const description = sanitizeInboundDescription(event.description ?? undefined, event.descriptionHtml ?? undefined);
+        if (description.description) {
+            lines.push(`DESCRIPTION:${escapeText(description.description)}`);
+        }
+        if (description.descriptionHtml) {
+            lines.push(`X-ALT-DESC;FMTTYPE=text/html:${escapeText(description.descriptionHtml)}`);
+        }
+        if (event.visibility === "public" || event.visibility === "private" || event.visibility === "confidential") {
+            lines.push(`CLASS:${event.visibility.toUpperCase()}`);
+        }
+        const guests = guestPermissionsOf(event);
+        if (guests.guestsCanModify) {
+            lines.push("X-RAPIDMX-GUESTS-CAN-MODIFY:TRUE");
+        }
+        if (!guests.guestsCanInviteOthers) {
+            lines.push("X-RAPIDMX-GUESTS-CAN-INVITE:FALSE");
+        }
+        if (!guests.guestsCanSeeGuestList) {
+            lines.push("X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST:FALSE");
+        }
+    }
+    if (options?.changeRequest) {
+        lines.push("X-RAPIDMX-CHANGE-REQUEST:TRUE");
     }
     lines.push(`SEQUENCE:${event.sequence}`);
     lines.push(`STATUS:${method === "CANCEL" ? "CANCELLED" : event.status.toUpperCase()}`);
@@ -469,7 +555,10 @@ export function buildEventIcs(event: CalendarEvent, method: "REQUEST" | "CANCEL"
         }
     }
 
-    const attendeesToEmit = method === "REPLY" || method === "COUNTER" ? (options?.onlyAttendee ? [options.onlyAttendee] : []) : event.attendees;
+    const attendeesToEmit =
+        method === "REPLY" || method === "COUNTER"
+            ? [...(options?.onlyAttendee ? [options.onlyAttendee] : []), ...(options?.extraAttendees ?? [])]
+            : event.attendees;
     for (const attendee of attendeesToEmit) {
         const cn = attendee.displayName ? `;CN=${quoteParamValue(attendee.displayName)}` : "";
         const partstat = `;PARTSTAT=${RESPONSE_STATUS_TO_PARTSTAT[attendee.responseStatus]}`;
@@ -479,7 +568,7 @@ export function buildEventIcs(event: CalendarEvent, method: "REQUEST" | "CANCEL"
     }
 
     lines.push("END:VEVENT", "END:VCALENDAR");
-    return lines.join("\r\n");
+    return lines.map(foldLine).join("\r\n");
 }
 
 /**
@@ -575,6 +664,13 @@ interface VEventAccumulator {
     sequence: number;
     summary?: string;
     location?: string;
+    description?: string;
+    descriptionHtml?: string;
+    visibility?: Exclude<EventVisibility, "default">;
+    guestsCanModify?: boolean;
+    guestsCanInviteOthers?: boolean;
+    guestsCanSeeGuestList?: boolean;
+    changeRequest?: boolean;
     status?: string;
     startDate?: Date;
     endDate?: Date;
@@ -592,6 +688,12 @@ function newVEventAccumulator(): VEventAccumulator {
     return { sequence: 0, exceptions: [], attendees: [] };
 }
 
+/** An iCalendar `BOOLEAN` value: `TRUE`/`FALSE`, any case; `undefined` for anything else. */
+function parseIcsBoolean(value: string): boolean | undefined {
+    const text: string = value.trim().toUpperCase();
+    return text === "TRUE" ? true : text === "FALSE" ? false : undefined;
+}
+
 function applyVEventProperty(vevent: VEventAccumulator, property: string, params: Record<string, string>, value: string): void {
     switch (property) {
         case "UID":
@@ -605,6 +707,31 @@ function applyVEventProperty(vevent: VEventAccumulator, property: string, params
             break;
         case "LOCATION":
             vevent.location = unescapeText(value);
+            break;
+        case "DESCRIPTION":
+            vevent.description = unescapeText(value);
+            break;
+        case "X-ALT-DESC":
+            if ((params.FMTTYPE ?? "").trim().toLowerCase() === "text/html") {
+                vevent.descriptionHtml = unescapeText(value);
+            }
+            break;
+        case "CLASS": {
+            const visibility: string = value.trim().toLowerCase();
+            vevent.visibility = visibility === "public" || visibility === "private" || visibility === "confidential" ? visibility : undefined;
+            break;
+        }
+        case "X-RAPIDMX-GUESTS-CAN-MODIFY":
+            vevent.guestsCanModify = parseIcsBoolean(value);
+            break;
+        case "X-RAPIDMX-GUESTS-CAN-INVITE":
+            vevent.guestsCanInviteOthers = parseIcsBoolean(value);
+            break;
+        case "X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST":
+            vevent.guestsCanSeeGuestList = parseIcsBoolean(value);
+            break;
+        case "X-RAPIDMX-CHANGE-REQUEST":
+            vevent.changeRequest = parseIcsBoolean(value) === true ? true : undefined;
             break;
         case "STATUS":
             vevent.status = value.trim().toUpperCase();
@@ -661,6 +788,12 @@ function finishVEvent(vevent: VEventAccumulator): ParsedIcsVEvent {
         sequence: vevent.sequence,
         summary: vevent.summary,
         location: vevent.location,
+        ...sanitizeInboundDescription(vevent.description, vevent.descriptionHtml),
+        ...(vevent.visibility ? { visibility: vevent.visibility } : {}),
+        ...(vevent.guestsCanModify !== undefined ? { guestsCanModify: vevent.guestsCanModify } : {}),
+        ...(vevent.guestsCanInviteOthers !== undefined ? { guestsCanInviteOthers: vevent.guestsCanInviteOthers } : {}),
+        ...(vevent.guestsCanSeeGuestList !== undefined ? { guestsCanSeeGuestList: vevent.guestsCanSeeGuestList } : {}),
+        ...(vevent.changeRequest ? { changeRequest: true } : {}),
         status: vevent.status,
         startDate: vevent.startDate,
         endDate: vevent.endDate,

@@ -17,6 +17,7 @@ import { Repository } from "typeorm";
 import config from "../../config.sql.js";
 import { dsnDeliverySuite } from "../dsnDeliverySuite.js";
 import { htmlMailSuite } from "../htmlMailSuite.js";
+import { eventDialogItipSuite } from "../eventDialogItipSuite.js";
 import { registerTestDoubles, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
 import { ScanQueueJobSQL } from "../../../src/jobs/sql/ScanQueueJobSQL.js";
 import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
@@ -462,6 +463,23 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             return inbox ? await messageRepo.find({ where: { folderUid: inbox.uid } }) : [];
         },
         attachmentsOf: async (messageUid) => await attachmentRepo.find({ where: { messageUid } }),
+    });
+
+    eventDialogItipSuite({
+        job: () => job as any,
+        createMailbox: async () => {
+            await createMailbox();
+        },
+        deliver: async (raw, envelopeFrom) => {
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await objectFactory.getInstance<any>("BlobStore")!.put(rawBlobKey, raw);
+            await createIngestEntry({ rawBlobKey, envelopeFrom, envelopeTo: ["recipient@example.com"] });
+            await job.run();
+        },
+        saveEvent: async (data) => await calendarEventRepo.save(new CalendarEventSQL({ mailboxUid, ...data })),
+        events: async (icalUid) => await calendarEventRepo.find({ where: { mailboxUid, icalUid } }),
+        event: async (uid) => (await calendarEventRepo.findOne({ where: { uid } }))!,
+        messages: async () => await messageRepo.find({ where: { mailboxUid } }),
     });
 
     describe("Delivered recipients and sender", () => {

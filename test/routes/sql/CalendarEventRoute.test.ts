@@ -21,7 +21,8 @@ import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
 import { AttendeeResponseStatus, AttendeeRole, BusyStatus, CalendarEventStatus, FolderType, MessageImportance, RecipientType } from "../../../src/models/types.js";
-import { calendarInviteSuite } from "../calendarInviteSuite.js";
+import { calendarInviteSuite, type CalendarInviteSuiteContext } from "../calendarInviteSuite.js";
+import { calendarEventDialogSuite } from "../calendarEventDialogSuite.js";
 import { registerTestDoubles, RecordingMailTransport, type InMemoryBlobStore } from "../../testDoubles.js";
 
 describe("Route:CalendarEventSQL Tests", () => {
@@ -817,7 +818,7 @@ describe("Route:CalendarEventSQL Tests", () => {
         });
     });
 
-    calendarInviteSuite({
+    const suiteContext: CalendarInviteSuiteContext = {
         app: () => server.getApplication(),
         baseUrl,
         ownerToken,
@@ -850,5 +851,17 @@ describe("Route:CalendarEventSQL Tests", () => {
             ),
         findMessage: async (uid) => (await messageRepo.findOne({ where: { uid } }))!,
         findEvents: async (mailboxUid) => (await calendarEventRepo.find({ where: { mailboxUid } })).filter((row: any) => !row.deleted),
+    };
+    calendarInviteSuite(suiteContext);
+    calendarEventDialogSuite({
+        ...suiteContext,
+        otherUid: otherUser.uid,
+        grantFolder: async (folderUid, userUid, actions) => {
+            const acl: any = await aclRepo.findOne({ where: { uid: folderUid } });
+            acl.records = [...acl.records, { userOrRoleId: userUid, actions }];
+            await aclRepo.save(acl);
+        },
+        findEvent: async (uid) => (await calendarEventRepo.findOne({ where: { uid } }))!,
+        shareLinksUrl: "/sql/calendar-share-links",
     });
 });
