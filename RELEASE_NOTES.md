@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The `repository` URL in `package.json` is lowercase (`https://github.com/rapidmx/restapi.git`)**, matching the organization's path on npm and GitHub; the capitalized one was wrong.
+
 ## v0.21.0
 
 ### Fixed
