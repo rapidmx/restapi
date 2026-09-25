@@ -27,6 +27,16 @@ import { DEFAULT_TIME_ZONE, isValidTimeZone } from "../util/TimeZoneUtils.js";
 import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { hasAddressLikeDisplayName } from "../util/MimeHeaderUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
+import {
+    fileLeftoverErasure,
+    findLeftoverEvidence,
+    findRunningErasure,
+    leftoverConflict,
+    listLeftoverMailboxes,
+    parseLeftoverLimit,
+    type LeftoverListContext,
+    type LeftoverMailboxPage,
+} from "../util/LeftoverMailboxUtils.js";
 import { DEFAULT_MAILBOX_QUOTA_BYTES, findOrSeedMailboxPolicy } from "../util/MailboxPolicyUtils.js";
 import {
     LOOKUP_MAX_ATTEMPTS,
@@ -378,7 +388,19 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * `MailboxPolicy`, whose saved values take precedence over the `mail:auto_provision:*` config. */
     protected abstract mailboxPolicyClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so the leftover-data endpoints (`GET /leftover`, `DELETE ?erase=true`) can
+     * count a deleted mailbox's messages without depending on either backend directly - see `util/LeftoverMailboxUtils.ts`. */
+    protected abstract messageClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so a deleted mailbox's data can be erased through the erasure request
+     * `ErasureExecutionJob` runs, and so `create()` can see one in flight - see `util/LeftoverMailboxUtils.ts`. */
+    protected abstract dataSubjectErasureRequestClass: any;
+
     private folderRepo?: RecoverableRepoUtils<any>;
+
+    private messageRepo?: RecoverableRepoUtils<any>;
+
+    private erasureRequestRepo?: RepoUtils<any>;
 
     private distributionListRepo?: RepoUtils<DistributionList>;
 
@@ -509,18 +531,29 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * removes only the mailbox row and its own ACL; its folders keep their ACLs (parented to the mailbox uid) and its
      * content keeps `mailboxUid`. A new mailbox at the same address would re-create the parent ACL - handing the new
      * owner every old folder and message - and `findOrCreateWellKnownFolder()` would reuse the old Inbox. An address is
-     * freed for reuse by erasing the mailbox (`DataSubjectErasureRequest`, which purges its content and then the mailbox)
-     * rather than deleting it outright.
+     * freed for reuse by erasing what the mailbox left: an administrator files the erasure (`GET /mailboxes/leftover` lists
+     * what is waiting, `POST /erasure-requests/leftover` or `DELETE /mailboxes/:id?erase=true` files it), and
+     * `ErasureExecutionJob` purges the content, the folders with their ACLs and the mailbox's own ACL. Also refused while such an
+     * erasure is still running for the address, even once its folders are gone, so the job's last steps can't meet a mailbox
+     * created meanwhile.
+     *
+     * The 409 carries a machine-readable `reason` - `mailbox-data-remaining` (offer the erasure), or `mailbox-data-erasing` with
+     * the running request's `erasure: { uid, status }` (wait for it) - besides `mailboxUid`.
      */
     private async assertNoLeftoverMailboxData(uid: string): Promise<void> {
-        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
-        const folderCount: number = await folderRepo.count({ mailboxUid: ModelUtils.literal(uid) } as any, { ignoreACL: true, includeDeleted: true });
-        const acl = await this.aclUtils?.findACL(uid, [], { skipCache: true });
-        if (folderCount > 0 || acl) {
-            throw new ApiError(
-                ApiErrors.IDENTIFIER_EXISTS,
-                409,
+        const { folderCount, hasAcl } = await findLeftoverEvidence(await this.getFolderRepo(), this.aclUtils, uid);
+        const running = await findRunningErasure(await this.getErasureRequestRepo(), uid);
+        if (running) {
+            throw leftoverConflict("mailbox-data-erasing", "The data at this address is being erased. Try again once that has finished.", {
+                mailboxUid: uid,
+                erasure: { uid: running.uid, status: running.status },
+            });
+        }
+        if (folderCount > 0 || hasAcl) {
+            throw leftoverConflict(
+                "mailbox-data-remaining",
                 "This address still has data from a deleted mailbox. Erase that data before reusing the address.",
+                { mailboxUid: uid },
             );
         }
     }
@@ -533,6 +566,43 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             });
         }
         return this.folderRepo;
+    }
+
+    private async getMessageRepo(): Promise<RecoverableRepoUtils<any>> {
+        if (!this.messageRepo) {
+            this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
+        return this.messageRepo;
+    }
+
+    private async getErasureRequestRepo(): Promise<RepoUtils<any>> {
+        if (!this.erasureRequestRepo) {
+            this.erasureRequestRepo = await this._objectFactory!.newInstance(RepoUtils, {
+                name: this.dataSubjectErasureRequestClass.name,
+                args: [this.dataSubjectErasureRequestClass],
+            });
+        }
+        return this.erasureRequestRepo;
+    }
+
+    /** What the leftover-data helpers (`util/LeftoverMailboxUtils.ts`) work through. */
+    private async leftoverContext(): Promise<LeftoverListContext> {
+        return {
+            objectFactory: this._objectFactory!,
+            mailboxRepo: this.repoUtils!,
+            folderRepo: await this.getFolderRepo(),
+            messageRepo: await this.getMessageRepo(),
+            requestRepo: await this.getErasureRequestRepo(),
+            requestClass: this.dataSubjectErasureRequestClass,
+            matterClass: this.matterClass,
+            auditLogClass: this.auditLogClass,
+            aclUtils: this.aclUtils,
+            config: this.config,
+            logger: this.logger,
+        };
     }
 
     private async getDistributionListRepo(): Promise<RepoUtils<DistributionList>> {
@@ -1461,6 +1531,33 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         return await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
     }
 
+    /**
+     * Lists the deleted mailboxes that still have data: `{ items, next? }`, each item `{ mailboxUid, folderCount,
+     * messageCount, erasure? }` (`erasure` is the newest erasure request filed for the address: `{ uid, status, dateCreated }`),
+     * sorted by uid. `?limit=` (default 50, at most 100) and `?after=<mailboxUid>` (the previous page's `next`) page through
+     * it; `next` says there may be more. Reads are bounded (see `listLeftoverMailboxes()`), and only what the folders show is
+     * listed - an address whose remains are an access list alone is still refused on create and erasable by naming it.
+     *
+     * **Who.** A trusted role AND an elevated token (`assertAdminScope()`: 403 `api-103`/`api-104`), audited as
+     * `MAILBOX_ADMIN_LIST` with `details.leftover`. Metadata only: uids and counts, never a folder name, a subject or an
+     * address other than the mailbox's own. The mailbox no longer exists, so there is no grant to hold - an administrator
+     * needs none to delete a mailbox, and needs none to see what that delete left or to erase it.
+     */
+    @Auth(["jwt"])
+    @Get("/leftover")
+    public async findLeftover(
+        @Query("limit") limit: unknown,
+        @Query("after") after: unknown,
+        @Request req: HttpRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<LeftoverMailboxPage> {
+        assertAdminScope(user, this.trustedRoles);
+        const cursor: string | undefined = typeof after === "string" && after.length > 0 && after.length <= 320 ? after : undefined;
+        const page: LeftoverMailboxPage = await listLeftoverMailboxes(await this.leftoverContext(), cursor, parseLeftoverLimit(limit));
+        await this.auditAdmin(req, user, AuditAction.MAILBOX_ADMIN_LIST, "*", { leftover: true, count: page.items.length });
+        return page;
+    }
+
     /** The caller's own auth-server "name" aliases (e.g. usernames), via `GET /api/aliases?type=name&userUid=me` —
      * forwarding their `jwt` cookie is what scopes the call to *their* aliases specifically (auth-server lists only
      * the caller's own aliases to a non-administrator; `userUid=me` - a plain query value `ModelUtils.coerceOperand()`
@@ -1693,6 +1790,14 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * date - a whole-mailbox delete removes everything in it regardless of date, so it must be blocked by
      * ANY open hold on the mailbox, not just one whose date range happens to be checked against a single
      * record.
+     *
+     * **The mailbox's data stays.** Only the mailbox row and its own access list go; its folders and content keep its
+     * `mailboxUid` and the address can't be reused until they are erased (see `assertNoLeftoverMailboxData()`). A response says
+     * so in `X-Mailbox-Data: kept` (nothing more was done - list it with `GET /mailboxes/leftover`, erase it with
+     * `POST /erasure-requests/leftover`) or, when `?erase=true` asked for it, `X-Mailbox-Data: erasing` with
+     * `X-Erasure-Request: <request uid>`. `?erase=true` is for an administrator only (trusted AND elevated, else 403 before
+     * anything is deleted): after the delete it files the same approved, audited erasure `POST /erasure-requests/leftover`
+     * does, which `ErasureExecutionJob` runs. If filing it fails the mailbox stays deleted and the answer is `kept`.
      */
     @Delete("/:id")
     public async delete(
@@ -1701,9 +1806,15 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         @Query("purge") purge: string | undefined,
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
+        @Query("erase") erase?: string,
+        @Response res?: HttpResponse,
     ): Promise<void> {
         if (!this.repoUtils) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const eraseData: boolean = erase === "true";
+        if (eraseData) {
+            assertAdminScope(user, this.trustedRoles);
         }
         const existing: T | undefined = await this.repoUtils.findOne(id, { version, ignoreACL: true });
         // An administrator with no grant on the mailbox deletes it as the trusted caller `RepoUtils` lets through, audited;
@@ -1731,6 +1842,34 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         if (adminOnly && existing) {
             await this.auditAdmin(req, user, AuditAction.MAILBOX_ADMIN_DELETE, existing.uid, { primarySmtpAddress: existing.primarySmtpAddress });
         }
+        await this.reportRemainingData(existing?.uid ?? id, eraseData, req, user, res);
+    }
+
+    /** Tells a `delete()` caller (in `X-Mailbox-Data`) what became of the deleted mailbox's data - and files its erasure when
+     * `erase` asked for it (the caller is an administrator: `delete()` checked). Says nothing when nothing was left. */
+    private async reportRemainingData(
+        uid: string,
+        erase: boolean,
+        req: HttpRequest,
+        user: JWTUser | undefined,
+        res: HttpResponse | undefined,
+    ): Promise<void> {
+        const context: LeftoverListContext = await this.leftoverContext();
+        const { folderCount, hasAcl } = await findLeftoverEvidence(context.folderRepo, this.aclUtils, uid);
+        if (folderCount === 0 && !hasAcl) {
+            return;
+        }
+        if (erase) {
+            try {
+                const { request } = await fileLeftoverErasure(context, { user: user!, req }, uid);
+                res?.setHeader("X-Mailbox-Data", "erasing");
+                res?.setHeader("X-Erasure-Request", request.uid);
+                return;
+            } catch (err: any) {
+                this.logger?.warn(`Mailbox ${uid} was deleted but the erasure of its data could not be filed: ${err.message}`);
+            }
+        }
+        res?.setHeader("X-Mailbox-Data", "kept");
     }
 
     /** Fetches every page of `repoUtils.find(criteria, ...)` results - `truncate()`'s legal-hold check

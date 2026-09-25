@@ -87,6 +87,33 @@ describe("BaseMailboxRoute Tests (repoUtils guard clauses only)", () => {
         );
     });
 
+    it("Answers X-Mailbox-Data: kept, and logs, when the erasure a delete asked for could not be filed - the mailbox stays deleted.", async () => {
+        const route = objectFactory.newInstance<TestMailboxRoute>(TestMailboxRoute, { initialize: false });
+        const warn = vi.fn();
+        (route as any).logger = { warn };
+        (route as any).aclUtils = undefined;
+        // The folders still exist, so there is data to report; the mailbox lookup that filing starts with then fails.
+        (route as any).leftoverContext = vi.fn().mockResolvedValue({
+            folderRepo: { count: vi.fn().mockResolvedValue(2) },
+            mailboxRepo: { findOne: vi.fn().mockRejectedValue(new Error("simulated lookup failure")) },
+        });
+        const res = makeRes();
+
+        await (route as any).reportRemainingData("gone@example.com", true, {}, { uid: "admin-1" }, res);
+
+        expect(res.setHeader).toHaveBeenCalledTimes(1);
+        expect(res.setHeader).toHaveBeenCalledWith("X-Mailbox-Data", "kept");
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("simulated lookup failure"));
+    });
+
+    it("Reports nothing about remaining data when there is none, and needs no response object to say so.", async () => {
+        const route = objectFactory.newInstance<TestMailboxRoute>(TestMailboxRoute, { initialize: false });
+        (route as any).aclUtils = undefined;
+        (route as any).leftoverContext = vi.fn().mockResolvedValue({ folderRepo: { count: vi.fn().mockResolvedValue(0) } });
+
+        await expect((route as any).reportRemainingData("gone@example.com", false, {}, undefined, undefined)).resolves.toBeUndefined();
+    });
+
     it("truncate() throws INTERNAL_ERROR when repoUtils is not set.", async () => {
         const route = objectFactory.newInstance<TestMailboxRoute>(TestMailboxRoute, { initialize: false });
 

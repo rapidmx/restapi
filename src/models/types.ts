@@ -613,6 +613,11 @@ export interface DataSubjectErasureRequest extends BaseEntity {
     /** The total number of rows `ErasureExecutionJob` permanently deleted across every `mailboxUid`-
      * scoped entity type plus the mailbox itself - set once `status` becomes `"completed"`. */
     purgedCount?: number;
+
+    /** Set when an administrator filed this request (`POST /erasure-requests/leftover`) for the leftover data of a
+     * mailbox that had already been deleted, and so approved it in the same step. `ErasureExecutionJob` never removes
+     * a mailbox row on behalf of such a request: if one exists again when it runs, the request is denied instead. */
+    leftoverOnly?: boolean;
 }
 
 /**

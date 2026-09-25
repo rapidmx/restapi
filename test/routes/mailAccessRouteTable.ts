@@ -28,7 +28,7 @@ export interface RouteRow {
 /** Keyed by the concrete route class name without its backend suffix (`MailboxRoute` for `MailboxRouteMongo`/`MailboxRouteSQL`). */
 export const ROUTE_TABLE: Record<string, RouteRow> = {
     // --- mailbox-scoped -------------------------------------------------------------------------------------------
-    MailboxRoute: { kind: "mailbox", base: "BaseMailboxRoute", gate: "own/ACL mailboxes for everyone; ?scope=admin metadata for trusted+elevated, audited" },
+    MailboxRoute: { kind: "mailbox", base: "BaseMailboxRoute", gate: "own/ACL mailboxes for everyone; ?scope=admin metadata for trusted+elevated, audited; GET /leftover (uids and counts of deleted mailboxes' data) and DELETE ?erase=true for trusted+elevated only" },
     FolderRoute: { kind: "mailbox", base: "BaseFolderRoute", gate: "hasMailAccess on the mailbox/folder; inherited handlers get mailUser()" },
     MessageRoute: { kind: "mailbox", base: "BaseMessageRoute", gate: "hasMailAccess on the folder/mailbox (BaseScopedChildRoute)" },
     AttachmentRoute: { kind: "mailbox", base: "BaseAttachmentRoute", gate: "hasMailAccess on the message's folder" },
@@ -55,7 +55,7 @@ export const ROUTE_TABLE: Record<string, RouteRow> = {
     AppearanceRoute: { kind: "user", base: "BaseAppearanceRoute", gate: "the caller's own row only (uid = 'appearance:<user uid>'); no trusted path" },
     // --- designed to cross mailboxes (JP decides) --------------------------------------------------------------------
     DataExportRequestRoute: { kind: "compliance", base: "BaseDataExportRoute", gate: "trusted may export/download ANY mailbox (data-subject request); requests and non-owner downloads audited" },
-    DataSubjectErasureRequestRoute: { kind: "compliance", base: "BaseDataSubjectErasureRequestRoute", gate: "trusted approves/denies erasure of any mailbox; exposes no content; audited" },
+    DataSubjectErasureRequestRoute: { kind: "compliance", base: "BaseDataSubjectErasureRequestRoute", gate: "trusted approves/denies erasure of any mailbox; POST /leftover (trusted+elevated) files an approved erasure of a DELETED mailbox's data - never of an existing mailbox; exposes no content; audited" },
     EscrowAccessRequestRoute: { kind: "compliance", base: "BaseEscrowAccessRequestRoute", gate: "escrow-scope holders only (never a trusted role), dual control, hash-chained escrow audit" },
     EscrowAuditLogRoute: { kind: "compliance", base: "BaseEscrowAuditLogRoute", gate: "trusted reads the chained escrow audit (metadata); holders see their matters'" },
     EscrowScopeRoute: { kind: "compliance", base: "BaseEscrowScopeRoute", gate: "trusted configures scopes (holders, keys); no mail content" },

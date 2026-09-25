@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
-import { BackgroundService, ObjectFactory, RecoverableBaseEntity, RepoUtils } from "@rapidrest/service-core";
+import { ACLUtils, BackgroundService, ModelUtils, ObjectFactory, RecoverableBaseEntity, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { BlobReferenceSource, deleteBlobsIfUnreferenced, messageBlobReferenceSources } from "../util/BlobReferenceUtils.js";
@@ -82,6 +82,15 @@ const MAX_PURGE_PASSES = 3;
  * re-scanned to catch rows a concurrent delivery wrote behind the cursor. Messages, contacts, calendar events, tasks
  * and notes also have their search index documents removed.
  *
+ * The same cascade erases the leftover data of a mailbox that was already deleted (an administrator's
+ * `POST /erasure-requests/leftover`, a request with `leftoverOnly` set - see `util/LeftoverMailboxUtils.ts`): deleting a
+ * mailbox removes only its row and its own access list, so its folders, content and folder ACLs stay until purged here. It
+ * needs no mailbox row - every entity type is purged by the exact `mailboxUid` (a query literal, never a pattern) and, with no
+ * mailbox row left, the mailbox's own `AccessControlList` document is removed last (`removeLeftoverMailboxAcl()`), which
+ * is what frees the address for `BaseMailboxRoute.create()`. Idempotent and resumable like any request: a hold, an unloaded plugin
+ * or a failure hands it back, and a re-run finds the rows already gone. Such a request never removes a mailbox row: one that
+ * exists when it runs (created again after it was filed) gets the request denied and nothing purged.
+ *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`ErasureExecutionJobMongo`/
  * `ErasureExecutionJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob`/
  * `DataExportJob` use.
@@ -132,6 +141,10 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
+
+    /** Removes the access list of a mailbox whose row is already gone - see `removeLeftoverMailboxAcl()`. */
+    @Inject(ACLUtils)
+    private aclUtils?: ACLUtils;
 
     /** Optional: when search isn't configured, index removal is a no-op. */
     @Inject("SearchProvider")
@@ -295,6 +308,14 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         request = this.claim!.request;
 
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(request.mailboxUid, { ignoreACL: true });
+        if (mailbox && request.leftoverOnly) {
+            // Filed for the leftover data of a deleted mailbox (`POST /erasure-requests/leftover`), and the mailbox is back
+            // (created again after the request was filed, or filed for a uid that never was deleted). That request never
+            // had the mailbox's owner or an ordinary review behind it, so it must not touch a live mailbox: it is denied
+            // and the mailbox is erased, if it should be, by an ordinary erasure request.
+            await this.denyLeftoverRequest(request);
+            return;
+        }
 
         let purgedCount = 0;
         // Message content blobs are shared: one inbound raw blob is referenced by every recipient mailbox's
@@ -345,7 +366,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         // before that folder is purged (purging the folder also removes the folder ACL holding the link's token).
         let shareLinkCount = 0;
         purgedCount += await this.purgeEntityType(this.folderClass, request.mailboxUid, async (row: any) => {
-            shareLinkCount += await this.purgeByCriteria(this.calendarShareLinkClass, { folderUid: row.uid });
+            shareLinkCount += await this.purgeByCriteria(this.calendarShareLinkClass, { folderUid: ModelUtils.literal(row.uid) });
         });
         purgedCount += shareLinkCount;
         purgedCount += await this.purgeEntityType(this.focusedInboxOverrideClass, request.mailboxUid);
@@ -375,33 +396,36 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             await this.blobStore!.delete(row.sourceBlobKey);
         });
 
+        try {
+            // A final re-check: the top-of-method hold check only catches a hold already in place
+            // before this run started, not one placed WHILE this potentially-long cascade was already
+            // running. This mailbox's own content is already gone by this point regardless (a
+            // narrow, documented TOCTOU window - see this class's own doc comment), but stopping here
+            // at least keeps the anchor `Mailbox` record itself (or, for a mailbox that was already deleted, its
+            // access list, which is what keeps the address from being reused) in place rather than also destroying
+            // the one thing a hold is meant to keep discoverable. `status` is deliberately handed back as
+            // `"approved"` (not advanced to `"completed"`) so a later run retries this exact final
+            // step once the hold resolves - every entity type purged above is already empty by then,
+            // so the retry is a cheap no-op cascade followed by just this one remaining check, the
+            // same "skip, don't error, retry automatically" shape the top-of-method check already
+            // uses.
+            await assertNotOnLegalHold(this._objectFactory!, this.matterClass, request.mailboxUid);
+        } catch {
+            this.logger?.error(
+                `ErasureExecutionJob: a legal hold appeared on mailbox ${request.mailboxUid} while erasure request ${request.uid} was already running - ${purgedCount} rows were purged before it was detected; the mailbox record and its access list were preserved pending the hold's resolution.`,
+            );
+            await this.releaseClaim();
+            return;
+        }
         if (mailbox) {
-            try {
-                // A final re-check: the top-of-method hold check only catches a hold already in place
-                // before this run started, not one placed WHILE this potentially-long cascade was already
-                // running. This mailbox's own content is already gone by this point regardless (a
-                // narrow, documented TOCTOU window - see this class's own doc comment), but stopping here
-                // at least keeps the anchor `Mailbox` record itself in place rather than also destroying
-                // the one thing a hold is meant to keep discoverable. `status` is deliberately handed back as
-                // `"approved"` (not advanced to `"completed"`) so a later run retries this exact final
-                // step once the hold resolves - every entity type purged above is already empty by then,
-                // so the retry is a cheap no-op cascade followed by just this one remaining check, the
-                // same "skip, don't error, retry automatically" shape the top-of-method check already
-                // uses.
-                await assertNotOnLegalHold(this._objectFactory!, this.matterClass, request.mailboxUid);
-            } catch {
-                this.logger?.error(
-                    `ErasureExecutionJob: a legal hold appeared on mailbox ${request.mailboxUid} while erasure request ${request.uid} was already running - ${purgedCount} rows were purged before it was detected; the mailbox record itself was preserved pending the hold's resolution.`,
-                );
-                await this.releaseClaim();
-                return;
-            }
             try {
                 await this.mailboxRepo!.delete(mailbox.uid, { ignoreACL: true, purge: true });
                 purgedCount++;
             } catch (err: any) {
                 this.logger?.warn(`ErasureExecutionJob: failed to purge mailbox ${mailbox.uid}: ${err.message}`);
             }
+        } else {
+            purgedCount += await this.removeLeftoverMailboxAcl(request.mailboxUid);
         }
 
         // A plugin whose manifest declares `mailboxScopedData` but isn't loaded here (disabled, failed to load, safe
@@ -431,6 +455,46 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         this.claim = undefined;
     }
 
+    /**
+     * Removes the `AccessControlList` at `mailboxUid` for a mailbox whose row is already gone (deleting a mailbox removes its ACL, so
+     * this is only ever one an earlier, interrupted erasure or a rebuilt one left) - its folders' ACLs went with the folders above.
+     * Nothing is removed when a mailbox row exists again: creating one at this address is refused while an erasure is in flight, but
+     * the ACL now belongs to whatever got past that. Returns how many documents were removed. A failure is not swallowed: the request
+     * is handed back and retried, because completing with the ACL in place would leave the address unusable while reporting it freed.
+     */
+    private async removeLeftoverMailboxAcl(mailboxUid: string): Promise<number> {
+        if (await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true })) {
+            this.logger?.warn(`ErasureExecutionJob: mailbox ${mailboxUid} was created again while its data was being erased - its access list was kept.`);
+            return 0;
+        }
+        const removed = await this.aclUtils?.removeACL(mailboxUid, { unlessProtected: true });
+        return removed ? 1 : 0;
+    }
+
+    /** Denies a claimed request filed for leftover data whose mailbox exists (see `processRequest()`): nothing was purged. */
+    private async denyLeftoverRequest(request: T): Promise<void> {
+        const reason = "The mailbox exists, so it is not leftover data. Erase it with an erasure request instead.";
+        this.logger?.warn(`ErasureExecutionJob: denying leftover-data erasure request ${request.uid} - mailbox ${request.mailboxUid} exists.`);
+        const denied: T = await this.requestRepo!.update(
+            { uid: request.uid, version: (request as any).version, status: "denied", reason } as any,
+            asEntity(this.requestRepo!, request),
+            { ignoreACL: true },
+        );
+        this.claim = undefined;
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, logger: this.logger },
+            {
+                action: AuditAction.ERASURE_REQUEST_DENIED,
+                targetType: "DataSubjectErasureRequest",
+                targetUid: denied.uid,
+                mailboxUid: denied.mailboxUid,
+                details: { automatic: true, leftover: true },
+            },
+        );
+    }
+
     /** The plugins declaring `mailboxScopedData` in their stored manifest that aren't loaded in this process, per
      * `PluginRegistry`: installed ones (`unloaded`) and removed ones (`removed`). */
     private async unloadedMailboxDataPlugins(): Promise<{ unloaded: string[]; removed: string[] }> {
@@ -454,7 +518,8 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         onBeforeDelete?: (row: any) => Promise<void>,
         onAfterDelete?: (row: any) => Promise<void>,
     ): Promise<number> {
-        return await this.purgeByCriteria(entityClass, { mailboxUid }, onBeforeDelete, onAfterDelete);
+        // A literal, so a uid is only ever matched exactly - never parsed as a query operator, a list or a pattern.
+        return await this.purgeByCriteria(entityClass, { mailboxUid: ModelUtils.literal(mailboxUid) }, onBeforeDelete, onAfterDelete);
     }
 
     /** Purges every row of one entity type matching `criteria`, best-effort per row (a single row's failure is

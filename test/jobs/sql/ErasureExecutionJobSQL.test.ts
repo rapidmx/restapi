@@ -900,6 +900,140 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect(await auditLogRepo.count({ where: { action: AuditAction.ERASURE_REQUEST_COMPLETED } })).toBe(1);
     });
 
+    describe("Leftover data of a deleted mailbox (a request filed with leftoverOnly)", () => {
+        const aclUtils = (): ACLUtils => objectFactory.getInstance<ACLUtils>(ACLUtils)!;
+        const findAcl = async (uid: string) => await aclUtils().findACL(uid, [], { skipCache: true, skipParents: true });
+        const saveAcl = async (uid: string, parentUid: string) =>
+            await aclUtils().saveACL({ uid, parentUid, records: [{ userOrRoleId: "someone", actions: ["*"] }] });
+
+        it("Purges every row of the exact mailbox uid, its folders' ACLs and its own ACL - and nothing of a similar uid - without a mailbox row.", async () => {
+            const uid = `gone-${uuid.v4()}@example.com`;
+            const neighbours = [`${uid}x`, `x${uid}`, uid.replace("gone-", "gone_"), uid.replace("@example.com", "@example.org")];
+            const folder = await folderRepo.save(new FolderSQL({ mailboxUid: uid, name: "Inbox" }));
+            await saveAcl(folder.uid, uid);
+            await saveAcl(uid, "Mailbox");
+            await folderRepo.save(new FolderSQL({ mailboxUid: uid, name: "Soft deleted", deleted: true }));
+            await contactRepo.save(new ContactSQL({ mailboxUid: uid, folderUid: folder.uid, displayName: "Old contact" }));
+            await labelRepo.save(new LabelSQL({ mailboxUid: uid, name: "Old label" } as any));
+            const neighbourFolders: string[] = [];
+            for (const neighbour of neighbours) {
+                const other = await folderRepo.save(new FolderSQL({ mailboxUid: neighbour, name: "Inbox" }));
+                await saveAcl(other.uid, neighbour);
+                await contactRepo.save(new ContactSQL({ mailboxUid: neighbour, folderUid: other.uid, displayName: "Not mine" }));
+                neighbourFolders.push(other.uid);
+            }
+            const request = await createRequest({ mailboxUid: uid, leftoverOnly: true });
+
+            await job.run();
+
+            const done = await requestRepo.findOne({ where: { uid: request.uid } });
+            expect(done!.status).toBe("completed");
+            // Two folders, a contact, a label, and the mailbox's own ACL.
+            expect(done!.purgedCount).toBe(5);
+            expect(await folderRepo.count({ where: { mailboxUid: uid } })).toBe(0);
+            expect(await contactRepo.count({ where: { mailboxUid: uid } })).toBe(0);
+            expect(await labelRepo.count({ where: { mailboxUid: uid } })).toBe(0);
+            expect(await findAcl(folder.uid)).toBeUndefined();
+            expect(await findAcl(uid)).toBeUndefined();
+            for (const [i, neighbour] of neighbours.entries()) {
+                expect(await folderRepo.count({ where: { mailboxUid: neighbour } })).toBe(1);
+                expect(await contactRepo.count({ where: { mailboxUid: neighbour } })).toBe(1);
+                expect(await findAcl(neighbourFolders[i])).toBeDefined();
+            }
+            expect(await auditLogRepo.count({ where: { action: AuditAction.ERASURE_REQUEST_COMPLETED } })).toBe(1);
+        });
+
+        it("Is idempotent: a second request for the same address finds nothing left and completes with nothing purged.", async () => {
+            const uid = `gone-${uuid.v4()}@example.com`;
+            await contactRepo.save(new ContactSQL({ mailboxUid: uid, folderUid: uuid.v4(), displayName: "Old" }));
+            const first = await createRequest({ mailboxUid: uid, leftoverOnly: true });
+            await job.run();
+            const second = await createRequest({ mailboxUid: uid, leftoverOnly: true });
+
+            await job.run();
+
+            expect((await requestRepo.findOne({ where: { uid: first.uid } }))!.purgedCount).toBe(1);
+            const again = await requestRepo.findOne({ where: { uid: second.uid } });
+            expect([again!.status, again!.purgedCount]).toEqual(["completed", 0]);
+        });
+
+        it("Denies the request, purging nothing and keeping the mailbox, when the mailbox row exists.", async () => {
+            const mailbox = await createMailbox();
+            await saveAcl(mailbox.uid, "Mailbox");
+            await contactRepo.save(new ContactSQL({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "Live" }));
+            const request = await createRequest({ mailboxUid: mailbox.uid, leftoverOnly: true });
+
+            await job.run();
+
+            const denied = await requestRepo.findOne({ where: { uid: request.uid } });
+            expect(denied!.status).toBe("denied");
+            expect(denied!.reason).toMatch(/not leftover data/);
+            expect(await contactRepo.count({ where: { mailboxUid: mailbox.uid } })).toBe(1);
+            expect(await mailboxRepo.findOne({ where: { uid: mailbox.uid } })).not.toBeNull();
+            expect(await findAcl(mailbox.uid)).toBeDefined();
+            const entries = await auditLogRepo.find({ where: { action: AuditAction.ERASURE_REQUEST_DENIED } });
+            expect(entries).toHaveLength(1);
+            expect((entries[0] as any).details).toEqual({ automatic: true, leftover: true });
+            expect(await auditLogRepo.count({ where: { action: AuditAction.ERASURE_REQUEST_COMPLETED } })).toBe(0);
+        });
+
+        it("Keeps the access list, warning, when a mailbox was created at the address while the cascade ran.", async () => {
+            const uid = `gone-${uuid.v4()}@example.com`;
+            await saveAcl(uid, "Mailbox");
+            const request = await createRequest({ mailboxUid: uid, leftoverOnly: true });
+            vi.spyOn((job as any).mailboxRepo, "findOne").mockResolvedValueOnce(undefined).mockResolvedValueOnce({ uid } as any);
+
+            await job.run();
+
+            expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("completed");
+            expect(await findAcl(uid)).toBeDefined();
+        });
+
+        it("Hands the request back, keeping the access list, when removing it fails - and completes on the next run.", async () => {
+            const uid = `gone-${uuid.v4()}@example.com`;
+            await saveAcl(uid, "Mailbox");
+            const request = await createRequest({ mailboxUid: uid, leftoverOnly: true });
+            vi.spyOn(aclUtils(), "removeACL").mockRejectedValueOnce(new Error("simulated ACL failure"));
+
+            await job.run();
+
+            expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("approved");
+            expect(await findAcl(uid)).toBeDefined();
+
+            await job.run();
+
+            expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("completed");
+            expect(await findAcl(uid)).toBeUndefined();
+        });
+
+        it("Leaves the request approved and the access list in place when a legal hold appears mid-cascade.", async () => {
+            const uid = `gone-${uuid.v4()}@example.com`;
+            await saveAcl(uid, "Mailbox");
+            await contactRepo.save(new ContactSQL({ mailboxUid: uid, folderUid: uuid.v4(), displayName: "Old" }));
+            const request = await createRequest({ mailboxUid: uid, leftoverOnly: true });
+            const originalFindOne = (job as any).mailboxRepo.findOne.bind((job as any).mailboxRepo);
+            vi.spyOn((job as any).mailboxRepo, "findOne").mockImplementationOnce(async (...args: any[]) => {
+                const result = await originalFindOne(...args);
+                await matterRepo.save(
+                    new MatterSQL({
+                        name: "Hold placed mid-cascade",
+                        escrowScopeId: uuid.v4(),
+                        custodianMailboxUids: [uid],
+                        dateRangeStart: new Date("2020-01-01"),
+                        dateRangeEnd: new Date("2030-01-01"),
+                    }),
+                );
+                return result;
+            });
+
+            await job.run();
+
+            expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("approved");
+            expect(await contactRepo.count({ where: { mailboxUid: uid } })).toBe(0);
+            expect(await findAcl(uid)).toBeDefined();
+        });
+    });
+
     it("Does nothing when the repos are not yet initialized.", async () => {
         const original = (job as any).requestRepo;
         (job as any).requestRepo = undefined;

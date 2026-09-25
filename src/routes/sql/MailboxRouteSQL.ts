@@ -5,7 +5,18 @@
 import { Raw, type Repository as TypeOrmRepository } from "typeorm";
 import type { JWTUser } from "@rapidrest/core";
 import { AccessControlListSQL, DatabaseDecorators, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { AuditLogEntrySQL, DistributionListSQL, DomainSQL, EscrowScopeSQL, FolderSQL, MailboxSQL, MailboxPolicySQL, MatterSQL } from "../../sql.js";
+import {
+    AuditLogEntrySQL,
+    DataSubjectErasureRequestSQL,
+    DistributionListSQL,
+    DomainSQL,
+    EscrowScopeSQL,
+    FolderSQL,
+    MailboxSQL,
+    MailboxPolicySQL,
+    MatterSQL,
+    MessageSQL,
+} from "../../sql.js";
 import { BaseMailboxRoute } from "../BaseMailboxRoute.js";
 const { Model } = RouteDecorators;
 const { Repository } = DatabaseDecorators;
@@ -20,6 +31,8 @@ export class MailboxRouteSQL extends BaseMailboxRoute<MailboxSQL> {
     protected escrowScopeClass: any = EscrowScopeSQL;
     protected matterClass: any = MatterSQL;
     protected mailboxPolicyClass: any = MailboxPolicySQL;
+    protected messageClass: any = MessageSQL;
+    protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestSQL;
 
     // `@Repository`-injected, always present in any functioning deployment (the `acl` datastore is a hard
     // requirement of this entire library — every permission check everywhere else depends on it too), so an

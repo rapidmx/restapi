@@ -56,6 +56,11 @@ export class DataSubjectErasureRequestMongo extends BaseMongoEntity implements D
     @Nullable
     public purgedCount?: number;
 
+    @Column()
+    @Nullable
+    @Description("Set when an administrator filed this request for the leftover data of a mailbox that was already deleted.")
+    public leftoverOnly?: boolean;
+
     constructor(other?: Partial<DataSubjectErasureRequestMongo>) {
         super(other);
 
@@ -66,6 +71,7 @@ export class DataSubjectErasureRequestMongo extends BaseMongoEntity implements D
             this.reviewedByUserUid = "reviewedByUserUid" in other ? other.reviewedByUserUid : this.reviewedByUserUid;
             this.reason = "reason" in other ? other.reason : this.reason;
             this.purgedCount = "purgedCount" in other ? other.purgedCount : this.purgedCount;
+            this.leftoverOnly = "leftoverOnly" in other ? other.leftoverOnly : this.leftoverOnly;
         }
     }
 }

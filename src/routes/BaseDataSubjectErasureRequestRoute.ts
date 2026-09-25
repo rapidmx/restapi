@@ -6,14 +6,17 @@
 // `BaseDataExportRoute`/`BaseMailIngestRoute`'s identical note) - every method here is defined relative to
 // that.
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
-import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
+import { ACLUtils, ApiErrorMessages, ApiErrors, type HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { fileLeftoverErasure, requireMailboxUid } from "../util/LeftoverMailboxUtils.js";
+import { assertAdminScope } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
+import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, DataSubjectErasureRequest, Mailbox } from "../models/types.js";
-const { Config, Logger } = ObjectDecorators;
-const { Get, Param, Post, Query, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
+const { Config, Inject, Logger } = ObjectDecorators;
+const { Get, Param, Post, Query, Request, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
 
 /**
  * A GDPR Article 17 ("right to erasure") request - see `DataSubjectErasureRequest`'s own doc comment for
@@ -22,6 +25,11 @@ const { Get, Param, Post, Query, RequiresTrustedRole, User: AuthUser } = RouteDe
  * rather than synchronously here. Bespoke class (own `init()`-built `RepoUtils`, no `@Model`-driven CRUD),
  * same permission shape as `BaseDataExportRoute`: visibility is "the requester, the target mailbox's own
  * owner, or a trusted admin".
+ *
+ * The one admin-initiated path is `eraseLeftover()` (`POST /leftover`): erasing the data a mailbox that was already
+ * deleted left behind, which `create()` cannot do (it resolves the caller's own mailbox row) and nobody is left to
+ * consent to - see `util/LeftoverMailboxUtils.ts`. It files a request already approved and `leftoverOnly`, run by the
+ * same `ErasureExecutionJob`; it never touches an existing mailbox.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -37,6 +45,10 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
      * depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so `eraseLeftover()` can tell what data a deleted mailbox left behind
+     * (its folders) without depending on either backend directly - see `util/LeftoverMailboxUtils.ts`. */
+    protected abstract folderClass: any;
+
     protected trustedRoles: string[] = ["admin"];
 
     // Automatically injected by ObjectFactory on instantiation
@@ -44,6 +56,11 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
 
     private requestRepo?: RepoUtils<T>;
     private mailboxRepo?: RepoUtils<MB>;
+    private folderRepo?: RepoUtils<any>;
+
+    /** Reads the access list of a deleted mailbox, for `eraseLeftover()`. */
+    @Inject(ACLUtils)
+    private aclUtils?: ACLUtils;
 
     /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
     @Config()
@@ -65,6 +82,17 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
                 args: [this.mailboxClass],
             });
         }
+    }
+
+    /** Built on first use, by `eraseLeftover()` alone. */
+    private async getFolderRepo(): Promise<RepoUtils<any>> {
+        if (!this.folderRepo) {
+            this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+                name: this.folderClass.name,
+                args: [this.folderClass],
+            });
+        }
+        return this.folderRepo;
     }
 
     private async requireRequest(id: string): Promise<T> {
@@ -143,6 +171,50 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
             { action: AuditAction.ERASURE_REQUEST_CREATED, targetType: "DataSubjectErasureRequest", targetUid: created.uid, mailboxUid },
         );
         return created;
+    }
+
+    /**
+     * Erases the data a deleted mailbox left behind, on an administrator's word alone: files an already approved request
+     * (`leftoverOnly`) for `body.mailboxUid` that `ErasureExecutionJob` then runs. Deleting a mailbox removes only its row and
+     * its own access list; its folders and content keep its `mailboxUid`, and a new mailbox at the same address is refused
+     * (409 on `POST /mailboxes`) until that data is erased. An ordinary erasure request cannot do it - `create()` is self-service
+     * and needs the mailbox row - and nobody is left to consent for a mailbox that no longer exists, so an administrator does.
+     *
+     * **Who.** A trusted role AND an elevated token (`assertAdminScope()`: 403 `api-103`/`api-104`), like every administration
+     * action on a mailbox the caller has no grant on. This is not access to anyone's mail: the caller reads nothing and the
+     * response holds none, and an administrator may already delete the mailbox itself without a grant
+     * (`BaseMailboxRoute.delete()`), so erasing what that delete left is no wider. Audited (`ERASURE_REQUEST_CREATED` and
+     * `ERASURE_REQUEST_APPROVED`, `details.leftover`).
+     *
+     * **What it refuses.** `409` `reason: "mailbox-exists"` when the mailbox row exists - a live mailbox is erased only through
+     * an ordinary request, never this route; the hold `409` when a legal hold covers the address (as `approve()` answers it,
+     * and the job re-checks it); `404` when nothing is left (no folder and no access list at the uid); `400` for a missing or
+     * implausible `mailboxUid`. Idempotent: an approved or running request for the uid is returned as it is, so a double click
+     * or a retry after a dropped response is safe.
+     */
+    @RequiresTrustedRole()
+    @Post("/leftover")
+    public async eraseLeftover(body: { mailboxUid?: unknown } | undefined, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T> {
+        await this.init();
+        assertAdminScope(user, this.trustedRoles);
+        const mailboxUid: string = requireMailboxUid(body?.mailboxUid);
+        const { request } = await fileLeftoverErasure(
+            {
+                objectFactory: this._objectFactory!,
+                mailboxRepo: this.mailboxRepo!,
+                folderRepo: await this.getFolderRepo(),
+                requestRepo: this.requestRepo!,
+                requestClass: this.dataSubjectErasureRequestClass,
+                matterClass: this.matterClass,
+                auditLogClass: this.auditLogClass,
+                aclUtils: this.aclUtils,
+                config: this.config,
+                logger: this.logger,
+            },
+            { user: user!, req },
+            mailboxUid,
+        );
+        return request;
     }
 
     @RequiresTrustedRole()

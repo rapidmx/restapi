@@ -56,6 +56,11 @@ export class DataSubjectErasureRequestSQL extends BaseEntity implements DataSubj
     @Nullable
     public purgedCount?: number;
 
+    @Column({ type: "boolean", nullable: true })
+    @Nullable
+    @Description("Set when an administrator filed this request for the leftover data of a mailbox that was already deleted.")
+    public leftoverOnly?: boolean;
+
     constructor(other?: Partial<DataSubjectErasureRequestSQL>) {
         super(other);
 
@@ -66,6 +71,7 @@ export class DataSubjectErasureRequestSQL extends BaseEntity implements DataSubj
             this.reviewedByUserUid = "reviewedByUserUid" in other ? other.reviewedByUserUid : this.reviewedByUserUid;
             this.reason = "reason" in other ? other.reason : this.reason;
             this.purgedCount = "purgedCount" in other ? other.purgedCount : this.purgedCount;
+            this.leftoverOnly = "leftoverOnly" in other ? other.leftoverOnly : this.leftoverOnly;
         }
     }
 }

@@ -10,7 +10,18 @@ import {
     RouteDecorators,
     type MongoRepository,
 } from "@rapidrest/service-core";
-import { AuditLogEntryMongo, DistributionListMongo, DomainMongo, EscrowScopeMongo, FolderMongo, MailboxMongo, MailboxPolicyMongo, MatterMongo } from "../../mongo.js";
+import {
+    AuditLogEntryMongo,
+    DataSubjectErasureRequestMongo,
+    DistributionListMongo,
+    DomainMongo,
+    EscrowScopeMongo,
+    FolderMongo,
+    MailboxMongo,
+    MailboxPolicyMongo,
+    MatterMongo,
+    MessageMongo,
+} from "../../mongo.js";
 import { BaseMailboxRoute } from "../BaseMailboxRoute.js";
 const { Model } = RouteDecorators;
 const { Repository } = DatabaseDecorators;
@@ -25,6 +36,8 @@ export class MailboxRouteMongo extends BaseMailboxRoute<MailboxMongo> {
     protected escrowScopeClass: any = EscrowScopeMongo;
     protected matterClass: any = MatterMongo;
     protected mailboxPolicyClass: any = MailboxPolicyMongo;
+    protected messageClass: any = MessageMongo;
+    protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestMongo;
 
     // `@Repository`-injected, always present in any functioning deployment (the `acl` datastore is a hard
     // requirement of this entire library — every permission check everywhere else depends on it too), so an
