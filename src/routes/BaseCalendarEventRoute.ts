@@ -978,7 +978,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             descriptionHtml: parsed.descriptionHtml,
             visibility: parsed.visibility ?? "default",
             guestsCanModify: parsed.guestsCanModify ?? false,
-            guestsCanInviteOthers: parsed.guestsCanInviteOthers ?? true,
+            guestsCanInviteOthers: parsed.guestsCanInviteOthers ?? parsed.fromRapidMx === true,
             guestsCanSeeGuestList: parsed.guestsCanSeeGuestList ?? true,
             startDate: start,
             endDate: parsed.endDate ?? start,
@@ -1025,7 +1025,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                               descriptionHtml: parsed.descriptionHtml ?? null,
                               visibility: parsed.visibility ?? "default",
                               guestsCanModify: parsed.guestsCanModify ?? false,
-                              guestsCanInviteOthers: parsed.guestsCanInviteOthers ?? true,
+                              guestsCanInviteOthers: parsed.guestsCanInviteOthers ?? parsed.fromRapidMx === true,
                               guestsCanSeeGuestList: parsed.guestsCanSeeGuestList ?? true,
                               startDate: parsed.startDate ?? existing.startDate,
                               endDate: parsed.endDate ?? existing.endDate,
@@ -1047,6 +1047,13 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             }
 
             const folder = await findOrCreateWellKnownFolder(await this.getFolderRepo(), this.folderClass, mailbox.uid, FolderType.CALENDAR);
+            // A copy the reader declined or removed earlier is only soft-deleted and still holds this uid; clear it so the fresh copy can be filed
+            // (answering Accept after a Decline would otherwise fail as a duplicate).
+            const filedUid: string = nameBasedUuid(`itip:${mailbox.uid}:${parsed.uid}:${parsed.recurrenceId ? parsed.recurrenceId.toISOString() : "master"}`);
+            const trashed: any = await this.repoUtils!.findOne(filedUid, { ignoreACL: true, includeDeleted: true });
+            if (trashed?.deleted) {
+                await this.repoUtils!.delete(filedUid, { ignoreACL: true, purge: true });
+            }
             // An organizer who hides the guest list names only this guest; anything more in the file is not kept.
             const invited = parsed.guestsCanSeeGuestList === false ? parsed.attendees.filter((attendee) => addresses.has(normalizeAddress(attendee.address))) : parsed.attendees;
             const attendees: Attendee[] = withAnswer(
@@ -1064,7 +1071,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                     new Entity({
                         ...this.eventFromInvite(parsed, attendees, mailbox.uid),
                         // The uid inbound processing (`ScanQueueJob`) derives for the same invitation, so the two can't make two copies.
-                        uid: nameBasedUuid(`itip:${mailbox.uid}:${parsed.uid}:${parsed.recurrenceId ? parsed.recurrenceId.toISOString() : "master"}`),
+                        uid: filedUid,
                         folderUid: folder.uid,
                         busyStatus,
                         // Somebody else's invitation: marked as already sent, so the scheduling job never mails it again as though this mailbox organized it.

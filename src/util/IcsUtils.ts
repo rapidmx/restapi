@@ -58,6 +58,8 @@ import { sanitizeInboundDescription } from "./EventDescriptionUtils.js";
 /** The fields this library extracts from an inbound iTIP `text/calendar` message. */
 export interface ParsedIcsEvent {
     method: string;
+    /** The file's `PRODID` names a RapidMX server (`-//RapidMX//...`): its organizer's server understands `X-RAPIDMX-*` properties and change requests. */
+    fromRapidMx?: boolean;
     uid: string;
     sequence: number;
     summary?: string;
@@ -70,7 +72,8 @@ export interface ParsedIcsEvent {
     visibility?: Exclude<EventVisibility, "default">;
     /** `X-RAPIDMX-GUESTS-CAN-MODIFY`, when the file has one (a boolean value). Absent means the default (`false`). */
     guestsCanModify?: boolean;
-    /** `X-RAPIDMX-GUESTS-CAN-INVITE`, when the file has one. Absent means the default (`true`). */
+    /** `X-RAPIDMX-GUESTS-CAN-INVITE`, when the file has one. Absent means the default (`true`) for a file a RapidMX server wrote (`fromRapidMx`), which
+     * writes the line only when it differs, and `false` for anyone else's, whose server would never act on a request to add guests. */
     guestsCanInviteOthers?: boolean;
     /** `X-RAPIDMX-GUESTS-CAN-SEE-GUEST-LIST`, when the file has one. Absent means the default (`true`). */
     guestsCanSeeGuestList?: boolean;
@@ -585,6 +588,7 @@ export function parseIcsEvent(raw: string): ParsedIcsEvent | undefined {
     const lines = unfolded.split(/\r\n|\r|\n/);
 
     let method: string | undefined;
+    let fromRapidMx = false;
     const vevents: VEventAccumulator[] = [];
     // Open components, innermost last. Only a property whose innermost open component is a VEVENT belongs to
     // that VEVENT - a nested VALARM's `ATTENDEE`, or a VTIMEZONE's `DTSTART`/`RRULE`, must never be read as the
@@ -628,6 +632,12 @@ export function parseIcsEvent(raw: string): ParsedIcsEvent | undefined {
         }
 
         const top: string | undefined = stack[stack.length - 1];
+        if (property === "PRODID") {
+            if (top === undefined || top === "VCALENDAR") {
+                fromRapidMx = /^-\/\/RapidMX\/\//i.test(value.trim());
+            }
+            continue;
+        }
         if (property === "METHOD") {
             if (top === undefined || top === "VCALENDAR") {
                 method = value.trim().toUpperCase();
@@ -653,7 +663,7 @@ export function parseIcsEvent(raw: string): ParsedIcsEvent | undefined {
         .filter((vevent, index) => index !== primaryIndex && vevent.uid === primary.uid && vevent.recurrenceId)
         .map(finishVEvent);
 
-    return { method, ...master, ...(overrides.length > 0 ? { overrides } : {}) };
+    return { method, ...(fromRapidMx ? { fromRapidMx } : {}), ...master, ...(overrides.length > 0 ? { overrides } : {}) };
 }
 
 /** The per-VEVENT fields of a `ParsedIcsEvent` (everything but the calendar-level `method`). */

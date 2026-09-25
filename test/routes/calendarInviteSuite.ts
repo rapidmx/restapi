@@ -47,6 +47,8 @@ interface IcsOptions {
     status?: string;
     /** More content lines of the event (`DESCRIPTION:...`, `CLASS:...`, `X-RAPIDMX-...`). */
     extra?: string[];
+    /** The file's `PRODID`; defaults to another vendor's, as an invitation from an outside organizer has. */
+    prodId?: string;
 }
 
 /** A sent message as text, with quoted-printable soft line breaks and escapes undone, so the calendar file inside reads as written. */
@@ -56,7 +58,7 @@ const ics = (o: IcsOptions): string =>
     [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        "PRODID:-//Someone Else//Mail//EN",
+        `PRODID:${o.prodId ?? "-//Someone Else//Mail//EN"}`,
         ...(o.method ? [`METHOD:${o.method}`] : []),
         "BEGIN:VEVENT",
         `UID:${o.uid}`,
@@ -268,14 +270,14 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             expect(after.body.calendarEventUid).toBeTruthy();
         });
 
-        it("Reports the defaults for an invitation that names none of them.", async () => {
+        it("Reports the defaults for an invitation that names none of them (another vendor's organizer never acts on a request to add guests).", async () => {
             const { mailbox, inbox, me } = await setup();
             const message = await receive(mailbox.uid, inbox.uid, requestFor(me));
 
             const result = await owner(request(ctx.app()).get(inviteUrl(message.uid)));
 
             expect(result.body.visibility).toBe("default");
-            expect(result.body.guestPermissions).toEqual({ guestsCanModify: false, guestsCanInviteOthers: true, guestsCanSeeGuestList: true });
+            expect(result.body.guestPermissions).toEqual({ guestsCanModify: false, guestsCanInviteOthers: false, guestsCanSeeGuestList: true });
             expect(result.body.description).toBeUndefined();
         });
 
@@ -321,7 +323,25 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             const [row] = await ctx.findEvents(mailbox.uid);
             expect(row.description ?? undefined).toBeUndefined();
             expect(row.descriptionHtml ?? undefined).toBeUndefined();
-            expect(row).toMatchObject({ visibility: "default", guestsCanModify: false, guestsCanInviteOthers: true, guestsCanSeeGuestList: true, sequence: 3 });
+            // Another vendor's invitation names no permissions, and its server would never act on a request to add guests: only the list is visible.
+            expect(row).toMatchObject({ visibility: "default", guestsCanModify: false, guestsCanInviteOthers: false, guestsCanSeeGuestList: true, sequence: 3 });
+        });
+
+        it("Reads a missing invite permission as allowed only in an invitation another RapidMX server wrote, so a request to add guests is offered only where it can work.", async () => {
+            const { mailbox, inbox, calendar, me } = await setup();
+            const outside = await receive(mailbox.uid, inbox.uid, requestFor(me));
+            await owner(request(ctx.app()).post(inviteUrl(outside.uid, "/respond"))).send({ responseStatus: "accepted" });
+            const outsideView = await owner(request(ctx.app()).get(inviteUrl(outside.uid)));
+            expect(outsideView.body).toMatchObject({ canRequestInvite: false, canRequestChange: false });
+            expect((await ctx.findEvents(mailbox.uid))[0]).toMatchObject({ guestsCanInviteOthers: false });
+            await owner(request(ctx.app()).post(inviteUrl(outside.uid, "/respond"))).send({ responseStatus: "declined" });
+            expect(calendar.uid).toBeTruthy();
+
+            const ours = await receive(mailbox.uid, inbox.uid, requestFor(me, { prodId: "-//RapidMX//Mail Server//EN" }));
+            const acc = await owner(request(ctx.app()).post(inviteUrl(ours.uid, "/respond"))).send({ responseStatus: "accepted" });
+            const oursView = await owner(request(ctx.app()).get(inviteUrl(ours.uid)));
+            expect(oursView.body).toMatchObject({ canRequestInvite: true, canRequestChange: false });
+            expect((await ctx.findEvents(mailbox.uid))[0]).toMatchObject({ guestsCanInviteOthers: true });
         });
 
         it("Mails the organizer a REPLY without any of the event's details, and a proposal without them either.", async () => {

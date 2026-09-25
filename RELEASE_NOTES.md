@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- **Accepting a meeting invitation after declining it failed as a duplicate.** A declined (or removed) copy is only soft-deleted and still held the uid the accepted copy is filed under, so `POST /calendar-events/invite/:messageUid/respond` answered `400 A resource with that identifier already exists.` It now clears the trashed copy first.
+- **An invitation from another vendor's server no longer offers "Add guests".** A missing `X-RAPIDMX-GUESTS-CAN-INVITE` meant "guests may invite" for every organizer, but only a RapidMX organizer's server acts on a request to add guests. `ParsedIcsEvent.fromRapidMx` (from `PRODID`) now decides the default, so `MessageInvite.canRequestInvite` and a stored copy's `guestsCanInviteOthers` are `false` for an invitation from anyone else.
+
 - **Looking a plugin package up by name failed behind Envoy Gateway.** `GET /system/plugins/registry/:name` carried a scoped package name as `%40rapidmx%2Fbooking-plugin` in the path, and Envoy Gateway's default (`escapedSlashesAction: UnescapeAndRedirect`) unescapes the `%2F` and redirects to `/registry/@rapidmx/booking-plugin`, which matches no route - so the admin console's "Add by name" answered "Request failed." for every scoped package. `GET /registry?name=<package>[&packageVersion=<version>]` (`lookupByName()`) is the same lookup with the name in the query string, as `GET /plan` already takes it; the path form stays for existing clients.
 
 ### Added

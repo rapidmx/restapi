@@ -7,10 +7,11 @@
 import { AttendeeResponseStatus } from "../../src/models/types.js";
 import { describeInvite, parseInviteIcs } from "../../src/util/MeetingInviteUtils.js";
 
-const ICS = (extra: string[] = [], method = "REQUEST", attendees: string[] = ["ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@x.com"]): string =>
+const ICS = (extra: string[] = [], method = "REQUEST", attendees: string[] = ["ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@x.com"], prodId?: string): string =>
     [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
+        ...(prodId ? [`PRODID:${prodId}`] : []),
         `METHOD:${method}`,
         "BEGIN:VEVENT",
         "UID:abc@x",
@@ -33,11 +34,11 @@ describe("describeInvite() and the event dialog's fields", () => {
     it("Reports the defaults for an invitation that names none of them.", () => {
         const view = describeInvite(parseInviteIcs(ICS())!, me, onCalendar, {} as any);
         expect(view.visibility).toBe("default");
-        expect(view.guestPermissions).toEqual({ guestsCanModify: false, guestsCanInviteOthers: true, guestsCanSeeGuestList: true });
+        expect(view.guestPermissions).toEqual({ guestsCanModify: false, guestsCanInviteOthers: false, guestsCanSeeGuestList: true });
         expect(view.description).toBeUndefined();
         expect(view.descriptionHtml).toBeUndefined();
         expect(view.changeRequest).toBeUndefined();
-        expect(view).toMatchObject({ canRequestChange: false, canRequestInvite: true });
+        expect(view).toMatchObject({ canRequestChange: false, canRequestInvite: false });
     });
 
     it("Carries the description (HTML already sanitized), the visibility and the guest permissions.", () => {
@@ -64,10 +65,15 @@ describe("describeInvite() and the event dialog's fields", () => {
 
     it("Offers a guest the change and invite buttons the organizer's permissions allow, once the meeting is on their calendar.", () => {
         const allowed = parseInviteIcs(ICS(["X-RAPIDMX-GUESTS-CAN-MODIFY:TRUE"]))!;
-        expect(describeInvite(allowed, me, onCalendar, {} as any)).toMatchObject({ canRequestChange: true, canRequestInvite: true });
+        // Another vendor's file that names no invite permission: its server would never act on a request to add guests.
+        expect(describeInvite(allowed, me, onCalendar, {} as any)).toMatchObject({ canRequestChange: true, canRequestInvite: false });
+        // A RapidMX server writes the line only when it differs from the default (allowed), so its absence means allowed there.
+        const ours = parseInviteIcs(ICS(["X-RAPIDMX-GUESTS-CAN-MODIFY:TRUE"], "REQUEST", undefined, "-//RapidMX//Mail Server//EN"))!;
+        expect(ours.fromRapidMx).toBe(true);
+        expect(describeInvite(ours, me, onCalendar, {} as any)).toMatchObject({ canRequestChange: true, canRequestInvite: true });
         const onlyChange = parseInviteIcs(ICS(["X-RAPIDMX-GUESTS-CAN-MODIFY:TRUE", "X-RAPIDMX-GUESTS-CAN-INVITE:FALSE"]))!;
         expect(describeInvite(onlyChange, me, onCalendar, {} as any)).toMatchObject({ canRequestChange: true, canRequestInvite: false });
-        expect(describeInvite(parseInviteIcs(ICS())!, me, onCalendar, {} as any)).toMatchObject({ canRequestChange: false, canRequestInvite: true });
+        expect(describeInvite(parseInviteIcs(ICS())!, me, onCalendar, {} as any)).toMatchObject({ canRequestChange: false, canRequestInvite: false });
         // Not on the calendar yet (nothing to ask a change of), the organizer's own meeting, a cancellation and a reply.
         expect(describeInvite(allowed, me, undefined, {} as any)).toMatchObject({ canRequestChange: false, canRequestInvite: false });
         expect(describeInvite(allowed, boss, onCalendar, {} as any)).toMatchObject({ canRequestChange: false, canRequestInvite: false });

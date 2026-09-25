@@ -218,7 +218,8 @@ export function describeInvite(
     const replier = method === "REPLY" || method === "COUNTER" ? (proposer ?? parsed.attendees[0]) : undefined;
     const startDate: Date | undefined = parsed.startDate;
     const endDate: Date | undefined = parsed.endDate;
-    const guestPermissions: GuestPermissions = guestPermissionsOf(parsed);
+    // A missing invite permission only means "allowed" in a file a RapidMX server wrote; any other organizer's server would never act on a request to add guests.
+    const guestPermissions: GuestPermissions = guestPermissionsOf({ ...parsed, guestsCanInviteOthers: parsed.guestsCanInviteOthers ?? parsed.fromRapidMx === true });
     const changeRequestApplied: boolean = method === "COUNTER" && !!parsed.changeRequest && message.meetingResponse === "accepted";
     const canGuestAsk: boolean = method === "REQUEST" && !isOrganizer && !cancelled && !!existing;
     return {
