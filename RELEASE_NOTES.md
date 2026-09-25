@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.21.0
+
 ### Fixed
 
 - **Accepting a meeting invitation after declining it failed as a duplicate.** A declined (or removed) copy is only soft-deleted and still held the uid the accepted copy is filed under, so `POST /calendar-events/invite/:messageUid/respond` answered `400 A resource with that identifier already exists.` It now clears the trashed copy first.

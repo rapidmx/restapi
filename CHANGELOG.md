@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-09-25
+
+### Added
+- Added a <host> placeholder for a string plugin setting's default, filled in with the host the request reached when the plugin is installed (or a new version declares the setting with no value) and left unset when no host is known, so a plugin such as the video-conferencing join page works as installed
+- Added GET /system/plugins/registry?name= as the same registry lookup with the package name in the query string, because Envoy Gateway unescapes the %2F of a scoped name in the path and redirects to a path that matches no route, which made every scoped package fail to look up
+- Added answering the meeting invitation in a message as Outlook does: GET /calendar-events/invite/:messageUid reads the calendar file from the stored raw message and reports what it is, who organized it, whether it is on the reader's calendar, what they answered and which of respond, propose, add, remove and accept-proposal apply
+- Added POST .../respond, which puts an accepted or tentative meeting on the calendar at the uid inbound processing uses (or updates the answer on the copy that is there), removes it on a decline, and mails the organizer an iTIP REPLY either way
+- Added POST .../remove for a cancellation, POST .../propose to mail the organizer an iTIP COUNTER with a proposed time, and POST .../accept-proposal to move a meeting the reader organizes to the time a listed attendee proposed and re-invite everyone
+- Added Message.meetingMethod, set when a message is delivered, and Message.meetingResponse, kept because a decline leaves nothing on the calendar, and carry the latest message's on each conversation row so a list can show an RSVP button
+- Added MeetingInviteUtils with the pure parts of the above
+- Added description to a calendar event as sanitized HTML plus a plain-text copy, sent in the invitation as DESCRIPTION and X-ALT-DESC, sanitized again when read from a received invitation, and shown on the invitation card
+- Added event visibility (default, public, private, confidential), carried as CLASS, and show a private or confidential event to a reader who cannot update the calendar only as a busy block, in lists, single reads, counts, sorts and live updates
+- Added guest permissions (guests can modify, guests can invite others, guests can see the guest list), carried in the invitation as X-RAPIDMX properties, and mail each guest an invitation naming only themselves and the organizer when the guest list is hidden
+- Added POST /calendar-events/:id/request-change so a guest whose copy allows it can ask the organizer to change the title, location, description or time or to add guests, which the organizer's server applies and re-invites when the event allows it and shows as a proposal otherwise
+- Added POST /calendar-events/free-busy, which returns the busy times of up to 50 local mailboxes over up to 31 days without titles, marks unanswered and tentative time as tentative, and reports non-local addresses as unknown instead of free
+- Added Mailbox.freeBusyVisibility (domain, shared, nobody, everyone), changed only by an owner-level caller, to choose who may see a mailbox's free and busy times
+
+### Changed
+- Accept the caller's time zone on POST /mailboxes/auto-provision and store it when it is a valid IANA name (isValidTimeZone()), else UTC
+- Test the host placeholder on install and upgrade, the query-string registry lookup on Mongo and SQL, and the time zone on auto-provision
+- Document the changes in the release notes
+- Read a calendar file that names no METHOD as a PUBLISH so an exported event can be added, and let buildEventIcs build a COUNTER
+- Return the reader's own schedule around the meeting and the busy conflicts inside it, expanding recurring events and honoring moved occurrences
+- Test the endpoints on both backends, including concurrent writes, and test the utilities and the delivered method
+- Document the change in the release notes and NOTES
+- Fold every iCalendar line over 75 octets, so invitations are no longer quoted-printable when they are all short
+- Test the new fields, redaction, guest changes, hidden guest lists, free/busy visibility and the request limits on both backends
+- Document the changes in the release notes and NOTES
+- Read a missing X-RAPIDMX-GUESTS-CAN-INVITE as allowed only in an invitation whose PRODID names a RapidMX server, so an invitation from another vendor's server no longer offers Add guests, which only a RapidMX organizer's server acts on
+- Test both, and document them in the release notes and NOTES
+
+### Fixed
+- Fixed accepting a meeting invitation after declining it failing as a duplicate, by clearing the soft-deleted copy that still held the uid before filing the new one
+
 ## [0.20.1] - 2026-09-24
 
 ### Added
@@ -1127,7 +1161,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/RapidMX/restapi/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/RapidMX/restapi/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/RapidMX/restapi/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/RapidMX/restapi/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/RapidMX/restapi/compare/v0.18.0...v0.19.0
