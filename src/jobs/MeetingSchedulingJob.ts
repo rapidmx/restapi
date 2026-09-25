@@ -118,8 +118,9 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
     @Inject("BlobStore")
     private blobStore?: BlobStore;
 
-    @Config("mail:jobs:meeting_scheduling:schedule", "0 */5 * * * *")
-    private scheduleExpr: string = "0 */5 * * * *";
+    /** How often invitations and cancellations are mailed - every 10 seconds, so a guest hears of a deleted or cancelled meeting within moments, not minutes. */
+    @Config("mail:jobs:meeting_scheduling:schedule", "*/10 * * * * *")
+    private scheduleExpr: string = "*/10 * * * * *";
 
     @Config("mail:jobs:meeting_scheduling:batch_size", 100)
     private batchSize: number = 100;
