@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.22.0
+
 ### Added
 
 - **An administrator can erase the data a deleted mailbox left behind, which frees its address for reuse.** Deleting a mailbox removes only its row and its own access list; its folders (with their access lists) and everything carrying its `mailboxUid` stayed, and `POST /mailboxes` at the same address answered `409 This address still has data from a deleted mailbox. Erase that data before reusing the address.` with no way to do what it said - an ordinary erasure request is self-service and needs the mailbox row. Three additions, all for a trusted AND elevated caller (else `403` `api-103`/`api-104`, as `?scope=admin`):

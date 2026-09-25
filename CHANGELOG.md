@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-09-25
+
+### Added
+- Added GET /mailboxes/leftover, which lists deleted mailboxes that still have data, and POST /erasure-requests/leftover, which files an approved permanent erasure of that data through the existing erasure job, refusing a mailbox that still exists and one covered by a legal hold, for administrators with an elevated token
+- Added DELETE /mailboxes/:id?erase=true to delete a mailbox and erase its data in one step, and tell every delete whether its data was kept or is being erased
+
+### Changed
+- Test the routes, the job and the utilities on both backends
+- Document the change in the release notes and NOTES
+
+### Removed
+- Removed a deleted mailbox's own ACL when the erasure job purges it, and give the create 409 for a stuck address a reason, so a client can offer to erase the data or show the erasure that is running
+
 ## [0.21.1] - 2026-09-25
 
 ### Changed
@@ -1169,7 +1182,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.21.1...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/rapidmx/restapi/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/rapidmx/restapi/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/RapidMX/restapi/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/RapidMX/restapi/compare/v0.20.0...v0.20.1
