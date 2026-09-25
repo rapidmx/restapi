@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-09-25
+
+### Changed
+- Run MeetingSchedulingJob every 10 seconds by default instead of every 5 minutes, so the guests of a deleted or cancelled meeting are mailed within moments
+- Document the change in the release notes
+
 ## [0.22.0] - 2026-09-25
 
 ### Added
@@ -1182,7 +1188,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.22.1...HEAD
+[0.22.1]: https://github.com/rapidmx/restapi/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/rapidmx/restapi/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/rapidmx/restapi/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/RapidMX/restapi/compare/v0.20.1...v0.21.0

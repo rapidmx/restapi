@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.22.1
+
 ### Changed
 
 - **`MeetingSchedulingJob` runs every 10 seconds by default (`mail:jobs:meeting_scheduling:schedule`, was every 5 minutes),** so the guests of a meeting that is deleted or cancelled, or whose invitation was changed, are mailed within moments instead of minutes. Deleting a meeting only marks it, and this job is what mails the cancellation. Each run is a few indexed queries (a keyset walk of recently changed events and the not-yet-notified cancelled ones). Set the key to keep another cadence.
