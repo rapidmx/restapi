@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-26
+
+### Added
+- Added POST /messages/:id/report, which moves a reported message to Junk Email or, for not junk, to the Inbox, teaches rspamd through its controller's learnspam and learnham, records reportedAs and an audit entry, and can add the sender to Safe Senders
+- Added per-mailbox blocked and safe sender lists, changed one entry at a time by POST and DELETE on /mailboxes/:id/blocked-senders and safe-senders with a version-checked retry and only by a caller with full access, so a blocked sender goes to Junk and an authenticated safe sender is not sent to Junk by the spam verdict, while infected mail and policy quarantine are never rescued
+- Added fromEquals and fromDomainEquals to filter rules, matching the header From and the envelope sender exactly, so blocking ann@x.com no longer matches joann@x.com
+
+### Changed
+- Document that a downstream package's release bump level follows its upstream dependency's, minor for minor, patch for patch and major for major, in NOTES
+- Delete a purged message's attachments and the blobs no other row references, on a single purge and on emptying a folder, audit emptying a folder, and leave matter ids out of the legal hold refusal for callers without a trusted role
+- Test the report, the lists and their enforcement, the exact-match conditions, the rspamd wire calls and the purge on both backends
+- Document the change in the release notes and NOTES
+
 ## [0.22.1] - 2026-09-25
 
 ### Changed
@@ -1188,7 +1201,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.22.1...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/rapidmx/restapi/compare/v0.22.1...v0.23.0
 [0.22.1]: https://github.com/rapidmx/restapi/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/rapidmx/restapi/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/rapidmx/restapi/compare/v0.21.0...v0.21.1
