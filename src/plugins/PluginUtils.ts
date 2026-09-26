@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import crypto from "crypto";
 import semver from "semver";
-import { Plugin, PluginManifest, PluginSettingDefinition, PluginUi } from "../models/types.js";
+import { Plugin, PluginConfiguredSetting, PluginManifest, PluginSettingDefinition, PluginUi } from "../models/types.js";
 import { parsePluginUi } from "./PluginUiUtils.js";
 
 /** The plugin contract version this library implements. A plugin whose manifest declares any other
@@ -354,6 +354,48 @@ export function defaultPluginSettings(manifest: PluginManifest, host?: string): 
         const value: string | number | boolean | undefined = hasHostPlaceholder(setting) ? resolveHostDefault(setting, host) : setting.default;
         if (value !== undefined) {
             result[setting.key] = value;
+        }
+    }
+    return result;
+}
+
+/** The name of the nconf layer the server keeps the settings saved on plugins in: the first one, so a saved setting wins over
+ * the command line, the environment and the defaults. It is the same name as `PLUGIN_SETTINGS_STORE` in the server's
+ * `config.defaults.ts`, and is left out when reporting what the deployment itself configures. */
+export const PLUGIN_SETTINGS_STORE = "plugins";
+
+/** Keys naming a secret, whose value is never sent to the browser. */
+const SECRET_SETTING_KEY = /secret|password|credential|token|api_?key/i;
+
+/** What a config store holds for `key`: nothing for an unset value, an empty one (which nothing treats as set) or one that
+ * isn't text, a number or a flag. */
+function storedValue(store: { get?: (key: string) => unknown } | undefined, key: string): string | number | boolean | undefined {
+    const value: unknown = store?.get?.(key);
+    return (typeof value === "string" && value !== "") || typeof value === "number" || typeof value === "boolean" ? value : undefined;
+}
+
+/**
+ * What the deployment's own configuration says about each of `manifest`'s settings it sets: the value in the first of the
+ * config's layers that has one, in nconf's order of precedence - the command line, the environment, then the defaults -
+ * leaving out the layer the saved settings are loaded into (`PLUGIN_SETTINGS_STORE`), which wins over all of them. That is
+ * what applies until a value is saved, and what clearing it goes back to. An empty value says nothing. A secret's value is
+ * left out. Settings with nothing configured aren't in the result.
+ *
+ * @param config The server's nconf provider. Without its `stores`, nothing is reported.
+ * @param manifest The plugin's manifest.
+ */
+export function configuredPluginSettings(config: any, manifest: PluginManifest): Record<string, PluginConfiguredSetting> {
+    const stores: [string, any][] = Object.entries(config?.stores ?? {}).filter(([name]) => name !== PLUGIN_SETTINGS_STORE);
+    const result: Record<string, PluginConfiguredSetting> = {};
+    for (const setting of manifest.settings ?? []) {
+        for (const [, store] of stores) {
+            const value: string | number | boolean | undefined = storedValue(store, setting.key);
+            if (value === undefined) {
+                continue;
+            }
+            const secret: boolean = SECRET_SETTING_KEY.test(setting.key);
+            result[setting.key] = secret ? { secret } : { value, secret };
+            break;
         }
     }
     return result;

@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import "reflect-metadata";
+import nconf from "nconf";
 import { PluginManifest } from "../../src/models/types.js";
 import {
     computePluginStateHash,
+    configuredPluginSettings,
     defaultPluginSettings,
     findPluginNamespace,
     hasHostPlaceholder,
@@ -21,6 +23,7 @@ import {
     matchesAllowedPackage,
     parsePluginManifest,
     PLUGIN_API_VERSION,
+    PLUGIN_SETTINGS_STORE,
     validatePluginSettings,
 } from "../../src/plugins/PluginUtils.js";
 import { isMailboxScopedData, MailboxScopedData, PluginRegistry } from "../../src/plugins/PluginRegistry.js";
@@ -417,5 +420,86 @@ describe("isNewerVersion", () => {
         [undefined as any, "1.0.0", false],
     ])("%s newer than %s: %s", (candidate, current, expected) => {
         expect(isNewerVersion(candidate, current)).toBe(expected);
+    });
+});
+
+describe("configuredPluginSettings", () => {
+    const meet: PluginManifest = {
+        apiVersion: PLUGIN_API_VERSION,
+        displayName: "Meet",
+        settings: [
+            { key: "m:url", label: "URL", type: "string", default: "" },
+            { key: "m:shared_secret", label: "Secret", type: "string", default: "" },
+            { key: "m:limit", label: "Limit", type: "number" },
+            { key: "m:unset", label: "Unset", type: "string" },
+            { key: "m:blank", label: "Blank", type: "string" },
+        ],
+    };
+
+    /** The server's layers: the settings saved on plugins first, then the command line, the environment, memory and the defaults. */
+    function provider(env: Record<string, string>, defaults: Record<string, unknown>): nconf.Provider {
+        const saved: Record<string, string | undefined> = {};
+        for (const [key, value] of Object.entries(env)) {
+            saved[key] = process.env[key];
+            process.env[key] = value;
+        }
+        try {
+            const config = new nconf.Provider();
+            config.add(PLUGIN_SETTINGS_STORE, { type: "literal", store: {} });
+            config.argv().env({ separator: "__", parseValues: true });
+            config.use("memory");
+            config.defaults(defaults);
+            return config;
+        } finally {
+            for (const [key, value] of Object.entries(saved)) {
+                if (value === undefined) {
+                    delete process.env[key];
+                } else {
+                    process.env[key] = value;
+                }
+            }
+        }
+    }
+
+    it("reports what the environment sets, and leaves a secret's value out", () => {
+        const config = provider({ m__url: "turn:mail.example.com:3478", m__shared_secret: "hunter2", m__blank: "" }, {});
+        expect(configuredPluginSettings(config, meet)).toEqual({
+            "m:url": { value: "turn:mail.example.com:3478", secret: false },
+            "m:shared_secret": { secret: true },
+        });
+    });
+
+    it("reports a default of the server, and the environment over it, and skips an empty default", () => {
+        const config = provider({ m__url: "from-env" }, { m: { url: "from-defaults", limit: 5, unset: "" } });
+        expect(configuredPluginSettings(config, meet)).toEqual({
+            "m:url": { value: "from-env", secret: false },
+            "m:limit": { value: 5, secret: false },
+        });
+    });
+
+    it("leaves out the layer of settings saved on plugins, which wins over the rest", () => {
+        const config = provider({ m__url: "from-env" }, { m: { limit: 3 } });
+        const saved = (config as any).stores[PLUGIN_SETTINGS_STORE];
+        saved.readOnly = false;
+        saved.set("m:url", "saved");
+        saved.set("m:limit", 9);
+        expect(config.get("m:url")).toBe("saved");
+        expect(configuredPluginSettings(config, meet)).toEqual({
+            "m:url": { value: "from-env", secret: false },
+            "m:limit": { value: 3, secret: false },
+        });
+    });
+
+    it("reports nothing without stores or without settings", () => {
+        expect(configuredPluginSettings({ get: () => "x" }, meet)).toEqual({});
+        expect(configuredPluginSettings(undefined, meet)).toEqual({});
+        expect(configuredPluginSettings(provider({}, {}), { apiVersion: PLUGIN_API_VERSION, displayName: "None" })).toEqual({});
+    });
+
+    it("skips a store that can't be read and a value that isn't text, a number or a flag", () => {
+        const one: PluginManifest = { apiVersion: PLUGIN_API_VERSION, displayName: "One", settings: [{ key: "o:value", label: "Value", type: "string" }] };
+        expect(configuredPluginSettings({ stores: { argv: {}, env: undefined } }, one)).toEqual({});
+        expect(configuredPluginSettings({ stores: { env: { get: () => ({ nested: true }) } } }, one)).toEqual({});
+        expect(configuredPluginSettings({ stores: { env: { get: () => false } } }, one)).toEqual({ "o:value": { value: false, secret: false } });
     });
 });

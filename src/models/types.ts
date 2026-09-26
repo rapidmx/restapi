@@ -2749,6 +2749,24 @@ export interface Plugin extends BaseEntity {
 
     /** A snapshot of the package's `rapidmx.plugin` block for `version`. */
     manifest: PluginManifest;
+
+    /** Only in the plugin routes' responses, never stored: for each declared setting the deployment's configuration
+     * provides a value for (the command line, the environment or the server's defaults), what it says. A value saved in
+     * `settings` wins over it. */
+    configured?: Record<string, PluginConfiguredSetting>;
+}
+
+/**
+ * What the deployment's own configuration (the command line, the environment and the server's defaults, not the plugin's
+ * saved settings) says about one plugin setting. It is what applies until an administrator saves a value, and what
+ * clearing the saved value goes back to - see `Plugin.configured`.
+ */
+export interface PluginConfiguredSetting {
+    /** The value. Left out for a secret (a key naming a secret, password, credential, token or API key), which is never
+     * sent to the browser - the entry's presence says it is set. */
+    value?: string | number | boolean;
+    /** `true` when the value was left out because it is a secret. */
+    secret: boolean;
 }
 
 /** How the web client chooses between its light and dark themes. */

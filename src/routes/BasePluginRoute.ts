@@ -28,6 +28,7 @@ import {
 import { findPluginUiMountConflicts } from "../plugins/PluginUiUtils.js";
 import {
     computePluginStateHash,
+    configuredPluginSettings,
     DEFAULT_ALLOWED_PLUGIN_PACKAGES,
     DEFAULT_PLUGIN_NAMESPACES,
     findPluginNamespace,
@@ -601,7 +602,19 @@ export abstract class BasePluginRoute<T extends Plugin> {
     public async list(): Promise<T[]> {
         await this.init();
         const plugins: T[] = await this.pluginRepo!.find({} as any, { ignoreACL: true });
-        return plugins.filter((plugin) => !plugin.removed).sort((a, b) => a.name.localeCompare(b.name));
+        return plugins
+            .filter((plugin) => !plugin.removed)
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .map((plugin) => this.withConfigured(plugin));
+    }
+
+    /**
+     * `plugin` with what the deployment's configuration says about its settings (`Plugin.configured`), so the admin
+     * console shows a setting's value in effect and which ones a saved value can't change. Only in responses - the row
+     * is stored without it.
+     */
+    private withConfigured(plugin: T): T {
+        return { ...plugin, configured: configuredPluginSettings(this.config, plugin.manifest) };
     }
 
     @RequiresTrustedRole()
@@ -777,7 +790,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 pluginHostOfRequest(req.headers),
             );
             await this.audit(req, user, AuditAction.PLUGIN_INSTALL, created, { packageVersion: found.version });
-            return { plugin: created, dependencies };
+            return { plugin: this.withConfigured(created), dependencies: dependencies.map((row) => this.withConfigured(row)) };
         });
     }
 
@@ -884,7 +897,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 enabled: updated.enabled,
                 settingsChanged: patch.settings !== undefined,
             });
-            return updated;
+            return this.withConfigured(updated);
         });
     }
 

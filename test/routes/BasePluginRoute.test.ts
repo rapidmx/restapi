@@ -149,3 +149,15 @@ describe("BasePluginRoute rollback", () => {
         expect(logger.error).toHaveBeenCalledWith("Could not announce a plugin change: db down");
     });
 });
+
+describe("BasePluginRoute configured settings", () => {
+    it("adds what the deployment's configuration says about a plugin's settings to a response, leaving the row alone", async () => {
+        const stores = { env: { get: (key: string) => (key === "mail:videoconf:turn:url" ? "turn:mail.example.com:3478" : undefined) } };
+        const route = await newRoute({ config: { stores } });
+        const row = { uid: "1", name: "@rapidmx/meet", settings: {}, manifest: { apiVersion: 1, displayName: "Meet", settings: [{ key: "mail:videoconf:turn:url", label: "TURN", type: "string" }] } };
+        const shown = route.withConfigured(row);
+        expect(shown.configured).toEqual({ "mail:videoconf:turn:url": { value: "turn:mail.example.com:3478", secret: false } });
+        expect(shown).toEqual({ ...row, configured: shown.configured });
+        expect(row).not.toHaveProperty("configured");
+    });
+});
