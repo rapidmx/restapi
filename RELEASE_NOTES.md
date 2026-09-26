@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.24.0
+
 ### Added
 
 - **The plugin routes tell the admin console what the deployment's own configuration sets for a plugin's settings.** `GET /system/plugins` (and the plugin the add and update calls return) carries `configured` on each plugin: for every declared setting that the command line, the environment or the server's defaults give a value, `{ value, secret }`. It is what applies until an administrator saves a value (a saved value wins over all of them), and what clearing the saved value goes back to. The value of a key naming a secret, password, credential, token or API key is left out (`secret: true`). The saved `settings` are untouched. `PluginConfiguredSetting`, `Plugin.configured`, `configuredPluginSettings()` and `PLUGIN_SETTINGS_STORE` (the name of the server's first, saved-settings configuration layer, which it leaves out) are exported.

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-26
+
+### Added
+- Added configured to the plugins the plugin routes return, with what the command line, the environment and the server's defaults set for each declared setting, so the admin console can show the value in effect
+
+### Changed
+- Leave a secret's value out of it, and the layer that holds the settings saved on plugins, which wins over the rest
+- Test configuredPluginSettings against the server's real layers and withConfigured on the route
+- Document the change in the release notes and NOTES
+
 ## [0.23.0] - 2026-09-26
 
 ### Added
@@ -1201,7 +1211,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/rapidmx/restapi/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/rapidmx/restapi/compare/v0.22.1...v0.23.0
 [0.22.1]: https://github.com/rapidmx/restapi/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/rapidmx/restapi/compare/v0.21.1...v0.22.0
