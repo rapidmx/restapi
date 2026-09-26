@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { MailFilterAction, MailFilterActionType, MailFilterConditions, MailFilterRule, MessageImportance } from "../models/types.js";
+import { senderDomainOf } from "./SenderListUtils.js";
 
 /** The fields of a newly-delivered message `matchesConditions()`/`evaluateMailFilterRules()` need to evaluate a
  * `MailFilterRule` against - built from `ScanQueueJob`'s already-parsed MIME, not from a persisted `Message`
@@ -10,6 +11,14 @@ import { MailFilterAction, MailFilterActionType, MailFilterConditions, MailFilte
 export interface MailFilterMatchContext {
     /** The message's From address, optionally combined with its display name (e.g. `"Jane Doe <jane@x.com>"`). */
     from: string;
+
+    /** The bare address of the `From` header (`jane@x.com`) - what `MailFilterConditions.fromEquals`/`fromDomainEquals` match, together
+     * with `envelopeFrom`. Absent for a caller that only has `from`: the address in it is used then. */
+    fromAddress?: string;
+
+    /** The SMTP envelope sender (`MAIL FROM`), which can differ from the `From` header (forwarded and list mail, bounces - empty for
+     * those). `fromEquals`/`fromDomainEquals` match it too. */
+    envelopeFrom?: string;
 
     subject: string;
 
@@ -57,12 +66,48 @@ function containsAnyIgnoreCase(haystack: string, needles?: string[]): boolean {
 }
 
 /**
+ * The bare, lowercase addresses a message was sent from, for the exact-match sender conditions: the `From` header's address and the
+ * envelope sender (empty ones dropped). A context that names neither gets the address found in `context.from` - `<jane@x.com>` of
+ * `Jane Doe <jane@x.com>`, or the whole value when it is a bare address - so a caller that only has that string still matches.
+ */
+export function senderAddressesOf(context: MailFilterMatchContext): string[] {
+    const addresses: string[] = [context.fromAddress, context.envelopeFrom]
+        .map((address) => address?.trim().toLowerCase() ?? "")
+        .filter((address) => address.length > 0);
+    if (addresses.length === 0) {
+        const bracketed: string | undefined = /<([^<>]*)>\s*$/.exec(context.from)?.[1]?.trim().toLowerCase();
+        const candidate: string = bracketed ?? context.from.trim().toLowerCase();
+        if (candidate.includes("@")) {
+            addresses.push(candidate);
+        }
+    }
+    return addresses;
+}
+
+/**
  * Evaluates a single `MailFilterRule`'s `MailFilterConditions` against `context`. Every populated condition
  * field must match (AND); a field holding an array of strings is itself OR-matched against its entries.
+ *
+ * `fromContains` is a substring match on the `From` header's whole value (name and address): `ann@x.com` matches `joann@x.com`.
+ * `fromEquals` and `fromDomainEquals` are exact: an address equal to an entry (`fromEquals`) or a domain equal to one
+ * (`fromDomainEquals`, `x.com` and not `mail.x.com`), case-insensitively, on the `From` header's address OR the envelope sender - a
+ * rule that names a sender should still catch mail that reaches it through a forwarder or a mailing list.
  */
 export function matchesConditions(conditions: MailFilterConditions, context: MailFilterMatchContext): boolean {
     if (conditions.fromContains && !containsAnyIgnoreCase(context.from, conditions.fromContains)) {
         return false;
+    }
+    if (conditions.fromEquals) {
+        const senders: string[] = senderAddressesOf(context);
+        if (!conditions.fromEquals.some((entry) => senders.includes(entry.trim().toLowerCase()))) {
+            return false;
+        }
+    }
+    if (conditions.fromDomainEquals) {
+        const domains: (string | undefined)[] = senderAddressesOf(context).map((address) => senderDomainOf(address));
+        if (!conditions.fromDomainEquals.some((entry) => domains.includes(entry.trim().toLowerCase().replace(/^@/, "")))) {
+            return false;
+        }
     }
     if (conditions.subjectContains && !containsAnyIgnoreCase(context.subject, conditions.subjectContains)) {
         return false;

@@ -206,6 +206,25 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     @Nullable
     public freeBusyVisibility?: FreeBusyVisibility = "domain";
 
+    // `simple-json`, `nullable: true` so `synchronize` can add the columns to a table that already has rows (no migration): those rows
+    // read back `null`, which every reader takes as an empty list (`?? []`).
+    @Column({ type: "simple-json", nullable: true })
+    @Description(
+        "This mailbox's Blocked Senders list: lowercase addresses (`user@example.com`) and domains (`@example.com`). Mail from one " +
+            "goes to Junk Email. At most 1,000 entries; changed with `POST /:id/blocked-senders` and `DELETE /:id/blocked-senders/:entry`, " +
+            "and only by the mailbox's owner or a full-access delegate. A row without a value reads as empty.",
+    )
+    @Nullable
+    public blockedSenders?: string[] = [];
+
+    @Column({ type: "simple-json", nullable: true })
+    @Description(
+        "This mailbox's Safe Senders list, shaped like `blockedSenders`. Authenticated mail from one is never junked for a spam " +
+            "verdict (it never releases mail an antivirus or policy verdict quarantined). A row without a value reads as empty.",
+    )
+    @Nullable
+    public safeSenders?: string[] = [];
+
     constructor(other?: Partial<MailboxSQL>) {
         super(other);
 
@@ -252,6 +271,8 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
             this.keyDiscoveryHash = "keyDiscoveryHash" in other ? other.keyDiscoveryHash : this.keyDiscoveryHash;
             this.escrowScopeId = "escrowScopeId" in other ? other.escrowScopeId : this.escrowScopeId;
             this.freeBusyVisibility = other.freeBusyVisibility !== undefined ? other.freeBusyVisibility : this.freeBusyVisibility;
+            this.blockedSenders = other.blockedSenders !== undefined ? other.blockedSenders : this.blockedSenders;
+            this.safeSenders = other.safeSenders !== undefined ? other.safeSenders : this.safeSenders;
         }
     }
 }

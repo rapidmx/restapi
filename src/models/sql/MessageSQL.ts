@@ -16,6 +16,7 @@ import {
     MessageFlags,
     MessageImportance,
     MessageReceiptEntry,
+    MessageReportKind,
     Recipient,
     RecipientType,
 } from "../types.js";
@@ -365,6 +366,17 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
     @Nullable
     public receiptStatus?: MessageReceiptEntry[];
 
+    // `nullable: true` (no migration): a row from before the column existed reads `null`, which every reader takes as "never reported".
+    @Column({ type: "varchar", length: 16, nullable: true })
+    @Description("What the mailbox's user last reported this message as: junk, phishing or not_junk. Server-managed; unset until a report.")
+    @Nullable
+    public reportedAs?: MessageReportKind | null;
+
+    @Column({ nullable: true })
+    @Description("When reportedAs was last set. Server-managed.")
+    @Nullable
+    public dateReported?: Date;
+
     constructor(other?: Partial<MessageSQL>) {
         super(other);
 
@@ -421,6 +433,8 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
             this.receiptStatus = "receiptStatus" in other ? other.receiptStatus : this.receiptStatus;
             this.meetingResponse = "meetingResponse" in other ? other.meetingResponse : this.meetingResponse;
             this.meetingMethod = "meetingMethod" in other ? other.meetingMethod : this.meetingMethod;
+            this.reportedAs = "reportedAs" in other ? other.reportedAs : this.reportedAs;
+            this.dateReported = "dateReported" in other ? other.dateReported : this.dateReported;
         }
 
         // Always derived, never copied from `other`: these are server-managed mirrors of `flags`/`from`/

@@ -41,6 +41,7 @@ import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSu
 import { buildEventIcs } from "../../../src/util/IcsUtils.js";
 import { dsnDeliverySuite } from "../dsnDeliverySuite.js";
 import { htmlMailSuite } from "../htmlMailSuite.js";
+import { senderListsSuite } from "../senderListsSuite.js";
 import { eventDialogItipSuite } from "../eventDialogItipSuite.js";
 import { sanitizeDiscoveredKey } from "../../../src/util/KeyringUtils.js";
 import { issueCertificate, makeTestIssuer } from "../../util/signerCertificates.js";
@@ -457,6 +458,34 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         },
         quarantined: async () => await quarantineEntryRepo.find({ mailboxUid }).toArray(),
         relayed: () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!.sent,
+    });
+
+    senderListsSuite({
+        setMailbox: async (lists = {}) => {
+            await mailboxRepo.deleteMany({ uid: mailboxUid });
+            await createMailbox(lists as any);
+        },
+        deliver: async (raw, options = {}) => {
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await objectFactory.getInstance<any>("BlobStore")!.put(rawBlobKey, raw);
+            await createIngestEntry({
+                rawBlobKey,
+                envelopeFrom: options.envelopeFrom ?? "sender@example.com",
+                ...(options.quarantineReason ? { quarantineReason: options.quarantineReason } : {}),
+            });
+            await job.run();
+        },
+        messagesIn: async (type) => {
+            const folder = await folderRepo.findOne({ mailboxUid, type } as any);
+            return folder ? await messageRepo.find({ folderUid: folder.uid }).toArray() : [];
+        },
+        scanResultOf: async (uid) => (await scanResultRepo.findOne({ uid } as any))!,
+        quarantined: async () => await quarantineEntryRepo.find({ mailboxUid }).toArray(),
+        saveRule: async (fields) =>
+            await mailFilterRuleRepo.save(new MailFilterRuleMongo({ mailboxUid, enabled: true, sequence: 0, stopProcessingRules: false, ...fields })),
+        saveFolder: async (name) =>
+            await folderRepo.save(new FolderMongo({ mailboxUid, name, type: FolderType.USER, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 })),
+        messagesInFolder: async (folderUid) => await messageRepo.find({ folderUid }).toArray(),
     });
 
     htmlMailSuite({

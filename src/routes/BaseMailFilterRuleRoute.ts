@@ -5,6 +5,7 @@
 import { ApiError, type JWTUser } from "@rapidrest/core";
 import { ApiErrors, RepoUtils } from "@rapidrest/service-core";
 import { getMailboxUidForFolder } from "../util/FolderUtils.js";
+import { normalizeFilterSenderList } from "../util/SenderListUtils.js";
 import { Label, MailFilterRule } from "../models/types.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 
@@ -14,6 +15,11 @@ import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
  * of one mailbox could write a rule that files their incoming mail into a folder of any mailbox whose folder uid they
  * know - the rule runs server-side, where no per-caller permission check applies. Checked whenever the actions or the
  * rule's mailbox change.
+ *
+ * The exact-match sender conditions are validated and normalized too (`validateSenderConditions()`): `conditions.fromEquals` must be
+ * an array of at most 100 plain addresses and `conditions.fromDomainEquals` an array of at most 100 domains, each at most 254
+ * characters - stored lowercase and de-duplicated (a domain without any leading `@`), anything else a 400. A `null` condition (what a
+ * SQL row round-trips an absent one as) is dropped.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -58,13 +64,33 @@ export abstract class BaseMailFilterRuleRoute<T extends MailFilterRule> extends 
         }
     }
 
+    /** Validates and normalizes the exact-match sender conditions of `conditions` in place (see this class's doc comment). */
+    private validateSenderConditions(conditions: unknown): void {
+        if (typeof conditions !== "object" || conditions === null || Array.isArray(conditions)) {
+            return;
+        }
+        const record: Record<string, unknown> = conditions as Record<string, unknown>;
+        for (const [field, kind] of [
+            ["fromEquals", "address"],
+            ["fromDomainEquals", "domain"],
+        ] as const) {
+            if (record[field] === null) {
+                delete record[field];
+            } else if (record[field] !== undefined) {
+                record[field] = normalizeFilterSenderList(record[field], field, kind);
+            }
+        }
+    }
+
     protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
         await super.prepareCreate(obj, user);
+        this.validateSenderConditions(obj.conditions);
         await this.assertActionTargetsInMailbox(obj.actions, obj.mailboxUid);
     }
 
     protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
         await super.prepareUpdate(obj, existing, user);
+        this.validateSenderConditions(obj.conditions);
         const mailboxUid: string = obj.mailboxUid ?? existing.mailboxUid;
         if (obj.actions !== undefined || mailboxUid !== existing.mailboxUid) {
             await this.assertActionTargetsInMailbox(obj.actions ?? existing.actions, mailboxUid);

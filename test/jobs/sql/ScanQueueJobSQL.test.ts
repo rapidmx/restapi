@@ -17,6 +17,7 @@ import { Repository } from "typeorm";
 import config from "../../config.sql.js";
 import { dsnDeliverySuite } from "../dsnDeliverySuite.js";
 import { htmlMailSuite } from "../htmlMailSuite.js";
+import { senderListsSuite } from "../senderListsSuite.js";
 import { eventDialogItipSuite } from "../eventDialogItipSuite.js";
 import { registerTestDoubles, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
 import { ScanQueueJobSQL } from "../../../src/jobs/sql/ScanQueueJobSQL.js";
@@ -448,6 +449,34 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         },
         quarantined: async () => await quarantineEntryRepo.find({ where: { mailboxUid } }),
         relayed: () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!.sent,
+    });
+
+    senderListsSuite({
+        setMailbox: async (lists = {}) => {
+            await mailboxRepo.delete({ uid: mailboxUid });
+            await createMailbox(lists as any);
+        },
+        deliver: async (raw, options = {}) => {
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await objectFactory.getInstance<any>("BlobStore")!.put(rawBlobKey, raw);
+            await createIngestEntry({
+                rawBlobKey,
+                envelopeFrom: options.envelopeFrom ?? "sender@example.com",
+                ...(options.quarantineReason ? { quarantineReason: options.quarantineReason } : {}),
+            });
+            await job.run();
+        },
+        messagesIn: async (type) => {
+            const folder = await folderRepo.findOne({ where: { mailboxUid, type } });
+            return folder ? await messageRepo.find({ where: { folderUid: folder.uid } }) : [];
+        },
+        scanResultOf: async (uid) => (await scanResultRepo.findOne({ where: { uid } }))!,
+        quarantined: async () => await quarantineEntryRepo.find({ where: { mailboxUid } }),
+        saveRule: async (fields) =>
+            await mailFilterRuleRepo.save(new MailFilterRuleSQL({ mailboxUid, enabled: true, sequence: 0, stopProcessingRules: false, ...fields } as any)),
+        saveFolder: async (name) =>
+            await folderRepo.save(new FolderSQL({ mailboxUid, name, type: FolderType.USER, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 })),
+        messagesInFolder: async (folderUid) => await messageRepo.find({ where: { folderUid } }),
     });
 
     htmlMailSuite({

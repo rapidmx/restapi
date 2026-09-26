@@ -34,4 +34,25 @@ export interface SpamScanProvider {
     readonly name: string;
 
     scoreMessage(raw: Buffer, envelope: ScanEnvelope): Promise<SpamScanResult>;
+
+    /**
+     * Teaches the engine that `raw` (a whole RFC 5322 message) is spam (`"spam"`) or not (`"ham"`) - what `POST /messages/:id/report`
+     * calls when a user reports a message. Optional: an engine that cannot learn (or a deployment that turned learning off) simply
+     * leaves it out, and the report is answered `learnSkipped: "unsupported"`.
+     *
+     * Resolves once the engine accepted the message; a message it has already learned as that class counts as accepted. Rejects with
+     * an `Error` when the engine is unreachable, refuses (a bad password, no statistics configured) or times out - the caller logs it
+     * and reports `learned: false`, it never fails the user's report. Never called for an encrypted message.
+     *
+     * @param raw The raw message, at most the report route's size bound (5 MiB).
+     * @param kind What the message is.
+     * @param options `recipient` is the mailbox the message was reported from, for an engine that keeps statistics per user.
+     */
+    learn?(raw: Buffer, kind: "spam" | "ham", options?: SpamLearnOptions): Promise<void>;
+}
+
+/** Optional context for `SpamScanProvider.learn()`. */
+export interface SpamLearnOptions {
+    /** The primary address of the mailbox the message was reported from - what a per-user statistics engine files it under. */
+    recipient?: string;
 }

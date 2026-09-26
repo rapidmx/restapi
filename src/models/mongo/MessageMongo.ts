@@ -16,6 +16,7 @@ import {
     MessageFlags,
     MessageImportance,
     MessageReceiptEntry,
+    MessageReportKind,
     Recipient,
     RecipientType,
 } from "../types.js";
@@ -342,6 +343,16 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     @Nullable
     public receiptStatus?: MessageReceiptEntry[];
 
+    @Column()
+    @Description("What the mailbox's user last reported this message as: junk, phishing or not_junk. Server-managed; unset until a report.")
+    @Nullable
+    public reportedAs?: MessageReportKind | null;
+
+    @Column()
+    @Description("When reportedAs was last set. Server-managed.")
+    @Nullable
+    public dateReported?: Date;
+
     constructor(other?: Partial<MessageMongo>) {
         super(other);
 
@@ -398,6 +409,8 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.receiptStatus = "receiptStatus" in other ? other.receiptStatus : this.receiptStatus;
             this.meetingResponse = "meetingResponse" in other ? other.meetingResponse : this.meetingResponse;
             this.meetingMethod = "meetingMethod" in other ? other.meetingMethod : this.meetingMethod;
+            this.reportedAs = "reportedAs" in other ? other.reportedAs : this.reportedAs;
+            this.dateReported = "dateReported" in other ? other.dateReported : this.dateReported;
         }
 
         // Always derived, never copied from `other`: these are server-managed mirrors of `flags`/`from`/

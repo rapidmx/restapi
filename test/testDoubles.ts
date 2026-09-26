@@ -25,7 +25,7 @@ import type {
     SearchQuery,
     SearchResultPage,
 } from "../src/search/SearchProvider.js";
-import type { ScanEnvelope, SpamScanProvider, SpamScanResult } from "../src/scan/SpamScanProvider.js";
+import type { ScanEnvelope, SpamLearnOptions, SpamScanProvider, SpamScanResult } from "../src/scan/SpamScanProvider.js";
 import type { AvScanProvider, AvScanResult } from "../src/scan/AvScanProvider.js";
 import type { MailTransport, OutboundMessage, TransportResult } from "../src/transport/MailTransport.js";
 import { NullDkimKeyProvider } from "../src/dkim/NullDkimKeyProvider.js";
@@ -138,9 +138,25 @@ export class NoopSearchProvider implements SearchProvider {
  * string `"X-Test-Force-Spam: true"`, in which case it reports SPAM. This lets an integration test
  * exercise `BaseMessageRoute.send()`'s spam-rejection (422) path via a real HTTP request - by including
  * that header in the message body it hands to the route - rather than needing a mocked ScanPipeline.
+ *
+ * It also records what it is taught (`learn()`, called by `POST /messages/:id/report`) in `learned`, and fails every lesson with
+ * `learnError` while that is set.
  */
 export class AlwaysCleanSpamScanProvider implements SpamScanProvider {
     public readonly name: string = "always-clean";
+
+    /** Every message `learn()` accepted, oldest first. */
+    public learned: { kind: "spam" | "ham"; raw: Buffer; options?: SpamLearnOptions }[] = [];
+
+    /** While set, `learn()` rejects with it instead of recording. */
+    public learnError?: Error;
+
+    public async learn(raw: Buffer, kind: "spam" | "ham", options?: SpamLearnOptions): Promise<void> {
+        if (this.learnError) {
+            throw this.learnError;
+        }
+        this.learned.push({ kind, raw, options });
+    }
 
     public async scoreMessage(raw: Buffer, _envelope: ScanEnvelope): Promise<SpamScanResult> {
         if (raw.includes("X-Test-Force-Spam: true")) {

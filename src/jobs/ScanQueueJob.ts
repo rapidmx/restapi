@@ -29,6 +29,7 @@ import { ERASURE_IN_PROGRESS } from "./ErasureExecutionJob.js";
 import { writeContactKeys } from "../util/ContactKeyUtils.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
+import { evaluateSenderLists, type SenderListVerdict } from "../util/SenderListUtils.js";
 import { MAX_EVENT_ATTENDEES, MAX_REQUESTED_GUESTS, guestPermissionsOf } from "../util/CalendarEventUtils.js";
 import { mailboxAddressSet, meetingMethodOf } from "../util/MeetingInviteUtils.js";
 import { extractHeader, extractHeaders, isPlainAddress, prepareRelayCopy, prependHeaders, safeDisplayName, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
@@ -127,6 +128,12 @@ const RESOURCE_BOOKING_OVERRIDE_LOOKBACK_MS = MS_PER_DAY;
  * domain before they're honored - see `util/DkimOversignUtils.ts`. */
 const RAPIDMX_KEY_HEADER = "RapidMX-Key";
 const RECALL_HEADER = "X-RapidMX-Recall-Of";
+
+/** What `ScanQueueJob.applySenderLists()` decided: the delivery verdict, and the spam symbols it adds to the message's `ScanResult`. */
+interface SenderListDecision {
+    verdict: "deliver" | "junk";
+    symbols: string[];
+}
 
 /** A claim on one `IngestQueueEntry` by this worker: `row` is always the latest version this worker wrote, so
  * any later write (lease renewal, `DELIVERED`, `FAILED`) is version-checked against exactly that - a mismatch
@@ -722,7 +729,16 @@ export abstract class ScanQueueJob<
         // A `TransportRule`'s `quarantine` action (stamped by `BaseMailIngestRoute.deliver()`) always wins over
         // an AV/spam-derived verdict of "deliver"/"junk" - but scanning still ran normally above, so a
         // policy-quarantined message still gets a real `ScanResult` for the reviewer to see.
-        const verdict = entry.quarantineReason ? "quarantine" : resolveDeliveryVerdict(result);
+        let verdict: "deliver" | "junk" | "quarantine" = entry.quarantineReason ? "quarantine" : resolveDeliveryVerdict(result);
+
+        // The mailbox's own Blocked/Safe Senders lists refine "deliver"/"junk" - never "quarantine", which no list can undo - see
+        // `applySenderLists()`. Their marks go on the `ScanResult`'s symbols below, the one place a reader of the scan sees why.
+        const listSymbols: string[] = [];
+        if (verdict !== "quarantine") {
+            const decision: SenderListDecision = await this.applySenderLists(entry, raw, result, verdict);
+            verdict = decision.verdict;
+            listSymbols.push(...decision.symbols);
+        }
 
         // The `Message`/`QuarantineEntry` this scan is *for* doesn't exist yet, and `ScanResult.targetUid`
         // needs to reference it - pre-generating the target's uid here (rather than letting `create()` mint
@@ -741,7 +757,7 @@ export abstract class ScanQueueJob<
                     targetUid,
                     spamScore: result.spam.score,
                     spamVerdict: result.spam.verdict,
-                    spamSymbols: result.spam.symbols,
+                    spamSymbols: [...result.spam.symbols, ...listSymbols],
                     avVerdict: result.av.verdict,
                     avSignatureName: result.av.signatureName,
                     scannedAt: new Date(),
@@ -808,6 +824,43 @@ export abstract class ScanQueueJob<
         }
 
         await this.markDelivered(claim);
+    }
+
+    /**
+     * Applies the mailbox's Blocked Senders and Safe Senders lists (`Mailbox.blockedSenders`/`safeSenders`) to a message the scan
+     * verdicted `"deliver"` or `"junk"` (never `"quarantine"`: an antivirus or policy verdict is not for a list to undo, and this is not
+     * called for one). A mailbox that has gone, or has no list entry naming the sender, leaves `verdict` as it is.
+     *
+     * - **Blocked** (the `From` header's address OR the envelope sender is on `blockedSenders`, as an address or as its exact domain):
+     * `"junk"`, marked `BLOCKED_SENDER`. No authentication is required - blocking is safe on a spoofable header, and the worst a
+     * forger can do is get their own mail junked. Being junk-routed, the message skips the mailbox's mail filter rules and is filed in
+     * Junk Email, exactly as a spam verdict does; it was still scanned for viruses, and one found is quarantined before this runs.
+     * - **Safe** (the `From` address is on `safeSenders` AND authenticated - `verifiedFromAddress()`: a passing DKIM signature aligned
+     * with the `From` domain, stamped by this deployment's trusted MTA hop): a `"junk"` verdict that came from the spam filter becomes
+     * `"deliver"`, marked `SAFE_SENDER`, and the message then runs the mailbox's rules and Focused Inbox classification like any mail
+     * for the Inbox. A message that is not authenticated is NOT rescued - anyone can forge a `From` header - and only the `From` address
+     * is consulted: the envelope sender proves nothing here. That includes a spam-filter outage's fail-closed `SUSPECT`, which is a
+     * missing opinion rather than a bad one, and a safe, authenticated sender is delivered through it.
+     * - **Both** lists name the sender (the write paths never allow it, but rows can be edited directly): an authenticated safe sender
+     * is safe, anyone else is blocked.
+     */
+    private async applySenderLists(
+        entry: Q,
+        raw: Buffer,
+        result: ScanPipelineResult,
+        verdict: "deliver" | "junk",
+    ): Promise<SenderListDecision> {
+        const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            return { verdict, symbols: [] };
+        }
+        const lists: SenderListVerdict = evaluateSenderLists(mailbox, result.fromAddress, entry.envelopeFrom);
+        // Authentication only matters to a safe match, so it is only checked (a header parse) when there is one.
+        const safe: boolean = lists.safe && this.verifiedFromAddress(raw, result) !== undefined;
+        if (safe) {
+            return verdict === "junk" ? { verdict: "deliver", symbols: ["SAFE_SENDER"] } : { verdict, symbols: [] };
+        }
+        return lists.blocked ? { verdict: "junk", symbols: ["BLOCKED_SENDER"] } : { verdict, symbols: [] };
     }
 
     /** Closes `claim`'s entry as `DELIVERED` (version-checked against this worker's claim), then best-effort removes
@@ -933,6 +986,8 @@ export abstract class ScanQueueJob<
             );
             const matchContext: MailFilterMatchContext = {
                 from: result.parsedFrom ?? entry.envelopeFrom,
+                fromAddress: result.fromAddress,
+                envelopeFrom: entry.envelopeFrom,
                 subject: result.subject ?? "",
                 bodyPreview: result.bodyPreview ?? "",
                 recipientAddresses: entry.envelopeTo,

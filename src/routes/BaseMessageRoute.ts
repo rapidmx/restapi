@@ -19,6 +19,7 @@ import {
 import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
+import type { SpamScanProvider } from "../scan/SpamScanProvider.js";
 import { pointInlineImages, SanitizedBodyLoader, type InlineImageMode } from "../scan/SanitizedBody.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
@@ -45,7 +46,9 @@ import {
     parseMessageLabelUids,
     syncMessageListFields,
 } from "../util/MessageListUtils.js";
-import { checkOriginatorHeaders, extractHeader, safeDisplayName } from "../util/MimeHeaderUtils.js";
+import { collectMessagePurge, finishMessagePurge, type MessagePurgeContext, type PreparedMessagePurge } from "../util/MessagePurgeUtils.js";
+import { checkOriginatorHeaders, extractHeader, safeDisplayName, singleFromAddress } from "../util/MimeHeaderUtils.js";
+import { changeMailboxSenderList, parseSenderAddress } from "../util/SenderListUtils.js";
 import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification } from "../util/ReceiptUtils.js";
@@ -60,11 +63,12 @@ import {
     MessageClassification,
     MessageFlags,
     MessageReceiptEntry,
+    MessageReportKind,
     Recipient,
 } from "../models/types.js";
 const { Config, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
-const { Delete, Get, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
+const { Delete, Get, Param, Post, Put, Query, RateLimit, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** The answer to a background send: the message as it now sits in Outbox. */
 export interface QueuedSend<T> {
@@ -132,6 +136,9 @@ const SERVER_MANAGED_MESSAGE_FIELDS = [
     "readReceiptDeclined",
     "meetingResponse",
     "meetingMethod",
+    // Written by `report()` only.
+    "reportedAs",
+    "dateReported",
     "deliveryReceiptSentAt",
     "deliveryReceiptPending",
     "deliveryReceiptDeclined",
@@ -165,6 +172,37 @@ export const DEFAULT_CONVERSATION_PAGE_SIZE: number = 100;
 
 /** The most messages one `conversationMessages()` page may carry, whatever `limit` asks for. */
 export const MAX_CONVERSATION_PAGE_SIZE: number = 500;
+
+/** The most bytes of a message's raw source `report()` reads to teach the spam filter: a larger message is reported (moved, marked) but not
+ * learned (`learnSkipped: "too_large"`) - a statistics engine gains nothing from a 50 MB attachment and reading it would cost this server. */
+export const MAX_REPORT_LEARN_BYTES: number = 5 * 1024 * 1024;
+
+/** How much of the start of a message too large to learn `report()` reads to find its `From` header (`alwaysTrustSender`). */
+const REPORT_HEADER_BYTES: number = 64 * 1024;
+
+/** The kinds `report()` accepts. */
+const REPORT_KINDS: readonly MessageReportKind[] = ["junk", "phishing", "not_junk"];
+
+/** Why `report()` did not teach the spam filter (`MessageReportResult.learnSkipped`). */
+export type MessageLearnSkipped = "encrypted" | "unsupported" | "disabled" | "failed" | "too_large";
+
+/** The answer to `POST /:id/report`. */
+export interface MessageReportResult {
+    uid: string;
+    kind: MessageReportKind;
+    /** `true` when the message changed folder (`false` when it was already where the report sends it). */
+    moved: boolean;
+    /** The folder the message is in now: the mailbox's Junk Email for `junk`/`phishing`, its Inbox for `not_junk`. */
+    folderUid: string;
+    /** `true` when the spam filter accepted the message as spam (`junk`, `phishing`) or ham (`not_junk`). */
+    learned: boolean;
+    /** Why `learned` is `false`, when it is: `encrypted` (the server cannot read the message), `disabled` (`mail:scan:spam:learn:enabled`
+     * is off), `unsupported` (no spam engine registered, or one that cannot learn), `too_large` (over `MAX_REPORT_LEARN_BYTES`) or `failed`
+     * (the engine could not be reached, refused, timed out, or the message's source could not be read). */
+    learnSkipped?: MessageLearnSkipped;
+    /** The address `alwaysTrustSender` added to the mailbox's safe senders (the `From` header's), when it did. */
+    safeSender?: string;
+}
 
 /** The longest `Message.verificationSeal` `setVerificationSeal()` accepts, in characters. */
 export const MAX_VERIFICATION_SEAL_LENGTH = 2048;
@@ -377,6 +415,22 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
+
+    /** The spam engine `report()` teaches (`SpamScanProvider.learn()`) - the same registration `ScanPipeline` scans with. */
+    @Inject("SpamScanProvider")
+    private spamScanProvider?: SpamScanProvider;
+
+    /** Whether `report()` teaches the spam engine at all. Off, a report still moves and marks the message (`learnSkipped: "disabled"`). */
+    @Config("mail:scan:spam:learn:enabled", true)
+    private spamLearnEnabled: boolean = true;
+
+    /** Supplied by the Mongo/SQL concrete subclasses: with `ingestQueueEntryClass`, what a permanent delete needs to know a raw message is
+     * still held by another recipient's copy before it deletes the blob (`util/MessagePurgeUtils.ts`). Left unset (a downstream subclass
+     * that predates it), a permanent delete removes the messages' attachments and their blobs but leaves the raw message and sanitized HTML. */
+    protected quarantineEntryClass?: any;
+
+    /** See `quarantineEntryClass`. */
+    protected ingestQueueEntryClass?: any;
 
     @Inject("MailTransport")
     private mailTransport?: any;
@@ -1590,6 +1644,268 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     }
 
     /**
+     * Reports a message as junk, phishing or not junk - Outlook's "Report junk", "Report phishing" and "Not junk" in one call - and
+     * teaches the spam filter from it. The body is `{ kind: "junk" | "phishing" | "not_junk", alwaysTrustSender?: boolean }`.
+     *
+     * 1. **Moves** the message: `junk` and `phishing` to the mailbox's Junk Email folder, `not_junk` to its Inbox (either folder is
+     * created when missing); a message already there is not moved (`moved: false`). Drafts and Outbox are refused (400), as for
+     * `archive()`. `Message.reportedAs`/`dateReported` record what was reported (server-managed: no other write can set them).
+     * 2. **Teaches the spam filter** (`SpamScanProvider.learn()`; for rspamd `POST /learnspam` or `/learnham` on its controller): the raw
+     * message read from the blob store, `junk` and `phishing` as spam, `not_junk` as ham. Best-effort - the move has already happened and
+     * stands whatever this does: `learned: false` with `learnSkipped` says why (`encrypted`: the server has no plaintext to teach,
+     * nothing is read or sent; `disabled`: `mail:scan:spam:learn:enabled` is off; `unsupported`: no engine, or one without `learn()`;
+     * `too_large`: over 5 MiB, nothing is sent; `failed`: the engine was unreachable, refused, timed out, or the source could not be read - logged).
+     * 3. **`alwaysTrustSender: true`** (`not_junk` only, else 400) adds the `From` header's address to the mailbox's safe senders (and
+     * takes it off the blocked list), atomically. That is an owner-level change, so it needs full access to the mailbox (403 otherwise,
+     * before anything is done). The response's `safeSender` is the address added; it is absent when the message names no usable one.
+     * 4. **Audits** the report as `message.reported` (`details`: `kind`, `from`, `moved`, `folderUid`, `learned`, `learnSkipped`,
+     * `alwaysTrustSender`) - a phishing report is the same entry with `kind: "phishing"`; there is no administrator alert channel to
+     * raise it on, but the entry is also emitted as a telemetry event of that type.
+     *
+     * Needs READ and UPDATE on the message's folder (403), the message must exist (404), `kind` must be one of the three (400).
+     * Idempotent: reporting the same message again moves nothing, teaches the filter again (which counts an already-learned message
+     * once) and audits again.
+     */
+    @Summary("Report a message as junk, phishing or not junk")
+    @Description(
+        "Moves the message to Junk Email (junk, phishing) or the Inbox (not_junk), records what was reported, teaches the spam filter " +
+            "(never for an encrypted message) and audits the report. With alwaysTrustSender (not_junk only) the sender is added to the " +
+            "mailbox's safe senders. The response says whether the message moved and whether the spam filter learned it.",
+    )
+    @Returns([Object])
+    @RateLimit({ perUser: true, maxAttempts: 600, windowSeconds: 60 })
+    @Post("/:id/report")
+    public async report(
+        @Param("id") id: string,
+        body: { kind?: unknown; alwaysTrustSender?: unknown } | undefined,
+        @Request req: HttpRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<MessageReportResult> {
+        if (!this.repoUtils || !this.blobStore) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const kind: unknown = body?.kind;
+        if (typeof kind !== "string" || !(REPORT_KINDS as readonly string[]).includes(kind)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `kind must be one of: ${REPORT_KINDS.join(", ")}.`);
+        }
+        const reportKind: MessageReportKind = kind as MessageReportKind;
+        const alwaysTrustSender: unknown = body?.alwaysTrustSender;
+        if (alwaysTrustSender !== undefined && typeof alwaysTrustSender !== "boolean") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "alwaysTrustSender must be a boolean.");
+        }
+        if (alwaysTrustSender === true && reportKind !== "not_junk") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "alwaysTrustSender only applies to a not_junk report.");
+        }
+
+        const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
+        if (!message) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        if (
+            !(await this.hasMailAccess(user, message.folderUid, ACLAction.READ)) ||
+            !(await this.hasMailAccess(user, message.folderUid, ACLAction.UPDATE))
+        ) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+        // Trusting a sender is the mailbox owner's decision (the safe list is an owner-level setting), refused before anything moves.
+        if (alwaysTrustSender === true && !(await this.hasMailAccess(user, message.mailboxUid, ACLAction.FULL))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Only the mailbox's owner can add a sender to its safe senders.");
+        }
+        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        const sourceFolder: any = await folderRepo.findOne(message.folderUid, { ignoreACL: true });
+        if (sourceFolder?.type === FolderType.DRAFTS || sourceFolder?.type === FolderType.OUTBOX) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A message in Drafts or Outbox cannot be reported.");
+        }
+
+        const target: any = await findOrCreateWellKnownFolder(
+            folderRepo,
+            this.folderClass,
+            message.mailboxUid,
+            reportKind === "not_junk" ? FolderType.INBOX : FolderType.JUNK,
+            user,
+        );
+        const { moved, current } = await this.markReported(message, target.uid, reportKind, user);
+        if (moved) {
+            await this.notifyFolders([message.folderUid, target.uid]);
+        }
+
+        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
+        const learning: { learned: boolean; learnSkipped?: MessageLearnSkipped; raw?: Buffer } = await this.teachSpamFilter(
+            current,
+            reportKind,
+            mailbox,
+            alwaysTrustSender === true,
+        );
+        let safeSender: string | undefined;
+        if (alwaysTrustSender === true) {
+            safeSender = await this.trustReportedSender(current, learning.raw);
+        }
+
+        const result: MessageReportResult = {
+            uid: current.uid,
+            kind: reportKind,
+            moved,
+            folderUid: target.uid,
+            learned: learning.learned,
+            ...(learning.learnSkipped ? { learnSkipped: learning.learnSkipped } : {}),
+            ...(safeSender ? { safeSender } : {}),
+        };
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, req, user, logger: this.logger },
+            {
+                action: AuditAction.MESSAGE_REPORTED,
+                targetType: "Message",
+                targetUid: message.uid,
+                mailboxUid: message.mailboxUid,
+                details: {
+                    kind: reportKind,
+                    from: message.from?.address,
+                    moved,
+                    folderUid: target.uid,
+                    learned: result.learned,
+                    ...(result.learnSkipped ? { learnSkipped: result.learnSkipped } : {}),
+                    alwaysTrustSender: alwaysTrustSender === true,
+                },
+            },
+        );
+        return result;
+    }
+
+    /**
+     * Files `message` under `targetFolderUid` (when it is elsewhere) and records the report on it (`reportedAs`, `dateReported`) with
+     * a version-checked write, re-reading and trying again (3 attempts) when an unrelated write - the client marking it read - won the
+     * lock. Returns whether it moved, and the row as it was last read (its `folderUid` may be stale after the write; the caller only
+     * reads what a move does not change).
+     */
+    private async markReported(
+        message: T,
+        targetFolderUid: string,
+        kind: MessageReportKind,
+        user: JWTUser | undefined,
+    ): Promise<{ moved: boolean; current: T }> {
+        let current: T = message;
+        for (let attempt = 1; ; attempt++) {
+            const moved: boolean = current.folderUid !== targetFolderUid;
+            try {
+                // A move leaves the search index stale (it embeds the folder), as `prepareUpdate()` explains.
+                const updated: T = await this.repoUtils!.update(
+                    {
+                        uid: current.uid,
+                        version: (current as any).version,
+                        reportedAs: kind,
+                        dateReported: new Date(),
+                        ...(moved ? { folderUid: targetFolderUid, searchIndexedAt: null } : {}),
+                    } as any,
+                    asEntity(this.repoUtils!, current),
+                    { user, ignoreACL: true },
+                );
+                this.notificationUtils?.sendMessage(updated.folderUid, this.modelClass.name, "update", updated);
+                if (moved) {
+                    this.notificationUtils?.sendMessage(current.folderUid, this.modelClass.name, "delete", { uid: current.uid });
+                }
+                return { moved, current: updated };
+            } catch (err: any) {
+                /* v8 ignore next 3 -- only losing the optimistic lock to an unrelated write three times running */
+                if (err?.status !== 409 || attempt >= 3) {
+                    throw err;
+                }
+                const reread: T | undefined = await this.repoUtils!.findOne(current.uid, { ignoreACL: true, skipCache: true });
+                if (!reread) {
+                    throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+                }
+                current = reread;
+            }
+        }
+    }
+
+    /**
+     * Reads what `report()` needs of the message's raw source (`bodyBlobKey`) - all of it when it is at most `MAX_REPORT_LEARN_BYTES`,
+     * else `undefined` - and teaches the spam engine: see `report()` for the `learnSkipped` reasons. `needRaw` asks for the source to be
+     * read even when nothing is learned (an encrypted message, or learning off), because `alwaysTrustSender` needs its `From` header.
+     * Never throws: an engine or blob-store failure is logged and reported as `failed`.
+     */
+    private async teachSpamFilter(
+        message: T,
+        kind: MessageReportKind,
+        mailbox: Mailbox | undefined,
+        needRaw: boolean,
+    ): Promise<{ learned: boolean; learnSkipped?: MessageLearnSkipped; raw?: Buffer }> {
+        const provider: SpamScanProvider | undefined = this.spamScanProvider;
+        let skipped: MessageLearnSkipped | undefined;
+        if (message.encrypted) {
+            skipped = "encrypted";
+        } else if (!this.spamLearnEnabled) {
+            skipped = "disabled";
+        } else if (!provider || typeof provider.learn !== "function") {
+            skipped = "unsupported";
+        }
+        if (skipped && !needRaw) {
+            return { learned: false, learnSkipped: skipped };
+        }
+        let raw: Buffer | undefined;
+        let tooLarge: boolean = false;
+        try {
+            const size: number = await this.blobStore!.size(message.bodyBlobKey);
+            tooLarge = size > MAX_REPORT_LEARN_BYTES;
+            raw = tooLarge ? undefined : await this.blobStore!.get(message.bodyBlobKey);
+        } catch (err: any) {
+            this.logger?.warn(`Message report: could not read the source of message ${message.uid}: ${err?.message}`);
+        }
+        if (skipped) {
+            return { learned: false, learnSkipped: skipped, raw };
+        }
+        if (tooLarge) {
+            return { learned: false, learnSkipped: "too_large" };
+        }
+        if (!raw) {
+            return { learned: false, learnSkipped: "failed" };
+        }
+        try {
+            await provider!.learn!(raw, kind === "not_junk" ? "ham" : "spam", { recipient: mailbox?.primarySmtpAddress });
+            return { learned: true, raw };
+        } catch (err: any) {
+            this.logger?.warn(`Message report: the spam filter did not learn message ${message.uid} as ${kind}: ${err?.message}`);
+            return { learned: false, learnSkipped: "failed", raw };
+        }
+    }
+
+    /**
+     * Adds the sender of a message reported `not_junk` with `alwaysTrustSender` to the mailbox's safe senders, atomically
+     * (`changeMailboxSenderList()`, which also takes it off the blocked list): the address of the message's `From` header - read from
+     * `raw`, or from the start of the source when it was too large to read whole - and failing that `Message.from.address` (what
+     * the envelope, or a sent message's composer, named). `undefined`, with nothing added, when neither is a usable plain address.
+     */
+    private async trustReportedSender(message: T, raw: Buffer | undefined): Promise<string | undefined> {
+        let head: Buffer | undefined = raw;
+        if (!head) {
+            try {
+                head = await this.readHeadBytes(message.bodyBlobKey);
+            } catch (err: any) {
+                this.logger?.warn(`Message report: could not read the headers of message ${message.uid}: ${err?.message}`);
+            }
+        }
+        const fromHeader: string | undefined = head ? singleFromAddress(head) : undefined;
+        const address: string | undefined = parseSenderAddress(fromHeader) ?? parseSenderAddress(message.from?.address);
+        if (!address) {
+            return undefined;
+        }
+        const change = await changeMailboxSenderList(await this.getMailboxRepo(), message.mailboxUid, "safeSenders", address, true);
+        return change ? address : undefined;
+    }
+
+    /** The first `REPORT_HEADER_BYTES` of blob `key`. */
+    private async readHeadBytes(key: string): Promise<Buffer> {
+        const stream: NodeJS.ReadableStream = await this.blobStore!.getStream(key, { start: 0, end: REPORT_HEADER_BYTES - 1 });
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        return Buffer.concat(chunks);
+    }
+
+    /**
      * Stores the client's seal of a signature verification it performed (`Message.verificationSeal`), bound to the key vault
      * master key generation it was sealed under (`verificationSealGeneration`). The server can't verify signatures (it can't
      * decrypt, and isn't trusted to assert verification), so the seal is an opaque string it only stores.
@@ -1769,9 +2085,77 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * emptied (`?folderUid=` is the scope it was permission-checked against).
      */
     @Delete()
-    public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
-        await super.truncate(params, query, user);
+    public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser, @Request req?: HttpRequest): Promise<void> {
+        await super.truncate(params, query, user, req);
         await this.notifyFolders([query?.folderUid]);
+    }
+
+    /** What `util/MessagePurgeUtils.ts` needs to remove a permanently deleted message's attachments and blobs. */
+    private async purgeContext(): Promise<MessagePurgeContext> {
+        return {
+            objectFactory: this._objectFactory!,
+            blobStore: this.blobStore,
+            classes: {
+                messageClass: this.modelClass,
+                attachmentClass: this.attachmentClass,
+                quarantineEntryClass: this.quarantineEntryClass,
+                ingestQueueEntryClass: this.ingestQueueEntryClass,
+            },
+            logger: this.logger,
+        };
+    }
+
+    /**
+     * Before messages are permanently deleted (`DELETE /:id?purge=true`, and every batch of `DELETE /?folderUid=`, which is always permanent)
+     * this finds their attachments and every blob they name - the raw message, the sanitized HTML, superseded draft bodies, each
+     * attachment's content and extracted text - which `afterPurge()` removes once the messages are gone. What
+     * `RetentionEnforcementJob` did for an expired message and this route did not: without it a permanently deleted message left its
+     * `Attachment` rows and every blob behind for good.
+     */
+    protected async beforePurge(records: T[]): Promise<unknown> {
+        return await collectMessagePurge(await this.purgeContext(), records);
+    }
+
+    /**
+     * After the messages are gone, deletes their `Attachment` rows and then each blob no other row references (inbound mail is stored once
+     * for every recipient, and a mail filter rule's copies share their blobs - a blob still named by another message, attachment,
+     * quarantine entry or undelivered ingest entry, soft-deleted rows included, is kept). Best-effort: a row or blob that can't be deleted is
+     * logged, never fails the delete that already happened. Legal-hold refusals (`checkLegalHold()`) come before any of this.
+     */
+    protected async afterPurge(records: T[], prepared: unknown): Promise<void> {
+        await finishMessagePurge(await this.purgeContext(), prepared as PreparedMessagePurge);
+    }
+
+    /** Audits an emptied folder: one `message.truncate` entry per call (a folder can hold thousands of messages) with the folder and the number removed. */
+    protected async afterTruncate(scopeUid: string, count: number, user: JWTUser | undefined, req: HttpRequest | undefined): Promise<void> {
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, req, user, logger: this.logger },
+            {
+                action: AuditAction.MESSAGE_TRUNCATE,
+                targetType: "Folder",
+                targetUid: scopeUid,
+                mailboxUid: await this.resolveMailboxUidFor(scopeUid),
+                details: { folderUid: scopeUid, count },
+            },
+        );
+    }
+
+    /** Audits a truncate a legal hold refused, as the refusal of a single purge is (`legal_hold.blocked_delete`), with `details.truncate`. */
+    protected async onTruncateRefused(scopeUid: string, count: number, error: unknown, user: JWTUser | undefined, req: HttpRequest | undefined): Promise<void> {
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, req, user, logger: this.logger },
+            {
+                action: AuditAction.LEGAL_HOLD_BLOCKED_DELETE,
+                targetType: "Folder",
+                targetUid: scopeUid,
+                mailboxUid: await this.resolveMailboxUidFor(scopeUid),
+                details: { folderUid: scopeUid, truncate: true, count },
+            },
+        );
     }
 
     /**
@@ -1999,7 +2383,11 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * at all, any open hold on the mailbox blocks - the conservative direction for a hold. `sentDate`/`receivedDate`
      * aren't client-writable outside drafts (see `prepareCreate()`/`prepareUpdate()`), so a held message can't be
      * re-dated out of range first. */
-    protected async checkLegalHold(existing: T): Promise<void> {
+    //
+    // The refusal names the blocking matters (`Matter` uids) only to a caller with a trusted role: matters are a holder concern, and an
+    // ordinary mailbox user - whose delete this refuses - has no business learning that an investigation exists or what it is called.
+    // Everyone gets the same 409 (`api-011`); only its text differs.
+    protected async checkLegalHold(existing: T, user?: JWTUser): Promise<void> {
         const holds = await findActiveHoldsFor(this._objectFactory!, this.matterClass, existing.mailboxUid);
         if (holds.length === 0) {
             return;
@@ -2016,7 +2404,9 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw new ApiError(
                 ApiErrors.IDENTIFIER_EXISTS,
                 409,
-                `This action is blocked by an active legal hold: ${blocking.map((m) => m.uid).join(", ")}.`,
+                this.isTrusted(user)
+                    ? `This action is blocked by an active legal hold: ${blocking.map((m) => m.uid).join(", ")}.`
+                    : "This action is blocked by an active legal hold.",
             );
         }
     }
@@ -2056,7 +2446,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
         if (existing && purge === "true") {
             try {
-                await this.checkLegalHold(existing);
+                await this.checkLegalHold(existing, user);
             } catch (err) {
                 await recordAuditLog(
                     this._objectFactory!,

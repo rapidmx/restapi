@@ -792,6 +792,32 @@ export interface Mailbox extends BaseEntity {
      * address's domain doesn't.
      */
     freeBusyVisibility?: FreeBusyVisibility;
+
+    /**
+     * This mailbox's Blocked Senders list (Outlook's): plain lowercase addresses (`user@example.com`) and domains (`@example.com`,
+     * the whole exact domain and not its subdomains). Mail whose `From` header address OR SMTP envelope sender is on it is filed in
+     * the Junk Email folder by `ScanQueueJob` instead of the Inbox - without any authentication check (blocking is safe to apply on a
+     * spoofable header), skipping the mailbox's mail filter rules like any junk-routed mail, still scanned for viruses, and marked
+     * `BLOCKED_SENDER` among the message's spam symbols. It never releases mail an antivirus or policy verdict quarantined.
+     *
+     * At most 1,000 entries of at most 254 characters, written in canonical form (a domain given as `example.com` is stored as
+     * `@example.com`) with repeats removed, and never both here and in `safeSenders`. A row from before the field existed reads as
+     * `[]` (`null` on SQL, absent on Mongo). Owner-level setting, like `freeBusyVisibility`: changing it needs full access to the mailbox
+     * (its owner, or a "manager" delegate), so a delegate with plain update access and an administrator with no grant cannot.
+     * `POST /:id/blocked-senders` and `DELETE /:id/blocked-senders/:entry` change one entry atomically and are what a client should use.
+     */
+    blockedSenders?: string[];
+
+    /**
+     * This mailbox's Safe Senders list (Outlook's), the same shape as `blockedSenders`. Mail whose `From` address is on it AND is
+     * authenticated (a passing DKIM signature aligned with the `From` domain, stamped by the deployment's trusted MTA hop - what
+     * `verifiedFromAddress()` checks) is never junked for a spam verdict: `ScanQueueJob` delivers it to the Inbox and runs the mailbox's
+     * rules as for any mail, marking it `SAFE_SENDER` among the spam symbols. An unauthenticated message from a safe address is not
+     * rescued (the header may be forged), and nothing on this list ever releases a message an antivirus or policy verdict quarantined.
+     * The envelope sender is not consulted for this list. If an address is somehow on both lists, blocked wins for an unauthenticated
+     * message and safe wins for an authenticated one.
+     */
+    safeSenders?: string[];
 }
 
 /** Who may see a mailbox's free/busy - see `Mailbox.freeBusyVisibility`. */
@@ -1192,7 +1218,21 @@ export interface Message extends RecoverableBaseEntity {
      * comment). `undefined` (not an empty array) when no receipt was ever requested for this message at all.
      */
     receiptStatus?: MessageReceiptEntry[];
+
+    /**
+     * What the mailbox's user last reported this message as (`POST /:id/report`): `"junk"` or `"phishing"` (the message was moved to
+     * the Junk Email folder) or `"not_junk"` (moved to the Inbox). Server-managed: only that route writes it, never a create or
+     * update body. Absent until a report. The report also teaches the spam filter (rspamd `learn_spam`/`learn_ham`) unless the message
+     * is encrypted; this field records what was reported, not whether learning succeeded (the report's response says that).
+     */
+    reportedAs?: MessageReportKind | null;
+
+    /** When `reportedAs` was last set. Server-managed, like it. */
+    dateReported?: Date | null;
 }
+
+/** What a user can report a message as - see `Message.reportedAs` and `POST /messages/:id/report`. */
+export type MessageReportKind = "junk" | "phishing" | "not_junk";
 
 /**
  * A user's explicit "always put mail from this sender in Focused/Other" instruction, which overrides
@@ -1519,8 +1559,18 @@ export interface MailFilterAction {
  * fire; each field that holds an array is itself OR-matched against its entries. A pragmatic subset of MAPI's
  * restriction-based `PR_RULE_CONDITION`, not a general expression tree. */
 export interface MailFilterConditions {
-    /** Matches if the message's From address or display name contains any of these substrings (case-insensitive). */
+    /** Matches if the message's From address or display name contains any of these substrings (case-insensitive). A substring
+     * match: `ann@x.com` also matches `joann@x.com` - use `fromEquals` to name one sender exactly. */
     fromContains?: string[];
+
+    /** Matches if the address of the message's `From` header OR its SMTP envelope sender equals one of these plain addresses
+     * (case-insensitive, exact: `ann@x.com` does not match `joann@x.com`). Validated on write: each entry a plain address of at most 254
+     * characters, at most 100 entries. */
+    fromEquals?: string[];
+
+    /** Matches if the domain of the message's `From` header address OR of its SMTP envelope sender equals one of these domains
+     * (case-insensitive, exact: `x.com` does not match `mail.x.com`). Stored without an `@`; validated on write like `fromEquals`. */
+    fromDomainEquals?: string[];
 
     /** Matches if the message's subject contains any of these substrings (case-insensitive). */
     subjectContains?: string[];
@@ -1664,6 +1714,14 @@ export enum AuditAction {
     TRANSPORT_RULE_DELETE = "transport_rule.delete",
     MESSAGE_DELETE = "message.delete",
     MESSAGE_RECALL = "message.recall",
+    /** `POST /messages/:id/report` - a user reported a message as junk, phishing or not junk. `details` carries the `kind`, the sender's
+     * address (`from`), `moved`, the folder it went to (`folderUid`), `learned`, `learnSkipped` (why the spam filter was not taught,
+     * when it was not) and `alwaysTrustSender`. A phishing report is the same entry with `kind: "phishing"` - the one to watch for.
+     * No admin alert channel exists in this library; the entry is also emitted as a telemetry event of this type. */
+    MESSAGE_REPORTED = "message.reported",
+    /** `DELETE /messages?folderUid=` - a folder was emptied permanently. One entry per call: `targetType` `Folder`, `targetUid` the
+     * folder, `details.count` the messages removed. A refusal by a legal hold is `LEGAL_HOLD_BLOCKED_DELETE` with `details.truncate`. */
+    MESSAGE_TRUNCATE = "message.truncate",
     DOMAIN_CREATE = "domain.create",
     DOMAIN_UPDATE = "domain.update",
     DOMAIN_DELETE = "domain.delete",

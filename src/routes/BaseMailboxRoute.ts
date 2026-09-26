@@ -9,6 +9,7 @@ import {
     ApiErrorMessages,
     ApiErrors,
     CRUDRoute,
+    DocDecorators,
     HttpRequest,
     HttpResponse,
     ModelUtils,
@@ -24,6 +25,7 @@ import { getPrimaryDomainNames } from "../util/DomainUtils.js";
 import { ensureWellKnownFolders } from "../util/FolderUtils.js";
 import { assertFreeBusyVisibility, effectiveFreeBusyVisibility } from "../util/FreeBusyLookupUtils.js";
 import { DEFAULT_TIME_ZONE, isValidTimeZone } from "../util/TimeZoneUtils.js";
+import { changeMailboxSenderList, normalizeSenderList, parseSenderEntry, type SenderListsChange } from "../util/SenderListUtils.js";
 import { computeKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { hasAddressLikeDisplayName } from "../util/MimeHeaderUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
@@ -52,6 +54,16 @@ import { normalizeUserUid } from "../util/UserUidUtils.js";
 import { coerceDateFields } from "../util/DateCoercionUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 const { Auth, Delete, Get, Param, Post, Query, RateLimit, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
+const { Description, Returns, Summary } = DocDecorators;
+
+/** The sender lists a mailbox owner edits (`Mailbox.blockedSenders`, `Mailbox.safeSenders`). */
+type SenderListField = "blockedSenders" | "safeSenders";
+
+/** What `POST /:id/blocked-senders` (and its siblings) answer: the entry as stored, whether anything changed, and both lists as they now are. */
+export interface MailboxSenderListsResult extends SenderListsChange {
+    /** The entry in its canonical form: a lowercase address, or `@domain`. */
+    entry: string;
+}
 
 /** One mailbox's owner change: `ownerUserUid` before (`previous`) and after (`next`) the update; `undefined` for none. */
 interface OwnerChange {
@@ -100,6 +112,42 @@ function rejectServerManagedFields(obj: Record<string, unknown>): void {
     }
     if (typeof obj.keyDiscoveryHash === "string" && obj.keyDiscoveryHash.length > 0) {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'keyDiscoveryHash' is managed by the server and cannot be set directly.");
+    }
+}
+
+/** The two lists a client may write on `Mailbox` (see `Mailbox.blockedSenders`). */
+const SENDER_LIST_FIELDS: readonly SenderListField[] = ["blockedSenders", "safeSenders"];
+
+/** Whether two lists (of canonical, de-duplicated entries) hold the same entries, in any order. */
+function sameEntries(a: readonly string[], b: readonly string[]): boolean {
+    return a.length === b.length && a.every((entry) => b.includes(entry));
+}
+
+/** The entry that is on both lists, if any (an entry never is: `POST` moves it, and a write naming it on both is refused). */
+function entryOnBothLists(blocked: readonly string[], safe: readonly string[]): string | undefined {
+    return blocked.find((entry) => safe.includes(entry));
+}
+
+/** The 400 for an entry named as both a blocked and a safe sender. */
+function bothListsError(entry: string): ApiError {
+    return new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${entry}' cannot be both a blocked and a safe sender - POST it to the list it belongs on, which moves it.`);
+}
+
+/**
+ * Normalizes the sender lists (`blockedSenders`, `safeSenders`) of a mailbox being created, in place: `null` is dropped, anything else
+ * goes through `normalizeSenderList()` (400 for an invalid or oversized one), and an entry named on both lists is a 400.
+ */
+function normalizeNewSenderLists(obj: Record<string, any>): void {
+    for (const field of SENDER_LIST_FIELDS) {
+        if (obj[field] === null) {
+            delete obj[field];
+        } else if (obj[field] !== undefined) {
+            obj[field] = normalizeSenderList(obj[field], field);
+        }
+    }
+    const both: string | undefined = entryOnBothLists(obj.blockedSenders ?? [], obj.safeSenders ?? []);
+    if (both !== undefined) {
+        throw bothListsError(both);
     }
 }
 
@@ -685,6 +733,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             } else if ((o as any).freeBusyVisibility !== undefined) {
                 assertFreeBusyVisibility((o as any).freeBusyVisibility);
             }
+            normalizeNewSenderLists(o as Record<string, any>);
             // A brand-new mailbox always starts unscoped - assignment only ever happens afterward via
             // `update()`/`validateEscrowScopeAssignment()`, which also checks the referenced scope actually
             // exists. Rejected for every caller, trusted or not, rather than silently ignored.
@@ -986,6 +1035,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         await this.validateEscrowScopeAssignment(id, obj, isTrusted);
         await this.validateFreeBusyVisibilityChange(id, obj, user);
+        await this.validateSenderListChange(id, obj, user);
         rejectServerManagedFields(obj);
         await this.validateTrustedOnlyFields(id, obj, user, isTrusted);
         await this.validateDisplayNameChange(id, obj);
@@ -1027,6 +1077,40 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
         if (existing && effectiveFreeBusyVisibility(existing) !== obj.freeBusyVisibility && !(await this.hasMailAccess(user, id, ACLAction.FULL))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Only the mailbox's owner can change who sees its free/busy.");
+        }
+    }
+
+    /**
+     * The blocked and safe sender lists (`Mailbox.blockedSenders`, `Mailbox.safeSenders`) are the owner's: like the free/busy
+     * visibility, a real change needs full access to the mailbox (the owner's own record or a "manager" delegate's), so a delegate with
+     * plain update access can't block or trust somebody else's correspondents (403), and an administrator with no grant of their own
+     * never reaches here with them (`restrictToAdminFields()` drops them). Each list written is normalized in place
+     * (`normalizeSenderList()`: canonical, de-duplicated, at most 1,000 entries of 254 characters, 400 otherwise); `null` (what SQL
+     * reads a row from before the columns existed as) is dropped, and a list equal to the stored one passes for everybody, so a full-object
+     * `PUT` round-tripping the current lists works. An entry the resulting lists hold twice - blocked and safe - is a 400: use
+     * `POST /:id/blocked-senders` or `POST /:id/safe-senders`, which move it.
+     */
+    private async validateSenderListChange(id: string, obj: Record<string, any>, user: JWTUser | undefined): Promise<void> {
+        let written: boolean = false;
+        for (const field of SENDER_LIST_FIELDS) {
+            if (obj[field] === null) {
+                delete obj[field];
+            } else if (obj[field] !== undefined) {
+                obj[field] = normalizeSenderList(obj[field], field);
+                written = true;
+            }
+        }
+        if (!written) {
+            return;
+        }
+        const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true, skipCache: true });
+        const changed: boolean = SENDER_LIST_FIELDS.some((field) => obj[field] !== undefined && !sameEntries(obj[field], existing?.[field] ?? []));
+        if (changed && !(await this.hasMailAccess(user, id, ACLAction.FULL))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Only the mailbox's owner can change its blocked and safe senders.");
+        }
+        const both: string | undefined = entryOnBothLists(obj.blockedSenders ?? existing?.blockedSenders ?? [], obj.safeSenders ?? existing?.safeSenders ?? []);
+        if (both !== undefined) {
+            throw bothListsError(both);
         }
     }
 
@@ -1532,6 +1616,88 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     }
 
     /**
+     * Adds (`add`) or removes ONE entry of a mailbox's blocked or safe sender list, atomically: the mailbox is read uncached, the
+     * change computed (`moveSenderEntry()`) and written with a version-checked update, and on losing the optimistic lock to another
+     * write - a second browser tab adding a different entry at the same moment - it re-reads and applies the change to what is there
+     * now (up to `SENDER_LIST_MAX_ATTEMPTS` times, then 409), so two concurrent changes never overwrite each other. Adding an entry to
+     * one list removes it from the other (an entry is never on both). Adding an entry that is already there, or removing one that
+     * isn't, changes nothing and writes nothing (`changed: false`).
+     *
+     * 400 for an entry that is neither a plain address nor a domain, or a list already at its 1,000-entry cap; 404 for a mailbox the
+     * caller can't read (as `GET /:id`, so an address is never revealed); 403 for a caller without full access - the owner and a
+     * "manager" delegate change these lists, a delegate with plain update access and an administrator with no grant do not.
+     */
+    private async changeSenderList(
+        id: string,
+        target: SenderListField,
+        entryInput: unknown,
+        add: boolean,
+        user: JWTUser | undefined,
+    ): Promise<MailboxSenderListsResult> {
+        if (!this.repoUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
+        const entry: string | undefined = parseSenderEntry(entryInput);
+        if (entry === undefined) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'entry' must be an address (user@example.com) or a domain (@example.com) of at most 254 characters.");
+        }
+        if (!(await this.hasMailAccess(user, id, ACLAction.READ))) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        if (!(await this.hasMailAccess(user, id, ACLAction.FULL))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Only the mailbox's owner can change its blocked and safe senders.");
+        }
+        const change: SenderListsChange | undefined = await changeMailboxSenderList(this.repoUtils, id, target, entry, add);
+        if (!change) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        return { entry, ...change };
+    }
+
+    @Summary("Block a sender")
+    @Description(
+        "Adds an address (user@example.com) or a domain (@example.com) to the mailbox's Blocked Senders list and removes it from the Safe " +
+            "Senders list. Mail from a blocked sender is filed in Junk Email. Atomic: concurrent changes never overwrite each other. Owner " +
+            "(full access) only.",
+    )
+    @Returns([Object])
+    @Auth(["jwt"])
+    @Post("/:id/blocked-senders")
+    public async blockSender(@Param("id") id: string, body: { entry?: unknown } | undefined, @AuthUser user?: JWTUser): Promise<MailboxSenderListsResult> {
+        return await this.changeSenderList(id, "blockedSenders", body?.entry, true, user);
+    }
+
+    @Summary("Unblock a sender")
+    @Description("Removes an address or domain (URL-encoded, e.g. %40example.com) from the mailbox's Blocked Senders list. Removing an absent entry succeeds. Owner (full access) only.")
+    @Returns([Object])
+    @Auth(["jwt"])
+    @Delete("/:id/blocked-senders/:entry")
+    public async unblockSender(@Param("id") id: string, @Param("entry") entry: string, @AuthUser user?: JWTUser): Promise<MailboxSenderListsResult> {
+        return await this.changeSenderList(id, "blockedSenders", entry, false, user);
+    }
+
+    @Summary("Trust a sender")
+    @Description(
+        "Adds an address (user@example.com) or a domain (@example.com) to the mailbox's Safe Senders list and removes it from the Blocked " +
+            "Senders list. Authenticated mail from a safe sender is never junked for a spam verdict. Atomic. Owner (full access) only.",
+    )
+    @Returns([Object])
+    @Auth(["jwt"])
+    @Post("/:id/safe-senders")
+    public async trustSender(@Param("id") id: string, body: { entry?: unknown } | undefined, @AuthUser user?: JWTUser): Promise<MailboxSenderListsResult> {
+        return await this.changeSenderList(id, "safeSenders", body?.entry, true, user);
+    }
+
+    @Summary("Stop trusting a sender")
+    @Description("Removes an address or domain (URL-encoded) from the mailbox's Safe Senders list. Removing an absent entry succeeds. Owner (full access) only.")
+    @Returns([Object])
+    @Auth(["jwt"])
+    @Delete("/:id/safe-senders/:entry")
+    public async untrustSender(@Param("id") id: string, @Param("entry") entry: string, @AuthUser user?: JWTUser): Promise<MailboxSenderListsResult> {
+        return await this.changeSenderList(id, "safeSenders", entry, false, user);
+    }
+
+    /**
      * Lists the deleted mailboxes that still have data: `{ items, next? }`, each item `{ mailboxUid, folderCount,
      * messageCount, erasure? }` (`erasure` is the newest erasure request filed for the address: `{ uid, status, dateCreated }`),
      * sorted by uid. `?limit=` (default 50, at most 100) and `?after=<mailboxUid>` (the previous page's `next`) page through
@@ -1657,10 +1823,12 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     /** `mailbox` with `accessRole` for `user`: `"owner"` for their own mailbox, `"delegate"` for one shared with them - so a
      * client can label the shared ones. Computed on the way out, never stored (and dropped from a body that echoes it). */
     private withAccessRole(mailbox: T, user: JWTUser): T {
-        // A row from before `freeBusyVisibility` existed reads as its default (`null` on SQL, absent on Mongo).
+        // A row from before `freeBusyVisibility` or the sender lists existed reads as their defaults (`null` on SQL, absent on Mongo).
         return {
             ...mailbox,
             freeBusyVisibility: effectiveFreeBusyVisibility(mailbox),
+            blockedSenders: mailbox.blockedSenders ?? [],
+            safeSenders: mailbox.safeSenders ?? [],
             accessRole: sameOwner(mailbox.ownerUserUid, user.uid) ? "owner" : "delegate",
         };
     }

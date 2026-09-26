@@ -382,9 +382,37 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * and for EVERY record `truncate()` matches (that method has no `purge` option at all - it is always
      * a hard, permanent delete, see `truncate()`'s own doc comment - so skipping this check there would
      * let a caller destroy held records simply by preferring the bulk endpoint over the equivalent
-     * one-at-a-time `delete(..., { purge: true })` calls).
+     * one-at-a-time `delete(..., { purge: true })` calls). `user` is the caller, for an override that words its refusal by who is asking.
      */
-    protected async checkLegalHold(existing: T): Promise<void> {
+    protected async checkLegalHold(existing: T, user?: JWTUser): Promise<void> {
+        // no-op by default
+    }
+
+    /**
+     * Hook run just BEFORE records are permanently deleted (`delete()` with `purge: true`, and each batch of at most 500 records of
+     * `truncate()`), after the legal-hold check, so an override can gather what the records point at that must go with them. Whatever
+     * it returns is handed to `afterPurge()`. Nothing by default. `BaseMessageRoute` collects the messages' attachments and blob keys.
+     * A failure here fails the request before anything is deleted.
+     */
+    protected async beforePurge(records: T[]): Promise<unknown> {
+        return undefined;
+    }
+
+    /**
+     * Hook run just AFTER `records` were permanently deleted, with what `beforePurge()` returned - the records are gone, so a failure
+     * here is the override's to handle (`BaseMessageRoute` logs a blob it could not delete and carries on). Nothing by default.
+     */
+    protected async afterPurge(records: T[], prepared: unknown): Promise<void> {
+        // no-op by default
+    }
+
+    /** Hook run after `truncate()` removed `count` records of `scopeUid` (only when it removed some). Nothing by default; `BaseMessageRoute` audits it. */
+    protected async afterTruncate(scopeUid: string, count: number, user: JWTUser | undefined, req: HttpRequest | undefined): Promise<void> {
+        // no-op by default
+    }
+
+    /** Hook run when `truncate()` of `scopeUid` was refused by `checkLegalHold()` (`error`, the 409 about to be thrown), before it is thrown. Nothing by default. */
+    protected async onTruncateRefused(scopeUid: string, count: number, error: unknown, user: JWTUser | undefined, req: HttpRequest | undefined): Promise<void> {
         // no-op by default
     }
 
@@ -522,8 +550,9 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         await this.requirePermission(this.scopeUidOf(existing), user, ACLAction.DELETE);
         const purgeRequested: boolean = purge === "true";
         if (purgeRequested) {
-            await this.checkLegalHold(existing);
+            await this.checkLegalHold(existing, user);
         }
+        const prepared: unknown = purgeRequested ? await this.beforePurge([existing]) : undefined;
         await this.repoUtils.delete(existing.uid, { user, version, purge: purgeRequested, ignoreACL: true });
         this.notify(this.scopeUidOf(existing), "delete", { uid: existing.uid });
         if (purgeRequested && this.searchEntityType) {
@@ -533,6 +562,9 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             // attachment text/participants stay a live search hit - including OpenSearch serving a snippet
             // built from content that's already gone - forever, since nothing else ever revisits it.
             await removeFromSearchIndex(this.searchProvider, this.searchEntityType, existing.uid, this.logger);
+        }
+        if (purgeRequested) {
+            await this.afterPurge([existing], prepared);
         }
     }
 
@@ -639,7 +671,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
     }
 
     @Delete()
-    public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
+    public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser, @Request req?: HttpRequest): Promise<void> {
         if (!this.repoUtils) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
@@ -654,8 +686,13 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (matched.length === 0) {
             return;
         }
-        for (const existing of matched) {
-            await this.checkLegalHold(existing);
+        try {
+            for (const existing of matched) {
+                await this.checkLegalHold(existing, user);
+            }
+        } catch (err) {
+            await this.onTruncateRefused(scopeUid!, matched.length, err, user, req);
+            throw err;
         }
         // Deliberately re-scoped to the EXACT uids just checked, not the original query re-run live -
         // `RepoUtils.truncate()` re-executes its own search query at the moment it runs, independent of
@@ -669,8 +706,11 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         // A literal `in` list matches each uid exactly: a (legacy, client-chosen) uid holding `,` or `()` can't widen the
         // delete to records outside this scope, as a parsed `in(a,b,...)` would. Batched to keep each SQL `IN` bounded.
         for (let i = 0; i < matched.length; i += TRUNCATE_BATCH_SIZE) {
-            const uids: string[] = matched.slice(i, i + TRUNCATE_BATCH_SIZE).map((existing) => existing.uid);
+            const batch: T[] = matched.slice(i, i + TRUNCATE_BATCH_SIZE);
+            const uids: string[] = batch.map((existing) => existing.uid);
+            const prepared: unknown = await this.beforePurge(batch);
             await this.repoUtils.truncate({ uid: ModelUtils.literal(uids, "in") } as any, { user, ignoreACL: true });
+            await this.afterPurge(batch, prepared);
         }
         if (this.searchEntityType) {
             // `truncate()` is always a hard, permanent delete (see this method's own doc comment above) - same
@@ -682,6 +722,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
                 this.logger,
             );
         }
+        await this.afterTruncate(scopeUid!, matched.length, user, req);
     }
 
     @Put("/:id")
@@ -740,7 +781,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         // select by `mailboxUid`), so it's refused for a held record, like a purge.
         const movedToMailboxUid: unknown = (obj as any).mailboxUid;
         if (movedToMailboxUid !== undefined && movedToMailboxUid !== (existing as any).mailboxUid) {
-            await this.checkLegalHold(existing);
+            await this.checkLegalHold(existing, user);
         }
 
         coerceDateFields(obj, this.dateFields);
