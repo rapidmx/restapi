@@ -15,6 +15,7 @@ import {
     brokenPackages,
     extraSearchResults,
     failingSearchNamespaces,
+    fakeLatestTags,
     instanceStatuses,
     publishedHashes,
     publishFakePackage,
@@ -184,6 +185,108 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
         });
     });
 
+    describe("prerelease versions", () => {
+        const BETA = "@rapidmx/beta-plugin";
+        const STABLE = "@rapidmx/stable-plugin";
+
+        beforeEach(() => {
+            for (const version of ["1.0.0-beta.1", "1.0.0-beta.2", "1.0.0-beta.9", "1.0.0-beta.10"]) {
+                publishFakePackage(BETA, version, { plugin: EAS_MANIFEST }, { description: "Beta" });
+            }
+            // The registry's `latest` tag was never moved past the second beta.
+            fakeLatestTags.set(BETA, "1.0.0-beta.2");
+            for (const version of ["1.0.0", "1.1.0", "2.0.0-beta.1"]) {
+                publishFakePackage(STABLE, version, { plugin: EAS_MANIFEST });
+            }
+        });
+
+        const install = async (name: string, packageVersion: string) => {
+            const result = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name, packageVersion });
+            expect(result.status).toBe(200);
+            return result.body.plugin;
+        };
+        const updates = async (query = "") => (await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/updates${query}`))).body;
+
+        it("offers a newer prerelease only when prereleases are allowed, whatever the registry's latest tag says", async () => {
+            const beta = await install(BETA, "1.0.0-beta.9");
+            expect(await updates()).toEqual([{ uid: beta.uid, name: BETA, installedVersion: "1.0.0-beta.9", updateAvailable: false, allowed: true }]);
+            expect(await updates("?prerelease=true")).toEqual([
+                { uid: beta.uid, name: BETA, installedVersion: "1.0.0-beta.9", latestVersion: "1.0.0-beta.10", updateAvailable: true, allowed: true },
+            ]);
+            expect(await updates("?prerelease=false")).toEqual(await updates());
+        });
+
+        it("offers a release over a prerelease when prereleases aren't allowed", async () => {
+            const stable = await install(STABLE, "1.0.0");
+            expect(await updates()).toEqual([
+                { uid: stable.uid, name: STABLE, installedVersion: "1.0.0", latestVersion: "1.1.0", updateAvailable: true, allowed: true },
+            ]);
+            expect(await updates("?prerelease=true")).toEqual([
+                { uid: stable.uid, name: STABLE, installedVersion: "1.0.0", latestVersion: "2.0.0-beta.1", updateAvailable: true, allowed: true },
+            ]);
+        });
+
+        it("refuses a prerelease parameter that isn't true or false", async () => {
+            for (const path of ["/updates", "/search", "/plan?name=%40rapidmx%2Fbeta-plugin", "/registry?name=%40rapidmx%2Fbeta-plugin"]) {
+                const joiner = path.includes("?") ? "&" : "?";
+                const result = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}${path}${joiner}prerelease=maybe`));
+                expect(result.status).toBe(400);
+                expect(result.body.message).toMatch(/'prerelease' must be true or false/);
+            }
+        });
+
+        it("searches with the newest version allowed, and marks an installed prerelease as outdated", async () => {
+            const beta = await install(BETA, "1.0.0-beta.9");
+            const find = async (query: string) =>
+                (await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/search?namespace=%40rapidmx${query}`))).body.filter((r: any) => r.name === BETA || r.name === STABLE);
+
+            const without = await find("");
+            // Only prereleases are published, so there's nothing better than the registry's own latest to show.
+            expect(without.find((r: any) => r.name === BETA)).toMatchObject({ version: "1.0.0-beta.2", installedUid: beta.uid, updateAvailable: false });
+            expect(without.find((r: any) => r.name === STABLE)).toMatchObject({ version: "1.1.0" });
+
+            const withPrerelease = await find("&prerelease=true");
+            expect(withPrerelease.find((r: any) => r.name === BETA)).toMatchObject({ version: "1.0.0-beta.10", updateAvailable: true });
+            expect(withPrerelease.find((r: any) => r.name === STABLE)).toMatchObject({ version: "2.0.0-beta.1" });
+        });
+
+        it("lists a package's prereleases, and defaults to them, only when they're allowed", async () => {
+            const lookup = async (name: string, query = "") =>
+                (await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry?name=${encodeURIComponent(name)}${query}`))).body;
+
+            const stable = await lookup(STABLE);
+            expect(stable.package.versions).toEqual(["1.1.0", "1.0.0"]);
+            expect(stable.package.latest).toBe("1.1.0");
+            expect(stable.selected.version).toBe("1.1.0");
+
+            const allowed = await lookup(STABLE, "&prerelease=true");
+            expect(allowed.package.versions).toEqual(["2.0.0-beta.1", "1.1.0", "1.0.0"]);
+            expect(allowed.package.latest).toBe("2.0.0-beta.1");
+            expect(allowed.selected.version).toBe("2.0.0-beta.1");
+
+            // A package with nothing but prereleases keeps the registry's own latest.
+            const onlyBeta = await lookup(BETA);
+            expect(onlyBeta.package.versions).toEqual([]);
+            expect(onlyBeta.selected.version).toBe("1.0.0-beta.2");
+            expect((await lookup(BETA, "&prerelease=true")).selected.version).toBe("1.0.0-beta.10");
+        });
+
+        it("keeps the installed prerelease in the list of versions, and honours a version asked for by name", async () => {
+            await install(BETA, "1.0.0-beta.9");
+            const result = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry?name=${encodeURIComponent(BETA)}&packageVersion=1.0.0-beta.10`));
+            expect(result.status).toBe(200);
+            expect(result.body.package.versions).toEqual(["1.0.0-beta.9"]);
+            expect(result.body.selected.version).toBe("1.0.0-beta.10");
+        });
+
+        it("plans the newest allowed version when none is given", async () => {
+            const plan = async (query: string) => (await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/plan?name=${encodeURIComponent(STABLE)}${query}`))).body;
+            expect((await plan("")).plugin.version).toBe("1.1.0");
+            expect((await plan("&prerelease=true")).plugin.version).toBe("2.0.0-beta.1");
+            expect((await plan("&packageVersion=1.0.0&prerelease=true")).plugin.version).toBe("1.0.0");
+        });
+    });
+
     describe("GET /updates", () => {
         it("reports each installed plugin's latest version and whether it's newer", async () => {
             const current = await addEas("1.1.0");
@@ -264,7 +367,8 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
 
         it("reads the package from the registry once, and reports a registry failure as 502", async () => {
             expect((await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry/%40rapidmx%2Factivesync`))).status).toBe(200);
-            expect(registryReads).toEqual(["package:@rapidmx/activesync", "version:@rapidmx/activesync@latest"]);
+            // The version read is the newest one allowed, which is the registry's latest here.
+            expect(registryReads).toEqual(["package:@rapidmx/activesync", "version:@rapidmx/activesync@1.1.0"]);
             brokenPackages.add("@rapidmx/activesync");
             expect((await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry/%40rapidmx%2Factivesync`))).status).toBe(502);
         });

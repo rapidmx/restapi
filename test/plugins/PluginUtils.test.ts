@@ -13,6 +13,8 @@ import {
     hasHostPlaceholder,
     isExactVersion,
     isNewerVersion,
+    isPrereleaseVersion,
+    pickLatestVersion,
     missingRequiredSettings,
     isValidPackageName,
     normalizeAllowedPackages,
@@ -420,6 +422,41 @@ describe("isNewerVersion", () => {
         [undefined as any, "1.0.0", false],
     ])("%s newer than %s: %s", (candidate, current, expected) => {
         expect(isNewerVersion(candidate, current)).toBe(expected);
+    });
+});
+
+describe("isPrereleaseVersion", () => {
+    it.each([
+        ["1.0.0-beta.2", true],
+        ["1.0.0-rc.1", true],
+        ["1.0.0", false],
+        ["1.0.0+build.5", false],
+    ])("%s: %s", (version, expected) => {
+        expect(isPrereleaseVersion(version)).toBe(expected);
+    });
+});
+
+describe("pickLatestVersion", () => {
+    const versions = ["1.0.0-beta.10", "1.0.0-beta.9", "1.0.0", "1.2.0", "1.1.0", "2.0.0-rc.1", "not-a-version", "v1.5.0"];
+
+    it("takes the highest release, or the latest tag when it names one, when prereleases aren't allowed", () => {
+        expect(pickLatestVersion(versions)).toBe("1.2.0");
+        expect(pickLatestVersion(versions, { latest: "1.1.0" })).toBe("1.1.0");
+        // A tag that names a prerelease, or something that isn't published, is no help.
+        expect(pickLatestVersion(versions, { latest: "2.0.0-rc.1" })).toBe("1.2.0");
+        expect(pickLatestVersion(versions, { latest: "9.9.9" })).toBe("1.2.0");
+    });
+
+    it("takes the highest version, prereleases included, when they're allowed - ignoring a stale latest tag", () => {
+        expect(pickLatestVersion(versions, { prerelease: true })).toBe("2.0.0-rc.1");
+        expect(pickLatestVersion(["1.0.0-beta.2", "1.0.0-beta.10", "1.0.0-beta.9"], { latest: "1.0.0-beta.2", prerelease: true })).toBe("1.0.0-beta.10");
+        expect(pickLatestVersion(["1.0.0-beta.10", "1.0.0"], { prerelease: true })).toBe("1.0.0");
+    });
+
+    it("has nothing to pick when only prereleases exist and they aren't allowed", () => {
+        expect(pickLatestVersion(["1.0.0-beta.1", "1.0.0-beta.2"])).toBeUndefined();
+        expect(pickLatestVersion([])).toBeUndefined();
+        expect(pickLatestVersion([], { prerelease: true })).toBeUndefined();
     });
 });
 

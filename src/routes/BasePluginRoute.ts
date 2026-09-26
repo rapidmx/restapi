@@ -34,6 +34,7 @@ import {
     findPluginNamespace,
     isExactVersion,
     isNewerVersion,
+    isPrereleaseVersion,
     isValidPackageName,
     normalizeAllowedPackages,
     normalizePluginNamespaces,
@@ -46,6 +47,7 @@ import {
     PLUGIN_STATUS_MAX_AGE_MS,
     PluginInstanceStatus,
     pluginHostOfRequest,
+    pickLatestVersion,
     resolveHostDefault,
     validatePluginSettings,
 } from "../plugins/PluginUtils.js";
@@ -334,6 +336,27 @@ export abstract class BasePluginRoute<T extends Plugin> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'packageVersion' must be a single version.");
         }
         return packageVersion || undefined;
+    }
+
+    /** A `prerelease` query parameter: whether prerelease versions (`1.0.0-beta.2`) count. Absent or empty is `false`. */
+    private queryPrerelease(prerelease: unknown): boolean {
+        if (prerelease === undefined || prerelease === "" || prerelease === "false" || prerelease === "0") {
+            return false;
+        }
+        if (prerelease === "true" || prerelease === "1") {
+            return true;
+        }
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'prerelease' must be true or false.");
+    }
+
+    /**
+     * The version to use for a package when none was asked for: the newest one `pickLatestVersion()` allows. Resolves
+     * `undefined` - meaning the registry's own `latest` - when that leaves nothing (a package with only prereleases,
+     * asked without them) or the package can't be found, so a lookup that would fail still fails the way it always did.
+     */
+    private async defaultVersion(session: RegistrySession, name: string, prerelease: boolean): Promise<string | undefined> {
+        const pkg: RegistryPackage | undefined = await this.registryCall(() => session.getPackage(name));
+        return pkg ? pickLatestVersion(pkg.versions, { latest: pkg.latest, prerelease }) : undefined;
     }
 
     /** Resolves a package version from the registry, turning its failure modes into API errors. */
@@ -641,7 +664,8 @@ export abstract class BasePluginRoute<T extends Plugin> {
      * A registry result without a name and version is left out. */
     @RequiresTrustedRole()
     @Get("/search")
-    public async search(@Query("namespace") namespace?: unknown): Promise<PluginSearchResult[]> {
+    public async search(@Query("namespace") namespace?: unknown, @Query("prerelease") prerelease?: unknown): Promise<PluginSearchResult[]> {
+        const includePrerelease: boolean = this.queryPrerelease(prerelease);
         let scopes: string[];
         if (namespace === undefined || (typeof namespace === "string" && namespace.trim() === "")) {
             scopes = this.namespaces.map((ns) => ns.name);
@@ -656,10 +680,14 @@ export abstract class BasePluginRoute<T extends Plugin> {
         const pages: RegistrySearchResult[][] = await this.registryCall(() =>
             Promise.all(scopes.map((scope) => this.createRegistryClient(scope).searchPlugins(scope))),
         );
-        const found: RegistrySearchResult[] = pages
-            .flat()
-            .filter((result) => typeof result?.name === "string" && typeof result.version === "string")
-            .sort((a, b) => a.name.localeCompare(b.name));
+        const session: RegistrySession = this.registrySession();
+        const found: RegistrySearchResult[] = await Promise.all(
+            pages
+                .flat()
+                .filter((result) => typeof result?.name === "string" && typeof result.version === "string")
+                .sort((a, b) => a.name.localeCompare(b.name))
+                .map((result) => this.newestSearchResult(session, result, includePrerelease)),
+        );
         const installed: Map<string, T> = new Map((await this.installedPlugins()).map((plugin) => [plugin.name, plugin]));
         return found.map((result) => {
             const plugin: T | undefined = installed.get(result.name);
@@ -675,19 +703,40 @@ export abstract class BasePluginRoute<T extends Plugin> {
         });
     }
 
-    /** For each installed plugin, the registry's latest version and whether it's newer than the installed one. A plugin
-     * the registry can't be checked for reports an `error` rather than failing the whole request, and one outside the
-     * allow-list never reports an update, since upgrading it would be refused. */
+    /**
+     * `result` with its version replaced by the newest one `pickLatestVersion()` allows. The registry's search reports
+     * a package's `latest` tag, which is enough unless prereleases count or the tag names one, so only then is the
+     * package read. A package that can't be read keeps the version the search gave.
+     */
+    private async newestSearchResult(session: RegistrySession, result: RegistrySearchResult, prerelease: boolean): Promise<RegistrySearchResult> {
+        if (!prerelease && !isPrereleaseVersion(result.version)) {
+            return result;
+        }
+        try {
+            const pkg: RegistryPackage | undefined = await session.getPackage(result.name);
+            const newest: string | undefined = pkg ? pickLatestVersion(pkg.versions, { latest: pkg.latest, prerelease }) : undefined;
+            return newest ? { ...result, version: newest } : result;
+        } catch {
+            return result;
+        }
+    }
+
+    /** For each installed plugin, the newest published version and whether it's newer than the installed one. Only
+     * releases count unless `prerelease` is `true` (see `pickLatestVersion()`). A plugin the registry can't be checked
+     * for reports an `error` rather than failing the whole request, and one outside the allow-list never reports an
+     * update, since upgrading it would be refused. */
     @RequiresTrustedRole()
     @Get("/updates")
-    public async updates(): Promise<PluginUpdateInfo[]> {
+    public async updates(@Query("prerelease") prerelease?: unknown): Promise<PluginUpdateInfo[]> {
+        const includePrerelease: boolean = this.queryPrerelease(prerelease);
         const plugins: T[] = (await this.installedPlugins()).sort((a, b) => a.name.localeCompare(b.name));
         return Promise.all(
             plugins.map(async (plugin): Promise<PluginUpdateInfo> => {
                 const allowed: boolean = matchesAllowedPackage(plugin.name, this.allowedPackages);
                 const base = { uid: plugin.uid, name: plugin.name, installedVersion: plugin.packageVersion, allowed };
                 try {
-                    const latestVersion: string | undefined = (await this.createRegistryClient(plugin.name).getPackage(plugin.name))?.latest;
+                    const pkg: RegistryPackage | undefined = await this.createRegistryClient(plugin.name).getPackage(plugin.name);
+                    const latestVersion: string | undefined = pkg ? pickLatestVersion(pkg.versions, { latest: pkg.latest, prerelease: includePrerelease }) : undefined;
                     const newer: boolean = !!latestVersion && isNewerVersion(latestVersion, plugin.packageVersion);
                     return { ...base, latestVersion, updateAvailable: allowed && newer };
                 } catch (err: any) {
@@ -704,27 +753,47 @@ export abstract class BasePluginRoute<T extends Plugin> {
      */
     @RequiresTrustedRole()
     @Get("/registry")
-    public async lookupByName(@Query("name") name?: unknown, @Query("packageVersion") packageVersion?: string): Promise<PluginRegistryLookup> {
+    public async lookupByName(
+        @Query("name") name?: unknown,
+        @Query("packageVersion") packageVersion?: string,
+        @Query("prerelease") prerelease?: unknown,
+    ): Promise<PluginRegistryLookup> {
         if (typeof name !== "string" || !name.trim()) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'name' is required.");
         }
-        return this.lookupPackage(name.trim(), packageVersion);
+        return this.lookupPackage(name.trim(), packageVersion, this.queryPrerelease(prerelease));
     }
 
     @RequiresTrustedRole()
     @Get("/registry/:name")
-    public async lookup(@Param("name") name: string, @Query("packageVersion") packageVersion?: string): Promise<PluginRegistryLookup> {
-        return this.lookupPackage(name, packageVersion);
+    public async lookup(
+        @Param("name") name: string,
+        @Query("packageVersion") packageVersion?: string,
+        @Query("prerelease") prerelease?: unknown,
+    ): Promise<PluginRegistryLookup> {
+        return this.lookupPackage(name, packageVersion, this.queryPrerelease(prerelease));
     }
 
-    private async lookupPackage(name: string, packageVersion?: string): Promise<PluginRegistryLookup> {
+    /**
+     * A package's versions and one version's details. Without `prerelease` the versions leave out prereleases (except
+     * the one installed, which the administrator has to be able to see), and `latest` is the newest allowed version
+     * rather than the registry's tag - which is also the version selected when none was asked for.
+     */
+    private async lookupPackage(name: string, packageVersion: string | undefined, prerelease: boolean): Promise<PluginRegistryLookup> {
         this.assertAllowed(name);
         const session: RegistrySession = this.registrySession();
-        const pkg: RegistryPackage | undefined = await this.registryCall(() => session.getPackage(name));
-        if (!pkg) {
+        const found: RegistryPackage | undefined = await this.registryCall(() => session.getPackage(name));
+        if (!found) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, `'${name}' was not found in the plugin registry.`);
         }
-        const selected = await this.lookupVersion(session, name, packageVersion);
+        const newest: string | undefined = pickLatestVersion(found.versions, { latest: found.latest, prerelease });
+        const installedVersion: string | undefined = (await this.installedPlugins()).find((row) => row.name === name)?.packageVersion;
+        const pkg: RegistryPackage = {
+            name: found.name,
+            latest: newest ?? found.latest,
+            versions: prerelease ? found.versions : found.versions.filter((version) => version === installedVersion || !isPrereleaseVersion(version)),
+        };
+        const selected = await this.lookupVersion(session, name, this.queryVersion(packageVersion) ?? newest);
         return { package: pkg, selected };
     }
 
@@ -738,13 +807,18 @@ export abstract class BasePluginRoute<T extends Plugin> {
      */
     @RequiresTrustedRole()
     @Get("/plan")
-    public async plan(@Query("name") name?: unknown, @Query("packageVersion") packageVersion?: unknown): Promise<PluginPlanResponse> {
+    public async plan(
+        @Query("name") name?: unknown,
+        @Query("packageVersion") packageVersion?: unknown,
+        @Query("prerelease") prerelease?: unknown,
+    ): Promise<PluginPlanResponse> {
         const trimmed: string = typeof name === "string" ? name.trim() : "";
         if (!trimmed) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'name' is required.");
         }
         this.assertAllowed(trimmed);
         const requested: string | undefined = this.queryVersion(packageVersion);
+        const includePrerelease: boolean = this.queryPrerelease(prerelease);
         const session: RegistrySession = this.registrySession();
         const installed: T[] = await this.installedPlugins();
         const current: T | undefined = installed.find((row) => row.name === trimmed);
@@ -752,7 +826,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
         if (current && (requested === undefined || requested === current.packageVersion)) {
             target = { name: trimmed, version: current.packageVersion, manifest: current.manifest };
         } else {
-            const found = await this.lookupVersion(session, trimmed, requested);
+            const found = await this.lookupVersion(session, trimmed, requested ?? (await this.defaultVersion(session, trimmed, includePrerelease)));
             target = { name: trimmed, version: found.version, manifest: found.manifest };
         }
         const plan: PluginChangePlan = await planPluginChange(installed, target, this.plannerRegistry(session), {

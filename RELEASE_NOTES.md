@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **The plugin routes take `?prerelease=true`, which lets pre-release versions (`1.0.0-beta.2`) count.** `GET /system/plugins/updates`, `/search`, `/registry` (both forms) and `/plan` accept it; without it (or with `false`) only releases count, as before, and any other value is a `400`. With it, a package's newest version is the highest one of any kind, and a version list keeps its pre-releases. Without it, a version list leaves pre-releases out (except the installed one) and its `latest` is the newest release. `pickLatestVersion()` and `isPrereleaseVersion()` in `PluginUtils` do the choosing.
+
+### Fixed
+
+- **A plugin published as pre-releases never showed an update.** `GET /updates` and `/search` compared the installed version with the registry's `latest` tag, which for such a package is usually stale (`latest` at `1.0.0-beta.2` while `1.0.0-beta.10` is out), so an installed `1.0.0-beta.9` read as newer than anything published. Both now read the package's versions and choose the newest by semver: the highest release, or the `latest` tag when it names a release, and with `?prerelease=true` the highest of all. A package with only pre-releases and no `prerelease` still offers nothing, and `/search` and a default install keep the registry's own `latest` for it.
+
 ## v0.24.0
 
 ### Added

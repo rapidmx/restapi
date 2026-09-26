@@ -16,6 +16,12 @@ import { parsePluginManifest, PluginInstanceStatus } from "../../src/plugins/Plu
 /** Package name -> version -> package.json, in publish order. `latest` is the last version listed. */
 export const fakeRegistryPackages: Map<string, Map<string, any>> = new Map();
 
+/** Package name -> the version its `latest` tag names, when that isn't the last one published (a stale tag). */
+export const fakeLatestTags: Map<string, string> = new Map();
+
+/** The version a package's `latest` tag names. */
+const latestOf = (name: string, versions: Map<string, any>): string => fakeLatestTags.get(name) ?? [...versions.keys()].pop()!;
+
 /** Registry clients the route asked for, by the package or namespace it passed. */
 export const registryClientRequests: (string | undefined)[] = [];
 
@@ -42,6 +48,7 @@ export const extraSearchResults: any[] = [];
 
 export function resetPluginTestDoubles(): void {
     fakeRegistryPackages.clear();
+    fakeLatestTags.clear();
     publishedHashes.length = 0;
     registryClientRequests.length = 0;
     failingSearchNamespaces.clear();
@@ -68,7 +75,7 @@ export class FakeRegistryClient extends NpmRegistryClient {
         return [...fakeRegistryPackages.entries()]
             .filter(([name]) => name.startsWith(`${scope}/`) && name.endsWith("-plugin"))
             .map(([name, versions]): RegistrySearchResult => {
-                const version: string = [...versions.keys()].pop()!;
+                const version: string = latestOf(name, versions);
                 return { name, version, description: versions.get(version).description };
             })
             .concat(extraSearchResults.filter((result) => String(result?.name).startsWith(`${scope}/`)));
@@ -84,7 +91,7 @@ export class FakeRegistryClient extends NpmRegistryClient {
             return undefined;
         }
         const list: string[] = [...versions.keys()];
-        return { name, latest: list[list.length - 1], versions: list.reverse() };
+        return { name, latest: latestOf(name, versions), versions: list.reverse() };
     }
 
     public async getVersion(name: string, version: string = "latest"): Promise<RegistryPackageVersion | undefined> {
@@ -93,7 +100,7 @@ export class FakeRegistryClient extends NpmRegistryClient {
         if (!versions) {
             return undefined;
         }
-        const resolved: string = version === "latest" ? [...versions.keys()].pop()! : version;
+        const resolved: string = version === "latest" ? latestOf(name, versions) : version;
         const pkg: any = versions.get(resolved);
         if (!pkg) {
             return undefined;

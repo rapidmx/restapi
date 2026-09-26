@@ -178,6 +178,32 @@ export function isNewerVersion(candidate: string, current: string): boolean {
     return false;
 }
 
+/** Whether `version` is a prerelease build (`1.0.0-beta.2`), as opposed to a release (`1.0.0`). */
+export function isPrereleaseVersion(version: string): boolean {
+    return semver.prerelease(version) !== null;
+}
+
+/**
+ * The version of a package an administrator should be offered as its newest, from the versions it has published.
+ *
+ * Without `prerelease`, only releases count: the registry's `latest` tag when it names one (a maintainer can point it
+ * at an older release on purpose), otherwise the highest release. A package that has only published prereleases has no
+ * such version, so `undefined` comes back. With `prerelease`, the highest version wins whatever it is, since the
+ * `latest` tag of a package published mostly as prereleases is usually stale - it can point at `1.0.0-beta.2` long after
+ * `1.0.0-beta.10` came out. Versions that aren't exact semver (see `isExactVersion()`) are never chosen.
+ */
+export function pickLatestVersion(versions: string[], options: { latest?: string; prerelease?: boolean } = {}): string | undefined {
+    const exact: string[] = versions.filter(isExactVersion);
+    if (options.prerelease) {
+        return exact.reduce<string | undefined>((best, version) => (best === undefined || semver.gt(version, best) ? version : best), undefined);
+    }
+    const releases: string[] = exact.filter((version) => !isPrereleaseVersion(version));
+    if (options.latest !== undefined && releases.includes(options.latest)) {
+        return options.latest;
+    }
+    return releases.reduce<string | undefined>((best, version) => (best === undefined || semver.gt(version, best) ? version : best), undefined);
+}
+
 /** What one server copy reports about the plugins it loaded. */
 export interface PluginInstanceStatus {
     /** The server copy's identity (its hostname). */
