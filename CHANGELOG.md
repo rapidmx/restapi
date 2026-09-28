@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-09-28
+
+### Changed
+- Cover BasePluginRoute.newestSearchResult()'s catch branch (a package that can't be read during search keeps the search result's own version) - the v0.25.0 CI build failed a 100% coverage threshold on this exact line, left untested by the prerelease-filtering change
+- Pin brace-expansion (via minimatch's 1.x and 5.x lines) and tar (via node-gyp) to fixed versions in resolutions - the same CI run's non-blocking validate job failed yarn npm audit on real high/critical CVEs in these transitive dev dependencies
+- Document the standing wait-for-green-CI-before-releasing rule in NOTES, per JP
+
 ## [0.25.0] - 2026-09-28
 
 ### Added
@@ -1226,7 +1233,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.25.1...HEAD
+[0.25.1]: https://github.com/rapidmx/restapi/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/rapidmx/restapi/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/rapidmx/restapi/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/rapidmx/restapi/compare/v0.22.1...v0.23.0
