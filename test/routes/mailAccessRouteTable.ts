@@ -78,6 +78,7 @@ export const ROUTE_TABLE: Record<string, RouteRow> = {
     // --- public / machine ------------------------------------------------------------------------------------------
     KeyDiscoveryRoute: { kind: "public", base: "BaseKeyDiscoveryRoute", gate: "anonymous, rate limited: the published public keys of a mailbox, by hash" },
     MailIngestRoute: { kind: "public", base: "BaseMailIngestRoute", gate: "the MTA's shared bearer secret; not a user endpoint" },
+    ServerInfoRoute: { kind: "public", base: "BaseServerInfoRoute", gate: "anonymous, rate limited: this deployment's auth-server URL (mail:auth_server_url), the second hop of multi-server discovery" },
     // --- push ------------------------------------------------------------------------------------------------------
     MailPushRoute: { kind: "mailbox", base: "MailPushRoute", gate: "a channel is the caller's own uid or a mailbox/folder uid the caller holds READ on as themselves (roles stripped)" },
 };

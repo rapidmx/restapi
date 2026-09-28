@@ -39,6 +39,7 @@ export * from "./MailboxPolicyRouteSQL.js";
 export * from "./RetentionPolicyRouteSQL.js";
 export * from "./SetupRouteSQL.js";
 export * from "./SearchRouteSQL.js";
+export * from "./ServerInfoRouteSQL.js";
 export * from "./TaskListRouteSQL.js";
 export * from "./TaskRouteSQL.js";
 export * from "./TransportRuleRouteSQL.js";

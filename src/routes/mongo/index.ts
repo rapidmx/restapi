@@ -39,6 +39,7 @@ export * from "./MailboxPolicyRouteMongo.js";
 export * from "./RetentionPolicyRouteMongo.js";
 export * from "./SetupRouteMongo.js";
 export * from "./SearchRouteMongo.js";
+export * from "./ServerInfoRouteMongo.js";
 export * from "./TaskListRouteMongo.js";
 export * from "./TaskRouteMongo.js";
 export * from "./TransportRuleRouteMongo.js";

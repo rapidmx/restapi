@@ -34,6 +34,7 @@ export * from "./BaseRetentionPolicyRoute.js";
 export * from "./BaseSetupRoute.js";
 export * from "./BaseScopedChildRoute.js";
 export * from "./BaseSearchRoute.js";
+export * from "./BaseServerInfoRoute.js";
 export * from "./BaseTransportRuleRoute.js";
 export * from "./BaseSigningEnrollmentAdminRoute.js";
 export * from "./BaseSigningEnrollmentInfoRoute.js";

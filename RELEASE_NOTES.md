@@ -4,6 +4,7 @@
 
 ### Added
 
+- **`GET /.well-known/rapidmx/server-info`, a new unauthenticated endpoint returning `{ authServerUrl }`.** Multi-server discovery's second hop: each RapidMX install deploys `server` and its `auth-server` as two separate origins, and a client that has already resolved an email domain to this server's own host (the existing `_rapidmx.<domain>` DNS TXT record lookup) had no way to learn the separate auth-server host its sign-in flow needs - the gap the new native Tauri client surfaced. The value is read from the existing `mail:auth_server_url` setting, the same one already used to call auth-server's own API elsewhere; empty (never a `404`) when a deployment hasn't configured it.
 - **The plugin routes take `?prerelease=true`, which lets pre-release versions (`1.0.0-beta.2`) count.** `GET /system/plugins/updates`, `/search`, `/registry` (both forms) and `/plan` accept it; without it (or with `false`) only releases count, as before, and any other value is a `400`. With it, a package's newest version is the highest one of any kind, and a version list keeps its pre-releases. Without it, a version list leaves pre-releases out (except the installed one) and its `latest` is the newest release. `pickLatestVersion()` and `isPrereleaseVersion()` in `PluginUtils` do the choosing.
 
 ### Fixed
