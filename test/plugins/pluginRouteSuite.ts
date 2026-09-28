@@ -250,6 +250,16 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect(withPrerelease.find((r: any) => r.name === STABLE)).toMatchObject({ version: "2.0.0-beta.1" });
         });
 
+        it("keeps the search result's own version when the package can't be read for its newest one", async () => {
+            // BETA's search result is itself a prerelease (its registry `latest` tag), so the route tries to read
+            // the full package regardless of `prerelease` - exactly the read `brokenPackages` fails.
+            brokenPackages.add(BETA);
+            const found = (await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/search?namespace=%40rapidmx`))).body.find(
+                (r: any) => r.name === BETA,
+            );
+            expect(found).toMatchObject({ version: "1.0.0-beta.2" });
+        });
+
         it("lists a package's prereleases, and defaults to them, only when they're allowed", async () => {
             const lookup = async (name: string, query = "") =>
                 (await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/registry?name=${encodeURIComponent(name)}${query}`))).body;
