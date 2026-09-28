@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.25.0
+
 ### Added
 
 - **`GET /.well-known/rapidmx/server-info`, a new unauthenticated endpoint returning `{ authServerUrl }`.** Multi-server discovery's second hop: each RapidMX install deploys `server` and its `auth-server` as two separate origins, and a client that has already resolved an email domain to this server's own host (the existing `_rapidmx.<domain>` DNS TXT record lookup) had no way to learn the separate auth-server host its sign-in flow needs - the gap the new native Tauri client surfaced. The value is read from the existing `mail:auth_server_url` setting, the same one already used to call auth-server's own API elsewhere; empty (never a `404`) when a deployment hasn't configured it.

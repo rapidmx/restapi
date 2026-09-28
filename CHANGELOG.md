@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-09-28
+
+### Added
+- Added ?prerelease=true to the plugin updates, search, registry and plan routes so pre-release versions count, with releases only by default, and answer any other value with a 400
+- Added pickLatestVersion and isPrereleaseVersion to PluginUtils
+- Added ServerInfoRoute for auto discovering auth-server URL
+
+### Changed
+- Leave pre-releases out of a package's version list unless they are allowed, keeping the installed version, and default a lookup or plan to the newest allowed version
+- Test choosing the newest version, and the prerelease parameter on both backends against a registry whose latest tag is stale
+- Document the change in the release notes and NOTES
+
+### Fixed
+- Fixed a plugin published as pre-releases never showing an update, by choosing its newest version from every published version instead of the registry's latest tag, which is often stale
+
 ## [0.24.0] - 2026-09-26
 
 ### Added
@@ -1211,7 +1226,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/rapidmx/restapi/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/rapidmx/restapi/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/rapidmx/restapi/compare/v0.22.1...v0.23.0
 [0.22.1]: https://github.com/rapidmx/restapi/compare/v0.22.0...v0.22.1
