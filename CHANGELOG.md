@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.2] - 2026-09-29
+
+### Added
+- Added the missing "Enable corepack" step to the validate job - every other job already has it, and without it yarn runs the container's stock Yarn 1.22.22 instead of the packageManager-pinned version, which refuses to run at all against a packageManager field, so validate's yarn npm audit never actually ran regardless of real findings. Confirmed on rapidmx/server's identical job via a real CI log; this repo's validate job is the same template and shares the same latent gap even where it happened not to manifest yet
+
+### Changed
+- Send out-of-office auto-replies with a text/plain alternative and a complete <html> document
+
 ## [0.25.1] - 2026-09-28
 
 ### Changed
@@ -1233,7 +1241,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.25.1...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.25.2...HEAD
+[0.25.2]: https://github.com/rapidmx/restapi/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/rapidmx/restapi/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/rapidmx/restapi/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/rapidmx/restapi/compare/v0.23.0...v0.24.0
