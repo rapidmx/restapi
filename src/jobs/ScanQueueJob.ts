@@ -7,6 +7,7 @@ import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ModelUtils, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
+import { htmlToPlainText } from "../util/EventDescriptionUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, ScanPipelineResult } from "../scan/ScanPipeline.js";
@@ -1809,7 +1810,11 @@ export abstract class ScanQueueJob<
                 from: { name: safeDisplayName(mailbox.displayName), address: mailbox.primarySmtpAddress },
                 to: entry.envelopeFrom,
                 subject,
-                html: activeOof.message,
+                text: htmlToPlainText(activeOof.message),
+                html: /<html[\s>]/i.test(activeOof.message)
+                    ? activeOof.message
+                    : `<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head><body>${activeOof.message}</body></html>`,
                 inReplyTo: result.messageIdHeader,
                 references: result.messageIdHeader,
                 headers: { "Auto-Submitted": "auto-replied" },
