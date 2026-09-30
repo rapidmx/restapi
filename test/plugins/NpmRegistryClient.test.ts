@@ -243,21 +243,31 @@ describe("NpmRegistryClient.searchPlugins", () => {
         const results = await new NpmRegistryClient("https://npm.example.com/", "tok").searchPlugins("rapidmx");
         expect(results.map((r) => r.name)).toEqual(["@rapidmx/activesync-plugin", "@rapidmx/mapi-plugin"]);
         expect(results[0]).toEqual({ name: "@rapidmx/activesync-plugin", version: "1.0.0", description: "@rapidmx/activesync-plugin desc", date: "2026-09-01T00:00:00.000Z" });
-        expect(fetchMock).toHaveBeenCalledWith("https://npm.example.com/-/v1/search?text=scope%3Arapidmx&size=250&from=0", {
-            headers: { Accept: "application/json", Authorization: "Bearer tok" },
-            signal: expect.any(AbortSignal),
-        });
+        for (const text of ["scope%3Arapidmx", "%40rapidmx%2F"]) {
+            expect(fetchMock).toHaveBeenCalledWith(`https://npm.example.com/-/v1/search?text=${text}&size=250&from=0`, {
+                headers: { Accept: "application/json", Authorization: "Bearer tok" },
+                signal: expect.any(AbortSignal),
+            });
+        }
+    });
+
+    it("finds a package only the plain text search knows of, when the scope index has lagged or answers nothing", async () => {
+        const fetchMock = vi.fn(async (url: string) =>
+            json(url.includes("text=scope") ? page(["@rapidmx/meet-plugin"]) : page(["@rapidmx/meet-plugin", "@rapidmx/crm-plugin", "@rapidmx-other/x-plugin"])),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+        expect((await new NpmRegistryClient().searchPlugins("@rapidmx")).map((r) => r.name)).toEqual(["@rapidmx/crm-plugin", "@rapidmx/meet-plugin"]);
+
+        vi.stubGlobal("fetch", vi.fn(async (url: string) => json(url.includes("text=scope") ? { objects: [] } : page(["@rapidmx/crm-plugin"]))));
+        expect((await new NpmRegistryClient().searchPlugins("rapidmx")).map((r) => r.name)).toEqual(["@rapidmx/crm-plugin"]);
     });
 
     it("pages through full result pages, stops at a short one, and treats a missing body as no results", async () => {
         const full = page(Array.from({ length: 250 }, (_, i) => `@acme/p${String(i).padStart(3, "0")}-plugin`));
-        const fetchMock = vi
-            .fn()
-            .mockResolvedValueOnce(json(full))
-            .mockResolvedValueOnce(json(page(["@acme/zz-plugin"])));
+        const fetchMock = vi.fn(async (url: string) => (url.includes("text=scope") ? json(url.includes("from=250") ? page(["@acme/zz-plugin"]) : full) : json({ objects: [] })));
         vi.stubGlobal("fetch", fetchMock);
         expect(await new NpmRegistryClient().searchPlugins("@acme")).toHaveLength(251);
-        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(fetchMock).toHaveBeenCalledTimes(3);
         expect((fetchMock.mock.calls[1] as any[])[0]).toContain("from=250");
 
         vi.stubGlobal("fetch", vi.fn(async () => json(null, 404)));
@@ -269,6 +279,7 @@ describe("NpmRegistryClient.searchPlugins", () => {
         const fetchMock = vi.fn(async () => json(full));
         vi.stubGlobal("fetch", fetchMock);
         await new NpmRegistryClient().searchPlugins("@acme");
-        expect(fetchMock).toHaveBeenCalledTimes(4);
+        // Four pages of each of the two searches.
+        expect(fetchMock).toHaveBeenCalledTimes(8);
     });
 });

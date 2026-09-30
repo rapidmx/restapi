@@ -130,23 +130,28 @@ export class NpmRegistryClient {
     public async searchPlugins(namespace: string): Promise<RegistrySearchResult[]> {
         const scope: string = namespace.replace(/^@/, "");
         const results: Map<string, RegistrySearchResult> = new Map();
-        for (let from = 0; from < SEARCH_MAX_RESULTS; from += SEARCH_PAGE_SIZE) {
-            const query = new URLSearchParams({ text: `scope:${scope}`, size: String(SEARCH_PAGE_SIZE), from: String(from) });
-            const page: any = await this.request(`/-/v1/search?${query.toString()}`);
-            const objects: any[] = Array.isArray(page?.objects) ? page.objects : [];
-            for (const object of objects) {
-                const pkg: any = object?.package;
-                if (
-                    typeof pkg?.name === "string" &&
-                    typeof pkg.version === "string" &&
-                    pkg.name.startsWith(`@${scope}/`) &&
-                    pkg.name.endsWith(PLUGIN_PACKAGE_SUFFIX)
-                ) {
-                    results.set(pkg.name, { name: pkg.name, version: pkg.version, description: pkg.description, date: pkg.date });
+        // npm's `scope:` qualifier is served from an index that lags behind new publishes - and at times answers nothing at all for a scope that
+        // plainly has packages - while a plain text search for `@scope/` finds them; the results of both are merged. Anything the text search
+        // matches loosely is dropped by the name check below.
+        for (const text of [`scope:${scope}`, `@${scope}/`]) {
+            for (let from = 0; from < SEARCH_MAX_RESULTS; from += SEARCH_PAGE_SIZE) {
+                const query = new URLSearchParams({ text, size: String(SEARCH_PAGE_SIZE), from: String(from) });
+                const page: any = await this.request(`/-/v1/search?${query.toString()}`);
+                const objects: any[] = Array.isArray(page?.objects) ? page.objects : [];
+                for (const object of objects) {
+                    const pkg: any = object?.package;
+                    if (
+                        typeof pkg?.name === "string" &&
+                        typeof pkg.version === "string" &&
+                        pkg.name.startsWith(`@${scope}/`) &&
+                        pkg.name.endsWith(PLUGIN_PACKAGE_SUFFIX)
+                    ) {
+                        results.set(pkg.name, { name: pkg.name, version: pkg.version, description: pkg.description, date: pkg.date });
+                    }
                 }
-            }
-            if (objects.length < SEARCH_PAGE_SIZE) {
-                break;
+                if (objects.length < SEARCH_PAGE_SIZE) {
+                    break;
+                }
             }
         }
         return [...results.values()].sort((a, b) => a.name.localeCompare(b.name));
