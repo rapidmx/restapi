@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-09-30
+
+### Added
+- Added a mail event stream plugins can read (MailEventStream, MailEventConsumer): message.delivered for every filed message, message.sent and send.failed for what the mail transport accepted and refused
+- Added structured parsing of delivery status notifications and abuse feedback reports (DsnParser), with each bounced recipient classified as a hard bounce, soft bounce, delay or delivery
+- Added contact pictures: PUT, GET and DELETE /:id/photo on the contacts route store, serve and remove a contact's own JPEG, PNG, GIF or WebP picture (up to 1 MiB, checked by its magic bytes), kept in the blob store under the contact
+- Added resolveFrom to app rail entries in a plugin manifest: an API path the web client asks about the signed-in user, showing the entry only when it answers with a link
+
+### Changed
+- Publish message.delivered from inbound delivery, carrying the parsed bounce or feedback report and the envelope recipients exactly as given
+- Publish message.sent and send.failed from immediate and scheduled sends through a new optional argument of scanAndRelay()
+- Build the bounce preview from the parsed delivery status report
+
 ## [0.26.0] - 2026-09-30
 
 ### Added
@@ -1252,7 +1265,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/rapidmx/restapi/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/rapidmx/restapi/compare/v0.25.2...v0.26.0
 [0.25.2]: https://github.com/rapidmx/restapi/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/rapidmx/restapi/compare/v0.25.0...v0.25.1
