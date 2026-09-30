@@ -10,6 +10,7 @@ import {
     CalendarEventSQL,
     ContactListSQL,
     ContactSQL,
+    CorrespondentSQL,
     DataExportRequestSQL,
     DataSubjectErasureRequestSQL,
     FocusedInboxOverrideSQL,
@@ -45,6 +46,7 @@ export class ErasureExecutionJobSQL extends ErasureExecutionJob<DataSubjectErasu
     protected focusedInboxOverrideClass: any = FocusedInboxOverrideSQL;
     protected taskListClass: any = TaskListSQL;
     protected labelClass: any = LabelSQL;
+    protected correspondentClass: any = CorrespondentSQL;
     protected mailFilterRuleClass: any = MailFilterRuleSQL;
     protected mailSignatureClass: any = MailSignatureSQL;
     protected oofReplySuppressionClass: any = OofReplySuppressionSQL;

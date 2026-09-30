@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { DatabaseDecorators, type MongoRepository } from "@rapidrest/service-core";
-import { ContactMongo, DataSubjectErasureRequestMongo, DistributionListMongo, FolderMongo, MailboxMongo } from "../../mongo.js";
+import { CalendarEventMongo, ContactMongo, CorrespondentMongo, DataSubjectErasureRequestMongo, DistributionListMongo, FolderMongo, MailboxMongo, MessageMongo } from "../../mongo.js";
 import { BaseDirectoryRoute, escapeDirectoryRegExp } from "../BaseDirectoryRoute.js";
 const { Repository } = DatabaseDecorators;
 
@@ -21,6 +21,9 @@ export class DirectoryRouteMongo extends BaseDirectoryRoute<MailboxMongo, Folder
     protected mailboxClass: any = MailboxMongo;
     protected folderClass: any = FolderMongo;
     protected erasureRequestClass: any = DataSubjectErasureRequestMongo;
+    protected messageClass: any = MessageMongo;
+    protected calendarEventClass: any = CalendarEventMongo;
+    protected correspondentClass: any = CorrespondentMongo;
 
     @Repository(MailboxMongo)
     private mailboxCollection?: MongoRepository<MailboxMongo>;
@@ -30,6 +33,9 @@ export class DirectoryRouteMongo extends BaseDirectoryRoute<MailboxMongo, Folder
 
     @Repository(ContactMongo)
     private contactCollection?: MongoRepository<ContactMongo>;
+
+    @Repository(CorrespondentMongo)
+    private correspondentCollection?: MongoRepository<CorrespondentMongo>;
 
     protected async findMailboxCandidates(terms: string[], limit: number): Promise<MailboxMongo[]> {
         const filter: any = { $and: terms.map((term) => ({ $or: [{ displayName: wordPrefix(term) }, { primarySmtpAddress: prefix(term) }] })) };
@@ -63,6 +69,18 @@ export class DirectoryRouteMongo extends BaseDirectoryRoute<MailboxMongo, Folder
         return await this.contactCollection!.find(filter, {
             projection: { displayName: 1, givenName: 1, surname: 1, emails: 1 },
             sort: { displayName: 1 },
+            limit,
+        }).toArray();
+    }
+
+    protected async findCorrespondentCandidates(mailboxUids: string[], terms: string[], limit: number): Promise<CorrespondentMongo[]> {
+        const filter: any = {
+            mailboxUid: { $in: mailboxUids },
+            $and: terms.map((term) => ({ $or: [{ displayName: wordPrefix(term) }, { address: prefix(term) }] })),
+        };
+        return await this.correspondentCollection!.find(filter, {
+            projection: { address: 1, displayName: 1, lastSeenAt: 1, count: 1 },
+            sort: { lastSeenAt: -1, count: -1 },
             limit,
         }).toArray();
     }

@@ -6,11 +6,14 @@ import config from "../../config.js";
 import { ACLAction, ConnectionManager, MongoConnection, MongoRepository, ObjectFactory, Server } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { MongoMemoryServer } from "mongodb-memory-server";
+import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
 import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
+import { CorrespondentMongo } from "../../../src/models/mongo/CorrespondentMongo.js";
 import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSubjectErasureRequestMongo.js";
 import { DistributionListMongo } from "../../../src/models/mongo/DistributionListMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
+import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 import { directorySuite } from "../directorySuite.js";
 
@@ -31,6 +34,9 @@ describe("Route:DirectoryMongo Tests", () => {
     let contactRepo: MongoRepository<ContactMongo>;
     let listRepo: MongoRepository<DistributionListMongo>;
     let erasureRepo: MongoRepository<DataSubjectErasureRequestMongo>;
+    let correspondentRepo: MongoRepository<CorrespondentMongo>;
+    let messageRepo: MongoRepository<MessageMongo>;
+    let eventRepo: MongoRepository<CalendarEventMongo>;
 
     const saveAcl = async (uid: string, parentUid: string, records: any[]): Promise<void> => {
         await aclRepo.save({ uid, dateCreated: new Date(), dateModified: new Date(), version: 0, records, parentUid });
@@ -53,6 +59,9 @@ describe("Route:DirectoryMongo Tests", () => {
         contactRepo = conn.getMongoRepository("ContactMongo");
         listRepo = conn.getMongoRepository("DistributionListMongo");
         erasureRepo = conn.getMongoRepository("DataSubjectErasureRequestMongo");
+        correspondentRepo = conn.getMongoRepository("CorrespondentMongo");
+        messageRepo = conn.getMongoRepository("MessageMongo");
+        eventRepo = conn.getMongoRepository("CalendarEventMongo");
     });
 
     afterAll(async () => {
@@ -62,7 +71,7 @@ describe("Route:DirectoryMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, folderRepo, contactRepo, listRepo, erasureRepo] as MongoRepository<any>[]) {
+        for (const repo of [mailboxRepo, folderRepo, contactRepo, listRepo, erasureRepo, correspondentRepo, messageRepo, eventRepo] as MongoRepository<any>[]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -95,5 +104,10 @@ describe("Route:DirectoryMongo Tests", () => {
         saveErasureRequest: async (mailboxUid, status) => {
             await erasureRepo.save(new DataSubjectErasureRequestMongo({ mailboxUid, requestedByUserUid: "someone", status } as any));
         },
+        saveCorrespondent: async (fields) => await correspondentRepo.save(new CorrespondentMongo(fields as any)),
+        saveMessage: async (fields) => await messageRepo.save(new MessageMongo(fields as any)),
+        saveCalendarEvent: async (fields) => await eventRepo.save(new CalendarEventMongo(fields as any)),
+        findCorrespondents: async (mailboxUid) => await correspondentRepo.find({ mailboxUid }).toArray(),
+        findMailbox: async (uid) => await mailboxRepo.findOne({ uid }),
     });
 });

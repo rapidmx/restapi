@@ -36,6 +36,7 @@ import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
 import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { KeyVaultMongo } from "../../../src/models/mongo/KeyVaultMongo.js";
 import { FocusedInboxOverrideMongo } from "../../../src/models/mongo/FocusedInboxOverrideMongo.js";
+import { CorrespondentMongo } from "../../../src/models/mongo/CorrespondentMongo.js";
 import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySuppressionMongo.js";
 import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSubjectErasureRequestMongo.js";
 import { buildEventIcs } from "../../../src/util/IcsUtils.js";
@@ -237,6 +238,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
     let mailFilterRuleRepo: MongoRepository<MailFilterRuleMongo>;
     let calendarEventRepo: MongoRepository<CalendarEventMongo>;
     let oofReplySuppressionRepo: MongoRepository<OofReplySuppressionMongo>;
+    let correspondentRepo: MongoRepository<CorrespondentMongo>;
     let focusedInboxOverrideRepo: MongoRepository<FocusedInboxOverrideMongo>;
     let contactRepo: MongoRepository<ContactMongo>;
     let domainRepo: MongoRepository<DomainMongo>;
@@ -290,6 +292,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         models.set("MailFilterRuleMongo", MailFilterRuleMongo);
         models.set("CalendarEventMongo", CalendarEventMongo);
         models.set("OofReplySuppressionMongo", OofReplySuppressionMongo);
+        models.set("CorrespondentMongo", CorrespondentMongo);
         models.set("FocusedInboxOverrideMongo", FocusedInboxOverrideMongo);
         models.set("ContactMongo", ContactMongo);
         models.set("DomainMongo", DomainMongo);
@@ -311,6 +314,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         mailFilterRuleRepo = conn.getMongoRepository("MailFilterRuleMongo");
         calendarEventRepo = conn.getMongoRepository("CalendarEventMongo");
         oofReplySuppressionRepo = conn.getMongoRepository("OofReplySuppressionMongo");
+        correspondentRepo = conn.getMongoRepository("CorrespondentMongo");
         focusedInboxOverrideRepo = conn.getMongoRepository("FocusedInboxOverrideMongo");
         contactRepo = conn.getMongoRepository("ContactMongo");
         domainRepo = conn.getMongoRepository("DomainMongo");
@@ -339,6 +343,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             mailFilterRuleRepo,
             calendarEventRepo,
             oofReplySuppressionRepo,
+            correspondentRepo,
             focusedInboxOverrideRepo,
             contactRepo,
             domainRepo,
@@ -1654,6 +1659,99 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             expect(contact.keyConflicts).toHaveLength(1);
             const delivered = await messageRepo.find({ mailboxUid, subject: "Rotated" }).toArray();
             expect(delivered).toHaveLength(2);
+        });
+    });
+
+    describe("Recipient suggestions (correspondents)", () => {
+        /** Puts `raw` in the queue for the test mailbox and runs the job once. */
+        async function deliverRaw(raw: Buffer, data?: Partial<IngestQueueEntryMongo>): Promise<void> {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, raw);
+            await createIngestEntry({ rawBlobKey, ...data });
+            await job.run();
+        }
+        const stored = async (): Promise<CorrespondentMongo[]> => (await correspondentRepo.find({ mailboxUid }).toArray()).sort((a: any, b: any) => a.address.localeCompare(b.address));
+        const addressed = (...headers: string[]): Buffer => Buffer.from([...headers, "Subject: Addressed message", "", "Hello there.", ""].join("\r\n"));
+
+        it("Records the sender and the To and Cc recipients of a delivered message, but not the mailbox's own address or a bcc'd envelope recipient.", async () => {
+            await createMailbox({ aliasAddresses: ["alias@example.com"] });
+            await deliverRaw(
+                addressed(
+                    'From: "Bob Allen" <Bob@Partner.test>',
+                    'To: recipient@example.com, "Carol C" <carol@partner.test>, alias@example.com',
+                    "Cc: dave@partner.test",
+                ),
+                { envelopeFrom: "bob@partner.test", envelopeTo: ["recipient@example.com", "hidden@partner.test"] },
+            );
+
+            const rows = await stored();
+            expect(rows.map((row) => row.address)).toEqual(["bob@partner.test", "carol@partner.test", "dave@partner.test"]);
+            expect(rows.map((row) => row.displayName)).toEqual(["Bob Allen", "Carol C", ""]);
+            expect(rows.every((row) => row.mailboxUid === mailboxUid && row.count === 1 && row.lastSource === "received")).toBe(true);
+        });
+
+        it("Counts a repeat correspondent again and keeps the name the newest message carried.", async () => {
+            await createMailbox();
+            await deliverRaw(addressed('From: "Bob" <bob@partner.test>', "To: recipient@example.com"), { envelopeFrom: "bob@partner.test" });
+            await deliverRaw(addressed("From: bob@partner.test", "To: recipient@example.com"), { envelopeFrom: "bob@partner.test" });
+            await deliverRaw(addressed('From: "Robert Allen" <bob@partner.test>', "To: recipient@example.com"), { envelopeFrom: "bob@partner.test" });
+
+            const rows = await stored();
+            expect(rows).toHaveLength(1);
+            expect(rows[0]).toMatchObject({ address: "bob@partner.test", count: 3, displayName: "Robert Allen" });
+        });
+
+        it("Falls back to the envelope sender when the message has no usable From header.", async () => {
+            await createMailbox();
+            await deliverRaw(addressed("To: recipient@example.com"), { envelopeFrom: "envelope@partner.test" });
+            expect((await stored()).map((row) => row.address)).toEqual(["envelope@partner.test"]);
+        });
+
+        it("Records nothing for junk or quarantined mail, or for a mailbox that has no row.", async () => {
+            await createMailbox();
+            await deliverRaw(addressed("From: spam@partner.test", "To: recipient@example.com", "X-Test-Force-Spam: true"));
+            await deliverRaw(addressed("From: virus@partner.test", "To: recipient@example.com", "X-Test-Force-Infected: true"));
+            expect(await stored()).toEqual([]);
+
+            await mailboxRepo.clear();
+            await deliverRaw(addressed("From: bob@partner.test", "To: recipient@example.com"));
+            expect(await stored()).toEqual([]);
+        });
+
+        it("Records the organizer and guests of an inbound invitation from a verified sender as event correspondents.", async () => {
+            await createMailbox();
+            const icalUid = uuid.v4();
+            const ics = buildEventIcs(
+                makeIcsEventFixture({
+                    icalUid,
+                    attendees: [
+                        { address: "recipient@example.com", displayName: "Recipient", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+                        { address: "Guest@Partner.test", displayName: "Gus Guest", role: AttendeeRole.OPTIONAL, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+                    ],
+                }),
+                "REQUEST",
+            );
+            await deliverRaw(makeItipRawMessage(ics), { envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            const rows = await stored();
+            expect(rows.map((row) => row.address)).toEqual(["guest@partner.test", "organizer@example.com"]);
+            expect(rows[0]).toMatchObject({ displayName: "Gus Guest", count: 1, lastSource: "event" });
+            // The organizer wrote the message and organizes the event: two sightings.
+            expect(rows[1]).toMatchObject({ count: 2 });
+        });
+
+        it("Ignores the guests of an invitation whose sender is not verified, though its From and To are still recorded.", async () => {
+            await createMailbox();
+            const ics = buildEventIcs(
+                makeIcsEventFixture({
+                    icalUid: uuid.v4(),
+                    attendees: [{ address: "guest@partner.test", displayName: "Gus Guest", role: AttendeeRole.OPTIONAL, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+                }),
+                "REQUEST",
+            );
+            await deliverRaw(makeItipRawMessage(ics, { dkim: false }), { envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+            expect((await stored()).map((row) => row.address)).toEqual(["organizer@example.com"]);
         });
     });
 

@@ -191,6 +191,11 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     public keyDiscoveryHash?: string = undefined;
 
     @Column({ nullable: true })
+    @Description("When this mailbox's correspondents were built from its existing messages and events. Managed by the server.")
+    @Nullable
+    public correspondentsBackfilledAt?: Date = undefined;
+
+    @Column({ nullable: true })
     @Description("This mailbox's assigned escrow scope, if any.")
     @Nullable
     public escrowScopeId?: string = undefined;
@@ -270,6 +275,8 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
             this.keys = other.keys !== undefined ? other.keys : this.keys;
             this.keyDiscoveryHash = "keyDiscoveryHash" in other ? other.keyDiscoveryHash : this.keyDiscoveryHash;
             this.escrowScopeId = "escrowScopeId" in other ? other.escrowScopeId : this.escrowScopeId;
+            this.correspondentsBackfilledAt =
+                "correspondentsBackfilledAt" in other ? other.correspondentsBackfilledAt : this.correspondentsBackfilledAt;
             this.freeBusyVisibility = other.freeBusyVisibility !== undefined ? other.freeBusyVisibility : this.freeBusyVisibility;
             this.blockedSenders = other.blockedSenders !== undefined ? other.blockedSenders : this.blockedSenders;
             this.safeSenders = other.safeSenders !== undefined ? other.safeSenders : this.safeSenders;

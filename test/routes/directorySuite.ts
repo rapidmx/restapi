@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-// `GET /mail/directory` and `GET /mail/directory/contacts` (recipient suggestions), identical on both backends.
+// `GET /mail/directory`, `GET /mail/directory/contacts` and `GET /mail/directory/correspondents` (recipient suggestions),
+// identical on both backends.
 // `test/routes/{mongo,sql}/DirectoryRoute.test.ts` supply a started server and raw row helpers.
 import { request } from "@rapidrest/service-core/test";
 import { ACLAction } from "@rapidrest/service-core";
@@ -25,6 +26,13 @@ export interface DirectorySuiteContext {
     saveFolder: (fields: Record<string, any>, records?: AclRecords) => Promise<any>;
     saveContact: (fields: Record<string, any>) => Promise<any>;
     saveErasureRequest: (mailboxUid: string, status: string) => Promise<void>;
+    saveCorrespondent: (fields: Record<string, any>) => Promise<any>;
+    saveMessage: (fields: Record<string, any>) => Promise<any>;
+    saveCalendarEvent: (fields: Record<string, any>) => Promise<any>;
+    /** Every stored `Correspondent` of `mailboxUid`. */
+    findCorrespondents: (mailboxUid: string) => Promise<any[]>;
+    /** The stored `Mailbox` `uid`. */
+    findMailbox: (uid: string) => Promise<any>;
 }
 
 export function directorySuite(ctx: DirectorySuiteContext): void {
@@ -36,6 +44,7 @@ export function directorySuite(ctx: DirectorySuiteContext): void {
     };
     const search = (q: string, user: any, extra: string = "") => get(`?q=${encodeURIComponent(q)}${extra}`, user);
     const searchContacts = (q: string, user: any, extra: string = "") => get(`/contacts?q=${encodeURIComponent(q)}${extra}`, user);
+    const searchCorrespondents = (q: string, user: any, extra: string = "") => get(`/correspondents?q=${encodeURIComponent(q)}${extra}`, user);
     const addresses = (body: any[]): string[] => body.map((entry) => entry.address);
 
     const mailboxFor = async (owner: any, fields: Record<string, any> = {}, records: AclRecords = []) =>
@@ -252,6 +261,206 @@ export function directorySuite(ctx: DirectorySuiteContext): void {
                 expect(res.status).toBe(200);
                 expect(res.body).toEqual([]);
             }
+        });
+    });
+
+    describe("GET /correspondents (people the caller's mailboxes have corresponded with)", () => {
+        const owner: any = newUser();
+        const day = (n: number): Date => new Date(Date.UTC(2026, 0, n));
+        // A mailbox whose backfill has already run, so a test's own rows are the only ones searched.
+        const doneMailbox = async (user: any, fields: Record<string, any> = {}, records: AclRecords = []) =>
+            await mailboxFor(user, { correspondentsBackfilledAt: new Date(), ...fields }, records);
+        const correspondent = async (mailbox: any, address: string, fields: Record<string, any> = {}) =>
+            await ctx.saveCorrespondent({ mailboxUid: mailbox.uid, address, displayName: "", lastSeenAt: day(1), count: 1, lastSource: "received", ...fields });
+
+        it("requires a signed-in caller and validates the query", async () => {
+            expect((await get("/correspondents?q=carol")).status).toBe(401);
+            expect((await searchCorrespondents("c", owner)).status).toBe(400);
+            expect((await searchCorrespondents("carol", owner, "&limit=x")).status).toBe(400);
+            expect((await get("/correspondents", owner)).status).toBe(400);
+        });
+
+        it("returns nothing for a caller with no mailbox", async () => {
+            expect((await searchCorrespondents("carol", newUser())).body).toEqual([]);
+        });
+
+        it("matches name word prefixes and address prefixes, and returns only name, address and kind", async () => {
+            const mailbox = await doneMailbox(owner);
+            await correspondent(mailbox, "carol.danvers@marvel.test", { displayName: "Carol Danvers" });
+            await correspondent(mailbox, "nameless@marvel.test");
+            await correspondent(mailbox, "peter@marvel.test", { displayName: "Peter Parker-Stark" });
+
+            const byName = await searchCorrespondents("DANV", owner);
+            expect(byName.status).toBe(200);
+            expect(byName.body).toEqual([{ displayName: "Carol Danvers", address: "carol.danvers@marvel.test", kind: "correspondent" }]);
+            expect(addresses((await searchCorrespondents("carol dan", owner)).body)).toEqual(["carol.danvers@marvel.test"]);
+            expect(addresses((await searchCorrespondents("stark", owner)).body)).toEqual(["peter@marvel.test"]);
+            expect(addresses((await searchCorrespondents("nameless@ma", owner)).body)).toEqual(["nameless@marvel.test"]);
+            expect((await searchCorrespondents("nameless", owner)).body).toEqual([{ displayName: "", address: "nameless@marvel.test", kind: "correspondent" }]);
+            // Not a word prefix, and a domain isn't a prefix of the address.
+            expect((await searchCorrespondents("anvers", owner)).body).toEqual([]);
+            expect((await searchCorrespondents("marvel.test", owner)).body).toEqual([]);
+            expect((await searchCorrespondents("carol smith", owner)).body).toEqual([]);
+        });
+
+        it("orders by most recently seen, then most often, with one entry per address across the caller's mailboxes", async () => {
+            const first = await doneMailbox(owner);
+            const second = await doneMailbox(owner);
+            await correspondent(first, "ord.old@x.test", { displayName: "Ord Old", lastSeenAt: day(1), count: 50 });
+            await correspondent(first, "ord.new@x.test", { displayName: "Ord New", lastSeenAt: day(9), count: 1 });
+            await correspondent(first, "ord.tie.few@x.test", { displayName: "Ord Tie Few", lastSeenAt: day(5), count: 2 });
+            await correspondent(first, "ord.tie.many@x.test", { displayName: "Ord Tie Many", lastSeenAt: day(5), count: 7 });
+            await correspondent(first, "ord.both@x.test", { displayName: "Ord Both Old Name", lastSeenAt: day(2), count: 1 });
+            await correspondent(second, "ord.both@x.test", { displayName: "Ord Both New Name", lastSeenAt: day(7), count: 1 });
+            const res = await searchCorrespondents("ord", owner, "&limit=20");
+            expect(res.body.map((entry: any) => entry.address)).toEqual([
+                "ord.new@x.test",
+                "ord.both@x.test",
+                "ord.tie.many@x.test",
+                "ord.tie.few@x.test",
+                "ord.old@x.test",
+            ]);
+            expect(res.body[1].displayName).toBe("Ord Both New Name");
+        });
+
+        it("defaults to 8 entries and caps the limit", async () => {
+            const mailbox = await doneMailbox(owner);
+            for (let i = 0; i < 25; i++) {
+                await correspondent(mailbox, `lim${i}@x.test`, { displayName: `Lim ${i}`, lastSeenAt: day(1 + i) });
+            }
+            expect((await searchCorrespondents("lim", owner)).body).toHaveLength(8);
+            expect((await searchCorrespondents("lim", owner, "&limit=3")).body).toHaveLength(3);
+            expect((await searchCorrespondents("lim", owner, "&limit=500")).body).toHaveLength(DIRECTORY_MAX_LIMIT);
+            // Newest first.
+            expect((await searchCorrespondents("lim", owner, "&limit=1")).body[0].address).toBe("lim24@x.test");
+        });
+
+        it("only searches the caller's own mailboxes and a mailboxUid the caller may read", async () => {
+            const mine = await doneMailbox(owner);
+            await correspondent(mine, "scope.mine@x.test");
+            const someoneElse: any = newUser();
+            const shared = await doneMailbox(someoneElse, { displayName: "Shared" }, [{ userOrRoleId: owner.uid, actions: [ACLAction.READ] }]);
+            await correspondent(shared, "scope.shared@x.test");
+            const privateMailbox = await doneMailbox(someoneElse, { displayName: "Private" });
+            await correspondent(privateMailbox, "scope.private@x.test");
+
+            expect(addresses((await searchCorrespondents("scope", owner, "&limit=20")).body)).toEqual(["scope.mine@x.test"]);
+            expect(addresses((await searchCorrespondents("scope", owner, `&limit=20&mailboxUid=${shared.uid}`)).body).sort()).toEqual(["scope.mine@x.test", "scope.shared@x.test"]);
+            expect(addresses((await searchCorrespondents("scope", owner, `&limit=20&mailboxUid=${privateMailbox.uid}`)).body)).toEqual(["scope.mine@x.test"]);
+            expect(addresses((await searchCorrespondents("scope", owner, `&limit=20&mailboxUid=${mine.uid}`)).body)).toEqual(["scope.mine@x.test"]);
+            expect(addresses((await searchCorrespondents("scope", owner, "&limit=20&mailboxUid=no-such-mailbox")).body)).toEqual(["scope.mine@x.test"]);
+            expect(addresses((await searchCorrespondents("scope", someoneElse, "&limit=20")).body).sort()).toEqual(["scope.private@x.test", "scope.shared@x.test"]);
+            // No role reads another user's mailbox (the platform's mail privacy rule): an administrator without a grant finds nothing.
+            expect((await searchCorrespondents("scope", newUser(["admin"]), `&limit=20&mailboxUid=${privateMailbox.uid}`)).body).toEqual([]);
+        });
+
+        it("matches query text literally", async () => {
+            const mailbox = await doneMailbox(owner);
+            await correspondent(mailbox, "50%off@deals.test", { displayName: "Percent Person" });
+            await correspondent(mailbox, "a_b@deals.test", { displayName: "Under Score" });
+            expect(addresses((await searchCorrespondents("50%", owner)).body)).toEqual(["50%off@deals.test"]);
+            expect(addresses((await searchCorrespondents("a_b", owner)).body)).toEqual(["a_b@deals.test"]);
+            for (const q of ["5%", "a%", "__", ".*", "(a+)+$", "\\\\", "$ne"]) {
+                const res = await searchCorrespondents(q, owner);
+                expect(res.status).toBe(200);
+                expect(res.body).toEqual([]);
+            }
+        });
+
+        it("builds a mailbox's correspondents from its existing mail and events the first time it is searched, once", async () => {
+            const mailbox = await mailboxFor(owner, { primarySmtpAddress: "me.bf@owners.test", aliasAddresses: ["alias.bf@owners.test"] });
+            const folder = async (type: FolderType) => await ctx.saveFolder({ mailboxUid: mailbox.uid, name: type, type });
+            const inbox = await folder(FolderType.INBOX);
+            const sent = await folder(FolderType.SENT_ITEMS);
+            const junk = await folder(FolderType.JUNK);
+            const calendar = await folder(FolderType.CALENDAR);
+            const msg = (folderUid: string, from: string, recipients: [string, string][], receivedDate: Date, fromName = "") =>
+                ctx.saveMessage({
+                    mailboxUid: mailbox.uid,
+                    folderUid,
+                    messageId: uuid.v4(),
+                    from: { address: from, displayName: fromName, type: "to" },
+                    recipients: recipients.map(([address, type]) => ({ address, type, displayName: address.split("@")[0] })),
+                    receivedDate,
+                });
+            await msg(inbox.uid, "BF.Ann@Sender.test", [["me.bf@owners.test", "to"], ["bf.cc@sender.test", "cc"], ["bf.bcc@sender.test", "bcc"]], day(3), "Ann Backfill");
+            await msg(inbox.uid, "bf.ann@sender.test", [["alias.bf@owners.test", "to"]], day(4), "Ann B. Backfill");
+            await msg(sent.uid, "me.bf@owners.test", [["bf.to@dest.test", "to"], ["bf.hidden@dest.test", "bcc"]], day(5));
+            await msg(junk.uid, "bf.spam@sender.test", [["me.bf@owners.test", "to"]], day(6));
+            await ctx.saveCalendarEvent({
+                mailboxUid: mailbox.uid,
+                folderUid: calendar.uid,
+                title: "Sync",
+                icalUid: uuid.v4(),
+                organizer: { address: "bf.org@meet.test", displayName: "Olive Organizer", type: "to" },
+                attendees: [
+                    { address: "me.bf@owners.test", role: "required", responseStatus: "accepted", isOrganizer: false },
+                    { address: "bf.guest@meet.test", displayName: "Gus Guest", role: "required", responseStatus: "needs_action", isOrganizer: false },
+                ],
+                startDate: day(7),
+                endDate: day(8),
+            });
+
+            expect((await ctx.findMailbox(mailbox.uid)).correspondentsBackfilledAt ?? null).toBeNull();
+            const res = await searchCorrespondents("bf", owner, "&limit=20");
+            expect(res.status).toBe(200);
+            expect(res.body.map((entry: any) => entry.address).sort()).toEqual([
+                "bf.ann@sender.test",
+                "bf.cc@sender.test",
+                "bf.guest@meet.test",
+                "bf.hidden@dest.test",
+                "bf.org@meet.test",
+                "bf.to@dest.test",
+            ]);
+            // The newest name of Ann wins; the bcc of received mail, junk and the mailbox's own addresses are left out.
+            expect(res.body.find((entry: any) => entry.address === "bf.ann@sender.test").displayName).toBe("Ann B. Backfill");
+
+            const stored = await ctx.findCorrespondents(mailbox.uid);
+            expect(stored.find((row) => row.address === "bf.ann@sender.test")).toMatchObject({ count: 2, lastSource: "received" });
+            expect(stored.find((row) => row.address === "bf.to@dest.test")).toMatchObject({ count: 1, lastSource: "sent" });
+            expect(stored.find((row) => row.address === "bf.org@meet.test")).toMatchObject({ count: 1, lastSource: "event" });
+            expect((await ctx.findMailbox(mailbox.uid)).correspondentsBackfilledAt).toBeTruthy();
+
+            // Once: a second search adds nothing, however often it is repeated.
+            await Promise.all([searchCorrespondents("bf", owner), searchCorrespondents("bf", owner)]);
+            const after = await ctx.findCorrespondents(mailbox.uid);
+            expect(after).toHaveLength(stored.length);
+            expect(after.find((row) => row.address === "bf.ann@sender.test").count).toBe(2);
+        });
+
+        it("backfills a mailbox once even when searched by several requests at the same time", async () => {
+            const mailbox = await mailboxFor(owner, { primarySmtpAddress: "me.race@owners.test" });
+            const inbox = await ctx.saveFolder({ mailboxUid: mailbox.uid, name: "Inbox", type: FolderType.INBOX });
+            await ctx.saveMessage({
+                mailboxUid: mailbox.uid,
+                folderUid: inbox.uid,
+                messageId: uuid.v4(),
+                from: { address: "zed.race@sender.test", displayName: "Zed", type: "to" },
+                recipients: [],
+                receivedDate: day(3),
+            });
+            await Promise.all([searchCorrespondents("zed", owner), searchCorrespondents("zed", owner), searchCorrespondents("zed", owner)]);
+            const stored = (await ctx.findCorrespondents(mailbox.uid)).filter((row) => row.address === "zed.race@sender.test");
+            expect(stored).toHaveLength(1);
+            expect(stored[0].count).toBe(1);
+        });
+
+        it("does not backfill a mailbox that is not the caller's to read", async () => {
+            const someoneElse: any = newUser();
+            const privateMailbox = await mailboxFor(someoneElse);
+            const inbox = await ctx.saveFolder({ mailboxUid: privateMailbox.uid, name: "Inbox", type: FolderType.INBOX });
+            await ctx.saveMessage({
+                mailboxUid: privateMailbox.uid,
+                folderUid: inbox.uid,
+                messageId: uuid.v4(),
+                from: { address: "who.priv@sender.test", displayName: "", type: "to" },
+                recipients: [],
+                receivedDate: day(3),
+            });
+            await mailboxFor(owner);
+            expect((await searchCorrespondents("who", owner, `&mailboxUid=${privateMailbox.uid}`)).body).toEqual([]);
+            expect(await ctx.findCorrespondents(privateMailbox.uid)).toEqual([]);
+            expect((await ctx.findMailbox(privateMailbox.uid)).correspondentsBackfilledAt ?? null).toBeNull();
         });
     });
 }

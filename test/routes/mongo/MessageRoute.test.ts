@@ -8,6 +8,7 @@ import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionMana
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
+import { CorrespondentMongo } from "../../../src/models/mongo/CorrespondentMongo.js";
 import { FocusedInboxOverrideMongo } from "../../../src/models/mongo/FocusedInboxOverrideMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
@@ -43,6 +44,7 @@ describe("Route:MessageMongo Tests", () => {
     let aclRepo: MongoRepository<any>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
     let overrideRepo: MongoRepository<FocusedInboxOverrideMongo>;
+    let correspondentRepo: MongoRepository<CorrespondentMongo>;
     let domainRepo: MongoRepository<DomainMongo>;
     let matterRepo: MongoRepository<MatterMongo>;
 
@@ -147,6 +149,7 @@ describe("Route:MessageMongo Tests", () => {
             messageRepo = conn.getMongoRepository("MessageMongo");
             auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
             overrideRepo = conn.getMongoRepository("FocusedInboxOverrideMongo");
+            correspondentRepo = conn.getMongoRepository("CorrespondentMongo");
             domainRepo = conn.getMongoRepository("DomainMongo");
             matterRepo = conn.getMongoRepository("MatterMongo");
         } else {
@@ -161,7 +164,7 @@ describe("Route:MessageMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, folderRepo, messageRepo, auditLogRepo, overrideRepo, domainRepo, matterRepo]) {
+        for (const repo of [mailboxRepo, folderRepo, messageRepo, auditLogRepo, overrideRepo, domainRepo, matterRepo, correspondentRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -265,6 +268,46 @@ describe("Route:MessageMongo Tests", () => {
         expect(transport.sent[0].envelopeFrom).toBe("owner@example.com");
         expect(transport.sent[0].envelopeTo).toEqual(["recipient@example.com"]);
         expect(result.body.encrypted).toBe(false);
+    });
+
+    it("Sending a draft records its To, Cc and Bcc recipients as sent correspondents, but not the sender's own addresses.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+        const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        await blobStore.put(bodyBlobKey, Buffer.from("From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n"));
+        const message = await createMessage(mailbox.uid, draftsFolder.uid, {
+            bodyBlobKey,
+            recipients: [
+                { address: "Recipient@Example.com", displayName: "Rita Recipient", type: RecipientType.TO },
+                { address: "cc@example.com", type: RecipientType.CC },
+                { address: "bcc@example.com", type: RecipientType.BCC },
+                { address: "owner@example.com", type: RecipientType.CC },
+            ],
+        });
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/${message.uid}/send`)
+            .set("Authorization", "jwt " + ownerToken);
+        expect(result.status).toBeLessThan(300);
+
+        const rows = (await correspondentRepo.find({ mailboxUid: mailbox.uid }).toArray()).sort((a: any, b: any) => a.address.localeCompare(b.address));
+        expect(rows.map((row: any) => row.address)).toEqual(["bcc@example.com", "cc@example.com", "recipient@example.com"]);
+        expect(rows.find((row: any) => row.address === "recipient@example.com")).toMatchObject({ displayName: "Rita Recipient", count: 1, lastSource: "sent" });
+    });
+
+    it("Records nothing for a send that is only deferred (nothing has been relayed yet).", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const draftsFolder = await createFolder(mailbox.uid, FolderType.DRAFTS);
+        const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const bodyBlobKey = `bodies/${uuid.v4()}`;
+        await blobStore.put(bodyBlobKey, Buffer.from("From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n"));
+        const deferred = await createMessage(mailbox.uid, draftsFolder.uid, { bodyBlobKey, scheduledSendTime: new Date(Date.now() + 60 * 60 * 1000) });
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/${deferred.uid}/send`)
+            .set("Authorization", "jwt " + ownerToken);
+        expect(result.status).toBeLessThan(300);
+        expect((await correspondentRepo.find({ mailboxUid: mailbox.uid }).toArray())).toEqual([]);
     });
 
     describe("domain alias sending", () => {

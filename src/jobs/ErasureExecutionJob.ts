@@ -60,7 +60,7 @@ const MAX_PURGE_PASSES = 3;
  * an orphaned folder after its owning mailbox is gone would be a real data-hygiene gap for a feature whose
  * whole point is leaving no trace). Verified against every interface in `models/types.ts` that declares a
  * `mailboxUid` field, this also purges `FocusedInboxOverride`/`TaskList`/`Label`/`MailFilterRule`/
- * `MailSignature`/`OofReplySuppression`/plugin `@MailboxScopedData()` models/`QuarantineEntry`/
+ * `MailSignature`/`OofReplySuppression`/`Correspondent`/plugin `@MailboxScopedData()` models/`QuarantineEntry`/
  * `IngestQueueEntry` (each carries real personal data - sender addresses, a signature's name/contact
  * details, filter-rule conditions naming other people - that would otherwise
  * silently survive an "erasure" that reports itself complete), and `DataExportRequest`/
@@ -111,6 +111,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     protected abstract focusedInboxOverrideClass: any;
     protected abstract taskListClass: any;
     protected abstract labelClass: any;
+    protected abstract correspondentClass: any;
     protected abstract mailFilterRuleClass: any;
     protected abstract mailSignatureClass: any;
     protected abstract oofReplySuppressionClass: any;
@@ -375,6 +376,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         purgedCount += await this.purgeEntityType(this.mailFilterRuleClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.mailSignatureClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.oofReplySuppressionClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.correspondentClass, request.mailboxUid);
         // The mailbox's end-to-end encryption key material (wrapped private keys and master-key wraps).
         purgedCount += await this.purgeEntityType(this.keyVaultClass, request.mailboxUid);
         // Plugin models marked `@MailboxScopedData()` (e.g. ActiveSync device state, or the booking plugin's booking types and bookings) hold this mailbox's data too.

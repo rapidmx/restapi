@@ -34,10 +34,11 @@ import { DistributionListMongo } from "../../src/models/mongo/DistributionListMo
 import { DomainMongo } from "../../src/models/mongo/DomainMongo.js";
 import { EscrowAccessRequestMongo } from "../../src/models/mongo/EscrowAccessRequestMongo.js";
 import { FocusedInboxOverrideMongo } from "../../src/models/mongo/FocusedInboxOverrideMongo.js";
+import { CorrespondentMongo } from "../../src/models/mongo/CorrespondentMongo.js";
+import { MailboxMongo } from "../../src/models/mongo/MailboxMongo.js";
 import { FolderMongo } from "../../src/models/mongo/FolderMongo.js";
 import { IngestQueueEntryMongo } from "../../src/models/mongo/IngestQueueEntryMongo.js";
 import { KeyVaultMongo } from "../../src/models/mongo/KeyVaultMongo.js";
-import { MailboxMongo } from "../../src/models/mongo/MailboxMongo.js";
 import { MessageMongo } from "../../src/models/mongo/MessageMongo.js";
 import { NoteMongo } from "../../src/models/mongo/NoteMongo.js";
 import { QuarantineEntryMongo } from "../../src/models/mongo/QuarantineEntryMongo.js";
@@ -576,6 +577,48 @@ describe("Mongo model default construction", () => {
         expect(obj.dkimPublicKey).toBe("MIGfMA0GCSq");
         expect(obj.dmarcPolicy).toBe("quarantine");
         expect(obj.dmarcReportEmail).toBe("dmarc@example.com");
+    });
+
+    it("CorrespondentMongo falls back to class defaults when constructed with no data.", () => {
+        const obj = new CorrespondentMongo();
+
+        expect(obj.mailboxUid).toBe("");
+        expect(obj.address).toBe("");
+        expect(obj.displayName).toBe("");
+        expect(obj.lastSeenAt).toBeInstanceOf(Date);
+        expect(obj.count).toBe(0);
+        expect(obj.lastSource).toBe("received");
+    });
+
+    it("CorrespondentMongo applies provided values and keeps defaults for omitted fields.", () => {
+        const seen = new Date("2026-01-02T03:04:05Z");
+        const obj = new CorrespondentMongo({
+            mailboxUid: "mailbox-1",
+            address: "bob@example.com",
+            displayName: "Bob",
+            lastSeenAt: seen,
+            count: 3,
+            lastSource: "event",
+        });
+
+        expect(obj.mailboxUid).toBe("mailbox-1");
+        expect(obj.address).toBe("bob@example.com");
+        expect(obj.displayName).toBe("Bob");
+        expect(obj.lastSeenAt).toBe(seen);
+        expect(obj.count).toBe(3);
+        expect(obj.lastSource).toBe("event");
+
+        const partial = new CorrespondentMongo({ mailboxUid: "mailbox-1" });
+        expect(partial.address).toBe("");
+        expect(partial.count).toBe(0);
+        expect(partial.lastSource).toBe("received");
+    });
+
+    it("MailboxMongo.correspondentsBackfilledAt is unset by default and kept when provided.", () => {
+        expect(new MailboxMongo().correspondentsBackfilledAt).toBeUndefined();
+        expect(new MailboxMongo({}).correspondentsBackfilledAt).toBeUndefined();
+        const at = new Date("2026-01-02T03:04:05Z");
+        expect(new MailboxMongo({ correspondentsBackfilledAt: at }).correspondentsBackfilledAt).toBe(at);
     });
 
     it("FocusedInboxOverrideMongo falls back to class defaults when constructed with no data.", () => {

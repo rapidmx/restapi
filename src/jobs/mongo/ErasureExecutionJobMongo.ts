@@ -10,6 +10,7 @@ import {
     CalendarEventMongo,
     ContactListMongo,
     ContactMongo,
+    CorrespondentMongo,
     DataExportRequestMongo,
     DataSubjectErasureRequestMongo,
     FocusedInboxOverrideMongo,
@@ -45,6 +46,7 @@ export class ErasureExecutionJobMongo extends ErasureExecutionJob<DataSubjectEra
     protected focusedInboxOverrideClass: any = FocusedInboxOverrideMongo;
     protected taskListClass: any = TaskListMongo;
     protected labelClass: any = LabelMongo;
+    protected correspondentClass: any = CorrespondentMongo;
     protected mailFilterRuleClass: any = MailFilterRuleMongo;
     protected mailSignatureClass: any = MailSignatureMongo;
     protected oofReplySuppressionClass: any = OofReplySuppressionMongo;

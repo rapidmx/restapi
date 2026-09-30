@@ -32,6 +32,7 @@ import { MailSignatureSQL } from "../../../src/models/sql/MailSignatureSQL.js";
 import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
 import { NoteSQL } from "../../../src/models/sql/NoteSQL.js";
+import { CorrespondentSQL } from "../../../src/models/sql/CorrespondentSQL.js";
 import { OofReplySuppressionSQL } from "../../../src/models/sql/OofReplySuppressionSQL.js";
 import { PluginSQL } from "../../../src/models/sql/PluginSQL.js";
 import { PluginRegistry } from "../../../src/plugins/PluginRegistry.js";
@@ -62,6 +63,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
     let mailFilterRuleRepo: Repository<MailFilterRuleSQL>;
     let mailSignatureRepo: Repository<MailSignatureSQL>;
     let oofReplySuppressionRepo: Repository<OofReplySuppressionSQL>;
+    let correspondentRepo: Repository<CorrespondentSQL>;
     let pluginMailboxDataRepo: Repository<PluginMailboxDataSQL>;
     let pluginRepo: Repository<PluginSQL>;
     let quarantineEntryRepo: Repository<QuarantineEntrySQL>;
@@ -113,6 +115,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         models.set("MailFilterRuleSQL", MailFilterRuleSQL);
         models.set("MailSignatureSQL", MailSignatureSQL);
         models.set("OofReplySuppressionSQL", OofReplySuppressionSQL);
+        models.set("CorrespondentSQL", CorrespondentSQL);
         models.set("PluginMailboxDataSQL", PluginMailboxDataSQL);
         models.set("PluginSQL", PluginSQL);
         objectFactory.register(PluginMailboxDataSQL);
@@ -148,6 +151,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         mailFilterRuleRepo = conn.getRepository(MailFilterRuleSQL);
         mailSignatureRepo = conn.getRepository(MailSignatureSQL);
         oofReplySuppressionRepo = conn.getRepository(OofReplySuppressionSQL);
+        correspondentRepo = conn.getRepository(CorrespondentSQL);
         pluginMailboxDataRepo = conn.getRepository(PluginMailboxDataSQL);
         pluginRepo = conn.getRepository(PluginSQL);
         quarantineEntryRepo = conn.getRepository(QuarantineEntrySQL);
@@ -184,6 +188,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
             mailFilterRuleRepo,
             mailSignatureRepo,
             oofReplySuppressionRepo,
+            correspondentRepo,
             pluginMailboxDataRepo,
             pluginRepo,
             quarantineEntryRepo,
@@ -309,6 +314,9 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
             new MailSignatureSQL({ mailboxUid: mailbox.uid, name: "A Signature", contentHtml: "<p>Sig</p>", isDefaultForNewMessages: true, isDefaultForReplyForward: false }),
         );
         await oofReplySuppressionRepo.save(new OofReplySuppressionSQL({ mailboxUid: mailbox.uid, senderAddress: "sender@example.com", lastRepliedAt: new Date() }));
+        await correspondentRepo.save(new CorrespondentSQL({ mailboxUid: mailbox.uid, address: "friend@example.com", displayName: "A Friend", count: 2 }));
+        // Another mailbox's correspondent survives.
+        await correspondentRepo.save(new CorrespondentSQL({ mailboxUid: "another-mailbox", address: "friend@example.com", count: 1 }));
         await pluginMailboxDataRepo.save(
             new PluginMailboxDataSQL({ mailboxUid: mailbox.uid }),
         );
@@ -358,9 +366,9 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect(updated!.status).toBe("completed");
         // folder, message, attachment, contact, contactList, calendarEvent, task, note,
         // focusedInboxOverride, taskList, label, mailFilterRule, mailSignature,
-        // oofReplySuppression, plugin mailbox data, quarantineEntry, ingestQueueEntry, dataExportRequest,
+        // oofReplySuppression, correspondent, plugin mailbox data, quarantineEntry, ingestQueueEntry, dataExportRequest,
         // mailboxImportRequest, mailbox = 20
-        expect(updated!.purgedCount).toBe(20);
+        expect(updated!.purgedCount).toBe(21);
 
         expect(await mailboxRepo.findOne({ where: { uid: mailbox.uid } })).toBeNull();
         expect(await folderRepo.findOne({ where: { uid: folder.uid } })).toBeNull();
@@ -377,6 +385,8 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect((await mailFilterRuleRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await mailSignatureRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await oofReplySuppressionRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await correspondentRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect((await correspondentRepo.find({ where: { mailboxUid: "another-mailbox" } })).length).toBe(1);
         expect((await pluginMailboxDataRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await quarantineEntryRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
         expect((await ingestQueueEntryRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);

@@ -14,6 +14,7 @@ import config from "../../config.js";
 import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
 import { backgroundSendSuite } from "../backgroundSendSuite.js";
 import { ScheduledSendJobMongo } from "../../../src/jobs/mongo/ScheduledSendJobMongo.js";
+import { CorrespondentMongo } from "../../../src/models/mongo/CorrespondentMongo.js";
 import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
@@ -33,6 +34,7 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
     let folderRepo: MongoRepository<FolderMongo>;
     let mailboxRepo: MongoRepository<MailboxMongo>;
     let messageRepo: MongoRepository<MessageMongo>;
+    let correspondentRepo: MongoRepository<CorrespondentMongo>;
 
     let mailboxUid: string;
     let outboxUid: string;
@@ -93,6 +95,7 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
         models.set("FolderMongo", FolderMongo);
         models.set("MailboxMongo", MailboxMongo);
         models.set("MessageMongo", MessageMongo);
+        models.set("CorrespondentMongo", CorrespondentMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("mongo");
@@ -102,6 +105,7 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
         folderRepo = conn.getMongoRepository("FolderMongo");
         mailboxRepo = conn.getMongoRepository("MailboxMongo");
         messageRepo = conn.getMongoRepository("MessageMongo");
+        correspondentRepo = conn.getMongoRepository("CorrespondentMongo");
 
         job = await objectFactory.newInstance(ScheduledSendJobMongo, { name: "default" });
     });
@@ -112,7 +116,7 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [folderRepo, mailboxRepo, messageRepo] as MongoRepository<any>[]) {
+        for (const repo of [folderRepo, mailboxRepo, messageRepo, correspondentRepo] as MongoRepository<any>[]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -231,6 +235,34 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
 
         const updated = await findMessage(message.uid);
         expect(updated.conversationId).toBe("root@example.com");
+    });
+
+    it("Records every To, Cc and Bcc recipient of a relayed message as a sent correspondent, but not the sender's own addresses.", async () => {
+        const bodyBlobKey = await putBody();
+        await createMessage({
+            bodyBlobKey,
+            scheduledSendTime: new Date(Date.now() - 60 * 1000),
+            recipients: [
+                { address: "Recipient@Example.com", displayName: "The Recipient", type: RecipientType.TO },
+                { address: "cc@example.com", type: RecipientType.CC },
+                { address: "bcc@example.com", type: RecipientType.BCC },
+                { address: "alias@example.com", type: RecipientType.CC },
+            ],
+        });
+
+        await job.run();
+
+        const rows = (await correspondentRepo.find({ mailboxUid }).toArray()).sort((a: any, b: any) => a.address.localeCompare(b.address));
+        expect(rows.map((row: any) => row.address)).toEqual(["bcc@example.com", "cc@example.com", "recipient@example.com"]);
+        expect(rows.find((row: any) => row.address === "recipient@example.com")).toMatchObject({ displayName: "The Recipient", count: 1, lastSource: "sent" });
+    });
+
+    it("Records nothing for a message that fails to relay.", async () => {
+        await createMessage({ bodyBlobKey: `bodies/${uuid.v4()}`, scheduledSendTime: new Date(Date.now() - 60 * 1000) });
+
+        await job.run();
+
+        expect((await correspondentRepo.find({ mailboxUid }).toArray())).toEqual([]);
     });
 
     it("Does not relay a message whose scheduledSendTime is still in the future.", async () => {

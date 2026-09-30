@@ -6,11 +6,14 @@ import config from "../../config.sql.js";
 import { ACLAction, AccessControlListSQL, ConnectionManager, isSqlDataSource, ObjectFactory, Server } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { Repository } from "typeorm";
+import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
 import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
+import { CorrespondentSQL } from "../../../src/models/sql/CorrespondentSQL.js";
 import { DataSubjectErasureRequestSQL } from "../../../src/models/sql/DataSubjectErasureRequestSQL.js";
 import { DistributionListSQL } from "../../../src/models/sql/DistributionListSQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 import { directorySuite } from "../directorySuite.js";
 
@@ -24,6 +27,9 @@ describe("Route:DirectorySQL Tests", () => {
     let contactRepo: Repository<ContactSQL>;
     let listRepo: Repository<DistributionListSQL>;
     let erasureRepo: Repository<DataSubjectErasureRequestSQL>;
+    let correspondentRepo: Repository<CorrespondentSQL>;
+    let messageRepo: Repository<MessageSQL>;
+    let eventRepo: Repository<CalendarEventSQL>;
 
     const saveAcl = async (uid: string, parentUid: string, records: any[]): Promise<void> => {
         await aclRepo.save({ uid, dateCreated: new Date(), dateModified: new Date(), version: 0, records, parentUid } as any);
@@ -45,6 +51,9 @@ describe("Route:DirectorySQL Tests", () => {
         contactRepo = conn.getRepository(ContactSQL);
         listRepo = conn.getRepository(DistributionListSQL);
         erasureRepo = conn.getRepository(DataSubjectErasureRequestSQL);
+        correspondentRepo = conn.getRepository(CorrespondentSQL);
+        messageRepo = conn.getRepository(MessageSQL);
+        eventRepo = conn.getRepository(CalendarEventSQL);
     });
 
     afterAll(async () => {
@@ -53,7 +62,7 @@ describe("Route:DirectorySQL Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, folderRepo, contactRepo, listRepo, erasureRepo] as Repository<any>[]) {
+        for (const repo of [mailboxRepo, folderRepo, contactRepo, listRepo, erasureRepo, correspondentRepo, messageRepo, eventRepo] as Repository<any>[]) {
             await repo.clear();
         }
     });
@@ -80,5 +89,10 @@ describe("Route:DirectorySQL Tests", () => {
         saveErasureRequest: async (mailboxUid, status) => {
             await erasureRepo.save(new DataSubjectErasureRequestSQL({ mailboxUid, requestedByUserUid: "someone", status } as any));
         },
+        saveCorrespondent: async (fields) => await correspondentRepo.save(new CorrespondentSQL(fields as any)),
+        saveMessage: async (fields) => await messageRepo.save(new MessageSQL(fields as any)),
+        saveCalendarEvent: async (fields) => await eventRepo.save(new CalendarEventSQL(fields as any)),
+        findCorrespondents: async (mailboxUid) => await correspondentRepo.find({ where: { mailboxUid } }),
+        findMailbox: async (uid) => await mailboxRepo.findOne({ where: { uid } }),
     });
 });

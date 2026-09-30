@@ -764,6 +764,13 @@ export interface Mailbox extends BaseEntity {
      * pre-existing row colliding on the same default value under a uniqueness constraint. */
     keyDiscoveryHash?: string;
 
+    /** When this mailbox's `Correspondent` list was built from its existing messages and calendar events
+     * (`util/CorrespondentUtils.ts`'s `backfillCorrespondents()`, run the first time the mailbox is searched for
+     * recipient suggestions). Unset until then; set BEFORE the backfill starts, so two searches racing on a fresh
+     * mailbox don't both count its history. Nothing outside the server reads it, and a value a client writes only
+     * changes whether that client's own mailbox is rebuilt. */
+    correspondentsBackfilledAt?: Date;
+
     /** This mailbox's assigned escrow scope, if any (`undefined`/absent = the spec's "scope: none" - no
      * escrow, recoverable only via the user's own recovery codes). Distinct from `MasterKeyWrap.escrowScopeId`
      * (which tags which scope a specific client-side wrap ARTIFACT was generated for) - the two can
@@ -1233,6 +1240,39 @@ export interface Message extends RecoverableBaseEntity {
 
 /** What a user can report a message as - see `Message.reportedAs` and `POST /messages/:id/report`. */
 export type MessageReportKind = "junk" | "phishing" | "not_junk";
+
+/** How a `Correspondent` was last encountered: in a message received (`"received"`), in one the mailbox sent
+ * (`"sent"`), or on a calendar event as its organizer or an attendee (`"event"`). */
+export type CorrespondentSource = "received" | "sent" | "event";
+
+/**
+ * Someone a mailbox has encountered by e-mail or calendar - a sender or recipient of one of its messages, or the
+ * organizer or an attendee of one of its events - so that recipient suggestions (`GET /mail/directory/correspondents`)
+ * can offer people who are in neither the user's address book nor the server's directory. One row per (mailbox,
+ * address), kept up to date by `util/CorrespondentUtils.ts`'s `recordCorrespondents()`; deleted with the mailbox's
+ * other data by `ErasureExecutionJob`. Internal bookkeeping only - no CRUD route exists for it.
+ *
+ * @author Jean-Philippe Steinmetz
+ */
+export interface Correspondent extends BaseEntity {
+    /** The unique identifier of the `Mailbox` that encountered this address. */
+    mailboxUid: string;
+
+    /** The address, lowercased (`normalizeAddress()`). Unique together with `mailboxUid`. */
+    address: string;
+
+    /** The most recent non-empty display name seen with this address, or `""` if it has only ever been seen bare. */
+    displayName: string;
+
+    /** When this address was last encountered. */
+    lastSeenAt: Date;
+
+    /** How many times this address has been encountered (once per message or event it appears on). */
+    count: number;
+
+    /** How the address was last encountered. */
+    lastSource: CorrespondentSource;
+}
 
 /**
  * A user's explicit "always put mail from this sender in Focused/Other" instruction, which overrides

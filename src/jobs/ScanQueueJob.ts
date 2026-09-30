@@ -39,6 +39,7 @@ import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification, parseDispositionNotification } from "../util/ReceiptUtils.js";
 import { parseRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
 import { buildDeliveredRecipients } from "../util/RecipientUtils.js";
+import { eventObservations, messageObservations, recordCorrespondents, type CorrespondentContext } from "../util/CorrespondentUtils.js";
 import { nameBasedUuid } from "../util/UuidUtils.js";
 import { sendOrThrow } from "../transport/TransportResultUtils.js";
 import {
@@ -204,6 +205,9 @@ export abstract class ScanQueueJob<
     protected abstract oofReplySuppressionClass: any;
     protected abstract focusedInboxOverrideClass: any;
     protected abstract contactClass: any;
+    /** The `Correspondent` model class: everyone a delivered message or received invitation names is recorded into it
+     * (`recordCorrespondents()`), for recipient suggestions. */
+    protected abstract correspondentClass: any;
     protected abstract domainClass: any;
     protected abstract keyVaultClass: any;
 
@@ -821,10 +825,41 @@ export abstract class ScanQueueJob<
             if (verdict === "deliver" && delivered) {
                 await this.maybeSendAutoReplyOnce(entry, raw, result);
                 await this.maybeProcessItipMessage(entry, raw, result);
+                // Recipient suggestions: only mail that reached the Inbox counts - junk is not somebody the user knows.
+                await this.recordInboundCorrespondents(entry, result);
             }
         }
 
         await this.markDelivered(claim);
+    }
+
+    /** What `recordCorrespondents()` needs to reach the datastore from this job. */
+    private correspondentContext(): CorrespondentContext {
+        return {
+            objectFactory: this._objectFactory!,
+            correspondentClass: this.correspondentClass,
+            mailboxClass: this.mailboxClass,
+            logger: this.logger,
+        };
+    }
+
+    /**
+     * Records the sender and the To/Cc recipients of a message delivered to `entry`'s mailbox as its correspondents
+     * (`util/CorrespondentUtils.ts`). The sender is the `From` header's address (falling back to the envelope sender), the
+     * recipients are those the headers name; the mailbox's own addresses are skipped by `recordCorrespondents()`, which
+     * also never throws. Runs once per delivered message, for the one mailbox it was delivered to.
+     */
+    private async recordInboundCorrespondents(entry: Q, result: ScanPipelineResult): Promise<void> {
+        const recipients: Recipient[] = buildDeliveredRecipients(result.headerRecipients, entry.envelopeTo);
+        await recordCorrespondents(
+            this.correspondentContext(),
+            entry.mailboxUid,
+            messageObservations(
+                { from: { address: result.fromAddress || entry.envelopeFrom, displayName: result.fromDisplayName }, recipients },
+                { from: true, types: [RecipientType.TO, RecipientType.CC] },
+            ),
+            "received",
+        );
     }
 
     /**
@@ -2205,6 +2240,9 @@ export abstract class ScanQueueJob<
             this.logger?.warn(`ScanQueueJob: ignoring iTIP ${parsed.method} for event ${parsed.uid} - its sender isn't DKIM-verified.`);
             return;
         }
+
+        // Everyone the invitation names is somebody this mailbox now knows of - the organizer and the guests.
+        await recordCorrespondents(this.correspondentContext(), entry.mailboxUid, eventObservations(parsed), "event");
 
         try {
             switch (parsed.method) {

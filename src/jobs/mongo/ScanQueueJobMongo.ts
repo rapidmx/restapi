@@ -7,6 +7,7 @@ import {
     AttachmentMongo,
     CalendarEventMongo,
     ContactMongo,
+    CorrespondentMongo,
     DomainMongo,
     FocusedInboxOverrideMongo,
     FolderMongo,
@@ -46,6 +47,7 @@ export class ScanQueueJobMongo extends ScanQueueJob<
     protected oofReplySuppressionClass: any = OofReplySuppressionMongo;
     protected focusedInboxOverrideClass: any = FocusedInboxOverrideMongo;
     protected contactClass: any = ContactMongo;
+    protected correspondentClass: any = CorrespondentMongo;
     protected domainClass: any = DomainMongo;
     protected keyVaultClass: any = KeyVaultMongo;
 }

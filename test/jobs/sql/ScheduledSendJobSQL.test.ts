@@ -13,6 +13,7 @@ import config from "../../config.sql.js";
 import { registerTestDoubles, RecordingMailTransport } from "../../testDoubles.js";
 import { backgroundSendSuite } from "../backgroundSendSuite.js";
 import { ScheduledSendJobSQL } from "../../../src/jobs/sql/ScheduledSendJobSQL.js";
+import { CorrespondentSQL } from "../../../src/models/sql/CorrespondentSQL.js";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
@@ -28,6 +29,7 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
     let folderRepo: Repository<FolderSQL>;
     let mailboxRepo: Repository<MailboxSQL>;
     let messageRepo: Repository<MessageSQL>;
+    let correspondentRepo: Repository<CorrespondentSQL>;
 
     let mailboxUid: string;
     let outboxUid: string;
@@ -88,6 +90,7 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         models.set("FolderSQL", FolderSQL);
         models.set("MailboxSQL", MailboxSQL);
         models.set("MessageSQL", MessageSQL);
+        models.set("CorrespondentSQL", CorrespondentSQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");
@@ -97,6 +100,7 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         folderRepo = conn.getRepository(FolderSQL);
         mailboxRepo = conn.getRepository(MailboxSQL);
         messageRepo = conn.getRepository(MessageSQL);
+        correspondentRepo = conn.getRepository(CorrespondentSQL);
 
         job = await objectFactory.newInstance(ScheduledSendJobSQL, { name: "default" });
     });
@@ -107,6 +111,7 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
 
     beforeEach(async () => {
         await messageRepo.clear();
+        await correspondentRepo.clear();
         await folderRepo.clear();
         await mailboxRepo.clear();
         transport().sent = [];
@@ -217,6 +222,34 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
 
         const updated = await findMessage(message.uid);
         expect(updated.conversationId).toBe("root@example.com");
+    });
+
+    it("Records every To, Cc and Bcc recipient of a relayed message as a sent correspondent, but not the sender's own addresses.", async () => {
+        const bodyBlobKey = await putBody();
+        await createMessage({
+            bodyBlobKey,
+            scheduledSendTime: new Date(Date.now() - 60 * 1000),
+            recipients: [
+                { address: "Recipient@Example.com", displayName: "The Recipient", type: RecipientType.TO },
+                { address: "cc@example.com", type: RecipientType.CC },
+                { address: "bcc@example.com", type: RecipientType.BCC },
+                { address: "alias@example.com", type: RecipientType.CC },
+            ],
+        });
+
+        await job.run();
+
+        const rows = (await correspondentRepo.find({ where: { mailboxUid } })).sort((a: any, b: any) => a.address.localeCompare(b.address));
+        expect(rows.map((row: any) => row.address)).toEqual(["bcc@example.com", "cc@example.com", "recipient@example.com"]);
+        expect(rows.find((row: any) => row.address === "recipient@example.com")).toMatchObject({ displayName: "The Recipient", count: 1, lastSource: "sent" });
+    });
+
+    it("Records nothing for a message that fails to relay.", async () => {
+        await createMessage({ bodyBlobKey: `bodies/${uuid.v4()}`, scheduledSendTime: new Date(Date.now() - 60 * 1000) });
+
+        await job.run();
+
+        expect((await correspondentRepo.find({ where: { mailboxUid } }))).toEqual([]);
     });
 
     it("Does not relay a message whose scheduledSendTime is still in the future.", async () => {

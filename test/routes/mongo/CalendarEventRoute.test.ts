@@ -19,6 +19,7 @@ import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
 import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
+import { CorrespondentMongo } from "../../../src/models/mongo/CorrespondentMongo.js";
 import { AttendeeResponseStatus, AttendeeRole, BusyStatus, CalendarEventStatus, FolderType, MessageImportance, RecipientType } from "../../../src/models/types.js";
 import { calendarInviteSuite, type CalendarInviteSuiteContext } from "../calendarInviteSuite.js";
 import { calendarEventDialogSuite } from "../calendarEventDialogSuite.js";
@@ -41,6 +42,7 @@ describe("Route:CalendarEventMongo Tests", () => {
     let folderRepo: MongoRepository<FolderMongo>;
     let calendarEventRepo: MongoRepository<CalendarEventMongo>;
     let messageRepo: MongoRepository<MessageMongo>;
+    let correspondentRepo: MongoRepository<CorrespondentMongo>;
     let aclRepo: MongoRepository<any>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -137,6 +139,7 @@ describe("Route:CalendarEventMongo Tests", () => {
             folderRepo = conn.getMongoRepository("FolderMongo");
             calendarEventRepo = conn.getMongoRepository("CalendarEventMongo");
             messageRepo = conn.getMongoRepository("MessageMongo");
+            correspondentRepo = conn.getMongoRepository("CorrespondentMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -149,7 +152,7 @@ describe("Route:CalendarEventMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, folderRepo, calendarEventRepo, messageRepo]) {
+        for (const repo of [mailboxRepo, folderRepo, calendarEventRepo, messageRepo, correspondentRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -304,6 +307,114 @@ describe("Route:CalendarEventMongo Tests", () => {
             .set("Authorization", "jwt " + otherUserToken);
 
         expect(result.status).toBe(404);
+    });
+
+    describe("Recipient suggestions (correspondents)", () => {
+        const eventBody = (mailbox: any, folder: any, extra: any) => {
+            const now = new Date();
+            return {
+                mailboxUid: mailbox.uid,
+                folderUid: folder.uid,
+                title: "Planning",
+                startDate: now,
+                endDate: new Date(now.getTime() + 60 * 60 * 1000),
+                allDay: false,
+                timezone: "UTC",
+                status: CalendarEventStatus.CONFIRMED,
+                busyStatus: BusyStatus.BUSY,
+                icalUid: uuid.v4(),
+                sequence: 0,
+                ...extra,
+            };
+        };
+        const attendee = (address: string, displayName?: string) => ({
+            address,
+            displayName,
+            role: AttendeeRole.REQUIRED,
+            responseStatus: AttendeeResponseStatus.NEEDS_ACTION,
+            isOrganizer: false,
+        });
+
+        it("Creating an event records its organizer and attendees, but not the mailbox's own address.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + ownerToken)
+                .send(
+                    eventBody(mailbox, folder, {
+                        organizer: { address: mailbox.primarySmtpAddress, type: RecipientType.TO },
+                        attendees: [attendee(mailbox.primarySmtpAddress), attendee("Guest@Partner.test", "Gus Guest"), attendee("plain@partner.test")],
+                    }),
+                );
+            expect(result.status).toBeLessThan(300);
+
+            const rows = (await correspondentRepo.find({ mailboxUid: mailbox.uid }).toArray()).sort((a: any, b: any) => a.address.localeCompare(b.address));
+            expect(rows.map((row: any) => row.address)).toEqual(["guest@partner.test", "plain@partner.test"]);
+            expect(rows[0]).toMatchObject({ displayName: "Gus Guest", count: 1, lastSource: "event" });
+        });
+
+        it("Creating several events at once records each one's people.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + ownerToken)
+                .send([
+                    eventBody(mailbox, folder, { organizer: { address: "one@partner.test", type: RecipientType.TO }, attendees: [] }),
+                    eventBody(mailbox, folder, { organizer: { address: "two@partner.test", type: RecipientType.TO }, attendees: [attendee("one@partner.test")] }),
+                ]);
+            expect(result.status).toBeLessThan(300);
+
+            const rows = (await correspondentRepo.find({ mailboxUid: mailbox.uid }).toArray()).sort((a: any, b: any) => a.address.localeCompare(b.address));
+            expect(rows.map((row: any) => [row.address, row.count])).toEqual([
+                ["one@partner.test", 2],
+                ["two@partner.test", 1],
+            ]);
+        });
+
+        it("Updating an event's attendees records them again; an update that names nobody records nothing.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createCalendarEvent(mailbox.uid, folder.uid, { organizer: { address: mailbox.primarySmtpAddress, type: RecipientType.TO } });
+
+            const renamed = await request(server.getApplication())
+                .put(`${baseUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: event.uid, version: event.version, title: "Renamed" });
+            expect(renamed.status).toBe(200);
+            expect((await correspondentRepo.find({ mailboxUid: mailbox.uid }).toArray())).toEqual([]);
+
+            const invited = await request(server.getApplication())
+                .put(`${baseUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: event.uid, version: renamed.body.version, attendees: [attendee("guest@partner.test", "Gus")] });
+            expect(invited.status).toBe(200);
+            const again = await request(server.getApplication())
+                .put(`${baseUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: event.uid, version: invited.body.version, attendees: [attendee("guest@partner.test", "Gus Guest")] });
+            expect(again.status).toBe(200);
+
+            const rows = (await correspondentRepo.find({ mailboxUid: mailbox.uid }).toArray());
+            expect(rows).toHaveLength(1);
+            expect(rows[0]).toMatchObject({ address: "guest@partner.test", displayName: "Gus Guest", count: 2, lastSource: "event" });
+        });
+
+        it("Updating an event's organizer alone records the organizer.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const folder = await createFolder(mailbox.uid);
+            const event = await createCalendarEvent(mailbox.uid, folder.uid);
+
+            const result = await request(server.getApplication())
+                .put(`${baseUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: event.uid, version: event.version, organizer: { address: "boss@partner.test", displayName: "The Boss", type: RecipientType.TO } });
+            expect(result.status).toBe(200);
+            expect((await correspondentRepo.find({ mailboxUid: mailbox.uid }).toArray()).map((row: any) => row.address)).toEqual(["boss@partner.test"]);
+        });
     });
 
     it("Owner can update a calendar event they have access to.", async () => {

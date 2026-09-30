@@ -542,6 +542,13 @@ export const MATRIX_CASES: MatrixCase[] = [
         request: (s) => ({ method: "get", path: `/directory/contacts?mailboxUid=${s.mailbox.uid}&q=secret` }),
         success: (res) => ok(res) && Array.isArray(res.body) && res.body.length >= 1,
     },
+    {
+        route: "DirectoryRoute",
+        name: "Directory: correspondent suggestions from a mailbox",
+        access: "read",
+        request: (s) => ({ method: "get", path: `/directory/correspondents?mailboxUid=${s.mailbox.uid}&q=secret` }),
+        success: (res) => ok(res) && Array.isArray(res.body) && res.body.length >= 1,
+    },
     // MailboxImportRequestRoute
     {
         route: "MailboxImportRequestRoute",
@@ -616,6 +623,8 @@ export function mailAccessMatrixSuite(ctx: MailAccessMatrixContext): void {
             quotaBytes: 1_000_000_000,
             usedBytes: 0,
             oofMessage: `Away ${marker}`,
+            // Already backfilled, so the correspondent below is what the suggestions hold.
+            correspondentsBackfilledAt: new Date(),
         });
         await store.saveAcl(mailbox.uid, "Mailbox", [
             { userOrRoleId: owner.uid, actions: ["*"] },
@@ -675,6 +684,14 @@ export function mailAccessMatrixSuite(ctx: MailAccessMatrixContext): void {
                 ...kind.fields(s),
             });
         }
+        s.rows.Correspondent = await store.save("Correspondent", {
+            mailboxUid: mailbox.uid,
+            address: `${marker}@correspondents.test`,
+            displayName: `Correspondent ${marker}`,
+            lastSeenAt: new Date(),
+            count: 1,
+            lastSource: "received",
+        });
         s.rows.CalendarShareLink = await store.save("CalendarShareLink", {
             token: uuid.v4().replace(/-/g, "").padEnd(43, "x"),
             folderUid: folders.calendar.uid,

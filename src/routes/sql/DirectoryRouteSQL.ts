@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { Brackets, type SelectQueryBuilder, type Repository as TypeOrmRepository, type WhereExpressionBuilder } from "typeorm";
 import { DatabaseDecorators } from "@rapidrest/service-core";
-import { ContactSQL, DataSubjectErasureRequestSQL, DistributionListSQL, FolderSQL, MailboxSQL } from "../../sql.js";
+import { CalendarEventSQL, ContactSQL, CorrespondentSQL, DataSubjectErasureRequestSQL, DistributionListSQL, FolderSQL, MailboxSQL, MessageSQL } from "../../sql.js";
 import { BaseDirectoryRoute, escapeDirectoryLike } from "../BaseDirectoryRoute.js";
 const { Repository } = DatabaseDecorators;
 
@@ -44,6 +44,9 @@ export class DirectoryRouteSQL extends BaseDirectoryRoute<MailboxSQL, FolderSQL>
     protected mailboxClass: any = MailboxSQL;
     protected folderClass: any = FolderSQL;
     protected erasureRequestClass: any = DataSubjectErasureRequestSQL;
+    protected messageClass: any = MessageSQL;
+    protected calendarEventClass: any = CalendarEventSQL;
+    protected correspondentClass: any = CorrespondentSQL;
 
     @Repository(MailboxSQL)
     private mailboxTable?: TypeOrmRepository<MailboxSQL>;
@@ -53,6 +56,9 @@ export class DirectoryRouteSQL extends BaseDirectoryRoute<MailboxSQL, FolderSQL>
 
     @Repository(ContactSQL)
     private contactTable?: TypeOrmRepository<ContactSQL>;
+
+    @Repository(CorrespondentSQL)
+    private correspondentTable?: TypeOrmRepository<CorrespondentSQL>;
 
     protected async findMailboxCandidates(terms: string[], limit: number): Promise<MailboxSQL[]> {
         const qb = this.mailboxTable!.createQueryBuilder("e").select([
@@ -91,6 +97,17 @@ export class DirectoryRouteSQL extends BaseDirectoryRoute<MailboxSQL, FolderSQL>
         const addressPattern = (term: string): string => `%"address":"${escapeDirectoryLike(JSON.stringify(term).slice(1, -1))}%`;
         return await andTerms(qb, terms, ["e.displayName", "e.givenName", "e.surname"], ["e.emails"], addressPattern)
             .orderBy("e.displayName", "ASC")
+            .take(limit)
+            .getMany();
+    }
+
+    protected async findCorrespondentCandidates(mailboxUids: string[], terms: string[], limit: number): Promise<CorrespondentSQL[]> {
+        const qb = this.correspondentTable!.createQueryBuilder("e")
+            .select(["e.uid", "e.address", "e.displayName", "e.lastSeenAt", "e.count"])
+            .where("e.mailboxUid IN (:...mailboxUids)", { mailboxUids });
+        return await andTerms(qb, terms, ["e.displayName"], ["e.address"])
+            .orderBy("e.lastSeenAt", "DESC")
+            .addOrderBy("e.count", "DESC")
             .take(limit)
             .getMany();
     }

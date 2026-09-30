@@ -16,6 +16,7 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
+import { eventObservations, recordCorrespondents } from "../util/CorrespondentUtils.js";
 import { boundIndexedValue } from "../util/ConversationUtils.js";
 import { coerceCalendarEventDates } from "../util/DateCoercionUtils.js";
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
@@ -122,6 +123,10 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     /** The concrete `Folder` entity class, supplied by the Mongo/SQL concrete subclass - used only by
      * `resolveMailboxUidFor()` below. */
     protected abstract folderClass: any;
+
+    /** The concrete `Correspondent` entity class, supplied by the Mongo/SQL concrete subclass - the organizer and attendees of
+     * every event saved through `create()`/`update()` are recorded into it, for recipient suggestions. */
+    protected abstract correspondentClass: any;
 
     /** The concrete `Message` entity class, supplied by the Mongo/SQL concrete subclass - the invitation endpoints read a
      * message's calendar file and record the reader's answer on it. */
@@ -296,7 +301,22 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         for (const single of Array.isArray(obj) ? obj : [obj]) {
             coerceCalendarEventDates(single);
         }
-        return await super.create(obj, req, user);
+        const created: T | T[] = await super.create(obj, req, user);
+        for (const event of Array.isArray(created) ? created : [created]) {
+            await this.recordEventCorrespondents(event);
+        }
+        return created;
+    }
+
+    /** Records an event's organizer and attendees as correspondents of the mailbox it is on, for recipient suggestions.
+     * Best-effort - `recordCorrespondents()` never throws. */
+    private async recordEventCorrespondents(event: CalendarEvent): Promise<void> {
+        await recordCorrespondents(
+            { objectFactory: this._objectFactory!, correspondentClass: this.correspondentClass, mailboxClass: this.mailboxClass, logger: this.logger },
+            event.mailboxUid,
+            eventObservations(event),
+            "event",
+        );
     }
 
     /** Also serves `updateBulk()`/`updateProperty()`, which `BaseScopedChildRoute` routes through `update()`. */
@@ -309,7 +329,12 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (existing && this.isSchedulingRelevantChange(existing, obj)) {
             (obj as any).sequence = existing.sequence + 1;
         }
-        return await super.update(id, obj, req, user);
+        const updated: T = await super.update(id, obj, req, user);
+        // Only an update that names the people involved is a new sighting of them (a move or a rename is not).
+        if ((obj as any).attendees !== undefined || (obj as any).organizer !== undefined) {
+            await this.recordEventCorrespondents(updated);
+        }
+        return updated;
     }
 
     /** `true` if any of `startDate`/`endDate`/`location`/`attendees`/`status`/`recurrenceRule` in `obj`

@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ScheduledSendJob } from "../ScheduledSendJob.js";
-import { DomainMongo, FolderMongo, MailboxMongo, MessageMongo } from "../../mongo.js";
+import { CorrespondentMongo, DomainMongo, FolderMongo, MailboxMongo, MessageMongo } from "../../mongo.js";
 
 export class ScheduledSendJobMongo extends ScheduledSendJob<MessageMongo> {
     protected messageClass: any = MessageMongo;
     protected folderClass: any = FolderMongo;
     protected mailboxClass: any = MailboxMongo;
+    protected correspondentClass: any = CorrespondentMongo;
     protected domainClass: any = DomainMongo;
 }

@@ -34,6 +34,7 @@ import type { ScheduledSendJob } from "../jobs/ScheduledSendJob.js";
 import { deliveryFailureKey, describeOriginal, tryFileDeliveryFailureNotice } from "../util/DeliveryFailureNoticeUtils.js";
 import { coerceDateValue } from "../util/DateCoercionUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
+import { messageObservations, recordCorrespondents } from "../util/CorrespondentUtils.js";
 import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
 import {
     MESSAGE_LIST_FIELDS,
@@ -65,6 +66,7 @@ import {
     MessageReceiptEntry,
     MessageReportKind,
     Recipient,
+    RecipientType,
 } from "../models/types.js";
 const { Config, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
@@ -377,6 +379,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     /** Supplied by the Mongo/SQL concrete subclasses so `send()`/the read-receipt trigger can read the
      * sending/recipient mailbox's own receipt settings without depending on either backend directly. */
     protected abstract mailboxClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses: the `Correspondent` model `send()` records a sent message's recipients
+     * into, for recipient suggestions. */
+    protected abstract correspondentClass: any;
 
     /** Supplied by the Mongo/SQL concrete subclasses so `classifyRecipientTier()` can classify a receipt
      * request's recipient/requester without depending on either backend directly - same field
@@ -1163,6 +1169,14 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             encrypted,
             undelivered,
         } = await this.relayClaimed(claimed, message.folderUid, raw, envelopeTo);
+        // Recipient suggestions: everyone the message went to, once the transport has accepted it. Best-effort -
+        // `recordCorrespondents()` never throws. (`ScheduledSendJob` does the same for a deferred send.)
+        await recordCorrespondents(
+            { objectFactory: this._objectFactory!, correspondentClass: this.correspondentClass, mailboxClass: this.mailboxClass, logger: this.logger },
+            sendingMailbox!,
+            messageObservations(message, { from: false, types: [RecipientType.TO, RecipientType.CC, RecipientType.BCC] }),
+            "sent",
+        );
         // The transport relayed the message to some recipients and refused others: nobody is waiting on a failed
         // response for those, so the sender is told in their Inbox.
         if (undelivered) {

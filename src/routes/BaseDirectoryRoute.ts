@@ -6,14 +6,16 @@
 // `@Get("/contacts")` below then resolve to `GET /mail/directory` and `GET /mail/directory/contacts`.
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrors, ModelUtils, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { Contact, DataSubjectErasureRequest, DistributionList, Folder, FolderType, Mailbox } from "../models/types.js";
+import { Contact, Correspondent, DataSubjectErasureRequest, DistributionList, Folder, FolderType, Mailbox } from "../models/types.js";
+import { ensureCorrespondentsBackfilled } from "../util/CorrespondentUtils.js";
 import { hasMailAccess } from "../util/MailAccessUtils.js";
-const { Config, Inject } = ObjectDecorators;
+const { Config, Inject, Logger } = ObjectDecorators;
 const { Auth, Get, Query, RateLimit, User: AuthUser } = RouteDecorators;
 
 /** What a directory entry names: a person's mailbox, a shared mailbox, a room or equipment resource, a distribution
- * list, or (from `GET /contacts`) one of the caller's own contacts. */
-export type DirectoryEntryKind = "user" | "shared" | "room" | "equipment" | "list" | "contact";
+ * list, (from `GET /contacts`) one of the caller's own contacts, or (from `GET /correspondents`) somebody the caller's
+ * mailboxes have exchanged mail or calendar invitations with. */
+export type DirectoryEntryKind = "user" | "shared" | "room" | "equipment" | "list" | "contact" | "correspondent";
 
 /** One recipient suggestion. Deliberately nothing else - no uid, owner, policy, key or membership. */
 export interface DirectoryEntry {
@@ -146,11 +148,12 @@ function mailboxKind(mailbox: Mailbox): DirectoryEntryKind {
 
 /**
  * Recipient suggestions for compose: `GET /` searches this server's address directory (mailboxes and distribution
- * lists) and `GET /contacts` the caller's own contacts. Both match each word of `q` against the start of a name word
+ * lists), `GET /contacts` the caller's own contacts and `GET /correspondents` the people the caller's mailboxes have
+ * corresponded with (`Correspondent`). All match each word of `q` against the start of a name word
  * (split on spaces and hyphens) or the start of an address (so its local part), case-insensitively, and return only
  * `DirectoryEntry` fields.
  *
- * Both require a signed-in caller and are rate limited per caller (`DIRECTORY_MAX_ATTEMPTS` a minute each). `q` is
+ * All require a signed-in caller and are rate limited per caller (`DIRECTORY_MAX_ATTEMPTS` a minute each). `q` is
  * always matched literally: the concrete subclasses escape it for a regular expression (Mongo) or a `LIKE` pattern
  * (SQL) and never pass it through the search query parser, so it can't carry operators, and a regular expression built
  * from escaped text can't backtrack catastrophically. Results are re-checked in code with `matchesDirectoryTerms()`, so both
@@ -162,12 +165,20 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
     protected abstract mailboxClass: any;
     protected abstract folderClass: any;
     protected abstract erasureRequestClass: any;
+    /** The `Message`, `CalendarEvent` and `Correspondent` model classes: `GET /correspondents` reads the first two, once per
+     * mailbox, to build the third (`ensureCorrespondentsBackfilled()`). */
+    protected abstract messageClass: any;
+    protected abstract calendarEventClass: any;
+    protected abstract correspondentClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
     private mailboxRepo?: RepoUtils<M>;
     private folderRepo?: RepoUtils<F>;
     private erasureRepo?: RepoUtils<DataSubjectErasureRequest>;
+
+    @Logger
+    private logger: any;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
@@ -185,6 +196,10 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
     /** Contacts that aren't soft-deleted in `folderUids` matching every term by `displayName`, `givenName`, `surname`
      * or one of `emails`' addresses, at most `limit`. */
     protected abstract findContactCandidates(folderUids: string[], terms: string[], limit: number): Promise<Contact[]>;
+
+    /** Correspondents in `mailboxUids` matching every term by `displayName` or `address`, most recently seen first and then
+     * most often seen, at most `limit`. Only `address`, `displayName`, `lastSeenAt` and `count` are read. */
+    protected abstract findCorrespondentCandidates(mailboxUids: string[], terms: string[], limit: number): Promise<Correspondent[]>;
 
     private async init(): Promise<void> {
         if (!this.mailboxRepo) {
@@ -308,5 +323,69 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
             }
         }
         return rankDirectoryEntries(entries, query.text, query.limit);
+    }
+
+    /**
+     * Searches the people the caller's mailboxes have corresponded with: everyone who sent or received mail with, or shared a
+     * calendar event with, the mailboxes the caller owns plus `mailboxUid` (the mailbox being composed from) when the caller
+     * may read it - an unreadable `mailboxUid` is ignored, and a caller with no mailbox gets `[]`. Entries have kind
+     * `correspondent`, one per address across those mailboxes, most recently seen first and then most often seen.
+     *
+     * The first time a mailbox is searched its correspondents are built from the mail and events it already holds
+     * (`ensureCorrespondentsBackfilled()`, bounded), so the first search of an old mailbox is slower than the rest.
+     */
+    @Auth(["jwt"])
+    @RateLimit({ perUser: true, maxAttempts: DIRECTORY_MAX_ATTEMPTS, windowSeconds: DIRECTORY_WINDOW_SECONDS })
+    @Get("/correspondents")
+    public async searchCorrespondents(
+        @Query("q") q: unknown,
+        @Query("limit") limit: unknown,
+        @Query("mailboxUid") mailboxUid: unknown,
+        @AuthUser user?: JWTUser,
+    ): Promise<DirectoryEntry[]> {
+        const query: DirectoryQuery = parseDirectoryQuery(q, limit);
+        await this.init();
+        const mailboxes = new Map<string, M>((await this.ownedMailboxes(user!)).map((mailbox) => [mailbox.uid, mailbox]));
+        if (typeof mailboxUid === "string" && mailboxUid && !mailboxes.has(mailboxUid)) {
+            if (await hasMailAccess(this.aclUtils, this.trustedRoles, user, mailboxUid, ACLAction.READ)) {
+                const extra: M | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
+                if (extra) {
+                    mailboxes.set(extra.uid, extra);
+                }
+            }
+        }
+        if (mailboxes.size === 0) {
+            return [];
+        }
+        for (const mailbox of mailboxes.values()) {
+            await ensureCorrespondentsBackfilled(
+                {
+                    objectFactory: this._objectFactory!,
+                    correspondentClass: this.correspondentClass,
+                    mailboxClass: this.mailboxClass,
+                    messageClass: this.messageClass,
+                    folderClass: this.folderClass,
+                    calendarEventClass: this.calendarEventClass,
+                    logger: this.logger,
+                },
+                mailbox,
+            );
+        }
+        const rows: Correspondent[] = await this.findCorrespondentCandidates([...mailboxes.keys()], query.terms, query.limit * 2);
+        // The same person in several mailboxes is one suggestion: the candidates are ordered per query, so re-order across
+        // mailboxes (most recently seen, then most often) before the first of each address is kept.
+        const time = (row: Correspondent): number => new Date(row.lastSeenAt).getTime() || 0;
+        const ordered: Correspondent[] = rows
+            .filter((row) => matchesDirectoryTerms(query.terms, directoryNameWords(row.displayName), row.address))
+            .sort((a, b) => time(b) - time(a) || b.count - a.count);
+        const seen = new Set<string>();
+        const entries: DirectoryEntry[] = [];
+        for (const row of ordered) {
+            if (!seen.has(row.address)) {
+                seen.add(row.address);
+                entries.push({ displayName: row.displayName, address: row.address, kind: "correspondent" });
+            }
+        }
+        return entries.slice(0, query.limit);
     }
 }

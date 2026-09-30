@@ -34,10 +34,11 @@ import { DistributionListSQL } from "../../src/models/sql/DistributionListSQL.js
 import { DomainSQL } from "../../src/models/sql/DomainSQL.js";
 import { EscrowAccessRequestSQL } from "../../src/models/sql/EscrowAccessRequestSQL.js";
 import { FocusedInboxOverrideSQL } from "../../src/models/sql/FocusedInboxOverrideSQL.js";
+import { CorrespondentSQL } from "../../src/models/sql/CorrespondentSQL.js";
+import { MailboxSQL } from "../../src/models/sql/MailboxSQL.js";
 import { FolderSQL } from "../../src/models/sql/FolderSQL.js";
 import { IngestQueueEntrySQL } from "../../src/models/sql/IngestQueueEntrySQL.js";
 import { KeyVaultSQL } from "../../src/models/sql/KeyVaultSQL.js";
-import { MailboxSQL } from "../../src/models/sql/MailboxSQL.js";
 import { MessageSQL } from "../../src/models/sql/MessageSQL.js";
 import { NoteSQL } from "../../src/models/sql/NoteSQL.js";
 import { QuarantineEntrySQL } from "../../src/models/sql/QuarantineEntrySQL.js";
@@ -576,6 +577,48 @@ describe("SQL model default construction", () => {
         expect(obj.dkimPublicKey).toBe("MIGfMA0GCSq");
         expect(obj.dmarcPolicy).toBe("quarantine");
         expect(obj.dmarcReportEmail).toBe("dmarc@example.com");
+    });
+
+    it("CorrespondentSQL falls back to class defaults when constructed with no data.", () => {
+        const obj = new CorrespondentSQL();
+
+        expect(obj.mailboxUid).toBe("");
+        expect(obj.address).toBe("");
+        expect(obj.displayName).toBe("");
+        expect(obj.lastSeenAt).toBeInstanceOf(Date);
+        expect(obj.count).toBe(0);
+        expect(obj.lastSource).toBe("received");
+    });
+
+    it("CorrespondentSQL applies provided values and keeps defaults for omitted fields.", () => {
+        const seen = new Date("2026-01-02T03:04:05Z");
+        const obj = new CorrespondentSQL({
+            mailboxUid: "mailbox-1",
+            address: "bob@example.com",
+            displayName: "Bob",
+            lastSeenAt: seen,
+            count: 3,
+            lastSource: "event",
+        });
+
+        expect(obj.mailboxUid).toBe("mailbox-1");
+        expect(obj.address).toBe("bob@example.com");
+        expect(obj.displayName).toBe("Bob");
+        expect(obj.lastSeenAt).toBe(seen);
+        expect(obj.count).toBe(3);
+        expect(obj.lastSource).toBe("event");
+
+        const partial = new CorrespondentSQL({ mailboxUid: "mailbox-1" });
+        expect(partial.address).toBe("");
+        expect(partial.count).toBe(0);
+        expect(partial.lastSource).toBe("received");
+    });
+
+    it("MailboxSQL.correspondentsBackfilledAt is unset by default and kept when provided.", () => {
+        expect(new MailboxSQL().correspondentsBackfilledAt).toBeUndefined();
+        expect(new MailboxSQL({}).correspondentsBackfilledAt).toBeUndefined();
+        const at = new Date("2026-01-02T03:04:05Z");
+        expect(new MailboxSQL({ correspondentsBackfilledAt: at }).correspondentsBackfilledAt).toBe(at);
     });
 
     it("FocusedInboxOverrideSQL falls back to class defaults when constructed with no data.", () => {

@@ -32,6 +32,7 @@ import { MailSignatureMongo } from "../../../src/models/mongo/MailSignatureMongo
 import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
 import { NoteMongo } from "../../../src/models/mongo/NoteMongo.js";
+import { CorrespondentMongo } from "../../../src/models/mongo/CorrespondentMongo.js";
 import { OofReplySuppressionMongo } from "../../../src/models/mongo/OofReplySuppressionMongo.js";
 import { PluginMongo } from "../../../src/models/mongo/PluginMongo.js";
 import { PluginRegistry } from "../../../src/plugins/PluginRegistry.js";
@@ -66,6 +67,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
     let mailFilterRuleRepo: MongoRepository<MailFilterRuleMongo>;
     let mailSignatureRepo: MongoRepository<MailSignatureMongo>;
     let oofReplySuppressionRepo: MongoRepository<OofReplySuppressionMongo>;
+    let correspondentRepo: MongoRepository<CorrespondentMongo>;
     let pluginMailboxDataRepo: MongoRepository<PluginMailboxDataMongo>;
     let pluginRepo: MongoRepository<PluginMongo>;
     let quarantineEntryRepo: MongoRepository<QuarantineEntryMongo>;
@@ -117,6 +119,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         models.set("MailFilterRuleMongo", MailFilterRuleMongo);
         models.set("MailSignatureMongo", MailSignatureMongo);
         models.set("OofReplySuppressionMongo", OofReplySuppressionMongo);
+        models.set("CorrespondentMongo", CorrespondentMongo);
         models.set("PluginMailboxDataMongo", PluginMailboxDataMongo);
         models.set("PluginMongo", PluginMongo);
         objectFactory.register(PluginMailboxDataMongo);
@@ -152,6 +155,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         mailFilterRuleRepo = conn.getMongoRepository("MailFilterRuleMongo");
         mailSignatureRepo = conn.getMongoRepository("MailSignatureMongo");
         oofReplySuppressionRepo = conn.getMongoRepository("OofReplySuppressionMongo");
+        correspondentRepo = conn.getMongoRepository("CorrespondentMongo");
         pluginMailboxDataRepo = conn.getMongoRepository("PluginMailboxDataMongo");
         pluginRepo = conn.getMongoRepository("PluginMongo");
         quarantineEntryRepo = conn.getMongoRepository("QuarantineEntryMongo");
@@ -189,6 +193,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
             mailFilterRuleRepo,
             mailSignatureRepo,
             oofReplySuppressionRepo,
+            correspondentRepo,
             pluginMailboxDataRepo,
             pluginRepo,
             quarantineEntryRepo,
@@ -314,6 +319,9 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
             new MailSignatureMongo({ mailboxUid: mailbox.uid, name: "A Signature", contentHtml: "<p>Sig</p>", isDefaultForNewMessages: true, isDefaultForReplyForward: false }),
         );
         await oofReplySuppressionRepo.save(new OofReplySuppressionMongo({ mailboxUid: mailbox.uid, senderAddress: "sender@example.com", lastRepliedAt: new Date() }));
+        await correspondentRepo.save(new CorrespondentMongo({ mailboxUid: mailbox.uid, address: "friend@example.com", displayName: "A Friend", count: 2 }));
+        // Another mailbox's correspondent survives.
+        await correspondentRepo.save(new CorrespondentMongo({ mailboxUid: "another-mailbox", address: "friend@example.com", count: 1 }));
         await pluginMailboxDataRepo.save(
             new PluginMailboxDataMongo({ mailboxUid: mailbox.uid }),
         );
@@ -363,9 +371,9 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         expect(updated!.status).toBe("completed");
         // folder, message, attachment, contact, contactList, calendarEvent, task, note,
         // focusedInboxOverride, taskList, label, mailFilterRule, mailSignature,
-        // oofReplySuppression, plugin mailbox data, quarantineEntry, ingestQueueEntry, dataExportRequest,
-        // mailboxImportRequest, mailbox = 20
-        expect(updated!.purgedCount).toBe(20);
+        // oofReplySuppression, correspondent, plugin mailbox data, quarantineEntry, ingestQueueEntry, dataExportRequest,
+        // mailboxImportRequest, mailbox = 21
+        expect(updated!.purgedCount).toBe(21);
 
         expect(await mailboxRepo.findOne({ uid: mailbox.uid } as any)).toBeNull();
         expect(await folderRepo.findOne({ uid: folder.uid } as any)).toBeNull();
@@ -382,6 +390,8 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         expect((await mailFilterRuleRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await mailSignatureRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await oofReplySuppressionRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
+        expect((await correspondentRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
+        expect((await correspondentRepo.find({ mailboxUid: "another-mailbox" }).toArray()).length).toBe(1);
         expect((await pluginMailboxDataRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await quarantineEntryRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);
         expect((await ingestQueueEntryRepo.find({ mailboxUid: mailbox.uid }).toArray()).length).toBe(0);

@@ -8,6 +8,7 @@ import {
     AttachmentSQL,
     CalendarEventSQL,
     ContactSQL,
+    CorrespondentSQL,
     DomainSQL,
     FocusedInboxOverrideSQL,
     FolderSQL,
@@ -47,6 +48,7 @@ export class ScanQueueJobSQL extends ScanQueueJob<
     protected oofReplySuppressionClass: any = OofReplySuppressionSQL;
     protected focusedInboxOverrideClass: any = FocusedInboxOverrideSQL;
     protected contactClass: any = ContactSQL;
+    protected correspondentClass: any = CorrespondentSQL;
     protected domainClass: any = DomainSQL;
     protected keyVaultClass: any = KeyVaultSQL;
 

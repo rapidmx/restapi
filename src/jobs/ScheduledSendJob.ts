@@ -20,11 +20,12 @@ import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
+import { messageObservations, recordCorrespondents } from "../util/CorrespondentUtils.js";
 import { prepareOutboundMime, scanAndRelay, seedReceiptStatus } from "../util/MailSendUtils.js";
 import { deriveMessageListFields } from "../util/MessageListUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-import { FolderType, Mailbox, Message } from "../models/types.js";
+import { FolderType, Mailbox, Message, RecipientType } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** Maximum length of a persisted `scheduledSendError`. */
@@ -115,6 +116,8 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
     protected abstract messageClass: any;
     protected abstract folderClass: any;
     protected abstract mailboxClass: any;
+    /** The `Correspondent` model class: the recipients of each message relayed are recorded into it, for recipient suggestions. */
+    protected abstract correspondentClass: any;
 
     /** The `Domain` class, for classifying recipients when a receipt is requested. Without it no receipt is requested. */
     protected domainClass?: any;
@@ -436,6 +439,15 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 );
                 sanitizedHtmlBlobKey = result.sanitizedHtmlBlobKey ?? sanitizedHtmlBlobKey;
                 undelivered = result.undelivered;
+                // Recipient suggestions: everyone the message went to. Best-effort - `recordCorrespondents()` never throws.
+                if (sendingMailbox) {
+                    await recordCorrespondents(
+                        { objectFactory: this._objectFactory!, correspondentClass: this.correspondentClass, mailboxClass: this.mailboxClass, logger: this.logger },
+                        sendingMailbox,
+                        messageObservations(claimed, { from: false, types: [RecipientType.TO, RecipientType.CC, RecipientType.BCC] }),
+                        "sent",
+                    );
+                }
             } catch (err: any) {
                 if (!relayedAt) {
                     await this.recordFailedAttempt(claimed, dueAt, err, {});
