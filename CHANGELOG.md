@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-09-30
+
+### Changed
+- Find plugins in a namespace even when the npm registry's scope: search index lags behind or answers nothing, by also searching for the scope's name and merging the results
+
 ## [0.27.0] - 2026-09-30
 
 ### Added
@@ -1265,7 +1270,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.27.1...HEAD
+[0.27.1]: https://github.com/rapidmx/restapi/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/rapidmx/restapi/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/rapidmx/restapi/compare/v0.25.2...v0.26.0
 [0.25.2]: https://github.com/rapidmx/restapi/compare/v0.25.1...v0.25.2
