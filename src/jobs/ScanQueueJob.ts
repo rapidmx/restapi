@@ -9,6 +9,7 @@ import { BackgroundService, ModelUtils, NotificationUtils, ObjectFactory, RepoUt
 import { asEntity } from "../util/EntityUtils.js";
 import { htmlToPlainText } from "../util/EventDescriptionUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
+import { MailEventStream } from "../events/MailEventStream.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { resolveDeliveryVerdict, ScanPipeline, ScanPipelineAttachmentResult, ScanPipelineResult } from "../scan/ScanPipeline.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
@@ -250,6 +251,10 @@ export abstract class ScanQueueJob<
     /** Publishes a live-update notification (see `push/MailPushRoute.ts`) once a message is delivered. */
     @Inject(NotificationUtils)
     private notificationUtils?: NotificationUtils;
+
+    /** Publishes `message.delivered` to the mail event stream plugins read (`events/MailEventStream.ts`). */
+    @Inject(MailEventStream)
+    private mailEventStream?: MailEventStream;
 
     /** Backs the real federated-peer check `classifyRecipientTier()` calls (`util/DomainUtils.ts`'s
      * `createFederatedPeerCheck()`) - same DI token `BaseDomainRoute`/`DomainVerificationJob` already
@@ -822,6 +827,9 @@ export abstract class ScanQueueJob<
             // by whether this attempt filed the message - so a retry of an attempt that filed the message but failed
             // before replying still replies. iTIP processing is idempotent (sequence/state checks), so a retry re-applies
             // it safely.
+            if (delivered) {
+                await this.publishDelivered(entry, targetUid, result, verdict === "junk");
+            }
             if (verdict === "deliver" && delivered) {
                 await this.maybeSendAutoReplyOnce(entry, raw, result);
                 await this.maybeProcessItipMessage(entry, raw, result);
@@ -831,6 +839,31 @@ export abstract class ScanQueueJob<
         }
 
         await this.markDelivered(claim);
+    }
+
+    /**
+     * Tells plugins a message was filed (`message.delivered` on `events/MailEventStream.ts`), with its bounce or feedback report
+     * when it is one. A retried entry that already filed its message publishes again - the stream is at-least-once, and its
+     * consumers dedupe by `messageUid`. Never throws: `publish()` swallows a Redis failure.
+     */
+    private async publishDelivered(entry: Q, messageUid: string, result: ScanPipelineResult, junk: boolean): Promise<void> {
+        await this.mailEventStream?.publish({
+            type: "message.delivered",
+            mailboxUid: entry.mailboxUid,
+            messageUid,
+            junk,
+            envelopeFrom: entry.envelopeFrom,
+            envelopeTo: [...entry.envelopeTo],
+            fromAddress: result.fromAddress,
+            subject: result.subject,
+            messageId: result.messageIdHeader,
+            inReplyTo: result.inReplyTo,
+            references: result.references,
+            autoSubmitted: result.autoSubmittedHeader,
+            precedence: result.precedenceHeader,
+            deliveryStatusReport: result.deliveryStatusReport,
+            feedbackReport: result.feedbackReport,
+        });
     }
 
     /** What `recordCorrespondents()` needs to reach the datastore from this job. */

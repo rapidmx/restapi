@@ -5,6 +5,7 @@
 import { simpleParser, ParsedMail, Attachment as ParsedAttachment } from "mailparser";
 import { ObjectDecorators } from "@rapidrest/core";
 import { AvVerdict, Recipient, SpamVerdict } from "../models/types.js";
+import { DeliveryStatusReport, FeedbackReport, formatDeliveryStatusPreview, parseDeliveryStatusReport, parseFeedbackReport } from "../util/DsnParser.js";
 import { isEncryptedBody } from "../util/SmimeUtils.js";
 import { parseHeaderRecipients, parseSenderDisplayName } from "../util/RecipientUtils.js";
 import { AvScanProvider, AvScanResult } from "./AvScanProvider.js";
@@ -112,6 +113,13 @@ export interface ScanPipelineResult {
      * message is itself an inbound MDN) - see `ScanQueueJob.processReceipt()` and
      * `util/ReceiptUtils.ts`'s `parseDispositionNotification()`, which actually interprets it. */
     dispositionNotificationPart?: string;
+    /** The parsed delivery status report, when this message is a bounce (`multipart/report; report-type=delivery-status`) - see
+     * `util/DsnParser.ts`. Published with the delivery on the mail event stream (`events/MailEventStream.ts`), which is how a
+     * plugin that sent the bounced message learns of it. */
+    deliveryStatusReport?: DeliveryStatusReport;
+    /** The parsed abuse/feedback report, when this message is one (ARF: `multipart/report; report-type=feedback-report`) - see
+     * `util/DsnParser.ts`. Its origin is unverified; see `parseFeedbackReport()`. */
+    feedbackReport?: FeedbackReport;
 }
 
 /** Strips a `Message-ID`-shaped header value's surrounding angle brackets, if present - mailparser
@@ -227,7 +235,9 @@ export class ScanPipeline {
         const sanitizedHtml: string | undefined =
             !encrypted && typeof parsed.html === "string" ? this.sanitize(parsed.html) : undefined;
 
-        const bodyPreview: string | undefined = encrypted || options.skipPreview ? undefined : this.derivePreview(parsed);
+        const deliveryStatusReport: DeliveryStatusReport | undefined = encrypted ? undefined : parseDeliveryStatusReport(parsed);
+        const feedbackReport: FeedbackReport | undefined = encrypted ? undefined : parseFeedbackReport(parsed);
+        const bodyPreview: string | undefined = encrypted || options.skipPreview ? undefined : this.derivePreview(parsed, deliveryStatusReport);
         const parsedFrom: string | undefined = parsed.from?.text;
         const fromDisplayName: string | undefined = parseSenderDisplayName(parsed.from);
         const fromAddress: string | undefined = parsed.from?.value?.[0]?.address;
@@ -275,6 +285,8 @@ export class ScanPipeline {
             references,
             dispositionNotificationTo,
             dispositionNotificationPart,
+            deliveryStatusReport,
+            feedbackReport,
         };
     }
 
@@ -285,52 +297,15 @@ export class ScanPipeline {
      * message, so an empty `parsed.text` means there is no plain-text part.
      *
      * A delivery status notification (a bounce: `multipart/report; report-type=delivery-status`) is previewed by what its
-     * report says instead (`deriveDeliveryStatusPreview()`): its notification text opens with a page of boilerplate ("This is
+     * report says instead (`formatDeliveryStatusPreview()`, `util/DsnParser.ts`): its notification text opens with a page of boilerplate ("This is
      * the mail system at host ...") that would fill the preview before the reason for the failure is reached.
      */
-    private derivePreview(parsed: ParsedMail): string | undefined {
-        const report: string | undefined = this.deriveDeliveryStatusPreview(parsed);
-        if (report) {
-            return report.slice(0, BODY_PREVIEW_MAX_LENGTH);
+    private derivePreview(parsed: ParsedMail, deliveryStatusReport: DeliveryStatusReport | undefined): string | undefined {
+        if (deliveryStatusReport) {
+            return formatDeliveryStatusPreview(deliveryStatusReport).slice(0, BODY_PREVIEW_MAX_LENGTH);
         }
         const text: string | undefined = parsed.text || (typeof parsed.html === "string" ? htmlPreview(parsed.html, BODY_PREVIEW_MAX_LENGTH) : parsed.text);
         return text?.trim().slice(0, BODY_PREVIEW_MAX_LENGTH);
-    }
-
-    /**
-     * One line per recipient of the delivery status report (RFC 3464) of a `multipart/report; report-type=delivery-status`
-     * message, joined with `; `: `<Final-Recipient>: <Action> (<Status>) - <Diagnostic-Code>`, e.g. `nobody@x.example: failed
-     * (5.1.1) - 550 5.1.1 <nobody@x.example>: Recipient address rejected: User unknown`. A field the report lacks is left out,
-     * folded fields are unfolded, and a group with no `Final-Recipient` (the per-message group) is skipped. `undefined` when the
-     * message is not such a report or it names no recipient.
-     *
-     * mailparser does not expose the `message/delivery-status` part as an attachment: it appends it to `parsed.text`, after the
-     * notification, where it starts at the report's mandatory `Reporting-MTA` field.
-     */
-    private deriveDeliveryStatusPreview(parsed: ParsedMail): string | undefined {
-        const contentType: any = parsed.headers.get("content-type");
-        const start: number = typeof parsed.text === "string" ? parsed.text.search(/^Reporting-MTA:/im) : -1;
-        if (contentType?.value !== "multipart/report" || contentType.params?.["report-type"] !== "delivery-status" || start < 0) {
-            return undefined;
-        }
-        const lines: string[] = [];
-        for (const group of parsed.text!.slice(start).replace(/\r\n/g, "\n").split(/\n{2,}/)) {
-            const fields: Map<string, string> = new Map();
-            for (const line of group.replace(/\n[ \t]+/g, " ").split("\n")) {
-                const colon: number = line.indexOf(":");
-                if (colon > 0) {
-                    fields.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
-                }
-            }
-            const recipient: string | undefined = fields.get("final-recipient")?.replace(/^[^;]*;\s*/, "");
-            if (recipient) {
-                const action: string | undefined = fields.get("action");
-                const status: string | undefined = fields.get("status");
-                const diagnostic: string | undefined = fields.get("diagnostic-code")?.replace(/^[^;]*;\s*/, "");
-                lines.push(`${recipient}:${action ? ` ${action}` : ""}${status ? ` (${status})` : ""}${diagnostic ? ` - ${diagnostic}` : ""}`);
-            }
-        }
-        return lines.length > 0 ? lines.join("; ") : undefined;
     }
 
     /** Finds this message's `text/calendar` part (an iTIP invite/reply/cancel), if it has one - mailparser

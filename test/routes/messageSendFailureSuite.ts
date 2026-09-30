@@ -7,6 +7,7 @@
 // double, which refuses `reject@example.com` outright and `partial-reject@example.com` alone, with Postfix-style diagnostics.
 import { request } from "@rapidrest/service-core/test";
 import { simpleParser } from "mailparser";
+import { MailEventStream } from "../../src/events/MailEventStream.js";
 import { FolderType } from "../../src/models/types.js";
 import type { InMemoryBlobStore, RecordingMailTransport } from "../testDoubles.js";
 
@@ -72,6 +73,24 @@ export function messageSendFailureSuite(ctx: MessageSendFailureSuiteContext): vo
                 ],
                 error: { message: "The recording transport refused the message.", code: "EREJECT", command: "RCPT TO" },
             });
+        });
+
+        it("tells plugins what the transport did: message.sent for the accepted recipients, send.failed for the refused one", async () => {
+            const publish = vi.spyOn(MailEventStream.prototype, "publish").mockResolvedValue();
+            try {
+                const { mailbox, message } = await draftTo(["ok@example.com", "partial-reject@example.com"]);
+
+                expect((await send(message.uid)).status).toBe(200);
+
+                const events = publish.mock.calls.map(([event]) => event);
+                expect(events.map((event) => event.type)).toEqual(["message.sent", "send.failed"]);
+                expect(events[0]).toMatchObject({ mailboxUid: mailbox.uid, messageUid: message.uid, source: "compose", envelopeFrom: "owner@example.com" });
+                expect(events[0].recipients).not.toContain("partial-reject@example.com");
+                expect(events[1].failures).toEqual([expect.objectContaining({ recipient: "partial-reject@example.com", temporary: false })]);
+                expect(events[1].messageId).toBe(events[0].messageId);
+            } finally {
+                publish.mockRestore();
+            }
         });
 
         it("leaves the message in Drafts, releasing its claim, sends it to nobody, and files no notice - the caller is told directly", async () => {

@@ -19,6 +19,7 @@ import {
 import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
+import { MailEventStream } from "../events/MailEventStream.js";
 import type { SpamScanProvider } from "../scan/SpamScanProvider.js";
 import { pointInlineImages, SanitizedBodyLoader, type InlineImageMode } from "../scan/SanitizedBody.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
@@ -443,6 +444,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
     @Inject(ScanPipeline)
     private scanPipeline?: ScanPipeline;
+
+    /** Where `message.sent`/`send.failed` go (`events/MailEventStream.ts`). */
+    @Inject(MailEventStream)
+    private mailEventStream?: MailEventStream;
 
     /** Backs the real federated-peer check `classifyRecipientTier()` calls (`util/DomainUtils.ts`'s
      * `createFederatedPeerCheck()`) - same DI token `BaseDomainRoute`/`DomainVerificationJob` already
@@ -1360,7 +1365,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             },
         };
         try {
-            return await scanAndRelay(raw, claimed.from.address, envelopeTo, this.scanPipeline!, trackingTransport, this.blobStore!);
+            return await scanAndRelay(raw, claimed.from.address, envelopeTo, this.scanPipeline!, trackingTransport, this.blobStore!, {
+                stream: this.mailEventStream,
+                mailboxUid: claimed.mailboxUid,
+                messageUid: claimed.uid,
+                source: "compose",
+            });
         } catch (err) {
             /* v8 ignore start -- only a blob store failure after the transport accepted the message */
             if (accepted) {

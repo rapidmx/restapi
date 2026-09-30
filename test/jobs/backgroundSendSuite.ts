@@ -6,6 +6,7 @@
 // pool, and a crash at each step - identical on both backends. `ScheduledSendJob{Mongo,SQL}.test.ts` call this from inside
 // their own `describe`, after their `beforeEach` has created the mailbox and its Outbox.
 import { NotificationUtils } from "@rapidrest/service-core";
+import { MailEventStream } from "../../src/events/MailEventStream.js";
 import { FolderType, RecipientType } from "../../src/models/types.js";
 import type { RecordingMailTransport } from "../testDoubles.js";
 
@@ -79,6 +80,27 @@ export function backgroundSendSuite(ctx: BackgroundSendSuiteContext): void {
                 recipients: ["recipient@example.com"],
                 attempt: 1,
             });
+        });
+
+        it("tells plugins it was sent: message.sent on the mail event stream, from the scheduled sender, with the accepted recipients", async () => {
+            const publish = vi.spyOn(MailEventStream.prototype, "publish").mockResolvedValue();
+            try {
+                const message = await dueMessage();
+
+                await ctx.job().enqueue(message.uid);
+
+                expect(publish).toHaveBeenCalledWith(
+                    expect.objectContaining({
+                        type: "message.sent",
+                        mailboxUid: ctx.mailboxUid(),
+                        messageUid: message.uid,
+                        recipients: ["recipient@example.com"],
+                        source: "scheduled",
+                    }),
+                );
+            } finally {
+                publish.mockRestore();
+            }
         });
 
         it("leaves a message that is not due alone: one held for later, one with no time (cancelled), one already filed, one that is gone", async () => {

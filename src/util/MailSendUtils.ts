@@ -8,6 +8,7 @@ import { ApiErrors } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import type { Mailbox, MessageReceiptEntry, PublicKey } from "../models/types.js";
+import { type MailSendContext, publishTransportOutcome } from "../events/MailEventStream.js";
 import { MailRelayError, type MailRelayFailureDetails, relayFailureDetails } from "../transport/TransportResultUtils.js";
 import { normalizeAddress } from "./AddressUtils.js";
 import { deriveConversationId } from "./ConversationUtils.js";
@@ -79,6 +80,9 @@ export interface ScanAndRelayResult {
  * transport's own diagnostic text (SMTP/enhanced status codes, responses, what `sendmail` printed) in `details`.
  * A transport that relays to some recipients and refuses others is not a failure: the refused ones are reported in the
  * result's `undelivered`.
+ *
+ * With `events` (and a stream in it), what the transport did is published on the mail event stream - `message.sent` for the
+ * accepted recipients and `send.failed` for the refused ones (`events/MailEventStream.ts`'s `publishTransportOutcome()`).
  */
 export async function scanAndRelay(
     raw: Buffer,
@@ -87,6 +91,7 @@ export async function scanAndRelay(
     scanPipeline: ScanPipeline,
     mailTransport: any,
     blobStore: BlobStore,
+    events?: MailSendContext,
 ): Promise<ScanAndRelayResult> {
     let finalRaw = raw;
     const existingMessageId = extractHeader(raw, "Message-ID");
@@ -107,6 +112,7 @@ export async function scanAndRelay(
     }
 
     const transportResult = await mailTransport.send({ raw: finalRaw, envelopeFrom, envelopeTo });
+    await publishTransportOutcome(events, { messageId, envelopeFrom, envelopeTo }, transportResult);
     if (transportResult.accepted.length === 0) {
         throw new MailRelayError(relayFailureDetails(transportResult, envelopeTo, mailTransport.name));
     }

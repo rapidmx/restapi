@@ -18,6 +18,7 @@ import {
 } from "../util/DeliveryFailureNoticeUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
+import { MailEventStream } from "../events/MailEventStream.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { messageObservations, recordCorrespondents } from "../util/CorrespondentUtils.js";
@@ -137,6 +138,10 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
 
     @Inject(ScanPipeline)
     private scanPipeline?: ScanPipeline;
+
+    /** Where `message.sent`/`send.failed` go (`events/MailEventStream.ts`). */
+    @Inject(MailEventStream)
+    private mailEventStream?: MailEventStream;
 
     @Inject(NotificationUtils)
     private notificationUtils?: NotificationUtils;
@@ -427,6 +432,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     this.scanPipeline!,
                     trackingTransport,
                     this.blobStore!,
+                    { stream: this.mailEventStream, mailboxUid: claimed.mailboxUid, messageUid: claimed.uid, source: "scheduled" },
                 );
                 relayedRaw = result.raw;
                 relayInfo = { encrypted: result.encrypted, inReplyTo: result.inReplyTo, references: result.references };

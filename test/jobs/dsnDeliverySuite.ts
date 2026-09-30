@@ -6,6 +6,7 @@
 // `test/jobs/{mongo,sql}/ScanQueueJob*.test.ts` supply the real job over a real datastore, with the shared test doubles
 // (a real `ScanPipeline` over always-clean spam/AV providers).
 import { simpleParser } from "mailparser";
+import { MailEventStream } from "../../src/events/MailEventStream.js";
 import { IngestStatus } from "../../src/models/types.js";
 import { buildDeliveryFailureNotice } from "../../src/util/DeliveryFailureNoticeUtils.js";
 import { postfixDsn } from "../fixtures/postfixDsn.js";
@@ -181,6 +182,31 @@ export function dsnDeliverySuite(ctx: DsnDeliverySuiteContext): void {
             await ctx.ingest(Buffer.from("To: recipient@example.com\r\nSubject: Orphan\r\n\r\nHi\r\n"), "");
 
             expect((await ctx.inbox())[0].from.address).toBe("");
+        });
+
+        it("Tells plugins about the bounce: message.delivered with the parsed report, the envelope recipient kept as given", async () => {
+            const publish = vi.spyOn(MailEventStream.prototype, "publish").mockResolvedValue();
+            try {
+                await ctx.ingest(DSN_UNKNOWN_RECIPIENT_550, "", ["alice+tok@owned.lab"]);
+
+                const message = (await ctx.inbox())[0];
+                expect(publish).toHaveBeenCalledTimes(1);
+                expect(publish.mock.calls[0][0]).toMatchObject({
+                    type: "message.delivered",
+                    messageUid: message.uid,
+                    junk: false,
+                    envelopeFrom: "",
+                    envelopeTo: ["alice+tok@owned.lab"],
+                    fromAddress: "MAILER-DAEMON@mail.owned.lab",
+                    messageId: message.messageId,
+                    deliveryStatusReport: {
+                        originalMessageId: "6ffffb17-1dc0-a0c6-0ab8-173f954579ce@owned.lab",
+                        recipients: [expect.objectContaining({ finalRecipient: "nobody@refuse.lab", status: "5.1.1", outcome: "hard_bounce" })],
+                    },
+                });
+            } finally {
+                publish.mockRestore();
+            }
         });
     });
 }
