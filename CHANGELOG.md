@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-09-30
+
+### Added
+- Added a correspondents search to the directory so addressing suggests anyone the user has corresponded with, not only their contacts
+
+### Changed
+- Remember the people each mailbox has exchanged mail or shared an event with, from delivered, sent and scheduled mail and from calendar events and invitations
+- Build a mailbox's list of correspondents from its existing mail and events the first time it is searched
+- Delete a mailbox's correspondents when its data is erased
+- Pin undici (via node-gyp) to a fixed version in resolutions - the validate job's yarn npm audit now fails on a high severity advisory (denial of service through an unrequested WebSocket subprotocol) in the 6.27.0 the ^6.25.0 range resolved to
+
 ## [0.25.2] - 2026-09-29
 
 ### Added
@@ -1241,7 +1252,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.25.2...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/rapidmx/restapi/compare/v0.25.2...v0.26.0
 [0.25.2]: https://github.com/rapidmx/restapi/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/rapidmx/restapi/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/rapidmx/restapi/compare/v0.24.0...v0.25.0
