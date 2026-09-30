@@ -453,7 +453,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         }
     }
 
-    private notify(scopeUid: string | undefined, action: "create" | "update" | "delete", data: any): void {
+    protected notify(scopeUid: string | undefined, action: "create" | "update" | "delete", data: any): void {
         /* v8 ignore else -- unreachable via real usage: every call site derives `scopeUid` from a record that
            already passed `requirePermission()` (which throws on a falsy scope) earlier in the same method, so
            it is always truthy by the time `notify()` runs. The `string | undefined` parameter type (matching

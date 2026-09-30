@@ -2726,6 +2726,10 @@ export interface PluginUiNavItem {
     /** The name of a `react-icons/hi2` icon, e.g. `HiOutlineCalendarDays` - the same icon set the shells use. A shell
      * that doesn't know the name shows a generic icon; the settings sidebar shows none. */
     icon?: string;
+    /** App rail only: an API path (without the `/api` prefix, e.g. `/mail/video-meetings/personal-room`) the web client asks
+     * about the signed-in user. The entry is shown only when it answers `200 { href }` with a path on the same site, and links
+     * there instead of to `href`; any other answer hides it. */
+    resolveFrom?: string;
 }
 
 /** The `ui` block of a plugin manifest: the browser apps a plugin ships and where the shells link to them. */

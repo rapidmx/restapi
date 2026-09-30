@@ -222,6 +222,17 @@ describe("parsePluginUi", () => {
             }
             expect(parsePluginUi({ appRail: [entry({ href: "/book", icon: `Hi${"A".repeat(62)}` })] })).not.toBeTypeOf("string");
         });
+
+        it("accepts an optional resolveFrom API path on app rail entries only", () => {
+            const path = "/mail/video-meetings/personal-room";
+            expect(parsePluginUi({ appRail: [entry({ href: "/book", resolveFrom: path })] })).toEqual({ appRail: [entry({ href: "/book", resolveFrom: path })] });
+            for (const resolveFrom of ["", "mail/x", "//evil.example", "/a/../b", "/a?b=1", "/a/", "/A", "https://evil.example/x", "/a/b/c/d/e/f/g", 3, null]) {
+                expect(parsePluginUi({ appRail: [entry({ href: "/book", resolveFrom })] })).toBe(
+                    `This plugin's manifest has an invalid ui.appRail entry: 'booking-types' has resolveFrom ${JSON.stringify(resolveFrom)}, which must be an API path such as /mail/video-meetings/personal-room and is only allowed on appRail entries.`,
+                );
+            }
+            expect(parsePluginUi({ settingsSections: [entry({ href: "/settings/book", resolveFrom: path })] })).toBeTypeOf("string");
+        });
     });
 });
 

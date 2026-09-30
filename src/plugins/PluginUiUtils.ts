@@ -104,6 +104,8 @@ const MAX_PATH_LENGTH = 200;
 const DIR_SEGMENT_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 
 /** A `react-icons/hi2` component name. */
+/** An API path for `resolveFrom`: lowercase slug segments only, so it can't reach outside the API or carry a query. */
+const RESOLVE_FROM_PATTERN = /^(\/[a-z0-9]+(-[a-z0-9]+)*){1,6}$/;
 const ICON_PATTERN = /^Hi[A-Z][A-Za-z0-9]*$/;
 
 /** Where each host's apps may be mounted, as the path segments before the app's own name, and how that reads. */
@@ -195,7 +197,16 @@ function checkNavItem(item: any, items: PluginUiNavItem[], list: (typeof NAV_LIS
     if (item.icon !== undefined && (typeof item.icon !== "string" || item.icon.length > MAX_SLUG_LENGTH || !ICON_PATTERN.test(item.icon))) {
         return `'${item.id}' has icon ${JSON.stringify(item.icon)}, which isn't a react-icons/hi2 icon name such as HiOutlineCalendarDays.`;
     }
-    return { id: item.id, label: item.label, href: item.href, ...(item.icon !== undefined ? { icon: item.icon } : {}) };
+    if (item.resolveFrom !== undefined && (list.key !== "appRail" || typeof item.resolveFrom !== "string" || !RESOLVE_FROM_PATTERN.test(item.resolveFrom))) {
+        return `'${item.id}' has resolveFrom ${JSON.stringify(item.resolveFrom)}, which must be an API path such as /mail/video-meetings/personal-room and is only allowed on appRail entries.`;
+    }
+    return {
+        id: item.id,
+        label: item.label,
+        href: item.href,
+        ...(item.icon !== undefined ? { icon: item.icon } : {}),
+        ...(item.resolveFrom !== undefined ? { resolveFrom: item.resolveFrom } : {}),
+    };
 }
 
 /** Reads one list of the `ui` block with `check`, returning the checked entries or the first problem as a manifest
