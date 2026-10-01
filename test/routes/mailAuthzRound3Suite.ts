@@ -313,6 +313,27 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
             expect((await ctx.findOne("Message", message.uid)).encrypted).toBe(true);
         });
 
+        it("never lets even a trusted caller set a contact's photoBlobKey (only the photo routes do)", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await grantAdmin(mailbox);
+            const contacts = await createFolder(mailbox.uid, FolderType.CONTACTS);
+            const body = { mailboxUid: mailbox.uid, folderUid: contacts.uid, displayName: "Pat", emails: [], phones: [], addresses: [] };
+
+            const created = await auth(request(ctx.app()).post(url("/contacts")), admin).send({ ...body, photoBlobKey: "bodies/someone-elses" });
+            expect(created.status).toBe(200);
+            expect(created.body.photoBlobKey ?? undefined).toBeUndefined();
+
+            const updated = await auth(request(ctx.app()).put(url(`/contacts/${created.body.uid}`)), admin).send({
+                uid: created.body.uid,
+                version: created.body.version,
+                displayName: "Pat 2",
+                photoBlobKey: "bodies/someone-elses",
+            });
+            expect(updated.status).toBe(200);
+            expect(updated.body.displayName).toBe("Pat 2");
+            expect((await ctx.findOne("Contact", created.body.uid)).photoBlobKey ?? undefined).toBeUndefined();
+        });
+
         it("keeps dispositionNotificationTo and dates only on a draft create", async () => {
             const mailbox = await createMailbox(owner.uid);
             const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);

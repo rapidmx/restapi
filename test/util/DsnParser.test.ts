@@ -208,4 +208,30 @@ describe("DsnParser", () => {
             expect(parseFeedbackReport(bareReport("feedback-report"))).toBeUndefined();
         });
     });
+
+    describe("caps on hostile reports", () => {
+        it("Keeps at most 100 recipient groups and clips every field to 1 KB", () => {
+            const long = "x".repeat(5000);
+            const groups = Array.from(
+                { length: 500 },
+                (_, i) => `Final-Recipient: rfc822; u${i}@x.example\nAction: failed\nStatus: 5.1.1\nDiagnostic-Code: smtp; ${long}`,
+            );
+            const text = `Reporting-MTA: dns; ${long}\n\n${groups.join("\n\n")}\n`;
+            const parsed = parseDeliveryStatusReport(bareReport("delivery-status", { text, attachments: [] }))!;
+            expect(parsed.recipients).toHaveLength(100);
+            expect(parsed.recipients[0].finalRecipient).toBe("u0@x.example");
+            expect(parsed.recipients[0].diagnosticCode!.length).toBeLessThanOrEqual(1024);
+            expect(parsed.reportingMta!.length).toBeLessThanOrEqual(1024);
+        });
+
+        it("Keeps at most 100 ARF original recipients and clips every field to 1 KB", () => {
+            const long = "y".repeat(5000);
+            const rcpts = Array.from({ length: 500 }, (_, i) => `Original-Rcpt-To: <u${i}@x.example>`).join("\n");
+            const text = `Feedback-Type: abuse\nUser-Agent: ${long}\n${rcpts}\nOriginal-Mail-From: ${long}\n`;
+            const parsed = parseFeedbackReport(bareReport("feedback-report", { text, attachments: [] }))!;
+            expect(parsed.originalRecipients).toHaveLength(100);
+            expect(parsed.userAgent).toHaveLength(1024);
+            expect(parsed.originalMailFrom).toHaveLength(1024);
+        });
+    });
 });

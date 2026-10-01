@@ -439,7 +439,7 @@ describe("Route:ContactPhotoSQL Tests", () => {
         expect(result.body.photoBlobKey).toBeFalsy();
     });
 
-    it("GET returns the stored bytes with safe headers, an ETag and a private one-day cache.", async () => {
+    it("GET returns the stored bytes with safe headers, an ETag and a private, always-revalidated cache.", async () => {
         const { contact } = await setup();
         const key = (await putPhoto(contact.uid, PNG, "image/png")).body.photoBlobKey;
 
@@ -448,7 +448,7 @@ describe("Route:ContactPhotoSQL Tests", () => {
         expect(result.status).toBe(200);
         expect(result.headers["content-type"]).toBe("image/png");
         expect(result.headers["content-length"]).toBe(String(PNG.length));
-        expect(result.headers["cache-control"]).toBe("private, max-age=86400");
+        expect(result.headers["cache-control"]).toBe("private, no-cache");
         expect(result.headers["etag"]).toBe(`"${key.substring(key.lastIndexOf("/") + 1)}"`);
         expect(result.headers["x-content-type-options"]).toBe("nosniff");
         expect(result.headers["content-disposition"]).toBe("inline");
@@ -469,7 +469,7 @@ describe("Route:ContactPhotoSQL Tests", () => {
             const result = await conditional(value);
             expect(result.status, value).toBe(304);
             expect(result.headers["etag"]).toBe(etag);
-            expect(result.headers["cache-control"]).toBe("private, max-age=86400");
+            expect(result.headers["cache-control"]).toBe("private, no-cache");
         }
         expect((await conditional('"stale"')).status).toBe(200);
 

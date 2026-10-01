@@ -32,7 +32,9 @@ export interface DeliveryStatusRecipient {
     outcome: DeliveryOutcome;
 }
 
-/** A parsed delivery status notification (a bounce): `multipart/report; report-type=delivery-status`. */
+/** A parsed delivery status notification (a bounce): `multipart/report; report-type=delivery-status`. The report is attacker-controlled
+ * input, so it is bounded: at most `MAX_REPORT_RECIPIENTS` (100) recipient groups are kept and every string field is clipped to
+ * `MAX_REPORT_FIELD_LENGTH` (1024) characters. */
 export interface DeliveryStatusReport {
     /** The `Reporting-MTA` field of the per-message group, its type (`dns;`) removed. */
     reportingMta?: string;
@@ -41,11 +43,12 @@ export interface DeliveryStatusReport {
     /** The `Message-ID` (angle brackets stripped) of the message the report is about, read from its returned copy
      * (`message/rfc822`) or returned headers (`text/rfc822-headers`), if the report includes either. */
     originalMessageId?: string;
-    /** One entry per recipient group - never empty. */
+    /** One entry per recipient group - never empty, at most `MAX_REPORT_RECIPIENTS`. */
     recipients: DeliveryStatusRecipient[];
 }
 
-/** A parsed abuse/feedback report (ARF, RFC 5965): `multipart/report; report-type=feedback-report`. */
+/** A parsed abuse/feedback report (ARF, RFC 5965): `multipart/report; report-type=feedback-report`. Bounded like
+ * `DeliveryStatusReport`: at most `MAX_REPORT_RECIPIENTS` original recipients, every string field clipped to `MAX_REPORT_FIELD_LENGTH`. */
 export interface FeedbackReport {
     /** The `Feedback-Type` field, lowercased (`abuse`, `fraud`, `not-spam`, `virus`, `other`, ...). */
     feedbackType: string;
@@ -58,6 +61,12 @@ export interface FeedbackReport {
     /** The `Message-ID` (angle brackets stripped) of the reported message, read from its returned copy or headers. */
     originalMessageId?: string;
 }
+
+/** The most recipient groups (or ARF original recipients) kept from one report - the rest of a hostile report is dropped. */
+export const MAX_REPORT_RECIPIENTS = 100;
+
+/** The longest any string field of a parsed report can be - a longer value is clipped. */
+export const MAX_REPORT_FIELD_LENGTH = 1024;
 
 /** The content types a report's returned original can come as. */
 const RETURNED_ORIGINAL_TYPES: ReadonlySet<string> = new Set(["message/rfc822", "text/rfc822-headers", "message/global", "message/global-headers"]);
@@ -83,9 +92,9 @@ function readFields(block: string): Map<string, string[]> {
     return fields;
 }
 
-/** The first value of `name` in `fields`, if any. */
+/** The first value of `name` in `fields`, if any, clipped to `MAX_REPORT_FIELD_LENGTH`. */
 function first(fields: Map<string, string[]>, name: string): string | undefined {
-    return fields.get(name)?.[0];
+    return fields.get(name)?.[0]?.slice(0, MAX_REPORT_FIELD_LENGTH);
 }
 
 /** A typed report field's value without its type prefix: `rfc822; a@b` becomes `a@b`, `smtp; 550 ...` becomes `550 ...`. */
@@ -171,6 +180,9 @@ export function parseDeliveryStatusReport(parsed: ParsedMail): DeliveryStatusRep
     let originalEnvelopeId: string | undefined;
     const recipients: DeliveryStatusRecipient[] = [];
     for (const group of statusText.replace(/\r\n/g, "\n").split(/\n{2,}/)) {
+        if (recipients.length >= MAX_REPORT_RECIPIENTS) {
+            break;
+        }
         const fields: Map<string, string[]> = readFields(group);
         const finalRecipient: string | undefined = stripType(first(fields, "final-recipient"));
         if (!finalRecipient) {
@@ -239,7 +251,10 @@ export function parseFeedbackReport(parsed: ParsedMail): FeedbackReport | undefi
     return {
         feedbackType,
         userAgent: first(fields, "user-agent"),
-        originalRecipients: (fields.get("original-rcpt-to") ?? []).map((value) => stripAngleBrackets(value)!).filter(Boolean),
+        originalRecipients: (fields.get("original-rcpt-to") ?? [])
+            .slice(0, MAX_REPORT_RECIPIENTS)
+            .map((value) => stripAngleBrackets(value.slice(0, MAX_REPORT_FIELD_LENGTH))!)
+            .filter(Boolean),
         originalMailFrom: stripAngleBrackets(first(fields, "original-mail-from")),
         originalMessageId: returnedOriginalMessageId(parsed),
     };

@@ -83,6 +83,26 @@ describe("MailEventStream", () => {
         await stream.publish(sent("m2"));
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("plain failure"));
     });
+
+    it("Gives up on an xAdd that never settles (Redis down, command queued offline) so mail flow is not blocked", async () => {
+        const redis = { xAdd: vi.fn(() => new Promise<string>(() => undefined)) };
+        const { stream, logger } = makeStream(redis, { publishTimeoutMs: 20 });
+
+        await expect(stream.publish(sent("m1"))).resolves.toBeUndefined();
+
+        expect(redis.xAdd).toHaveBeenCalledTimes(1);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("timed out"));
+    });
+
+    it("Does not log a timeout for an xAdd that settles in time", async () => {
+        const redis = new FakeRedisStream();
+        const { stream, logger } = makeStream(redis, { publishTimeoutMs: 1000 });
+
+        await stream.publish(sent("m1"));
+
+        expect(redis.entries).toHaveLength(1);
+        expect(logger.warn).not.toHaveBeenCalled();
+    });
 });
 
 describe("publishTransportOutcome()", () => {

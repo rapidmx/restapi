@@ -828,7 +828,7 @@ export abstract class ScanQueueJob<
             // before replying still replies. iTIP processing is idempotent (sequence/state checks), so a retry re-applies
             // it safely.
             if (delivered) {
-                await this.publishDelivered(entry, targetUid, result, verdict === "junk");
+                await this.publishDelivered(entry, raw, targetUid, result, verdict === "junk");
             }
             if (verdict === "deliver" && delivered) {
                 await this.maybeSendAutoReplyOnce(entry, raw, result);
@@ -846,7 +846,8 @@ export abstract class ScanQueueJob<
      * when it is one. A retried entry that already filed its message publishes again - the stream is at-least-once, and its
      * consumers dedupe by `messageUid`. Never throws: `publish()` swallows a Redis failure.
      */
-    private async publishDelivered(entry: Q, messageUid: string, result: ScanPipelineResult, junk: boolean): Promise<void> {
+    private async publishDelivered(entry: Q, raw: Buffer, messageUid: string, result: ScanPipelineResult, junk: boolean): Promise<void> {
+        const isReport: boolean = !!(result.deliveryStatusReport || result.feedbackReport);
         await this.mailEventStream?.publish({
             type: "message.delivered",
             mailboxUid: entry.mailboxUid,
@@ -863,6 +864,8 @@ export abstract class ScanQueueJob<
             precedence: result.precedenceHeader,
             deliveryStatusReport: result.deliveryStatusReport,
             feedbackReport: result.feedbackReport,
+            // A report is attacker-controlled input - the event says whether its sender was authenticated, so a consumer can tell.
+            reportAuthenticated: isReport ? this.verifiedFromAddress(raw, result) !== undefined : undefined,
         });
     }
 

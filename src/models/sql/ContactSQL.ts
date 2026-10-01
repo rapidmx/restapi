@@ -32,6 +32,7 @@ const { Column, Entity, Index } = PersistenceDecorators;
 @Index("contact_folder", ["folderUid"])
 @Index("contact_folder_modified", ["folderUid", "dateModified", "uid"])
 @Index("contact_mailbox_modified", ["mailboxUid", "dateModified", "uid"])
+@Index("contact_photo_blob_key", ["photoBlobKey"])
 @Protect(
     {
         uid: "Contact",

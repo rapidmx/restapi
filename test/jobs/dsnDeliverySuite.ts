@@ -208,5 +208,22 @@ export function dsnDeliverySuite(ctx: DsnDeliverySuiteContext): void {
                 publish.mockRestore();
             }
         });
+
+        it("Marks a bounce reportAuthenticated only when the trusted hop vouched for its From domain with an aligned DKIM pass", async () => {
+            const publish = vi.spyOn(MailEventStream.prototype, "publish").mockResolvedValue();
+            try {
+                const signed = Buffer.concat([Buffer.from("Authentication-Results: mx.example.com; dkim=pass header.d=mail.owned.lab\r\n"), DSN_UNKNOWN_RECIPIENT_550]);
+                await ctx.ingest(signed, "", ["alice@owned.lab"]);
+                await ctx.ingest(DSN_UNKNOWN_RECIPIENT_550, "", ["alice@owned.lab"]);
+                await ctx.ingest(Buffer.from("From: a@example.org\r\nTo: recipient@example.com\r\nSubject: Plain\r\n\r\nHi\r\n"), "a@example.org");
+
+                expect(publish).toHaveBeenCalledTimes(3);
+                expect(publish.mock.calls[0][0]).toMatchObject({ reportAuthenticated: true });
+                expect(publish.mock.calls[1][0]).toMatchObject({ reportAuthenticated: false });
+                expect((publish.mock.calls[2][0] as any).reportAuthenticated).toBeUndefined();
+            } finally {
+                publish.mockRestore();
+            }
+        });
     });
 }

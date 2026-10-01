@@ -282,4 +282,16 @@ describe("NpmRegistryClient.searchPlugins", () => {
         // Four pages of each of the two searches.
         expect(fetchMock).toHaveBeenCalledTimes(8);
     });
+
+    it("returns what one search found when the other fails, and throws only when both do", async () => {
+        const ok = page(["@rapidmx/crm-plugin"]);
+        vi.stubGlobal("fetch", vi.fn(async (url: string) => (url.includes("text=scope") ? json(ok) : json(null, 500))));
+        expect((await new NpmRegistryClient().searchPlugins("rapidmx")).map((r) => r.name)).toEqual(["@rapidmx/crm-plugin"]);
+
+        vi.stubGlobal("fetch", vi.fn(async (url: string) => (url.includes("text=scope") ? json(null, 500) : json(ok))));
+        expect((await new NpmRegistryClient().searchPlugins("rapidmx")).map((r) => r.name)).toEqual(["@rapidmx/crm-plugin"]);
+
+        vi.stubGlobal("fetch", vi.fn(async (url: string) => json(null, url.includes("text=scope") ? 502 : 503)));
+        await expect(new NpmRegistryClient().searchPlugins("rapidmx")).rejects.toThrow(/502/);
+    });
 });

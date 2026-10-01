@@ -8,6 +8,7 @@ import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { BlobReferenceSource, deleteBlobsIfUnreferenced, messageBlobReferenceSources } from "../util/BlobReferenceUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
+import { CONTACT_PHOTO_KEY_PREFIX } from "../routes/BaseContactRoute.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { retainedBodyBlobKeysOf } from "../util/DraftBodyRetentionUtils.js";
@@ -353,7 +354,8 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             this.contactClass,
             request.mailboxUid,
             async (row: any) => {
-                if (row.photoBlobKey) {
+                // Only the contact's own photo: a `photoBlobKey` outside `contact-photos/<uid>/` is not this contact's to delete.
+                if (typeof row.photoBlobKey === "string" && row.photoBlobKey.startsWith(`${CONTACT_PHOTO_KEY_PREFIX}${row.uid}/`)) {
                     await this.blobStore!.delete(row.photoBlobKey);
                 }
             },

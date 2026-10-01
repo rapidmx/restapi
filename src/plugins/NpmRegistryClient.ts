@@ -133,26 +133,37 @@ export class NpmRegistryClient {
         // npm's `scope:` qualifier is served from an index that lags behind new publishes - and at times answers nothing at all for a scope that
         // plainly has packages - while a plain text search for `@scope/` finds them; the results of both are merged. Anything the text search
         // matches loosely is dropped by the name check below.
-        for (const text of [`scope:${scope}`, `@${scope}/`]) {
-            for (let from = 0; from < SEARCH_MAX_RESULTS; from += SEARCH_PAGE_SIZE) {
-                const query = new URLSearchParams({ text, size: String(SEARCH_PAGE_SIZE), from: String(from) });
-                const page: any = await this.request(`/-/v1/search?${query.toString()}`);
-                const objects: any[] = Array.isArray(page?.objects) ? page.objects : [];
-                for (const object of objects) {
-                    const pkg: any = object?.package;
-                    if (
-                        typeof pkg?.name === "string" &&
-                        typeof pkg.version === "string" &&
-                        pkg.name.startsWith(`@${scope}/`) &&
-                        pkg.name.endsWith(PLUGIN_PACKAGE_SUFFIX)
-                    ) {
-                        results.set(pkg.name, { name: pkg.name, version: pkg.version, description: pkg.description, date: pkg.date });
+        // Each search settles on its own: one failing (a registry that errors on a query form) keeps what the other found, and the call
+        // fails - with the first error - only when both do.
+        const errors: unknown[] = [];
+        const texts: string[] = [`scope:${scope}`, `@${scope}/`];
+        for (const text of texts) {
+            try {
+                for (let from = 0; from < SEARCH_MAX_RESULTS; from += SEARCH_PAGE_SIZE) {
+                    const query = new URLSearchParams({ text, size: String(SEARCH_PAGE_SIZE), from: String(from) });
+                    const page: any = await this.request(`/-/v1/search?${query.toString()}`);
+                    const objects: any[] = Array.isArray(page?.objects) ? page.objects : [];
+                    for (const object of objects) {
+                        const pkg: any = object?.package;
+                        if (
+                            typeof pkg?.name === "string" &&
+                            typeof pkg.version === "string" &&
+                            pkg.name.startsWith(`@${scope}/`) &&
+                            pkg.name.endsWith(PLUGIN_PACKAGE_SUFFIX)
+                        ) {
+                            results.set(pkg.name, { name: pkg.name, version: pkg.version, description: pkg.description, date: pkg.date });
+                        }
+                    }
+                    if (objects.length < SEARCH_PAGE_SIZE) {
+                        break;
                     }
                 }
-                if (objects.length < SEARCH_PAGE_SIZE) {
-                    break;
-                }
+            } catch (err) {
+                errors.push(err);
             }
+        }
+        if (errors.length === texts.length) {
+            throw errors[0];
         }
         return [...results.values()].sort((a, b) => a.name.localeCompare(b.name));
     }

@@ -121,6 +121,13 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
      * mailbox's message body or attachment). Only `setPhoto()`/`deletePhoto()` (below) set it. */
     protected readonly serverManagedFields: readonly string[] = ["photoBlobKey"];
 
+    /** `photoBlobKey` is dropped from every caller's body, a trusted one's included (the base class leaves those alone): a stored
+     * key is deleted with the contact (`afterPurge()`, the erasure job), so no body may be able to name another object's blob. */
+    protected stripServerManagedFields(obj: any, user: JWTUser | undefined): void {
+        delete obj.photoBlobKey;
+        super.stripServerManagedFields(obj, user);
+    }
+
     @Inject("BlobStore")
     private blobStore?: BlobStore;
 
@@ -312,7 +319,9 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
             .map((candidate) => candidate.trim().replace(/^W\//, ""))
             .some((candidate) => candidate === "*" || candidate === etag);
         res.setHeader("etag", etag);
-        res.setHeader("cache-control", "private, max-age=86400");
+        // Revalidated on every use (the ETag makes that a cheap 304): a stored max-age would keep showing the photo for a day after
+        // the contact was deleted or the caller lost access, and the access check above only runs when the browser asks.
+        res.setHeader("cache-control", "private, no-cache");
         if (matches) {
             res.status(304).send();
             return;

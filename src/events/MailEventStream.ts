@@ -57,10 +57,20 @@ export interface MessageDeliveredEvent extends MailEventBase {
     autoSubmitted?: string;
     /** The `Precedence` header, if any (`bulk`, `list`, `junk`, `auto_reply`). */
     precedence?: string;
-    /** The parsed delivery status report, when the message is a bounce - see `util/DsnParser.ts`. */
+    /** The parsed delivery status report, when the message is a bounce - see `util/DsnParser.ts`. Attacker-controlled input: anyone can
+     * send a message shaped like a bounce. See `reportAuthenticated`. */
     deliveryStatusReport?: DeliveryStatusReport;
-    /** The parsed abuse/feedback report, when the message is one - see `util/DsnParser.ts`. Its origin is unverified. */
+    /** The parsed abuse/feedback report, when the message is one - see `util/DsnParser.ts`. Attacker-controlled input, like
+     * `deliveryStatusReport`. */
     feedbackReport?: FeedbackReport;
+    /**
+     * Set only on a message that carries a `deliveryStatusReport` or `feedbackReport`: `true` when its `From` address is authenticated
+     * (a passing DKIM result aligned with the `From` domain, stamped by this deployment's trusted MTA hop), `false` when it is not.
+     * Absent on any other message. A consumer must not act on a report that is not `true` - and even a `true` only proves who sent it,
+     * not that the report is about something this deployment sent - so it must still correlate the report to a message it sent
+     * itself (`originalMessageId`, the VERP address in `envelopeTo`) before suppressing an address or the like.
+     */
+    reportAuthenticated?: boolean;
 }
 
 /** Where an outbound message came from. */
@@ -183,7 +193,7 @@ export interface MailEventRedis {
  * after handling an event but before acknowledging it sees it again, so handlers must be idempotent).
  *
  * Publishing never throws and never blocks mail flow on Redis: without an `events` datastore (a single-process development
- * setup), or with `mail:events:enabled` off, it does nothing; a Redis error is logged and dropped. The stream is capped at roughly
+ * setup), or with `mail:events:enabled` off, it does nothing; a Redis error - or a Redis that does not answer within `mail:events:publish_timeout_ms` (2 seconds by default) - is logged and dropped. The stream is capped at roughly
  * `mail:events:max_length` entries (oldest trimmed first), so a consumer that stays down long enough loses the oldest events.
  */
 export class MailEventStream {
@@ -198,6 +208,10 @@ export class MailEventStream {
 
     @Config("mail:events:max_length", 100000)
     private maxLength: number = 100000;
+
+    /** How long `publish()` waits for Redis before it gives up on an event (it is then dropped, with a warning). */
+    @Config("mail:events:publish_timeout_ms", 2000)
+    private publishTimeoutMs: number = 2000;
 
     @Logger
     private logger?: any;
@@ -218,15 +232,26 @@ export class MailEventStream {
             return;
         }
         const full: MailEvent = { ...event, occurredAt: event.occurredAt ?? new Date().toISOString() };
+        // node-redis queues a command while its connection is down and keeps it pending until the connection returns, so the
+        // append is bounded: a stream that can't be reached must cost mail flow at most `publishTimeoutMs`, not stall it.
+        let timer: NodeJS.Timeout | undefined;
+        const timeout: Promise<never> = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`timed out after ${this.publishTimeoutMs} ms`)), this.publishTimeoutMs);
+        });
         try {
-            await redis.xAdd(
-                MAIL_EVENT_STREAM_KEY,
-                "*",
-                { [EVENT_FIELD]: JSON.stringify(full) },
-                { TRIM: { strategy: "MAXLEN", strategyModifier: "~", threshold: this.maxLength } },
-            );
+            await Promise.race([
+                redis.xAdd(
+                    MAIL_EVENT_STREAM_KEY,
+                    "*",
+                    { [EVENT_FIELD]: JSON.stringify(full) },
+                    { TRIM: { strategy: "MAXLEN", strategyModifier: "~", threshold: this.maxLength } },
+                ),
+                timeout,
+            ]);
         } catch (err: any) {
             this.logger?.warn(`MailEventStream: failed to publish a ${full.type} event: ${err?.message ?? err}`);
+        } finally {
+            clearTimeout(timer);
         }
     }
 }

@@ -291,9 +291,18 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
             }),
         );
 
-        const photoBlobKey = `photos/${uuid.v4()}`;
+        const contactUid = uuid.v4();
+        const photoBlobKey = `contact-photos/${contactUid}/${uuid.v4()}`;
         await blobStore.put(photoBlobKey, Buffer.from("photo bytes"));
-        await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: folder.uid, displayName: "A Contact", photoBlobKey }));
+        await contactRepo.save(new ContactMongo({ uid: contactUid, mailboxUid: mailbox.uid, folderUid: folder.uid, displayName: "A Contact", photoBlobKey }));
+        // A photoBlobKey that is not under the contact's own `contact-photos/<uid>/` (set by some other writer) must never be deleted: it is
+        // someone else's blob (another contact's photo, a message body...).
+        const foreignBlobKey = `contact-photos/${uuid.v4()}/${uuid.v4()}`;
+        const foreignBodyKey = `bodies/${uuid.v4()}`;
+        await blobStore.put(foreignBlobKey, Buffer.from("another contact's photo"));
+        await blobStore.put(foreignBodyKey, Buffer.from("another mailbox's body"));
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: folder.uid, displayName: "Foreign 1", photoBlobKey: foreignBlobKey }));
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: folder.uid, displayName: "Foreign 2", photoBlobKey: foreignBodyKey }));
         await contactListRepo.save(new ContactListMongo({ mailboxUid: mailbox.uid, name: "A Contact List" }));
         await calendarEventRepo.save(new CalendarEventMongo({ mailboxUid: mailbox.uid, folderUid: folder.uid, title: "An Event" }));
         await taskRepo.save(new TaskMongo({ mailboxUid: mailbox.uid, folderUid: folder.uid, title: "A Task" }));
@@ -372,8 +381,8 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         // folder, message, attachment, contact, contactList, calendarEvent, task, note,
         // focusedInboxOverride, taskList, label, mailFilterRule, mailSignature,
         // oofReplySuppression, correspondent, plugin mailbox data, quarantineEntry, ingestQueueEntry, dataExportRequest,
-        // mailboxImportRequest, mailbox = 21
-        expect(updated!.purgedCount).toBe(21);
+        // mailboxImportRequest, mailbox = 21, plus the two foreign-photo contacts = 23
+        expect(updated!.purgedCount).toBe(23);
 
         expect(await mailboxRepo.findOne({ uid: mailbox.uid } as any)).toBeNull();
         expect(await folderRepo.findOne({ uid: folder.uid } as any)).toBeNull();
@@ -403,6 +412,8 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         expect(await blobStore.exists(attachmentBlobKey)).toBe(false);
         expect(await blobStore.exists(extractedTextBlobKey)).toBe(false);
         expect(await blobStore.exists(photoBlobKey)).toBe(false);
+        expect(await blobStore.exists(foreignBlobKey)).toBe(true);
+        expect(await blobStore.exists(foreignBodyKey)).toBe(true);
         expect(await blobStore.exists(quarantineRawBlobKey)).toBe(false);
         expect(await blobStore.exists(ingestRawBlobKey)).toBe(false);
         expect(await blobStore.exists(exportBlobKey)).toBe(false);
