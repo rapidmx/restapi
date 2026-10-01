@@ -45,6 +45,9 @@ export interface DeliveryStatusReport {
     originalMessageId?: string;
     /** One entry per recipient group - never empty, at most `MAX_REPORT_RECIPIENTS`. */
     recipients: DeliveryStatusRecipient[];
+    /** `true` when the report named more than `MAX_REPORT_RECIPIENTS` recipients and the rest were dropped, so `recipients` is not
+     * the whole list (a consumer must not assume the other recipients were delivered). Absent when nothing was dropped. */
+    recipientsTruncated?: true;
 }
 
 /** A parsed abuse/feedback report (ARF, RFC 5965): `multipart/report; report-type=feedback-report`. Bounded like
@@ -56,6 +59,9 @@ export interface FeedbackReport {
     userAgent?: string;
     /** The `Original-Rcpt-To` field(s): who the reported message was delivered to, where the reporter disclosed it. */
     originalRecipients: string[];
+    /** `true` when the report named more than `MAX_REPORT_RECIPIENTS` original recipients and the rest were dropped. Absent when
+     * nothing was dropped. */
+    originalRecipientsTruncated?: true;
     /** The `Original-Mail-From` field: the reported message's envelope sender, where the reporter disclosed it. */
     originalMailFrom?: string;
     /** The `Message-ID` (angle brackets stripped) of the reported message, read from its returned copy or headers. */
@@ -179,12 +185,18 @@ export function parseDeliveryStatusReport(parsed: ParsedMail): DeliveryStatusRep
     let reportingMta: string | undefined;
     let originalEnvelopeId: string | undefined;
     const recipients: DeliveryStatusRecipient[] = [];
+    let recipientsTruncated: boolean = false;
     for (const group of statusText.replace(/\r\n/g, "\n").split(/\n{2,}/)) {
-        if (recipients.length >= MAX_REPORT_RECIPIENTS) {
-            break;
-        }
         const fields: Map<string, string[]> = readFields(group);
         const finalRecipient: string | undefined = stripType(first(fields, "final-recipient"));
+        if (recipients.length >= MAX_REPORT_RECIPIENTS) {
+            // Full: stop at the first group that would have been kept (trailing text and the like is not a dropped recipient).
+            if (finalRecipient) {
+                recipientsTruncated = true;
+                break;
+            }
+            continue;
+        }
         if (!finalRecipient) {
             // The per-message group (or trailing text) - it names no recipient.
             reportingMta ??= stripType(first(fields, "reporting-mta"));
@@ -206,7 +218,13 @@ export function parseDeliveryStatusReport(parsed: ParsedMail): DeliveryStatusRep
     if (recipients.length === 0) {
         return undefined;
     }
-    return { reportingMta, originalEnvelopeId, originalMessageId: returnedOriginalMessageId(parsed), recipients };
+    return {
+        reportingMta,
+        originalEnvelopeId,
+        originalMessageId: returnedOriginalMessageId(parsed),
+        recipients,
+        ...(recipientsTruncated ? { recipientsTruncated: true as const } : {}),
+    };
 }
 
 /**
@@ -248,13 +266,15 @@ export function parseFeedbackReport(parsed: ParsedMail): FeedbackReport | undefi
     if (!feedbackType) {
         return undefined;
     }
+    const rcptTo: string[] = fields.get("original-rcpt-to") ?? [];
     return {
         feedbackType,
         userAgent: first(fields, "user-agent"),
-        originalRecipients: (fields.get("original-rcpt-to") ?? [])
+        originalRecipients: rcptTo
             .slice(0, MAX_REPORT_RECIPIENTS)
             .map((value) => stripAngleBrackets(value.slice(0, MAX_REPORT_FIELD_LENGTH))!)
             .filter(Boolean),
+        ...(rcptTo.length > MAX_REPORT_RECIPIENTS ? { originalRecipientsTruncated: true as const } : {}),
         originalMailFrom: stripAngleBrackets(first(fields, "original-mail-from")),
         originalMessageId: returnedOriginalMessageId(parsed),
     };

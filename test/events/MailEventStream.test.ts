@@ -91,7 +91,18 @@ describe("MailEventStream", () => {
         await expect(stream.publish(sent("m1"))).resolves.toBeUndefined();
 
         expect(redis.xAdd).toHaveBeenCalledTimes(1);
-        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("timed out"));
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("may still be delivered"));
+    });
+
+    it.each([["2000"], ["abc"], [0], [-5], [NaN], [undefined]])("Falls back to the default wait for a bad publish timeout (%j) instead of dropping every event", async (bad) => {
+        // Settles after 30 ms: a timeout that fires at once (setTimeout's reading of NaN) would beat it.
+        const redis = { xAdd: vi.fn(() => new Promise<string>((resolve) => setTimeout(() => resolve("1-0"), 30))) };
+        const { stream, logger } = makeStream(redis, { publishTimeoutMs: bad });
+
+        await stream.publish(sent("m1"));
+
+        expect(redis.xAdd).toHaveBeenCalledTimes(1);
+        expect(logger.warn).not.toHaveBeenCalled();
     });
 
     it("Does not log a timeout for an xAdd that settles in time", async () => {

@@ -222,6 +222,15 @@ describe("DsnParser", () => {
             expect(parsed.recipients[0].finalRecipient).toBe("u0@x.example");
             expect(parsed.recipients[0].diagnosticCode!.length).toBeLessThanOrEqual(1024);
             expect(parsed.reportingMta!.length).toBeLessThanOrEqual(1024);
+            expect(parsed.recipientsTruncated).toBe(true);
+        });
+
+        it("Does not flag truncation for a report of exactly 100 recipient groups", () => {
+            const groups = Array.from({ length: 100 }, (_, i) => `Final-Recipient: rfc822; u${i}@x.example\nAction: failed\nStatus: 5.1.1`);
+            const text = `Reporting-MTA: dns; mx.x.example\n\n${groups.join("\n\n")}\n\ntrailing text\n`;
+            const parsed = parseDeliveryStatusReport(bareReport("delivery-status", { text, attachments: [] }))!;
+            expect(parsed.recipients).toHaveLength(100);
+            expect(parsed.recipientsTruncated).toBeUndefined();
         });
 
         it("Keeps at most 100 ARF original recipients and clips every field to 1 KB", () => {
@@ -230,8 +239,16 @@ describe("DsnParser", () => {
             const text = `Feedback-Type: abuse\nUser-Agent: ${long}\n${rcpts}\nOriginal-Mail-From: ${long}\n`;
             const parsed = parseFeedbackReport(bareReport("feedback-report", { text, attachments: [] }))!;
             expect(parsed.originalRecipients).toHaveLength(100);
+            expect(parsed.originalRecipientsTruncated).toBe(true);
             expect(parsed.userAgent).toHaveLength(1024);
             expect(parsed.originalMailFrom).toHaveLength(1024);
+        });
+
+        it("Does not flag truncation for an ARF report within the cap", () => {
+            const text = "Feedback-Type: abuse\nOriginal-Rcpt-To: <a@x.example>\n";
+            const parsed = parseFeedbackReport(bareReport("feedback-report", { text, attachments: [] }))!;
+            expect(parsed.originalRecipients).toEqual(["a@x.example"]);
+            expect(parsed.originalRecipientsTruncated).toBeUndefined();
         });
     });
 });

@@ -209,7 +209,8 @@ export class MailEventStream {
     @Config("mail:events:max_length", 100000)
     private maxLength: number = 100000;
 
-    /** How long `publish()` waits for Redis before it gives up on an event (it is then dropped, with a warning). */
+    /** How long `publish()` waits for Redis before it stops waiting for an event (with a warning) - the append may still reach the
+     * stream afterwards. A value that is not a finite positive number (an environment string, say) falls back to the 2000 ms default. */
     @Config("mail:events:publish_timeout_ms", 2000)
     private publishTimeoutMs: number = 2000;
 
@@ -234,9 +235,11 @@ export class MailEventStream {
         const full: MailEvent = { ...event, occurredAt: event.occurredAt ?? new Date().toISOString() };
         // node-redis queues a command while its connection is down and keeps it pending until the connection returns, so the
         // append is bounded: a stream that can't be reached must cost mail flow at most `publishTimeoutMs`, not stall it.
+        const configured: number = Number(this.publishTimeoutMs);
+        const waitMs: number = Number.isFinite(configured) && configured > 0 ? configured : 2000;
         let timer: NodeJS.Timeout | undefined;
         const timeout: Promise<never> = new Promise((_, reject) => {
-            timer = setTimeout(() => reject(new Error(`timed out after ${this.publishTimeoutMs} ms`)), this.publishTimeoutMs);
+            timer = setTimeout(() => reject(new Error(`gave up waiting after ${waitMs} ms; it may still be delivered`)), waitMs);
         });
         try {
             await Promise.race([
