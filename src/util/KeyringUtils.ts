@@ -9,7 +9,7 @@ import * as crypto from "crypto";
 import * as x509 from "@peculiar/x509";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { resolveFederationPolicy } from "./FederationUtils.js";
-import { fetchRemoteKeys, parseKeyDiscoveryAddress, parseKeyDiscoveryResponse } from "./KeyDiscoveryClient.js";
+import { fetchRemoteKeys, MAX_DISCOVERED_KEYS, parseKeyDiscoveryAddress, parseKeyDiscoveryResponse } from "./KeyDiscoveryClient.js";
 import { discoverLocalKeys, type LocalKeyDiscovery } from "./LocalKeyDiscoveryUtils.js";
 import { parseContactKey } from "./SignerCertificateUtils.js";
 import { Contact, EncryptionPreference, KeyConflict, KeyDiscoveryResponse, PreviousKey, PublicKey, RejectedKey } from "../models/types.js";
@@ -21,12 +21,6 @@ export type ContactKeyState = Pick<Contact, "keys" | "encryptPreference" | "keys
 /** The fields `applyDiscoveredKeys()`/`discoverAndMergeKeys()` compute - a caller persists these onto the
  * `Contact` it's tracking (creating one first if this is the first time the address has ever been seen). */
 export type KeyringUpdate = ContactKeyState;
-
-/** Bounds how many keys one `KeyDiscoveryResponse` can contribute to a single merge - `applyDiscoveredKeys()`
- * only ever pins at most one key per `useType` ("sign"/"encrypt") regardless of how many entries a response
- * contains (see the loop below), so this exists purely to bound processing cost against a hostile/misbehaving
- * peer's oversized response, not to cap stored state (which the useType-indexed merge already bounds to 2). */
-const MAX_DISCOVERED_KEYS = 8;
 
 /** How many replaced keys `Contact.previousKeys` keeps per `useType`. */
 export const MAX_PREVIOUS_KEYS_PER_USE_TYPE = 5;
@@ -271,6 +265,8 @@ export function applyDiscoveredKeys(
         return unchanged;
     }
 
+    // The certificates of an alias (or alias domain's) mailbox name its primary address, which the response says when it answers for one.
+    const certificateAddress: string = validated.address ?? address;
     const sanitizedKeys: PublicKey[] = validated.keys
         .slice(0, MAX_DISCOVERED_KEYS)
         .map(sanitizeDiscoveredKey)
@@ -293,6 +289,13 @@ export function applyDiscoveredKeys(
         }
         const pinnedIndex: number = resultKeys.findIndex((k) => k.useType === useType);
         if (pinnedIndex === -1) {
+            // The first key pinned for a use type gets the checks every later pin does (`canReplaceAutomatically()`, the trust
+            // endpoint): valid now, naming this address, usage fitting its use type. A certificate that fails them is not pinned.
+            try {
+                parseContactKey(discoveredKey.publicKey, certificateAddress, useType, observedAt);
+            } catch {
+                continue;
+            }
             resultKeys.push(discoveredKey);
             firstPinnedNow = true;
             continue;
@@ -301,7 +304,7 @@ export function applyDiscoveredKeys(
         if (pinned.fingerprint === fingerprint) {
             continue;
         }
-        if (canReplaceAutomatically(pinned, discoveredKey, address, observedAt)) {
+        if (canReplaceAutomatically(pinned, discoveredKey, certificateAddress, observedAt)) {
             resultKeys[pinnedIndex] = discoveredKey;
             previousKeys = addPreviousKey(previousKeys, {
                 ...pinned,

@@ -179,6 +179,60 @@ describe("buildEventIcs() / parseIcsEvent() Tests", () => {
         expect(parseIcsEvent("BEGIN:VCALENDAR\r\nEND:VCALENDAR")).toBeUndefined();
     });
 
+    describe("Stored values that could add lines to an invitation", () => {
+        it("Writes a stored recurrence rule from its checked parts only, so a CRLF in one cannot add a line.", () => {
+            const event = makeEvent({
+                recurrenceRule: {
+                    freq: RecurrenceFrequency.DAILY,
+                    interval: 1,
+                    byDay: ["MO\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:ceo@victim.example"],
+                    exceptions: [],
+                },
+            });
+            const ics = buildEventIcs(event, "REQUEST");
+            expect(ics).not.toContain("ceo@victim.example");
+            expect(ics).not.toContain("RRULE");
+            for (const rule of [
+                { freq: "daily\r\nX-EVIL:1", interval: 1 },
+                { freq: 5, interval: 1 },
+                { freq: "daily", interval: "1\r\nX-EVIL:1" },
+                { freq: "daily", interval: 1, count: "3\r\nX-EVIL:1" },
+                { freq: "daily", interval: 1, byMonth: ["1\r\nX-EVIL:1"] },
+            ]) {
+                const out = buildEventIcs(makeEvent({ recurrenceRule: { ...rule, exceptions: [] } as any }), "REQUEST");
+                expect(out).not.toContain("X-EVIL");
+                expect(out).not.toContain("RRULE");
+            }
+        });
+
+        it("Leaves out an invalid UNTIL or EXDATE and writes a valid one, normalizing the rule.", () => {
+            const event = makeEvent({
+                recurrenceRule: {
+                    freq: "WEEKLY" as any,
+                    interval: "2" as any,
+                    byDay: ["mo"],
+                    until: "not a date" as any,
+                    exceptions: ["junk" as any, new Date("2026-07-01T19:00:00.000Z")],
+                },
+            });
+            const ics = buildEventIcs(event, "REQUEST");
+            expect(ics).toContain("RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO");
+            expect(ics).not.toContain("UNTIL");
+            expect(ics).not.toContain("NaN");
+            expect(ics.match(/EXDATE/g)).toHaveLength(1);
+            const withUntil = buildEventIcs(makeEvent({ recurrenceRule: { freq: RecurrenceFrequency.DAILY, interval: 1, until: new Date("2026-12-31T00:00:00.000Z"), exceptions: undefined as any } }), "REQUEST");
+            expect(withUntil).toContain("UNTIL=20261231T000000Z");
+        });
+
+        it("Writes only a known STATUS and an integer SEQUENCE.", () => {
+            const ics = buildEventIcs(makeEvent({ status: "confirmed\r\nX-EVIL:1" as any, sequence: "3\r\nX-EVIL:1" as any }), "REQUEST");
+            expect(ics).not.toContain("X-EVIL");
+            expect(ics).toContain("STATUS:CONFIRMED");
+            expect(ics).toContain("SEQUENCE:0");
+            expect(buildEventIcs(makeEvent({ status: "tentative" as any, sequence: 4 }), "REQUEST")).toMatch(/SEQUENCE:4\r\nSTATUS:TENTATIVE/);
+        });
+    });
+
     describe("Recurring meetings", () => {
         it("Round-trips RRULE + EXDATE for a master (whole-series) event.", () => {
             const event = makeEvent({

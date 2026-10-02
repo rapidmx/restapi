@@ -128,4 +128,64 @@ describe("BaseAttachmentRoute Tests (repoUtils/blobStore guard clauses only)", (
         expect(rows.map((row) => row.folderUid)).toEqual(["f2", "f2", "f2", "f2", "f2"]);
         expect(superTruncate).toHaveBeenCalledTimes(1);
     });
+
+    describe("checkLegalHold()", () => {
+        const makeHeldRoute = (): any => {
+            const factory: ObjectFactory = new ObjectFactory(config, Logger());
+            const route: any = factory.newInstance<TestAttachmentRoute>(TestAttachmentRoute, { initialize: false });
+            const matter = {
+                uid: "matter-1",
+                custodianMailboxUids: ["mb"],
+                dateRangeStart: new Date("2000-01-01"),
+                dateRangeEnd: new Date("2100-01-01"),
+            };
+            route.matterClass = class FakeMatter {};
+            vi.spyOn(factory, "newInstance").mockImplementation((() => ({ find: vi.fn().mockResolvedValueOnce([matter]).mockResolvedValue([]) })) as any);
+            route.messageRepo = { findOne: vi.fn().mockResolvedValue({ uid: "m1", mailboxUid: "mb", sentDate: new Date("2020-01-01") }) };
+            return route;
+        };
+        const existing: any = { uid: "a1", messageUid: "m1", mailboxUid: "mb" };
+
+        it("returns without looking anything up when the route has no matter class.", async () => {
+            const route: any = objectFactory.newInstance<TestAttachmentRoute>(TestAttachmentRoute, { initialize: false });
+            route.messageRepo = { findOne: vi.fn() };
+
+            await expect(route.checkLegalHold(existing, { uid: "u1" })).resolves.toBeUndefined();
+
+            expect(route.messageRepo.findOne).not.toHaveBeenCalled();
+        });
+
+        it("names the blocking matter for a trusted caller.", async () => {
+            const route = makeHeldRoute();
+            route.isTrusted = vi.fn().mockReturnValue(true);
+
+            await expect(route.checkLegalHold(existing, { uid: "admin" })).rejects.toMatchObject({ status: 409, message: expect.stringContaining("matter-1") });
+        });
+
+        it("does not name the blocking matter for a caller that is not trusted.", async () => {
+            const route = makeHeldRoute();
+            route.isTrusted = vi.fn().mockReturnValue(false);
+
+            const error: any = await route.checkLegalHold(existing, { uid: "user" }).catch((err: any) => err);
+
+            expect(error.status).toBe(409);
+            expect(error.message).not.toContain("matter-1");
+        });
+    });
+
+    it("afterPurge() logs a warning for a blob that fails to delete and for a quota refund that fails.", async () => {
+        const route: any = objectFactory.newInstance<TestAttachmentRoute>(TestAttachmentRoute, { initialize: false });
+        const warn = vi.fn();
+        route.logger = { warn };
+        
+        route.blobStore = { delete: vi.fn().mockRejectedValue(new Error("store down")) };
+        route.mailboxRepo = { findOne: vi.fn().mockRejectedValue(new Error("db down")), update: vi.fn() };
+        const records = [{ uid: "a1", blobKey: "blob-1", sizeBytes: 10, mailboxUid: "mb" }];
+
+        const prepared = await route.beforePurge(records);
+        await route.afterPurge(records, prepared);
+
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("failed to delete blob blob-1: store down"));
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("failed to refund 10 quota bytes to mailbox mb"));
+    });
 });

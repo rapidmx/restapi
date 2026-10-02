@@ -5,6 +5,7 @@
 import type { ObjectFactory } from "@rapidrest/core";
 import { RepoUtils } from "@rapidrest/service-core";
 import type { DnsResolver } from "../dns/DnsResolver.js";
+import { addressDomainOf } from "./AddressUtils.js";
 import { resolveFederationPolicy } from "./FederationUtils.js";
 
 /** Caches one `RepoUtils` per concrete `Domain` class (Mongo vs SQL) - shared across every calling route
@@ -180,7 +181,7 @@ export async function isInternalAddress(
     address: string,
     verifiedDomainNames?: string[],
 ): Promise<boolean> {
-    const domain: string | undefined = address.split("@")[1]?.toLowerCase();
+    const domain: string | undefined = addressDomainOf(address);
     if (!domain) {
         return false;
     }
@@ -217,7 +218,7 @@ const neverFederated: FederatedPeerCheck = async () => false;
  */
 export function createFederatedPeerCheck(dnsResolver: DnsResolver): FederatedPeerCheck {
     return async (address: string): Promise<boolean> => {
-        const domain: string | undefined = address.split("@")[1]?.toLowerCase();
+        const domain: string | undefined = addressDomainOf(address);
         if (!domain) {
             return false;
         }

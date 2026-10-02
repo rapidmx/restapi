@@ -116,7 +116,7 @@ describe("BaseMailboxImportRoute.create() streaming upload (req.bodyStream, @Str
 
     function makeRoute(blobStore: any, maxImportBytes: number = 50 * 1024 * 1024 * 1024): TestMailboxImportRoute {
         const route = objectFactory.newInstance<TestMailboxImportRoute>(TestMailboxImportRoute, { initialize: false });
-        (route as any).requestRepo = { create: vi.fn(async (entity: any) => entity) };
+        (route as any).requestRepo = { create: vi.fn(async (entity: any) => entity), find: vi.fn().mockResolvedValue([]) };
         (route as any).mailboxRepo = {
             find: vi.fn(async () => [mailbox]),
             findOne: vi.fn(async (uid: string) => (uid === mailbox.uid ? mailbox : undefined)),
@@ -371,6 +371,34 @@ describe("BaseMailboxImportRoute.create() streaming upload (req.bodyStream, @Str
 
         await expect(route.create(makeReq(chunkedStream([])), folder.uid, "mbox", undefined, user)).rejects.toMatchObject({ status: 400 });
 
+        expect(store.delete).toHaveBeenCalledTimes(1);
+    });
+    it("takes its own request and uploaded file back out and answers 409 when an earlier import into the mailbox was filed concurrently, even when that clean-up itself fails.", async () => {
+        const store: any = {
+            put: vi.fn(async (_key: string, body: Readable) => {
+                for await (const _chunk of body) {
+                    // drained, so the upload is not empty
+                }
+            }),
+            delete: vi.fn().mockRejectedValue(new Error("blob clean-up failed")),
+        };
+        const route = makeRoute(store);
+        const earlier: any = { uid: "earlier", dateCreated: new Date("2000-01-01"), status: "pending" };
+        let filed = false;
+        (route as any).requestRepo = {
+            create: vi.fn(async (entity: any) => {
+                filed = true;
+                entity.dateCreated = new Date();
+                return entity;
+            }),
+            // Nothing is open when the upload starts; once this one is filed, an earlier one shows up as well.
+            find: vi.fn(async (query: any) => (filed && query.status === "pending" ? [earlier] : [])),
+            delete: vi.fn().mockRejectedValue(new Error("request clean-up failed")),
+        };
+
+        await expect(route.create(makeReq(chunkedStream([Buffer.from("hello")])), folder.uid, "mbox", undefined, user)).rejects.toMatchObject({ status: 409 });
+
+        expect((route as any).requestRepo.delete).toHaveBeenCalledTimes(1);
         expect(store.delete).toHaveBeenCalledTimes(1);
     });
 });

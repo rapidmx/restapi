@@ -198,6 +198,7 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         expect(updated.scheduledSendAttempts).toBeFalsy();
         expect(updated.scheduledSendError).toBeFalsy();
         expect(updated.scheduledSendRelayedAt).toBeFalsy();
+        expect(updated.sentByServerAt).toBeTruthy();
         expect(updated.flags.read).toBe(true);
     });
 
@@ -558,6 +559,7 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         expect(updated.folderUid).toBe(sentFolder!.uid);
         expect(updated.scheduledSendTime).toBeFalsy();
         expect(updated.scheduledSendRelayedAt).toBeFalsy();
+        expect(updated.sentByServerAt).toBeTruthy();
         expect(updated.scheduledSendAttempts).toBeFalsy();
         expect(updated.scheduledSendError).toBeFalsy();
     });
@@ -781,6 +783,7 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
             expect(updated.scheduledSendTime).toBeFalsy();
             expect(updated.scheduledSendLeaseExpiresAt).toBeFalsy();
             expect(updated.scheduledSendRelayedAt).toBeFalsy();
+            expect(updated.sentByServerAt).toBeTruthy();
             expect(updated.messageId).toBe(boundIndexedValue(longId));
             expect(updated.conversationId).toBe(boundIndexedValue(longId));
             // Claim, then the relayed marker on its own, then the filing.

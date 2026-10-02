@@ -11,6 +11,7 @@ import { ApiErrors } from "@rapidrest/service-core";
 import { WrappedPrivateKey } from "../models/types.js";
 import { readFileIfExists, updateJsonFile } from "./FileStoreUtils.js";
 import { computeManualStages } from "./EnrollmentStages.js";
+import { enrollmentLimitProblem, pruneFinishedEnrollments } from "./EnrollmentLimits.js";
 import { validateIssuedCertificate, ValidatedCertificate } from "./IssuedCertificateValidation.js";
 import {
     AdminEnrollmentSummary,
@@ -131,6 +132,12 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
 
         const enrollmentId: string = crypto.randomUUID();
         await this.updateStore((store) => {
+            // Each owner could otherwise grow this file without bound (every change rewrites and syncs the whole of it).
+            const limit: ApiError | undefined = enrollmentLimitProblem(store, identity, Date.now());
+            if (limit) {
+                throw limit;
+            }
+            pruneFinishedEnrollments(store, Date.now());
             store[enrollmentId] = { identity, csr, status: "pending", createdAt: new Date().toISOString() };
         });
 
@@ -246,7 +253,7 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
     public async getIssuedMaterial(
         enrollmentId: string,
     ): Promise<
-        | { certificate: string; wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">; mailboxUid?: string; masterKeyGeneration?: number }
+        | { certificate: string; wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">; mailboxUid?: string; masterKeyGeneration?: number; createdAt?: string }
         | undefined
     > {
         const enrollment: PendingEnrollment = await this.requireEnrollment(await this.loadStore(), enrollmentId);
@@ -258,6 +265,7 @@ export class ManualSigningCertificateEnrollment implements SigningCertificateEnr
             wrappedKey: enrollment.wrappedKey,
             mailboxUid: enrollment.mailboxUid,
             masterKeyGeneration: enrollment.masterKeyGeneration,
+            createdAt: enrollment.createdAt,
         };
     }
 

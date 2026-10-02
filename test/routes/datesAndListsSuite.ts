@@ -157,10 +157,21 @@ export function datesAndListsSuite(ctx: SecurityControlsSuiteContext): void {
                 requiredHolders: 1,
                 notifySubjectOnAccess: false,
             });
+            // A custodian is a mailbox that exists and belongs to the matter's own scope.
+            const custodian = await ctx.store().save("Mailbox", {
+                ownerUserUid: uuid.v4(),
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Custodian",
+                timezone: "UTC",
+                quotaBytes: 1_000_000_000,
+                usedBytes: 0,
+                escrowScopeId: scope.uid,
+            });
             const body = {
                 name: "Matter",
                 escrowScopeId: scope.uid,
-                custodianMailboxUids: [uuid.v4()],
+                custodianMailboxUids: [custodian.uid],
                 dateRangeStart: "2026-01-01T00:00:00.000Z",
                 dateRangeEnd: "2026-06-01T00:00:00.000Z",
             };

@@ -66,6 +66,10 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
     @Config("mail:jobs:attachment_extraction:retry_backoff_seconds", 60)
     private retryBackoffSeconds: number = 60;
 
+    /** The same ceiling `ExtractorRegistry` applies to an attachment's size: one declared larger is never downloaded just to be refused. */
+    @Config("mail:search:extraction:max_bytes", 25 * 1024 * 1024)
+    private maxExtractBytes: number = 25 * 1024 * 1024;
+
     @Logger
     private logger: any;
 
@@ -193,9 +197,15 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
         // happen) is still extracted exactly as before: a pre-existing message from before this feature
         // existed is not encrypted, and failing closed for it too would silently stop indexing every
         // installation's entire attachment history, not just close the soft-delete race this change targets.
-        const text: string | undefined = !message || message.encrypted
-            ? undefined
-            : await this.extractorRegistry.extract(attachment.mimeType, await this.blobStore!.get(attachment.blobKey));
+        //
+        // The MIME type is matched by its bare, lower-cased `type/subtype`: a stored `Content-Type` can carry parameters
+        // (`application/pdf; name=a.pdf`) or odd casing, which the registry's exact-match lookup would never find. An attachment
+        // whose declared size already exceeds what the registry would take is not downloaded at all.
+        const mimeType: string = (attachment.mimeType ?? "").split(";")[0].trim().toLowerCase();
+        const text: string | undefined =
+            !message || message.encrypted || (attachment.sizeBytes ?? 0) > this.maxExtractBytes || !this.extractorRegistry.supports(mimeType)
+                ? undefined
+                : await this.extractorRegistry.extract(mimeType, await this.blobStore!.get(attachment.blobKey));
 
         const extractedTextBlobKey = `attachment-text/${crypto.randomUUID()}`;
         await this.blobStore!.put(extractedTextBlobKey, Buffer.from(text ?? "", "utf-8"), {

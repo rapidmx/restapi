@@ -15,7 +15,7 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import type { CalendarShareLink, Folder } from "../models/types.js";
+import { FolderType, type CalendarShareLink, type Folder } from "../models/types.js";
 import { countMessagesByFolder, healStoredFolderCounts } from "../util/FolderCountUtils.js";
 import { ensureWellKnownFolders } from "../util/FolderUtils.js";
 import { hasMailAccess, stripTrustedRoles } from "../util/MailAccessUtils.js";
@@ -30,6 +30,18 @@ const SHARE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
  * `util/FolderCountUtils.ts` - and the EAS sync key), plus `mailboxUid`, which is the folder's ACL parent and so
  * can't be moved to another mailbox by a client. */
 const SERVER_MANAGED_FOLDER_FIELDS = ["unreadCount", "totalCount", "syncKeyVersion", "mailboxUid"] as const;
+
+/** The types of folder a client may create: the user's own folders and the extra calendars, address books, task lists and note
+ * folders it makes. Every other type (the mail folders) is made by the server alone (`ensureWellKnownFolders()`): the message
+ * routes' guards (Drafts is writable and sendable, Sent Items can be recalled, a held message's fields are frozen outside
+ * Drafts) all key off the folder's `type`, so a client that could pick one could defeat them. */
+const CLIENT_CREATABLE_FOLDER_TYPES: ReadonlySet<string> = new Set<string>([
+    FolderType.USER,
+    FolderType.CALENDAR,
+    FolderType.CONTACTS,
+    FolderType.TASKS,
+    FolderType.NOTES,
+]);
 
 /** See `stripUnsafeQueryKeys()` on `BaseScopedChildRoute.ts`. */
 function stripUnsafeQueryKeys(query: any): Record<string, any> {
@@ -235,8 +247,13 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         return filter;
     }
 
-    /** Drops `SERVER_MANAGED_FOLDER_FIELDS` from a non-trusted caller's update patch. */
+    /** Drops `SERVER_MANAGED_FOLDER_FIELDS` from a non-trusted caller's update patch, and `mailboxUid` and `type` from every caller's. */
     private stripServerManagedFields(obj: Record<string, any>, user: JWTUser | undefined): void {
+        // A folder never changes mailbox, a trusted caller's update included: its ACL is parented to the mailbox it was made in, so
+        // re-pointing `mailboxUid` would only list it (under a name of the caller's choosing) in another mailbox nobody can manage it from.
+        delete obj.mailboxUid;
+        // Nor does it ever change type, whoever asks: see `CLIENT_CREATABLE_FOLDER_TYPES`.
+        delete obj.type;
         if (user && UserUtils.hasRoles(user, this.trustedRoles)) {
             return;
         }
@@ -309,6 +326,9 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
             // A non-string (`mailboxUid[]=a`) names no single mailbox - refused before anything looks it up.
             if (typeof mailboxUid !== "string" || !mailboxUid || !(await this.hasMailAccess(user, mailboxUid, ACLAction.CREATE))) {
                 throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+            }
+            if (raw.type !== undefined && !CLIENT_CREATABLE_FOLDER_TYPES.has(raw.type)) {
+                throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "The server creates the mail folders; a client can only create its own.");
             }
             // The uid is always server-minted: `RepoUtils.create()` reuses an existing `AccessControlList` whose uid
             // equals the new record's and adds the creator to it with full rights, so a client-chosen uid naming

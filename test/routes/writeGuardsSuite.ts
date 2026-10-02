@@ -121,11 +121,11 @@ export function writeGuardsSuite(ctx: SecurityControlsSuiteContext): void {
             await ctx.store().clear("KeyVault", "Mailbox", "AuditLogEntry");
         });
 
-        it("refuses every key vault write from a delegate with UPDATE access, while still letting them read", async () => {
+        it("refuses every key vault write, and the read, from a delegate with UPDATE access", async () => {
             const mailbox = await createMailbox([wrap("password")]);
             const wrappedKey = { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" };
 
-            expect((await authed("get", delegate, `/mailboxes/${mailbox.uid}/keyvault`)).status).toBe(200);
+            expect((await authed("get", delegate, `/mailboxes/${mailbox.uid}/keyvault`)).status).toBe(403);
             expect((await authed("post", delegate, `/mailboxes/${mailbox.uid}/keyvault/keys`).send({ useType: "encrypt", csr: "x", wrappedKey })).status).toBe(403);
             expect((await authed("post", delegate, `/mailboxes/${mailbox.uid}/keyvault/keys/sign-enrollment`).send({ csr: "x", wrappedKey })).status).toBe(
                 403,

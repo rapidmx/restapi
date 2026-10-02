@@ -162,6 +162,15 @@ describe("parsePluginUi", () => {
             expect(parsePluginUi({ apps: [BOOK, BOOKING_TYPES] })).toEqual({ apps: [BOOK, BOOKING_TYPES] });
         });
 
+        it("reserves the web client's diagnostics, signing-certificates, appearance, blocked-senders and profile pages", () => {
+            for (const mount of ["/admin/diagnostics", "/admin/signing-certificates", "/settings/appearance", "/settings/blocked-senders", "/settings/profile"]) {
+                expect(RESERVED_PLUGIN_UI_MOUNTS).toContain(mount);
+                expect(appError(app({ host: mount.startsWith("/admin") ? "admin" : "www", mount }))).toBe(
+                    `This plugin's manifest has an invalid ui.apps app: 'book' mounts at ${mount}, which is reserved for the server's own pages.`,
+                );
+            }
+        });
+
         it("refuses two apps of the same plugin at the same mount", () => {
             expect(parsePluginUi({ apps: [BOOK, { ...BOOKING_TYPES, host: "www", mount: "/book" }] })).toBe(
                 "This plugin's manifest has an invalid ui.apps app: 'booking-types' mounts at /book, which overlaps 'book' at /book.",

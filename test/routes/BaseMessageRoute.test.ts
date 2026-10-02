@@ -113,4 +113,16 @@ describe("BaseMessageRoute Tests (dependency guard clause only)", () => {
 
         await expect(route.archive("msg-1", { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
     });
+
+    it("forceOwnSender() leaves the message as it is when its mailbox cannot be found.", async () => {
+        const route: any = objectFactory.newInstance<TestMessageRoute>(TestMessageRoute, { initialize: false });
+        route.mailboxRepo = { findOne: vi.fn().mockResolvedValue(undefined) };
+        const assertSenderAllowed = vi.spyOn(route, "assertSenderAllowed");
+        const message: any = { mailboxUid: "gone", from: { address: "someone@example.com", type: "from" } };
+
+        await route.forceOwnSender(message);
+
+        expect(assertSenderAllowed).not.toHaveBeenCalled();
+        expect(message.from.address).toBe("someone@example.com");
+    });
 });

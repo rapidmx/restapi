@@ -19,6 +19,9 @@ import {
 } from "./SearchProvider.js";
 const { Config, Init, Logger } = ObjectDecorators;
 
+/** The sort keys that follow the main one in every search, so that the order of the hits is total: `entityUid` is unique within an entity type. */
+const TIE_BREAKERS: Record<string, "asc" | "desc">[] = [{ entityUid: "asc" }, { entityType: "asc" }];
+
 /**
  * `SearchProvider` adapter for a dedicated OpenSearch cluster, via the optional peer dependency
  * `@opensearch-project/opensearch` — the recommended provider for larger deployments where the embedded
@@ -290,8 +293,12 @@ export class OpenSearchProvider implements SearchProvider {
                 query: { bool: { must, filter } },
                 // Populates `SearchResult.snippet` - previously left undefined despite the interface
                 // declaring it (specs/search.md §1 calls this out explicitly as a pre-existing gap).
-                highlight: { fields: { subject: {}, body: {}, attachmentText: {} } },
-                sort: query.text || query.subject ? undefined : [{ dateForSort: "desc" }],
+                // No markup around a match: the snippet is plain text a client shows as it is (the default `<em>` tags would be
+                // shown literally), and a literal `<em>` in the mail itself can then no longer be told from a highlight.
+                highlight: { pre_tags: [""], post_tags: [""], fields: { subject: {}, body: {}, attachmentText: {} } },
+                // Ties (equal scores, equal dates) are broken by the document's identity, so paging with `from` can neither repeat
+                // nor skip a hit between pages.
+                sort: [...(query.text || query.subject ? [{ _score: "desc" }] : [{ dateForSort: "desc" }]), ...TIE_BREAKERS],
                 from,
                 size,
             },
@@ -341,7 +348,7 @@ export class OpenSearchProvider implements SearchProvider {
             index: this.index_,
             body: {
                 query: { bool: { must, filter } },
-                sort: [{ dateForSort: "desc" }],
+                sort: [{ dateForSort: "desc" }, ...TIE_BREAKERS],
                 from,
                 size,
             },

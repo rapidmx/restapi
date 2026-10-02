@@ -108,7 +108,7 @@ describe("ManualSigningCertificateEnrollment administrator Tests", () => {
 
         expect(validated.chainLength).toBe(2);
         expect(await enrollment.checkStatus(enrollmentId)).toEqual({ status: "issued", certificate: `${certificate}\n${ca.pem}`, error: undefined });
-        expect(await enrollment.getIssuedMaterial(enrollmentId)).toEqual({ certificate: `${certificate}\n${ca.pem}`, wrappedKey: WRAPPED_KEY, mailboxUid: "mailbox-1", masterKeyGeneration: 2 });
+        expect(await enrollment.getIssuedMaterial(enrollmentId)).toEqual({ certificate: `${certificate}\n${ca.pem}`, wrappedKey: WRAPPED_KEY, mailboxUid: "mailbox-1", masterKeyGeneration: 2, createdAt: expect.any(String) });
         expect((await enrollment.listAdminEnrollments())[0]).toEqual(expect.objectContaining({ status: "issued", stage: "issued", canUpload: false }));
         expect((await enrollment.listPendingEnrollments()).map((row) => row.status)).toEqual(["issued"]);
 

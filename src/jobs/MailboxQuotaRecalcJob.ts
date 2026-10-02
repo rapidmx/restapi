@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
-import { BackgroundService, BaseEntity, ObjectFactory, RepoUtils, SimpleEntity } from "@rapidrest/service-core";
+import { BackgroundService, BaseEntity, ModelUtils, ObjectFactory, RepoUtils, SimpleEntity } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
+import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { Attachment, Mailbox, Message } from "../models/types.js";
@@ -14,6 +15,9 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * once - small enough to keep the generated query comfortably within the shared query DSL's own node/length
  * limits, large enough to meaningfully cut the number of round-trips versus one query per message. */
 const ATTACHMENT_QUERY_CHUNK_SIZE = 100;
+
+/** How many message body sizes (one blob store call each - an S3 HEAD) `recalcMailbox()` asks for at once. */
+const BODY_SIZE_CONCURRENCY = 16;
 
 /**
  * Periodically recomputes `Mailbox.usedBytes` from the mailbox's actual stored content (message body blobs plus
@@ -47,6 +51,9 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
 
     @Config("mail:jobs:mailbox_quota_recalc:batch_size", 100)
     private batchSize: number = 100;
+
+    /** Messages read per keyset page while summing one mailbox. */
+    private messagePageSize: number = 500;
 
     @Logger
     private logger: any;
@@ -144,16 +151,32 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
     }
 
     private async recalcMailbox(mailbox: MB): Promise<void> {
-        const messages: M[] = await this.findAllPages(this.messageRepo!, { mailboxUid: mailbox.uid });
+        // The state this scan starts from. A delivery or delete charges `usedBytes` while the scan runs, so what it computes from
+        // rows read earlier may already be stale: the figure is applied as a correction (what the scan found minus what it started
+        // from) on top of whatever the mailbox holds when the scan ends, never as an absolute value that would drop those charges.
+        const start: MB = (await this.mailboxRepo!.findOne(mailbox.uid, { ignoreACL: true, skipCache: true })) ?? mailbox;
 
+        // Messages are read in keyset pages and only what is needed is kept (their uids, to find attachments), never the whole mailbox's
+        // documents at once. Their body sizes are a blob store call each, a few at a time. A soft-deleted message (Deleted Items, still
+        // restorable) is a plain `find()` blind spot but its blobs are still stored, so a second pass counts those too - otherwise
+        // deleting mail would hand its bytes back to the quota while they are still on disk.
         let usedBytes = 0;
-        for (const message of messages) {
-            try {
-                usedBytes += await this.blobStore!.size(message.bodyBlobKey);
-            } catch (err: any) {
-                this.logger?.warn(
-                    `MailboxQuotaRecalcJob: failed to size body blob ${message.bodyBlobKey} for message ${message.uid}, treating as 0 bytes: ${err.message}`,
-                );
+        let unsized = 0;
+        const messageUidsWithAttachments: string[] = [];
+        for (const softDeleted of [false, true]) {
+            const criteria: Record<string, any> = { mailboxUid: ModelUtils.literal(mailbox.uid), ...(softDeleted ? { deleted: true } : {}) };
+            for await (const page of findPagesByUid<M>(this.messageRepo!, criteria, this.messagePageSize)) {
+                for (let i = 0; i < page.length; i += BODY_SIZE_CONCURRENCY) {
+                    const sizes: (number | undefined)[] = await Promise.all(page.slice(i, i + BODY_SIZE_CONCURRENCY).map((message) => this.bodySize(message)));
+                    for (const size of sizes) {
+                        if (size === undefined) {
+                            unsized++;
+                        } else {
+                            usedBytes += size;
+                        }
+                    }
+                }
+                messageUidsWithAttachments.push(...page.filter((m) => m.hasAttachments).map((m) => m.uid));
             }
         }
 
@@ -162,7 +185,6 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
         // thousands of messages carrying attachments previously issued that many separate DB round-trips
         // every run. `sizeBytes` is summed directly across the whole mailbox's attachments; nothing here needs
         // them correlated back to a specific message.
-        const messageUidsWithAttachments: string[] = messages.filter((m) => m.hasAttachments).map((m) => m.uid);
         for (let i = 0; i < messageUidsWithAttachments.length; i += ATTACHMENT_QUERY_CHUNK_SIZE) {
             const chunk: string[] = messageUidsWithAttachments.slice(i, i + ATTACHMENT_QUERY_CHUNK_SIZE);
             const attachments: A[] = await this.findAllPages(this.attachmentRepo!, { messageUid: `in(${chunk.join(",")})` });
@@ -171,28 +193,58 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
             }
         }
 
+        const startBytes: number = start.usedBytes ?? 0;
+        if (unsized > 0) {
+            // A blob store that is failing (an outage, an expired credential) sizes nothing, which would write a near-zero figure and
+            // leave every mailbox unmetered for the next hour. What was sized is only a lower bound of the real usage: it can still
+            // raise the stored figure, never lower it.
+            this.logger?.warn(`MailboxQuotaRecalcJob: ${unsized} body blob(s) of mailbox ${mailbox.uid} could not be sized, so its usedBytes is only ever raised this run.`);
+            if (usedBytes <= startBytes) {
+                return;
+            }
+        }
+
         // Skip the write entirely when nothing has drifted - this job runs frequently and most mailboxes won't
         // have drifted, so avoiding a no-op update() call (and the version bump/push it would trigger) matters.
-        if (usedBytes !== mailbox.usedBytes) {
-            // `mailbox` came from `run()`'s own `find()` call, which - unlike `findOne()` - returns a plain,
-            // un-hydrated document on the Mongo backend rather than a real model instance. `RepoUtils.update()`
-            // branches its optimistic-lock check, version bump, and `dateModified` refresh entirely on an
-            // `instanceof BaseEntity` check, and silently skips all three (a confirmed real cross-backend bug,
-            // caught by real-database testing: the write still applies `usedBytes`, but leaves `version` and
-            // `dateModified` untouched) when that check comes back false. Re-fetching via `findOne()` right
-            // before the write - the same defensive pattern `ScanQueueJob` already uses for its own updates -
-            // sidesteps the bug and also guards against `mailbox`'s version having gone stale during this
-            // method's own async work above.
-            // The `?? mailbox` fallback only matters if the mailbox was deleted out from under this run between
-            // the initial `find()` and this `findOne()` a few lines later - unreachable in any realistic single
-            // -process test without artificially deleting the row mid-`run()` to win that race, so it's
-            // intentionally left uncovered rather than contrived.
-            const current: MB = (await this.mailboxRepo!.findOne(mailbox.uid, { ignoreACL: true })) ?? mailbox;
+        if (usedBytes === startBytes) {
+            return;
+        }
+        // `current` is a `findOne()` result, a real model instance - unlike `mailbox`, from `run()`'s own `find()`, which on
+        // the Mongo backend is a plain, un-hydrated document. `RepoUtils.update()` branches its optimistic-lock check,
+        // version bump, and `dateModified` refresh entirely on an `instanceof BaseEntity` check, and silently skips all
+        // three (a confirmed real cross-backend bug, caught by real-database testing) when that check comes back false.
+        const current: MB | undefined = await this.mailboxRepo!.findOne(mailbox.uid, { ignoreACL: true, skipCache: true });
+        if (!current) {
+            return;
+        }
+        // Anything that changed the mailbox since the scan began (a charge, a refund, an unrelated edit) has bumped its version. A
+        // mailbox that is busy enough to move on every scan would never be corrected by an all-or-nothing write, so the drift the
+        // scan found is applied to what it holds now. A charge that was also scanned is then counted twice until the next run
+        // corrects it - the over-count is the safe direction for enforcement.
+        const moved: boolean = (current as any).version !== (start as any).version;
+        const target: number = moved ? Math.max(0, (current.usedBytes ?? 0) + usedBytes - startBytes) : usedBytes;
+        if (target === current.usedBytes) {
+            return;
+        }
+        try {
             await this.mailboxRepo!.update(
-                { uid: current.uid, version: (current as any).version, usedBytes } as any,
+                { uid: current.uid, version: (current as any).version, usedBytes: target } as any,
                 asEntity(this.mailboxRepo!, current),
                 { ignoreACL: true, skipPush: true },
             );
+        } catch (err: any) {
+            // Lost a race with a charge landing right now: the next run corrects it.
+            this.logger?.debug?.(`MailboxQuotaRecalcJob: mailbox ${mailbox.uid} changed while it was being corrected - left for the next run: ${err.message}`);
+        }
+    }
+
+    /** One message's stored body size, `undefined` (logged) when the blob store can't say - see `recalcMailbox()`. */
+    private async bodySize(message: M): Promise<number | undefined> {
+        try {
+            return await this.blobStore!.size(message.bodyBlobKey);
+        } catch (err: any) {
+            this.logger?.warn(`MailboxQuotaRecalcJob: failed to size body blob ${message.bodyBlobKey} for message ${message.uid}: ${err.message}`);
+            return undefined;
         }
     }
 }

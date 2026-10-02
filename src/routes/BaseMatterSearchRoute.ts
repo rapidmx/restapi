@@ -9,12 +9,18 @@
 // framework mounts one concrete class per `@Route` prefix, so a second, bespoke class can't also claim
 // `/matters/:id/search` without colliding with it.
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
-import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
+import * as crypto from "crypto";
+import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { SearchEntityType, SearchProvider, SearchResultPage } from "../search/SearchProvider.js";
+import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { requireEscrowHolder } from "../util/EscrowUtils.js";
-import { Mailbox, Matter } from "../models/types.js";
-const { Inject, Logger } = ObjectDecorators;
-const { Get, Query, User: AuthUser } = RouteDecorators;
+import { AuditAction, Mailbox, Matter } from "../models/types.js";
+const { Config, Inject, Logger } = ObjectDecorators;
+const { Get, Query, RateLimit, Request, User: AuthUser } = RouteDecorators;
+
+/** A review search is limited per user: each one runs a full-text query against every custodian mailbox of the matter. */
+const SEARCH_MAX_ATTEMPTS: number = 60;
+const SEARCH_WINDOW_SECONDS: number = 60;
 
 /** Parses an ISO date-string query param, returning `undefined` for an absent/empty/unparseable value -
  * mirrors `BaseSearchRoute.ts`'s own identical helper. */
@@ -77,8 +83,14 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
     protected abstract escrowScopeClass: any;
     protected abstract mailboxClass: any;
 
+    /** The concrete `AuditLogEntry` class, supplied by the Mongo/SQL subclasses. Unset: a search is not audited. */
+    protected auditLogClass?: any;
+
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
+
+    @Config()
+    private config: any;
 
     private matterRepo?: RepoUtils<M>;
     private mailboxRepo?: RepoUtils<MB>;
@@ -119,6 +131,7 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
         return matter;
     }
 
+    @RateLimit({ perUser: true, maxAttempts: SEARCH_MAX_ATTEMPTS, windowSeconds: SEARCH_WINDOW_SECONDS })
     @Get()
     public async search(
         @Query("matterId") matterId: string | undefined,
@@ -135,6 +148,7 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
         @Query("in") folderUid: string | undefined,
         @Query("is") isParam: string | undefined,
         @Query("label") labelParam: string | undefined,
+        @Request req?: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<Record<string, SearchResultPage>> {
         if (!this.searchProvider) {
@@ -143,6 +157,17 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
         if (!matterId) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "matterId is required.");
         }
+        // A repeated or nested query key reaches here as an array or object whatever the parameter is typed as: every filter is one string.
+        text = assertSingleStringParam(text, "q");
+        from = assertSingleStringParam(from, "from");
+        to = assertSingleStringParam(to, "to");
+        cc = assertSingleStringParam(cc, "cc");
+        subject = assertSingleStringParam(subject, "subject");
+        folderUid = assertSingleStringParam(folderUid, "in");
+        limitParam = assertSingleStringParam(limitParam, "limit");
+        hasAttachmentParam = assertSingleStringParam(hasAttachmentParam, "hasAttachment");
+        beforeParam = assertSingleStringParam(beforeParam, "before");
+        afterParam = assertSingleStringParam(afterParam, "after");
         typesParam = assertSingleStringParam(typesParam, "types");
         isParam = assertSingleStringParam(isParam, "is");
         labelParam = assertSingleStringParam(labelParam, "label");
@@ -190,6 +215,8 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
 
         const mailboxRepo: RepoUtils<MB> = await this.getMailboxRepo();
         const resultsByMailbox: Record<string, SearchResultPage> = {};
+        // Read as a number of results per custodian: anything that isn't a positive whole number is no limit at all (the provider's own default applies).
+        const limit: number | undefined = limitParam !== undefined && /^[1-9][0-9]{0,6}$/.test(limitParam) ? parseInt(limitParam, 10) : undefined;
         for (const mailboxUid of matter.custodianMailboxUids) {
             const mailbox: MB | undefined = await mailboxRepo.findOne(mailboxUid, { ignoreACL: true });
             if (!mailbox || mailbox.escrowScopeId !== matter.escrowScopeId) {
@@ -202,7 +229,7 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
                 mailboxUid,
                 text: text ?? "",
                 entityTypes,
-                limit: limitParam ? parseInt(limitParam, 10) : undefined,
+                limit,
                 from,
                 to,
                 cc,
@@ -214,6 +241,28 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
                 flags: isParam ? isParam.split(",") : undefined,
                 labels: labelParam ? labelParam.split(",") : undefined,
             });
+        }
+        // Reading every custodian's mail is the point of a hold review, and the holder's own searches are what an audit has to be able to show:
+        // the matter, how many mailboxes were searched and a digest of the query - not the text, which can itself be what is sensitive.
+        if (this.auditLogClass) {
+            await recordAuditLog(
+                this._objectFactory!,
+                this.auditLogClass,
+                { config: this.config, req, user, logger: this.logger },
+                {
+                    action: AuditAction.MATTER_SEARCH,
+                    targetType: "Matter",
+                    targetUid: matter.uid,
+                    details: {
+                        custodianCount: Object.keys(resultsByMailbox).length,
+                        queryDigest: crypto
+                            .createHash("sha256")
+                            .update(JSON.stringify([text, typesParam, from, to, cc, subject, hasAttachmentParam, beforeParam, afterParam, folderUid, isParam, labelParam]))
+                            .digest("hex")
+                            .slice(0, 16),
+                    },
+                },
+            );
         }
         return resultsByMailbox;
     }

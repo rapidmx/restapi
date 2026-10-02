@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { AttendeeResponseStatus, CalendarEvent, CalendarEventStatus, BusyStatus } from "../models/types.js";
 import { normalizeAddress } from "./AddressUtils.js";
-import { expandOccurrences, type OccurrenceWindow } from "./IcsUtils.js";
+import { expandOccurrencesDetailed, type OccurrenceExpansion, type OccurrenceWindow } from "./IcsUtils.js";
 
 /** One `[start, end)` window during which someone is busy: `tentative` when every event covering it is only tentatively so. */
 export interface BusyInterval extends OccurrenceWindow {
@@ -94,7 +94,7 @@ export function computeBusyIntervals(
               ]
             : undefined;
 
-        for (const occurrence of expandOccurrences(
+        const expansion: OccurrenceExpansion = expandOccurrencesDetailed(
             {
                 startDate: event.startDate,
                 endDate: event.endDate,
@@ -105,8 +105,14 @@ export function computeBusyIntervals(
             windowStart,
             windowEnd,
             excludeDates,
-        )) {
+        );
+        for (const occurrence of expansion.occurrences) {
             busy.push({ start: occurrence.start, end: occurrence.end, tentative });
+        }
+        if (expansion.truncated) {
+            // A safety cap (or an unusable rule) stopped the expansion before the window was covered, so occurrences may be missing:
+            // that must never read as free, so the whole window counts as busy for this event.
+            busy.push({ start: windowStart, end: windowEnd, tentative });
         }
     }
 

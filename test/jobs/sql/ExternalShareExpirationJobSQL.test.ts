@@ -139,6 +139,37 @@ describe("ExternalShareExpirationJobSQL Tests (real DB + DI)", () => {
         expect(remaining.length).toBe(1);
     });
 
+    it("Steps over links that keep failing instead of letting them fill the batch ahead of the expired links behind them.", async () => {
+        (job as any).batchSize = 2;
+        const expiredDate = new Date(Date.now() - HOUR_MS);
+        const links = [
+            await createShareLink({ expiresAt: expiredDate }),
+            await createShareLink({ expiresAt: expiredDate }),
+            await createShareLink({ expiresAt: expiredDate }),
+            await createShareLink({ expiresAt: expiredDate }),
+        ].sort((a, b) => (a.uid < b.uid ? -1 : 1));
+        // The two that sort first can never be revoked.
+        const stuck = new Set([links[0].uid, links[1].uid]);
+        const aclUtils: ACLUtils = objectFactory.getInstance(ACLUtils)!;
+        const realFind = aclUtils.findACL.bind(aclUtils);
+        vi.spyOn(aclUtils, "findACL").mockImplementation(async (uid: any, ...rest: any[]) => {
+            if (stuck.has(links.find((l) => l.folderUid === uid)?.uid ?? "")) {
+                throw new Error("simulated ACL failure");
+            }
+            return (realFind as any)(uid, ...rest);
+        });
+
+        await job.run();
+
+        for (const link of links.slice(0, 2)) {
+            expect(await calendarShareLinkRepo.findOne({ where: { uid: link.uid } })).not.toBeNull();
+        }
+        // The stuck ones did not use up the batch of 2: both later links went in the same run.
+        for (const link of links.slice(2)) {
+            expect(await calendarShareLinkRepo.findOne({ where: { uid: link.uid } })).toBeNull();
+        }
+    });
+
     it("Revokes the expired link's ACLRecord from its folder's real ACL when purging it.", async () => {
         const aclUtils: ACLUtils = objectFactory.getInstance(ACLUtils)!;
         const folderUid = uuid.v4();

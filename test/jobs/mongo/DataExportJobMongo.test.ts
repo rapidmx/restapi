@@ -208,7 +208,9 @@ describe("DataExportJobMongo Tests (real DB + DI)", () => {
         const bundle = await blobStore.get(updated!.blobKey!);
         expect(bundle.toString("utf-8")).toContain("First body.");
         expect(bundle.toString("utf-8")).toContain("Second body.");
-        expect(bundle.toString("utf-8")).toMatch(/^From alice@example\.com /);
+        // One entry per message, in uid order (keyset paging) - whichever of the two senders that puts first.
+        expect(bundle.toString("utf-8")).toMatch(/^From (alice|carol)@example\.com /);
+        expect(bundle.toString("utf-8")).toMatch(/\nFrom (alice|carol)@example\.com /);
 
         const entries = await auditLogRepo.find({ action: AuditAction.DATA_EXPORT_READY }).toArray();
         expect(entries.length).toBe(1);
@@ -265,6 +267,35 @@ describe("DataExportJobMongo Tests (real DB + DI)", () => {
         expect(lines.find((line) => line.entityType === "message").verificationSealGeneration).toBe(2);
         expect(lines.find((line) => line.entityType === "contact").displayName).toBe("A Contact");
         expect(lines.find((line) => line.entityType === "note").title).toBe("A Note");
+    });
+
+    it("Includes the rows the user deleted (still held, restorable) in the JSON bundle, tagged deleted, and counts them against max_content_rows.", async () => {
+        const mailbox = await createMailbox();
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "Live" }));
+        const gone = await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "Deleted" }));
+        await contactRepo.updateOne({ uid: gone.uid } as any, { $set: { deleted: true } });
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "json" });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.status).toBe("ready");
+        const lines = (await blobStore.get(updated!.blobKey!)).toString("utf-8").split(String.fromCharCode(10)).map((line) => JSON.parse(line));
+        expect(lines.filter((l) => l.entityType === "contact").map((l) => [l.displayName, l.deleted ?? false]).sort()).toEqual([["Deleted", true], ["Live", false]]);
+
+        // The live rows alone fit under the cap (the mailbox line and one contact); the deleted one does not.
+        const second = await createRequest({ mailboxUid: mailbox.uid, format: "json" });
+        const original = (job as any).maxContentRows;
+        (job as any).maxContentRows = 2;
+        try {
+            await job.run();
+            const failed = await requestRepo.findOne({ uid: second.uid } as any);
+            expect(failed!.status).toBe("failed");
+            expect(failed!.errorMessage).toContain("exceeds the maximum of 2");
+        } finally {
+            (job as any).maxContentRows = original;
+        }
     });
 
     it("Does not include another mailbox's content in the bundle.", async () => {

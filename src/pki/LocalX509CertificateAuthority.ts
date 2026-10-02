@@ -40,6 +40,10 @@ async function derivePublicKey(privateKeyPem: string): Promise<CryptoKey> {
     return crypto.subtle.importKey("jwk", publicJwk, CA_KEY_ALGORITHM, true, ["verify"]);
 }
 
+/** The largest RSA modulus a CSR may carry: the verification of a CSR's own signature is done with its key, so a 65536-bit one is a
+ * way to make this server do seconds of work per request. */
+const MAX_RSA_MODULUS_BITS = 4096;
+
 /**
  * The zero-external-infrastructure `EncryptionCertificateAuthority` - a self-signed, single-tier CA whose
  * root key pair is generated once and persisted to local disk, built on `@peculiar/x509` (WebCrypto-based,
@@ -118,7 +122,13 @@ export class LocalX509CertificateAuthority implements EncryptionCertificateAutho
                 );
                 const certPem: string | undefined = await readFileIfExists(this.caCertPath());
                 if (certPem !== undefined) {
-                    return { certificate: new x509.X509Certificate(certPem), privateKey };
+                    const certificate = new x509.X509Certificate(certPem);
+                    // A certificate that isn't the key's would sign every leaf under an issuer name whose key can't have signed them.
+                    const keyOnDisk: Buffer = Buffer.from(await crypto.subtle.exportKey("spki", await derivePublicKey(keyPem)));
+                    if (!keyOnDisk.equals(Buffer.from(certificate.publicKey.rawData))) {
+                        throw new Error(`LocalX509CertificateAuthority: '${this.caCertPath()}' is not the certificate of the key '${this.caKeyPath()}'.`);
+                    }
+                    return { certificate, privateKey };
                 }
 
                 // Key present, certificate missing (first run, or a crash between the two writes): self-sign a
@@ -153,13 +163,28 @@ export class LocalX509CertificateAuthority implements EncryptionCertificateAutho
         } catch {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The provided CSR could not be parsed.");
         }
+        // The CSR's key is the mailbox owner's choice, and this CA signs over it: RSA of 2048 to 4096 bits, or one of the NIST
+        // curves (`keyAgreement`/`keyEncipherment` are the only usages it grants), nothing weaker or stranger. Checked before the
+        // signature is, which costs work in the size of the key.
+        const keyAlgorithm: any = parsedCsr.publicKey.algorithm;
+        const acceptable: boolean =
+            keyAlgorithm.name === "ECDSA" || keyAlgorithm.name === "ECDH"
+                ? ["P-256", "P-384", "P-521"].includes(keyAlgorithm.namedCurve)
+                : String(keyAlgorithm.name).startsWith("RSA") && keyAlgorithm.modulusLength >= 2048 && keyAlgorithm.modulusLength <= MAX_RSA_MODULUS_BITS;
+        if (!acceptable) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The provided CSR's key is too weak or of a kind that is not accepted (RSA of 2048 to 4096 bits, or a P-256, P-384 or P-521 curve).");
+        }
         if (!(await parsedCsr.verify())) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The provided CSR's self-signature does not verify.");
         }
 
         const ca = await this.ensureCa();
         const notBefore = new Date();
-        const notAfter = new Date(notBefore.getTime() + this.validityDays * MS_PER_DAY);
+        if (ca.certificate.notAfter.getTime() <= notBefore.getTime()) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, `The local CA certificate expired on ${ca.certificate.notAfter.toISOString()}; it has to be replaced before certificates can be issued.`);
+        }
+        // Never valid beyond the CA that issues it.
+        const notAfter = new Date(Math.min(notBefore.getTime() + this.validityDays * MS_PER_DAY, ca.certificate.notAfter.getTime()));
 
         const certificate: x509.X509Certificate = await x509.X509CertificateGenerator.create({
             // A structured `JsonName` (one RDN, `CN` only), not a hand-interpolated `` `CN=${identity}` ``

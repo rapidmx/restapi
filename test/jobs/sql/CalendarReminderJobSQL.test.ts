@@ -112,6 +112,7 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
         fakeRedis.published = [];
         // The job keeps a per-process fire-window watermark; each test starts as a fresh process would.
         (job as any).watermarkMs = undefined;
+        (job as any).nextDue = new Map();
         await calendarEventRepo.clear();
     });
 
@@ -428,6 +429,65 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
             // A fresh SQL read of an unset nullable `text` column comes back `null`, not `undefined` - unlike
             // Mongo, where the field is genuinely absent and JSON.stringify() drops it from the payload entirely.
             location: null,
+        });
+    });
+
+    describe("Skipping recurring masters with nothing due yet", () => {
+        const weekly = (startDate: Date, extra: any = {}) => ({
+            startDate,
+            endDate: new Date(startDate.getTime() + 30 * 60 * 1000),
+            recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+            reminderMinutesBeforeStart: 4.5,
+            ...extra,
+        });
+
+        it("Remembers when a master's next reminder is due, so later runs don't expand it again until then.", async () => {
+            const now = Date.now();
+            // Weekly, last occurred about an hour ago: the next one is a week less an hour from now.
+            const seriesStart = new Date(Math.floor((now - 60 * 60 * 1000) / 1000) * 1000 - 14 * 24 * 60 * 60 * 1000);
+            const event = await createEvent(weekly(seriesStart));
+            const nextStartMs = seriesStart.getTime() + 21 * 24 * 60 * 60 * 1000;
+
+            await job.run();
+
+            expect(fakeRedis.published).toHaveLength(0);
+            const remembered = (job as any).nextDue.get(event.uid);
+            const stored = (await calendarEventRepo.findOne({ where: { uid: event.uid } }))!;
+            expect(remembered.notBeforeMs).toBe(nextStartMs - Number(stored.reminderMinutesBeforeStart) * 60 * 1000);
+            expect(remembered.version).toBe((await calendarEventRepo.findOne({ where: { uid: event.uid } }))!.version);
+
+            // Not expanded again while its next reminder is more than a window away.
+            const expandSpy = vi.spyOn(job as any, "expandStarts");
+            await job.run();
+            expect(expandSpy).not.toHaveBeenCalled();
+            expandSpy.mockRestore();
+        });
+
+        it("Does not skip a master whose row changed since it was remembered, nor one whose remembered time has come.", async () => {
+            const now = Date.now();
+            const occurrenceStart = new Date(Math.floor((now + 5 * 60 * 1000) / 1000) * 1000);
+            const seriesStart = new Date(occurrenceStart.getTime() - 14 * 24 * 60 * 60 * 1000);
+            const event = await createEvent(weekly(seriesStart));
+            const version = (await calendarEventRepo.findOne({ where: { uid: event.uid } }))!.version;
+
+            // Remembered as not due for a day: skipped.
+            (job as any).nextDue.set(event.uid, { version, notBeforeMs: now + 24 * 60 * 60 * 1000 });
+            await job.run();
+            expect(fakeRedis.published).toHaveLength(0);
+
+            // The row has been edited since (another version): expanded again, and the reminder goes out.
+            (job as any).watermarkMs = undefined;
+            (job as any).nextDue.set(event.uid, { version: version - 1, notBeforeMs: now + 24 * 60 * 60 * 1000 });
+            await job.run();
+            expect(fakeRedis.published).toHaveLength(2);
+        });
+
+        it("Forgets a master that no longer comes up as a candidate.", async () => {
+            (job as any).nextDue.set("gone", { version: 0, notBeforeMs: Date.now() + 1000 });
+
+            await job.run();
+
+            expect((job as any).nextDue.has("gone")).toBe(false);
         });
     });
 

@@ -4,12 +4,13 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { Readable } from "stream";
 import { ObjectDecorators } from "@rapidrest/core";
-import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { BackgroundService, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { collectMailboxContentLines, DEFAULT_MAX_MAILBOX_CONTENT_ROWS, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
+import { collectMailboxContentLines, DEFAULT_MAX_MAILBOX_CONTENT_ROWS, findPagesByUid, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
 import { buildMboxEntry } from "../util/MboxUtils.js";
+import { softDeletedContentLines } from "./SoftDeletedContent.js";
 import { AuditAction, DataExportRequest, Mailbox, Message } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
@@ -40,6 +41,9 @@ interface ExportLease<DER> {
  * referencing this mailbox are deliberately NOT included in this pass - "referencing" is a fuzzier,
  * many-target-types concept than a direct `mailboxUid` filter, and a clear fast-follow rather than
  * something to approximate poorly now.
+ *
+ * The `"json"` bundle also carries the rows the user deleted (flagged `deleted`, still held and restorable), tagged `deleted: true`
+ * (`SoftDeletedContent.ts`) - they are personal data the deployment still holds. `"mbox"` is live mail only.
  *
  * The aggregation step (`util/MailboxContentUtils.ts`'s `collectMailboxContentLines()`) is deliberately
  * not hard-wired to "one mailbox" - `MatterExportJob` reuses it per custodian mailbox for a Matter-scoped
@@ -342,8 +346,9 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
     private async *generateMbox(messageRepo: RepoUtils<any>, mailboxUid: string, lease: ExportLease<DER>, pageSize: number = 500): AsyncGenerator<Buffer> {
         let rows = 0;
         let bytes = 0;
-        for (let page = 0; ; page++) {
-            const batch: Message[] = await messageRepo.find({ mailboxUid, limit: pageSize, page } as any, { ignoreACL: true, limit: pageSize, page });
+        // Keyset paging on `uid` (`findPagesByUid()`), not offset paging: rows moving mid-export (read, moved) would shift an
+        // unsorted offset page, and an export must be neither missing a message nor repeating one.
+        for await (const batch of findPagesByUid<Message>(messageRepo, { mailboxUid: ModelUtils.literal(mailboxUid) }, pageSize)) {
             rows += batch.length;
             if (rows > this.maxContentRows) {
                 throw new Error(`Mailbox ${mailboxUid}'s content exceeds the maximum of ${this.maxContentRows} exportable rows.`);
@@ -364,9 +369,6 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
                 yield entry;
             }
             await this.renewLease(lease);
-            if (batch.length < pageSize) {
-                break;
-            }
         }
     }
 
@@ -391,6 +393,11 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
             undefined,
             this.maxContentRows,
         );
+        // The rows a user deleted are still held (restorable) and still their data: appended, tagged `deleted: true`. The mbox format
+        // carries live mail only.
+        for await (const line of softDeletedContentLines(this._objectFactory!, this.contentEntityClasses, mailboxUid, undefined, lines.length, this.maxContentRows)) {
+            lines.push(line);
+        }
         // Checked before joining, so an oversized bundle never costs a second full-size copy.
         let bytes: number = Math.max(0, lines.length - 1); // "\n" separators
         for (const line of lines) {

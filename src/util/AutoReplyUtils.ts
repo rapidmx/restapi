@@ -30,7 +30,7 @@ const BULK_PRECEDENCE_VALUES = new Set(["bulk", "list", "junk"]);
  * same feature, doesn't loop back.
  */
 export function isAutoReplyEligible(envelopeFrom: string, headers: AutoReplyHeaders): boolean {
-    if (!envelopeFrom || envelopeFrom.trim().length === 0) {
+    if (!envelopeFrom || /^\s*(?:<\s*>)?\s*$/.test(envelopeFrom)) {
         return false;
     }
     if (headers.autoSubmittedHeader && headers.autoSubmittedHeader.trim().toLowerCase() !== "no") {

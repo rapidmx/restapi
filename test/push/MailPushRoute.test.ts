@@ -7,6 +7,7 @@
 // (`ACLUtils.hasPermission()` treats a trusted role as a superuser). All the WebSocket protocol behaviour is
 // `BasePushRoute`'s own, already covered by that package's test suite; what is tested here is the wiring (this file) and,
 // against a real ACL store with a fake Redis, who gets which channel (`MailPushAccess.test.ts`).
+import { EventEmitter } from "events";
 import { ApiError } from "@rapidrest/core";
 import { BasePushRoute } from "@rapidrest/service-core";
 import { MailPushRoute } from "../../src/push/MailPushRoute.js";
@@ -15,7 +16,122 @@ describe("MailPushRoute Tests", () => {
     it("Extends BasePushRoute, overriding only connect() and send() to strip the caller's trusted roles.", () => {
         const route = new MailPushRoute();
         expect(route).toBeInstanceOf(BasePushRoute);
-        expect(Object.getOwnPropertyNames(MailPushRoute.prototype).sort()).toEqual(["connect", "constructor", "send", "trustedRoles"]);
+        // The two entry points, plus the origin check and the access recheck connect() adds to them.
+        expect(Object.getOwnPropertyNames(MailPushRoute.prototype).sort()).toEqual([
+            "connect",
+            "constructor",
+            "corsOrigins",
+            "isOriginAllowed",
+            "recheckAccess",
+            "recheckMs",
+            "send",
+            "trustedRoles",
+            "watchAccess",
+        ]);
+    });
+
+    describe("origin", () => {
+        it.each([
+            [undefined, "https://evil.example", true],
+            ["*", "https://evil.example", true],
+            [["https://mail.example"], undefined, true],
+            [["https://mail.example"], "https://mail.example", true],
+            [["https://mail.example"], "https://evil.example", false],
+            ["https://mail.example", "https://mail.example", true],
+            ["https://mail.example", "https://evil.example", false],
+        ])("With cors:origins %j, a connection from %j is allowed: %j.", (origins, origin, allowed) => {
+            const route: any = new MailPushRoute();
+            route.corsOrigins = origins;
+            expect(route.isOriginAllowed(origin)).toBe(allowed);
+        });
+
+        it("Closes a connection from an origin that is not allowed without ever reaching the base class.", async () => {
+            const route: any = new MailPushRoute();
+            route.corsOrigins = ["https://mail.example"];
+            const connect = vi.spyOn(BasePushRoute.prototype, "connect").mockResolvedValue(undefined);
+            const sock = { close: vi.fn(), on: vi.fn() };
+            await route.connect(sock, { uid: "u1", roles: [], elevated: -1, scopes: [] }, { headers: { origin: "https://evil.example" } });
+            expect(sock.close).toHaveBeenCalledWith(1008, expect.any(String));
+            expect(connect).not.toHaveBeenCalled();
+            await route.connect(sock, { uid: "u1", roles: [], elevated: -1, scopes: [] }, { headers: { origin: "https://mail.example" } });
+            expect(connect).toHaveBeenCalledTimes(1);
+            // Without a user there is nothing to watch.
+            sock.on.mockClear();
+            await route.connect(sock, undefined);
+            expect(sock.on).not.toHaveBeenCalled();
+            connect.mockRestore();
+        });
+    });
+
+    describe("access recheck", () => {
+        const user = { uid: "u1", roles: [], elevated: -1, scopes: [] };
+        const sockOf = () => Object.assign(new EventEmitter(), { readyState: 1, close: vi.fn() });
+
+        it("Is off when recheck_ms is 0, and for a socket that cannot be listened to.", () => {
+            const route: any = new MailPushRoute();
+            route.recheckMs = 0;
+            const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+            route.watchAccess(sockOf(), user);
+            route.recheckMs = 50;
+            route.watchAccess({}, user);
+            expect(setIntervalSpy).not.toHaveBeenCalled();
+            setIntervalSpy.mockRestore();
+        });
+
+        it("Closes a socket whose user lost a channel, whose token expired, and stops watching a closed one.", async () => {
+            const route: any = new MailPushRoute();
+            const hasPermission = vi.fn().mockImplementation(async (_user: any, channel: string) => channel !== "revoked");
+            route.aclUtils = { hasPermission };
+            route.activeSubs = new Map([["u1", ["u1", "kept", "revoked"]]]);
+
+            const still = sockOf();
+            await expect(route.recheckAccess(still, user)).resolves.toBe(false);
+            expect(still.close).toHaveBeenCalledWith(1008, expect.stringContaining("removed"));
+            expect(hasPermission).not.toHaveBeenCalledWith(user, "u1", expect.anything());
+
+            route.activeSubs = new Map([["u1", ["u1", "kept"]]]);
+            const fine = sockOf();
+            await expect(route.recheckAccess(fine, user)).resolves.toBe(true);
+            expect(fine.close).not.toHaveBeenCalled();
+            // A failing check is not a loss: it is asked again next round. No subscriptions at all is fine too.
+            hasPermission.mockRejectedValueOnce(new Error("db down"));
+            await expect(route.recheckAccess(fine, user)).resolves.toBe(true);
+            route.activeSubs = new Map();
+            await expect(route.recheckAccess(fine, user)).resolves.toBe(true);
+            route.aclUtils = undefined;
+            route.activeSubs = new Map([["u1", ["kept"]]]);
+            await expect(route.recheckAccess(fine, user)).resolves.toBe(false);
+
+            const expired = sockOf();
+            await expect(route.recheckAccess(expired, { ...user, exp: Math.floor(Date.now() / 1000) - 5 })).resolves.toBe(false);
+            expect(expired.close).toHaveBeenCalledWith(1008, expect.stringContaining("expired"));
+
+            const closed = Object.assign(sockOf(), { readyState: 3 });
+            await expect(route.recheckAccess(closed, user)).resolves.toBe(false);
+            expect(closed.close).not.toHaveBeenCalled();
+        });
+
+        it("Rechecks on a timer for as long as the socket is open, and stops once it has been closed here or by the client.", async () => {
+            vi.useFakeTimers();
+            try {
+                const route: any = new MailPushRoute();
+                route.recheckMs = 100;
+                route.aclUtils = { hasPermission: vi.fn().mockResolvedValue(false) };
+                route.activeSubs = new Map([["u1", ["u1", "gone"]]]);
+                const sock = sockOf();
+                route.watchAccess(sock, user);
+                await vi.advanceTimersByTimeAsync(250);
+                expect(sock.close).toHaveBeenCalledTimes(1);
+
+                const other = sockOf();
+                route.watchAccess(other, user);
+                other.emit("close");
+                await vi.advanceTimersByTimeAsync(250);
+                expect(other.close).not.toHaveBeenCalled();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
     });
 
     it("Hands the base class the caller without their trusted roles, for a connection and for a publish.", async () => {

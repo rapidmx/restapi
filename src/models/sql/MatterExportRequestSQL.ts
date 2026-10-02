@@ -61,6 +61,11 @@ export class MatterExportRequestSQL extends BaseEntity implements MatterExportRe
     @Nullable
     public processingAttempts?: number = 0;
 
+    @Column({ type: "simple-json", nullable: true })
+    @Description("The custodian mailboxes whose MATTER_EXPORT_READY escrow audit entry this ready export still owes (null once all are recorded).")
+    @Nullable
+    public pendingAttestationMailboxUids?: string[] | null;
+
     constructor(other?: Partial<MatterExportRequestSQL>) {
         super(other);
 
@@ -71,6 +76,7 @@ export class MatterExportRequestSQL extends BaseEntity implements MatterExportRe
             this.blobKey = "blobKey" in other ? other.blobKey : this.blobKey;
             this.errorMessage = "errorMessage" in other ? other.errorMessage : this.errorMessage;
             this.processingAttempts = other.processingAttempts !== undefined && other.processingAttempts !== null ? other.processingAttempts : this.processingAttempts;
+            this.pendingAttestationMailboxUids = "pendingAttestationMailboxUids" in other ? other.pendingAttestationMailboxUids : this.pendingAttestationMailboxUids;
         }
     }
 }

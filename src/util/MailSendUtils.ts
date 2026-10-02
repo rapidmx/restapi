@@ -13,7 +13,7 @@ import { MailRelayError, type MailRelayFailureDetails, relayFailureDetails } fro
 import { normalizeAddress } from "./AddressUtils.js";
 import { deriveConversationId } from "./ConversationUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "./DomainUtils.js";
-import { extractHeader, prependHeaders } from "./MimeHeaderUtils.js";
+import { checkOriginatorHeaders, extractHeader, prependHeaders } from "./MimeHeaderUtils.js";
 import { buildRapidMxKeyHeader } from "./RapidMxKeyHeaderUtils.js";
 import { resolveDeliveryVerdict, ScanPipeline } from "../scan/ScanPipeline.js";
 
@@ -62,6 +62,12 @@ export interface ScanAndRelayResult {
     undelivered?: MailRelayFailureDetails;
 }
 
+/** What `scanAndRelay()` checks the final bytes' `From`/`Sender` headers against (`checkOriginatorHeaders()`). */
+export interface ScanAndRelayOriginators {
+    isAllowed: (address: string) => boolean;
+    rejectAddressLikeDisplayNames?: boolean;
+}
+
 /**
  * Runs `raw` through `ScanPipeline` and, if it passes, relays it via `mailTransport` - the scan-then-relay core
  * shared by every "send a composed message" entry point in this library (`BaseMessageRoute.send()`'s REST
@@ -83,6 +89,10 @@ export interface ScanAndRelayResult {
  *
  * With `events` (and a stream in it), what the transport did is published on the mail event stream - `message.sent` for the
  * accepted recipients and `send.failed` for the refused ones (`events/MailEventStream.ts`'s `publishTransportOutcome()`).
+ *
+ * With `originators`, the message is refused (403) unless its `From`/`Sender` headers pass `checkOriginatorHeaders()` on the
+ * final bytes - after the `Message-ID` above and whatever else the caller added - so no header addition made after a caller's
+ * own check can change who the message is from.
  */
 export async function scanAndRelay(
     raw: Buffer,
@@ -92,6 +102,7 @@ export async function scanAndRelay(
     mailTransport: any,
     blobStore: BlobStore,
     events?: MailSendContext,
+    originators?: ScanAndRelayOriginators,
 ): Promise<ScanAndRelayResult> {
     let finalRaw = raw;
     const existingMessageId = extractHeader(raw, "Message-ID");
@@ -102,6 +113,12 @@ export async function scanAndRelay(
         const domain = envelopeFrom.split("@")[1] || "localhost";
         messageId = `${crypto.randomUUID()}@${domain}`;
         finalRaw = prependHeaders(raw, [{ name: "Message-ID", value: `<${messageId}>` }]);
+    }
+
+    // The originator headers of the bytes actually relayed - after every header added above or by the caller - not of the
+    // composed source a caller checked earlier.
+    if (originators && checkOriginatorHeaders(finalRaw, originators.isAllowed, { rejectAddressLikeDisplayNames: originators.rejectAddressLikeDisplayNames }) !== undefined) {
+        throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "A message can only be sent from its mailbox's own address or one of its aliases.");
     }
 
     // No preview: no caller of a send uses one (the draft already has its own), and deriving it converts the whole HTML body to text.
@@ -147,14 +164,15 @@ export async function scanAndRelay(
 export const MAX_RELAYED_REFERENCES: number = 20;
 export const MAX_RELAYED_REFERENCES_LENGTH: number = 900;
 
-/** One `Message-ID` as it goes into an `In-Reply-To`/`References` header: no angle brackets, no whitespace and
- * nothing that could start a second header line. `undefined` when nothing usable is left. */
+/** One `Message-ID` as it goes into an `In-Reply-To`/`References` header: no angle brackets and visible ASCII only - no
+ * whitespace, control or non-ASCII character (U+010A would become a line feed once the header is written out one byte per
+ * character, and start a second header line). `undefined` when nothing usable is left. */
 function headerMessageId(value: unknown): string | undefined {
     if (typeof value !== "string") {
         return undefined;
     }
     const cleaned: string = value.replace(/[\r\n<>]/g, "").trim();
-    return cleaned.length > 0 && !/\s/.test(cleaned) ? cleaned : undefined;
+    return /^[\x21-\x7E]+$/.test(cleaned) ? cleaned : undefined;
 }
 
 /**
@@ -270,7 +288,10 @@ export async function prepareOutboundMime(args: {
     // Announces the sending mailbox's current encryption key (the Autocrypt-style opportunistic-discovery half of the protocol).
     // `?? []`: defense in depth against a legacy row whose SQL `keys` column was backfilled to `null` rather than the column's
     // own default - the documented "SQL returns null, not undefined, for an unset column" hazard.
-    const activeEncryptKey: PublicKey | undefined = (mailbox?.keys ?? []).find((k) => k.useType === "encrypt" && !k.revokedAt && k.notAfter > Date.now());
+    // With several active ones (legacy duplicates), the newest - the one `revokeInactiveKeys()` and the clients keep.
+    const activeEncryptKey: PublicKey | undefined = (mailbox?.keys ?? [])
+        .filter((k) => k.useType === "encrypt" && !k.revokedAt && k.notAfter > Date.now())
+        .reduce<PublicKey | undefined>((newest, k) => (newest === undefined || k.notBefore > newest.notBefore ? k : newest), undefined);
     if (activeEncryptKey) {
         raw = prependHeaders(raw, [
             {

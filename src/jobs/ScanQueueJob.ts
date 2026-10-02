@@ -18,7 +18,7 @@ import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
 import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames, resolveDomainAlias } from "../util/DomainUtils.js";
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
-import { chargeMailboxQuota, MailboxNotFoundError, MailboxQuotaExceededError } from "../util/MailboxQuotaUtils.js";
+import { chargeMailboxQuota, MailboxNotFoundError, MailboxQuotaExceededError, refundMailboxQuota } from "../util/MailboxQuotaUtils.js";
 import { isHeaderOversignedByAlignedDkim, topmostTrustedAuthenticationResults } from "../util/DkimOversignUtils.js";
 import { refreshFolderCounts, type FolderCountsContext } from "../util/FolderCountUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
@@ -286,6 +286,12 @@ export abstract class ScanQueueJob<
     /** The delay before the first retry of a failed entry; each later retry waits twice as long as the last. */
     @Config("mail:jobs:scan_queue:retry_backoff_seconds", 60)
     private retryBackoffSeconds: number = 60;
+
+    /** The most contacts a mailbox may hold for an inbound `RapidMX-Key` header to still create another one: any external domain that signs its own
+     * mail can name one new address after another, and each would otherwise add a contact to the address book without anyone asking. A header for
+     * a contact the mailbox already has is not affected. `0` disables the limit. */
+    @Config("mail:jobs:scan_queue:max_header_key_contacts", 2000)
+    private maxHeaderKeyContacts: number = 2000;
 
     /** How long a worker's claim on an entry lasts. A `SCANNING` entry past its lease is assumed abandoned (its
      * worker died) and is claimed again - keep this well above the slowest realistic scan. */
@@ -819,7 +825,16 @@ export abstract class ScanQueueJob<
             // `false` means the message was quarantined instead of filed (its mailbox's storage quota would
             // have been exceeded) - see `deliverMessage()`'s own doc comment. Nothing was actually delivered
             // to the Inbox/Junk folder in that case, so auto-reply/iTIP below must not run either.
-            const delivered: boolean = await this.deliverMessage(claim, raw, targetUid, scanResult, result, verdict === "junk");
+            const charge = { bytes: 0 };
+            let delivered: boolean;
+            try {
+                delivered = await this.deliverMessage(claim, raw, targetUid, scanResult, result, verdict === "junk", charge);
+            } catch (err) {
+                // The retry of this entry charges the message again (nothing is filed yet), so an attempt that failed
+                // after its charge hands the charge back.
+                await this.refundUnfiledDelivery(entry.uid, entry.mailboxUid, targetUid, charge.bytes);
+                throw err;
+            }
 
             // Mail filter rules, automatic replies, and iTIP processing only apply to mail actually delivered
             // to the Inbox - matching Exchange's own behavior, junk-routed mail never runs any of them. An
@@ -949,13 +964,19 @@ export abstract class ScanQueueJob<
             asEntity(this.ingestQueueRepo!, claim.row),
             { ignoreACL: true },
         );
-        for (const markerKey of [this.forwardMarkerKey(claim.row.uid), this.autoReplyMarkerKey(claim.row.uid)]) {
+        for (const markerKey of [this.forwardMarkerKey(claim.row.uid), this.autoReplyMarkerKey(claim.row.uid), this.chargeMarkerKey(claim.row.uid)]) {
             try {
                 await this.blobStore!.delete(markerKey);
             } catch (err: any) {
                 this.logger?.debug(`ScanQueueJob: failed to remove marker ${markerKey} of ingest entry ${claim.row.uid}: ${err?.message}`);
             }
         }
+    }
+
+    /** Blob key of the marker `deliverMessage()` writes once it charged an entry's message to the mailbox's quota and no failed attempt handed that
+     * charge back - see `refundUnfiledDelivery()`. */
+    private chargeMarkerKey(entryUid: string): string {
+        return `ingest-markers/${entryUid}/charged`;
     }
 
     /** Blob key of the marker `maybeSendAutoReplyOnce()` writes once an entry's automatic reply was handled. */
@@ -1014,6 +1035,7 @@ export abstract class ScanQueueJob<
         scanResult: SR,
         result: ScanPipelineResult,
         isJunk: boolean,
+        charge: { bytes: number },
     ): Promise<boolean> {
         const entry: Q = claim.row;
         // Who this message was actually addressed to, and who sent it, as its own headers say - shared by the
@@ -1093,8 +1115,23 @@ export abstract class ScanQueueJob<
         // message's attachments written to the `BlobStore` at all.
         if (!alreadyFiled && !filterResult.deleted) {
             const messageBytes: number = raw.length + result.attachments.reduce((sum, a) => sum + a.content.length, 0);
-            const withinQuota: boolean = await this.chargeMailboxQuotaForDelivery(entry.mailboxUid, messageBytes);
-            if (!withinQuota) {
+            // Charged once per entry: a marker (`chargeMarkerKey()`) records a charge no failed attempt has handed back, so a retry - or
+            // another worker taking the entry over after this one stalled past its lease - does not charge the same message again.
+            const outcome: "charged" | "exceeded" | "gone" = (await this.blobStore!.exists(this.chargeMarkerKey(entry.uid)))
+                ? "charged"
+                : await this.chargeMailboxQuotaForDelivery(entry.mailboxUid, messageBytes);
+            // Before the marker is written, so a failure of that write hands the charge back too.
+            charge.bytes = outcome === "charged" ? messageBytes : 0;
+            if (outcome === "charged") {
+                await this.blobStore!.put(this.chargeMarkerKey(entry.uid), Buffer.from(String(messageBytes), "utf-8"), { contentType: "text/plain" });
+            }
+            if (outcome === "gone") {
+                // The mailbox was deleted (and no erasure covers it) after the address was resolved: filing would create folders and a
+                // message for a mailbox that does not exist - rows nothing would ever clean up. The entry is closed with nothing filed.
+                this.logger?.warn(`ScanQueueJob: dropping ingest entry ${entry.uid} - mailbox ${entry.mailboxUid} no longer exists.`);
+                return false;
+            }
+            if (outcome !== "charged") {
                 // Over quota - held for review instead of either silently dropping it or filing it anyway and
                 // running the mailbox's usedBytes over its own configured limit. Same "held out of normal
                 // delivery" mechanism `processEntry()`'s own AV/spam/transport-rule quarantine branch uses -
@@ -1249,28 +1286,52 @@ export abstract class ScanQueueJob<
     }
 
     /**
-     * Charges `bytes` against `mailboxUid`'s persisted quota for inbound delivery (`chargeMailboxQuota()`),
-     * but treats a missing target `Mailbox` row as "nothing to enforce against" - delivery proceeds
-     * uncharged - rather than failing an otherwise-deliverable message outright over it. A real deployment's
-     * `mailboxUid` always names an existing row (an `IngestQueueEntry` is only ever created by resolving a
-     * real address to a real `Mailbox` first - see `BaseMailIngestRoute`), so this only matters for the
-     * genuine race of the mailbox being deleted between resolution and delivery, not for the ordinary case.
-     * Returns `true` if delivery should proceed (charged, or nothing to charge against), `false` if the
-     * charge would exceed the mailbox's quota (the caller quarantines instead of filing).
+     * Charges `bytes` against `mailboxUid`'s persisted quota for inbound delivery (`chargeMailboxQuota()`). A real deployment's
+     * `mailboxUid` always names an existing row (an `IngestQueueEntry` is only ever created by resolving a real address to a real
+     * `Mailbox` first - see `BaseMailIngestRoute`), so a missing row is the genuine race of the mailbox being deleted between
+     * resolution and delivery: `"gone"`, which the caller answers by filing nothing. Returns `"charged"` if delivery should proceed, or
+     * `"exceeded"` if the charge would exceed the mailbox's quota (the caller quarantines instead of filing).
      */
-    private async chargeMailboxQuotaForDelivery(mailboxUid: string, bytes: number): Promise<boolean> {
+    private async chargeMailboxQuotaForDelivery(mailboxUid: string, bytes: number): Promise<"charged" | "exceeded" | "gone"> {
         try {
             await chargeMailboxQuota(this.mailboxRepo!, mailboxUid, bytes);
-            return true;
+            return "charged";
         } catch (err) {
             if (err instanceof MailboxQuotaExceededError) {
-                return false;
+                return "exceeded";
             }
             if (err instanceof MailboxNotFoundError) {
-                this.logger?.debug(`ScanQueueJob: skipping quota enforcement for mailbox ${mailboxUid} - no Mailbox row found.`);
-                return true;
+                return "gone";
             }
             throw err;
+        }
+    }
+
+    /**
+     * Hands back the `bytes` a failed delivery attempt charged to `mailboxUid`'s quota, unless the message was filed after
+     * all (`targetUid`'s row exists: its retry sees it as already filed and charges nothing). Best-effort and never throws -
+     * a refund that can't be written is logged, and `MailboxQuotaRecalcJob` corrects the count later.
+     */
+    private async refundUnfiledDelivery(entryUid: string, mailboxUid: string, targetUid: string, bytes: number): Promise<void> {
+        if (bytes <= 0) {
+            return;
+        }
+        try {
+            if (await this.messageRepo!.findOne(targetUid, { ignoreACL: true })) {
+                return;
+            }
+            let failed = false;
+            await refundMailboxQuota(this.mailboxRepo!, mailboxUid, bytes, (err) => {
+                failed = true;
+                this.logger?.warn(`ScanQueueJob: failed to refund ${bytes} quota bytes to mailbox ${mailboxUid}: ${(err as Error)?.message}`);
+            });
+            // Only once the charge is handed back does the entry stop counting as charged: left in place after a failed refund, the next attempt
+            // does not charge it a second time.
+            if (!failed) {
+                await this.blobStore!.delete(this.chargeMarkerKey(entryUid));
+            }
+        } catch (err: any) {
+            this.logger?.warn(`ScanQueueJob: failed to refund ${bytes} quota bytes to mailbox ${mailboxUid}: ${err.message}`);
         }
     }
 
@@ -1563,11 +1624,20 @@ export abstract class ScanQueueJob<
 
         const now: number = Date.now();
         let headerConflict = false;
-        await this.persistContactKeyUpdate(entry.mailboxUid, fromAddress, now, (existingContact) => {
+        await this.persistContactKeyUpdate(entry.mailboxUid, fromAddress, now, async (existingContact) => {
             if (!existingContact && !discovered) {
                 // Nothing on file, nothing discovered - recording lastMessageSeen alone isn't reason enough to
                 // create a Contact for every random inbound sender.
                 return undefined;
+            }
+            if (!existingContact && this.maxHeaderKeyContacts > 0) {
+                const held: number = await this.contactRepo!.count({ mailboxUid: ModelUtils.literal(entry.mailboxUid) } as any, { ignoreACL: true, skipCache: true });
+                if (held >= this.maxHeaderKeyContacts) {
+                    this.logger?.warn(
+                        `ScanQueueJob: not creating a contact for ${fromAddress} from its RapidMX-Key header - mailbox ${entry.mailboxUid} already holds ${held} contacts.`,
+                    );
+                    return undefined;
+                }
             }
             const update: ContactKeyState = applyDiscoveredKeys(existingContact, discovered, now, "header", fromAddress);
             headerConflict = !!update.keyConflicts?.some((conflict) => conflict.source === "header" && conflict.observedAt === now);

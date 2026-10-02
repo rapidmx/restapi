@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { createHash } from "crypto";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import {
@@ -30,7 +31,7 @@ import { coalesceFolderCounts, notifyFolderCounts, type FolderCountsContext } fr
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { findActiveHoldsFor } from "../util/LegalHoldUtils.js";
 import { applyThreadHeaders, prepareOutboundMime, scanAndRelay, seedReceiptStatus } from "../util/MailSendUtils.js";
-import type { MailRelayFailureDetails } from "../transport/TransportResultUtils.js";
+import { sendOrThrow, type MailRelayFailureDetails } from "../transport/TransportResultUtils.js";
 import type { ScheduledSendJob } from "../jobs/ScheduledSendJob.js";
 import { deliveryFailureKey, describeOriginal, tryFileDeliveryFailureNotice } from "../util/DeliveryFailureNoticeUtils.js";
 import { coerceDateValue } from "../util/DateCoercionUtils.js";
@@ -66,12 +67,38 @@ import {
     MessageFlags,
     MessageReceiptEntry,
     MessageReportKind,
+    Matter,
     Recipient,
     RecipientType,
 } from "../models/types.js";
 const { Config, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Delete, Get, Param, Post, Put, Query, RateLimit, Request, Response, User: AuthUser } = RouteDecorators;
+
+/** What an audit entry records of a message's subject in place of the subject itself: the entries are readable by every administrator, and a
+ * subject is mail content. The digest still lets the same message be matched across entries. */
+function subjectDigest(subject: string | undefined): string {
+    return createHash("sha256").update(`${subject}`).digest("hex").slice(0, 16);
+}
+
+/** The most recipients a recall notice goes to: a recall is addressed to what the message's own recipients say, and one request must not fan out unbounded. */
+export const MAX_RECALL_RECIPIENTS: number = 100;
+
+/** A comparable form of a held field's value: an address (`from`, a recipient) by what identifies it, so a round-tripped object whose keys
+ * come back in another order, or with an empty display name left out, still reads as unchanged. */
+function heldValue(value: unknown): string {
+    const one = (entry: any): string =>
+        entry && typeof entry === "object"
+            ? `${String(entry.address).toLowerCase()}|${entry.type}|${entry.displayName ?? ""}`
+            : String(entry);
+    return Array.isArray(value) ? value.map(one).join(String.fromCharCode(10)) : one(value);
+}
+
+/** The fields of a message that make up what it says it is - who sent it to whom, about what. Frozen while an open legal hold covers the message. */
+const HELD_MESSAGE_FIELDS: readonly string[] = ["subject", "from", "recipients", "messageId"];
+
+/** The dates a legal hold's range is judged by - frozen with `HELD_MESSAGE_FIELDS`. */
+const HELD_MESSAGE_DATE_FIELDS: readonly string[] = ["sentDate", "receivedDate"];
 
 /** The answer to a background send: the message as it now sits in Outbox. */
 export interface QueuedSend<T> {
@@ -222,6 +249,7 @@ const MESSAGE_DATE_FIELDS = [
     "scheduledSendTime",
     "scheduledSendRelayedAt",
     "scheduledSendLeaseExpiresAt",
+    "sentByServerAt",
     "recallRequestedAt",
     "deliveryReceiptSentAt",
     "readReceiptSentAt",
@@ -304,6 +332,19 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     protected readonly scopeProperty: string = "folderUid";
 
     protected readonly serverManagedFields: readonly string[] = SERVER_MANAGED_MESSAGE_FIELDS;
+
+    /** The blob keys and the scan/encryption markers are dropped from a trusted caller's body too: a stored key is read back by
+     * `content()`/raw download and deleted with its message (`afterPurge()`, `RetentionEnforcementJob`), so no body may name another
+     * object's blob. Only the server's own jobs write them, through the repository. */
+    protected readonly alwaysStrippedFields: readonly string[] = [
+        "bodyBlobKey",
+        "sanitizedHtmlBlobKey",
+        "retainedBodyBlobKeys",
+        "scanResultUid",
+        "encrypted",
+        // The marker `recall()` relies on: only the server's own send paths set it.
+        "sentByServerAt",
+    ];
 
     protected readonly dateFields: readonly string[] = MESSAGE_DATE_FIELDS;
 
@@ -575,6 +616,24 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         delete obj.sentDate;
         delete obj.receivedDate;
         delete obj.dispositionNotificationTo;
+        // Mail that sits outside Drafts passes for sent or received: a created one is always from its own mailbox.
+        await this.forceOwnSender(obj);
+        Object.assign(obj, deriveMessageListFields(obj));
+    }
+
+    /** Replaces `message.from` with the mailbox's own address when it names an address the mailbox can't send as: a caller with CREATE on a
+     * mailbox (a delegate included) must not be able to plant mail "from" anyone else in it. Left as it is without a resolvable mailbox. */
+    private async forceOwnSender(message: any): Promise<void> {
+        const mailbox: Mailbox | undefined =
+            typeof message.mailboxUid === "string" ? await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true }) : undefined;
+        if (!mailbox) {
+            return;
+        }
+        try {
+            await this.assertSenderAllowed(mailbox, message);
+        } catch {
+            message.from = { address: mailbox.primarySmtpAddress, type: message.from?.type ?? "to" };
+        }
     }
 
     /**
@@ -615,6 +674,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             obj.searchIndexedAt = null;
         }
         if (this.isTrusted(user)) {
+            await this.assertHeldFieldsUnchanged(obj, existing, user);
             return;
         }
         delete obj.sentDate;
@@ -623,6 +683,24 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             delete obj.dispositionNotificationTo;
         }
         await this.prepareScheduledSendUpdate(obj, existing);
+        await this.assertHeldFieldsUnchanged(obj, existing, user);
+    }
+
+    /**
+     * Refuses (409) a change to `HELD_MESSAGE_FIELDS` of a message an open legal hold covers (`checkLegalHold()`), for every caller: the dates
+     * are already fixed, and a custodian could otherwise rewrite who a held message was from, to or about. A draft isn't held - it is being
+     * written - and a value that isn't changing (a round-tripped object) never counts.
+     */
+    private async assertHeldFieldsUnchanged(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
+        // The dates scope a hold (`checkLegalHold()`), so a trusted caller - whose dates are otherwise left alone - can't move one either.
+        const changed: boolean =
+            HELD_MESSAGE_FIELDS.some((field) => field in obj && heldValue(obj[field]) !== heldValue((existing as any)[field])) ||
+            HELD_MESSAGE_DATE_FIELDS.some(
+                (field) => field in obj && toValidDate(obj[field])?.getTime() !== toValidDate((existing as any)[field])?.getTime(),
+            );
+        if (changed && !(await this.isDraftsFolder(existing.folderUid))) {
+            await this.checkLegalHold(existing, user);
+        }
     }
 
     /**
@@ -668,6 +746,24 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 403,
                 "Only a draft, or a message taken back out of Outbox, can be moved into Drafts.",
             );
+        }
+        // A message created in Drafts keeps the `from` and dates its creator gave it, which is all it takes to forge mail: moved into the
+        // Inbox or any other folder it would pass for received mail. Out of Drafts it can only be thrown away.
+        if (sourceType === FolderType.DRAFTS && targetType !== FolderType.DRAFTS && targetType !== FolderType.DELETED_ITEMS) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "A draft can only be moved to Deleted Items.");
+        }
+        // And what the draft's author made up leaves with it: from Deleted Items a message can go anywhere (restore, archive), so a forged
+        // sender or date must not survive the way out of Drafts.
+        if (sourceType === FolderType.DRAFTS && targetType === FolderType.DELETED_ITEMS) {
+            const now: Date = new Date();
+            obj.sentDate = now;
+            obj.receivedDate = now;
+            const scrubbed: any = { mailboxUid: existing.mailboxUid, from: obj.from ?? (existing as any).from };
+            await this.forceOwnSender(scrubbed);
+            if (heldValue(scrubbed.from) !== heldValue((existing as any).from) || "from" in obj) {
+                obj.from = scrubbed.from;
+                syncMessageListFields(obj, existing);
+            }
         }
         if (sourceType === FolderType.OUTBOX) {
             if ((existing as any).scheduledSendRelayedAt) {
@@ -766,7 +862,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 dispositionType,
                 reportingUa: `${this.mxHostname}; RapidMX`,
             });
-            await this.mailTransport!.send({
+            // A transport reports a refusal in its result rather than throwing: not a receipt that went out.
+            await sendOrThrow(this.mailTransport, {
                 raw: composed,
                 envelopeFrom: mailbox.primarySmtpAddress,
                 envelopeTo: [dispositionNotificationTo],
@@ -950,6 +1047,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             "arrives as a send-succeeded, send-retrying or send-failed event.",
     )
     @Returns([Object])
+    @RateLimit({ perUser: true, maxAttempts: 120, windowSeconds: 3600 })
     @Post("/:id/send")
     public async send(
         @Param("id") id: string,
@@ -1146,6 +1244,9 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             dnsResolver: this.dnsResolver,
         });
         raw = prepared.raw;
+        // The originator headers again, on the final bytes: every header added since the first check (threading, receipt
+        // request, key announcement) is in them, so none of those can change who the message is from.
+        await this.assertSenderAllowed(sendingMailbox, message, raw);
         const attachesReceiptRequest: boolean = prepared.attachesReceiptRequest;
 
         // Claim: a version-checked move into Outbox carrying an in-flight lease (`scheduledSendLeaseExpiresAt`) and no
@@ -1336,6 +1437,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 scheduledSendTime: null,
                 scheduledSendLeaseExpiresAt: null,
                 scheduledSendRelayedAt: null,
+                // The server relayed this message: the one thing that makes it recallable (see `recall()`).
+                sentByServerAt: new Date(),
             } as any,
             current,
             { user, ignoreACL: true },
@@ -1482,16 +1585,20 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * it (see `ScanQueueJob.processRecall()`). The outcome is reported back to this mailbox as an ordinary
      * visible email rather than synced onto this record.
      *
-     * Only available for a message currently in Sent Items (matches Outlook's own restriction — recall isn't
+     * Only available for a message the server itself relayed and filed into Sent Items (`sentByServerAt`, set by `send()` and
+     * `ScheduledSendJob`; a message that merely sits in Sent Items, or was filed before the marker existed, is refused with 403)
+     * and still in Sent Items (matches Outlook's own restriction — recall isn't
      * offered anywhere else).
      */
     @Summary("Recall message")
     @Description(
         "Attempts to recall (delete before it's read) a message this mailbox previously sent, from every " +
-            "original recipient on this mail system. Only available for a message currently in Sent Items. " +
+            "original recipient on this mail system. Only available for a message this server sent and filed in Sent Items. " +
             "Asynchronous and best-effort — see this method's own doc comment.",
     )
     @Returns([Object])
+    // The notice is a relay of the caller's choosing (recipients, subject), so it is bounded like every other send.
+    @RateLimit({ perUser: true, maxAttempts: 30, windowSeconds: 3600 })
     @Post("/:id/recall")
     public async recall(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<T> {
         if (!this.repoUtils || !this.mailTransport) {
@@ -1514,6 +1621,19 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (!message.messageId) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This message cannot be recalled.");
         }
+        // Only a message the server itself relayed and filed (`sentByServerAt`) is recalled: a caller can put any message, with any
+        // recipients, into Sent Items, and a recall mails every recipient the stored message names. Messages filed before the
+        // marker existed carry none and cannot be recalled.
+        if (!(message as any).sentByServerAt) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Only a message this server sent can be recalled.");
+        }
+        // A message is recalled once: every recall mails a notice to all of its recipients.
+        if ((message as any).recallRequestedAt) {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "A recall of this message was already requested.");
+        }
+        if (message.recipients.length > MAX_RECALL_RECIPIENTS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A message to more than ${MAX_RECALL_RECIPIENTS} recipients cannot be recalled.`);
+        }
         // The recall notice goes out with `from.address` as its sender - same rule as `send()`.
         await this.assertSenderAllowed(await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true }), message);
 
@@ -1522,20 +1642,36 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const fromName: string | undefined = safeDisplayName(message.from.displayName);
         const composed: Buffer = await new MailComposer({
             from: { address: message.from.address, name: fromName },
-            to: envelopeTo,
+            // Every recipient - Bcc ones included - gets the notice by envelope only: listing them in `To` would show a Bcc recipient to everyone.
+            to: message.from.address,
             subject: `Recall: ${message.subject}`,
             text: `${fromName ?? message.from.address} is attempting to recall the message: "${message.subject}".`,
             headers: { "X-RapidMX-Recall-Of": message.messageId },
         })
             .compile()
             .build();
-        await this.mailTransport.send({ raw: composed, envelopeFrom: message.from.address, envelopeTo });
 
+        // Claimed before anything is mailed: the stamp is written under the optimistic lock first, so of two concurrent recalls only one
+        // gets past this point (the other fails its version check, 409). A notice the transport turned away releases the claim.
         const updated: T = await this.repoUtils.update(
             { uid: message.uid, version: (message as any).version, recallRequestedAt: new Date() } as any,
             message,
             { user, ignoreACL: true },
         );
+        try {
+            const result = await this.mailTransport.send({ raw: composed, envelopeFrom: message.from.address, envelopeTo });
+            if ((result?.accepted ?? []).length === 0) {
+                throw new Error("The mail transport accepted the recall notice for no recipient.");
+            }
+        } catch (err: any) {
+            this.logger?.warn(`BaseMessageRoute: could not relay the recall of message ${message.uid}: ${err?.message}`);
+            await this.repoUtils.update(
+                { uid: updated.uid, version: (updated as any).version, recallRequestedAt: null } as any,
+                updated,
+                { user, ignoreACL: true },
+            );
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 502, "The recall could not be sent. Try again later.");
+        }
 
         await recordAuditLog(
             this._objectFactory!,
@@ -1546,7 +1682,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 targetType: "Message",
                 targetUid: message.uid,
                 mailboxUid: message.mailboxUid,
-                details: { subject: message.subject, recipientCount: envelopeTo.length },
+                details: { subjectDigest: subjectDigest(message.subject), recipientCount: envelopeTo.length },
             },
         );
 
@@ -2213,6 +2349,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // in the same request can't make an already-answered receipt look unanswered.
         if (
             justMarkedRead &&
+            // Only received mail asks for a receipt: on a message the caller wrote (a draft, a copy planted in Sent Items) it is an arbitrary address to mail.
+            (updated as any).scanResultUid &&
             updated.dispositionNotificationTo &&
             !existing!.readReceiptSentAt &&
             !existing!.readReceiptPending &&
@@ -2309,6 +2447,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     @Summary("Approve a pending receipt")
     @Description("Sends a delivery or read receipt this mailbox originally held pending the owner's explicit approval.")
     @Returns([Object])
+    @RateLimit({ perUser: true, maxAttempts: 120, windowSeconds: 3600 })
     @Post("/:id/receipt/approve")
     public async approveReceipt(
         @Param("id") id: string,
@@ -2411,8 +2550,20 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     // The refusal names the blocking matters (`Matter` uids) only to a caller with a trusted role: matters are a holder concern, and an
     // ordinary mailbox user - whose delete this refuses - has no business learning that an investigation exists or what it is called.
     // Everyone gets the same 409 (`api-011`); only its text differs.
-    protected async checkLegalHold(existing: T, user?: JWTUser): Promise<void> {
-        const holds = await findActiveHoldsFor(this._objectFactory!, this.matterClass, existing.mailboxUid);
+    protected async checkLegalHold(existing: T, user?: JWTUser, context?: Record<string, unknown>): Promise<void> {
+        // A `truncate()` checks every message of a folder: the open matters are loaded once per mailbox for the whole call
+        // (`findActiveHoldsFor()` reads every `Matter`), not once per message.
+        let cache: Map<string, Promise<Matter[]>> | undefined;
+        if (context) {
+            cache = (context.holds as Map<string, Promise<Matter[]>> | undefined) ?? new Map<string, Promise<Matter[]>>();
+            context.holds = cache;
+        }
+        let pending: Promise<Matter[]> | undefined = cache?.get(existing.mailboxUid);
+        if (!pending) {
+            pending = findActiveHoldsFor(this._objectFactory!, this.matterClass, existing.mailboxUid);
+            cache?.set(existing.mailboxUid, pending);
+        }
+        const holds: Matter[] = await pending;
         if (holds.length === 0) {
             return;
         }
@@ -2438,8 +2589,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `Message` is exactly the
      * entity that doc comment's compliance-job list (`ErasureExecutionJob`/`RetentionEnforcementJob`/
      * `LegalHoldUtils`) names as trusting `mailboxUid` directly. */
-    protected async resolveMailboxUidFor(scopeUid: string): Promise<string | undefined> {
-        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid);
+    protected async resolveMailboxUidFor(scopeUid: string, rejectDeleted?: boolean): Promise<string | undefined> {
+        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid, rejectDeleted);
     }
 
     /**
@@ -2481,7 +2632,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                         targetType: "Message",
                         targetUid: existing.uid,
                         mailboxUid: existing.mailboxUid,
-                        details: { subject: existing.subject },
+                        details: { subjectDigest: subjectDigest(existing.subject) },
                     },
                 );
                 throw err;
@@ -2503,7 +2654,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                     targetType: "Message",
                     targetUid: existing.uid,
                     mailboxUid: existing.mailboxUid,
-                    details: { subject: existing.subject, folderUid: existing.folderUid },
+                    details: { subjectDigest: subjectDigest(existing.subject), folderUid: existing.folderUid },
                 },
             );
         }
@@ -2549,7 +2700,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                     targetType: "Message",
                     targetUid: message.uid,
                     mailboxUid: message.mailboxUid,
-                    details: { subject: message.subject },
+                    details: { subjectDigest: subjectDigest(message.subject) },
                 },
             );
         }

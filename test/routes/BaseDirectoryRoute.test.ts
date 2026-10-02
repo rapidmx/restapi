@@ -45,7 +45,7 @@ describe("BaseDirectoryRoute helpers", () => {
     it("escapes regular expression and LIKE syntax", () => {
         const source = escapeDirectoryRegExp("(a+)+$.*[x]{2}|\\^?");
         expect(new RegExp(`^${source}$`).test("(a+)+$.*[x]{2}|\\^?")).toBe(true);
-        expect(escapeDirectoryLike("50%_\\")).toBe("50\\%\\_\\\\");
+        expect(escapeDirectoryLike("50%_!\\")).toBe("50!%!_!!\\");
     });
 
     it("ranks entries starting with the whole query first, de-duplicates addresses and keeps the limit", () => {

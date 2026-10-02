@@ -9,6 +9,9 @@
 // is already covered on its own in test/pki/Rfc8823AcmeSigningCertificateEnrollment.test.ts.
 import { ACLUtils, AccessControlListSQL, ConnectionManager, ObjectFactory, isSqlDataSource } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
+import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import config from "../../config.sql.js";
@@ -21,12 +24,14 @@ import { AuditAction } from "../../../src/models/types.js";
 import { EnrollmentResult, SigningCertificateEnrollment } from "../../../src/pki/SigningCertificateEnrollment.js";
 import { publicKeyFromCertificatePem } from "../../../src/util/CertificateInstallUtils.js";
 import { issueTestLeaf, makeTestCa } from "../../routes/keyRotationContinuitySuite.js";
+import { ManualSigningCertificateEnrollment } from "../../../src/pki/ManualSigningCertificateEnrollment.js";
+import { createTestCa, generateCsrWithKeys } from "../../pki/signingCertTestUtils.js";
 import { caHealthSuite } from "../caHealthSuite.js";
 
 interface FakeEntry {
     identity: string;
     status: "pending" | "issued" | "failed";
-    material?: { certificate: string; wrappedKey: any; mailboxUid?: string; masterKeyGeneration?: number };
+    material?: { certificate: string; wrappedKey: any; mailboxUid?: string; masterKeyGeneration?: number; createdAt?: string };
     installed?: boolean;
     cancelledReason?: string;
     advanceCallCount: number;
@@ -261,6 +266,81 @@ describe("AcmeEnrollmentDriverJobSQL Tests (real DB + DI)", () => {
         expect(FakeDrivenEnrollment.entries.get("moved")!.installed).toBeFalsy();
         expect(FakeDrivenEnrollment.entries.get("moved")!.cancelledReason).toMatch(/different mailbox/);
         expect((await keyVaultRepo.findOne({ where: { mailboxUid: mailbox.uid } }))).toBeFalsy();
+    });
+
+    it("Never installs into a mailbox created after the enrollment began (the address was deleted and reused), but does into one that predates it.", async () => {
+        const mailbox = await createMailbox();
+        const certificate = await generateSelfSignedCertPem(mailbox.primarySmtpAddress);
+        const material = { certificate, wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" }, mailboxUid: mailbox.uid };
+        FakeDrivenEnrollment.entries.set("reused", {
+            identity: mailbox.primarySmtpAddress,
+            status: "issued",
+            material: { ...material, createdAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString() },
+            advanceCallCount: 0,
+        });
+
+        await job.run();
+
+        expect(FakeDrivenEnrollment.entries.get("reused")!.installed).toBeFalsy();
+        expect(FakeDrivenEnrollment.entries.get("reused")!.cancelledReason).toMatch(/different mailbox/);
+        expect(await keyVaultRepo.findOne({ where: { mailboxUid: mailbox.uid } })).toBeFalsy();
+
+        FakeDrivenEnrollment.entries.set("original", {
+            identity: mailbox.primarySmtpAddress,
+            status: "issued",
+            material: { ...material, createdAt: new Date(Date.now() + 60 * 1000).toISOString() },
+            advanceCallCount: 0,
+        });
+
+        await job.run();
+
+        expect(FakeDrivenEnrollment.entries.get("original")!.installed).toBe(true);
+    });
+
+    it("Applies the same guard to the real manual enrollment's material, which reports when the enrollment began.", async () => {
+        const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acmedriver-real-"));
+        const real = new ManualSigningCertificateEnrollment();
+        (real as any).storePath = path.join(dir, "store.json");
+        (real as any).logger = { info: () => undefined };
+        const original = (job as any).signingCertificateEnrollment;
+        (job as any).signingCertificateEnrollment = real;
+        const ca = await createTestCa();
+        const wrappedKey = { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } as any;
+        const issue = async (identity: string, mailboxUid: string): Promise<string> => {
+            const { csr } = await generateCsrWithKeys(identity);
+            const { enrollmentId } = await real.startEnrollment(identity, csr);
+            await real.attachWrappedKey(enrollmentId, wrappedKey, { mailboxUid });
+            await real.uploadValidatedCertificate(enrollmentId, `${await ca.issue(csr)}\n${ca.pem}`);
+            return enrollmentId;
+        };
+        try {
+            // Began before the mailbox at that address was created: the address was reused, so nothing is installed.
+            const identity = `${uuid.v4()}@example.com`;
+            const { csr } = await generateCsrWithKeys(identity);
+            const { enrollmentId: reused } = await real.startEnrollment(identity, csr);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            const newer = await createMailbox({ primarySmtpAddress: identity });
+            await real.attachWrappedKey(reused, wrappedKey, { mailboxUid: newer.uid });
+            await real.uploadValidatedCertificate(reused, `${await ca.issue(csr)}\n${ca.pem}`);
+
+            await job.run();
+
+            expect((await real.describeProgress(reused)).installedAt).toBeUndefined();
+            expect(await keyVaultRepo.findOne({ where: { mailboxUid: newer.uid } })).toBeFalsy();
+
+            // Began after the mailbox was created: installed.
+            const older = await createMailbox();
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            const original8 = await issue(older.primarySmtpAddress, older.uid);
+
+            await job.run();
+
+            expect((await real.describeProgress(original8)).installedAt).toEqual(expect.any(String));
+            expect(await keyVaultRepo.findOne({ where: { mailboxUid: older.uid } })).toBeTruthy();
+        } finally {
+            (job as any).signingCertificateEnrollment = original;
+            await fs.rm(dir, { recursive: true, force: true });
+        }
     });
 
     it("Appends to an existing KeyVault's wrappedKeys rather than creating a second one.", async () => {
@@ -538,6 +618,33 @@ describe("AcmeEnrollmentDriverJobSQL Tests (real DB + DI)", () => {
     });
 
     describe("flagExpiringSigningCerts()", () => {
+        // These exercise the sweep itself, so it runs on every `run()`; the throttle has its own test below.
+        beforeEach(() => {
+            (job as any).expirySweepIntervalMinutes = 0;
+        });
+        afterEach(() => {
+            (job as any).expirySweepIntervalMinutes = 360;
+            (job as any).lastExpirySweepAt = 0;
+        });
+
+        it("Sweeps every mailbox only once per sweep interval, not on every tick.", async () => {
+            (job as any).expirySweepIntervalMinutes = 360;
+            (job as any).lastExpirySweepAt = 0;
+            const soon = (fp: string) => ({ publicKey: "x", type: "x509", useType: "sign" as const, fingerprint: fp, notBefore: Date.now() - 1000, notAfter: Date.now() + 24 * 60 * 60 * 1000 });
+            const sweep = vi.spyOn(job as any, "flagExpiringSigningCerts");
+
+            await job.run();
+            await createMailbox({ keys: [soon("fp-throttled")] });
+            await job.run();
+
+            expect(sweep).toHaveBeenCalledTimes(1);
+            // Due again once the interval has passed.
+            (job as any).lastExpirySweepAt = Date.now() - 361 * 60_000;
+            await job.run();
+            expect(sweep).toHaveBeenCalledTimes(2);
+            sweep.mockRestore();
+        });
+
         it("Records the expiry audit entry only once per certificate across repeated runs, persisting the fingerprint on the KeyVault, and again for a new certificate.", async () => {
             const soon = (fp: string) => ({ publicKey: "x", type: "x509", useType: "sign" as const, fingerprint: fp, notBefore: Date.now() - 1000, notAfter: Date.now() + 24 * 60 * 60 * 1000 });
             const mailbox = await createMailbox({ keys: [soon("fp-1")] });

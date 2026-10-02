@@ -3,9 +3,15 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
+import * as dns from "dns";
 import * as net from "net";
 import { MemoryStore, SimpleStore } from "@rapidrest/core";
 import { EncryptionPreference, KeyDiscoveryResponse, PublicKey } from "../models/types.js";
+
+/** TLDs whose names resolve only inside a private network (or to the host itself): a discovery host under one is an attempt to
+ * reach an internal service (`*.svc.cluster.local`, `metadata.google.internal`, `app.localhost`). The documentation TLDs
+ * (`.example`, `.test`, `.invalid`) resolve nowhere, so they are no SSRF risk and tests rely on them. */
+const PRIVATE_NETWORK_TLDS: ReadonlySet<string> = new Set(["local", "localhost", "internal", "localdomain", "lan", "home", "corp", "intranet", "private", "svc", "cluster"]);
 
 /**
  * z-base32's alphabet (Zooko Wilcox-O'Hearn's human-oriented base32 variant) - the encoding
@@ -164,7 +170,8 @@ export function parseKeyDiscoveryResponse(raw: unknown): KeyDiscoveryResponse | 
         }
         keys.push(key);
     }
-    return { encryptPreference, keys, escrow: raw.escrow };
+    const address: string | undefined = typeof raw.address === "string" && raw.address.length <= 320 && parseKeyDiscoveryAddress(raw.address) ? raw.address : undefined;
+    return { encryptPreference, keys, escrow: raw.escrow, ...(address !== undefined ? { address } : {}) };
 }
 
 /** One cached discovery response, alongside the `ETag` it was served with (if any) so a later request can
@@ -186,6 +193,15 @@ const keyCache: SimpleStore = new MemoryStore();
 
 const CACHE_KEY_PREFIX = "key-discovery:";
 
+/** Bounds how many keys one `KeyDiscoveryResponse` can contribute: `KeyringUtils.applyDiscoveredKeys()` pins at most one key per
+ * `useType` however many a response lists, so this only bounds the cost of a hostile peer's oversized response - and what the
+ * cache keeps of it, since the cache holds one response per address asked about. */
+export const MAX_DISCOVERED_KEYS = 8;
+
+/** The longest a cached response is kept (seconds), whatever `max-age` the peer sent: a peer controls the header, and a long one
+ * would keep an entry (up to `MAX_DISCOVERED_KEYS` certificates) in memory for as long as it likes. */
+const MAX_TTL_SECONDS = 60 * 60;
+
 /** Default cache lifetime (seconds) used only when a response carries no `Cache-Control: max-age` at all -
  * the spec requires the server to always set one, so this is a defensive fallback, not the normal path. */
 const DEFAULT_TTL_SECONDS = 60 * 60;
@@ -202,6 +218,85 @@ function parseMaxAgeSeconds(cacheControl: string | null): number | undefined {
     // `\d+` guarantees a non-empty digit string, so `parseInt` can never return `NaN` here - no further
     // validation needed.
     return match ? parseInt(match[1], 10) : undefined;
+}
+
+/** Address ranges a discovery host may never resolve to: this host, private and shared networks, link-local (the cloud metadata
+ * address among them), multicast and the unique-local IPv6 range. */
+const NON_PUBLIC_ADDRESSES: net.BlockList = (() => {
+    const list = new net.BlockList();
+    for (const [network, prefix] of [
+        ["0.0.0.0", 8],
+        ["10.0.0.0", 8],
+        ["100.64.0.0", 10],
+        ["127.0.0.0", 8],
+        ["169.254.0.0", 16],
+        ["172.16.0.0", 12],
+        ["192.0.0.0", 24],
+        ["192.168.0.0", 16],
+        ["198.18.0.0", 15],
+        ["224.0.0.0", 3],
+    ] as [string, number][]) {
+        list.addSubnet(network, prefix, "ipv4");
+    }
+    for (const [network, prefix] of [
+        ["::", 128],
+        ["::1", 128],
+        ["fc00::", 7],
+        ["fe80::", 10],
+        ["ff00::", 8],
+    ] as [string, number][]) {
+        list.addSubnet(network, prefix, "ipv6");
+    }
+    return list;
+})();
+
+/** Whether `address` (an IPv4 or IPv6 literal) is one a discovery request may be sent to. An IPv4-mapped IPv6 address is judged as the IPv4 address in it. */
+export function isPublicDiscoveryAddress(address: string): boolean {
+    const family: number = net.isIP(address);
+    if (family === 0) {
+        return false;
+    }
+    const mapped: RegExpExecArray | null = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(address);
+    if (mapped) {
+        return isPublicDiscoveryAddress(mapped[1]);
+    }
+    return !NON_PUBLIC_ADDRESSES.check(address, family === 6 ? "ipv6" : "ipv4");
+}
+
+/** How the addresses of a discovery host are looked up: `dns.lookup()` (what `fetch()` resolves with) unless replaced (tests). */
+export type DiscoveryAddressLookup = (hostname: string) => Promise<string[]>;
+
+const systemLookup: DiscoveryAddressLookup = async (hostname) => (await dns.promises.lookup(hostname, { all: true })).map((entry) => entry.address);
+let addressLookup: DiscoveryAddressLookup = systemLookup;
+/** How long to wait for the lookup before leaving the decision to the request itself, which resolves the host on its own. */
+const LOOKUP_TIMEOUT_MS = 3000;
+
+/** Replaces how `fetchRemoteKeys()` looks up a discovery host's addresses; call with no argument to restore the system lookup. */
+export function setDiscoveryAddressLookup(lookup?: DiscoveryAddressLookup): void {
+    addressLookup = lookup ?? systemLookup;
+}
+
+/**
+ * Whether every address `hostname` resolves to is public. A public name that resolves to a private address (`127.0.0.1.nip.io`,
+ * `localtest.me`) is the way past `isSafeDiscoveryHost()`'s name checks to an internal service. A name that does not resolve (or
+ * not in time) passes: the request will not connect to it either. A host that changes its answer between this lookup and the
+ * request's own (DNS rebinding) is not caught - that takes a connection-level hook, which `fetch()` does not give.
+ */
+async function resolvesToPublicAddresses(hostname: string): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+        const addresses: string[] | undefined = await Promise.race([
+            addressLookup(hostname),
+            new Promise<undefined>((resolve) => {
+                timer = setTimeout(() => resolve(undefined), LOOKUP_TIMEOUT_MS);
+            }),
+        ]);
+        return addresses === undefined || addresses.every(isPublicDiscoveryAddress);
+    } catch {
+        return true;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 export interface FetchRemoteKeysOptions {
@@ -281,7 +376,10 @@ function isSafeDiscoveryHost(host: string): boolean {
     } catch {
         return false;
     }
-    return net.isIP(normalizedHostname) === 0;
+    // A name that can only be resolved inside a private network: a single label (`localhost`, `redis`, `kubernetes`) or one
+    // under a private-network TLD (`PRIVATE_NETWORK_TLDS`; cluster names such as `*.svc.cluster.local` end in `.local`). A remote
+    // domain's TXT record has no reason to name any of them.
+    return net.isIP(normalizedHostname) === 0 && withoutPort.includes(".") && !PRIVATE_NETWORK_TLDS.has(withoutPort.toLowerCase().split(".").pop()!);
 }
 
 /** An email address split into its local part and (lowercased) domain - see `parseKeyDiscoveryAddress()`. */
@@ -391,7 +489,7 @@ export async function fetchRemoteKeys(
     const cacheKey: string = `${CACHE_KEY_PREFIX}${host.toLowerCase()}:${domain}:${hash}`;
     const cached: CachedKeyDiscoveryResult | undefined = (await keyCache.load(cacheKey)) as CachedKeyDiscoveryResult | undefined;
 
-    if (!isSafeDiscoveryHost(host)) {
+    if (!isSafeDiscoveryHost(host) || !(await resolvesToPublicAddresses(host.split(":")[0]))) {
         return cached?.response;
     }
 
@@ -412,7 +510,7 @@ export async function fetchRemoteKeys(
         if (response.status === 304 && cached) {
             const refreshedTtl: number | undefined = parseMaxAgeSeconds(response.headers.get("cache-control"));
             if (refreshedTtl !== undefined) {
-                await keyCache.save(cacheKey, cached, refreshedTtl);
+                await keyCache.save(cacheKey, cached, Math.min(refreshedTtl, MAX_TTL_SECONDS));
             }
             return cached.response;
         }
@@ -426,7 +524,9 @@ export async function fetchRemoteKeys(
             return cached?.response;
         }
         const etag: string | undefined = response.headers.get("etag") ?? undefined;
-        const ttl: number = parseMaxAgeSeconds(response.headers.get("cache-control")) ?? DEFAULT_TTL_SECONDS;
+        const ttl: number = Math.min(parseMaxAgeSeconds(response.headers.get("cache-control")) ?? DEFAULT_TTL_SECONDS, MAX_TTL_SECONDS);
+        // Only what a merge could use is kept: the response is cached per address a peer is asked about.
+        body.keys = body.keys.slice(0, MAX_DISCOVERED_KEYS);
         await keyCache.save(cacheKey, { response: body, etag }, ttl);
         return body;
     } catch {

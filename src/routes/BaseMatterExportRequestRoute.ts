@@ -10,14 +10,19 @@
 // dedicated collection with independent find/findById/download, and a request a holder may want to list
 // or re-download later deserves the same treatment here rather than a one-off nested action route.
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
-import { ApiErrorMessages, ApiErrors, HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
+import { ApiErrorMessages, ApiErrors, HttpRequest, HttpResponse, ModelUtils, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
+import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
 import { exactInFilter, findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
-import { EscrowAuditAction, Mailbox, Matter, MatterExportRequest } from "../models/types.js";
-const { Inject, Logger } = ObjectDecorators;
-const { Get, Param, Post, Query, Response, User: AuthUser } = RouteDecorators;
+import { AuditAction, EscrowAuditAction, Mailbox, Matter, MatterExportRequest } from "../models/types.js";
+const { Config, Inject, Logger } = ObjectDecorators;
+const { Get, Param, Post, Query, RateLimit, Request, Response, User: AuthUser } = RouteDecorators;
+
+/** `create()` is limited per user: each request queues a whole-mailbox export of every custodian and writes a ledger entry for each. */
+const CREATE_MAX_ATTEMPTS: number = 10;
+const CREATE_WINDOW_SECONDS: number = 3600;
 
 /** Page size for reading every matter under the caller's held scopes - see `find()`. */
 const MATTER_PAGE_SIZE = 500;
@@ -44,8 +49,14 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
      * without depending on either backend directly - see `util/EscrowAuditUtils.ts`. */
     protected abstract escrowAuditLogClass: any;
 
+    /** The concrete `AuditLogEntry` class, supplied by the Mongo/SQL subclasses. Unset: a download is not audited. */
+    protected auditLogClass?: any;
+
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
+
+    @Config()
+    private config: any;
 
     private requestRepo?: RepoUtils<T>;
     private matterRepo?: RepoUtils<M>;
@@ -95,6 +106,7 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
     }
 
     @Post()
+    @RateLimit({ perUser: true, maxAttempts: CREATE_MAX_ATTEMPTS, windowSeconds: CREATE_WINDOW_SECONDS })
     public async create(body: { matterId: string }, @AuthUser user?: JWTUser): Promise<T> {
         await this.init();
         const matter: M = await this.requireMatter(body?.matterId);
@@ -104,6 +116,13 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This matter is closed.");
         }
 
+        // One export of a matter at a time: each is every custodian's whole mailbox, and a second one while the first is still being built is the same
+        // content again.
+        for (const status of ["pending", "processing"]) {
+            if ((await this.requestRepo!.find({ matterId: ModelUtils.literal(matter.uid), status } as any, { ignoreACL: true, limit: 1 })).length > 0) {
+                throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "An export of this matter is already in progress.");
+            }
+        }
         const created: T = await this.requestRepo!.create(
             new this.matterExportRequestClass({ matterId: matter.uid, requestedByUserUid: user!.uid, status: "pending" }),
             { ignoreACL: true },
@@ -183,7 +202,12 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
     }
 
     @Get("/:id/download")
-    public async download(@Param("id") id: string, @Response res: HttpResponse, @AuthUser user?: JWTUser): Promise<void> {
+    public async download(
+        @Param("id") id: string,
+        @Response res: HttpResponse,
+        @Request req?: HttpRequest,
+        @AuthUser user?: JWTUser,
+    ): Promise<void> {
         await this.init();
         if (!this.blobStore) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
@@ -201,6 +225,15 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
         }
 
         const content: Buffer = await this.blobStore.get(request.blobKey);
+        if (this.auditLogClass) {
+            // Whoever takes the export out of the system is on the record: the request's own ledger entries say who asked for it.
+            await recordAuditLog(
+                this._objectFactory!,
+                this.auditLogClass,
+                { config: this.config, req, user, logger: this.logger },
+                { action: AuditAction.MATTER_EXPORT_DOWNLOAD, targetType: "MatterExportRequest", targetUid: request.uid, details: { matterId: request.matterId } },
+            );
+        }
         res.setHeader("content-type", "application/x-ndjson");
         res.setHeader("content-disposition", `attachment; filename="matter-export-${request.matterId}.ndjson"`);
         res.send(content);

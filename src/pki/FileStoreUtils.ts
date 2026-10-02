@@ -14,9 +14,11 @@ import * as path from "path";
  *
  * **Scope of the guarantees**: `withLock()` serializes callers *within one Node.js process* only. Every write
  * is crash-atomic (a reader, in this process or any other, only ever observes the old or the new complete
- * file, never a torn one), and `createFileExclusive()` is atomic across processes too, but two separate
- * processes (e.g. two replicas sharing a volume) doing a read-modify-write on the same JSON store can still
- * lose one another's update - a real fix for that would be a database-backed store or OS file locking.
+ * file, never a torn one), and `createFileExclusive()` is atomic across processes too. `updateJsonFile()` (the
+ * read-modify-write every JSON store here goes through) also takes a lock file next to the store (`<file>.lock`, created
+ * exclusively, so atomic across processes - replicas sharing a volume), which a crashed holder's leaves behind for at most
+ * `STALE_LOCK_AGE_MS`. That makes the update safe across replicas on any filesystem where exclusive create is atomic (local
+ * disks, NFSv3 and later), though a store that must survive heavy contention belongs in a database.
  */
 
 /** Tail of the in-process lock chain per key - see `withLock()`. */
@@ -43,6 +45,48 @@ export async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T>
         if (lockTails.get(key) === tail) {
             lockTails.delete(key);
         }
+    }
+}
+
+/** A lock file older than this is taken to be a crashed holder's and is removed - far longer than any store update takes. */
+export const STALE_LOCK_AGE_MS = 20_000;
+/** How long `withFileLock()` waits for another process's lock before giving up. */
+const FILE_LOCK_WAIT_MS = 25_000;
+const FILE_LOCK_RETRY_MS = 25;
+
+/**
+ * Runs `fn` while holding `<filePath>.lock`, an exclusively created file (so atomic across processes, unlike `withLock()`, which only
+ * serializes within one). Another process's lock is waited for (retrying every 25 ms, up to 25 s) and removed once it is older than
+ * `STALE_LOCK_AGE_MS`. Throws if the lock can't be had in time. Callers hold the in-process `withLock()` first, so at most one caller per
+ * process is ever waiting here.
+ */
+export async function withFileLock<T>(filePath: string, fn: () => Promise<T>, dirMode: number = 0o700): Promise<T> {
+    const lockPath: string = `${filePath}.lock`;
+    const deadline: number = Date.now() + FILE_LOCK_WAIT_MS;
+    for (;;) {
+        if (await createFileExclusive(lockPath, `${process.pid}`, 0o600, dirMode)) {
+            break;
+        }
+        try {
+            if (Date.now() - (await fs.stat(lockPath)).mtimeMs > STALE_LOCK_AGE_MS) {
+                await fs.rm(lockPath, { force: true });
+                continue;
+            }
+        } catch {
+            /* v8 ignore start -- only reachable when the holder releases the lock in the instant between the two calls. */
+            // Released between the two calls: try to take it again.
+            continue;
+            /* v8 ignore stop */
+        }
+        if (Date.now() > deadline) {
+            throw new Error(`Timed out waiting for the lock on ${path.basename(filePath)}.`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, FILE_LOCK_RETRY_MS));
+    }
+    try {
+        return await fn();
+    } finally {
+        await fs.rm(lockPath, { force: true });
     }
 }
 
@@ -215,11 +259,17 @@ export async function updateJsonFile<S extends object, T>(
     mutate: (store: S) => Promise<T> | T,
     dirMode: number = 0o700,
 ): Promise<T> {
-    return withLock(lockKeyForPath(filePath), async () => {
-        const raw: string | undefined = await readFileIfExists(filePath);
-        const store: S = raw === undefined ? ({} as S) : JSON.parse(raw);
-        const result: T = await mutate(store);
-        await writeFileAtomic(filePath, JSON.stringify(store), mode, dirMode);
-        return result;
-    });
+    return withLock(lockKeyForPath(filePath), () =>
+        withFileLock(
+            filePath,
+            async () => {
+                const raw: string | undefined = await readFileIfExists(filePath);
+                const store: S = raw === undefined ? ({} as S) : JSON.parse(raw);
+                const result: T = await mutate(store);
+                await writeFileAtomic(filePath, JSON.stringify(store), mode, dirMode);
+                return result;
+            },
+            dirMode,
+        ),
+    );
 }

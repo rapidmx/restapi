@@ -10,13 +10,17 @@ import { ACLUtils, ApiErrorMessages, ApiErrors, type HttpRequest, ObjectFactory,
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { fileLeftoverErasure, requireMailboxUid } from "../util/LeftoverMailboxUtils.js";
-import { assertAdminScope } from "../util/MailAccessUtils.js";
+import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, DataSubjectErasureRequest, Mailbox } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
-const { Get, Param, Post, Query, Request, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
+const { Get, Param, Post, Query, RateLimit, Request, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
+
+/** `create()` is limited per user: a request files a review an administrator has to handle. */
+const CREATE_MAX_ATTEMPTS: number = 10;
+const CREATE_WINDOW_SECONDS: number = 3600;
 
 /**
  * A GDPR Article 17 ("right to erasure") request - see `DataSubjectErasureRequest`'s own doc comment for
@@ -49,7 +53,12 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
      * (its folders) without depending on either backend directly - see `util/LeftoverMailboxUtils.ts`. */
     protected abstract folderClass: any;
 
+    @Config("trusted_roles", ["admin"])
     protected trustedRoles: string[] = ["admin"];
+
+    /** How old an elevated token may be before it has to be elevated again, in seconds (`mail:security:elevation_max_age_seconds`, 0 = no limit). */
+    @Config("mail:security:elevation_max_age_seconds", DEFAULT_ELEVATION_MAX_AGE_SECONDS)
+    protected elevationMaxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -65,6 +74,12 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
     /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
     @Config()
     private config: any;
+
+    /** `mail:erasure:allow_self_approval` (default `false`): whether an administrator may approve the erasure request they made themselves. Off, a
+     * request needs a second administrator (four eyes) - which a deployment with a single administrator doesn't have, and can switch this on for;
+     * the approval is then audited as a self-approval. */
+    @Config("mail:erasure:allow_self_approval", false)
+    private allowSelfApproval: boolean = false;
 
     @Logger
     private logger: any;
@@ -117,6 +132,7 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
     }
 
     @Post()
+    @RateLimit({ perUser: true, maxAttempts: CREATE_MAX_ATTEMPTS, windowSeconds: CREATE_WINDOW_SECONDS })
     public async create(@AuthUser user?: JWTUser): Promise<T> {
         await this.init();
         if (!user) {
@@ -196,7 +212,7 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
     @Post("/leftover")
     public async eraseLeftover(body: { mailboxUid?: unknown } | undefined, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T> {
         await this.init();
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const mailboxUid: string = requireMailboxUid(body?.mailboxUid);
         const { request } = await fileLeftoverErasure(
             {
@@ -221,9 +237,16 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
     @Post("/:id/approve")
     public async approve(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<T> {
         await this.init();
+        // An approval queues an irreversible deletion: a trusted role alone isn't enough, the token must be elevated.
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const request: T = await this.requireRequest(id);
         if (request.status !== "pending") {
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This request is not pending review.");
+        }
+        // Four eyes: the reviewer is never the one who asked - unless the deployment says it has no one else (`mail:erasure:allow_self_approval`).
+        const selfApproval: boolean = request.requestedByUserUid === user!.uid;
+        if (selfApproval && this.allowSelfApproval !== true) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "A request can't be approved by the person who made it.");
         }
         // 409 (citing the blocking Matter) if held - the correct GDPR Article 17(3) behavior, not a
         // failure to route around. `ErasureExecutionJob` re-checks this again immediately before the
@@ -239,7 +262,13 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
             this._objectFactory!,
             this.auditLogClass,
             { config: this.config, user, logger: this.logger },
-            { action: AuditAction.ERASURE_REQUEST_APPROVED, targetType: "DataSubjectErasureRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid },
+            {
+                action: AuditAction.ERASURE_REQUEST_APPROVED,
+                targetType: "DataSubjectErasureRequest",
+                targetUid: updated.uid,
+                mailboxUid: updated.mailboxUid,
+                ...(selfApproval ? { details: { selfApproved: true } } : {}),
+            },
         );
         return updated;
     }

@@ -173,6 +173,63 @@ export async function publishTransportOutcome(
     }
 }
 
+/** The longest a free-text or identifier field of a published event may be, in characters (a subject can be 100 KB, and every
+ * delivered copy of a message publishes one event). */
+const MAX_EVENT_FIELD_LENGTH = 1000;
+/** The most of a list (references, recipients, failures) a published event carries - the last of `references`, the first of the rest. */
+const MAX_EVENT_LIST_LENGTH = 100;
+const MAX_EVENT_REFERENCES = 20;
+/** The most a published event may be as JSON, once its fields are clipped: past it a delivered message's parsed report is left off. */
+const MAX_EVENT_BYTES = 64 * 1024;
+
+/** The longest an e-mail address is (RFC 5321). */
+const MAX_EVENT_ADDRESS_LENGTH = 320;
+
+const clip = (value: string | undefined, max: number): string | undefined => (typeof value === "string" && value.length > max ? value.slice(0, max) : value);
+const clipText = (value: string | undefined): string | undefined => clip(value, MAX_EVENT_FIELD_LENGTH);
+const clipAddress = (value: string | undefined): string | undefined => clip(value, MAX_EVENT_ADDRESS_LENGTH);
+const clipList = (values: string[] | undefined, max: number = MAX_EVENT_FIELD_LENGTH, keepLast: boolean = false): string[] | undefined =>
+    Array.isArray(values)
+        ? (keepLast ? values.slice(-MAX_EVENT_LIST_LENGTH) : values.slice(0, MAX_EVENT_LIST_LENGTH)).map((value) => clip(value, max) as string)
+        : values;
+
+/**
+ * `event` with its attacker-controlled fields clipped, so that what is appended to the shared Redis stream stays small whatever the mail
+ * it describes held: text fields to 1,000 characters (an address to 320), `references` to the last 20 (the nearest ancestors) and the other lists to 100
+ * entries, and - should the event still be over 64 KB - its parsed delivery status or feedback report left off.
+ */
+export function boundMailEvent(event: MailEvent): MailEvent {
+    let bounded: MailEvent;
+    switch (event.type) {
+        case "message.delivered":
+            bounded = {
+                ...event,
+                envelopeFrom: clipAddress(event.envelopeFrom) as string,
+                envelopeTo: clipList(event.envelopeTo, MAX_EVENT_ADDRESS_LENGTH) as string[],
+                fromAddress: clipAddress(event.fromAddress),
+                subject: clipText(event.subject),
+                messageId: clipText(event.messageId),
+                inReplyTo: clipText(event.inReplyTo),
+                references: (clipList((event.references ?? []).slice(-MAX_EVENT_REFERENCES), MAX_EVENT_FIELD_LENGTH, true) as string[]),
+                autoSubmitted: clipText(event.autoSubmitted),
+                precedence: clipText(event.precedence),
+            };
+            if (JSON.stringify(bounded).length > MAX_EVENT_BYTES) {
+                bounded = { ...bounded, deliveryStatusReport: undefined, feedbackReport: undefined };
+            }
+            return bounded;
+        case "message.sent":
+            return { ...event, messageId: clipText(event.messageId) as string, envelopeFrom: clipAddress(event.envelopeFrom) as string, recipients: clipList(event.recipients, MAX_EVENT_ADDRESS_LENGTH) as string[] };
+        case "send.failed":
+            return {
+                ...event,
+                messageId: clipText(event.messageId),
+                envelopeFrom: clipAddress(event.envelopeFrom) as string,
+                failures: event.failures.slice(0, MAX_EVENT_LIST_LENGTH).map((failure) => ({ ...failure, recipient: clipAddress(failure.recipient) as string, message: clipText(failure.message) })),
+            };
+    }
+}
+
 /** A `MailEvent` without its timestamp, which `publish()` fills in when the caller leaves it out. */
 export type MailEventInput = MailEvent extends infer E ? (E extends MailEvent ? Omit<E, "occurredAt"> & { occurredAt?: string } : never) : never;
 
@@ -232,7 +289,7 @@ export class MailEventStream {
         if (!redis) {
             return;
         }
-        const full: MailEvent = { ...event, occurredAt: event.occurredAt ?? new Date().toISOString() };
+        const full: MailEvent = boundMailEvent({ ...event, occurredAt: event.occurredAt ?? new Date().toISOString() });
         // node-redis queues a command while its connection is down and keeps it pending until the connection returns, so the
         // append is bounded: a stream that can't be reached must cost mail flow at most `publishTimeoutMs`, not stall it.
         const configured: number = Number(this.publishTimeoutMs);

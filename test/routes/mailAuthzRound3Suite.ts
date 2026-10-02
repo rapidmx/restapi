@@ -299,7 +299,7 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
             expect(new Date(stored.sentDate).toISOString()).toBe(new Date("2025-06-01").toISOString());
         });
 
-        it("a trusted caller can still set them", async () => {
+        it("a trusted caller can still set the job-managed ones, but not the blob keys or markers", async () => {
             const mailbox = await createMailbox(owner.uid);
             await grantAdmin(mailbox);
             const inbox = await createFolder(mailbox.uid);
@@ -307,10 +307,16 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
             const result = await auth(request(ctx.app()).put(url(`/messages/${message.uid}`)), admin).send({
                 uid: message.uid,
                 version: message.version,
+                searchIndexAttempts: 3,
+                // The blob keys and the scan/encryption markers are never a body's, a trusted caller's included.
                 encrypted: true,
+                scanResultUid: "scan-from-a-body",
             });
             expect(result.status).toBe(200);
-            expect((await ctx.findOne("Message", message.uid)).encrypted).toBe(true);
+            const stored = await ctx.findOne("Message", message.uid);
+            expect(stored.searchIndexAttempts).toBe(3);
+            expect(stored.encrypted ?? false).toBe(false);
+            expect(stored.scanResultUid || undefined).toBeUndefined();
         });
 
         it("never lets even a trusted caller set a contact's photoBlobKey (only the photo routes do)", async () => {
@@ -649,7 +655,7 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
         it("refuses a recall whose sender isn't the mailbox's", async () => {
             const mailbox = await createMailbox(owner.uid);
             const sent = await createFolder(mailbox.uid, FolderType.SENT_ITEMS);
-            const message = await createMessage(mailbox, sent.uid, { from: { address: "ceo@example.com", type: RecipientType.TO } });
+            const message = await createMessage(mailbox, sent.uid, { from: { address: "ceo@example.com", type: RecipientType.TO }, sentByServerAt: new Date() });
             expect((await auth(request(ctx.app()).post(url(`/messages/${message.uid}/recall`)), owner)).status).toBe(403);
         });
     });
@@ -775,7 +781,7 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
             expect((await list("A".repeat(43))).headers["content-length"]).toBe("0");
             const link = await auth(request(ctx.app()).post(url("/calendar-share-links")), owner).send({
                 folderUid: calendar.uid,
-                permittedActions: ["*"],
+                permittedActions: ["list", "read", "count", "exists"],
                 createdByUserUid: owner.uid,
             });
             await ctx.saveAcl({ uid: otherCalendar.uid, parentUid: mailbox.uid, records: [{ userOrRoleId: `share:${link.body.token}`, actions: ["*"] }] });
@@ -955,9 +961,10 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
             expect(renamed.status).toBe(200);
         });
 
-        it("quarantine: a trusted create never carries a release, and a release is stamped once", async () => {
+        it("quarantine: a trusted create is refused, and a release is stamped once", async () => {
             const mailbox = await createMailbox(owner.uid);
-            const created = await auth(request(ctx.app()).post(url("/quarantine")), admin).send({
+            // Entries are the scan pipeline's own: no create through the API, and no rawBlobKey for anyone to point at another blob.
+            const refused = await auth(request(ctx.app()).post(url("/quarantine")), admin).send({
                 mailboxUid: mailbox.uid,
                 reason: QuarantineReason.SPAM_POLICY,
                 scanResultUid: uuid.v4(),
@@ -965,7 +972,9 @@ export function mailAuthzRound3Suite(ctx: MailAuthzRound3SuiteContext): void {
                 releasedAt: new Date().toISOString(),
                 releasedByUserUid: owner.uid,
             });
-            expect(created.status).toBe(200);
+            expect(refused.status).toBe(403);
+            const entry = await ctx.save("QuarantineEntry", { mailboxUid: mailbox.uid, reason: QuarantineReason.SPAM_POLICY, scanResultUid: uuid.v4(), rawBlobKey: "raw/3" });
+            const created = { body: entry };
             expect(created.body.releasedAt ?? undefined).toBeUndefined();
 
             const first = await auth(request(ctx.app()).put(url(`/quarantine/${created.body.uid}`)), admin).send({

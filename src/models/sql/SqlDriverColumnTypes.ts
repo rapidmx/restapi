@@ -45,9 +45,31 @@ function restapiSqlEntities(): any[] {
     );
 }
 
+/**
+ * The untyped (`@Column()`) string columns holding text a user types - never indexed - that are widened to `LONGTEXT` on
+ * MySQL/MariaDB, where an untyped string is `varchar(255)` and rejects a longer name or title that Mongo and Postgres accept.
+ * They stay untyped in the entity on purpose: declaring them `text` there would make Postgres' `synchronize` drop and re-add
+ * each existing `character varying` column. Keyed by entity class name.
+ */
+export const MYSQL_LONGTEXT_STRING_COLUMNS: Readonly<Record<string, readonly string[]>> = {
+    BrandingSQL: ["companyName", "title"],
+    ContactListSQL: ["name"],
+    ContactSQL: ["displayName", "givenName", "surname", "company", "jobTitle"],
+    DistributionListSQL: ["name"],
+    FolderSQL: ["name"],
+    LabelSQL: ["name"],
+    MailFilterRuleSQL: ["name"],
+    MailSignatureSQL: ["name"],
+    MailboxSQL: ["displayName"],
+    NoteSQL: ["title"],
+    TaskListSQL: ["name"],
+    TaskSQL: ["title", "assignedTo"],
+    TransportRuleSQL: ["name"],
+};
+
 /** The MySQL-family column options to use in place of a column's framework-declared type, if it needs any. */
-function mysqlColumnOverride(type: any): Record<string, any> | undefined {
-    if (type === "text") {
+function mysqlColumnOverride(type: any, widenString: boolean): Record<string, any> | undefined {
+    if (type === "text" || (widenString && type === String)) {
         return { type: "longtext" };
     }
     if (type === "simple-json") {
@@ -63,7 +85,7 @@ function mysqlColumnOverride(type: any): Record<string, any> | undefined {
  * Adjusts the TypeORM column types of SQL entities for MySQL/MariaDB, where the framework's `@Column` (which can
  * only declare a column's `type`, not a length or precision) maps to types too small for this library's data:
  *
- * - `text` -> `LONGTEXT`. MySQL `TEXT` holds 64 KB; a longer subject, body preview, error message etc. is rejected
+ * - `text`, and the untyped string columns of `MYSQL_LONGTEXT_STRING_COLUMNS` -> `LONGTEXT`. MySQL `TEXT` holds 64 KB; a longer subject, body preview, error message etc. is rejected
  * in strict mode (losing the write) or silently truncated.
  * - `simple-json` -> `LONGTEXT` with `SIMPLE_JSON_LONGTEXT_TRANSFORMER`. TypeORM stores `simple-json` as `TEXT` on
  * MySQL, so a large recipient list, `references` chain, attendee list etc. fails the same way. Stored text is
@@ -110,7 +132,10 @@ export async function applySqlDriverColumnTypes(
             if (column.options.isObjectId) {
                 continue;
             }
-            const override: Record<string, any> | undefined = mysqlColumnOverride(column.options.type ?? column.designType);
+            const override: Record<string, any> | undefined = mysqlColumnOverride(
+                column.options.type ?? column.designType,
+                MYSQL_LONGTEXT_STRING_COLUMNS[entity.name]?.includes(column.propertyName) ?? false,
+            );
             if (!override) {
                 continue;
             }

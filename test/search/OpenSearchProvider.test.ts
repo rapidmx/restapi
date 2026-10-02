@@ -421,7 +421,10 @@ describe("OpenSearchProvider Tests", () => {
 
             expect(result.results[0].snippet).toBe("<em>Budget</em> Q3 … discussing the <em>budget</em>");
             const call = mockClientInstance.search.mock.calls[0][0];
-            expect(call.body.highlight).toEqual({ fields: { subject: {}, body: {}, attachmentText: {} } });
+            // The server is asked for no markup around a match, so a snippet is plain text and a literal `<em>` in mail is just text.
+            expect(call.body.highlight).toEqual({ pre_tags: [""], post_tags: [""], fields: { subject: {}, body: {}, attachmentText: {} } });
+            // A ranked search is ordered by score, then by identity, so that paging cannot repeat or skip a tied hit.
+            expect(call.body.sort).toEqual([{ _score: "desc" }, { entityUid: "asc" }, { entityType: "asc" }]);
         });
 
         it("Leaves snippet undefined when the hit carries no highlight.", async () => {
@@ -498,7 +501,7 @@ describe("OpenSearchProvider Tests", () => {
 
             const call = mockClientInstance.search.mock.calls[0][0];
             expect(call.body.query.bool.must).toEqual([{ match_all: {} }]);
-            expect(call.body.sort).toEqual([{ dateForSort: "desc" }]);
+            expect(call.body.sort).toEqual([{ dateForSort: "desc" }, { entityUid: "asc" }, { entityType: "asc" }]);
         });
     });
 
@@ -521,7 +524,7 @@ describe("OpenSearchProvider Tests", () => {
                 { terms: { entityType: ["message"] } },
                 { term: { folderUid: "folder-1" } },
             ]);
-            expect(call.body.sort).toEqual([{ dateForSort: "desc" }]);
+            expect(call.body.sort).toEqual([{ dateForSort: "desc" }, { entityUid: "asc" }, { entityType: "asc" }]);
             expect(result).toEqual({ candidates: [{ entityType: "message", entityUid: "msg-1" }], nextCursor: undefined });
         });
 

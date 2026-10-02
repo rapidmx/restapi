@@ -151,4 +151,77 @@ describe("buildMboxEntry() / parseMbox() Tests", () => {
         expect(parsed[1].toString("utf-8")).toBe(rawB.toString("utf-8"));
         expect(parsed[2].toString("utf-8")).toBe(rawC.toString("utf-8"));
     });
+
+    it("Finds every separator whichever read-stream chunk boundary it straddles.", async () => {
+        // Bodies of varying length (so separators fall at every offset relative to the 64 KiB chunks), many short lines each.
+        const raws: Buffer[] = [];
+        for (let i = 0; i < 60; i++) {
+            raws.push(Buffer.from(`Subject: M${i}\r\n\r\n${"line of text\r\n".repeat(400 + i * 37)}From the end\r\n`, "utf-8"));
+        }
+        const mbox = Buffer.concat(raws.map((raw, i) => buildMboxEntry(raw, `m${i}@example.com`, new Date("2026-01-01T00:00:00Z"))));
+
+        const parsed = await parseMboxBuffer(mbox);
+
+        expect(parsed.length).toBe(raws.length);
+        parsed.forEach((message, i) => expect(Buffer.compare(message, raws[i])).toBe(0));
+    });
+
+    it("Parses one very large message in time linear in its size (no rescan of everything read so far per chunk).", async () => {
+        const raw = Buffer.from(`Subject: Huge\r\n\r\n${"0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz\r\n".repeat(900_000)}`, "utf-8");
+        const started: number = performance.now();
+        const parsed = await parseMboxBuffer(buildMboxEntry(raw, "big@example.com", new Date("2026-01-01T00:00:00Z")));
+        expect(performance.now() - started).toBeLessThan(2500);
+        expect(parsed.length).toBe(1);
+        expect(parsed[0].length).toBe(raw.length);
+    }, 30_000);
+
+    it("Parses one endless line in linear time, and refuses a message over the cap.", async () => {
+        // Neither a newline-free `From ` line nor a newline-free blob may make each chunk rescan everything read before it.
+        for (const lead of ["From ", "x"]) {
+            const started: number = performance.now();
+            const body = `${lead}${"a".repeat(40 * 1024 * 1024)}`;
+            const parsed = await parseMboxBuffer(Buffer.from(`From a@b Thu Jan  1 00:00:00 2026\nSubject: s\n\n${body}\n`, "latin1"));
+            expect(performance.now() - started).toBeLessThan(5000);
+            expect(parsed).toHaveLength(1);
+            expect(parsed[0].length).toBe(`Subject: s\n\n${body}`.length);
+        }
+        const tempPath = path.join(os.tmpdir(), `mbox-test-${crypto.randomUUID()}.tmp`);
+        await fs.writeFile(tempPath, `From a@b Thu Jan  1 00:00:00 2026\nSubject: s\n\n${"b".repeat(5000)}\n`);
+        try {
+            const drain = async (cap: number): Promise<number> => {
+                let count = 0;
+                for await (const _message of parseMbox(tempPath, cap)) {
+                    count++;
+                }
+                return count;
+            };
+            await expect(drain(1000)).rejects.toThrow(/larger than 1000 bytes/);
+            expect(await drain(10_000)).toBe(1);
+        } finally {
+            await fs.rm(tempPath, { force: true });
+        }
+    }, 60_000);
+
+    it("Finds a separator whose start is split across read chunks, and takes a long or truncated From line as text.", async () => {
+        const first = "From a@b Thu Jan  1 00:00:00 2026\n";
+        // The second separator begins `split` characters before the 64 KB read boundary, so its `From ` is cut at every offset.
+        for (let split = 1; split <= 6; split++) {
+            const pad = "x".repeat(65_536 - split - first.length - 1);
+            const mbox = Buffer.from(`${first}${pad}\nFrom c@d Thu Jan  1 00:00:00 2026\nbody\n`, "latin1");
+            const parsed = await parseMboxBuffer(mbox);
+            expect(parsed.map((m) => m.toString("latin1")), `split ${split}`).toEqual([pad, "body"]);
+        }
+        // A line that starts like a separator but is longer than any is text, and so is one cut short by the end of the file.
+        const longFrom = `From ${"z".repeat(5000)}`;
+        const parsed = await parseMboxBuffer(Buffer.from(`${first}Subject: s\n\n${longFrom}\nFro\nFrom x`, "latin1"));
+        expect(parsed).toHaveLength(1);
+        expect(parsed[0].toString("latin1")).toBe(`Subject: s\n\n${longFrom}\nFro\nFrom x`);
+    });
+
+    it("Takes a From line directly after a separator as text, as before, and drops what precedes the first separator.", async () => {
+        const mbox = Buffer.from("junk line\nmore junk\nFrom a@b Thu Jan  1 00:00:00 2026\nFrom c@d Thu Jan  1 00:00:00 2026\nbody\n", "latin1");
+        const parsed = await parseMboxBuffer(mbox);
+        expect(parsed).toHaveLength(1);
+        expect(parsed[0].toString("latin1")).toBe("From c@d Thu Jan  1 00:00:00 2026\nbody");
+    });
 });

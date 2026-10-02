@@ -433,6 +433,8 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     trackingTransport,
                     this.blobStore!,
                     { stream: this.mailEventStream, mailboxUid: claimed.mailboxUid, messageUid: claimed.uid, source: "scheduled" },
+                    // The final bytes, after the headers `prepareOutboundMime()` added to the ones checked above.
+                    { isAllowed: (address) => ownAddresses.has(normalizeAddress(address)), rejectAddressLikeDisplayNames: true },
                 );
                 relayedRaw = result.raw;
                 relayInfo = { encrypted: result.encrypted, inReplyTo: result.inReplyTo, references: result.references };
@@ -541,6 +543,8 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     scheduledSendAttempts: null,
                     scheduledSendError: null,
                     scheduledSendRelayedAt: null,
+                    // The server relayed this message: the one thing that makes it recallable (`BaseMessageRoute.recall()`).
+                    sentByServerAt: new Date(),
                 } as any,
                 asEntity(this.messageRepo!, refetched),
                 { ignoreACL: true },

@@ -29,6 +29,14 @@ describe("ExtractorRegistry Tests", () => {
         expect(result).toBe("hi");
     });
 
+    it("supports() answers for the bare, lower-cased type/subtype, ignoring parameters and casing.", () => {
+        expect(registry.supports("text/plain")).toBe(true);
+        expect(registry.supports(" Application/PDF; name=a.pdf")).toBe(true);
+        expect(registry.supports("application/zip")).toBe(false);
+        expect(registry.supports("image/png")).toBe(false);
+        expect(registry.supports("")).toBe(false);
+    });
+
     it("Returns undefined for an unsupported MIME type, without error.", async () => {
         const result = await registry.extract("application/zip", Buffer.from("x"));
         expect(result).toBeUndefined();
@@ -168,6 +176,7 @@ const FAKE_WORKER = [
     "    if (text === \"exit\") { process.exit(3); }",
     "    if (text === \"throw\") { throw new Error(\"worker threw\"); }",
     "    if (text === \"oom\") { const keep = []; for (;;) { keep.push(new Array(1e5).fill({ x: Math.random() })); } }",
+    "    if (text === \"abuf\") { globalThis.keep = []; for (let i = 0; i < 12; i++) { globalThis.keep.push(new ArrayBuffer(16 * 1024 * 1024)); } return; }",
     "    if (text === \"fail\") { return reply({ id: task.id, ok: false, error: \"boom\" }); }",
     "    if (text === \"fail-noerror\") { return reply({ id: task.id, ok: false }); }",
     "    if (text === \"nontext\") { return reply({ id: task.id, ok: true, text: 42 }); }",
@@ -239,6 +248,19 @@ describe("ExtractorRegistry worker isolation Tests", () => {
         (registry as any).workerMaxYoungGenerationMb = 4;
         await expect(registry.extract("text/html", Buffer.from("oom"))).resolves.toBeUndefined();
         expect(warn).toHaveBeenCalledWith(expect.stringMatching(/memory limit|out of memory/i));
+    });
+
+    it("Terminates a worker whose native (ArrayBuffer) memory grows past the cap, well before the timeout.", async () => {
+        (registry as any).workerMaxArrayBufferMb = 64;
+        (registry as any).workerMemoryPollMs = 20;
+        const started = Date.now();
+        await expect(registry.extract("text/html", Buffer.from("abuf"))).resolves.toBeUndefined();
+        expect(Date.now() - started).toBeLessThan(8_000);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("of native memory"));
+        expect((registry as any).workerHandle).toBeUndefined();
+        // Below the cap, a task is untouched, and the next call gets a fresh worker.
+        (registry as any).workerMaxArrayBufferMb = 512;
+        await expect(registry.extract("text/html", Buffer.from("fine"))).resolves.toBe("W:fine:2000000");
     });
 
     it("Handles a worker that exits, throws, or reports an error.", async () => {

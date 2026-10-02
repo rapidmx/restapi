@@ -57,12 +57,19 @@ export function buildMboxEntry(rawMime: Buffer, fromAddress: string, date: Date)
     return Buffer.from(separator + escapedBody + "\n", "latin1");
 }
 
+/** The largest message `parseMbox()` buffers by default: a file with a message beyond it (or one endless line) is refused instead of
+ * being read into memory whole. */
+export const MAX_MBOX_MESSAGE_BYTES = 100 * 1024 * 1024;
+
+/** The longest `From ` line `parseMbox()` takes as a separator; a longer one is message text. */
+const MAX_MBOX_SEPARATOR_LINE = 4096;
+
 /** Reverses `buildMboxEntry()`'s mboxo escaping and (for the LAST message only - see `parseMbox()`'s own doc
  * comment) strips the one trailing separator-blank-line byte that isn't actually part of the original raw
  * content. */
-function finalizeMboxMessage(raw: string, isLast: boolean): Buffer {
+function finalizeMboxMessage(raw: string): Buffer {
     const unescaped = raw.replace(/^> From /gm, "From ");
-    const trimmed = isLast && unescaped.endsWith("\n") ? unescaped.slice(0, -1) : unescaped;
+    const trimmed = unescaped.endsWith("\n") ? unescaped.slice(0, -1) : unescaped;
     return Buffer.from(trimmed, "latin1");
 }
 
@@ -75,52 +82,96 @@ function finalizeMboxMessage(raw: string, isLast: boolean): Buffer {
  * actually holds it). Every `From ` separator line - and only a genuine separator line, never an escaped
  * `> From ` one - starts a new message.
  *
- * Incremental-parsing note: the original (whole-buffer) implementation matched a separator via
- * `/(?:^|\n)From [^\n]*\n/` - true file start OR a preceding newline. Streaming a growing, periodically-
- * trimmed buffer means "true file start" can no longer be told apart from "start of whatever's left after
- * trimming" by position alone, so a single synthetic leading `"\n"` is prepended once, up front, unifying
- * both cases into one plain `/\nFrom [^\n]*\n/` match - the real file start behaves exactly like any other
- * `\n`-preceded separator from then on, with nothing further to special-case.
+ * Incremental-parsing note: the file is read line by line as it streams in, so the time is linear in its size whatever the shape of
+ * its lines. A message larger than `maxMessageBytes` (default `MAX_MBOX_MESSAGE_BYTES`) makes the generator throw instead of
+ * buffering it. A `From ` line is a separator unless it directly follows another separator (nothing to end a message with) or is
+ * longer than `MAX_MBOX_SEPARATOR_LINE` - the same lines the original whole-buffer `/(?:^|\n)From [^\n]*\n/` match took.
  */
-export async function* parseMbox(mboxFilePath: string): AsyncGenerator<Buffer> {
-    let text = "\n";
-    // Offset into `text` where the in-progress (not yet fully seen) message's own content begins - `undefined`
-    // until the first separator is found (a leading fragment before it, i.e. a malformed file, is discarded,
-    // matching the original implementation's `parts.slice(1)`).
-    let messageStart: number | undefined;
-    const separatorPattern = /\nFrom [^\n]*\n/g;
+export async function* parseMbox(mboxFilePath: string, maxMessageBytes: number = MAX_MBOX_MESSAGE_BYTES): AsyncGenerator<Buffer> {
+    // The text of the message being read, in pieces joined only once it ends, and its size so far. A line is looked at once, as it
+    // arrives: only the start of a line that could be a separator is held back (`pending`, at most `MAX_MBOX_SEPARATOR_LINE`
+    // characters), and the rest of a line - however long - goes straight into `pieces`. The time is linear in the size of the file,
+    // whatever the shape of its lines.
+    let pieces: string[] = [];
+    let size = 0;
+    // Whether a separator has been found - `false` until then (a leading fragment before it, i.e. a malformed file, is
+    // discarded, matching the original implementation's `parts.slice(1)`).
+    let started = false;
+    // The start of the line being read, while it could still turn out to be a separator.
+    let pending = "";
+    // Whether the line being read is part-way through, and known not to be a separator: the rest of it is message text.
+    let inLine = false;
 
-    function* drainCompleteMessages(): Generator<Buffer> {
-        for (;;) {
-            separatorPattern.lastIndex = messageStart ?? 0;
-            const match = separatorPattern.exec(text);
-            if (!match) {
-                return;
-            }
-            if (messageStart === undefined) {
-                // The very first separator - nothing to emit yet, just record where its message begins.
-                messageStart = match.index + match[0].length;
-                continue;
-            }
-            yield finalizeMboxMessage(text.slice(messageStart, match.index), false);
-            messageStart = match.index + match[0].length;
-            // Compact away everything already consumed, so `text` never grows past roughly one message's
-            // worth (plus whatever's been read ahead so far) rather than the whole file.
-            text = text.slice(messageStart);
-            messageStart = 0;
+    function addText(text: string): void {
+        if (!started || text.length === 0) {
+            return;
         }
+        size += text.length;
+        if (size > maxMessageBytes) {
+            throw new Error(`The mbox file holds a message larger than ${maxMessageBytes} bytes.`);
+        }
+        pieces.push(text);
+    }
+
+    /** A separator line: ends the message in progress (if any text has followed the previous separator) and starts the next. */
+    function* separator(): Generator<Buffer> {
+        if (started && size === 0) {
+            // Directly after another separator line there is no line break left to start one with: it is text, as it always was.
+            addText(pending + "\n");
+            return;
+        }
+        if (started) {
+            // Everything before it, its own leading line break excluded.
+            yield finalizeMboxMessage(pieces.join(""));
+        }
+        pieces = [];
+        size = 0;
+        started = true;
     }
 
     for await (const chunk of createReadStream(mboxFilePath)) {
-        text += (chunk as Buffer).toString("latin1");
-        yield* drainCompleteMessages();
+        const data: string = (chunk as Buffer).toString("latin1");
+        let pos = 0;
+        while (pos < data.length) {
+            if (inLine) {
+                const lineEnd: number = data.indexOf("\n", pos);
+                const next: number = lineEnd < 0 ? data.length : lineEnd + 1;
+                addText(data.slice(pos, next));
+                inLine = lineEnd < 0;
+                pos = next;
+                continue;
+            }
+            const lineEnd: number = data.indexOf("\n", pos);
+            pending += data.slice(pos, lineEnd < 0 ? data.length : lineEnd);
+            if (lineEnd < 0) {
+                pos = data.length;
+                const couldBeSeparator: boolean = pending.startsWith("From ")
+                    ? pending.length <= MAX_MBOX_SEPARATOR_LINE
+                    : pending.length < 5 && "From ".startsWith(pending);
+                if (!couldBeSeparator) {
+                    addText(pending);
+                    pending = "";
+                    inLine = true;
+                }
+                continue;
+            }
+            pos = lineEnd + 1;
+            if (pending.startsWith("From ") && pending.length <= MAX_MBOX_SEPARATOR_LINE) {
+                yield* separator();
+            } else {
+                addText(pending + "\n");
+            }
+            pending = "";
+        }
     }
-    // EOF: whatever remains from the last found separator onward is the final message - the only one whose
+    // EOF: a line that never ended is text, whatever it started with.
+    addText(pending);
+    // Whatever remains from the last found separator onward is the final message - the only one whose
     // own trailing separator-blank-line byte was never consumed by a following separator match, so it alone
     // needs it stripped back off (see `finalizeMboxMessage()`). A file with no separator at all (malformed,
-    // or genuinely empty) leaves `messageStart` `undefined` here, yielding nothing - matching the original
+    // or genuinely empty) leaves `started` false here, yielding nothing - matching the original
     // implementation's empty-array result for the same inputs.
-    if (messageStart !== undefined) {
-        yield finalizeMboxMessage(text.slice(messageStart), true);
+    if (started) {
+        yield finalizeMboxMessage(pieces.join(""));
     }
 }

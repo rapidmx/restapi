@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { LabelSQL, MessageSQL } from "../../sql.js";
+import { buildMessageLabelFilterSQL } from "../../util/MessageListUtils.js";
 import { BaseLabelRoute } from "../BaseLabelRoute.js";
 const { Model } = RouteDecorators;
 
@@ -11,4 +12,8 @@ const { Model } = RouteDecorators;
 export class LabelRouteSQL extends BaseLabelRoute<LabelSQL, MessageSQL> {
     protected readonly repoUtilsClass: any = RepoUtils;
     protected messageClass: any = MessageSQL;
+
+    protected buildLabelUidsFilter(labelUids: string[]): Record<string, any> {
+        return buildMessageLabelFilterSQL(labelUids);
+    }
 }

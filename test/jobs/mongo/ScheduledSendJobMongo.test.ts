@@ -211,6 +211,7 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
         expect(updated.scheduledSendAttempts).toBeFalsy();
         expect(updated.scheduledSendError).toBeFalsy();
         expect(updated.scheduledSendRelayedAt).toBeFalsy();
+        expect(updated.sentByServerAt).toBeTruthy();
         expect(updated.flags.read).toBe(true);
     });
 
@@ -571,6 +572,7 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
         expect(updated.folderUid).toBe(sentFolder!.uid);
         expect(updated.scheduledSendTime).toBeFalsy();
         expect(updated.scheduledSendRelayedAt).toBeFalsy();
+        expect(updated.sentByServerAt).toBeTruthy();
         expect(updated.scheduledSendAttempts).toBeFalsy();
         expect(updated.scheduledSendError).toBeFalsy();
     });
@@ -639,6 +641,7 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
         const updated = await findMessage(message.uid);
         expect(updated.folderUid).toBe(sentFolder!.uid);
         expect(updated.scheduledSendRelayedAt).toBeFalsy();
+        expect(updated.sentByServerAt).toBeTruthy();
     });
 
     it("Skips recording a failed attempt for a message deleted out from under the relay.", async () => {
@@ -829,6 +832,7 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
             expect(updated.scheduledSendTime).toBeFalsy();
             expect(updated.scheduledSendLeaseExpiresAt).toBeFalsy();
             expect(updated.scheduledSendRelayedAt).toBeFalsy();
+            expect(updated.sentByServerAt).toBeTruthy();
             expect(updated.messageId).toBe(boundIndexedValue(longId));
             expect(updated.conversationId).toBe(boundIndexedValue(longId));
             // Claim, then the relayed marker on its own, then the filing.

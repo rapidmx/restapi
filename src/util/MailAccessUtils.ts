@@ -92,12 +92,24 @@ export function isAdminScope(query: any): boolean {
     return query?.scope === ADMIN_SCOPE;
 }
 
+/** How long an elevation (the token's `elevated` timestamp) is honored by default, in seconds - `mail:security:elevation_max_age_seconds`. `0` = no limit. */
+export const DEFAULT_ELEVATION_MAX_AGE_SECONDS: number = 900;
+
+/** The smallest `elevated` value taken for a timestamp (milliseconds since the epoch, as the auth server stamps it: `Date.now()`). A smaller one is just a flag
+ * some other issuer or test double set, has no age, and is not held to the maximum. */
+const MIN_ELEVATION_TIMESTAMP: number = 1e11;
+
 /**
  * Requires the caller for an administration-scope (`?scope=admin`) request: a trusted role (403 `api-103` without) AND
  * an elevated token (403 `api-104` without). An administration scope shows administrative metadata and runs
  * management actions - it is not a way into anyone's mail, and every use of it is audited by the route that offers it.
+ *
+ * The elevation also expires: when the token's `elevated` timestamp is more than `maxAgeSeconds` old (`mail:security:elevation_max_age_seconds`, 900 by
+ * default, `0` for no limit) the request is refused with the same `api-104` an unelevated token gets, so the client asks the administrator to confirm
+ * their identity again - a stolen but still valid elevated token stops being useful after minutes, not after the token's own lifetime. Only a token that
+ * carries a timestamp is held to it (see `MIN_ELEVATION_TIMESTAMP`).
  */
-export function assertAdminScope(user: JWTUser | undefined, trustedRoles: readonly string[]): void {
+export function assertAdminScope(user: JWTUser | undefined, trustedRoles: readonly string[], maxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS): void {
     if (!user) {
         throw new ApiError(ApiErrors.AUTH_REQUIRED, 401, ApiErrorMessages.AUTH_REQUIRED);
     }
@@ -105,6 +117,9 @@ export function assertAdminScope(user: JWTUser | undefined, trustedRoles: readon
         throw new ApiError(ApiErrors.AUTH_REQUIRES_TRUSTED_ROLE, 403, ApiErrorMessages.AUTH_REQUIRES_TRUSTED_ROLE);
     }
     if (!(typeof user.elevated === "number" && user.elevated > 0)) {
+        throw new ApiError(ApiErrors.AUTH_REQUIRES_ELEVATION, 403, ApiErrorMessages.AUTH_REQUIRES_ELEVATION);
+    }
+    if (typeof maxAgeSeconds === "number" && maxAgeSeconds > 0 && user.elevated >= MIN_ELEVATION_TIMESTAMP && Date.now() - user.elevated > maxAgeSeconds * 1000) {
         throw new ApiError(ApiErrors.AUTH_REQUIRES_ELEVATION, 403, ApiErrorMessages.AUTH_REQUIRES_ELEVATION);
     }
 }

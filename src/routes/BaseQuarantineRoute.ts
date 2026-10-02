@@ -23,14 +23,21 @@ export abstract class BaseQuarantineRoute<T extends QuarantineEntry> extends Bas
 
     protected readonly trustedOnlyWrites: boolean = true;
 
+    /** Entries are the scan pipeline's own; `rawBlobKey` names a stored object and no body - a trusted caller's included - may set it. */
+    protected readonly createRefused: boolean = true;
+
+    protected readonly alwaysStrippedFields: readonly string[] = ["rawBlobKey"];
+
     /** A trusted AND elevated caller reviews (and releases) any mailbox's entries with `?scope=admin`, audited. */
     protected readonly adminScope: boolean = true;
 
+    /* v8 ignore start -- `createRefused` makes `create()` answer 403 before this runs; kept so a subclass that allows creation still strips the release fields */
     protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
         await super.prepareCreate(obj, user);
         delete obj.releasedAt;
         delete obj.releasedByUserUid;
     }
+    /* v8 ignore stop */
 
     protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
         await super.prepareUpdate(obj, existing, user);

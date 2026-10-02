@@ -92,13 +92,16 @@ export function parseRapidMxKeyHeader(headerValues: string[], fromAddress: strin
     // Validated as real base64 first, and capped well above any real certificate's encoded size (a P-256 cert
     // is a few hundred base64 characters; a few KB of headroom covers RSA-4096 with a large extension set)
     // before ever handing it to the X.509 parser.
-    if (attrs.keydata.length > 8192 || !/^[A-Za-z0-9+/]+={0,2}$/.test(attrs.keydata)) {
+    // Whitespace is removed first: a header line is folded at 998 characters (an RSA-4096 certificate is longer than that),
+    // and unfolding leaves a space where each fold was.
+    const keydata: string = attrs.keydata.replace(/\s+/g, "");
+    if (keydata.length > 8192 || !/^[A-Za-z0-9+/]+={0,2}$/.test(keydata)) {
         return undefined;
     }
 
     let cert: crypto.X509Certificate;
     try {
-        cert = new crypto.X509Certificate(Buffer.from(attrs.keydata, "base64"));
+        cert = new crypto.X509Certificate(Buffer.from(keydata, "base64"));
     } catch {
         return undefined;
     }
@@ -108,7 +111,7 @@ export function parseRapidMxKeyHeader(headerValues: string[], fromAddress: strin
         addr: attrs.addr,
         preferEncrypt: attrs["prefer-encrypt"] === "mutual" ? "mutual" : "nopreference",
         publicKey: {
-            publicKey: attrs.keydata,
+            publicKey: keydata,
             type: attrs.type,
             useType: "encrypt",
             fingerprint,

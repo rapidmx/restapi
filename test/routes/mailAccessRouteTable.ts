@@ -108,6 +108,7 @@ export const SERVER_ROUTE_TABLE: Record<string, RouteRow> = {
  * concerns something that isn't a mailbox. A new file using a trusted role has to be added here - and that means someone
  * decided it. */
 export const TRUSTED_ROLE_USES: Record<string, string> = {
+    "BaseAttachmentRoute.ts": "trusted-only wording of a legal-hold refusal (the blocking matters are named to a trusted caller only) - after hasMailAccess has passed; the hold itself binds everyone",
     "BaseCalendarEventRoute.ts": "free/busy lookup: a trusted caller who owns no mailbox is told `restricted` rather than `unknown` about a mailbox they may not see, as the directory lists it to them - never a grant",
     "BaseDataExportRoute.ts": "compliance: a trusted caller may request/download any mailbox's export - by design, audited",
     "BaseDataSubjectErasureRequestRoute.ts": "compliance: trusted approves erasure; exposes no mail content",

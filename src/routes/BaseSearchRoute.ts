@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
-import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, DocDecorators, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
+import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, DocDecorators, ModelUtils, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { CandidateResultPage, SearchEntityType, SearchProvider, SearchResultPage } from "../search/SearchProvider.js";
 import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
-import { Mailbox } from "../models/types.js";
+import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
+import { Mailbox, Message } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Auth, Get, Query, User: AuthUser } = RouteDecorators;
@@ -62,10 +63,14 @@ function assertSingleStringParam(value: unknown, name: string): string | undefin
 export abstract class BaseSearchRoute<M extends Mailbox> {
     protected abstract mailboxClass: any;
 
+    /** The concrete `Message` class, supplied by the Mongo/SQL subclass: a search hit is only returned while its message still exists and isn't soft-deleted. */
+    protected abstract messageClass: any;
+
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     private mailboxRepo?: RepoUtils<M>;
+    private messageRepo?: RecoverableRepoUtils<Message>;
 
     @Inject("SearchProvider")
     private searchProvider?: SearchProvider;
@@ -87,6 +92,28 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
             });
         }
         return this.mailboxRepo;
+    }
+
+    /**
+     * `hits` without the message hits whose message was soft-deleted: the index keeps a soft-deleted message (so restoring it needs no re-index), but a search shows
+     * the mailbox's messages - what its list shows - not what was deleted from it; a viewer without delete access couldn't list it at all. A hit of any
+     * other kind passes.
+     */
+    private async withoutDeletedMessages<H extends { entityType: SearchEntityType; entityUid: string }>(hits: H[]): Promise<H[]> {
+        const uids: string[] = hits.filter((hit) => hit.entityType === "message").map((hit) => hit.entityUid);
+        if (uids.length === 0) {
+            return hits;
+        }
+        if (!this.messageRepo) {
+            this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
+        }
+        // `deleted: true` is how a query asks for the soft-deleted rows (a plain `find()` leaves them out).
+        const rows: Message[] = await this.messageRepo.find(
+            { uid: ModelUtils.literal(uids, "in"), deleted: true, limit: uids.length } as any,
+            { ignoreACL: true, includeDeleted: true, limit: uids.length },
+        );
+        const deleted: Set<string> = new Set(rows.filter((message) => (message as any).deleted === true).map((message) => message.uid));
+        return hits.filter((hit) => !deleted.has(hit.entityUid) || hit.entityType !== "message");
     }
 
     /** The mailbox to search: `requestedMailboxUid` if given and readable by `user` (else 404), otherwise the caller's
@@ -140,6 +167,18 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
         if (!this.searchProvider) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
+        // A repeated or nested query key reaches here as an array or object whatever the parameter is typed as: every filter is one string.
+        text = assertSingleStringParam(text, "q");
+        from = assertSingleStringParam(from, "from");
+        to = assertSingleStringParam(to, "to");
+        cc = assertSingleStringParam(cc, "cc");
+        subject = assertSingleStringParam(subject, "subject");
+        folderUid = assertSingleStringParam(folderUid, "in");
+        limitParam = assertSingleStringParam(limitParam, "limit");
+        hasAttachmentParam = assertSingleStringParam(hasAttachmentParam, "hasAttachment");
+        beforeParam = assertSingleStringParam(beforeParam, "before");
+        afterParam = assertSingleStringParam(afterParam, "after");
+        cursor = assertSingleStringParam(cursor, "cursor");
         typesParam = assertSingleStringParam(typesParam, "types");
         isParam = assertSingleStringParam(isParam, "is");
         labelParam = assertSingleStringParam(labelParam, "label");
@@ -165,7 +204,7 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
             ? (typesParam.split(",") as SearchEntityType[])
             : undefined;
 
-        return await this.searchProvider.search({
+        const page: SearchResultPage = await this.searchProvider.search({
             mailboxUid,
             text: text ?? "",
             entityTypes,
@@ -182,6 +221,7 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
             flags: isParam ? isParam.split(",") : undefined,
             labels: labelParam ? labelParam.split(",") : undefined,
         });
+        return { ...page, results: await this.withoutDeletedMessages(page.results) };
     }
 
     /**
@@ -218,6 +258,11 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
         participantsParam = assertSingleStringParam(participantsParam, "participants");
         isParam = assertSingleStringParam(isParam, "is");
         labelParam = assertSingleStringParam(labelParam, "label");
+        folderUid = assertSingleStringParam(folderUid, "in");
+        cursor = assertSingleStringParam(cursor, "cursor");
+        limitParam = assertSingleStringParam(limitParam, "limit");
+        beforeParam = assertSingleStringParam(beforeParam, "before");
+        afterParam = assertSingleStringParam(afterParam, "after");
 
         const mailboxUid: string = await this.requireCallerMailboxUid(user, mailboxUidParam);
 
@@ -225,7 +270,7 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
             ? (typesParam.split(",") as SearchEntityType[])
             : undefined;
 
-        return await this.searchProvider.candidates({
+        const page: CandidateResultPage = await this.searchProvider.candidates({
             mailboxUid,
             entityTypes,
             participants: participantsParam ? participantsParam.split(",") : undefined,
@@ -237,5 +282,6 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
             cursor,
             limit: limitParam ? parseInt(limitParam, 10) : undefined,
         });
+        return { ...page, candidates: await this.withoutDeletedMessages(page.candidates) };
     }
 }

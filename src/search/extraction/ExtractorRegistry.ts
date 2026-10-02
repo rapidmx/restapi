@@ -54,8 +54,11 @@ export function resolveExtractionWorkerUrl(moduleUrl: string): URL | undefined {
  * `"in_process"`, or for a custom (non-built-in) extractor, extraction runs in-process with the same size/zip/output
  * caps and a best-effort timeout (which cannot interrupt synchronous CPU work).
  *
- * Residual limits: V8 `resourceLimits` bound the JS heap, not `ArrayBuffer`/native memory, so an inflation that lies
- * about its declared size is bounded only by the timeout (and the zip pre-check).
+ * Native memory: V8 `resourceLimits` bound the JS heap, not `ArrayBuffer`/native memory (a PDF that inflates to gigabytes, a DOCX
+ * whose central directory lies about its sizes). So while a task runs the worker's external (`ArrayBuffer`) memory is polled
+ * (`worker:memory_poll_ms`, from `Worker.getHeapStatistics()`, which answers even while the worker spins), and the worker is
+ * terminated, failing the task, once it holds more than `worker:max_array_buffer_mb` - well before the timeout, and before the
+ * pod is killed for memory.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -91,6 +94,14 @@ export class ExtractorRegistry {
     @Config("mail:search:extraction:worker:max_tasks", 100)
     private workerMaxTasks: number = 100;
 
+    /** How much external (`ArrayBuffer`) memory the worker may hold while it runs a task before it is terminated. */
+    @Config("mail:search:extraction:worker:max_array_buffer_mb", 512)
+    private workerMaxArrayBufferMb: number = 512;
+
+    /** How often a running worker task's memory growth is checked. */
+    @Config("mail:search:extraction:worker:memory_poll_ms", 200)
+    private workerMemoryPollMs: number = 200;
+
     /** An idle worker is terminated after this long. */
     @Config("mail:search:extraction:worker:idle_ms", 60_000)
     private workerIdleMs: number = 60_000;
@@ -115,6 +126,11 @@ export class ExtractorRegistry {
     private byMimeType: Map<string, TextExtractor> = new Map(
         this.extractors.flatMap((extractor) => extractor.mimeTypes.map((mimeType) => [mimeType, extractor])),
     );
+
+    /** Whether an extractor is registered for `mimeType`, taken as its bare, lower-cased `type/subtype` (parameters and casing ignored). */
+    public supports(mimeType: string): boolean {
+        return this.byMimeType.has(mimeType.split(";")[0].trim().toLowerCase());
+    }
 
     /**
      * Extracts text from `content` if a `TextExtractor` is registered for `mimeType` and `content` is within
@@ -240,9 +256,11 @@ export class ExtractorRegistry {
             const id: number = ++this.taskSeq;
             let handle: { worker: Worker; tasks: number; idleTimer?: NodeJS.Timeout } | undefined;
             let timeoutHandle: NodeJS.Timeout | undefined;
+            let memoryPoll: NodeJS.Timeout | undefined;
             // Every listener and the timer are removed synchronously on the first outcome, so each path settles once.
             const cleanup = (): void => {
                 clearTimeout(timeoutHandle);
+                clearInterval(memoryPoll);
                 handle?.worker.off("message", onMessage);
                 handle?.worker.off("error", onError);
                 handle?.worker.off("exit", onExit);
@@ -283,6 +301,19 @@ export class ExtractorRegistry {
                 const bytes: Uint8Array = new Uint8Array(content.byteLength);
                 bytes.set(content);
                 handle.worker.postMessage({ id, mimeType, content: bytes, maxOutputChars: this.maxOutputChars }, [bytes.buffer as ArrayBuffer]);
+                const limit: number = this.workerMaxArrayBufferMb * 1024 * 1024;
+                const watched: Worker = handle.worker;
+                memoryPoll = setInterval(() => {
+                    watched
+                        .getHeapStatistics()
+                        .then((stats) => {
+                            if (stats.external_memory > limit) {
+                                fail(new Error(`Text extraction for ${mimeType} used more than ${this.workerMaxArrayBufferMb} MB of native memory and was stopped.`));
+                            }
+                        })
+                        .catch(noop);
+                }, this.workerMemoryPollMs);
+                memoryPoll.unref();
             } catch (err: any) {
                 fail(err);
             }

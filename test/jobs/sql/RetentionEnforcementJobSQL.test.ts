@@ -416,6 +416,30 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
         expect(await auditLogRepo.findOne({ where: { uid: orgWide.uid } })).toBeNull();
     });
 
+    it("Purges an expired AuditLogEntry sorted behind more held ones than a run examines, plus an org-wide one, instead of starving behind the held ones.", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", auditLogRetentionDays: 2190 }));
+        (job as any).batchSize = 1;
+        const heldMailboxUid = uuid.v4();
+        await createMatter({ custodianMailboxUids: [heldMailboxUid], dateRangeStart: new Date("2000-01-01"), dateRangeEnd: new Date("2030-01-01") });
+        const heldUids: string[] = [];
+        // One page is a single row and a run examines 20 rows at most: 25 held entries sort ahead of the purgeable ones.
+        for (let i = 0; i < 25; i++) {
+            const held = await createAuditLogEntry({ uid: `a-held-${String(i).padStart(2, "0")}`, mailboxUid: heldMailboxUid, dateCreated: new Date(Date.now() - 2300 * DAY_MS) });
+            heldUids.push(held.uid);
+        }
+        const behind = await createAuditLogEntry({ uid: "z-other", mailboxUid: uuid.v4(), dateCreated: new Date(Date.now() - 2200 * DAY_MS) });
+        const orgWide = await createAuditLogEntry({ uid: "z-org", dateCreated: new Date(Date.now() - 2200 * DAY_MS) });
+
+        await job.run();
+        await job.run();
+
+        expect(await auditLogRepo.findOne({ where: { uid: behind.uid } })).toBeNull();
+        expect(await auditLogRepo.findOne({ where: { uid: orgWide.uid } })).toBeNull();
+        for (const uid of heldUids) {
+            expect(await auditLogRepo.findOne({ where: { uid: uid } })).not.toBeNull();
+        }
+    });
+
     describe("draft bodies kept for a legal hold (round 6)", () => {
         const putBodies = async (...keys: string[]) => {
             const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
@@ -492,6 +516,24 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
 
         const found = await messageRepo.findOne({ where: { uid: recent.uid } });
         expect(found).not.toBeNull();
+    });
+
+    it("Still skips an expired message whose mailbox the query did not leave out when the hold covers it (a hold placed after the query was built).", async () => {
+        await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
+        const old = await createMessage({ sentDate: new Date(Date.now() - 35 * DAY_MS) });
+        await createMatter({ custodianMailboxUids: [old.mailboxUid] });
+        // Return the held mailbox's message anyway, as a query built before the hold was placed would.
+        const repoUtils = (job as any).messageRepo;
+        const originalFind = repoUtils.find.bind(repoUtils);
+        const findSpy = vi.spyOn(repoUtils, "find").mockImplementation(async (query: any, options: any) => {
+            const { mailboxUid: _left, ...rest } = query;
+            return await originalFind(rest, options);
+        });
+
+        await job.run();
+
+        expect(await messageRepo.findOne({ where: { uid: old.uid } })).toBeTruthy();
+        findSpy.mockRestore();
     });
 
     it("Skips (does not purge) an expired message under an active legal hold, and retries it on a later run once the hold lifts.", async () => {

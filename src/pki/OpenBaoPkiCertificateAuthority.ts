@@ -90,7 +90,7 @@ export class OpenBaoPkiCertificateAuthority implements EncryptionCertificateAuth
         if (parsed.protocol === "https:") {
             return;
         }
-        const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
+        const loopbackHosts = new Set(["127.0.0.1", "::1", "[::1]", "localhost"]);
         if (parsed.protocol === "http:" && loopbackHosts.has(parsed.hostname)) {
             return;
         }
@@ -116,6 +116,8 @@ export class OpenBaoPkiCertificateAuthority implements EncryptionCertificateAuth
                 },
                 body: JSON.stringify(body),
                 signal: controller.signal,
+                // `X-Vault-Token` is not stripped on a cross-origin redirect the way `Authorization` is, so a redirect is an error.
+                redirect: "error",
             });
         } catch (err: any) {
             this.logger?.error(`OpenBaoPkiCertificateAuthority: request to '${urlPath}' failed: ${err.message}`);
@@ -159,6 +161,36 @@ export class OpenBaoPkiCertificateAuthority implements EncryptionCertificateAuth
         );
     }
 
+    /**
+     * Whether `certificate` is what was asked for: it carries the CSR's public key, and it names `identity` and nothing else - its
+     * subjectAltName is `identity` as an e-mail address alone (no other address, DNS name, URI or IP), and its common name, if it has
+     * one, is `identity` too (without a subjectAltName, the common name or the subject's e-mail address stands for it). The role the
+     * installers create takes subjectAltNames from the CSR (`use_csr_sans`), so without this a mailbox owner could have the CA sign a
+     * certificate naming someone else's address.
+     */
+    private async matchesRequest(certificate: x509.X509Certificate, identity: string, csr: string): Promise<boolean> {
+        try {
+            const request = new x509.Pkcs10CertificateRequest(csr);
+            const [certificateKey, requestKey] = await Promise.all([certificate.publicKey.getThumbprint("SHA-256"), request.publicKey.getThumbprint("SHA-256")]);
+            if (Buffer.compare(Buffer.from(certificateKey), Buffer.from(requestKey)) !== 0) {
+                return false;
+            }
+        } catch {
+            return false;
+        }
+        const wanted: string = identity.toLowerCase();
+        const san: x509.SubjectAlternativeNameExtension | null = certificate.getExtension(x509.SubjectAlternativeNameExtension);
+        const commonNames: string[] = certificate.subjectName.getField("CN");
+        if (commonNames.some((name) => name.toLowerCase() !== wanted)) {
+            return false;
+        }
+        if (san) {
+            const names = san.names.items;
+            return names.length > 0 && names.every((name) => name.type === "email" && name.value.toLowerCase() === wanted);
+        }
+        return [...commonNames, ...certificate.subjectName.getField("1.2.840.113549.1.9.1")].some((name) => name.toLowerCase() === wanted);
+    }
+
     public async issue(identity: string, csr: string): Promise<IssuedCertificate> {
         const result: SignResponse = await this.request<SignResponse>(`${this.mount}/sign/${this.role}`, {
             csr,
@@ -171,6 +203,12 @@ export class OpenBaoPkiCertificateAuthority implements EncryptionCertificateAuth
         }
 
         const certificate = new x509.X509Certificate(certificatePem);
+        if (!(await this.matchesRequest(certificate, identity, csr))) {
+            this.logger?.error(`OpenBaoPkiCertificateAuthority: the certificate with serial ${serialNumber} does not match the request for '${identity}'; revoking it.`);
+            // Best effort: whatever happens to the revocation, the certificate is never returned or recorded.
+            await this.request(`${this.mount}/revoke`, { serial_number: serialNumber }).catch(() => undefined);
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 502, "The configured PKI server issued a certificate that does not match the request.");
+        }
         const fingerprint: string = Buffer.from(await certificate.getThumbprint("SHA-256")).toString("hex");
         await this.recordSerial(fingerprint, serialNumber);
 

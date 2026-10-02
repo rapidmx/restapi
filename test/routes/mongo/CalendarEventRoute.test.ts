@@ -979,6 +979,9 @@ describe("Route:CalendarEventMongo Tests", () => {
             ),
         findMessage: async (uid) => (await messageRepo.findOne({ uid } as any))!,
         findEvents: async (mailboxUid) => (await calendarEventRepo.find({ mailboxUid } as any).toArray()).filter((row: any) => !row.deleted),
+        deleteEventOrganizer: async (uid) => {
+            await calendarEventRepo.updateOne({ uid } as any, { $unset: { organizer: "" } } as any);
+        },
     };
     calendarInviteSuite(suiteContext);
     calendarEventDialogSuite({

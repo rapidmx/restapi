@@ -76,6 +76,10 @@ export class PostfixSendmailTransport implements MailTransport {
             sendmail: true,
             path: this.sendmailPath,
             newline: "unix",
+            // The null sender (`<>`, which bounces and notices go out with so they can't bounce again - RFC 5321 section 4.5.5) is
+            // an empty envelope address, for which nodemailer adds no `-f` at all and Postfix then makes the sender the unix user
+            // that ran it. Its own arguments for the case say it outright; they are used only when there is no sender.
+            ...(message.envelopeFrom ? {} : { args: ["-f", "<>"] }),
         });
         const capture: SendmailCapture = { stderr: "" };
         this.captureSendmail(transport, capture);

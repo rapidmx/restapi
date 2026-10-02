@@ -2,13 +2,14 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { Raw } from "typeorm";
+import { escapeLike, rawLike } from "../../routes/sql/LikeUtils.js";
 import { ScanQueueJob } from "../ScanQueueJob.js";
 import {
     AttachmentSQL,
     CalendarEventSQL,
     ContactSQL,
     CorrespondentSQL,
+    DataSubjectErasureRequestSQL,
     DomainSQL,
     FocusedInboxOverrideSQL,
     FolderSQL,
@@ -51,12 +52,12 @@ export class ScanQueueJobSQL extends ScanQueueJob<
     protected correspondentClass: any = CorrespondentSQL;
     protected domainClass: any = DomainSQL;
     protected keyVaultClass: any = KeyVaultSQL;
+    protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestSQL;
 
     /** `MailboxSQL.aliasAddresses` is a serialized `simple-json` column - see `MailIngestRouteSQL.aliasQueryValue()`, whose
      * anchored, `ESCAPE`d LIKE this repeats. */
     protected aliasQueryValue(address: string): any {
-        const escaped: string = address.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-        return Raw((alias) => `${alias} LIKE :pattern ESCAPE '\\'`, { pattern: `%"${escaped}"%` });
+        return rawLike(`%"${escapeLike(address)}"%`);
     }
 
     /**
@@ -68,7 +69,6 @@ export class ScanQueueJobSQL extends ScanQueueJob<
      * Identical problem/solution to `MailIngestRouteSQL.aliasQueryValue()`.
      */
     protected contactEmailQuery(address: string): any {
-        const escaped: string = address.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-        return { emails: Raw((alias) => `${alias} LIKE :pattern ESCAPE '\\'`, { pattern: `%"address":"${escaped}"%` }) };
+        return { emails: rawLike(`%"address":"${escapeLike(address)}"%`) };
     }
 }

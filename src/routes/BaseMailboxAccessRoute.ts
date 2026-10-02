@@ -22,7 +22,7 @@ import {
 import { AuditAction, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { assertAdminScope, hasMailAccess, isTrustedUser } from "../util/MailAccessUtils.js";
+import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS, hasMailAccess, isTrustedUser } from "../util/MailAccessUtils.js";
 import {
     findMailboxByAddress,
     LOOKUP_MAX_ATTEMPTS,
@@ -166,6 +166,10 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
     @Config("trusted_roles", ["admin"])
     private trustedRoles: string[] = ["admin"];
 
+    /** How old an elevated token may be before it has to be elevated again, in seconds (`mail:security:elevation_max_age_seconds`, 0 = no limit). */
+    @Config("mail:security:elevation_max_age_seconds", DEFAULT_ELEVATION_MAX_AGE_SECONDS)
+    protected elevationMaxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS;
+
     /** Base URL of auth-server, whose `GET /api/aliases` resolves a username or e-mail alias to a user uid (see
      * `resolvePrincipal()`); the same setting `BaseMailboxRoute`'s self-service creation reads. Empty: none. */
     @Config("mail:auth_server_url", "")
@@ -244,7 +248,7 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         if (!isTrustedUser(user, this.trustedRoles)) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         return { mailbox, acl, admin: true };
     }
 

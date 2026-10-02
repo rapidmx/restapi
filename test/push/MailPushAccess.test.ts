@@ -72,8 +72,9 @@ describe("MailPushRoute access (Mongo ACLs, fake Redis)", () => {
     });
 
     /** A route wired to the real ACL store, a fake socket for `user`, and what it sent back. */
-    async function connect(user: any): Promise<{ route: any; sock: any; granted: (channels: string[]) => Promise<string[]> }> {
+    async function connect(user: any, recheckMs: number = 0): Promise<{ route: any; sock: any; granted: (channels: string[]) => Promise<string[]> }> {
         const route: any = new MailPushRoute();
+        route.recheckMs = recheckMs;
         route.aclUtils = objectFactory.getInstance(ACLUtils);
         route.redisConfig = { url: "redis://fake" };
         route.logger = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
@@ -118,6 +119,33 @@ describe("MailPushRoute access (Mongo ACLs, fake Redis)", () => {
 
     it("Grants an unrelated user nothing.", async () => {
         expect(await (await connect(stranger)).granted([folderUid, mailboxUid, owner.uid])).toEqual([]);
+    });
+
+    it("Closes the socket of a delegate removed from the mailbox while it is open, and keeps the owner's.", async () => {
+        const shared = `${uuid.v4()}@example.com`;
+        const records = [
+            { userOrRoleId: owner.uid, actions: ["*"] },
+            { userOrRoleId: delegate.uid, actions: ["read", "list", "count", "exists"] },
+        ];
+        await store.saveAcl(shared, "Mailbox", records);
+        const forDelegate = await connect(delegate, 25);
+        const forOwner = await connect(owner, 25);
+        expect(await forDelegate.granted([shared])).toEqual([shared]);
+        expect(await forOwner.granted([shared])).toEqual([shared]);
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        expect(forDelegate.sock.close).not.toHaveBeenCalled();
+
+        // The delegate's record is removed: the real ACL answers for everyone else, and now says no to them.
+        const real = forDelegate.route.aclUtils;
+        let removed = false;
+        forDelegate.route.aclUtils = { hasPermission: (user: any, ...rest: any[]) => (removed && user.uid === delegate.uid ? false : real.hasPermission(user, ...rest)) };
+        removed = true;
+        for (let i = 0; i < 100 && forDelegate.sock.close.mock.calls.length === 0; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        expect(forDelegate.sock.close).toHaveBeenCalledWith(1008, expect.any(String));
+        expect(forOwner.sock.close).not.toHaveBeenCalled();
+        forOwner.sock.emit("close");
     });
 
     it("Lets an administrator with an explicit delegate grant subscribe like any delegate.", async () => {

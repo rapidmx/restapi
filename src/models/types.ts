@@ -314,6 +314,11 @@ export interface MatterExportRequest extends BaseEntity {
      * the processing replica died) is reclaimed back to `"pending"` until this reaches
      * `mail:jobs:matter_export:max_attempts`, then marked `"failed"`. */
     processingAttempts?: number;
+
+    /** The custodian mailboxes whose `MATTER_EXPORT_READY` escrow audit entry a `"ready"` export still owes: written with the
+     * same version-checked update that makes the request `"ready"`, so a crash or a failed write between "downloadable" and
+     * "attested" leaves a record `MatterExportJob` finishes on a later run. `null` once everything is recorded. */
+    pendingAttestationMailboxUids?: string[] | null;
 }
 
 /** The lifecycle event an `EscrowAuditLogEntry` records - the three moments real escrow-wrapped key
@@ -416,6 +421,11 @@ export interface KeyDiscoveryResponse {
     encryptPreference: EncryptionPreference;
     keys: PublicKey[];
     escrow: boolean;
+
+    /** The primary address the keys' certificates name, when the address that was asked for is an alias (or an alias domain's) of
+     * it. Absent when the certificates name the address asked for. A key is only pinned when its certificate names the address
+     * asked for or this one. */
+    address?: string;
 }
 
 /**
@@ -577,7 +587,7 @@ export interface MailboxImportRequest extends BaseEntity {
     processingAttempts?: number;
 }
 
-export type DataSubjectErasureStatus = "pending" | "approved" | "in_progress" | "denied" | "completed";
+export type DataSubjectErasureStatus = "pending" | "approved" | "in_progress" | "denied" | "completed" | "failed";
 
 /**
  * A GDPR Article 17 ("right to erasure") request for one mailbox - mirrors `EscrowAccessRequest`'s
@@ -1096,6 +1106,9 @@ export interface Message extends RecoverableBaseEntity {
     /** Set by `ScheduledSendJob`/`BaseMessageRoute.send()` as soon as the transport accepted this message, and cleared
      * once it is filed into Sent Items. A later run only finishes filing - it never relays a message carrying it. */
     scheduledSendRelayedAt?: Date;
+
+    /** Set by the server, and only by it, when it files a message it relayed into Sent Items (`BaseMessageRoute.send()`, `ScheduledSendJob`). `recall()` refuses a message without it, so a message a caller merely placed in Sent Items cannot have a recall notice mailed to its (caller-chosen) recipients. */
+    sentByServerAt?: Date;
 
     /** The in-flight marker of a send: set (to the claim's lease expiry) by `BaseMessageRoute.send()` and
      * `ScheduledSendJob` when they claim a message for relay, cleared when it is filed or handed back. While it lies
@@ -1693,16 +1706,17 @@ export interface TransportRuleAction {
  * shape this pragmatic subset mirrors. Every populated field must match (AND); a field holding an array of
  * strings is itself OR-matched against its entries. */
 export interface TransportRuleConditions {
-    /** Matches if the message's From address contains any of these substrings (case-insensitive). */
+    /** Matches if the envelope sender or the From header's address contains any of these substrings (case-insensitive). */
     fromContains?: string[];
 
     /** Matches if the message's subject contains any of these substrings (case-insensitive). */
     subjectContains?: string[];
 
-    /** Matches if the message's plain-text body preview contains any of these substrings (case-insensitive). */
+    /** Matches if the message's plain-text body (its first 1,000,000 characters) contains any of these substrings (case-insensitive). */
     bodyContains?: string[];
 
-    /** Matches if any envelope recipient address contains any of these substrings (case-insensitive). */
+    /** Matches if any envelope recipient address, or any address in the To or Cc header, contains any of these substrings
+     * (case-insensitive). */
     recipientContains?: string[];
 
     /** Matches if any envelope recipient's domain is not one of this server's configured `mail:domains`. */
@@ -1749,11 +1763,17 @@ export enum AuditAction {
     DISTRIBUTION_LIST_CREATE = "distribution_list.create",
     DISTRIBUTION_LIST_UPDATE = "distribution_list.update",
     DISTRIBUTION_LIST_DELETE = "distribution_list.delete",
+    MAIL_FILTER_RULE_CREATE = "mail_filter_rule.create",
+    MAIL_FILTER_RULE_UPDATE = "mail_filter_rule.update",
     TRANSPORT_RULE_CREATE = "transport_rule.create",
     TRANSPORT_RULE_UPDATE = "transport_rule.update",
     TRANSPORT_RULE_DELETE = "transport_rule.delete",
     MESSAGE_DELETE = "message.delete",
     MESSAGE_RECALL = "message.recall",
+    /** A reviewer ran a search under a matter (`/matter-search`); `details` names the matter and the query shape. */
+    MATTER_SEARCH = "matter.search",
+    /** A matter export was downloaded. */
+    MATTER_EXPORT_DOWNLOAD = "matter_export.downloaded",
     /** `POST /messages/:id/report` - a user reported a message as junk, phishing or not junk. `details` carries the `kind`, the sender's
      * address (`from`), `moved`, the folder it went to (`folderUid`), `learned`, `learnSkipped` (why the spam filter was not taught,
      * when it was not) and `alwaysTrustSender`. A phishing report is the same entry with `kind: "phishing"` - the one to watch for.
@@ -2689,6 +2709,8 @@ export interface PluginSettingDefinition {
     max?: number;
     /** The allowed values for `select` settings. */
     options?: { value: string; label: string }[];
+    /** Marks the setting a secret whatever its key is called: its saved value is never sent to the browser. A key that names a secret (`isSecretSettingKey()`) is one without this. */
+    secret?: boolean;
 }
 
 /** Which of the server's base routes a plugin UI app is hosted by - it decides the app's authentication and the props

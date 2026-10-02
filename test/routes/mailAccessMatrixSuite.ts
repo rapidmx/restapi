@@ -515,6 +515,8 @@ export const MATRIX_CASES: MatrixCase[] = [
         route: "KeyVaultRoute",
         name: "KeyVault: read",
         access: "read",
+        // The wrapped keys and master key wraps would open to an offline guess at the owner's password: the owner alone reads them, as they alone write them.
+        only: ["owner", "impersonated"],
         request: (s) => ({ method: "get", path: `/mailboxes/${s.mailbox.uid}/keyvault` }),
         success: (res) => ok(res),
     },

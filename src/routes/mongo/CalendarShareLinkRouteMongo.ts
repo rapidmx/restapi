@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { CalendarShareLinkMongo } from "../../mongo.js";
+import { CalendarShareLinkMongo, FolderMongo } from "../../mongo.js";
 import { BaseCalendarShareLinkRoute } from "../BaseCalendarShareLinkRoute.js";
 const { Model } = RouteDecorators;
 
@@ -11,4 +11,5 @@ const { Model } = RouteDecorators;
 export class CalendarShareLinkRouteMongo extends BaseCalendarShareLinkRoute<CalendarShareLinkMongo> {
     protected readonly repoUtilsClass: any = RepoUtils;
     protected readonly scopeProperty: string = "folderUid";
+    protected folderClass: any = FolderMongo;
 }

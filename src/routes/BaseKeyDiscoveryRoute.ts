@@ -145,13 +145,20 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
         // alias domain (`getPrimaryDomainNames()`), so without this fallback a remote peer asking about an
         // address on an alias domain always gets a false "key not published" here.
         let match: M | undefined = domain ? matchesDomain(domain) : undefined;
+        let viaAliasDomain: boolean = false;
         if (!match && domain) {
             const primaryDomain: string | undefined = await resolveDomainAliasName(this._objectFactory!, this.domainClass, domain);
             if (primaryDomain) {
                 match = matchesDomain(primaryDomain);
+                viaAliasDomain = match !== undefined;
             }
         }
         const body: KeyDiscoveryResponse = await buildKeyDiscoveryResponse(this.keyVaultRepo!, match);
+        // The certificates name the mailbox's primary address, not the alias-domain address that was asked about: say so, so the asking server can check
+        // the certificate against it (`KeyDiscoveryResponse.address`).
+        if (viaAliasDomain && match?.primarySmtpAddress) {
+            body.address = match.primarySmtpAddress;
+        }
 
         const etag = `"${crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")}"`;
         res.setHeader("etag", etag).setHeader("cache-control", `max-age=${this.maxAgeSeconds}`);

@@ -21,6 +21,7 @@ import { TaskSQL } from "../../src/models/sql/TaskSQL.js";
 import {
     applySqlDriverColumnTypes,
     ColumnArgsStorage,
+    MYSQL_LONGTEXT_STRING_COLUMNS,
     SIMPLE_JSON_LONGTEXT_TRANSFORMER,
 } from "../../src/models/sql/SqlDriverColumnTypes.js";
 import { CalendarEventMongo } from "../../src/models/mongo/CalendarEventMongo.js";
@@ -294,5 +295,32 @@ describe("SQL schema sync (better-sqlite3, every restapi SQL model)", () => {
         expect(found[0].inReplyTo).toBe(longHeader);
         expect(found[0].dispositionNotificationTo).toBe(longHeader);
         expect(found[0].conversationId).toBe(boundIndexedValue(longId));
+    });
+});
+
+describe("User-entered text columns", () => {
+    // An untyped string column is `varchar(255)` on MySQL/MariaDB, which rejects (a 500) a longer name or title that Mongo and
+    // Postgres accept. The entities keep them untyped - declaring `text` would make Postgres' synchronize drop and re-add each
+    // existing `character varying` column - and `applySqlDriverColumnTypes()` widens them for MySQL/MariaDB only.
+    it.each(Object.entries(MYSQL_LONGTEXT_STRING_COLUMNS))("%s keeps its entered text untyped, none of it indexed, and widens it for MySQL only", async (modelName, properties) => {
+        const clazz: any = (restapiSql as any)[modelName];
+        for (const property of properties) {
+            expect(getColumnMetadata(clazz).find((c) => c.propertyName === property)?.options.type, `${modelName}.${property}`).toBeUndefined();
+            expect(indexColumns(clazz).some((index) => index.split(",").includes(property)), `${modelName}.${property} is indexed`).toBe(false);
+        }
+        const postgres: ColumnArgsStorage = { columns: [] };
+        expect(await applySqlDriverColumnTypes("postgres", [clazz], postgres)).toBe(0);
+        const mysql: ColumnArgsStorage = { columns: [] };
+        await applySqlDriverColumnTypes("mysql", [clazz], mysql);
+        for (const property of properties) {
+            expect(mysql.columns.find((c) => c.target === clazz && c.propertyName === property)?.options.type, `${modelName}.${property}`).toBe("longtext");
+        }
+    });
+
+    it("Still constructs each model, carrying a long name through.", () => {
+        const long = "x".repeat(600);
+        expect(new (restapiSql as any).FolderSQL({ name: long }).name).toBe(long);
+        expect(new (restapiSql as any).ContactSQL({ displayName: long, company: long }).company).toBe(long);
+        expect(new (restapiSql as any).TaskSQL({ title: long }).title).toBe(long);
     });
 });

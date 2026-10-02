@@ -274,8 +274,8 @@ describe("Route:MailboxAccessSQL Tests", () => {
 
         it("Matches an alias as a whole JSON string element, with LIKE wildcards escaped.", () => {
             const raw: any = (new MailboxAccessRouteSQL() as any).aliasQueryValue("a_b%c@example.com");
-            expect(raw.getSql("aliases")).toBe("aliases LIKE :pattern ESCAPE '\\'");
-            expect(raw.objectLiteralParameters).toEqual({ pattern: '%"a\\_b\\%c@example.com"%' });
+            expect(raw.getSql("aliases")).toBe("aliases LIKE :pattern ESCAPE '!'");
+            expect(raw.objectLiteralParameters).toEqual({ pattern: '%"a!_b!%c@example.com"%' });
         });
 
         it("Skips auditing, rather than failing, in a subclass that supplies no auditLogClass.", async () => {

@@ -23,8 +23,10 @@ import type { ScanPipeline } from "./ScanPipeline.js";
  * *Bounded.* A raw message over `maxRawBytes` is not re-parsed, and a run that takes over `timeoutMs` is left to finish in the
  * background while the reader is answered with what is stored.
  *
- * *Never worse than before.* Any failure (a missing raw blob, a parse error) serves the HTML already stored, and is not retried for
- * `RETRY_AFTER_MS`, so a message that cannot be redone costs one failed attempt, not one per read.
+ * *Fails closed.* Any failure (a missing raw blob, a parse error, a message too large) is not retried for `RETRY_AFTER_MS`, so a message
+ * that cannot be redone costs one failed attempt, not one per read. What is served meanwhile is the stored HTML passed through the
+ * current sanitizer too - never as an older sanitizer left it, which may have let through what the current one blocks - and nothing at
+ * all if even that fails.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -66,10 +68,20 @@ export class SanitizedBodyLoader {
             return stripSanitizerStamp(stored.toString("utf-8"));
         }
         const fresh: string | undefined = await this.refresh(message);
-        return stripSanitizerStamp(fresh ?? stored.toString("utf-8"));
+        return stripSanitizerStamp(fresh ?? this.sanitizeStored(message, stored.toString("utf-8")));
     }
 
-    /** The re-sanitized HTML (stamped), or `undefined` when the stored HTML has to do. */
+    /** The old blob's HTML sanitized by the current sanitizer, or an empty body when that cannot be done either. */
+    private sanitizeStored(message: SanitizedBodySource, html: string): string {
+        try {
+            return this.pipeline.sanitizeStoredHtml(html);
+        } catch (err) {
+            this.logger?.warn(`Could not sanitize the stored HTML of message ${message.uid}, serving none: ${(err as Error).message}`);
+            return "";
+        }
+    }
+
+    /** The re-sanitized HTML (stamped), or `undefined` when it could not be redone from the raw message. */
     private async refresh(message: SanitizedBodySource): Promise<string | undefined> {
         const key: string = message.sanitizedHtmlBlobKey;
         if ((this.failed.get(key) ?? 0) > Date.now()) {

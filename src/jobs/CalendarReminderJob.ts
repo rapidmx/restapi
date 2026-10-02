@@ -11,6 +11,9 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 const MS_PER_MINUTE = 60 * 1000;
 
+/** How far past a run's fire window `processEvent()` looks for a recurring master's next occurrence, to remember when it is next due. */
+const NEXT_REMINDER_LOOKAHEAD_MS = 400 * 24 * 60 * MS_PER_MINUTE;
+
 /**
  * Dispatches a `"reminder"` push notification (to the event's folder and mailbox channels) when an event
  * occurrence's reminder fire time (`occurrence start - reminderMinutesBeforeStart`) comes due. The payload carries
@@ -85,6 +88,10 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
 
     /** Upper bound (epoch ms) of the fire window the previous successful run in this process covered. */
     private watermarkMs?: number;
+
+    /** Per recurring master (by uid): the row version it was expanded at, and the earliest time a reminder of it can next be due -
+     * see `processEvent()`. In memory and per process, so a restart simply expands every master once more. */
+    private nextDue: Map<string, { version: number; notBeforeMs: number }> = new Map();
 
     public get schedule(): string | undefined {
         return this.scheduleExpr;
@@ -169,6 +176,13 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
             }
         }
 
+        // A master that is no longer a candidate (ended, cancelled, deleted) needs no remembered time.
+        for (const uid of this.nextDue.keys()) {
+            if (!candidates.has(uid)) {
+                this.nextDue.delete(uid);
+            }
+        }
+
         this.watermarkMs = horizonMs;
     }
 
@@ -212,6 +226,23 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         }
     }
 
+    /** The starts of `event`'s occurrences inside `(windowStart, windowEnd)`, as zero-length occurrences. */
+    private expandStarts(event: CE, isMaster: boolean, excludeDates: (Date | string)[] | undefined, windowStart: Date, windowEnd: Date): OccurrenceWindow[] {
+        return expandOccurrences(
+            {
+                startDate: event.startDate,
+                endDate: event.startDate,
+                // An override row is a single concrete occurrence - never re-expand it by an inherited rule.
+                recurrenceRule: isMaster ? event.recurrenceRule : undefined,
+                timezone: event.timezone,
+                allDay: event.allDay,
+            },
+            windowStart,
+            windowEnd,
+            excludeDates,
+        );
+    }
+
     private async processEvent(event: CE, lowerMs: number, horizonMs: number): Promise<void> {
         const reminderMinutes = event.reminderMinutesBeforeStart;
         if (reminderMinutes === undefined || reminderMinutes === null || Number(reminderMinutes) < 0 || event.status === CalendarEventStatus.CANCELLED) {
@@ -219,6 +250,14 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         }
         const leadMs: number = Number(reminderMinutes) * MS_PER_MINUTE;
         const isMaster: boolean = !!event.recurrenceRule && !event.recurrenceId;
+
+        // A master whose next reminder was found, on an earlier run, to be further away than this run's window is not expanded
+        // again until then (expanding a series is the costly part of every run, done on the event loop) - unless its row has
+        // changed since, which makes what was remembered stale.
+        const remembered: { version: number; notBeforeMs: number } | undefined = isMaster ? this.nextDue.get(event.uid) : undefined;
+        if (remembered && remembered.version === (event as any).version && horizonMs < remembered.notBeforeMs) {
+            return;
+        }
 
         let excludeDates: (Date | string)[] | undefined;
         if (isMaster) {
@@ -230,25 +269,23 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         const windowStart = new Date(lowerMs + leadMs);
         const windowEnd = new Date(horizonMs + leadMs + 1);
         const expand = (): OccurrenceWindow[] =>
-            expandOccurrences(
-                {
-                    startDate: event.startDate,
-                    endDate: event.startDate,
-                    // An override row is a single concrete occurrence - never re-expand it by an inherited rule.
-                    recurrenceRule: isMaster ? event.recurrenceRule : undefined,
-                    timezone: event.timezone,
-                    allDay: event.allDay,
-                },
-                windowStart,
-                windowEnd,
-                excludeDates,
-            ).filter((occurrence) => {
+            this.expandStarts(event, isMaster, excludeDates, windowStart, windowEnd).filter((occurrence) => {
                 const fireAtMs = occurrence.start.getTime() - leadMs;
                 return fireAtMs > lowerMs && fireAtMs <= horizonMs;
             });
 
         let due: OccurrenceWindow[] = expand();
         if (due.length === 0) {
+            if (isMaster) {
+                // Remember when to look again: the first occurrence after this window, or - when none comes within the
+                // look-ahead - when the look-ahead itself runs out.
+                const lookAheadEnd = new Date(windowEnd.getTime() + NEXT_REMINDER_LOOKAHEAD_MS);
+                const [next] = this.expandStarts(event, isMaster, excludeDates, new Date(windowEnd.getTime() - 1), lookAheadEnd);
+                this.nextDue.set(event.uid, {
+                    version: (event as any).version,
+                    notBeforeMs: next ? next.start.getTime() - leadMs : lookAheadEnd.getTime() - leadMs,
+                });
+            }
             return;
         }
         if (isMaster) {

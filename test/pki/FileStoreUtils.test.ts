@@ -11,9 +11,11 @@ import {
     fsyncDirectory,
     lockKeyForPath,
     readFileIfExists,
+    STALE_LOCK_AGE_MS,
     STALE_TEMP_FILE_AGE_MS,
     sweepStaleTempFiles,
     updateJsonFile,
+    withFileLock,
     withLock,
     writeFileAtomic,
 } from "../../src/pki/FileStoreUtils.js";
@@ -97,6 +99,52 @@ describe("FileStoreUtils Tests", () => {
             ).rejects.toThrow("nope");
 
             expect(JSON.parse(await fs.readFile(filePath, "utf-8"))).toEqual({ a: "1" });
+        });
+    });
+
+    describe("the lock file other processes (replicas) respect", () => {
+        it("Waits for another process's lock, then updates, leaving no lock file behind.", async () => {
+            const filePath: string = path.join(freshDir(), "store.json");
+            await fs.mkdir(path.dirname(filePath), { recursive: true });
+            await fs.writeFile(`${filePath}.lock`, "12345");
+            setTimeout(() => void fs.rm(`${filePath}.lock`), 120);
+            await updateJsonFile<Record<string, number>, void>(filePath, 0o600, (s) => {
+                s.n = 1;
+            });
+            expect(JSON.parse(await fs.readFile(filePath, "utf-8"))).toEqual({ n: 1 });
+            await expect(fs.access(`${filePath}.lock`)).rejects.toThrow();
+        });
+
+        it("Takes over a lock a crashed process left behind, once it is stale.", async () => {
+            const filePath: string = path.join(freshDir(), "store.json");
+            await fs.mkdir(path.dirname(filePath), { recursive: true });
+            await fs.writeFile(`${filePath}.lock`, "12345");
+            const old = new Date(Date.now() - STALE_LOCK_AGE_MS - 5000);
+            await fs.utimes(`${filePath}.lock`, old, old);
+            await updateJsonFile<Record<string, number>, void>(filePath, 0o600, (s) => {
+                s.n = 2;
+            });
+            expect(JSON.parse(await fs.readFile(filePath, "utf-8"))).toEqual({ n: 2 });
+        });
+
+        it("Gives up with an error when a live lock is not released in time, leaving it alone.", async () => {
+            const filePath: string = path.join(freshDir(), "store.json");
+            await fs.mkdir(path.dirname(filePath), { recursive: true });
+            await fs.writeFile(`${filePath}.lock`, "12345");
+            const future = new Date(Date.now() + 10 * 60 * 1000);
+            await fs.utimes(`${filePath}.lock`, future, future);
+            const real = Date.now.bind(Date);
+            let calls = 0;
+            const now = vi.spyOn(Date, "now").mockImplementation(() => (calls++ === 0 ? real() : real() + 30_000));
+            try {
+                await expect(withFileLock(filePath, async () => "never")).rejects.toThrow(/Timed out waiting for the lock/);
+            } finally {
+                now.mockRestore();
+            }
+            // The other process's lock was not touched.
+            await fs.access(`${filePath}.lock`);
+            await fs.rm(`${filePath}.lock`);
+            await expect(withFileLock(filePath, async () => "ok")).resolves.toBe("ok");
         });
     });
 

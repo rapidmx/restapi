@@ -963,6 +963,10 @@ describe("Route:CalendarEventSQL Tests", () => {
             ),
         findMessage: async (uid) => (await messageRepo.findOne({ where: { uid } }))!,
         findEvents: async (mailboxUid) => (await calendarEventRepo.find({ where: { mailboxUid } })).filter((row: any) => !row.deleted),
+        deleteEventOrganizer: async (uid) => {
+            // The column can't be null: an address-less organizer is as close as a SQL row gets.
+            await calendarEventRepo.update({ uid }, { organizer: { address: "", type: "to" } });
+        },
     };
     calendarInviteSuite(suiteContext);
     calendarEventDialogSuite({

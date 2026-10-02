@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { Raw } from "typeorm";
 import { DistributionListSQL, DomainSQL, IngestQueueEntrySQL, MailboxSQL, TransportRuleSQL } from "../../sql.js";
 import { BaseMailIngestRoute } from "../BaseMailIngestRoute.js";
+import { escapeLike, rawLike } from "./LikeUtils.js";
 
 export class MailIngestRouteSQL extends BaseMailIngestRoute<MailboxSQL, IngestQueueEntrySQL> {
     protected mailboxClass: any = MailboxSQL;
@@ -31,7 +31,7 @@ export class MailIngestRouteSQL extends BaseMailIngestRoute<MailboxSQL, IngestQu
      * theoretical one.
      */
     protected aliasQueryValue(address: string): any {
-        const escaped: string = address.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-        return Raw((alias) => `${alias} LIKE :pattern ESCAPE '\\'`, { pattern: `%"${escaped}"%` });
+        const escaped: string = escapeLike(address);
+        return rawLike(`%"${escaped}"%`);
     }
 }

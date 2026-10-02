@@ -9,7 +9,7 @@ import { ApiErrors, HttpRequest, HttpResponse, ObjectFactory, RouteDecorators } 
 import { ValidatedCertificate } from "../pki/IssuedCertificateValidation.js";
 import { AdminEnrollmentSummary, SigningCertificateEnrollment } from "../pki/SigningCertificateEnrollment.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { assertAdminScope } from "../util/MailAccessUtils.js";
+import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { AuditAction } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Request, Response, User: AuthUser } = RouteDecorators;
@@ -56,6 +56,10 @@ export abstract class BaseSigningEnrollmentAdminRoute {
     @Config("trusted_roles", ["admin"])
     protected trustedRoles: string[] = ["admin"];
 
+    /** How old an elevated token may be before it has to be elevated again, in seconds (`mail:security:elevation_max_age_seconds`, 0 = no limit). */
+    @Config("mail:security:elevation_max_age_seconds", DEFAULT_ELEVATION_MAX_AGE_SECONDS)
+    protected elevationMaxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS;
+
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
@@ -95,15 +99,16 @@ export abstract class BaseSigningEnrollmentAdminRoute {
 
     @Get()
     public async list(@Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<AdminEnrollmentSummary[]> {
-        assertAdminScope(user, this.trustedRoles);
-        const list: AdminEnrollmentSummary[] = (await this.signingCertificateEnrollment!.listAdminEnrollments?.()) ?? [];
-        await this.audit(req, user, AuditAction.SIGNING_ENROLLMENT_ADMIN_LIST, "signing-enrollments", undefined, { count: list.length, provider: this.signingCertificateEnrollment!.kind });
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
+        // A deployment with no signing certificate provider has no enrollments (not an error).
+        const list: AdminEnrollmentSummary[] = (await this.signingCertificateEnrollment?.listAdminEnrollments?.()) ?? [];
+        await this.audit(req, user, AuditAction.SIGNING_ENROLLMENT_ADMIN_LIST, "signing-enrollments", undefined, { count: list.length, provider: this.signingCertificateEnrollment?.kind ?? "none" });
         return list;
     }
 
     @Get("/:id/csr")
     public async csr(@Param("id") id: string, @Request req: HttpRequest, @Response res: HttpResponse, @AuthUser user?: JWTUser): Promise<void> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const request = await this.manualProvider().getRequest(id);
         await this.audit(req, user, AuditAction.SIGNING_ENROLLMENT_ADMIN_CSR, id, request.mailboxUid, { address: request.identity });
         res.setHeader("content-type", "application/x-pem-file");
@@ -118,7 +123,7 @@ export abstract class BaseSigningEnrollmentAdminRoute {
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<CertificateUploadResult> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const provider: ManualAdminProvider = this.manualProvider();
         const request = await provider.getRequest(id);
         const validated: ValidatedCertificate = await provider.uploadValidatedCertificate(id, body?.certificate);
@@ -139,7 +144,7 @@ export abstract class BaseSigningEnrollmentAdminRoute {
 
     @Post("/:id/reject")
     public async reject(@Param("id") id: string, body: { reason?: unknown } | undefined, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<{ enrollmentId: string; status: "failed"; error: string }> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const provider: ManualAdminProvider = this.manualProvider();
         // eslint-disable-next-line no-control-regex -- deliberately strips control characters from an admin-supplied reason before it is shown to the mailbox's owner.
         const reason: string = typeof body?.reason === "string" ? body.reason.replace(/[\u0000-\u001f\u007f]+/g, " ").trim() : "";

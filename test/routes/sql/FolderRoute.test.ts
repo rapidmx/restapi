@@ -280,7 +280,7 @@ describe("Route:FolderSQL Tests", () => {
     describe("Anonymous access via a share token", () => {
         it("An anonymous caller with a token granted `exists` on the folder's own ACL can confirm it exists.", async () => {
             const mailbox = await createMailbox(owner.uid);
-            const folder = await createFolder(mailbox.uid);
+            const folder = await createFolder(mailbox.uid, { type: FolderType.CALENDAR });
             // A token only resolves for a real, unexpired link on this very folder - see `BaseFolderRoute.resolveEffectiveUser()`.
             const link = await request(server.getApplication())
                 .post("/sql/calendar-share-links")

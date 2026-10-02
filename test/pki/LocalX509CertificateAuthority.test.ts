@@ -96,6 +96,18 @@ describe("LocalX509CertificateAuthority Tests", () => {
         await expect(authority.issue("bad@example.com", "not a csr")).rejects.toThrow(/could not be parsed/);
     });
 
+    it("Rejects a CSR whose key is too weak or of a kind this CA doesn't sign (RSA under 2048 bits, an unusual curve).", async () => {
+        const csrFor = async (generate: any, signingAlgorithm: any): Promise<string> => {
+            const keys: CryptoKeyPair = await crypto.subtle.generateKey(generate, true, ["sign", "verify"]);
+            return (await x509.Pkcs10CertificateRequestGenerator.create({ name: "CN=weak@example.com", keys, signingAlgorithm })).toString("pem");
+        };
+        const rsa1024 = await csrFor({ name: "RSASSA-PKCS1-v1_5", modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" });
+        const rsa2048 = await csrFor({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" });
+
+        await expect(authority.issue("weak@example.com", rsa1024)).rejects.toThrow(/key is too weak|not accepted/);
+        await expect(authority.issue("strong@example.com", rsa2048)).resolves.toBeDefined();
+    });
+
     it("Rejects a CSR whose self-signature does not verify (tampered public key).", async () => {
         const keys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
             "sign",
@@ -114,6 +126,68 @@ describe("LocalX509CertificateAuthority Tests", () => {
         const tamperedPem: string = x509.PemConverter.encode(tamperedBytes, "CERTIFICATE REQUEST");
 
         await expect(authority.issue("tampered@example.com", tamperedPem)).rejects.toThrow(/self-signature does not verify/);
+    });
+
+    it("Refuses an RSA key above 4096 bits, before the (costly) check of the CSR's own signature.", async () => {
+        const keys: CryptoKeyPair = await crypto.subtle.generateKey(
+            { name: "RSASSA-PKCS1-v1_5", modulusLength: 4112, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+            true,
+            ["sign", "verify"],
+        );
+        const csr = (await x509.Pkcs10CertificateRequestGenerator.create({ name: "CN=huge@example.com", keys, signingAlgorithm: { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" } })).toString("pem");
+        const verify = vi.spyOn(x509.Pkcs10CertificateRequest.prototype, "verify");
+        try {
+            await expect(authority.issue("huge@example.com", csr)).rejects.toThrow(/2048 to 4096 bits/);
+            expect(verify).not.toHaveBeenCalled();
+        } finally {
+            verify.mockRestore();
+        }
+    }, 60_000);
+
+    describe("the CA certificate on disk", () => {
+        /** A CA directory holding a CA made by this class, and a way to put a CA certificate of our own making in place of its own. */
+        async function caWith(notAfter: Date | undefined, otherKey: boolean = false): Promise<LocalX509CertificateAuthority> {
+            const dir: string = path.join(tmpDir, `ca-${Math.random()}`);
+            const ca = new LocalX509CertificateAuthority();
+            (ca as any).caDir = dir;
+            (ca as any).caSubject = "CN=Test Local CA";
+            (ca as any).validityDays = 397;
+            await ca.issue("seed@example.com", await generateCsr("seed@example.com"));
+            if (notAfter || otherKey) {
+                const keyPem: string = await fs.readFile(path.join(dir, "ca.key.pem"), "utf-8");
+                const privateKey = await crypto.subtle.importKey("pkcs8", x509.PemConverter.decodeFirst(keyPem), { name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]);
+                const { d: _d, key_ops: _ops, ...publicJwk } = await crypto.subtle.exportKey("jwk", privateKey);
+                const publicKey = await crypto.subtle.importKey("jwk", publicJwk, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]);
+                const other: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+                const replacement = await x509.X509CertificateGenerator.createSelfSigned({
+                    name: "CN=Test Local CA",
+                    notBefore: new Date(Date.now() - 20 * 24 * 60 * 60 * 1000),
+                    notAfter: notAfter ?? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+                    keys: otherKey ? other : { privateKey, publicKey },
+                    signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+                });
+                await fs.writeFile(path.join(dir, "ca.cert.pem"), replacement.toString("pem"));
+            }
+            return ca;
+        }
+
+        it("Refuses to issue once the CA certificate has expired.", async () => {
+            const ca = await caWith(new Date(Date.now() - 24 * 60 * 60 * 1000));
+            await expect(ca.issue("late@example.com", await generateCsr("late@example.com"))).rejects.toMatchObject({ status: 500, message: expect.stringMatching(/expired on .* has to be replaced/) });
+        });
+
+        it("Refuses a CA certificate that is not the certificate of the key beside it.", async () => {
+            const ca = await caWith(undefined, true);
+            await expect(ca.issue("mismatch@example.com", await generateCsr("mismatch@example.com"))).rejects.toThrow(/is not the certificate of the key/);
+        });
+
+        it("Never issues a certificate valid beyond the CA's own.", async () => {
+            const caEnds = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000);
+            const ca = await caWith(caEnds);
+            const issued = await ca.issue("short@example.com", await generateCsr("short@example.com"));
+            expect(issued.notAfter.getTime()).toBe(Math.floor(caEnds.getTime() / 1000) * 1000);
+            expect(new x509.X509Certificate(issued.certificate).notAfter.getTime()).toBeLessThanOrEqual(caEnds.getTime());
+        });
     });
 
     it("revoke() is a no-op that resolves without error.", async () => {

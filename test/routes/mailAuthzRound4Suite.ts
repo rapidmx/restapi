@@ -547,15 +547,21 @@ export function mailAuthzRound4Suite(ctx: MailAuthzRound4SuiteContext): void {
             const fresh = await ctx.findOne("Mailbox", mailbox.uid);
             expect((await auth(request(ctx.app()).put(url(`/mailboxes/${mailbox.uid}`)), owner).send({ uid: mailbox.uid, version: fresh.version, oofEndTime: "whenever" })).status).toBe(400);
 
+            // A share link can't be set to end more than a year ahead.
+            const soon = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
             const calendar = await createFolder(mailbox.uid, FolderType.CALENDAR);
             const link = await auth(request(ctx.app()).post(url("/calendar-share-links")), owner).send({
                 folderUid: calendar.uid,
                 permittedActions: ["list", "read"],
                 createdByUserUid: owner.uid,
-                expiresAt: when,
+                expiresAt: soon,
             });
             expect(link.status).toBe(200);
-            sameInstant((await ctx.findOne("CalendarShareLink", link.body.uid)).expiresAt);
+            const storedExpiry: any = (await ctx.findOne("CalendarShareLink", link.body.uid)).expiresAt;
+            expect(new Date(storedExpiry).toISOString()).toBe(soon);
+            if (isMongo) {
+                expect(storedExpiry).toBeInstanceOf(Date);
+            }
 
             const tasks = await createFolder(mailbox.uid, FolderType.TASKS);
             const task = await auth(request(ctx.app()).post(url("/tasks")), owner).send({

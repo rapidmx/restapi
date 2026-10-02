@@ -243,7 +243,7 @@ describe("MongoTextSearchProvider Tests", () => {
                 { mailboxUid: "mbx-1", $text: { $search: "hello" } },
                 { projection: { score: { $meta: "textScore" } } },
             );
-            expect(cursor.sort).toHaveBeenCalledWith({ score: { $meta: "textScore" } });
+            expect(cursor.sort).toHaveBeenCalledWith({ score: { $meta: "textScore" }, entityType: 1, entityUid: 1 });
             expect(cursor.skip).toHaveBeenCalledWith(0);
             expect(cursor.limit).toHaveBeenCalledWith(26);
             expect(result).toEqual({
@@ -427,7 +427,7 @@ describe("MongoTextSearchProvider Tests", () => {
 
             await provider.search({ mailboxUid: "mbx-1", text: "", folderUid: "folder-1" });
 
-            expect(cursor.sort).toHaveBeenCalledWith({ dateForSort: -1 });
+            expect(cursor.sort).toHaveBeenCalledWith({ dateForSort: -1, entityType: 1, entityUid: 1 });
         });
     });
 
@@ -461,7 +461,7 @@ describe("MongoTextSearchProvider Tests", () => {
                 },
                 { projection: { entityType: 1, entityUid: 1 } },
             );
-            expect(cursor.sort).toHaveBeenCalledWith({ dateForSort: -1 });
+            expect(cursor.sort).toHaveBeenCalledWith({ dateForSort: -1, entityType: 1, entityUid: 1 });
             expect(result).toEqual({ candidates: [{ entityType: "message", entityUid: "msg-1" }], nextCursor: undefined });
         });
 

@@ -14,6 +14,11 @@ describe("isAutoReplyEligible() Tests", () => {
         expect(isAutoReplyEligible("   ", {})).toBe(false);
     });
 
+    it("Refuses the literal null return-path '<>' (spaces inside allowed).", () => {
+        expect(isAutoReplyEligible("<>", {})).toBe(false);
+        expect(isAutoReplyEligible(" < > ", {})).toBe(false);
+    });
+
     it("Refuses when Auto-Submitted is present and not 'no'.", () => {
         expect(isAutoReplyEligible("sender@example.com", { autoSubmittedHeader: "auto-replied" })).toBe(false);
         expect(isAutoReplyEligible("sender@example.com", { autoSubmittedHeader: "auto-generated" })).toBe(false);

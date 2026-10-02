@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { DistributionList } from "../models/types.js";
-import { rebuildDroppingReplyTo } from "./MimeHeaderUtils.js";
+import { rebuildDroppingReplyTo, singleLineHeaderValue } from "./MimeHeaderUtils.js";
 
 /**
  * Produces a copy of `raw` rewritten for distribution-list delivery: any existing `Reply-To` header (and its
@@ -13,9 +13,17 @@ import { rebuildDroppingReplyTo } from "./MimeHeaderUtils.js";
  * `BaseMailIngestRoute.deliver()`.
  */
 export function rewriteHeadersForList(raw: Buffer, list: DistributionList): Buffer {
-    // Defensive against header injection via an admin-controlled field ending up in a header value.
-    const safeName: string = list.name.replace(/[\r\n]/g, "");
-    const address: string = list.primarySmtpAddress.replace(/[\r\n]/g, "");
+    // Defensive against header injection via an admin-controlled field ending up in a header value: the address keeps only
+    // visible ASCII (and no angle brackets), the name is an RFC 2047 encoded word when it isn't plain printable ASCII.
+    const trimmedName: string = singleLineHeaderValue(list.name).trim();
+    // A plain ASCII name made only of atom characters (RFC 5322) and spaces goes out as it is; one with a special (`<`, `>`, `"`, `(`,
+    // `,` ...) as a quoted string, so the phrase stays a phrase in front of the `<list-id>`.
+    const safeName: string = /^[A-Za-z0-9 !#$%&'*+\-/=?^_`{|}~.]*$/.test(trimmedName)
+        ? trimmedName
+        : /^[\x20-\x7E]*$/.test(trimmedName)
+          ? `"${trimmedName.replace(/["\\]/g, "\\$&")}"`
+          : `=?UTF-8?B?${Buffer.from(trimmedName, "utf8").toString("base64")}?=`;
+    const address: string = list.primarySmtpAddress.replace(/[^\x21-\x7E]|[<>]/g, "");
     const listIdHost: string = address.includes("@") ? address.replace("@", ".") : address;
 
     const newHeaders: string[] = [

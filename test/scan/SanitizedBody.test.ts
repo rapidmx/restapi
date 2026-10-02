@@ -11,6 +11,9 @@ describe("SanitizedBodyLoader", () => {
     const FRESH = "<!DOCTYPE html><html><head></head><body><p>fresh</p></body></html>";
     let blobs: InMemoryBlobStore;
     let sanitizeRaw: ReturnType<typeof vi.fn>;
+    let sanitizeStoredHtml: ReturnType<typeof vi.fn>;
+    // What the current sanitizer makes of the stored HTML of an older one.
+    const CLEAN = (html: string): string => `<!--cleaned-->${html}`;
     let logger: { warn: ReturnType<typeof vi.fn> };
     let loader: SanitizedBodyLoader;
     const message = { uid: "msg-1", bodyBlobKey: "bodies/msg-1", sanitizedHtmlBlobKey: "sanitized/msg-1" };
@@ -20,8 +23,9 @@ describe("SanitizedBodyLoader", () => {
         await blobs.put(message.bodyBlobKey, Buffer.from("From: a@b.example\r\n\r\nraw"));
         await blobs.put(message.sanitizedHtmlBlobKey, Buffer.from(OLD));
         sanitizeRaw = vi.fn(async () => stampSanitizedHtml(FRESH));
+        sanitizeStoredHtml = vi.fn((html: string) => stampSanitizedHtml(CLEAN(html)));
         logger = { warn: vi.fn() };
-        loader = new SanitizedBodyLoader(blobs, { sanitizeRaw } as any, { maxRawBytes: 1000, timeoutMs: 2000 }, logger);
+        loader = new SanitizedBodyLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 2000 }, logger);
     });
 
     const stored = async (): Promise<string> => (await blobs.get(message.sanitizedHtmlBlobKey)).toString();
@@ -63,12 +67,12 @@ describe("SanitizedBodyLoader", () => {
         expect(sanitizeRaw).toHaveBeenCalledTimes(1);
     });
 
-    describe("never worse than before", () => {
-        it("serves the stored HTML when the sanitizer fails, says so, and does not try again for a while", async () => {
+    describe("fails closed", () => {
+        it("serves the stored HTML, sanitized again, when the sanitizer fails, says so, and does not try again for a while", async () => {
             sanitizeRaw.mockRejectedValue(new Error("parse exploded"));
 
-            expect(await loader.load(message)).toBe(OLD);
-            expect(await loader.load(message)).toBe(OLD);
+            expect(await loader.load(message)).toBe(CLEAN(OLD));
+            expect(await loader.load(message)).toBe(CLEAN(OLD));
             expect(sanitizeRaw).toHaveBeenCalledTimes(1);
             expect(logger.warn).toHaveBeenCalledTimes(1);
             expect(logger.warn.mock.calls[0][0]).toContain("msg-1");
@@ -82,24 +86,36 @@ describe("SanitizedBodyLoader", () => {
             expect(sanitizeRaw).toHaveBeenCalledTimes(2);
         });
 
-        it("works without a logger", async () => {
-            loader = new SanitizedBodyLoader(blobs, { sanitizeRaw } as any, { maxRawBytes: 1000, timeoutMs: 2000 });
-            sanitizeRaw.mockRejectedValue(new Error("x"));
+        it("serves nothing, and says so, when even the stored HTML cannot be sanitized, and never serves it as it was", async () => {
+            sanitizeRaw.mockRejectedValue(new Error("parse exploded"));
+            sanitizeStoredHtml.mockImplementation(() => {
+                throw new Error("too large");
+            });
 
-            expect(await loader.load(message)).toBe(OLD);
+            expect(await loader.load(message)).toBe("");
+            expect(logger.warn.mock.calls.map((call) => call[0]).join(" ")).toContain("too large");
+            loader = new SanitizedBodyLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 2000 });
+            expect(await loader.load(message)).toBe("");
         });
 
-        it("serves the stored HTML when the raw message is missing, too large, or has no HTML any more", async () => {
-            expect(await loader.load({ ...message, bodyBlobKey: undefined })).toBe(OLD);
+        it("works without a logger", async () => {
+            loader = new SanitizedBodyLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 2000 });
+            sanitizeRaw.mockRejectedValue(new Error("x"));
+
+            expect(await loader.load(message)).toBe(CLEAN(OLD));
+        });
+
+        it("serves the stored HTML, sanitized again, when the raw message is missing, too large, or has no HTML any more", async () => {
+            expect(await loader.load({ ...message, bodyBlobKey: undefined })).toBe(CLEAN(OLD));
             expect(await loader.load({ ...message, sanitizedHtmlBlobKey: "sanitized/other", bodyBlobKey: "bodies/missing" }).catch(() => "missing sanitized blob")).toBe("missing sanitized blob");
 
             await blobs.put("sanitized/big", Buffer.from(OLD));
             await blobs.put("bodies/big", Buffer.alloc(2000));
-            expect(await loader.load({ uid: "big", bodyBlobKey: "bodies/big", sanitizedHtmlBlobKey: "sanitized/big" })).toBe(OLD);
+            expect(await loader.load({ uid: "big", bodyBlobKey: "bodies/big", sanitizedHtmlBlobKey: "sanitized/big" })).toBe(CLEAN(OLD));
 
             await blobs.put("sanitized/none", Buffer.from(OLD));
             sanitizeRaw.mockResolvedValue(undefined);
-            expect(await loader.load({ uid: "none", bodyBlobKey: message.bodyBlobKey, sanitizedHtmlBlobKey: "sanitized/none" })).toBe(OLD);
+            expect(await loader.load({ uid: "none", bodyBlobKey: message.bodyBlobKey, sanitizedHtmlBlobKey: "sanitized/none" })).toBe(CLEAN(OLD));
             expect(sanitizeRaw).toHaveBeenCalledTimes(1);
         });
 
@@ -109,18 +125,18 @@ describe("SanitizedBodyLoader", () => {
                 return stampSanitizedHtml(FRESH);
             });
 
-            expect(await loader.load(message)).toBe(OLD);
+            expect(await loader.load(message)).toBe(CLEAN(OLD));
             expect(await blobs.exists(message.sanitizedHtmlBlobKey)).toBe(false);
         });
 
-        it("answers with the stored HTML when the re-sanitization takes too long, and lets it finish for the next reader", async () => {
-            loader = new SanitizedBodyLoader(blobs, { sanitizeRaw } as any, { maxRawBytes: 1000, timeoutMs: 10 }, logger);
+        it("answers with the stored HTML, sanitized again, when the re-sanitization takes too long, and lets it finish for the next reader", async () => {
+            loader = new SanitizedBodyLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 10 }, logger);
             sanitizeRaw.mockImplementation(async () => {
                 await new Promise((resolve) => setTimeout(resolve, 80));
                 return stampSanitizedHtml(FRESH);
             });
 
-            expect(await loader.load(message)).toBe(OLD);
+            expect(await loader.load(message)).toBe(CLEAN(OLD));
             await vi.waitFor(async () => expect(await stored()).toBe(stampSanitizedHtml(FRESH)), { timeout: 2000 });
             expect(await loader.load(message)).toBe(FRESH);
         });
@@ -128,7 +144,7 @@ describe("SanitizedBodyLoader", () => {
         it("remembers only so many failures", async () => {
             for (let i = 0; i < 2100; i++) {
                 await blobs.put(`sanitized/${i}`, Buffer.from(OLD));
-                expect(await loader.load({ uid: `m${i}`, sanitizedHtmlBlobKey: `sanitized/${i}` })).toBe(OLD);
+                expect(await loader.load({ uid: `m${i}`, sanitizedHtmlBlobKey: `sanitized/${i}` })).toBe(CLEAN(OLD));
             }
             // The oldest were forgotten, so the first is tried again.
             sanitizeRaw.mockResolvedValue(stampSanitizedHtml(FRESH));

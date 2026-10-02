@@ -16,7 +16,7 @@ import {
 } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { evaluateEscrowApprovals, exactInFilter, resolveEscrowApprovalTtlHours } from "../util/EscrowUtils.js";
-import { assertAdminScope } from "../util/MailAccessUtils.js";
+import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import {
     LOOKUP_MAX_ATTEMPTS,
     LOOKUP_WINDOW_SECONDS,
@@ -183,6 +183,10 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
      * class's own doc comment for why. Mirrors `BaseMailboxRoute`/`BaseSigningEnrollmentAdminRoute`'s identical field. */
     protected trustedRoles: string[] = ["admin"];
 
+    /** How old an elevated token may be before it has to be elevated again, in seconds (`mail:security:elevation_max_age_seconds`, 0 = no limit). */
+    @Config("mail:security:elevation_max_age_seconds", DEFAULT_ELEVATION_MAX_AGE_SECONDS)
+    protected elevationMaxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS;
+
     /** Base URL of auth-server, whose `GET /api/aliases` resolves a username or e-mail alias to a user uid (see
      * `resolveHolder()`) - the same setting `BaseMailboxAccessRoute`'s own resolution reads. Empty: none. */
     @Config("mail:auth_server_url", "")
@@ -321,7 +325,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
     @RateLimit({ perUser: true, maxAttempts: LOOKUP_MAX_ATTEMPTS, windowSeconds: LOOKUP_WINDOW_SECONDS })
     @Get("/resolve-holder")
     public async resolveHolder(@Query("principal") principal: unknown, @AuthUser user?: JWTUser, @Request req?: HttpRequest): Promise<ResolvedPrincipal> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         if (typeof principal !== "string" || principal.trim().length === 0 || principal.length > MAX_PRINCIPAL_LENGTH) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The 'principal' query parameter must be an address, username or user uid.");
         }
@@ -334,7 +338,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
 
     @RequiresTrustedRole()
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
         for (const o of objs) {
             if (!o || typeof o !== "object" || Array.isArray(o)) {
@@ -376,7 +380,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
@@ -443,7 +447,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
      * the rest (same trade-off as `BaseMatterRoute.updateBulk()`). */
     @RequiresTrustedRole()
     public async updateBulk(objs: UpdateObject<T>[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         if (!Array.isArray(objs)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
@@ -463,7 +467,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         obj: any,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         assertPlainPropertyName(propertyName);
         if (propertyName === "uid") {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
@@ -479,7 +483,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
      * entry - refused; delete scopes one at a time. */
     @RequiresTrustedRole()
     public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Escrow scopes must be deleted one at a time.");
     }
 
@@ -491,7 +495,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<void> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const existing: T | undefined = await this.repoUtils!.findOne(id, { version, ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -541,7 +545,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
 
     @RequiresTrustedRole()
     public async find(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<T[]> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         return await this.repoUtils!.find(
             { ...query, ...params },
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
@@ -555,7 +559,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         @Response res: HttpResponse,
         @AuthUser user?: JWTUser,
     ): Promise<any> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const result: number = await this.repoUtils!.count(
             { ...query, ...params },
             { limit: query?.limit, page: query?.page, version: query?.version, user, ignoreACL: true },
@@ -565,7 +569,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
 
     @RequiresTrustedRole()
     public async findById(@Param("id") id: string, @Query() query: any, @AuthUser user?: JWTUser): Promise<T | null> {
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const result: T | undefined = await this.repoUtils!.findOne(id, {
             version: query?.version,
             includeDeleted: query?.deleted === true || query?.deleted === "true",

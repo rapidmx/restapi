@@ -37,7 +37,8 @@ import {
 
 x509.cryptoProvider.set(crypto);
 
-async function makeCertDer(cn: string): Promise<string> {
+/** A self-signed certificate for `cn` that names `email` - the address a key must name to be pinned for a contact. */
+async function makeCertDer(cn: string, email: string = "peer@example.com"): Promise<string> {
     const keys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
         "sign",
         "verify",
@@ -48,6 +49,7 @@ async function makeCertDer(cn: string): Promise<string> {
         notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
         keys,
         signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+        extensions: [new x509.SubjectAlternativeNameExtension([{ type: "email", value: email }])],
     });
     return Buffer.from(cert.rawData).toString("base64");
 }
@@ -130,6 +132,8 @@ async function makeKey(overrides: Partial<PublicKey> = {}): Promise<PublicKey> {
 }
 
 const ADDRESS = "peer@example.com";
+/** The observation time a key pinned for the first time is checked at: a certificate must be valid then (`parseContactKey()`). */
+const NOW = Date.now() + 60_000; // a minute of margin: the test certificates are made later and start at their own second
 
 function makeDiscovery(keys: PublicKey[], lastSeen?: number): KeyDiscoveryResponse {
     return { encryptPreference: { preferEncrypt: "mutual", lastSeen }, keys, escrow: false };
@@ -138,17 +142,40 @@ function makeDiscovery(keys: PublicKey[], lastSeen?: number): KeyDiscoveryRespon
 describe("applyDiscoveredKeys() Tests", () => {
     it("TOFU-pins the first key ever observed for a useType, with no conflict, and stamps keysFirstSeen.", async () => {
         const newKey = await makeKey();
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([newKey]), 1000, "discovery", ADDRESS);
+        const result = applyDiscoveredKeys(undefined, makeDiscovery([newKey]), NOW, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([newKey]);
         expect(result.keyConflicts).toBeUndefined();
-        expect(result.keysFirstSeen).toBe(1000);
+        expect(result.keysFirstSeen).toBe(NOW);
+    });
+
+    it("Does not pin a first key whose certificate names another address or is expired.", async () => {
+        const otherAddress = await makeKey({ publicKey: await makeCertDer("mallory", "mallory@example.com") });
+        const result = applyDiscoveredKeys(undefined, makeDiscovery([otherAddress]), NOW, "discovery", ADDRESS);
+        expect(result.keys).toEqual([]);
+        expect(result.keysFirstSeen).toBeUndefined();
+
+        const valid = await makeKey();
+        const expired = applyDiscoveredKeys(undefined, makeDiscovery([valid]), Date.now() + 2 * 365 * 24 * 60 * 60 * 1000, "discovery", ADDRESS);
+        expect(expired.keys).toEqual([]);
+    });
+
+    it("Pins the key of an alias whose response names its primary address, and only then.", async () => {
+        const primaryKey = await makeKey({ publicKey: await makeCertDer("primary", "primary@primary.example") });
+        const alias = "bob@alias-domain.example";
+        // Without the primary address in the response, the certificate does not name the alias that was asked for.
+        expect(applyDiscoveredKeys(undefined, makeDiscovery([primaryKey]), NOW, "discovery", alias).keys).toEqual([]);
+        const answered = { ...makeDiscovery([primaryKey]), address: "primary@primary.example" };
+        const result = applyDiscoveredKeys(undefined, answered, NOW, "discovery", alias);
+        expect(result.keys).toEqual([primaryKey]);
+        // A response that names an address its certificate does not name pins nothing.
+        expect(applyDiscoveredKeys(undefined, { ...answered, address: "other@primary.example" }, NOW, "discovery", alias).keys).toEqual([]);
     });
 
     it("TOFU-pins encrypt and sign keys independently from the same discovery response.", async () => {
         const encryptKey = await makeKey({ useType: "encrypt" });
         const signKey = await makeKey({ useType: "sign" });
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([encryptKey, signKey]), 1000, "discovery", ADDRESS);
+        const result = applyDiscoveredKeys(undefined, makeDiscovery([encryptKey, signKey]), NOW, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([encryptKey, signKey]);
     });
@@ -287,7 +314,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const realKey = await makeKey();
         const lying: PublicKey = { ...realKey, notBefore: 1, notAfter: 8_000_000_000_000 };
 
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([lying]), 1000, "discovery", ADDRESS);
+        const result = applyDiscoveredKeys(undefined, makeDiscovery([lying]), NOW, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([realKey]);
         expect(result.keys![0].notAfter).not.toBe(8_000_000_000_000);
@@ -392,7 +419,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const key = await makeKey();
         const manyKeys: PublicKey[] = Array.from({ length: 50 }, () => ({ ...key }));
 
-        const result = applyDiscoveredKeys(undefined, makeDiscovery(manyKeys), 1000, "discovery", ADDRESS);
+        const result = applyDiscoveredKeys(undefined, makeDiscovery(manyKeys), NOW, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([key]);
     });
@@ -845,7 +872,7 @@ describe("discoverAndMergeKeys() Tests", () => {
 
     it("Resolves the peer, fetches its keys, and merges them via applyDiscoveredKeys().", async () => {
         (dnsResolver.resolveTxt as any).mockResolvedValue([["v=RMXv1; id=1; host=mail.participating-2.example.com;"]]);
-        const remoteKey = await makeKey();
+        const remoteKey = await makeKey({ publicKey: await makeCertDer("alice", "alice@participating-2.example.com") });
         const discovered = makeDiscovery([remoteKey], 100);
         mockFetch.mockResolvedValue({
             ok: true,
@@ -854,9 +881,9 @@ describe("discoverAndMergeKeys() Tests", () => {
             headers: { get: () => null },
         });
 
-        const result = await discoverAndMergeKeys(dnsResolver, "alice@participating-2.example.com", undefined, 5000);
+        const result = await discoverAndMergeKeys(dnsResolver, "alice@participating-2.example.com", undefined, NOW);
 
         expect(result?.keys).toEqual([remoteKey]);
-        expect(result?.keysFirstSeen).toBe(5000);
+        expect(result?.keysFirstSeen).toBe(NOW);
     });
 });

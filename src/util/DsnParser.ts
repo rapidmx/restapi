@@ -116,7 +116,7 @@ function stripAngleBrackets(value: string | undefined): string | undefined {
 }
 
 /** Whether `parsed` is a `multipart/report` of the given `report-type`. */
-function isReportOfType(parsed: ParsedMail, reportType: string): boolean {
+export function isReportOfType(parsed: ParsedMail, reportType: string): boolean {
     const contentType: any = parsed.headers?.get("content-type");
     return contentType?.value === "multipart/report" && String(contentType.params?.["report-type"] ?? "").toLowerCase() === reportType;
 }

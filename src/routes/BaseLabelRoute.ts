@@ -14,6 +14,9 @@ const { Delete, Param, Query, Request, User: AuthUser } = RouteDecorators;
  * still reference a just-deleted label - same pattern/size as `MailboxQuotaRecalcJob.findAllPages()`. */
 const MESSAGE_PAGE_SIZE = 500;
 
+/** The most pages of labelled messages one label delete cleans up - a bound, not a limit anyone reaches (500 messages a page). */
+const MAX_CLEANUP_ROUNDS = 10000;
+
 /**
  * Base CRUD route for the Gmail-style `Label` entity. `Label` has no `AccessControlList` of its own -
  * scoped/permission-checked by `mailboxUid`, same as `ContactList` - so this is otherwise a thin
@@ -30,6 +33,9 @@ const MESSAGE_PAGE_SIZE = 500;
  * synchronously as part of the delete request. This trades away efficiency for a very large mailbox in
  * exchange for zero new schema/DSL work.
  *
+ * The scan is narrowed to the messages that carry the label (`buildLabelUidsFilter()`, the same predicate the message list's label filter
+ * uses), so a large mailbox costs one query per page of labelled messages rather than one per page of every message.
+ *
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseLabelRoute<T extends Label, M extends Message> extends BaseScopedChildRoute<T> {
@@ -38,6 +44,10 @@ export abstract class BaseLabelRoute<T extends Label, M extends Message> extends
     /** Supplied by the Mongo/SQL concrete subclasses so `delete()` can clean up references to a deleted
      * label without depending on either backend directly. */
     protected abstract messageClass: any;
+
+    /** The query that matches the messages carrying any of `labelUids` (`buildMessageLabelFilterMongo()`/`buildMessageLabelFilterSQL()`), supplied by
+     * the Mongo/SQL concrete subclass - `Message.labelUids` is a native array on Mongo and JSON text on SQL. */
+    protected abstract buildLabelUidsFilter(labelUids: string[]): Record<string, any>;
 
     private messageRepo?: RecoverableRepoUtils<M>;
 
@@ -59,16 +69,23 @@ export abstract class BaseLabelRoute<T extends Label, M extends Message> extends
      */
     private async cleanUpDeletedLabel(mailboxUid: string, labelUid: string): Promise<void> {
         const repo: RecoverableRepoUtils<M> = await this.getMessageRepo();
-        for (let page = 0; ; page++) {
-            const options: RepoFindOptions = { limit: MESSAGE_PAGE_SIZE, page, ignoreACL: true };
-            const batch: M[] = await repo.find({ mailboxUid, limit: MESSAGE_PAGE_SIZE, page } as any, options);
-            for (const message of batch) {
-                if ((message.labelUids ?? []).includes(labelUid)) {
-                    await this.removeLabelFrom(repo, message, labelUid);
+        // Only the messages that carry the label (`buildLabelUidsFilter()`), never the whole mailbox. Each one stripped drops out of that
+        // filter, so every round reads the first page again; a round that stripped nothing ends it. A message the user deleted is still
+        // there to be restored, so a second pass covers those (`find()` only returns them for an explicit `deleted: true`).
+        for (const pass of [{}, { deleted: true }]) {
+            for (let round = 0; round < MAX_CLEANUP_ROUNDS; round++) {
+                const options: RepoFindOptions = { limit: MESSAGE_PAGE_SIZE, page: 0, ignoreACL: true };
+                const batch: M[] = await repo.find({ mailboxUid, ...pass, ...this.buildLabelUidsFilter([labelUid]), limit: MESSAGE_PAGE_SIZE, page: 0 } as any, options);
+                let stripped: number = 0;
+                for (const message of batch) {
+                    if ((message.labelUids ?? []).includes(labelUid)) {
+                        await this.removeLabelFrom(repo, message, labelUid);
+                        stripped++;
+                    }
                 }
-            }
-            if (batch.length < MESSAGE_PAGE_SIZE) {
-                break;
+                if (batch.length < MESSAGE_PAGE_SIZE || stripped === 0) {
+                    break;
+                }
             }
         }
     }
@@ -121,7 +138,13 @@ export abstract class BaseLabelRoute<T extends Label, M extends Message> extends
         await super.delete(id, version, purge, req, user);
 
         if (existing) {
-            await this.cleanUpDeletedLabel(existing.mailboxUid, existing.uid);
+            // The label is gone whatever happens here: a message this could not clean up keeps an id that names no label (shown as nothing),
+            // which is no reason to answer a delete that happened with an error.
+            try {
+                await this.cleanUpDeletedLabel(existing.mailboxUid, existing.uid);
+            } catch (err: any) {
+                this.logger?.warn(`BaseLabelRoute: could not remove deleted label ${existing.uid} from every message of mailbox ${existing.mailboxUid}: ${err?.message}`);
+            }
         }
     }
 }

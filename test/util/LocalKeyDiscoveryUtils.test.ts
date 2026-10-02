@@ -170,7 +170,8 @@ describe("LocalKeyDiscoveryUtils", () => {
             const dns = { resolveTxt: vi.fn() } as unknown as StaticDnsResolver;
 
             // The alias names the mailbox, whose certificate names its primary address.
-            const update = await discoverAndMergeKeys(dns, "robert@example.com", undefined, 1000, local);
+            // Observed now: a first key is pinned only while its certificate is valid.
+            const update = await discoverAndMergeKeys(dns, "robert@example.com", undefined, Date.now(), local);
 
             expect(update?.keys?.map((key) => key.fingerprint)).toEqual([cert.fingerprint]);
             expect(dns.resolveTxt).not.toHaveBeenCalled();

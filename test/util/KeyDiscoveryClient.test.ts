@@ -9,12 +9,26 @@
 import {
     computeKeyDiscoveryHash,
     fetchRemoteKeys,
+    isPublicDiscoveryAddress,
     isValidKeyDiscoveryHash,
+    MAX_DISCOVERED_KEYS,
     parseKeyDiscoveryAddress,
     parseKeyDiscoveryResponse,
+    setDiscoveryAddressLookup,
     zBase32Encode,
 } from "../../src/util/KeyDiscoveryClient.js";
+import * as dns from "dns";
+import { MemoryStore } from "@rapidrest/core";
 import type { KeyDiscoveryResponse } from "../../src/models/types.js";
+
+// No test here may wait on real DNS: every host resolves to a public address unless a test says otherwise.
+beforeEach(() => {
+    setDiscoveryAddressLookup(async () => ["93.184.216.34"]);
+});
+
+afterEach(() => {
+    setDiscoveryAddressLookup();
+});
 
 function makeDiscoveryResponse(overrides: Partial<KeyDiscoveryResponse> = {}): KeyDiscoveryResponse {
     return { encryptPreference: { preferEncrypt: "nopreference" }, keys: [], escrow: false, ...overrides };
@@ -30,6 +44,95 @@ function makeFetchResponse(overrides: any = {}) {
         ...overrides,
     };
 }
+
+describe("fetchRemoteKeys() discovery host and cache bounds", () => {
+    const key = { publicKey: "QUJD", type: "x509", useType: "encrypt", fingerprint: "fp", notBefore: 0, notAfter: 1 };
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        mockFetch = vi.fn();
+        vi.stubGlobal("fetch", mockFetch);
+        setDiscoveryAddressLookup(async () => ["93.184.216.34"]);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+        setDiscoveryAddressLookup();
+    });
+
+    it.each(["127.0.0.1", "10.1.2.3", "169.254.169.254", "172.16.0.1", "192.168.1.1", "100.64.0.1", "0.0.0.0", "224.0.0.1", "::1", "::", "fe80::1", "fd12::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "not an address"])(
+        "Does not treat %s as a public address.",
+        (address) => {
+            expect(isPublicDiscoveryAddress(address)).toBe(false);
+        },
+    );
+
+    it.each(["93.184.216.34", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946", "::ffff:8.8.8.8"])("Treats %s as a public address.", (address) => {
+        expect(isPublicDiscoveryAddress(address)).toBe(true);
+    });
+
+    it("Never connects to a public name that resolves to a private address, and falls back to the cache.", async () => {
+        setDiscoveryAddressLookup(async () => ["93.184.216.34", "127.0.0.1"]);
+        expect(await fetchRemoteKeys("127.0.0.1.nip.io", "alice@rebind1.example")).toBeUndefined();
+        expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("Connects when the lookup fails or is too slow, leaving the request to fail on its own.", async () => {
+        mockFetch.mockResolvedValue(makeFetchResponse());
+        setDiscoveryAddressLookup(async () => {
+            throw new Error("ENOTFOUND");
+        });
+        await fetchRemoteKeys("mail.lookup1.example", "alice@lookup1.example");
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+
+        vi.useFakeTimers();
+        try {
+            setDiscoveryAddressLookup(() => new Promise<string[]>(() => undefined));
+            const pending = fetchRemoteKeys("mail.lookup2.example", "alice@lookup2.example");
+            await vi.advanceTimersByTimeAsync(3500);
+            await pending;
+        } finally {
+            vi.useRealTimers();
+        }
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("Resolves with the system lookup unless replaced.", async () => {
+        mockFetch.mockResolvedValue(makeFetchResponse());
+        setDiscoveryAddressLookup();
+        // `.invalid` never resolves, so the system lookup fails and the request goes ahead.
+        await fetchRemoteKeys("mail.nowhere.invalid", "alice@nowhere.invalid");
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("Asks dns.promises.lookup for every address of the host with the system lookup, and never connects when one is private.", async () => {
+        mockFetch.mockResolvedValue(makeFetchResponse());
+        const lookup = vi.spyOn(dns.promises, "lookup").mockResolvedValue([
+            { address: "93.184.216.34", family: 4 },
+            { address: "10.0.0.5", family: 4 },
+        ] as any);
+        setDiscoveryAddressLookup();
+        await fetchRemoteKeys("mail.systemlookup.example.com", "alice@systemlookup.example.com");
+        expect(lookup).toHaveBeenCalledWith("mail.systemlookup.example.com", { all: true });
+        expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("Caches at most MAX_DISCOVERED_KEYS keys of a response, for at most an hour whatever max-age says.", async () => {
+        const save = vi.spyOn(MemoryStore.prototype, "save");
+        const keys = Array.from({ length: MAX_DISCOVERED_KEYS + 20 }, () => ({ ...key }));
+        mockFetch.mockResolvedValueOnce(
+            makeFetchResponse({ json: vi.fn().mockResolvedValue({ ...makeDiscoveryResponse(), keys }), headerValues: { "cache-control": "max-age=99999999", etag: '"e"' } }),
+        );
+        await fetchRemoteKeys("mail.cache1.example", "alice@cache1.example");
+        expect(save).toHaveBeenCalledWith(expect.any(String), expect.anything(), 3600);
+        expect((save.mock.calls[0][1] as any).response.keys).toHaveLength(MAX_DISCOVERED_KEYS);
+
+        mockFetch.mockResolvedValueOnce(makeFetchResponse({ status: 304, ok: false, json: vi.fn(), headerValues: { "cache-control": "max-age=99999999" } }));
+        await fetchRemoteKeys("mail.cache1.example", "alice@cache1.example");
+        expect(save).toHaveBeenLastCalledWith(expect.any(String), expect.anything(), 3600);
+    });
+});
 
 describe("zBase32Encode() Tests", () => {
     it("Encodes a single zero byte to two 'y' characters (5 zero bits, then 3 zero bits padded to 5).", () => {
@@ -257,6 +360,13 @@ describe("fetchRemoteKeys() Tests", () => {
         expect(mockFetch).not.toHaveBeenCalled();
     });
 
+    it("Rejects a single-label host and a host under a private-network TLD, never calling fetch.", async () => {
+        for (const host of ["localhost", "kubernetes", "redis:8443", "metadata.google.internal", "api.svc.cluster.local", "printer.local", "app.localhost", "nas.lan"]) {
+            expect(await fetchRemoteKeys(host, "alice@private-host.example.com")).toBeUndefined();
+        }
+        expect(mockFetch).not.toHaveBeenCalled();
+    });
+
     it("Reads a real streamed response body and parses it once complete (the non-test-double path).", async () => {
         const body = makeDiscoveryResponse({ escrow: true });
         const encoded = new TextEncoder().encode(JSON.stringify(body));
@@ -341,6 +451,14 @@ describe("parseKeyDiscoveryResponse() Tests", () => {
             keys: [{ ...validKey, revokedAt: 3 }],
             escrow: true,
         });
+    });
+
+    it("Keeps the primary address of an alias response when it is one address, and drops anything else.", () => {
+        const base = { encryptPreference: { preferEncrypt: "mutual" }, keys: [validKey], escrow: false };
+        expect(parseKeyDiscoveryResponse({ ...base, address: "bob@primary.example" })!.address).toBe("bob@primary.example");
+        for (const address of ["a@b@primary.example", "no-at-sign", 5, `${"a".repeat(400)}@primary.example`, "bob@primary.example\r\nX: y"]) {
+            expect(parseKeyDiscoveryResponse({ ...base, address })).not.toHaveProperty("address");
+        }
     });
 
     it("Keeps a well-formed issuerCertificate and revocationReason, and treats null ones as absent.", () => {

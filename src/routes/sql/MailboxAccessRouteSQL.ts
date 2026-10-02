@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { Raw } from "typeorm";
 import { AuditLogEntrySQL, MailboxSQL } from "../../sql.js";
 import { BaseMailboxAccessRoute } from "../BaseMailboxAccessRoute.js";
+import { escapeLike, rawLike } from "./LikeUtils.js";
 
 export class MailboxAccessRouteSQL extends BaseMailboxAccessRoute<MailboxSQL> {
     protected mailboxClass: any = MailboxSQL;
@@ -14,7 +14,7 @@ export class MailboxAccessRouteSQL extends BaseMailboxAccessRoute<MailboxSQL> {
      * equality filter compares against the whole serialized string and never matches a single element.
      * Mirrors `MailIngestRouteSQL.aliasQueryValue()`'s identical LIKE-escape shape. */
     protected aliasQueryValue(address: string): any {
-        const escaped: string = address.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-        return Raw((alias) => `${alias} LIKE :pattern ESCAPE '\\'`, { pattern: `%"${escaped}"%` });
+        const escaped: string = escapeLike(address);
+        return rawLike(`%"${escaped}"%`);
     }
 }

@@ -6,6 +6,7 @@ import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { AuditAction, MIN_AUDIT_LOG_RETENTION_DAYS, RetentionPolicy } from "../models/types.js";
+import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 const { Config, Logger } = ObjectDecorators;
 const { Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorators;
 
@@ -13,6 +14,10 @@ const { Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorat
  * singleton-row convention as `BaseBrandingRoute.ts`'s `BRANDING_UID`/`BaseEncryptionPolicyRoute.ts`'s
  * `ENCRYPTION_POLICY_UID`. */
 const RETENTION_POLICY_UID = "retention-policy";
+
+/** The shortest `messageRetentionDays` may be set to: `RetentionEnforcementJob` purges every user's mail older than it, so a value of a day
+ * or two would destroy a deployment's mail with one request. Clearing it (`null`) is always allowed. */
+export const MIN_MESSAGE_RETENTION_DAYS: number = 30;
 
 /** The wire shape of `RetentionPolicy` - identical to the entity today, kept as its own type mirroring
  * `BaseEncryptionPolicyRoute.ts`'s `PublicEncryptionPolicy` so a future internal-only field doesn't leak
@@ -46,6 +51,13 @@ export abstract class BaseRetentionPolicyRoute<T extends RetentionPolicy> {
     /** Supplied by the Mongo/SQL concrete subclasses so `update()` can persist an `AuditLogEntry` without
      * depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
+
+    @Config("trusted_roles", ["admin"])
+    protected trustedRoles: string[] = ["admin"];
+
+    /** How old an elevated token may be before it has to be elevated again, in seconds (`mail:security:elevation_max_age_seconds`, 0 = no limit). */
+    @Config("mail:security:elevation_max_age_seconds", DEFAULT_ELEVATION_MAX_AGE_SECONDS)
+    protected elevationMaxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -120,6 +132,30 @@ export abstract class BaseRetentionPolicyRoute<T extends RetentionPolicy> {
         return patch;
     }
 
+    /**
+     * Refuses (400) a period set below its floor (`MIN_MESSAGE_RETENTION_DAYS`, `MIN_AUDIT_LOG_RETENTION_DAYS`). A floor only judges a value being set or
+     * changed: a period stored from before the floor existed (or from a deployment that chose it) is left as it is when a request round-trips it, so the
+     * other period can still be changed on its own. Clearing a period (`null`) always passes. Read from the stored row without creating it, so a refused
+     * request never materializes the singleton.
+     */
+    private assertFloors(patch: RetentionPolicyUpdate, stored: T | undefined): void {
+        if (typeof patch.messageRetentionDays === "number" && patch.messageRetentionDays !== stored?.messageRetentionDays && patch.messageRetentionDays < MIN_MESSAGE_RETENTION_DAYS) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                `'messageRetentionDays' cannot be set below ${MIN_MESSAGE_RETENTION_DAYS} days.`,
+            );
+        }
+        // Clearing the audit log period (`null`) keeps entries forever, so the floor only applies to a number.
+        if (typeof patch.auditLogRetentionDays === "number" && patch.auditLogRetentionDays !== stored?.auditLogRetentionDays && patch.auditLogRetentionDays < MIN_AUDIT_LOG_RETENTION_DAYS) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                `'auditLogRetentionDays' cannot be set below ${MIN_AUDIT_LOG_RETENTION_DAYS} days.`,
+            );
+        }
+    }
+
     /** Runs as `@Validate` middleware, strictly before `update()` is ever invoked - guarantees a rejected
      * (400) request never has the side effect of materializing the singleton row on what would otherwise
      * be its first write, same guarantee `BaseEncryptionPolicyRoute.validateUpdate()` preserves. */
@@ -132,14 +168,6 @@ export abstract class BaseRetentionPolicyRoute<T extends RetentionPolicy> {
             if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${field}' must be a positive integer number of days, or null for no automatic purge.`);
             }
-        }
-        // Clearing the audit log period (`null`) keeps entries forever, so the floor only applies to a number.
-        if (typeof obj?.auditLogRetentionDays === "number" && obj.auditLogRetentionDays < MIN_AUDIT_LOG_RETENTION_DAYS) {
-            throw new ApiError(
-                ApiErrors.INVALID_REQUEST,
-                400,
-                `'auditLogRetentionDays' cannot be set below ${MIN_AUDIT_LOG_RETENTION_DAYS} days.`,
-            );
         }
     }
 
@@ -157,9 +185,12 @@ export abstract class BaseRetentionPolicyRoute<T extends RetentionPolicy> {
     @Put()
     @Validate("validateUpdate")
     public async update(obj: RetentionPolicyUpdate | undefined, @AuthUser user?: JWTUser): Promise<PublicRetentionPolicy> {
+        // A shorter period purges every user's mail: a trusted role alone isn't enough, the token must be elevated.
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const patch: RetentionPolicyUpdate = this.extractPatch(obj);
 
         await this.init();
+        this.assertFloors(patch, await this.retentionPolicyRepo!.findOne(RETENTION_POLICY_UID, { ignoreACL: true }));
         const existing: T = await this.findOrCreate();
 
         const updated: T = await this.retentionPolicyRepo!.update(
@@ -171,7 +202,12 @@ export abstract class BaseRetentionPolicyRoute<T extends RetentionPolicy> {
             this._objectFactory!,
             this.auditLogClass,
             { config: this.config, user, logger: this.logger },
-            { action: AuditAction.RETENTION_POLICY_UPDATE, targetType: "RetentionPolicy", targetUid: RETENTION_POLICY_UID, details: patch },
+            {
+                action: AuditAction.RETENTION_POLICY_UPDATE,
+                targetType: "RetentionPolicy",
+                targetUid: RETENTION_POLICY_UID,
+                details: { ...patch, previous: this.toPublic(existing) },
+            },
         );
         return this.toPublic(updated);
     }

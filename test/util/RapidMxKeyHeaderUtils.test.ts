@@ -105,6 +105,13 @@ describe("parseRapidMxKeyHeader() Tests", () => {
         expect(parseRapidMxKeyHeader([header], "alice@example.com")).toBeUndefined();
     });
 
+    it("Accepts keydata a relay folded at the header line limit (unfolding leaves a space), storing it without the whitespace.", async () => {
+        const keydata = await makeCertBase64("alice@example.com");
+        const folded = `${keydata.slice(0, 100)} ${keydata.slice(100, 200)}  ${keydata.slice(200)}`;
+        const result = parseRapidMxKeyHeader([`addr=alice@example.com; type=x509; keydata=${folded}`], "alice@example.com");
+        expect(result?.publicKey.publicKey).toBe(keydata);
+    });
+
     it("Ignores the header when keydata contains characters outside the base64 alphabet.", async () => {
         const keydata = await makeCertBase64("alice@example.com");
         const header = `addr=alice@example.com; type=x509; keydata=${keydata}!!not-base64!!`;

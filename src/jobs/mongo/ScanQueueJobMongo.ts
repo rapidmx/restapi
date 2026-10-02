@@ -8,6 +8,7 @@ import {
     CalendarEventMongo,
     ContactMongo,
     CorrespondentMongo,
+    DataSubjectErasureRequestMongo,
     DomainMongo,
     FocusedInboxOverrideMongo,
     FolderMongo,
@@ -50,4 +51,5 @@ export class ScanQueueJobMongo extends ScanQueueJob<
     protected correspondentClass: any = CorrespondentMongo;
     protected domainClass: any = DomainMongo;
     protected keyVaultClass: any = KeyVaultMongo;
+    protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestMongo;
 }

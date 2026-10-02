@@ -16,23 +16,52 @@ import { topmostTrustedAuthenticationResults } from "./DkimOversignUtils.js";
  */
 
 /**
- * Splits a raw RFC 5322 message into its header block and body, at the first blank line. Decodes/encodes via
- * the `binary` (latin1) encoding so every byte round-trips exactly - headers are ASCII by spec, and this never
- * touches (or needs to understand) the body's own encoding.
+ * Splits a raw RFC 5322 message into its header block and body, at the first blank line - the first line break that directly
+ * follows another, whichever of CRLF, LF and a bare CR each is (so a header block ending `\n\r\n` ends where mailparser and the MTA
+ * end it too). Only the header block is decoded, via the `binary` (latin1) encoding so every byte round-trips exactly - headers
+ * are ASCII by spec - and the body is a view of `raw`, never copied or decoded, so this never touches (or needs to understand) the
+ * body's own encoding and costs time in the size of the headers rather than of the message.
  */
-function splitRawIntoHeaderAndBody(raw: Buffer): { headerText: string; bodyText: string } {
-    const text: string = raw.toString("binary");
-    const match: RegExpMatchArray | null = text.match(/\r\n\r\n|\n\n/);
-    if (!match || match.index === undefined) {
-        return { headerText: text, bodyText: "" };
+function splitRawIntoHeaderAndBody(raw: Buffer): { headerText: string; body: Buffer } {
+    let lineStart: number = 0;
+    // Where the line break that ended the last non-empty line began.
+    let previousBreak: number = 0;
+    for (let i = 0; i < raw.length; i++) {
+        const byte: number = raw[i];
+        if (byte !== 0x0a && byte !== 0x0d) {
+            continue;
+        }
+        const length: number = byte === 0x0d && raw[i + 1] === 0x0a ? 2 : 1;
+        // A blank line at the very start is skipped, not taken as an empty header block (a stray leading line break).
+        if (i === lineStart && i > 0) {
+            return { headerText: raw.toString("binary", 0, previousBreak), body: raw.subarray(i + length) };
+        }
+        previousBreak = i;
+        lineStart = i + length;
+        i += length - 1;
     }
-    return { headerText: text.slice(0, match.index), bodyText: text.slice(match.index + match[0].length) };
+    return { headerText: raw.toString("binary"), body: raw.subarray(raw.length) };
+}
+
+/** The unfolded value of `line` (one logical header line) when it is the header `lowerName`, tolerating whitespace before the
+ * colon the way `prepareRelayCopy()` and the originator checks do - or `undefined`. */
+function valueOfHeaderLine(line: string, lowerName: string): string | undefined {
+    const match: RegExpMatchArray | null = line.match(/^([^:\s]*)[ \t]*:/);
+    if (!match || match[1].toLowerCase() !== lowerName) {
+        return undefined;
+    }
+    return line
+        .slice(match[0].length)
+        .split(/\r\n[ \t]*/)
+        .join(" ")
+        .trim();
 }
 
 /** Unfolds a header block's physical lines into logical ones - a continuation line (starting with a space or
- * tab) is joined onto the previous logical header rather than treated as its own. */
-function splitLogicalHeaderLines(headerText: string): string[] {
-    const physicalLines: string[] = headerText.split(/\r\n|\n/);
+ * tab) is joined onto the previous logical header rather than treated as its own. With `bareCrBreaks` a bare CR
+ * is a line break too (as `lexLogicalHeaderLines()` treats it). */
+function splitLogicalHeaderLines(headerText: string, bareCrBreaks: boolean = false): string[] {
+    const physicalLines: string[] = headerText.split(bareCrBreaks ? /\r\n|\n|\r/ : /\r\n|\n/);
     const logical: string[] = [];
     for (const line of physicalLines) {
         if (/^[ \t]/.test(line) && logical.length > 0) {
@@ -52,14 +81,11 @@ function splitLogicalHeaderLines(headerText: string): string[] {
  */
 export function extractHeader(raw: Buffer, name: string): string | undefined {
     const { headerText } = splitRawIntoHeaderAndBody(raw);
-    const prefix: string = `${name.toLowerCase()}:`;
+    const lowerName: string = name.toLowerCase();
     for (const line of splitLogicalHeaderLines(headerText)) {
-        if (line.toLowerCase().startsWith(prefix)) {
-            return line
-                .slice(prefix.length)
-                .split(/\r\n[ \t]*/)
-                .join(" ")
-                .trim();
+        const value: string | undefined = valueOfHeaderLine(line, lowerName);
+        if (value !== undefined) {
+            return value;
         }
     }
     return undefined;
@@ -74,17 +100,12 @@ export function extractHeader(raw: Buffer, name: string): string | undefined {
  */
 export function extractHeaders(raw: Buffer, name: string): string[] {
     const { headerText } = splitRawIntoHeaderAndBody(raw);
-    const prefix: string = `${name.toLowerCase()}:`;
+    const lowerName: string = name.toLowerCase();
     const values: string[] = [];
     for (const line of splitLogicalHeaderLines(headerText)) {
-        if (line.toLowerCase().startsWith(prefix)) {
-            values.push(
-                line
-                    .slice(prefix.length)
-                    .split(/\r\n[ \t]*/)
-                    .join(" ")
-                    .trim(),
-            );
+        const value: string | undefined = valueOfHeaderLine(line, lowerName);
+        if (value !== undefined) {
+            values.push(value);
         }
     }
     return values;
@@ -278,6 +299,22 @@ function hasControlCharacter(value: string, tabCounts: boolean): boolean {
     return false;
 }
 
+/** A character a reader can't see or sees as something else in an address: any control (C1 included) or Unicode format
+ * character (zero-width, bidi overrides and isolates, soft hyphen), and a look-alike `@`. */
+const DECEPTIVE_ADDRESS_CHARACTER = /[\p{Cc}\p{Cf}＠﹫]/u;
+
+/** The bidi controls: they reorder how the text around them is displayed, so a display name holding one shows a reader
+ * something other than what it contains. (Other format characters, such as the joiner of an emoji sequence, are fine in one.) */
+function hasBidiControl(value: string): boolean {
+    for (const ch of value) {
+        const code: number = ch.codePointAt(0)!;
+        if (code === 0x061c || code === 0x200e || code === 0x200f || (code >= 0x202a && code <= 0x202e) || (code >= 0x2066 && code <= 0x2069)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /** Whether `address` is exactly one plain address (`local@domain`, nothing around it), at most 320 characters - safe to
  * hand to a composer as one recipient, e.g. a meeting attendee or organizer. */
 export function isPlainAddress(address: unknown): address is string {
@@ -285,6 +322,7 @@ export function isPlainAddress(address: unknown): address is string {
         typeof address === "string" &&
         address.length <= MAX_PLAIN_ADDRESS_LENGTH &&
         !hasControlCharacter(address, true) &&
+        !DECEPTIVE_ADDRESS_CHARACTER.test(address) &&
         PLAIN_ADDRESS_PATTERN.test(address)
     );
 }
@@ -297,7 +335,7 @@ export function isPlainAddress(address: unknown): address is string {
  * real address shows the reader an address the sender doesn't own.
  */
 export function safeDisplayName(name: unknown): string | undefined {
-    if (typeof name !== "string" || hasControlCharacter(name, false)) {
+    if (typeof name !== "string" || hasControlCharacter(name, false) || hasBidiControl(name)) {
         return undefined;
     }
     const clean: string = name.trim();
@@ -455,7 +493,7 @@ export interface RelayCopyOptions {
 }
 
 /** A header value safe to emit on one line: CR/LF (and other control characters) removed. */
-function singleLineHeaderValue(value: string): string {
+export function singleLineHeaderValue(value: string): string {
     return Array.from(value)
         .filter((ch) => {
             const code: number = ch.charCodeAt(0);
@@ -494,7 +532,7 @@ export function prepareRelayCopy(raw: Buffer, options: RelayCopyOptions): Buffer
     if (!fromVerified && containsCalendarContent(raw)) {
         return undefined;
     }
-    const { headerText, bodyText } = splitRawIntoHeaderAndBody(raw);
+    const { headerText, body } = splitRawIntoHeaderAndBody(raw);
     const lines: string[] = [];
     for (const line of headerText.split(/\r\n|\n|\r/)) {
         if (/^[ \t]/.test(line) && lines.length > 0) {
@@ -516,7 +554,7 @@ export function prepareRelayCopy(raw: Buffer, options: RelayCopyOptions): Buffer
     });
     const added: string[] = [];
     if (!fromVerified) {
-        const address: string = singleLineHeaderValue(options.rewriteFrom.address).replace(/[<>\s]/g, "");
+        const address: string = options.rewriteFrom.address.replace(/[^\x21-\x7E]|[<>]/g, "");
         const name: string | undefined = safeDisplayName(options.rewriteFrom.name);
         added.push(`From: ${name ? `${formatDisplayName(name)} ` : ""}<${address}>`);
         if (originalFrom.length > 0) {
@@ -527,7 +565,23 @@ export function prepareRelayCopy(raw: Buffer, options: RelayCopyOptions): Buffer
             }
         }
     }
-    return Buffer.from([...added, ...kept].join("\r\n") + "\r\n\r\n" + bodyText, "binary");
+    return Buffer.concat([Buffer.from([...added, ...kept].join("\r\n") + "\r\n\r\n", "binary"), body]);
+}
+
+/**
+ * One header line this server writes (`Name: value`) made safe to write out one byte per character, which keeps only the
+ * low byte of each character - so U+010D and U+010A would otherwise become CR and LF and start a new header (or the body).
+ * The name keeps only RFC 5322 field-name characters (the line is dropped when none are left); the value loses every
+ * control character, and a value that still has a non-ASCII character is written as one RFC 2047 encoded word.
+ */
+function safeNewHeaderLine(line: string): string | undefined {
+    const colon: number = line.indexOf(":");
+    const name: string = line.slice(0, colon).replace(/[^\x21-\x39\x3B-\x7E]/g, "");
+    if (name.length === 0) {
+        return undefined;
+    }
+    const value: string = singleLineHeaderValue(line.slice(colon + 1));
+    return `${name}:${/^[\x20-\x7E\t]*$/.test(value) ? value : ` =?UTF-8?B?${Buffer.from(value.trim(), "utf8").toString("base64")}?=`}`;
 }
 
 /**
@@ -542,22 +596,20 @@ function rebuildWithHeaders(
     newHeaders: string[],
     filterLine: (line: string) => boolean = () => true,
 ): Buffer {
-    const { headerText, bodyText } = splitRawIntoHeaderAndBody(raw);
-    const keptLines: string[] = splitLogicalHeaderLines(headerText).filter(filterLine);
-    const rebuilt: string = [...newHeaders, ...keptLines].join("\r\n") + "\r\n\r\n" + bodyText;
-    return Buffer.from(rebuilt, "binary");
+    const { headerText, body } = splitRawIntoHeaderAndBody(raw);
+    const keptLines: string[] = splitLogicalHeaderLines(headerText, true).filter(filterLine);
+    const rebuilt: string = [...newHeaders.map(safeNewHeaderLine).filter((line): line is string => line !== undefined), ...keptLines].join("\r\n") + "\r\n\r\n";
+    return Buffer.concat([Buffer.from(rebuilt, "binary"), body]);
 }
 
 /**
  * Produces a copy of `raw` with each of `headers` prepended as a new top-level header line - no existing
  * header is removed or modified (only addition is supported; see `TransportRuleUtils`'s `add_header`
- * action). `name`/`value` are defensively stripped of embedded CR/LF (an admin-controlled rule
- * configuration value ending up as a raw header value must not be able to inject an extra header line).
+ * action). `name`/`value` are made safe by `safeNewHeaderLine()` (an admin-controlled rule configuration
+ * value ending up as a raw header value must not be able to inject an extra header line, whatever its characters).
  */
 export function prependHeaders(raw: Buffer, headers: { name: string; value: string }[]): Buffer {
-    const newHeaders: string[] = headers.map(
-        ({ name, value }) => `${name.replace(/[\r\n]/g, "")}: ${value.replace(/[\r\n]/g, "")}`,
-    );
+    const newHeaders: string[] = headers.map(({ name, value }) => `${name}: ${value}`);
     return rebuildWithHeaders(raw, newHeaders);
 }
 
@@ -566,5 +618,9 @@ export function prependHeaders(raw: Buffer, headers: { name: string; value: stri
  * dropped, then `newHeaders` prepended. Shared low-level rebuild step for `rewriteHeadersForList()`.
  */
 export function rebuildDroppingReplyTo(raw: Buffer, newHeaders: string[]): Buffer {
-    return rebuildWithHeaders(raw, newHeaders, (line) => !line.toLowerCase().startsWith("reply-to:"));
+    return rebuildWithHeaders(raw, newHeaders, (line) => {
+        // The same name rule `prepareRelayCopy()` uses (whitespace before the colon allowed), and a bare CR a line break.
+        const name: string = (line.match(/^([^:\s]*)[ \t]*:/)?.[1] ?? "").toLowerCase();
+        return name !== "reply-to" && !name.startsWith("list-");
+    });
 }

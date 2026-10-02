@@ -161,13 +161,13 @@ describe("Route:KeyVaultMongo Tests", () => {
             expect(result.body).toEqual({ wrappedKeys: [], masterKeyWraps: [], masterKeyGeneration: 0 });
         });
 
-        it("A caller with a delegate READ grant (not owner) can read the vault.", async () => {
+        it("A caller with a delegate READ grant (not owner) cannot read the vault (403) - its wraps would open to an offline guess at the owner's password.", async () => {
             const mailbox = await createMailbox();
             const result = await request(server.getApplication())
                 .get(`${baseUrl}/${mailbox.uid}/keyvault`)
                 .set("Authorization", "jwt " + delegateToken);
 
-            expect(result.status).toBe(200);
+            expect(result.status).toBe(403);
         });
 
         it("A different, unrelated user cannot read the vault (403).", async () => {

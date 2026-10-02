@@ -3,15 +3,19 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { convert } from "html-to-text";
-import { ParsedMail, simpleParser } from "mailparser";
+import { AddressObject, ParsedMail, simpleParser } from "mailparser";
 import { TransportRule, TransportRuleAction, TransportRuleActionType, TransportRuleConditions } from "../models/types.js";
-import { stripPlusTag } from "./AddressUtils.js";
+import { addressDomainOf, stripPlusTag } from "./AddressUtils.js";
 import { isEncryptedBody } from "./SmimeUtils.js";
 
 /** The maximum length, in characters, of the plain-text body preview `buildTransportRuleContext()` derives -
  * mirrors `ScanPipeline`'s own `BODY_PREVIEW_MAX_LENGTH` constant (kept as a separate constant/parse rather
  * than shared - see the module doc comment below for why). */
 const BODY_PREVIEW_MAX_LENGTH = 500;
+
+/** The most of a message's plain-text body `bodyContains` looks at, in characters. Beyond it a rule cannot see - the limit that
+ * keeps matching cheap - which a sender can only use by sending a body longer than a mail server accepts in practice. */
+const BODY_TEXT_MAX_LENGTH = 1_000_000;
 
 /** The fields of an inbound SMTP transaction `matchesTransportRuleConditions()`/`evaluateTransportRules()` need to
  * evaluate a `TransportRule` against - built once per transaction by `buildTransportRuleContext()`, from a
@@ -23,6 +27,13 @@ export interface TransportRuleMatchContext {
     fromAddress: string;
     subject: string;
     bodyPreview: string;
+    /** The plain-text body `bodyContains` matches against - up to `BODY_TEXT_MAX_LENGTH` characters, so a rule cannot be evaded by
+     * padding the start of a message. Falls back to `bodyPreview` when absent. */
+    bodyText?: string;
+    /** The addresses of the From header, which a rule on the sender matches as well as the envelope sender `fromAddress`. */
+    headerFromAddresses?: string[];
+    /** The addresses of the To and Cc headers, which `recipientContains` matches as well as the envelope recipients. */
+    headerRecipientAddresses?: string[];
     /** The full envelope recipient list for this SMTP transaction (before any per-recipient resolution/
      * distribution-list expansion). */
     recipientAddresses: string[];
@@ -74,16 +85,19 @@ function containsAnyInList(haystackList: string[], needles?: string[]): boolean 
  * entries - same evaluation shape as `MailFilterUtils.matchesConditions()`.
  */
 export function matchesTransportRuleConditions(conditions: TransportRuleConditions, context: TransportRuleMatchContext): boolean {
-    if (conditions.fromContains && !containsAnyIgnoreCase(context.fromAddress, conditions.fromContains)) {
+    if (conditions.fromContains && !containsAnyInList([context.fromAddress, ...(context.headerFromAddresses ?? [])], conditions.fromContains)) {
         return false;
     }
     if (conditions.subjectContains && !containsAnyIgnoreCase(context.subject, conditions.subjectContains)) {
         return false;
     }
-    if (conditions.bodyContains && !containsAnyIgnoreCase(context.bodyPreview, conditions.bodyContains)) {
+    if (conditions.bodyContains && !containsAnyIgnoreCase(context.bodyText ?? context.bodyPreview, conditions.bodyContains)) {
         return false;
     }
-    if (conditions.recipientContains && !containsAnyInList(context.recipientAddresses, conditions.recipientContains)) {
+    if (
+        conditions.recipientContains &&
+        !containsAnyInList([...context.recipientAddresses, ...(context.headerRecipientAddresses ?? [])], conditions.recipientContains)
+    ) {
         return false;
     }
     if (conditions.anyRecipientExternal !== undefined && conditions.anyRecipientExternal !== context.anyRecipientExternal) {
@@ -181,14 +195,17 @@ export async function buildTransportRuleContext(
     // false-positive attachment match.
     const encrypted: boolean = isEncryptedBody(parsed);
 
-    const bodyPreview: string = encrypted
+    const bodyText: string = encrypted
         ? ""
         : ((typeof parsed.text === "string"
               ? parsed.text
               : typeof parsed.html === "string"
                 ? convert(parsed.html, { wordwrap: false })
                 : ""
-          )?.trim().slice(0, BODY_PREVIEW_MAX_LENGTH) ?? "");
+          )?.trim().slice(0, BODY_TEXT_MAX_LENGTH) ?? "");
+    const bodyPreview: string = bodyText.slice(0, BODY_PREVIEW_MAX_LENGTH);
+    const headerAddresses = (field: AddressObject | AddressObject[] | undefined): string[] =>
+        (Array.isArray(field) ? field : field ? [field] : []).flatMap((group) => group.value.map((entry) => entry.address).filter((address): address is string => !!address));
 
     const hasAttachment: boolean = !encrypted && (parsed.attachments ?? []).length > 0;
     const attachmentFilenames: string[] = encrypted
@@ -198,7 +215,7 @@ export async function buildTransportRuleContext(
     const anyRecipientExternal: boolean =
         domains.length > 0 &&
         envelopeTo.some((address) => {
-            const domain = address.split("@")[1]?.toLowerCase();
+            const domain = addressDomainOf(address);
             return !domain || !domains.includes(domain);
         });
 
@@ -210,6 +227,9 @@ export async function buildTransportRuleContext(
         fromAddress: envelopeFrom,
         subject: parsed.subject ?? "",
         bodyPreview,
+        bodyText,
+        headerFromAddresses: headerAddresses(parsed.from),
+        headerRecipientAddresses: [...headerAddresses(parsed.to), ...headerAddresses(parsed.cc)],
         recipientAddresses,
         anyRecipientExternal,
         hasAttachment,

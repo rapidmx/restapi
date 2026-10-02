@@ -5,7 +5,7 @@
 // Isolated unit tests for ScanPipeline - the injected SpamScanProvider/AvScanProvider are hand-built mocks;
 // `mailparser`'s `simpleParser` is exercised for real against small hand-built raw MIME messages (it's a
 // regular, already-installed dependency here, not an optional peer one worth mocking away).
-import { ScanPipeline, resolveDeliveryVerdict } from "../../src/scan/ScanPipeline.js";
+import { MAX_SCANNED_ATTACHMENTS, ScanPipeline, resolveDeliveryVerdict } from "../../src/scan/ScanPipeline.js";
 import { readSanitizerVersion, SANITIZER_VERSION } from "../../src/scan/HtmlSanitizer.js";
 import { AvVerdict, RecipientType, SpamVerdict } from "../../src/models/types.js";
 import { MAX_MESSAGE_RECIPIENTS } from "../../src/util/RecipientUtils.js";
@@ -211,10 +211,73 @@ describe("ScanPipeline Tests", () => {
         });
     });
 
+    describe("run() - disposition notification part", () => {
+        beforeEach(() => {
+            (pipeline as any).spamScanProvider = spamScanProvider;
+            (pipeline as any).avScanProvider = avScanProvider;
+        });
+
+        const withMdnPart = (topLevel: string): Buffer =>
+            Buffer.from(
+                [
+                    "From: Sender <sender@example.com>",
+                    "To: Recipient <recipient@example.com>",
+                    "Subject: Receipt",
+                    "MIME-Version: 1.0",
+                    `Content-Type: ${topLevel}; boundary="B"`,
+                    "",
+                    "--B",
+                    "Content-Type: text/plain",
+                    "",
+                    "Your message was read.",
+                    "",
+                    "--B",
+                    "Content-Type: message/disposition-notification",
+                    "",
+                    "Final-Recipient: rfc822; recipient@example.com",
+                    "Disposition: manual-action/MDN-sent-manually; displayed",
+                    "",
+                    "--B--",
+                    "",
+                ].join("\r\n"),
+            );
+
+        it("Reports the part of a real MDN (multipart/report; report-type=disposition-notification).", async () => {
+            const result = await pipeline.run(withMdnPart("multipart/report; report-type=disposition-notification"), makeEnvelope());
+
+            expect(result.dispositionNotificationPart).toContain("Final-Recipient: rfc822; recipient@example.com");
+        });
+
+        it("Does not report an MDN part attached to an ordinary message (a forwarded receipt, a ticket), so it is delivered rather than consumed.", async () => {
+            for (const topLevel of ["multipart/mixed", "multipart/report; report-type=delivery-status"]) {
+                const result = await pipeline.run(withMdnPart(topLevel), makeEnvelope());
+
+                expect(result.dispositionNotificationPart).toBeUndefined();
+            }
+        });
+    });
+
     describe("run() - AV severity combination", () => {
         beforeEach(() => {
             (pipeline as any).spamScanProvider = spamScanProvider;
             (pipeline as any).avScanProvider = avScanProvider;
+        });
+
+        it("Treats a message with more attachment parts than the cap as an AV error (quarantined), without scanning each part.", async () => {
+            const parts: string[] = [];
+            for (let i = 0; i < MAX_SCANNED_ATTACHMENTS + 1; i++) {
+                parts.push("--B", `Content-Type: application/octet-stream; name="f${i}.bin"`, `Content-Disposition: attachment; filename="f${i}.bin"`, "", "x", "");
+            }
+            const raw = Buffer.from(
+                ["From: a@example.com", "To: b@example.com", "Subject: many", "MIME-Version: 1.0", 'Content-Type: multipart/mixed; boundary="B"', "", ...parts, "--B--", ""].join("\r\n"),
+            );
+
+            const result = await pipeline.run(raw, makeEnvelope());
+
+            expect(result.av.verdict).toBe(AvVerdict.ERROR);
+            expect(result.attachments).toEqual([]);
+            expect(avScanProvider.scanBuffer).toHaveBeenCalledTimes(1);
+            expect(resolveDeliveryVerdict(result)).toBe("quarantine");
         });
 
         it("Picks the raw-message verdict when it is clean and no attachment is infected.", async () => {
@@ -391,6 +454,15 @@ describe("ScanPipeline Tests", () => {
         it("Gives nothing for a message with no HTML body or an S/MIME encrypted one.", async () => {
             expect(await pipeline.sanitizeRaw(makePlainRawMessage())).toBeUndefined();
             expect(await pipeline.sanitizeRaw(makeEncryptedRawMessage())).toBeUndefined();
+        });
+
+        it("Sanitizes stored HTML again with the current sanitizer, stamped, whatever an older one let through.", () => {
+            const html = pipeline.sanitizeStoredHtml('<p onclick="alert(1)">hi</p><script>alert(2)</script><img srcset="javascript:alert(3) 1x" src="https://example.com/a.png">');
+            expect(readSanitizerVersion(html)).toBe(SANITIZER_VERSION);
+            expect(html).toContain("hi");
+            expect(html).not.toContain("onclick");
+            expect(html).not.toContain("<script");
+            expect(html).not.toContain("javascript:");
         });
     });
 

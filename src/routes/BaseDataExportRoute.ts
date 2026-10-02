@@ -10,11 +10,16 @@ import { ApiErrorMessages, ApiErrors, HttpResponse, ObjectFactory, RepoUtils, Ro
 import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { exactInFilter } from "../util/EscrowUtils.js";
+import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, DataExportFormat, DataExportRequest, Mailbox } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
-const { Get, Param, Post, Query, Response, User: AuthUser } = RouteDecorators;
+const { Get, Param, Post, Query, RateLimit, Response, User: AuthUser } = RouteDecorators;
+
+/** `create()` is limited per user: each request makes `DataExportJob` build an archive of a whole mailbox. */
+const CREATE_MAX_ATTEMPTS: number = 10;
+const CREATE_WINDOW_SECONDS: number = 3600;
 
 const VALID_FORMATS: ReadonlySet<string> = new Set<DataExportFormat>(["json", "mbox"]);
 
@@ -47,7 +52,12 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
 
+    @Config("trusted_roles", ["admin"])
     protected trustedRoles: string[] = ["admin"];
+
+    /** How old an elevated token may be before it has to be elevated again, in seconds (`mail:security:elevation_max_age_seconds`, 0 = no limit). */
+    @Config("mail:security:elevation_max_age_seconds", DEFAULT_ELEVATION_MAX_AGE_SECONDS)
+    protected elevationMaxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -88,14 +98,25 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
         return request;
     }
 
-    /** `true` for a trusted admin, the caller who created the request, or the request's own target
+    /** Whether `user` is an administrator acting as one: a trusted role AND an elevated token. Reading or requesting another
+     * mailbox's export is an administrative action (a data-subject request), not something a trusted role alone allows. */
+    private isElevatedAdmin(user: JWTUser): boolean {
+        try {
+            assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /** `true` for an elevated admin, the caller who created the request, or the request's own target
      * mailbox's owner (an admin may have requested an export on an owner's behalf - the owner can still
      * see/download it themselves). */
     private async canView(request: T, user: JWTUser | undefined): Promise<boolean> {
         if (!user) {
             return false;
         }
-        if (UserUtils.hasRoles(user, this.trustedRoles) || request.requestedByUserUid === user.uid) {
+        if (this.isElevatedAdmin(user) || request.requestedByUserUid === user.uid) {
             return true;
         }
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(request.mailboxUid, { ignoreACL: true });
@@ -103,6 +124,7 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
     }
 
     @Post()
+    @RateLimit({ perUser: true, maxAttempts: CREATE_MAX_ATTEMPTS, windowSeconds: CREATE_WINDOW_SECONDS })
     public async create(body: { mailboxUid?: string; format: DataExportFormat }, @AuthUser user?: JWTUser): Promise<T> {
         await this.init();
         if (!user) {
@@ -120,6 +142,16 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
         if (!mailbox) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        // Exporting somebody else's mailbox is an administrative action: a trusted role alone isn't enough, the token must be elevated.
+        if (isTrusted && (mailbox as any).ownerUserUid !== user.uid) {
+            assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
+        }
+        // One export at a time per mailbox: each builds an archive of the whole mailbox.
+        for (const status of ["pending", "processing"]) {
+            if ((await this.requestRepo!.find({ mailboxUid, status } as any, { ignoreACL: true, limit: 1 })).length > 0) {
+                throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "An export of this mailbox is already in progress.");
+            }
         }
 
         const created: T = await this.requestRepo!.create(
@@ -152,7 +184,7 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
             return [];
         }
         const paging = { sort: "-dateCreated", limit, page };
-        if (UserUtils.hasRoles(user, this.trustedRoles)) {
+        if (this.isElevatedAdmin(user)) {
             return await this.requestRepo!.find(paging as any, { ignoreACL: true, limit, page });
         }
         // One query (`$or`) rather than two merged lists, so a page is a real page of the combined set.

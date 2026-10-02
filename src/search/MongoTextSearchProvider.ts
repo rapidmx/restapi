@@ -242,9 +242,10 @@ export class MongoTextSearchProvider implements SearchProvider {
         const projection: any = query.text ? { score: { $meta: "textScore" } } : {};
         const cursor = this.collection.find(filter, { projection });
         if (query.text) {
-            cursor.sort({ score: { $meta: "textScore" } });
+            // Ties are broken by the document's identity, so paging with `skip` can neither repeat nor skip a hit between pages.
+            cursor.sort({ score: { $meta: "textScore" }, entityType: 1, entityUid: 1 });
         } else {
-            cursor.sort({ dateForSort: -1 });
+            cursor.sort({ dateForSort: -1, entityType: 1, entityUid: 1 });
         }
         cursor.skip(skip).limit(limit + 1);
         const rows: (StoredDoc & { score?: number })[] = await cursor.toArray();
@@ -294,7 +295,7 @@ export class MongoTextSearchProvider implements SearchProvider {
 
         const rows: StoredDoc[] = await this.collection
             .find(filter, { projection: { entityType: 1, entityUid: 1 } })
-            .sort({ dateForSort: -1 })
+            .sort({ dateForSort: -1, entityType: 1, entityUid: 1 })
             .skip(skip)
             .limit(limit + 1)
             .toArray();

@@ -7,6 +7,7 @@ import {
     AttendeeResponseStatus,
     AttendeeRole,
     CalendarEvent,
+    CalendarEventStatus,
     EventVisibility,
     RecurrenceFrequency,
     RecurrenceRule,
@@ -433,22 +434,34 @@ function stripMailto(value: string): string {
     return value.replace(/^mailto:/i, "").trim();
 }
 
-function buildRrule(rule: RecurrenceRule): string {
-    const parts: string[] = [`FREQ=${rule.freq.toUpperCase()}`, `INTERVAL=${rule.interval}`];
-    if (rule.byDay && rule.byDay.length > 0) {
-        parts.push(`BYDAY=${rule.byDay.join(",")}`);
+/** The `STATUS` an event's status is written as: one of the three iCalendar knows, `CONFIRMED` for anything else. */
+function eventStatusText(status: unknown): string {
+    return status === CalendarEventStatus.TENTATIVE || status === CalendarEventStatus.CANCELLED ? String(status).toUpperCase() : "CONFIRMED";
+}
+
+/** `rule` as an `RRULE` value, built only from its checked parts (so nothing stored in it can add a line to the invitation), or
+ * `undefined` when it isn't a rule that can be written - the invitation then names the event alone. */
+function buildRrule(rule: RecurrenceRule): string | undefined {
+    const freq: string = String(rule.freq).toLowerCase();
+    const checked: CheckedRule | undefined = SUPPORTED_FREQUENCIES.includes(freq) ? checkRuleParts(rule) : undefined;
+    if (!checked) {
+        return undefined;
     }
-    if (rule.byMonthDay && rule.byMonthDay.length > 0) {
-        parts.push(`BYMONTHDAY=${rule.byMonthDay.join(",")}`);
+    const parts: string[] = [`FREQ=${freq.toUpperCase()}`, `INTERVAL=${checked.interval}`];
+    if (checked.byDay.length > 0) {
+        parts.push(`BYDAY=${formatByDay(checked.byDay).join(",")}`);
     }
-    if (rule.byMonth && rule.byMonth.length > 0) {
-        parts.push(`BYMONTH=${rule.byMonth.join(",")}`);
+    if (checked.byMonthDay.length > 0) {
+        parts.push(`BYMONTHDAY=${checked.byMonthDay.join(",")}`);
     }
-    if (rule.count !== undefined) {
-        parts.push(`COUNT=${rule.count}`);
+    if (checked.byMonth.length > 0) {
+        parts.push(`BYMONTH=${checked.byMonth.join(",")}`);
     }
-    if (rule.until !== undefined) {
-        parts.push(`UNTIL=${formatDateUtc(rule.until)}`);
+    if (checked.count !== undefined) {
+        parts.push(`COUNT=${checked.count}`);
+    }
+    if (rule.until !== undefined && rule.until !== null && !Number.isNaN(toDate(rule.until).getTime())) {
+        parts.push(`UNTIL=${formatDateUtc(toDate(rule.until))}`);
     }
     return parts.join(";");
 }
@@ -473,15 +486,91 @@ function parseUntil(value: string, tzid?: string): Date | undefined {
     return new Date(nextMidnightMs - 1);
 }
 
-function parseRrule(value: string, tzid?: string): RecurrenceRule {
+/** The largest `INTERVAL`, `COUNT` and per-part list length a rule is expanded with - an `RRULE` is attacker-chosen (a stored
+ * event or an inbound invitation), and each of these multiplies the work of expanding it. A rule over `MAX_RULE_INTERVAL` or
+ * `MAX_RULE_LIST` is invalid rather than cut down (cutting it would change what it means); a `COUNT` over `MAX_RULE_COUNT` (about 270
+ * years of a daily series) is the one part that is capped, because the walk is bounded by it. */
+const MAX_RULE_INTERVAL = 1_000_000;
+const MAX_RULE_COUNT = 100_000;
+const MAX_RULE_LIST = 366;
+
+/** An optional rule part that is an integer from `min` to `max` (`undefined`/`null`/`""` is "not given", and `fallback` is returned for it),
+ * or `NaN` when it was given and is not one. */
+function ruleInteger(value: unknown, min: number, max: number, fallback: number | undefined): number | undefined {
+    if (value === undefined || value === null || value === "") {
+        return fallback;
+    }
+    const parsed: number = typeof value === "string" || typeof value === "number" ? Number(value) : NaN;
+    return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : NaN;
+}
+
+/** The distinct integers of `values` that are `min`..`max` (and not 0), in order, or `undefined` when `values` is not a list of at most
+ * `MAX_RULE_LIST` of them. An empty or missing list is `[]`. */
+function distinctRuleIntegers(values: unknown, min: number, max: number): number[] | undefined {
+    if (values === undefined || values === null) {
+        return [];
+    }
+    if (!Array.isArray(values) || values.length > MAX_RULE_LIST) {
+        return undefined;
+    }
+    const result: Set<number> = new Set();
+    for (const value of values) {
+        const parsed: number = ruleInteger(value, min, max, NaN)!;
+        if (!Number.isInteger(parsed) || parsed === 0) {
+            return undefined;
+        }
+        result.add(parsed);
+    }
+    return [...result];
+}
+
+/** A rule whose parts have been checked: every value is one the rule can be expanded and written with. */
+interface CheckedRule {
+    interval: number;
+    count?: number;
+    byDay: ParsedByDay[];
+    byMonth: number[];
+    byMonthDay: number[];
+}
+
+/**
+ * Checks the `INTERVAL`, `COUNT` and `BYxxx` parts of `rule`, which may be any JSON a stored event holds. A part that is present but
+ * unusable (a `COUNT` of 0, a `BYMONTHDAY` of 32, a `BYDAY` that is not a weekday, a non-integer interval, ...) makes the whole rule
+ * invalid - `undefined` - rather than being dropped, since dropping a constraint widens the rule to occurrences it never described.
+ */
+function checkRuleParts(rule: Partial<RecurrenceRule>): CheckedRule | undefined {
+    const interval: number | undefined = ruleInteger(rule.interval, 1, MAX_RULE_INTERVAL, 1);
+    const count: number | undefined = ruleInteger(rule.count, 1, Number.MAX_SAFE_INTEGER, undefined);
+    const byDay: ParsedByDay[] | undefined = parseByDay(rule.byDay);
+    const byMonth: number[] | undefined = distinctRuleIntegers(rule.byMonth, 1, 12);
+    const byMonthDay: number[] | undefined = distinctRuleIntegers(rule.byMonthDay, -31, 31);
+    if (!interval || Number.isNaN(count) || !byDay || !byMonth || !byMonthDay) {
+        return undefined;
+    }
+    return { interval, ...(count !== undefined ? { count: Math.min(count, MAX_RULE_COUNT) } : {}), byDay, byMonth, byMonthDay };
+}
+
+/** The rule `value` (an `RRULE`) describes, or `undefined` when one of its parts is unusable (see `checkRuleParts()`) - the event then
+ * recurs not at all, rather than on occurrences its rule never listed. */
+function parseRrule(value: string, tzid?: string): RecurrenceRule | undefined {
     const params = parseParams(`;${value}`);
+    const checked: CheckedRule | undefined = checkRuleParts({
+        interval: params.INTERVAL as any,
+        count: params.COUNT as any,
+        byDay: params.BYDAY ? params.BYDAY.split(",") : undefined,
+        byMonthDay: params.BYMONTHDAY ? (params.BYMONTHDAY.split(",") as any) : undefined,
+        byMonth: params.BYMONTH ? (params.BYMONTH.split(",") as any) : undefined,
+    });
+    if (!checked) {
+        return undefined;
+    }
     return {
         freq: (params.FREQ ?? "").toLowerCase() as RecurrenceFrequency,
-        interval: params.INTERVAL ? parseInt(params.INTERVAL, 10) : 1,
-        byDay: params.BYDAY ? params.BYDAY.split(",") : undefined,
-        byMonthDay: params.BYMONTHDAY ? params.BYMONTHDAY.split(",").map(Number) : undefined,
-        byMonth: params.BYMONTH ? params.BYMONTH.split(",").map(Number) : undefined,
-        count: params.COUNT ? parseInt(params.COUNT, 10) : undefined,
+        interval: checked.interval,
+        byDay: params.BYDAY ? formatByDay(checked.byDay) : undefined,
+        byMonthDay: params.BYMONTHDAY ? checked.byMonthDay : undefined,
+        byMonth: params.BYMONTH ? checked.byMonth : undefined,
+        count: checked.count,
         until: params.UNTIL ? parseUntil(params.UNTIL, tzid) : undefined,
         exceptions: [],
     };
@@ -544,17 +633,22 @@ export function buildEventIcs(
     if (options?.changeRequest) {
         lines.push("X-RAPIDMX-CHANGE-REQUEST:TRUE");
     }
-    lines.push(`SEQUENCE:${event.sequence}`);
-    lines.push(`STATUS:${method === "CANCEL" ? "CANCELLED" : event.status.toUpperCase()}`);
+    lines.push(`SEQUENCE:${Number.isSafeInteger(event.sequence) && event.sequence >= 0 ? event.sequence : 0}`);
+    lines.push(`STATUS:${method === "CANCEL" ? "CANCELLED" : eventStatusText(event.status)}`);
     const organizerCn = event.organizer.displayName ? `;CN=${quoteParamValue(event.organizer.displayName)}` : "";
     lines.push(`ORGANIZER${organizerCn}:mailto:${stripControlChars(event.organizer.address)}`);
 
     if (event.recurrenceId) {
         lines.push(`RECURRENCE-ID:${formatDateUtc(event.recurrenceId)}`);
     } else if (event.recurrenceRule) {
-        lines.push(`RRULE:${buildRrule(event.recurrenceRule)}`);
-        for (const exception of event.recurrenceRule.exceptions ?? []) {
-            lines.push(`EXDATE:${formatDateUtc(exception)}`);
+        const rrule: string | undefined = buildRrule(event.recurrenceRule);
+        if (rrule) {
+            lines.push(`RRULE:${rrule}`);
+            for (const exception of Array.isArray(event.recurrenceRule.exceptions) ? event.recurrenceRule.exceptions : []) {
+                if (!Number.isNaN(toDate(exception).getTime())) {
+                    lines.push(`EXDATE:${formatDateUtc(toDate(exception))}`);
+                }
+            }
         }
     }
 
@@ -829,6 +923,9 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const MAX_PERIODS = 50_000;
 /** Safety-net cap on the number of occurrences a single `expandOccurrences()` call will return. */
 const MAX_OCCURRENCES = 500;
+/** Safety-net budget for one `expandOccurrences()` call: the sum, over every period walked, of what a period costs (one plus
+ * the entries in the rule's `BYxxx` parts). A rule over it is reported truncated rather than walked on. */
+const MAX_EXPANSION_WORK = 2_000_000;
 
 const BYDAY_TO_WEEKDAY: Record<string, number> = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
 
@@ -865,16 +962,38 @@ interface ParsedByDay {
     ordinal?: number;
 }
 
-function parseByDay(byDay: string[] | undefined): ParsedByDay[] {
+/** The weekday entries of `byDay` (`MO`, `2TU`, `-1FR`, ...), de-duplicated, or `undefined` when it is not a list of at most `MAX_RULE_LIST`
+ * of them. A missing list is `[]`. */
+function parseByDay(byDay: unknown): ParsedByDay[] | undefined {
+    if (byDay === undefined || byDay === null) {
+        return [];
+    }
+    if (!Array.isArray(byDay) || byDay.length > MAX_RULE_LIST) {
+        return undefined;
+    }
     const result: ParsedByDay[] = [];
-    for (const entry of byDay ?? []) {
-        const match = /^([+-]?\d{1,2})?(SU|MO|TU|WE|TH|FR|SA)$/i.exec(String(entry).trim());
-        if (match) {
-            const ordinal = match[1] !== undefined ? parseInt(match[1], 10) : undefined;
-            result.push({ weekday: BYDAY_TO_WEEKDAY[match[2].toUpperCase()], ordinal: ordinal === 0 ? undefined : ordinal });
+    const seen: Set<string> = new Set();
+    for (const entry of byDay) {
+        const match = /^([+-]?\d{1,2})?(SU|MO|TU|WE|TH|FR|SA)$/i.exec(typeof entry === "string" ? entry.trim() : "");
+        if (!match) {
+            return undefined;
+        }
+        const ordinal = match[1] !== undefined ? parseInt(match[1], 10) : undefined;
+        const parsed: ParsedByDay = { weekday: BYDAY_TO_WEEKDAY[match[2].toUpperCase()], ordinal: ordinal === 0 ? undefined : ordinal };
+        const key: string = `${parsed.weekday}:${parsed.ordinal ?? ""}`;
+        if (!seen.has(key)) {
+            seen.add(key);
+            result.push(parsed);
         }
     }
     return result;
+}
+
+const WEEKDAY_TO_BYDAY: string[] = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
+
+/** `byDay` written as `RRULE` `BYDAY` entries. */
+function formatByDay(byDay: ParsedByDay[]): string[] {
+    return byDay.map((entry) => `${entry.ordinal ?? ""}${WEEKDAY_TO_BYDAY[entry.weekday]}`);
 }
 
 /** Every day in `[firstDay, lastDay]` matching `byDay`, honoring ordinals relative to that range. */
@@ -1005,12 +1124,22 @@ function expandOccurrencesInternal(
     if (!SUPPORTED_FREQUENCIES.includes(freq)) {
         return [];
     }
-    const interval: number = Number(rule.interval) >= 1 ? Math.floor(Number(rule.interval)) : 1;
-    const count: number | undefined = rule.count !== undefined && rule.count !== null ? Number(rule.count) : undefined;
+    // A stored rule isn't necessarily one `parseRrule()` made, so every part is checked here too: a rule is walked period by
+    // period, and each part below multiplies what a period costs. A rule with an unusable part describes no series we can
+    // walk, so it expands to nothing - and says so, so that nobody reads that as "free" (see `OccurrenceExpansion.truncated`).
+    const checked: CheckedRule | undefined = checkRuleParts(rule);
+    if (!checked) {
+        info.truncated = true;
+        return [];
+    }
+    const { interval, count, byDay, byMonth, byMonthDay } = checked;
     const untilMs: number | undefined = rule.until !== undefined && rule.until !== null ? toDate(rule.until).getTime() : undefined;
-    const byDay: ParsedByDay[] = parseByDay(rule.byDay);
-    const byMonth: number[] = (rule.byMonth ?? []).map(Number);
-    const byMonthDay: number[] = (rule.byMonthDay ?? []).map(Number);
+    const byDayWeekdays: Set<number> = new Set(byDay.map((entry) => entry.weekday));
+    const byMonthSet: Set<number> = new Set(byMonth);
+    const byMonthDaySet: Set<number> = new Set(byMonthDay);
+    // What one walked period costs at most, and the total a single expansion may spend before it gives up (truncated).
+    const periodCost: number = 1 + byDay.length + byMonth.length + byMonthDay.length;
+    let workLeft: number = MAX_EXPANSION_WORK;
 
     const zone: string = (!event.allDay && resolveTimeZone(event.timezone)) || "UTC";
     const formatter: Intl.DateTimeFormat | undefined = zone === "UTC" ? undefined : getZoneFormatter(zone);
@@ -1073,8 +1202,8 @@ function expandOccurrencesInternal(
                 const day = startDay + k * interval;
                 const { year, month, day: dom } = dayNumberToDate(day);
                 const dim = daysInMonth(year, month);
-                const matchesMonthDay = byMonthDay.length === 0 || byMonthDay.some((value) => (value < 0 ? dim + 1 + value : value) === dom);
-                const matchesWeekday = byDay.length === 0 || byDay.some((entry) => entry.weekday === weekdayOf(day));
+                const matchesMonthDay = byMonthDay.length === 0 || byMonthDaySet.has(dom) || byMonthDaySet.has(dom - dim - 1);
+                const matchesWeekday = byDay.length === 0 || byDayWeekdays.has(weekdayOf(day));
                 days = matchesMonthDay && matchesWeekday ? [day] : [];
                 break;
             }
@@ -1106,7 +1235,7 @@ function expandOccurrencesInternal(
         }
         // BYMONTH limits DAILY/WEEKLY/MONTHLY periods (YEARLY is already expanded by it above).
         if (byMonth.length > 0 && freq !== RecurrenceFrequency.YEARLY) {
-            days = days.filter((day) => byMonth.includes(dayNumberToDate(day).month));
+            days = days.filter((day) => byMonthSet.has(dayNumberToDate(day).month));
         }
         return days.sort((a, b) => a - b);
     };
@@ -1144,6 +1273,11 @@ function expandOccurrencesInternal(
     for (; k < firstPeriod + MAX_PERIODS; k++) {
         if (periodFirstDay(k) > lastRelevantDay) {
             break;
+        }
+        workLeft -= periodCost;
+        if (workLeft < 0) {
+            info.truncated = true;
+            return occurrences;
         }
         for (const day of periodDays(k)) {
             if (day < startDay) {

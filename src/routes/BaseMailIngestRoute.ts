@@ -18,7 +18,7 @@ import {
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import type { MailTransport } from "../transport/MailTransport.js";
-import { sendOrThrow } from "../transport/TransportResultUtils.js";
+import { sendOrThrow, TransportRejectedError, transportFailuresOf } from "../transport/TransportResultUtils.js";
 import { DistributionList, IngestQueueEntry, IngestStatus, Mailbox, QuarantineReason, TransportRule } from "../models/types.js";
 import { normalizeAddress, stripPlusTag } from "../util/AddressUtils.js";
 import { rewriteHeadersForList } from "../util/DistributionListUtils.js";
@@ -31,6 +31,8 @@ import {
 } from "../util/DeliveryFailureNoticeUtils.js";
 import { extractHeader, prepareRelayCopy, prependHeaders, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
+import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
+import { nameBasedUuid } from "../util/UuidUtils.js";
 import { buildTransportRuleContext, evaluateTransportRules } from "../util/TransportRuleUtils.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 const { Description, Summary } = DocDecorators;
@@ -472,6 +474,13 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         const evaluation = evaluateTransportRules(rules, context);
 
         if (evaluation.reject) {
+            // The message was already accepted, so the notice is a bounce after the fact: `envelopeFrom` is whatever the sender claimed, and a
+            // notice to a forged one is backscatter from this domain at a stranger. It is only sent to a sender whose own DKIM signature verified.
+            const verified: string | undefined = verifiedFromAddress(raw, this.trustedAuthservId);
+            if (!verified || normalizeAddress(verified) !== normalizeAddress(envelopeFrom)) {
+                this.logger?.warn(`MailIngestRoute: not sending a transport-rule rejection notice to '${envelopeFrom}' - the sender isn't verified.`);
+                return { reject: true, raw, envelopeTo };
+            }
             try {
                 // A null/empty envelope-from is the standard SMTP convention for a bounce/rejection notice
                 // (prevents a bounce-loop if this notice itself were somehow rejected); `postmaster@<domain>`
@@ -659,7 +668,16 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
 
         // Evaluated once for the whole transaction, before any per-recipient resolution/fan-out below - see
         // `applyTransportRules()`'s own doc comment for why this must happen here rather than per-recipient.
-        const transportRuleOutcome = await this.applyTransportRules(raw, envelopeFrom, envelopeTo);
+        // A rule set that can't be evaluated (a stored rule that isn't the shape evaluation reads) must not stop every inbound message: it is
+        // logged as an error and the message is delivered as it came.
+        let transportRuleOutcome: { reject: boolean; raw: Buffer; envelopeTo: string[]; quarantineReason?: QuarantineReason };
+        const received: Buffer = raw;
+        try {
+            transportRuleOutcome = await this.applyTransportRules(raw, envelopeFrom, envelopeTo);
+        } catch (err: any) {
+            this.logger?.error(`MailIngestRoute: could not evaluate the transport rules, delivering without them: ${err?.message}`);
+            transportRuleOutcome = { reject: false, raw: received, envelopeTo };
+        }
         if (transportRuleOutcome.reject) {
             const results = envelopeTo.map((rcpt) => ({ rcpt: normalizeAddress(rcpt), queued: false }));
             res.status(202).json({ results });
@@ -682,6 +700,17 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         // blob (a full copy of `raw`) per direct recipient - e.g. a 20MB attachment CC'd to 50 internal
         // mailboxes wrote ~1GB for one logical message instead of one 20MB blob.
         let directRawBlobKey: string | undefined;
+        // What identifies this transaction when the MTA retries it after a failure part-way: the message, the sender and the recipients - so
+        // each recipient's queue entry (and the blob they share) is made once, however many times the same transaction arrives.
+        const transactionKey: string = crypto
+            .createHash("sha256")
+            .update(raw)
+            .update(`${String.fromCharCode(0)}${envelopeFrom}${String.fromCharCode(0)}${envelopeTo.join(",")}`)
+            .digest("hex");
+        // The external members a relay failed for (temporarily), and how many relays were accepted: a relay that already went out can't
+        // be undone, and the MTA's retry would send it again to every member, so a transaction that relayed anything is not retried.
+        const failedRelays: string[] = [];
+        let relayed: number = 0;
         for (const rcpt of envelopeTo) {
             const address: string = normalizeAddress(rcpt);
             // Exact mailbox match, then exact `DistributionList` match, THEN the plus-tag fallback - in that
@@ -698,20 +727,17 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
 
             if (mailbox) {
                 if (!directRawBlobKey) {
-                    directRawBlobKey = `ingest/${crypto.randomUUID()}`;
+                    directRawBlobKey = `ingest/${nameBasedUuid(`raw:${transactionKey}`)}`;
                     await this.blobStore.put(directRawBlobKey, raw, { contentType: "message/rfc822" });
                 }
-                await this.ingestQueueRepo!.create(
-                    new this.ingestQueueClass({
-                        mailboxUid: mailbox.uid,
-                        envelopeFrom,
-                        envelopeTo: [address],
-                        rawBlobKey: directRawBlobKey,
-                        status: IngestStatus.PENDING,
-                        quarantineReason,
-                    }),
-                    { ignoreACL: true },
-                );
+                await this.queueIngestEntry(transactionKey, {
+                    mailboxUid: mailbox.uid,
+                    envelopeFrom,
+                    envelopeTo: [address],
+                    rawBlobKey: directRawBlobKey,
+                    status: IngestStatus.PENDING,
+                    quarantineReason,
+                });
                 results.push({ rcpt: address, queued: true });
                 continue;
             }
@@ -764,21 +790,18 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             // shared by every internal member's `IngestQueueEntry` and every external relay - not rebuilt or
             // re-stored per recipient.
             const listRaw: Buffer = rewriteHeadersForList(raw, list);
-            const rawBlobKey: string = `ingest/${crypto.randomUUID()}`;
+            const rawBlobKey: string = `ingest/${nameBasedUuid(`list-raw:${transactionKey}:${list.uid}`)}`;
             await this.blobStore.put(rawBlobKey, listRaw, { contentType: "message/rfc822" });
 
             for (const member of mailboxes) {
-                await this.ingestQueueRepo!.create(
-                    new this.ingestQueueClass({
-                        mailboxUid: member.uid,
-                        envelopeFrom,
-                        envelopeTo: [address],
-                        rawBlobKey,
-                        status: IngestStatus.PENDING,
-                        quarantineReason,
-                    }),
-                    { ignoreACL: true },
-                );
+                await this.queueIngestEntry(transactionKey, {
+                    mailboxUid: member.uid,
+                    envelopeFrom,
+                    envelopeTo: [address],
+                    rawBlobKey,
+                    status: IngestStatus.PENDING,
+                    quarantineReason,
+                });
             }
 
             // External members get a copy the MTA signs as this server's domain, so it must not launder a spoofed message
@@ -803,9 +826,16 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                         envelopeFrom: list.primarySmtpAddress,
                         envelopeTo: [external],
                     });
+                    relayed++;
                 } catch (err: any) {
+                    // A refusal no retry can change (an SMTP 5xx for that member) is final: the member is skipped, and the MTA isn't made to retry.
+                    const failures = err instanceof TransportRejectedError ? transportFailuresOf(err.result, [external]) : [];
+                    const permanent: boolean = failures.length > 0 && failures.every((failure) => failure.temporary === false);
+                    if (!permanent) {
+                        failedRelays.push(external);
+                    }
                     this.logger?.warn(
-                        `MailIngestRoute: failed to relay distribution list message to external member '${external}': ${err.message}`,
+                        `MailIngestRoute: failed to relay distribution list message to external member '${external}'${permanent ? " (permanent)" : ""}: ${err.message}`,
                     );
                 }
             }
@@ -813,8 +843,34 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             results.push({ rcpt: address, queued: mailboxes.length > 0 || (!!externalRaw && externalAddresses.length > 0) });
         }
 
+        // A relay that failed is not a delivered message: answering 202 would have the MTA drop it. Everything else of the transaction is queued by
+        // now, and queues the same entries - not new ones - when the MTA retries it. Not when other external members were already relayed:
+        // the retry would send the list's message to each of them again, so the members that failed are given up on (logged) instead.
+        if (failedRelays.length > 0 && relayed === 0) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 503, `Could not relay to ${failedRelays.length} external list member(s). Try again.`);
+        }
+
         res.status(202).json({ results });
         return res;
+    }
+
+    /**
+     * Stages one `IngestQueueEntry`, once: its uid is derived from the transaction (`transactionKey`), the mailbox and the recipient address, so a
+     * retry of a transaction that failed part-way finds the entries it already made instead of making them again.
+     */
+    private async queueIngestEntry(transactionKey: string, fields: Record<string, unknown> & { mailboxUid: string; envelopeTo: string[] }): Promise<void> {
+        const uid: string = nameBasedUuid(`ingest-entry:${transactionKey}:${fields.mailboxUid}:${fields.envelopeTo[0]}`);
+        if (await this.ingestQueueRepo!.findOne(uid, { ignoreACL: true, includeDeleted: true })) {
+            return;
+        }
+        try {
+            await this.ingestQueueRepo!.create(new this.ingestQueueClass({ uid, ...fields }), { ignoreACL: true });
+        } catch (err: any) {
+            // A concurrent retry made it between the lookup and here.
+            if (!isDuplicateKeyError(err)) {
+                throw err;
+            }
+        }
     }
 }
 

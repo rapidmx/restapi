@@ -574,6 +574,96 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
         });
     });
 
+
+    describe("secret settings and integrity hashes", () => {
+        const SECRET_MANIFEST = {
+            apiVersion: PLUGIN_API_VERSION,
+            displayName: "Secretive",
+            settings: [
+                { key: "mail:x:api_key", label: "API key", type: "string" },
+                { key: "mail:x:note", label: "Note", type: "string" },
+            ],
+        };
+
+        it("never returns the value of a secret-named setting, and keeps the stored one when the placeholder is sent back", async () => {
+            publishFakePackage("@rapidmx/secretive", "1.0.0", { plugin: SECRET_MANIFEST });
+            const added = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/secretive" });
+            expect(added.status).toBe(200);
+            const uid: string = added.body.plugin.uid;
+            const put = (settings: any) => asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${uid}`)).send({ settings });
+            const storedKey = async () => (await ctx.rows()).find((row) => row.uid === uid).settings["mail:x:api_key"];
+
+            // A placeholder for a secret that was never saved leaves it unset.
+            const placeholder = await put({ "mail:x:api_key": { secret: true }, "mail:x:note": "hi" });
+            expect(placeholder.status).toBe(200);
+            expect(placeholder.body.settings).toEqual({ "mail:x:note": "hi" });
+
+            const saved = await put({ "mail:x:api_key": "s3cr3t", "mail:x:note": "hi" });
+            expect(saved.status).toBe(200);
+            expect(saved.body.settings).toEqual({ "mail:x:api_key": { secret: true }, "mail:x:note": "hi" });
+            expect(await storedKey()).toBe("s3cr3t");
+            const list = await asAdmin(request(ctx.app()).get(ctx.baseUrl));
+            expect(JSON.stringify(list.body)).not.toContain("s3cr3t");
+            expect(list.body[0].settings["mail:x:api_key"]).toEqual({ secret: true });
+
+            // The form sends back what it was given for a secret it left alone.
+            expect((await put({ "mail:x:api_key": { secret: true }, "mail:x:note": "changed" })).status).toBe(200);
+            expect(await storedKey()).toBe("s3cr3t");
+            // A new value replaces it, and null clears it.
+            expect((await put({ "mail:x:api_key": "other", "mail:x:note": "changed" })).status).toBe(200);
+            expect(await storedKey()).toBe("other");
+            const cleared = await put({ "mail:x:api_key": null, "mail:x:note": "changed" });
+            expect(cleared.status).toBe(200);
+            expect(cleared.body.settings["mail:x:api_key"]).toBeUndefined();
+            expect(await storedKey()).toBeUndefined();
+        });
+
+        it("refuses a manifest that declares a setting in the server's own configuration, and a saved setting named in it, whichever way the namespace is spelled", async () => {
+            const PROTECTED_MANIFEST = {
+                apiVersion: PLUGIN_API_VERSION,
+                displayName: "Overreaching",
+                settings: [
+                    { key: "mail:security:trusted_authserv_id", label: "Trusted authserv-id", type: "string" },
+                    { key: "mail:x:fine", label: "Fine", type: "string" },
+                ],
+            };
+            publishFakePackage("@rapidmx/overreaching", "1.0.0", { plugin: PROTECTED_MANIFEST });
+            const refusedManifest = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/overreaching" });
+            expect(refusedManifest.status).toBe(400);
+            expect(refusedManifest.body.message).toMatch(/server's own configuration/);
+            expect(await ctx.rows()).toHaveLength(0);
+
+            publishFakePackage("@rapidmx/modest", "1.0.0", {
+                plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "Modest", settings: [{ key: "mail:x:fine", label: "Fine", type: "string" }] },
+            });
+            const added = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/modest" });
+            expect(added.status).toBe(200);
+            const put = (settings: any) => asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${added.body.plugin.uid}`)).send({ settings });
+            for (const key of ["mail:security:trusted_authserv_id", "mail__escrow__enabled", "trusted_roles", "MAIL:Transport:Ingest:Secret"]) {
+                const refused = await put({ [key]: "x" });
+                expect(refused.status).toBe(400);
+                expect(refused.body.message).toMatch(/server's own configuration/);
+            }
+            expect((await ctx.rows())[0].settings["trusted_roles"]).toBeUndefined();
+            // A key the manifest doesn't declare is no setting of the plugin either.
+            const undeclared = await put({ "mail:x:other": "x" });
+            expect(undeclared.status).toBe(400);
+            expect((await put({ "mail:x:fine": "ok" })).status).toBe(200);
+        });
+
+        it("refuses to add, or move to, a version the registry published without an integrity hash", async () => {
+            publishFakePackage("@rapidmx/noint", "1.0.0", { plugin: EAS_MANIFEST }, { dist: {} });
+            expect((await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/noint" })).status).toBe(400);
+            expect(await ctx.rows()).toHaveLength(0);
+
+            const created = await addEas("1.0.0");
+            publishFakePackage("@rapidmx/activesync", "1.2.0", { plugin: EAS_MANIFEST }, { dist: {} });
+            const upgrade = await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${created.uid}`)).send({ packageVersion: "1.2.0" });
+            expect(upgrade.status).toBe(400);
+            expect((await ctx.rows()).find((row) => row.uid === created.uid).packageVersion).toBe("1.0.0");
+        });
+    });
+
     describe("PUT /:id", () => {
         it("disables a plugin and announces the new state", async () => {
             const created = await addEas();
@@ -618,12 +708,15 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect(result.body.settings).toEqual({ "mail:eas:sync_window_size": 50 });
         });
 
-        it("clears the recorded integrity when the new version has none", async () => {
+        it("refuses a new version that has no integrity hash, keeping the installed one", async () => {
             publishFakePackage("@rapidmx/activesync", "1.2.0", { plugin: EAS_MANIFEST }, { dist: {} });
             const created = await addEas("1.0.0");
             const result = await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${created.uid}`)).send({ packageVersion: "1.2.0" });
-            expect(result.status).toBe(200);
-            expect(result.body.integrity ?? undefined).toBeUndefined();
+            expect(result.status).toBe(400);
+            expect(result.body.message).toMatch(/no integrity hash/);
+            const [row] = await ctx.rows();
+            expect(row.packageVersion).toBe("1.0.0");
+            expect(row.integrity).toBe("sha512-@rapidmx/activesync@1.0.0");
         });
 
         it("returns 404 for an unknown plugin or version", async () => {
@@ -965,7 +1058,7 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             it("undoes the dependencies it installed, revived and enabled, then announces the result", async () => {
                 const eas = await addEas("1.1.0");
                 expect((await put(eas.uid, { enabled: false })).status).toBe(200);
-                publishFakePackage("@rapidmx/mapi-plugin", "1.0.0", { plugin: MAPI_MANIFEST }, { dist: {} });
+                publishFakePackage("@rapidmx/mapi-plugin", "1.0.0", { plugin: MAPI_MANIFEST });
                 const oldMapi = (await add("@rapidmx/mapi-plugin", "1.0.0")).body.plugin;
                 expect((await asAdmin(request(ctx.app()).delete(`${ctx.baseUrl}/${oldMapi.uid}`))).status).toBe(204);
                 const announced: number = publishedHashes.length;
@@ -978,8 +1071,8 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
                 const rows: Record<string, any> = Object.fromEntries((await ctx.rows()).map((row) => [row.name, row]));
                 expect(rows["@rapidmx/activesync"].enabled).toBe(false);
                 expect(rows["@rapidmx/mapi-plugin"]).toEqual(expect.objectContaining({ uid: oldMapi.uid, removed: true, enabled: false, packageVersion: "1.0.0" }));
-                // The revival recorded 1.3.0's integrity; 1.0.0 had none, so undoing it clears it again.
-                expect(rows["@rapidmx/mapi-plugin"].integrity ?? undefined).toBeUndefined();
+                // The revival recorded 1.3.0's integrity; undoing it puts 1.0.0's back.
+                expect(rows["@rapidmx/mapi-plugin"].integrity).toBe("sha512-@rapidmx/mapi-plugin@1.0.0");
                 expect(rows["@rapidmx/autodiscover-plugin"].packageVersion).toBe("0.9.0");
                 expect(publishedHashes).toHaveLength(announced + 1);
                 expect(publishedHashes[publishedHashes.length - 1]).toBe(computePluginStateHash(Object.values(rows)));
@@ -1095,6 +1188,50 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect(result.status).toBe(200);
             expect(result.body.hash).toBe(computePluginStateHash([created]));
             expect(result.body.instances.map((i: any) => i.instance)).toEqual(["a", "b"]);
+        });
+    });
+
+
+    describe("round 3: elevation and manifest secrets (R2-05, R2-06, R2-14)", () => {
+        it("managing plugins takes an elevated administrator, listing needs only the trusted role", async () => {
+            const added = await addEas();
+            const plain: any = { uid: uuid.v4(), roles: ["admin"] };
+            const plainToken = JWTUtils.createTokenSync(ctx.config.get("auth"), plain);
+            const asPlain = (req: any) => req.set("Authorization", "jwt " + plainToken);
+            expect((await asPlain(request(ctx.app()).get(ctx.baseUrl))).status).toBe(200);
+            expect((await asPlain(request(ctx.app()).get(`${ctx.baseUrl}/plan?name=%40rapidmx%2Factivesync`))).status).toBe(403);
+            expect((await asPlain(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/activesync" })).status).toBe(403);
+            expect((await asPlain(request(ctx.app()).put(`${ctx.baseUrl}/${added.uid}`)).send({ enabled: false })).status).toBe(403);
+            expect((await asPlain(request(ctx.app()).delete(`${ctx.baseUrl}/${added.uid}`))).status).toBe(403);
+            const rows = await ctx.rows();
+            expect(rows).toHaveLength(1);
+            expect(rows[0].enabled).toBe(true);
+            expect(rows[0].removed ?? false).toBe(false);
+        });
+
+        it("a setting the manifest marks secret is masked whatever its key is called", async () => {
+            publishFakePackage("@rapidmx/vaulted", "1.0.0", {
+                plugin: {
+                    apiVersion: PLUGIN_API_VERSION,
+                    displayName: "Vaulted",
+                    settings: [
+                        { key: "mail:v:private_key", label: "Private key", type: "string", secret: true },
+                        { key: "mail:v:note", label: "Note", type: "string" },
+                    ],
+                },
+            });
+            const added = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/vaulted" });
+            expect(added.status).toBe(200);
+            const saved = await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${added.body.plugin.uid}`)).send({ settings: { "mail:v:private_key": "hunter2", "mail:v:note": "hi" } });
+            expect(saved.status).toBe(200);
+            expect(saved.body.settings["mail:v:private_key"]).toEqual({ secret: true });
+            const list = await asAdmin(request(ctx.app()).get(ctx.baseUrl));
+            expect(JSON.stringify(list.body)).not.toContain("hunter2");
+            expect((await ctx.rows())[0].settings["mail:v:private_key"]).toBe("hunter2");
+            // The placeholder the console sends back keeps the saved value.
+            const kept = await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${added.body.plugin.uid}`)).send({ settings: { "mail:v:private_key": { secret: true }, "mail:v:note": "changed" } });
+            expect(kept.status).toBe(200);
+            expect((await ctx.rows())[0].settings["mail:v:private_key"]).toBe("hunter2");
         });
     });
 }

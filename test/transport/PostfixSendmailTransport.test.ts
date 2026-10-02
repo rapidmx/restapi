@@ -46,6 +46,16 @@ describe("PostfixSendmailTransport Tests", () => {
         });
     });
 
+    it("Sends with the null sender (-f <>) when the envelope sender is empty, and with nodemailer's own -f otherwise.", async () => {
+        sendMail.mockResolvedValue({ accepted: ["b@x.com"], rejected: [], messageId: "<abc@x.com>" });
+
+        await transport.send(makeMessage({ envelopeFrom: "" }));
+        expect(mockCreateTransport).toHaveBeenLastCalledWith(expect.objectContaining({ args: ["-f", "<>"] }));
+
+        await transport.send(makeMessage());
+        expect(mockCreateTransport.mock.lastCall![0]).not.toHaveProperty("args");
+    });
+
     it("Passes the envelope and raw source to sendMail.", async () => {
         sendMail.mockResolvedValue({ accepted: ["b@x.com"], rejected: [], messageId: "<abc@x.com>" });
         const message = makeMessage();

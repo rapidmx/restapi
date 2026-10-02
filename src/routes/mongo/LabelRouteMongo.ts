@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { LabelMongo, MessageMongo } from "../../mongo.js";
+import { buildMessageLabelFilterMongo } from "../../util/MessageListUtils.js";
 import { BaseLabelRoute } from "../BaseLabelRoute.js";
 const { Model } = RouteDecorators;
 
@@ -11,4 +12,8 @@ const { Model } = RouteDecorators;
 export class LabelRouteMongo extends BaseLabelRoute<LabelMongo, MessageMongo> {
     protected readonly repoUtilsClass: any = RepoUtils;
     protected messageClass: any = MessageMongo;
+
+    protected buildLabelUidsFilter(labelUids: string[]): Record<string, any> {
+        return buildMessageLabelFilterMongo(labelUids);
+    }
 }

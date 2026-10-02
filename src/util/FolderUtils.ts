@@ -22,8 +22,10 @@ function getCachedFolderRepo(objectFactory: ObjectFactory, folderClass: any): Pr
 
 /**
  * The real, authoritative `mailboxUid` of `folderUid` (`undefined` if no such folder exists) - looked up
- * with `ignoreACL: true` and no soft-delete filtering (a plain `RepoUtils`, not `RecoverableRepoUtils`),
- * so a folder that was soft-deleted mid-request still resolves correctly rather than appearing not found.
+ * with `ignoreACL: true`, INCLUDING a soft-deleted folder: `RepoUtils.findOne()` otherwise answers nothing for a
+ * soft-deleted record, and a folder deleted by its (former) owner still carries its ACL, so an unresolved folder
+ * would let a caller's own `mailboxUid` stand on a record planted through it. With `rejectDeleted`, a soft-deleted
+ * folder resolves to `undefined` too (a write into it is refused).
  *
  * This is the one place `BaseScopedChildRoute.resolveMailboxUidFor()`'s overrides
  * (`BaseMessageRoute`/`BaseAttachmentRoute`/`BaseContactRoute`/`BaseCalendarEventRoute`/`TaskRoute*`/
@@ -32,9 +34,17 @@ function getCachedFolderRepo(objectFactory: ObjectFactory, folderClass: any): Pr
  * `mailboxUid` is a real problem (every compliance job that purges/queries by `mailboxUid` treats it as
  * authoritative).
  */
-export async function getMailboxUidForFolder(objectFactory: ObjectFactory, folderClass: any, folderUid: string): Promise<string | undefined> {
+export async function getMailboxUidForFolder(
+    objectFactory: ObjectFactory,
+    folderClass: any,
+    folderUid: string,
+    rejectDeleted: boolean = false,
+): Promise<string | undefined> {
     const repo: RepoUtils<Folder> = await getCachedFolderRepo(objectFactory, folderClass);
-    const folder: Folder | undefined = await repo.findOne(folderUid, { ignoreACL: true });
+    const folder: Folder | undefined = await repo.findOne(folderUid, { ignoreACL: true, includeDeleted: true });
+    if (rejectDeleted && (folder as any)?.deleted) {
+        return undefined;
+    }
     return folder?.mailboxUid;
 }
 

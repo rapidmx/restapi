@@ -36,6 +36,9 @@ interface IssuedMaterial {
     wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">;
     mailboxUid?: string;
     masterKeyGeneration?: number;
+    /** When the enrollment began (ISO 8601). A mailbox uid is its address, so one deleted and created again at that address has the
+     * same `mailboxUid` - a mailbox created after this moment is a different incarnation and never gets the key. */
+    createdAt?: string;
 }
 
 /** What `installCertificate()` did: installed (or found installed), nothing yet (retry later), or refused for good. */
@@ -81,6 +84,13 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
     @Config("mail:jobs:acme_enrollment_driver:expiry_warning_days", 30)
     private expiryWarningDays: number = 30;
 
+    /** How often (minutes) this replica checks every mailbox for a signing key nearing its expiry - the enrollment tick itself runs on `schedule`. */
+    @Config("mail:jobs:acme_enrollment_driver:expiry_sweep_interval_minutes", 360)
+    private expirySweepIntervalMinutes: number = 360;
+
+    /** When this replica last started the expiry check (epoch ms). */
+    private lastExpirySweepAt: number = 0;
+
     /** How many checks in a row must fail to reach the CA (or be refused by it) before a `SIGNING_ENROLLMENT_CA_UNREACHABLE` audit entry is written - once
      * per run of failures. The failure itself is logged once (at warn) when it first happens and whenever its text changes, not on every tick. */
     @Config("mail:jobs:acme_enrollment_driver:failure_audit_after", 3)
@@ -120,7 +130,12 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
 
     public async run(): Promise<void> {
         await this.driveEnrollments();
-        await this.flagExpiringSigningCerts();
+        // Enrollments move every tick, but the expiry check reads every mailbox: with the warning window in days, running it every
+        // tick would page through the whole mailbox table every few minutes on every replica for nothing.
+        if (Date.now() - this.lastExpirySweepAt >= this.expirySweepIntervalMinutes * 60_000) {
+            this.lastExpirySweepAt = Date.now();
+            await this.flagExpiringSigningCerts();
+        }
     }
 
     private async driveEnrollments(): Promise<void> {
@@ -277,6 +292,10 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
         }
         if (material.mailboxUid !== undefined && material.mailboxUid !== found.uid) {
             return { status: "refused", reason: "The address this certificate was enrolled for now belongs to a different mailbox." };
+        }
+        // Not `<`-negated: with no `createdAt` (a provider that does not report it) or no `dateCreated` the comparison is false and nothing is refused.
+        if (Date.parse(material.createdAt ?? "") < new Date(found.dateCreated).getTime()) {
+            return { status: "refused", reason: "The mailbox at this address was created after the enrollment began, so it is a different mailbox." };
         }
 
         const { publicKey, fingerprint } = publicKeyFromCertificatePem(material.certificate, "sign", found.primarySmtpAddress);

@@ -10,6 +10,7 @@ import * as uuid from "uuid";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { EscrowAccessRequestMongo } from "../../../src/models/mongo/EscrowAccessRequestMongo.js";
 import { EscrowScopeMongo } from "../../../src/models/mongo/EscrowScopeMongo.js";
+import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
@@ -29,6 +30,7 @@ describe("Route:MatterMongo Tests", () => {
     const baseUrl = "/mongo/matters";
     let escrowScopeRepo: MongoRepository<EscrowScopeMongo>;
     let matterRepo: MongoRepository<MatterMongo>;
+    let mailboxRepo: MongoRepository<MailboxMongo>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
     let escrowAccessRequestRepo: MongoRepository<EscrowAccessRequestMongo>;
 
@@ -65,6 +67,22 @@ describe("Route:MatterMongo Tests", () => {
         return await matterRepo.save(obj);
     };
 
+    /** A mailbox assigned to `escrowScopeId`: a matter can only hold mailboxes that exist and belong to its own scope. */
+    const createCustodian = async function (escrowScopeId: string): Promise<MailboxMongo> {
+        return await mailboxRepo.save(
+            new MailboxMongo({
+                ownerUserUid: uuid.v4(),
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Custodian",
+                timezone: "UTC",
+                quotaBytes: 1000,
+                usedBytes: 0,
+                escrowScopeId,
+            }),
+        );
+    };
+
     beforeAll(async () => {
         await mongod.start();
         registerTestDoubles(objectFactory);
@@ -75,6 +93,7 @@ describe("Route:MatterMongo Tests", () => {
         if (conn instanceof MongoConnection) {
             escrowScopeRepo = conn.getMongoRepository("EscrowScopeMongo");
             matterRepo = conn.getMongoRepository("MatterMongo");
+            mailboxRepo = conn.getMongoRepository("MailboxMongo");
             auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
             escrowAccessRequestRepo = conn.getMongoRepository("EscrowAccessRequestMongo");
         } else {
@@ -89,7 +108,7 @@ describe("Route:MatterMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const r of [matterRepo, escrowScopeRepo, auditLogRepo, escrowAccessRequestRepo]) {
+        for (const r of [matterRepo, mailboxRepo, escrowScopeRepo, auditLogRepo, escrowAccessRequestRepo]) {
             try {
                 await r.clear();
             } catch (err: any) {
@@ -231,7 +250,7 @@ describe("Route:MatterMongo Tests", () => {
             .send({
                 name: "Investigation A",
                 escrowScopeId: scope.uid,
-                custodianMailboxUids: [uuid.v4()],
+                custodianMailboxUids: [(await createCustodian(scope.uid)).uid],
                 dateRangeStart: "2026-01-01",
                 dateRangeEnd: "2026-06-01",
             });
@@ -399,7 +418,7 @@ describe("Route:MatterMongo Tests", () => {
         const result = await request(server.getApplication())
             .post(baseUrl)
             .set("Authorization", "jwt " + holderAToken)
-            .send({ name: "Investigation A", escrowScopeId: scope.uid, custodianMailboxUids: [uuid.v4()], dateRangeStart: "2026-01-01" });
+            .send({ name: "Investigation A", escrowScopeId: scope.uid, custodianMailboxUids: [(await createCustodian(scope.uid)).uid], dateRangeStart: "2026-01-01" });
 
         expect(result.status).toBeGreaterThanOrEqual(200);
         expect(result.status).toBeLessThan(300);
@@ -415,14 +434,14 @@ describe("Route:MatterMongo Tests", () => {
                 {
                     name: "Investigation A",
                     escrowScopeId: scope.uid,
-                    custodianMailboxUids: [uuid.v4()],
+                    custodianMailboxUids: [(await createCustodian(scope.uid)).uid],
                     dateRangeStart: "2026-01-01",
                     dateRangeEnd: "2026-06-01",
                 },
                 {
                     name: "Investigation B",
                     escrowScopeId: scope.uid,
-                    custodianMailboxUids: [uuid.v4()],
+                    custodianMailboxUids: [(await createCustodian(scope.uid)).uid],
                     dateRangeStart: "2026-01-01",
                     dateRangeEnd: "2026-06-01",
                 },

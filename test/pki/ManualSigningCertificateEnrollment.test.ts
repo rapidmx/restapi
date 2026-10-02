@@ -9,6 +9,11 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import * as x509 from "@peculiar/x509";
+import {
+    MAX_ENROLLMENTS_PER_DAY,
+    MAX_ENROLLMENTS_PER_IDENTITY_PER_DAY,
+    MAX_PENDING_ENROLLMENTS_PER_IDENTITY,
+} from "../../src/pki/EnrollmentLimits.js";
 import { ManualSigningCertificateEnrollment } from "../../src/pki/ManualSigningCertificateEnrollment.js";
 import { EnrollmentResult } from "../../src/pki/SigningCertificateEnrollment.js";
 
@@ -74,6 +79,42 @@ describe("ManualSigningCertificateEnrollment Tests", () => {
         expect(enrollmentId).toBeTruthy();
         const status: EnrollmentResult = await enrollment.checkStatus(enrollmentId);
         expect(status).toEqual({ status: "pending", certificate: undefined, error: undefined });
+    });
+
+    it("Limits the pending requests and the requests a day for one address, and in all, and prunes old finished records.", async () => {
+        const csr: string = await generateCsr("flood@example.com");
+        const ids: string[] = [];
+        for (let i = 0; i < MAX_PENDING_ENROLLMENTS_PER_IDENTITY; i++) {
+            ids.push((await enrollment.startEnrollment("flood@example.com", csr)).enrollmentId);
+        }
+        await expect(enrollment.startEnrollment("FLOOD@example.com", csr)).rejects.toMatchObject({ status: 409 });
+        for (let i = MAX_PENDING_ENROLLMENTS_PER_IDENTITY; i < MAX_ENROLLMENTS_PER_IDENTITY_PER_DAY; i++) {
+            await enrollment.cancelEnrollment(ids[ids.length - 1], "cancelled");
+            ids.push((await enrollment.startEnrollment("flood@example.com", csr)).enrollmentId);
+        }
+        await enrollment.cancelEnrollment(ids[ids.length - 1], "cancelled");
+        await expect(enrollment.startEnrollment("flood@example.com", csr)).rejects.toMatchObject({ status: 429 });
+
+        const storePath: string = (enrollment as any).storePath;
+        const store = JSON.parse(await fs.readFile(storePath, "utf8"));
+        const template = Object.values(store)[0] as any;
+        const old = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
+        for (const record of Object.values(store)) {
+            record.createdAt = old;
+            record.status = "failed";
+        }
+        for (let i = 0; i < MAX_ENROLLMENTS_PER_DAY; i++) {
+            store[`bulk-${i}`] = { ...template, identity: `bulk${i}@example.com`, status: "failed", createdAt: new Date().toISOString() };
+        }
+        await fs.writeFile(storePath, JSON.stringify(store));
+        await expect(enrollment.startEnrollment("fresh@example.com", csr)).rejects.toMatchObject({ status: 429 });
+        delete store["bulk-0"];
+        await fs.writeFile(storePath, JSON.stringify(store));
+        await enrollment.startEnrollment("fresh@example.com", csr);
+        const after = JSON.parse(await fs.readFile(storePath, "utf8"));
+        // The records past retention are gone; the recent ones stay.
+        expect(Object.keys(after).filter((id) => !id.startsWith("bulk-"))).toHaveLength(1);
+        expect(Object.keys(after).filter((id) => id.startsWith("bulk-"))).toHaveLength(MAX_ENROLLMENTS_PER_DAY - 1);
     });
 
     it("Rejects a CSR that cannot be parsed.", async () => {

@@ -5,7 +5,7 @@
 import { simpleParser, ParsedMail, Attachment as ParsedAttachment } from "mailparser";
 import { ObjectDecorators } from "@rapidrest/core";
 import { AvVerdict, Recipient, SpamVerdict } from "../models/types.js";
-import { DeliveryStatusReport, FeedbackReport, formatDeliveryStatusPreview, parseDeliveryStatusReport, parseFeedbackReport } from "../util/DsnParser.js";
+import { DeliveryStatusReport, FeedbackReport, formatDeliveryStatusPreview, isReportOfType, parseDeliveryStatusReport, parseFeedbackReport } from "../util/DsnParser.js";
 import { isEncryptedBody } from "../util/SmimeUtils.js";
 import { parseHeaderRecipients, parseSenderDisplayName } from "../util/RecipientUtils.js";
 import { AvScanProvider, AvScanResult } from "./AvScanProvider.js";
@@ -130,6 +130,11 @@ function stripAngleBrackets(value: string): string {
     return value.replace(/^</, "").replace(/>$/, "");
 }
 
+/** The most attachment parts a message may carry and still be scanned and stored: each one costs an AV scan (a connection to
+ * the scan engine, sequentially), a blob and database rows, and mailparser puts no limit of its own on them, so a message of
+ * thousands of tiny parts would hold the delivery job for as long as that takes. One over the cap is quarantined (`AvVerdict.ERROR`). */
+export const MAX_SCANNED_ATTACHMENTS = 500;
+
 /** Verdicts ranked worst-to-best, used to combine the raw-message and per-attachment AV results. */
 const AV_SEVERITY: Record<AvVerdict, number> = {
     [AvVerdict.INFECTED]: 2,
@@ -219,13 +224,15 @@ export class ScanPipeline {
         // ultimately need to agree with.
         const encrypted: boolean = isEncryptedBody(parsed);
 
+        const tooManyParts: boolean = !encrypted && (parsed.attachments ?? []).length > MAX_SCANNED_ATTACHMENTS;
         const [spam, rawAv, attachmentResults] = await Promise.all([
             this.spamScanProvider.scoreMessage(raw, envelope),
             this.avScanProvider.scanBuffer(raw),
-            this.scanAttachments(encrypted ? [] : (parsed.attachments ?? [])),
+            this.scanAttachments(encrypted || tooManyParts ? [] : (parsed.attachments ?? [])),
         ]);
 
-        let worstAv: AvScanResult = rawAv;
+        // Not scanned at all, so not cleared: held like a failed scan (`resolveDeliveryVerdict()` quarantines it).
+        let worstAv: AvScanResult = tooManyParts ? { verdict: AvVerdict.ERROR } : rawAv;
         for (const attachment of attachmentResults) {
             if (AV_SEVERITY[attachment.av.verdict] > AV_SEVERITY[worstAv.verdict]) {
                 worstAv = attachment.av;
@@ -326,6 +333,12 @@ export class ScanPipeline {
      * re-wraps this text into a `Buffer` the same way for `MimeHeaderUtils.extractHeader()` - matching that
      * module's own encoding convention keeps the two sides consistent. */
     private deriveDispositionNotificationPart(parsed: ParsedMail): string | undefined {
+        // Only a message that is itself an MDN (`multipart/report; report-type=disposition-notification`): the caller consumes
+        // what has this part as a control message, never filing it, so an ordinary message that merely carries one (a forwarded
+        // receipt, a ticket, an archive) must not have one.
+        if (!isReportOfType(parsed, "disposition-notification")) {
+            return undefined;
+        }
         const part = (parsed.attachments ?? []).find((attachment) => attachment.contentType === "message/disposition-notification");
         return part?.content.toString("binary");
     }
@@ -399,6 +412,11 @@ export class ScanPipeline {
      * runs to bring a message stored by an older sanitizer up to date. `undefined` for a message with no HTML body or an S/MIME
      * encrypted one (there is nothing the server can show).
      */
+    /** `html` (an earlier sanitizer's output, say) sanitized again by the current sanitizer, stamped - for when a message cannot be sanitized anew from its raw source. */
+    public sanitizeStoredHtml(html: string): string {
+        return this.sanitize(html);
+    }
+
     public async sanitizeRaw(raw: Buffer): Promise<string | undefined> {
         const parsed: ParsedMail = await this.parse(raw);
         return !isEncryptedBody(parsed) && typeof parsed.html === "string" ? this.sanitize(parsed.html) : undefined;

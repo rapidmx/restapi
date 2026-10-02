@@ -58,6 +58,11 @@ export class MatterExportRequestMongo extends BaseMongoEntity implements MatterE
     @Nullable
     public processingAttempts?: number = 0;
 
+    @Column()
+    @Description("The custodian mailboxes whose MATTER_EXPORT_READY escrow audit entry this ready export still owes (null once all are recorded).")
+    @Nullable
+    public pendingAttestationMailboxUids?: string[] | null;
+
     constructor(other?: Partial<MatterExportRequestMongo>) {
         super(other);
 
@@ -68,6 +73,7 @@ export class MatterExportRequestMongo extends BaseMongoEntity implements MatterE
             this.blobKey = "blobKey" in other ? other.blobKey : this.blobKey;
             this.errorMessage = "errorMessage" in other ? other.errorMessage : this.errorMessage;
             this.processingAttempts = other.processingAttempts !== undefined && other.processingAttempts !== null ? other.processingAttempts : this.processingAttempts;
+            this.pendingAttestationMailboxUids = "pendingAttestationMailboxUids" in other ? other.pendingAttestationMailboxUids : this.pendingAttestationMailboxUids;
         }
     }
 }

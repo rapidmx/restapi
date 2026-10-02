@@ -197,10 +197,36 @@ describe("DataExportJobSQL Tests (real DB + DI)", () => {
         const bundle = await blobStore.get(updated!.blobKey!);
         expect(bundle.toString("utf-8")).toContain("First body.");
         expect(bundle.toString("utf-8")).toContain("Second body.");
-        expect(bundle.toString("utf-8")).toMatch(/^From alice@example\.com /);
+        // One entry per message, in uid order (keyset paging) - whichever of the two senders that puts first.
+        expect(bundle.toString("utf-8")).toMatch(/^From (alice|carol)@example\.com /);
+        expect(bundle.toString("utf-8")).toMatch(/\nFrom (alice|carol)@example\.com /);
 
         const entries = await auditLogRepo.find({ where: { action: AuditAction.DATA_EXPORT_READY } });
         expect(entries.length).toBe(1);
+    });
+
+    it("Pages an mbox export by keyset on uid, sorted - never by offset, which skips or repeats messages when rows move mid-export.", async () => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const rows = ["a", "b", "c", "d", "e"].map((uid) => ({ uid, mailboxUid: "m", bodyBlobKey: `bodies/${uid}`, from: { address: "x@example.com" }, sentDate: new Date(0) }));
+        for (const row of rows) {
+            await blobStore.put(row.bodyBlobKey, Buffer.from(`Subject: ${row.uid}\r\n\r\nbody ${row.uid}`));
+        }
+        const queries: any[] = [];
+        const fakeRepo = {
+            find: async (query: any) => {
+                queries.push(query);
+                const after: string | undefined = typeof query.uid === "string" ? query.uid.replace(/^gt\(|\)$/g, "") : undefined;
+                return rows.filter((row) => after === undefined || row.uid > after).slice(0, query.limit);
+            },
+        };
+        const entries: Buffer[] = [];
+        for await (const entry of (job as any).generateMbox(fakeRepo, "m", { held: {}, renewedAt: Date.now() }, 2)) {
+            entries.push(entry);
+        }
+
+        expect(entries.map((entry) => entry.toString().match(/body (\w)/)![1])).toEqual(["a", "b", "c", "d", "e"]);
+        expect(queries.every((query) => query.page === undefined && JSON.stringify(query.sort) === JSON.stringify({ uid: "ASC" }))).toBe(true);
+        expect(queries.map((query) => query.uid)).toEqual([undefined, "gt(b)", "gt(d)"]);
     });
 
     it("Builds a JSON bundle covering every entity type this mailbox owns.", async () => {
@@ -254,6 +280,35 @@ describe("DataExportJobSQL Tests (real DB + DI)", () => {
         expect(lines.find((line) => line.entityType === "message").verificationSealGeneration).toBe(2);
         expect(lines.find((line) => line.entityType === "contact").displayName).toBe("A Contact");
         expect(lines.find((line) => line.entityType === "note").title).toBe("A Note");
+    });
+
+    it("Includes the rows the user deleted (still held, restorable) in the JSON bundle, tagged deleted, and counts them against max_content_rows.", async () => {
+        const mailbox = await createMailbox();
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        await contactRepo.save(new ContactSQL({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "Live" }));
+        const gone = await contactRepo.save(new ContactSQL({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "Deleted" }));
+        await contactRepo.update({ uid: gone.uid }, { deleted: true });
+        const request = await createRequest({ mailboxUid: mailbox.uid, format: "json" });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
+        expect(updated!.status).toBe("ready");
+        const lines = (await blobStore.get(updated!.blobKey!)).toString("utf-8").split(String.fromCharCode(10)).map((line) => JSON.parse(line));
+        expect(lines.filter((l) => l.entityType === "contact").map((l) => [l.displayName, l.deleted ?? false]).sort()).toEqual([["Deleted", true], ["Live", false]]);
+
+        // The live rows alone fit under the cap (the mailbox line and one contact); the deleted one does not.
+        const second = await createRequest({ mailboxUid: mailbox.uid, format: "json" });
+        const original = (job as any).maxContentRows;
+        (job as any).maxContentRows = 2;
+        try {
+            await job.run();
+            const failed = await requestRepo.findOne({ where: { uid: second.uid } });
+            expect(failed!.status).toBe("failed");
+            expect(failed!.errorMessage).toContain("exceeds the maximum of 2");
+        } finally {
+            (job as any).maxContentRows = original;
+        }
     });
 
     it("Does not include another mailbox's content in the bundle.", async () => {

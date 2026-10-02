@@ -187,6 +187,25 @@ describe("TransportRuleUtils Tests", () => {
             expect(context.attachmentFilenames).toEqual([]);
         });
 
+        it("Matches the header From, the To and Cc headers and a body far beyond the preview, not only the envelope and the first 500 characters.", async () => {
+            const padding = "x".repeat(5000);
+            const raw = Buffer.from(
+                `From: Boss <ceo@corp.example>\r\nTo: one@corp.example\r\nTo: two@corp.example\r\nCc: cc@partner.example\r\nSubject: Hi\r\nContent-Type: text/plain\r\n\r\n${padding} secret-project\r\n`,
+            );
+            const context = await buildTransportRuleContext(raw, "bounce@elsewhere.example", ["bcc@hidden.example"], []);
+            expect(context.bodyPreview).toHaveLength(500);
+            expect(context.headerFromAddresses).toEqual(["ceo@corp.example"]);
+            expect(context.headerRecipientAddresses).toEqual(["one@corp.example", "two@corp.example", "cc@partner.example"]);
+
+            expect(matchesTransportRuleConditions({ bodyContains: ["secret-project"] }, context)).toBe(true);
+            expect(matchesTransportRuleConditions({ fromContains: ["@corp.example"] }, context)).toBe(true);
+            expect(matchesTransportRuleConditions({ fromContains: ["@elsewhere.example"] }, context)).toBe(true);
+            expect(matchesTransportRuleConditions({ fromContains: ["@nowhere.example"] }, context)).toBe(false);
+            expect(matchesTransportRuleConditions({ recipientContains: ["cc@partner"] }, context)).toBe(true);
+            expect(matchesTransportRuleConditions({ recipientContains: ["bcc@hidden"] }, context)).toBe(true);
+            expect(matchesTransportRuleConditions({ recipientContains: ["nobody@"] }, context)).toBe(false);
+        });
+
         it("Extracts attachment filenames and sets hasAttachment for a multipart message with an attachment.", async () => {
             const raw = Buffer.from(
                 [
@@ -271,5 +290,9 @@ describe("TransportRuleUtils Tests", () => {
             const context = makeContext({ bodyPreview: "" });
             expect(matchesTransportRuleConditions({ bodyContains: ["anything"] }, context)).toBe(false);
         });
+    });
+
+    it("Never matches a text condition whose list of needles is empty.", () => {
+        expect(matchesTransportRuleConditions({ subjectContains: [] }, makeContext())).toBe(false);
     });
 });

@@ -20,6 +20,9 @@ const { Config } = ObjectDecorators;
  * Keys are sharded two levels deep by the first four characters of their MD5 hash (e.g. key `abc123` is stored
  * at `<root>/ab/c1/abc123`) to avoid placing an unbounded number of files in a single directory.
  *
+ * Blobs are raw mail and attachments, so the directories this creates are `0700` and the files `0600` - not whatever the process
+ * umask would give (typically `0755`/`0644`, readable by every account on a shared host). A directory that already exists keeps its mode.
+ *
  * @author Jean-Philippe Steinmetz
  */
 export class LocalFsBlobStore implements BlobStore {
@@ -41,14 +44,14 @@ export class LocalFsBlobStore implements BlobStore {
      */
     public async put(key: string, data: Buffer | NodeJS.ReadableStream, _options?: BlobPutOptions): Promise<void> {
         const filePath: string = this.resolvePath(key);
-        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
 
         const tempPath: string = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
         try {
             if (Buffer.isBuffer(data)) {
-                await fs.writeFile(tempPath, data, { flag: "wx" });
+                await fs.writeFile(tempPath, data, { flag: "wx", mode: 0o600 });
             } else {
-                await pipeline(data, createWriteStream(tempPath, { flags: "wx" }));
+                await pipeline(data, createWriteStream(tempPath, { flags: "wx", mode: 0o600 }));
             }
             await fs.rename(tempPath, filePath);
         } catch (err) {

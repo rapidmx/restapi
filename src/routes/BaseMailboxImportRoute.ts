@@ -16,8 +16,14 @@ import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, Folder, Mailbox, MailboxImportFormat, MailboxImportRequest } from "../models/types.js";
+/** The mailboxes an upload is streaming into right now, in this process - see `create()`. */
+const UPLOADS_IN_FLIGHT: Set<string> = new Set();
 const { Config, Inject, Logger } = ObjectDecorators;
-const { Get, Param, Post, Query, Request, StreamingBody, User: AuthUser } = RouteDecorators;
+const { Get, Param, Post, Query, RateLimit, Request, StreamingBody, User: AuthUser } = RouteDecorators;
+
+/** `create()` is limited per user: each upload can be many GiB of disk until `MailboxImportJob` runs. */
+const CREATE_MAX_ATTEMPTS: number = 10;
+const CREATE_WINDOW_SECONDS: number = 3600;
 
 const VALID_FORMATS: ReadonlySet<string> = new Set<MailboxImportFormat>(["mbox", "pst"]);
 
@@ -162,6 +168,7 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
 
+    @Config("trusted_roles", ["admin"])
     protected trustedRoles: string[] = ["admin"];
 
     // Automatically injected by ObjectFactory on instantiation
@@ -261,6 +268,7 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
      */
     @Post()
     @StreamingBody()
+    @RateLimit({ perUser: true, maxAttempts: CREATE_MAX_ATTEMPTS, windowSeconds: CREATE_WINDOW_SECONDS })
     public async create(
         @Request req: HttpRequest,
         @Query("targetFolderUid") targetFolderUid: string | undefined,
@@ -272,6 +280,12 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         let target: { mailboxUid: string; remainingQuota: number };
         try {
             target = await this.resolveUploadTarget(req, targetFolderUid, format, mailboxUidParam, user);
+            // The check for an import in progress (a stored request) can't see an upload that is still streaming - its request is only
+            // made once the file is stored - so the uploads under way in this process are tracked as well, claimed in the same tick
+            // the check passed (nothing awaits in between). `storeUpload()` settles the same question across replicas.
+            if (UPLOADS_IN_FLIGHT.has(target.mailboxUid)) {
+                throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "An import into this mailbox is already in progress.");
+            }
         } catch (err: any) {
             // Every rejection ahead of the blob write funnels through here - see `discardSmallBody()` for why the
             // (small) unread body has to be dealt with before the error can reach the client at all.
@@ -279,7 +293,12 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
             throw err;
         }
         const { mailboxUid, remainingQuota } = target;
-        return await this.storeUpload(req.bodyStream!, targetFolderUid!, format!, mailboxUid, remainingQuota, user!);
+        UPLOADS_IN_FLIGHT.add(mailboxUid);
+        try {
+            return await this.storeUpload(req.bodyStream!, targetFolderUid!, format!, mailboxUid, remainingQuota, user!);
+        } finally {
+            UPLOADS_IN_FLIGHT.delete(mailboxUid);
+        }
     }
 
     /**
@@ -340,6 +359,13 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
         if (!mailbox) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        // One upload at a time per mailbox: a queued import holds its whole file on disk (uncharged to the quota) until the job runs,
+        // so repeated uploads would otherwise fill the disk well past the mailbox's quota.
+        for (const status of ["pending", "processing"]) {
+            if ((await this.requestRepo!.find({ mailboxUid, status } as any, { ignoreACL: true, limit: 1 })).length > 0) {
+                throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "An import into this mailbox is already in progress.");
+            }
         }
         const folder: F | undefined = await this.folderRepo!.findOne(targetFolderUid, { ignoreACL: true });
         if (!folder || folder.mailboxUid !== mailboxUid) {
@@ -419,6 +445,23 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
             }),
             { ignoreACL: true },
         );
+        // Two uploads (on different replicas) can both have passed the in-progress check: of every request open for the mailbox the
+        // earliest stands, any other takes itself back out - its file, its request - and is refused.
+        const open: T[] = [];
+        for (const status of ["pending", "processing"]) {
+            open.push(...(await this.requestRepo!.find({ mailboxUid, status } as any, { ignoreACL: true, limit: 50 })));
+        }
+        const order = (request: T): [number, string] => [new Date((request as any).dateCreated).getTime(), request.uid];
+        const earliest: T = open.reduce((a, b) => {
+            const [ta, ua] = order(a);
+            const [tb, ub] = order(b);
+            return tb < ta || (tb === ta && ub < ua) ? b : a;
+        }, created);
+        if (earliest.uid !== created.uid) {
+            await this.requestRepo!.delete(created.uid, { ignoreACL: true, purge: true }).catch(() => undefined);
+            await this.blobStore!.delete(sourceBlobKey).catch(() => undefined);
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "An import into this mailbox is already in progress.");
+        }
         await recordAuditLog(
             this._objectFactory!,
             this.auditLogClass,

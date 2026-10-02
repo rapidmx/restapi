@@ -47,7 +47,15 @@ describe("DistributionListUtils Tests", () => {
             // The injected CR/LF is stripped, so "X-Injected: true" merges harmlessly onto the same
             // List-Id line rather than becoming its own header - never a separate "\r\nX-Injected: true\r\n" line.
             expect(result).not.toContain("\r\nX-Injected: true\r\n");
-            expect(result).toContain("List-Id: EvilX-Injected: true <sales.example.com>");
+            expect(result).toContain('List-Id: "EvilX-Injected: true" <sales.example.com>');
+        });
+
+        it("Quotes a plain-ASCII list name that holds a special character, so the phrase stays a phrase before the list-id.", () => {
+            const raw = Buffer.from("From: sender@example.com\r\n\r\nBody\r\n");
+            expect(rewriteHeadersForList(raw, makeList({ name: "Eng <ops>" })).toString()).toContain("List-Id: \"Eng <ops>\" <sales.example.com>");
+            expect(rewriteHeadersForList(raw, makeList({ name: 'Say "hi" (all)\\' })).toString()).toContain('List-Id: "Say \\"hi\\" (all)\\\\" <sales.example.com>');
+            expect(rewriteHeadersForList(raw, makeList({ name: "Eng.Ops-team" })).toString()).toContain("List-Id: Eng.Ops-team <sales.example.com>");
+            expect(rewriteHeadersForList(raw, makeList({ name: "Zoë <ops>" })).toString()).toMatch(/List-Id: =\?UTF-8\?B\?[A-Za-z0-9+/=]+\?= <sales.example.com>/);
         });
 
         it("Falls back to the raw address as the List-Id host when it has no '@' (defensive branch).", () => {

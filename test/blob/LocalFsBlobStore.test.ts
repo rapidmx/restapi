@@ -27,6 +27,24 @@ describe("LocalFsBlobStore Tests", () => {
         (store as any).root = tmpDir;
     });
 
+    // POSIX modes only mean something off Windows.
+    it.skipIf(process.platform === "win32")("Creates blob directories 0700 and files 0600, whatever the umask.", async () => {
+        const previous: number = process.umask(0o000);
+        try {
+            const root: string = path.join(tmpDir, `private-${Math.random()}`);
+            (store as any).root = root;
+            await store.put("buffer-key", Buffer.from("secret"));
+            await store.put("stream-key", Readable.from([Buffer.from("secret")]));
+            const file: string = (await store.localPath("buffer-key"))!;
+            expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
+            expect((await fs.stat((await store.localPath("stream-key"))!)).mode & 0o777).toBe(0o600);
+            expect((await fs.stat(path.dirname(file))).mode & 0o777).toBe(0o700);
+            expect((await fs.stat(path.dirname(path.dirname(file)))).mode & 0o777).toBe(0o700);
+        } finally {
+            process.umask(previous);
+        }
+    });
+
     it("Stores and retrieves a Buffer.", async () => {
         const key = "buffer-key";
         const data = Buffer.from("hello world");

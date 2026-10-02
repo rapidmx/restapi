@@ -203,6 +203,27 @@ function validateWrappedPrivateKey(key: Pick<WrappedPrivateKey, "ciphertext" | "
     }
 }
 
+/** `wrap` reduced to `MasterKeyWrap`'s own fields (the validator only looks at the named ones, and the rest of a body would otherwise be stored
+ * as it came), with a `createdAt` that is a number or else now. */
+function pickMasterKeyWrap(wrap: MasterKeyWrap): MasterKeyWrap {
+    return {
+        method: wrap.method,
+        ...(wrap.methodId !== undefined ? { methodId: wrap.methodId } : {}),
+        ...(typeof wrap.escrowScopeId === "string" ? { escrowScopeId: wrap.escrowScopeId } : {}),
+        ciphertext: wrap.ciphertext,
+        nonce: wrap.nonce,
+        salt: wrap.salt,
+        kdf: wrap.kdf,
+        schemeVersion: wrap.schemeVersion,
+        createdAt: typeof wrap.createdAt === "number" && Number.isFinite(wrap.createdAt) ? wrap.createdAt : Date.now(),
+    };
+}
+
+/** `key` reduced to `WrappedPrivateKey`'s own fields - see `pickMasterKeyWrap()`. */
+function pickWrappedKey(key: WrappedPrivateKey): WrappedPrivateKey {
+    return { ciphertext: key.ciphertext, nonce: key.nonce, algorithm: key.algorithm, fingerprint: key.fingerprint, useType: key.useType };
+}
+
 /** Refuses (409) bootstrap `masterKeyWraps` for a vault that is already set up - holding wraps or wrapped keys. They
  * would be silently ignored while the new key (sealed under the caller's master key) was still appended and published,
  * leaving the active key under a master key no stored wrap opens: what two tabs setting up keys at once used to do. */
@@ -384,12 +405,25 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
      * `rekey()`/`removeMasterKeyWrap()` can permanently destroy the owner's own access to their encrypted mail
      * history, and `enrollKey()`/`startSignEnrollment()`/`addMasterKeyWrap()` would let a delegate publish a key
      * of their own for the owner's address or add an unlock method they control to the owner's master key - an
-     * `UPDATE` grant on a shared mailbox is meant for managing its content/settings, not its keys. Reads
-     * (`get()`/`checkSignEnrollmentStatus()`) still accept a delegate `READ` grant. */
+     * `UPDATE` grant on a shared mailbox is meant for managing its content/settings, not its keys. `get()` is owner-only too
+     * (`requireVaultReader()`); the sign-enrollment progress reads (`checkSignEnrollmentStatus()`) still accept a delegate `READ` grant. */
     private requireMailboxOwner(mailbox: M, user: JWTUser | undefined): void {
         if (!user || mailbox.ownerUserUid !== user.uid) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
+    }
+
+    /**
+     * Who may read a mailbox's key vault - its wrapped private keys and master key wraps, which an offline guess at the owner's password
+     * would open: only the mailbox's owner, like every write (`requireMailboxOwner()`); for a shared mailbox with no owner, a holder of
+     * FULL. A delegate with only READ is no reader of it.
+     */
+    private async requireVaultReader(mailbox: M, user: JWTUser | undefined): Promise<void> {
+        if (mailbox.ownerUserUid) {
+            this.requireMailboxOwner(mailbox, user);
+            return;
+        }
+        await this.requireMailboxAccess(mailbox, user, ACLAction.FULL);
     }
 
     /** Returned as an entity instance (`asEntity()`): every vault write below passes it as `existing` to
@@ -426,7 +460,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     public async get(@Param("id") mailboxId: string, @AuthUser user?: JWTUser): Promise<PublicKeyVault> {
         await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
-        await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
+        await this.requireVaultReader(mailbox, user);
 
         const existing: K | undefined = await this.findKeyVault(mailboxId);
         // Audit-logged like every mutating endpoint below, not just those - this is the one operation that
@@ -526,7 +560,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A non-expired, non-revoked key with this fingerprint is already enrolled.");
         }
 
-        const wrappedKey: WrappedPrivateKey = { ...body.wrappedKey, fingerprint, useType: body.useType };
+        const wrappedKey: WrappedPrivateKey = pickWrappedKey({ ...body.wrappedKey, fingerprint, useType: body.useType });
 
         // Checked here too (not only in `persistEnrollment()`), so a doomed request doesn't reach the writes.
         const currentVault: K | undefined = await this.findKeyVault(mailbox.uid);
@@ -574,7 +608,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         );
 
         // `initialMasterKeyWraps` only ever reaches an empty vault (`assertMasterKeyWrapsAccepted()`).
-        const masterKeyWraps: MasterKeyWrap[] = initialMasterKeyWraps?.length ? initialMasterKeyWraps : keyVault.masterKeyWraps;
+        const masterKeyWraps: MasterKeyWrap[] = initialMasterKeyWraps?.length ? initialMasterKeyWraps.map(pickMasterKeyWrap) : keyVault.masterKeyWraps;
         const updatedKeyVault: K = await this.keyVaultRepo!.update(
             {
                 uid: keyVault.uid,
@@ -883,7 +917,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             {
                 uid: keyVault.uid,
                 version: (keyVault as any).version,
-                masterKeyWraps: [...keyVault.masterKeyWraps, wrap],
+                masterKeyWraps: [...keyVault.masterKeyWraps, pickMasterKeyWrap(wrap)],
             } as any,
             keyVault,
             { ignoreACL: true },
@@ -1150,8 +1184,8 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             {
                 uid: keyVault.uid,
                 version: (keyVault as any).version,
-                wrappedKeys: body.wrappedKeys,
-                masterKeyWraps: body.masterKeyWraps,
+                wrappedKeys: body.wrappedKeys.map(pickWrappedKey),
+                masterKeyWraps: body.masterKeyWraps.map(pickMasterKeyWrap),
                 masterKeyGeneration: (keyVault.masterKeyGeneration ?? 0) + 1,
             } as any,
             keyVault,

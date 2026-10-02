@@ -79,10 +79,22 @@ export abstract class DomainVerificationJob<D extends Domain> extends Background
         // `limit` is passed both via `options` and baked into the query object itself - the SQL backend's
         // query builder ignores `options.limit` and falls back to its own default of 100 unless the query
         // object itself carries it (confirmed the same way on `QuarantineRetentionJob.run()`).
+        // Never-checked domains first, then the longest-unchecked: every check stamps `lastCheckedAt`, so a domain that can never
+        // verify (a typo, an abandoned one) goes to the back of the line instead of holding a place in the first batch forever and
+        // starving the ones behind it. (Two queries because databases order a null `lastCheckedAt` differently.)
         const candidates: D[] = await this.domainRepo.find(
-            { enabled: true, verified: false, limit: this.batchSize } as any,
+            { enabled: true, verified: false, lastCheckedAt: "eq(null)", limit: this.batchSize } as any,
             { ignoreACL: true, limit: this.batchSize },
         );
+        if (candidates.length < this.batchSize) {
+            const remaining: number = this.batchSize - candidates.length;
+            candidates.push(
+                ...(await this.domainRepo.find(
+                    { enabled: true, verified: false, lastCheckedAt: "ne(null)", sort: { lastCheckedAt: "ASC", uid: "ASC" }, limit: remaining } as any,
+                    { ignoreACL: true, limit: remaining },
+                )),
+            );
+        }
 
         for (const domain of candidates) {
             try {
@@ -107,7 +119,28 @@ export abstract class DomainVerificationJob<D extends Domain> extends Background
                 }
             } catch (err: any) {
                 this.logger?.warn(`DomainVerificationJob: failed to check domain '${domain.name}': ${err.message}`);
+                await this.stampChecked(domain);
             }
+        }
+    }
+
+    /**
+     * Best-effort: records that `domain` was just looked at even though the check or its write threw, so a domain whose
+     * check keeps failing goes to the back of the line instead of holding its place in the batch forever. Re-reads the row
+     * so a version conflict on the first attempt does not stop the stamp.
+     */
+    private async stampChecked(domain: D): Promise<void> {
+        try {
+            const [fresh] = await this.domainRepo!.find({ uid: domain.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+            if (fresh && !fresh.verified) {
+                await this.domainRepo!.update(
+                    { uid: fresh.uid, version: fresh.version, lastCheckedAt: new Date() } as any,
+                    asEntity(this.domainRepo!, fresh),
+                    { version: fresh.version, ignoreACL: true },
+                );
+            }
+        } catch (err: any) {
+            this.logger?.warn(`DomainVerificationJob: could not record the check of domain '${domain.name}': ${err.message}`);
         }
     }
 }

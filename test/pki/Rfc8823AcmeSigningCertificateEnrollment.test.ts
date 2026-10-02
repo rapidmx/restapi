@@ -15,7 +15,7 @@ import * as os from "os";
 import * as path from "path";
 import * as x509 from "@peculiar/x509";
 import * as FileStoreUtils from "../../src/pki/FileStoreUtils.js";
-import { Rfc8823AcmeSigningCertificateEnrollment } from "../../src/pki/Rfc8823AcmeSigningCertificateEnrollment.js";
+import { MAX_ENROLLMENTS_PER_IDENTITY_PER_DAY, MAX_PENDING_ENROLLMENTS_PER_IDENTITY, Rfc8823AcmeSigningCertificateEnrollment } from "../../src/pki/Rfc8823AcmeSigningCertificateEnrollment.js";
 import { EnrollmentResult } from "../../src/pki/SigningCertificateEnrollment.js";
 import { ScanPipeline } from "../../src/scan/ScanPipeline.js";
 import { AvVerdict, SpamVerdict } from "../../src/models/types.js";
@@ -168,6 +168,74 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
         const status: EnrollmentResult = await enrollment.checkStatus(enrollmentId);
         expect(status).toEqual({ status: "pending", certificate: undefined, error: undefined });
         expect(FakeAcmeClient.createAccountCallCount).toBe(1);
+    });
+
+    it("Refuses another enrollment for an identity that already has the maximum pending, before any CA call is made.", async () => {
+        const identity = "flood@example.com";
+        for (let i = 0; i < MAX_PENDING_ENROLLMENTS_PER_IDENTITY; i++) {
+            await enrollment.startEnrollment(identity, await generateCsr(identity));
+        }
+        const createOrder = vi.spyOn(FakeAcmeClient.prototype, "createOrder");
+
+        await expect(enrollment.startEnrollment(identity, await generateCsr(identity))).rejects.toMatchObject({ status: 409 });
+        expect(createOrder).not.toHaveBeenCalled();
+        // Another identity is unaffected.
+        await expect(enrollment.startEnrollment("other@example.com", await generateCsr("other@example.com"))).resolves.toBeDefined();
+        createOrder.mockRestore();
+    });
+
+    it("Limits the enrollments started in a day for one address however many were cancelled, and in all, and under the store lock too.", async () => {
+        const identity = "loop@example.com";
+        for (let i = 0; i < MAX_ENROLLMENTS_PER_IDENTITY_PER_DAY; i++) {
+            const { enrollmentId } = await enrollment.startEnrollment(identity, await generateCsr(identity));
+            await enrollment.cancelEnrollment(enrollmentId, "cancelled by the owner");
+        }
+        const createOrder = vi.spyOn(FakeAcmeClient.prototype, "createOrder");
+        await expect(enrollment.startEnrollment(identity, await generateCsr(identity))).rejects.toMatchObject({ status: 429 });
+        expect(createOrder).not.toHaveBeenCalled();
+
+        // A burst whose requests all passed the first check: the one that finds the day's limit reached under the lock is refused.
+        const racing = enrollment as any;
+        const realLoad = racing.loadStore.bind(racing);
+        const loadStore = vi.spyOn(racing, "loadStore").mockImplementationOnce(async () => ({}));
+        await expect(enrollment.startEnrollment(identity, await generateCsr(identity))).rejects.toMatchObject({ status: 429 });
+        loadStore.mockRestore();
+        expect(Object.values(await realLoad()).filter((e: any) => e.identity === identity)).toHaveLength(MAX_ENROLLMENTS_PER_IDENTITY_PER_DAY);
+
+        // Records older than a day no longer count, and the total for the day is capped across addresses.
+        const storePath: string = path.join(racing.storeDir, "enrollments.json");
+        const store = JSON.parse(await fs.readFile(storePath, "utf8"));
+        const template = Object.values(store)[0] as any;
+        for (const record of Object.values(store)) {
+            record.createdAt = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+        }
+        for (let i = 0; i < 500; i++) {
+            store[`bulk-${i}`] = { ...template, identity: `bulk${i}@example.com`, status: "failed", createdAt: new Date().toISOString() };
+        }
+        await fs.writeFile(storePath, JSON.stringify(store));
+        await expect(enrollment.startEnrollment("fresh@example.com", await generateCsr("fresh@example.com"))).rejects.toMatchObject({ status: 429 });
+        delete store["bulk-0"];
+        await fs.writeFile(storePath, JSON.stringify(store));
+        await expect(enrollment.startEnrollment(identity, await generateCsr(identity))).resolves.toBeDefined();
+        createOrder.mockRestore();
+    });
+
+    it("Prunes finished enrollments past the retention period when starting a new one, keeping recent ones.", async () => {
+        const csr: string = await generateCsr("prune@example.com");
+        const { enrollmentId: first } = await enrollment.startEnrollment("prune@example.com", csr);
+        const storePath: string = path.join((enrollment as any).storeDir, "enrollments.json");
+        const store = JSON.parse(await fs.readFile(storePath, "utf8"));
+        const old = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
+        store.oldIssued = { ...store[first], status: "issued", createdAt: old };
+        store.recentIssued = { ...store[first], status: "issued", createdAt: new Date().toISOString() };
+        store.oldPending = { ...store[first], status: "pending", createdAt: old };
+        await fs.writeFile(storePath, JSON.stringify(store));
+
+        await enrollment.startEnrollment("prune2@example.com", await generateCsr("prune2@example.com"));
+
+        const after = JSON.parse(await fs.readFile(storePath, "utf8"));
+        expect(Object.keys(after)).not.toContain("oldIssued");
+        expect(Object.keys(after)).toEqual(expect.arrayContaining(["recentIssued", "oldPending", first]));
     });
 
     it("Rejects a CSR that cannot be parsed.", async () => {
@@ -640,6 +708,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
             await expect(enrollment.getIssuedMaterial(enrollmentId)).resolves.toEqual({
                 certificate: FakeAcmeClient.certificatePem,
                 wrappedKey,
+                createdAt: expect.any(String),
             });
         });
 
@@ -668,8 +737,10 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
             await expect(enrollment.getIssuedMaterial(enrollmentId)).resolves.toEqual({
                 certificate: FakeAcmeClient.certificatePem,
                 wrappedKey,
+                createdAt: expect.any(String),
                 mailboxUid: "mailbox-1",
                 masterKeyGeneration: 3,
+                createdAt: expect.any(String),
             });
             await expect(enrollment.describeEnrollment("does-not-exist")).rejects.toThrow(/No enrollment found/);
         });

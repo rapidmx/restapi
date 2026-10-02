@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { Raw } from "typeorm";
 import { AuditLogEntrySQL, ContactSQL, DomainSQL, FolderSQL, KeyVaultSQL, MailboxSQL } from "../../sql.js";
 import { BaseKeyLookupRoute } from "../BaseKeyLookupRoute.js";
+import { escapeLike, rawLike } from "./LikeUtils.js";
 
 export class KeyLookupRouteSQL extends BaseKeyLookupRoute<MailboxSQL, ContactSQL, FolderSQL> {
     protected mailboxClass: any = MailboxSQL;
@@ -17,8 +17,8 @@ export class KeyLookupRouteSQL extends BaseKeyLookupRoute<MailboxSQL, ContactSQL
     /** `MailboxSQL.aliasAddresses` is a serialized `simple-json` column - see `MailIngestRouteSQL.aliasQueryValue()`, whose
      * anchored, `ESCAPE`d LIKE this repeats so a `%`/`_` in an address can't turn the exact match into a wildcard one. */
     protected aliasQueryValue(address: string): any {
-        const escaped: string = address.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-        return Raw((alias) => `${alias} LIKE :pattern ESCAPE '\\'`, { pattern: `%"${escaped}"%` });
+        const escaped: string = escapeLike(address);
+        return rawLike(`%"${escaped}"%`);
     }
 
     /** See `ScanQueueJobSQL.contactEmailQuery()`'s identical doc comment - `emails` is a serialized
@@ -26,7 +26,7 @@ export class KeyLookupRouteSQL extends BaseKeyLookupRoute<MailboxSQL, ContactSQL
      * match an array element's field, with the address escaped so a literal `%`/`_` can't turn this intended
      * exact match into a wildcard one. */
     protected contactEmailQuery(address: string): any {
-        const escaped: string = address.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-        return { emails: Raw((alias) => `${alias} LIKE :pattern ESCAPE '\\'`, { pattern: `%"address":"${escaped}"%` }) };
+        const escaped: string = escapeLike(address);
+        return { emails: rawLike(`%"address":"${escaped}"%`) };
     }
 }

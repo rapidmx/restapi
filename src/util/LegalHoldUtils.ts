@@ -72,11 +72,10 @@ export async function loadLegalHoldIndex(objectFactory: ObjectFactory, matterCla
     };
 }
 
+/** Whether `matter`'s date range covers `referenceDate`. The bounds are coerced the same way wherever a range is read (a
+ * stored value can be a string), and one that can't be read as a date doesn't narrow the hold - it fails closed. */
 function matterCovers(matter: Matter, referenceDate: Date): boolean {
-    return (
-        referenceDate.getTime() >= new Date(matter.dateRangeStart).getTime() &&
-        referenceDate.getTime() <= new Date(matter.dateRangeEnd).getTime()
-    );
+    return !(referenceDate.getTime() < new Date(matter.dateRangeStart).getTime()) && !(referenceDate.getTime() > new Date(matter.dateRangeEnd).getTime());
 }
 
 /**
@@ -108,7 +107,7 @@ export async function findActiveHoldsFor(
         if (!referenceDate) {
             return true;
         }
-        return referenceDate.getTime() >= matter.dateRangeStart.getTime() && referenceDate.getTime() <= matter.dateRangeEnd.getTime();
+        return matterCovers(matter, referenceDate);
     });
 }
 

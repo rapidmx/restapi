@@ -64,6 +64,7 @@ export function backgroundSendSuite(ctx: BackgroundSendSuiteContext): void {
             expect(filed.folderUid).toBe(sent.uid);
             expect(filed.scheduledSendTime).toBeFalsy();
             expect(filed.scheduledSendRelayedAt).toBeFalsy();
+            expect(filed.sentByServerAt).toBeTruthy();
             expect(filed.scheduledSendLeaseExpiresAt).toBeFalsy();
             expect(filed.flags.read).toBe(true);
 
@@ -497,6 +498,7 @@ export function backgroundSendSuite(ctx: BackgroundSendSuiteContext): void {
             const filed = await ctx.findMessage(message.uid);
             expect(filed.folderUid).not.toBe(ctx.outboxUid());
             expect(filed.scheduledSendRelayedAt).toBeFalsy();
+            expect(filed.sentByServerAt).toBeTruthy();
             expect(sendEvents().map((event) => event.action)).toEqual(["send-succeeded"]);
         });
     });

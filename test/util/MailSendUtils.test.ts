@@ -423,6 +423,15 @@ describe("prepareOutboundMime() and seedReceiptStatus() Tests", () => {
         expect((await prepareOutboundMime({ raw, message, mailbox: { ...mailbox(), keys: null }, objectFactory: factoryWithDomains(), domainClass: class I {}, dnsResolver: dns })).raw).toBe(raw);
     });
 
+    it("announces the newest of several active encryption keys (latest notBefore), whatever their order", async () => {
+        const key = (publicKey: string, notBefore: number) => ({ useType: "encrypt", type: "x509", publicKey, notBefore, notAfter: Date.now() + 60_000 });
+        const send = async (keys: any[]) =>
+            (await prepareOutboundMime({ raw, message, mailbox: mailbox({ keys }), objectFactory: factoryWithDomains(), domainClass: class J {}, dnsResolver: new StaticDnsResolver() })).raw.toString();
+
+        expect(await send([key("T0xE", 100), key("TkVX", 200)])).toContain("keydata=TkVX");
+        expect(await send([key("TkVX", 200), key("T0xE", 100)])).toContain("keydata=TkVX");
+    });
+
     it("seeds one tracking row per distinct recipient, case variants collapsed", () => {
         expect(seedReceiptStatus(["A@Example.com", "b@example.com", "a@example.com"])).toEqual([
             { recipientAddress: "a@example.com" },

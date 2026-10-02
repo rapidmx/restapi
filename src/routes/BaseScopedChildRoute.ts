@@ -20,10 +20,10 @@ import { AuditAction, type CalendarShareLink } from "../models/types.js";
 import type { SearchEntityType, SearchProvider } from "../search/SearchProvider.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { coerceDateFields } from "../util/DateCoercionUtils.js";
-import { assertAdminScope, hasMailAccess, isAdminScope, isTrustedUser } from "../util/MailAccessUtils.js";
+import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS, hasMailAccess, isAdminScope, isTrustedUser } from "../util/MailAccessUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
-const { Inject } = ObjectDecorators;
+const { Config, Inject } = ObjectDecorators;
 const { Delete, Get, Head, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /**
@@ -137,6 +137,10 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * scoped as usual. */
     protected readonly trustedOnlyWrites: boolean = false;
 
+    /** How old an elevated token may be before it has to be elevated again, in seconds (`mail:security:elevation_max_age_seconds`, 0 = no limit). */
+    @Config("mail:security:elevation_max_age_seconds", DEFAULT_ELEVATION_MAX_AGE_SECONDS)
+    protected elevationMaxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS;
+
     /** When `true`, a trusted AND elevated caller may read any mailbox's records with `?scope=admin` and (on a
      * `trustedOnlyWrites` route) write them, each call audited - for records the platform produces about mail flow
      * (`IngestQueueEntry`, `QuarantineEntry`) that an administrator reviews. Off everywhere else: an administrator has no
@@ -161,6 +165,13 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
     /** Fields only server-side code sets. Dropped from a non-trusted caller's create/update body, so a full object
      * round-tripped back keeps the stored values. */
     protected readonly serverManagedFields: readonly string[] = [];
+
+    /** Fields dropped from EVERY caller's create/update body, a trusted one's included (the blob keys: a stored key is read back
+     * by `content()`/`download()` and deleted with its record, so no body may be able to name another record's object). */
+    protected readonly alwaysStrippedFields: readonly string[] = [];
+
+    /** `true` on a route whose records only the server creates (ingest/quarantine entries): `POST` answers 403 for every caller. */
+    protected readonly createRefused: boolean = false;
 
     /** Top-level `Date` fields of `T`, coerced to real `Date`s (400 if unparseable) on every create and update - the
      * Mongo backend otherwise stores a JSON body's ISO string as-is. See `util/DateCoercionUtils.ts`. */
@@ -190,7 +201,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!this.adminScope || !isAdminScope(query)) {
             return false;
         }
-        assertAdminScope(user, this.trustedRoles);
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         return true;
     }
 
@@ -216,8 +227,11 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         }
     }
 
-    /** Drops `serverManagedFields` from a non-trusted caller's body. */
+    /** Drops `alwaysStrippedFields` from every caller's body and `serverManagedFields` from a non-trusted caller's. */
     protected stripServerManagedFields(obj: any, user: JWTUser | undefined): void {
+        for (const field of this.alwaysStrippedFields) {
+            delete obj[field];
+        }
         if (this.isTrusted(user)) {
             return;
         }
@@ -356,7 +370,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (this.adminScope && this.trustedOnlyWrites && isTrustedUser(user, this.trustedRoles)) {
             // The records of an `adminScope` route are written only by trusted callers (see `requireTrustedWrite()`), who
             // need no grant on the mailbox for it - but must hold an elevated token, and every write is audited.
-            assertAdminScope(user, this.trustedRoles);
+            assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
             await this.auditAdminAccess(user, action, scopeUid);
             return;
         }
@@ -383,8 +397,10 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * a hard, permanent delete, see `truncate()`'s own doc comment - so skipping this check there would
      * let a caller destroy held records simply by preferring the bulk endpoint over the equivalent
      * one-at-a-time `delete(..., { purge: true })` calls). `user` is the caller, for an override that words its refusal by who is asking.
+     * `context` is one object shared by every call of a single `truncate()`, for an override to keep what it loaded once (the open matters)
+     * rather than loading it again for every record.
      */
-    protected async checkLegalHold(existing: T, user?: JWTUser): Promise<void> {
+    protected async checkLegalHold(existing: T, user?: JWTUser, context?: Record<string, unknown>): Promise<void> {
         // no-op by default
     }
 
@@ -434,11 +450,16 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * really in, simply by setting `mailboxUid` in a create/update body to something other than its real
      * folder's mailbox.
      */
-    protected async resolveMailboxUidFor(scopeUid: string): Promise<string | undefined> {
-        return undefined;
+    protected async resolveMailboxUidFor(scopeUid: string, rejectDeleted?: boolean): Promise<string | null | undefined> {
+        return null;
     }
 
-    private async enforceMailboxUid(obj: any, scopeUid: string | undefined): Promise<void> {
+    /** Force-sets `obj.mailboxUid` from the scope (`resolveMailboxUidFor()`). A route that resolves it but finds no such folder - or, with
+     * `rejectDeleted` (a create, or a move into another folder), a soft-deleted one - fails closed (404) rather than keeping the
+     * client's own `mailboxUid`. With `unchangedScope` (an update that leaves the record in the folder it is in) a folder that no longer
+     * exists at all is no reason to refuse the update - the record is still where it was, and the client's `mailboxUid` is dropped, so the
+     * stored one stays: otherwise a message whose folder was purged could never be edited or moved out again. */
+    private async enforceMailboxUid(obj: any, scopeUid: string | undefined, rejectDeleted: boolean, unchangedScope: boolean = false): Promise<void> {
         /* v8 ignore if -- unreachable via real usage: both call sites (`create()`/`update()`) only reach
            this method after their own `requirePermission()` call already threw on a falsy scope, so
            `scopeUid` is always truthy by the time it gets here. The `string | undefined` parameter type
@@ -447,10 +468,18 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (scopeUid === undefined) {
             return;
         }
-        const mailboxUid: string | undefined = await this.resolveMailboxUidFor(scopeUid);
-        if (mailboxUid !== undefined) {
-            obj.mailboxUid = mailboxUid;
+        const mailboxUid: string | null | undefined = await this.resolveMailboxUidFor(scopeUid, rejectDeleted);
+        if (mailboxUid === null) {
+            return;
         }
+        if (mailboxUid === undefined) {
+            if (unchangedScope) {
+                delete obj.mailboxUid;
+                return;
+            }
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        obj.mailboxUid = mailboxUid;
     }
 
     protected notify(scopeUid: string | undefined, action: "create" | "update" | "delete", data: any): void {
@@ -505,13 +534,19 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
     @Post()
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         this.requireTrustedWrite(user);
+        if (this.createRefused) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
         if (objs.some((single) => !single || typeof single !== "object" || Array.isArray(single))) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
+        if (objs.length > MAX_BULK_UPDATE) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A bulk create may carry at most ${MAX_BULK_UPDATE} objects.`);
+        }
         for (const single of objs) {
             await this.requirePermission(this.scopeUidOf(single), user, ACLAction.CREATE);
-            await this.enforceMailboxUid(single, this.scopeUidOf(single));
+            await this.enforceMailboxUid(single, this.scopeUidOf(single), true);
             // Always a server-minted uid - see this class's doc comment. `_id` (which would replace another document
             // on Mongo), `version`/`dateCreated`/`dateModified` and path keys are never the client's either.
             delete (single as any).uid;
@@ -687,8 +722,9 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             return;
         }
         try {
+            const holdContext: Record<string, unknown> = {};
             for (const existing of matched) {
-                await this.checkLegalHold(existing, user);
+                await this.checkLegalHold(existing, user, holdContext);
             }
         } catch (err) {
             await this.onTruncateRefused(scopeUid!, matched.length, err, user, req);
@@ -774,7 +810,12 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         // something else entirely - `resolveMailboxUidFor()`'s doc comment explains why that must never be
         // trusted). An update that touches neither skips this entirely, same cost as before this fix.
         if (newScopeUid !== undefined || "mailboxUid" in (obj as any)) {
-            await this.enforceMailboxUid(obj, newScopeUid !== undefined ? newScopeUid : this.scopeUidOf(existing));
+            await this.enforceMailboxUid(
+                obj,
+                newScopeUid !== undefined ? newScopeUid : this.scopeUidOf(existing),
+                newScopeUid !== undefined && newScopeUid !== this.scopeUidOf(existing),
+                newScopeUid === undefined || newScopeUid === this.scopeUidOf(existing),
+            );
         }
 
         // Moving a record to another mailbox takes it out of its mailbox's legal hold (holds, erasure and retention all

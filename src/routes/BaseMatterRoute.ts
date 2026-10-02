@@ -18,7 +18,7 @@ import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { coerceDateFields, MATTER_DATE_FIELDS } from "../util/DateCoercionUtils.js";
 import { exactInFilter, findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
-import { AuditAction, Matter } from "../models/types.js";
+import { AuditAction, Mailbox, Matter } from "../models/types.js";
 const { Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** Validates the parts of a `Matter` a client can actually set, against the merged (existing + patch, for
@@ -104,6 +104,39 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
      * `EscrowAccessRequest`s without depending on either backend directly. */
     protected abstract escrowAccessRequestClass: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so a matter's custodian mailboxes can be checked against its escrow scope. */
+    protected abstract mailboxClass: any;
+
+    private mailboxRepo?: RepoUtils<Mailbox>;
+
+    /**
+     * Refuses (400) a matter naming a custodian mailbox that doesn't exist or isn't assigned to the matter's own escrow scope
+     * (`Mailbox.escrowScopeId`). A hold is read from `custodianMailboxUids` alone and blocks every purge, truncate, erasure and retention job on
+     * the mailbox, so without this a holder of any one scope could put a hold on any mailbox in the deployment - one only the holders of that scope
+     * could then lift. (Matter search and export check the same agreement per custodian when they read.)
+     */
+    private async assertCustodiansInScope(custodianMailboxUids: unknown, escrowScopeId: string, current?: readonly string[]): Promise<void> {
+        if (!Array.isArray(custodianMailboxUids)) {
+            return;
+        }
+        // On an update only the mailboxes being added are judged: one the matter already holds (whose mailbox was deleted or moved to another scope
+        // since) is no reason to refuse an update that round-trips the list unchanged - only removing it from the list is the holder's to do.
+        const already: Set<string> = new Set(current ?? []);
+        if (!this.mailboxRepo) {
+            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
+        }
+        for (const uid of new Set((custodianMailboxUids as string[]).filter((uid) => !already.has(uid)))) {
+            const mailbox: Mailbox | undefined = await this.mailboxRepo.findOne(uid, { ignoreACL: true });
+            if (!mailbox || mailbox.escrowScopeId !== escrowScopeId) {
+                throw new ApiError(
+                    ApiErrors.INVALID_REQUEST,
+                    400,
+                    "Every custodian mailbox must exist and be assigned to the matter's escrow scope.",
+                );
+            }
+        }
+    }
+
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
         for (const o of objs) {
@@ -121,6 +154,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, o.escrowScopeId, user);
             coerceDateFields(o, MATTER_DATE_FIELDS);
             validateMatter(o);
+            await this.assertCustodiansInScope(o.custodianMailboxUids, o.escrowScopeId);
         }
 
         const created: T[] = Array.isArray(obj)
@@ -190,6 +224,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         }
         coerceDateFields(obj, MATTER_DATE_FIELDS);
         validateMatter({ ...existing, ...obj });
+        await this.assertCustodiansInScope((obj as any).custodianMailboxUids, existing.escrowScopeId, existing.custodianMailboxUids);
 
         const updated: T = await this.repoUtils!.update(obj, existing, { user, version: (obj as any).version, ignoreACL: true });
 
@@ -249,6 +284,9 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             obj = coerceDateFields({ [propertyName]: obj }, MATTER_DATE_FIELDS)[propertyName];
         }
         validateMatter({ ...existing, [propertyName]: obj });
+        if (propertyName === "custodianMailboxUids") {
+            await this.assertCustodiansInScope(obj, existing.escrowScopeId, existing.custodianMailboxUids);
+        }
 
         const updated: T = await this.repoUtils!.update(
             { uid: existing.uid, version: (existing as any).version, [propertyName]: obj } as any,

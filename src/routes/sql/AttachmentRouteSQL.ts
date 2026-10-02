@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { AttachmentSQL, MailboxSQL, MessageSQL } from "../../sql.js";
+import { AttachmentSQL, IngestQueueEntrySQL, MailboxSQL, MatterSQL, MessageSQL, QuarantineEntrySQL } from "../../sql.js";
 import { BaseAttachmentRoute } from "../BaseAttachmentRoute.js";
 const { Model } = RouteDecorators;
 
@@ -12,4 +12,7 @@ export class AttachmentRouteSQL extends BaseAttachmentRoute<AttachmentSQL, Messa
     protected readonly repoUtilsClass: any = RepoUtils;
     protected messageClass: any = MessageSQL;
     protected mailboxClass: any = MailboxSQL;
+    protected matterClass: any = MatterSQL;
+    protected quarantineEntryClass: any = QuarantineEntrySQL;
+    protected ingestQueueEntryClass: any = IngestQueueEntrySQL;
 }

@@ -54,16 +54,16 @@ export class RspamdSpamScanProvider implements SpamScanProvider {
     public async scoreMessage(raw: Buffer, envelope: ScanEnvelope): Promise<SpamScanResult> {
         const headers: Record<string, string> = {
             "Content-Type": "application/octet-stream",
-            From: envelope.from,
+            From: headerValue(envelope.from),
         };
         if (envelope.to.length > 0) {
-            headers["Rcpt"] = envelope.to.join(",");
+            headers["Rcpt"] = headerValue(envelope.to.join(","));
         }
         if (envelope.remoteIp) {
-            headers["IP"] = envelope.remoteIp;
+            headers["IP"] = headerValue(envelope.remoteIp);
         }
         if (envelope.helo) {
-            headers["Helo"] = envelope.helo;
+            headers["Helo"] = headerValue(envelope.helo);
         }
 
         const controller = new AbortController();
@@ -145,16 +145,25 @@ export class RspamdSpamScanProvider implements SpamScanProvider {
     }
 }
 
+/** The longest header value sent (RFC 5322's line limit). */
+const MAX_HEADER_VALUE_LENGTH = 998;
+
+/** An envelope value as an HTTP header value `fetch` accepts: printable ASCII only (anything else - an internationalized address
+ * - becomes `?`, which keeps the scan running rather than throwing and sending the message to Junk) and bounded in length. */
+function headerValue(value: string): string {
+    return value.replace(/[^\x20-\x7E]/g, "?").slice(0, MAX_HEADER_VALUE_LENGTH);
+}
+
 function mapAction(action: RspamdCheckV2Response["action"]): SpamVerdict {
     switch (action) {
         case "reject":
         case "soft reject":
             return SpamVerdict.SPAM;
-        case "add header":
-        case "rewrite subject":
-        case "greylist":
-            return SpamVerdict.SUSPECT;
-        default:
+        case "no action":
             return SpamVerdict.CLEAN;
+        // `add header`, `rewrite subject`, `greylist` - and any action a newer rspamd adds (`quarantine`, `discard`), which is
+        // not known to be clean and so is not delivered as if it were.
+        default:
+            return SpamVerdict.SUSPECT;
     }
 }

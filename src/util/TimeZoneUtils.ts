@@ -15,6 +15,11 @@ export function isValidTimeZone(zone: unknown): zone is string {
     if (typeof zone !== "string" || zone.length === 0 || zone.length > 64) {
         return false;
     }
+    // Newer runtimes' `Intl` also accepts offset zones (`+03:00`) and any capitalisation of a name; an IANA name's every segment
+    // starts with a capital letter (`America/Port-au-Prince`, `Etc/GMT+3`, `UTC`), so one that doesn't isn't one.
+    if (!zone.split("/").every((segment) => /^[A-Z]/.test(segment))) {
+        return false;
+    }
     try {
         new Intl.DateTimeFormat("en-US", { timeZone: zone });
         return true;

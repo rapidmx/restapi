@@ -292,7 +292,9 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
 
     private async buildDocument(message: M, indexedAttachmentUids?: Set<string>): Promise<SearchDocument> {
         const raw: Buffer = await this.blobStore!.get(message.bodyBlobKey);
-        const parsed: ParsedMail = await simpleParser(raw);
+        // `skipImageLinks`: otherwise a related image is inlined into the HTML as a `data:` URI - base64 of the whole image, which
+        // is what would be indexed (and held in memory) for an HTML-only message.
+        const parsed: ParsedMail = await simpleParser(raw, { skipImageLinks: true });
         // An S/MIME-encrypted body is ciphertext to this server - indexing it (or any attachment text
         // extracted from inside it) would only ever put garbage into the index, not a privacy leak by itself,
         // but garbage nonetheless. `Message.subject`/`participants`/`dateForSort` below are unaffected: they

@@ -199,3 +199,19 @@ describe("mergeBusyIntervals() Tests", () => {
         expect(mergeBusyIntervals([], WINDOW_START, WINDOW_END)).toEqual([]);
     });
 });
+
+describe("computeBusyIntervals() with a truncated expansion", () => {
+    it("Counts the whole window busy when the expansion was cut short or the rule is unusable, instead of free.", () => {
+        const start = new Date("2026-06-01T00:00:00.000Z");
+        const end = new Date("2026-06-08T00:00:00.000Z");
+        for (const rule of [
+            { freq: RecurrenceFrequency.DAILY, interval: 1, count: 0, exceptions: [] },
+            // A COUNT walk that cannot reach the window within the period cap.
+            { freq: RecurrenceFrequency.DAILY, interval: 1, count: 100_000, exceptions: [] },
+        ]) {
+            const event = makeEvent({ startDate: new Date("1800-01-01T13:00:00.000Z"), endDate: new Date("1800-01-01T14:00:00.000Z"), recurrenceRule: rule });
+            const busy = computeBusyIntervals([event], start, end);
+            expect(busy.some((b) => b.start.getTime() <= start.getTime() && b.end.getTime() >= end.getTime()), JSON.stringify(rule)).toBe(true);
+        }
+    });
+});

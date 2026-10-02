@@ -48,6 +48,13 @@ describe("inspectZipArchive() Tests", () => {
         expect(result.reason).toMatch(/declared uncompressed size/);
     });
 
+    it("Rejects a central directory with more records than the entry count it declares (JSZip reads on until the signature stops).", () => {
+        const lying = buildZip([{ name: "a", uncompressed: 1 }, { name: "b", uncompressed: 1 << 28 }, { name: "c", uncompressed: 1 << 28 }], { totalEntries: 1 });
+        const result = inspectZipArchive(lying, 1000);
+        expect(result.ok).toBe(false);
+        expect(result.reason).toMatch(/more entries than it declares/);
+    });
+
     it("Rejects too-small and non-ZIP content.", () => {
         expect(inspectZipArchive(Buffer.from("tiny"), 1000).reason).toMatch(/too small/);
         expect(inspectZipArchive(Buffer.alloc(100, 1), 1000).reason).toMatch(/no end of central directory/);

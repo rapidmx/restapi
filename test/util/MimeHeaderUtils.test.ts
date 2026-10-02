@@ -128,6 +128,28 @@ describe("MimeHeaderUtils Tests", () => {
         });
     });
 
+    describe("Where the header block ends", () => {
+        it("Ends it at a blank line whichever way the breaks before it are written, and keeps the body byte for byte.", () => {
+            const body = "From: kept@example.com\r\nReply-To: kept@example.com\r\n\r\nline  \r\n";
+            for (const boundary of ["\r\n\r\n", "\n\n", "\n\r\n", "\r\n\n", "\r\r"]) {
+                const raw = Buffer.from(`From: a@example.com\r\nSubject: S${boundary}${body}`, "binary");
+                expect(extractHeader(raw, "Subject"), JSON.stringify(boundary)).toBe("S");
+                expect(extractHeader(raw, "Reply-To"), JSON.stringify(boundary)).toBeUndefined();
+                const out = prependHeaders(raw, [{ name: "X-Tag", value: "1" }]);
+                expect(out.toString("binary").endsWith(`\r\n\r\n${body}`), JSON.stringify(boundary)).toBe(true);
+                const relayed = prepareRelayCopy(raw, { trustedAuthservId: "mx.example.com", rewriteFrom: { address: "list@ours.example" } })!;
+                expect(relayed.toString("binary").endsWith(`\r\n\r\n${body}`), JSON.stringify(boundary)).toBe(true);
+            }
+        });
+
+        it("Reads a header with whitespace before its colon, as the relay and originator checks do, and a message of headers only.", () => {
+            expect(extractHeader(Buffer.from("Message-ID : <a@b>\r\nX: y\r\n\r\nBody"), "message-id")).toBe("<a@b>");
+            expect(extractHeaders(Buffer.from("Message-ID : <a@b>\r\nMessage-ID: <c@d>\r\n\r\n"), "Message-ID")).toEqual(["<a@b>", "<c@d>"]);
+            expect(extractHeader(Buffer.from("Subject: only headers"), "Subject")).toBe("only headers");
+            expect(prependHeaders(Buffer.from("Subject: only headers"), [{ name: "X-A", value: "1" }]).toString("binary")).toBe("X-A: 1\r\nSubject: only headers\r\n\r\n");
+        });
+    });
+
     describe("prependHeaders()", () => {
         it("Prepends each given header ahead of the existing ones, preserving the body.", () => {
             const raw = Buffer.from("From: sender@example.com\r\nSubject: Hi\r\n\r\nBody text\r\n");

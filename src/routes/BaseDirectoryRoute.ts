@@ -108,9 +108,9 @@ export function escapeDirectoryRegExp(value: string): string {
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Escapes `value` for a SQL `LIKE ... ESCAPE '\'` pattern, so `%` and `_` only ever match themselves. */
+/** Escapes `value` for a SQL `LIKE ... ESCAPE '!'` pattern (`routes/sql/LikeUtils.ts`: a backslash escape isn't valid on MySQL), so `%` and `_` only ever match themselves. */
 export function escapeDirectoryLike(value: string): string {
-    return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+    return value.replace(/[!%_]/g, (ch) => `!${ch}`);
 }
 
 /** Sorts entries whose name or address starts with the whole query first, then by name and address; drops repeated

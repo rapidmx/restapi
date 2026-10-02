@@ -242,7 +242,7 @@ export function mailAdminScopeSuite(ctx: MailAccessMatrixContext): void {
     });
 
     describe("Quarantine and the ingest queue (administration scope, audited)", () => {
-        it("Lets an administrator count, check, create and delete a mailbox's entries only with a trusted, elevated token - each call audited.", async () => {
+        it("Lets an administrator count, check and delete a mailbox's entries only with a trusted, elevated token - each call audited.", async () => {
             const { mailbox: m } = await mailbox();
             const entry = await ctx.store().save("QuarantineEntry", { mailboxUid: m.uid, reason: QuarantineReason.SPAM_POLICY, scanResultUid: uuid.v4(), rawBlobKey: "raw/x" });
             const base = url("/quarantine");
@@ -252,16 +252,17 @@ export function mailAdminScopeSuite(ctx: MailAccessMatrixContext): void {
             expect((await auth(request(ctx.app()).head(`${base}/${entry.uid}?scope=admin`), admin)).status).toBe(200);
             expect((await auth(request(ctx.app()).head(`${base}/${entry.uid}`), admin)).status).toBe(404);
 
-            const created = await auth(request(ctx.app()).post(base), admin).send({ mailboxUid: m.uid, reason: QuarantineReason.SPAM_POLICY, scanResultUid: uuid.v4(), rawBlobKey: "raw/y" });
-            expect(created.status).toBeLessThan(300);
-            expect((await auth(request(ctx.app()).delete(`${base}/${created.body.uid}?purge=true`), admin)).status).toBeLessThan(300);
+            // Entries are the scan pipeline's own: not even an elevated administrator creates one (it would carry a blob key of their choosing).
+            expect((await auth(request(ctx.app()).post(base), admin).send({ mailboxUid: m.uid, reason: QuarantineReason.SPAM_POLICY, scanResultUid: uuid.v4(), rawBlobKey: "raw/y" })).status).toBe(403);
+            const second = await ctx.store().save("QuarantineEntry", { mailboxUid: m.uid, reason: QuarantineReason.SPAM_POLICY, scanResultUid: uuid.v4(), rawBlobKey: "raw/y" });
+            expect((await auth(request(ctx.app()).delete(`${base}/${second.uid}?purge=true`), admin)).status).toBeLessThan(300);
             // Without elevation the write is refused, and an ordinary user can't write at all.
             expect((await auth(request(ctx.app()).delete(`${base}/${entry.uid}?purge=true`), unelevatedAdmin)).status).toBe(403);
             expect((await auth(request(ctx.app()).delete(`${base}/${entry.uid}?purge=true`), owner)).status).toBe(403);
             expect((await ctx.store().find("QuarantineEntry", { uid: entry.uid })).length).toBe(1);
 
             const operations = (await audit("mail_queue.admin_access", { mailboxUid: m.uid })).map((e: any) => e.details.operation);
-            expect(operations).toEqual(expect.arrayContaining(["count", "exists", "create", "delete"]));
+            expect(operations).toEqual(expect.arrayContaining(["count", "exists", "delete"]));
         });
     });
 

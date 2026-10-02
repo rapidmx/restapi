@@ -22,6 +22,22 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 const TABLE_NAME = "mail_search_index";
 
+/** The columns added to the table after its first version, and their types - see `init()`. */
+const ADDED_COLUMNS: [string, string][] = [
+    ["from_address", "varchar(320)"],
+    ["to_addresses", "text[]"],
+    ["cc_addresses", "text[]"],
+    ["folder_uid", "varchar(64)"],
+    ["flags", "text[]"],
+    ["label_uids", "text[]"],
+    ["has_attachments", "boolean"],
+    ["metadata_only", "boolean"],
+];
+
+/** `term` with the characters `LIKE` gives a meaning to (`%`, `_` and the escape character `\\`) escaped, so that it matches itself only. */
+function escapeLikeTerm(term: string): string {
+    return term.replace(/[\\%_]/g, "\\$&");
+}
 /**
  * The per-document free-text budget for this provider - a quarter of `MAX_SEARCH_DOCUMENT_TEXT_CHARS`, because
  * Postgres's own `tsvector` type is hard-capped at 1MB and `to_tsvector()` raises an error (failing that
@@ -66,7 +82,7 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
             CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
                 entity_type varchar(32) NOT NULL,
                 entity_uid varchar(64) NOT NULL,
-                mailbox_uid varchar(64) NOT NULL,
+                mailbox_uid varchar(320) NOT NULL,
                 subject text,
                 body text,
                 attachment_text text,
@@ -76,20 +92,25 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
                 PRIMARY KEY (entity_type, entity_uid)
             )
         `);
-        // `ADD COLUMN IF NOT EXISTS` rather than folding these into the `CREATE TABLE` above - that statement
-        // is a no-op against a table an earlier version of this provider already created, so a deployment
-        // upgrading from before these columns existed would otherwise never get them.
-        await this.dataSource.query(`
-            ALTER TABLE ${TABLE_NAME}
-                ADD COLUMN IF NOT EXISTS from_address varchar(320),
-                ADD COLUMN IF NOT EXISTS to_addresses text[],
-                ADD COLUMN IF NOT EXISTS cc_addresses text[],
-                ADD COLUMN IF NOT EXISTS folder_uid varchar(64),
-                ADD COLUMN IF NOT EXISTS flags text[],
-                ADD COLUMN IF NOT EXISTS label_uids text[],
-                ADD COLUMN IF NOT EXISTS has_attachments boolean,
-                ADD COLUMN IF NOT EXISTS metadata_only boolean
-        `);
+        // Columns added after the table first existed, which the `CREATE TABLE` above (a no-op against a table an earlier version
+        // already created) would never give a deployment upgrading from before them. The same goes for `mailbox_uid`, which is a
+        // mailbox's address (up to 320 characters) and was created as `varchar(64)`. `ALTER TABLE` takes an exclusive lock on the
+        // table even when it changes nothing, so it runs only when the catalog says something is missing or too narrow - not on every
+        // start of every replica.
+        const existing: { column_name: string; character_maximum_length: number | null }[] = await this.dataSource.query(
+            `SELECT column_name, character_maximum_length FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1`,
+            [TABLE_NAME],
+        );
+        const have: Map<string, number | null> = new Map((existing ?? []).map((column) => [column.column_name, column.character_maximum_length]));
+        const changes: string[] = have.get("mailbox_uid") === 320 ? [] : ["ALTER COLUMN mailbox_uid TYPE varchar(320)"];
+        for (const [column, type] of ADDED_COLUMNS) {
+            if (!have.has(column)) {
+                changes.push(`ADD COLUMN IF NOT EXISTS ${column} ${type}`);
+            }
+        }
+        if (changes.length > 0) {
+            await this.dataSource.query(`ALTER TABLE ${TABLE_NAME} ${changes.join(", ")}`);
+        }
         await this.dataSource.query(
             `CREATE INDEX IF NOT EXISTS mail_search_index_vector ON ${TABLE_NAME} USING GIN (search_vector)`,
         );
@@ -263,7 +284,8 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
 
         const limitParam = this.addParam(params, limit + 1);
         const offsetParam = this.addParam(params, offset);
-        const orderBy = query.text ? "rank DESC" : "date_for_sort DESC NULLS LAST";
+        // Ties are broken by the row's identity, so paging with `OFFSET` can neither repeat nor skip a hit between pages.
+        const orderBy = `${query.text ? "rank DESC" : "date_for_sort DESC NULLS LAST"}, entity_type, entity_uid`;
 
         const rows: { entity_type: SearchEntityType; entity_uid: string; rank: number; metadata_only: boolean | null }[] =
             await this.dataSource.query(
@@ -307,7 +329,7 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
             // `participants` is a space-joined string, not an array column - `&&` overlap semantics aren't
             // available, so this matches any one of the requested participant terms appearing in it verbatim.
             const orTerms: string[] = query.participants.map((term) => {
-                const p = this.addParam(params, term);
+                const p = this.addParam(params, escapeLikeTerm(term));
                 return `participants ILIKE '%' || $${p} || '%'`;
             });
             conditions.push(`(${orTerms.join(" OR ")})`);
@@ -340,7 +362,7 @@ export class PostgresFullTextSearchProvider implements SearchProvider {
             `SELECT entity_type, entity_uid
              FROM ${TABLE_NAME}
              WHERE ${conditions.join(" AND ")}
-             ORDER BY date_for_sort DESC NULLS LAST
+             ORDER BY date_for_sort DESC NULLS LAST, entity_type, entity_uid
              LIMIT $${limitParam} OFFSET $${offsetParam}`,
             params,
         );

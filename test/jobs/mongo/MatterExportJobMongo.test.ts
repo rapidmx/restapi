@@ -147,6 +147,11 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
         vi.restoreAllMocks();
     });
 
+    beforeEach(() => {
+        // Every request below is attested straight away; the grace period that keeps replicas apart has its own tests.
+        (job as any).attestationGraceSeconds = -1;
+    });
+
     it("Exposes the configured cron schedule.", () => {
         expect(job.schedule).toBe(config.get("mail:jobs:matter_export:schedule"));
     });
@@ -461,10 +466,122 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
         expect(updated!.status).toBe("ready");
         expect(updated!.blobKey).toBeTruthy();
 
-        // mailboxA's own attestation failed and was not retried; mailboxB's own later attestation still
-        // succeeded despite mailboxA's failure not blocking the rest of the loop.
+        // mailboxA's own attestation failed; mailboxB's own later attestation still succeeded despite mailboxA's
+        // failure not blocking the rest of the loop. A's stays on the request as still owed.
         const entries = await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_READY }).toArray();
         expect(entries.map((e) => e.mailboxUid)).toEqual([mailboxB.uid]);
+        expect(updated!.pendingAttestationMailboxUids).toEqual([mailboxA.uid]);
+
+        // The next run records what is still owed, and clears it.
+        vi.restoreAllMocks();
+        await job.run();
+
+        const attested = await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_READY }).toArray();
+        expect(attested.map((e) => e.mailboxUid).sort()).toEqual([mailboxA.uid, mailboxB.uid].sort());
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.pendingAttestationMailboxUids ?? null).toBeNull();
+
+        // And nothing is recorded twice.
+        await job.run();
+        expect((await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_READY }).toArray()).length).toBe(2);
+    });
+
+    it("Logs an error, and leaves the export marked as owing, when recording what it still owes fails.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId });
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailbox.uid] });
+        const request = await createRequest({ matterId: matter.uid, status: "ready", blobKey: "matter-exports/x-1.ndjson", pendingAttestationMailboxUids: [mailbox.uid] });
+        const error = vi.spyOn((job as any).logger, "error");
+        const update = vi.spyOn((job as any).requestRepo, "update").mockRejectedValue(new Error("simulated update failure"));
+        try {
+            await expect((job as any).attestPending(request)).resolves.toBeUndefined();
+        } finally {
+            update.mockRestore();
+        }
+        expect(error).toHaveBeenCalledWith(expect.stringContaining("simulated update failure"));
+    });
+
+    it("Records the attestations a ready export still owes (the run that made it ready died before recording them).", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId });
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailbox.uid] });
+        const request = await createRequest({ matterId: matter.uid, status: "ready", blobKey: "matter-exports/x-1.ndjson", pendingAttestationMailboxUids: [mailbox.uid] });
+
+        await job.run();
+
+        const entries = await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_READY }).toArray();
+        expect(entries.map((e) => [e.mailboxUid, e.requestId])).toEqual([[mailbox.uid, request.uid]]);
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.pendingAttestationMailboxUids ?? null).toBeNull();
+    });
+
+    it("Leaves the attestations of a freshly ready export to the replica that made it ready, and records them once only when two replicas race for an overdue one.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId });
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailbox.uid] });
+        const request = await createRequest({ matterId: matter.uid, status: "ready", blobKey: "matter-exports/x-1.ndjson", pendingAttestationMailboxUids: [mailbox.uid] });
+        const attestations = async (): Promise<number> => (await escrowAuditLogRepo.find({ action: EscrowAuditAction.MATTER_EXPORT_READY }).toArray()).length;
+
+        // Just touched: still inside the grace period, so another replica's tick leaves it alone.
+        (job as any).attestationGraceSeconds = 300;
+        await job.run();
+        expect(await attestations()).toBe(0);
+
+        // Overdue, and two replicas read it at the same time: only the one whose claim wins records anything.
+        (job as any).attestationGraceSeconds = -1;
+        // Both replicas read the row before either claimed it (the second one's read is stale by the time it claims).
+        const repoUtils = (job as any).requestRepo;
+        const stale = await repoUtils.find({ uid: request.uid, limit: 1 }, { ignoreACL: true, limit: 1 });
+        vi.spyOn(repoUtils, "find").mockResolvedValue(stale);
+        await (job as any).attestOwed();
+        await (job as any).attestOwed();
+        expect(await attestations()).toBe(1);
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.pendingAttestationMailboxUids ?? null).toBeNull();
+    });
+
+    it("Includes the custodian's soft-deleted messages (tagged deleted) and their retained draft bodies, but only those in the matter's date range.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailbox = await createMailbox({ escrowScopeId });
+        const matter = await createMatter({
+            escrowScopeId,
+            custodianMailboxUids: [mailbox.uid],
+            dateRangeStart: new Date("2026-03-01"),
+            dateRangeEnd: new Date("2026-03-31"),
+        });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const retained = `bodies/${uuid.v4()}`;
+        await blobStore.put(retained, Buffer.from(["Subject: deleted draft v1", "", "first"].join(String.fromCharCode(13, 10))));
+        const message = (subject: string, sentDate: string, extra: any = {}) =>
+            messageRepo.save(
+                new MessageMongo({
+                    mailboxUid: mailbox.uid,
+                    folderUid: uuid.v4(),
+                    messageId: `${uuid.v4()}@example.com`,
+                    subject,
+                    from: { address: "alice@example.com", type: RecipientType.TO },
+                    recipients: [],
+                    sentDate: new Date(sentDate),
+                    receivedDate: new Date(sentDate),
+                    bodyBlobKey: `bodies/${uuid.v4()}`,
+                    flags: { read: false, flagged: false, answered: false, forwarded: false },
+                    references: [],
+                    hasAttachments: false,
+                    ...extra,
+                }),
+            );
+        await message("Live", "2026-03-10");
+        const deleted = await message("Deleted", "2026-03-11", { retainedBodyBlobKeys: [retained] });
+        const deletedOutOfRange = await message("Deleted out of range", "2026-05-11");
+        await messageRepo.updateMany({ uid: { $in: [deleted.uid, deletedOutOfRange.uid] } } as any, { $set: { deleted: true } });
+        const request = await createRequest({ matterId: matter.uid });
+
+        await job.run();
+
+        const updated = await requestRepo.findOne({ uid: request.uid } as any);
+        expect(updated!.status).toBe("ready");
+        const lines = (await blobStore.get(updated!.blobKey!)).toString("utf-8").split(String.fromCharCode(10)).map((line) => JSON.parse(line));
+        const messages = lines.filter((l) => l.entityType === "message");
+        expect(messages.map((l) => [l.subject, l.deleted ?? false]).sort()).toEqual([["Deleted", true], ["Live", false]]);
+        const bodies = lines.filter((l) => l.entityType === "retainedDraftBody");
+        expect(bodies.map((l) => [l.messageUid, l.blobKey])).toEqual([[deleted.uid, retained]]);
     });
 
     it("Marks a request failed, without claiming it or writing a bundle, when looking up its matter throws.", async () => {
@@ -519,8 +636,8 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
         expect(updated!.processingAttempts).toBe(1);
         expect(updated!.blobKey).toBe(`matter-exports/${request.uid}-1.ndjson`);
         expect(Buffer.isBuffer(putSpy.mock.calls[0][1])).toBe(false);
-        // claim + ready (the lease isn't due for renewal yet)
-        expect(updated!.version).toBe(request.version + 2);
+        // claim + ready (the lease isn't due for renewal yet) + the attestation record cleared
+        expect(updated!.version).toBe(request.version + 3);
     });
 
     it("Only one of two overlapping runs holding the same stale request row wins the claim - the loser builds no bundle and records no attestations.", async () => {
@@ -619,8 +736,8 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
 
         const updated = (await requestRepo.findOne({ uid: request.uid } as any));
         expect(updated!.status).toBe("ready");
-        // claim + one renewal per custodian + ready
-        expect(updated!.version).toBe(request.version + 4);
+        // claim + one renewal per custodian + ready + the attestation record cleared
+        expect(updated!.version).toBe(request.version + 5);
     });
 
     it("A run that lost its lease mid-export (another replica reclaimed the request) neither marks it ready nor leaves its blob or attestations behind.", async () => {

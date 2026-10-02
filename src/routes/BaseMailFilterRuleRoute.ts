@@ -3,11 +3,24 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, type JWTUser } from "@rapidrest/core";
-import { ApiErrors, RepoUtils } from "@rapidrest/service-core";
+import { ApiErrors, HttpRequest, ModelUtils, RepoUtils, RouteDecorators, type UpdateObject } from "@rapidrest/service-core";
+import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { getMailboxUidForFolder } from "../util/FolderUtils.js";
+import { isPlainAddress } from "../util/MimeHeaderUtils.js";
 import { normalizeFilterSenderList } from "../util/SenderListUtils.js";
-import { Label, MailFilterRule } from "../models/types.js";
+import { AuditAction, Label, MailFilterAction, MailFilterActionType, MailFilterRule } from "../models/types.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
+const { Request, User: AuthUser } = RouteDecorators;
+
+/** The most actions one rule may carry: every `forward` action relays each matching message once more, from this server's domain. */
+export const MAX_RULE_ACTIONS: number = 20;
+
+/** The most rules one mailbox may have. */
+export const MAX_RULES_PER_MAILBOX: number = 200;
+
+/** The `AuditLogEntry.action` of a rule being created or changed. */
+const RULE_AUDIT_CREATE: AuditAction = AuditAction.MAIL_FILTER_RULE_CREATE;
+const RULE_AUDIT_UPDATE: AuditAction = AuditAction.MAIL_FILTER_RULE_UPDATE;
 
 /**
  * `mailboxUid`-scoped CRUD for `MailFilterRule`, refusing (400) a rule whose action targets a `Folder` (`folderUid`) or
@@ -20,6 +33,11 @@ import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
  * an array of at most 100 plain addresses and `conditions.fromDomainEquals` an array of at most 100 domains, each at most 254
  * characters - stored lowercase and de-duplicated (a domain without any leading `@`), anything else a 400. A `null` condition (what a
  * SQL row round-trips an absent one as) is dropped.
+ *
+ * A rule runs server-side on every message the mailbox receives, so its actions are bounded and checked: at most `MAX_RULE_ACTIONS`
+ * per rule and `MAX_RULES_PER_MAILBOX` per mailbox (400), and a `forward` action needs a `forwardTo` that is one plain address (400). Creating or
+ * changing a rule is audited (`mail_filter_rule.create`/`.update`) with the addresses it forwards to - a forward rule keeps relaying mail
+ * after the delegate who wrote it is revoked.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -38,7 +56,13 @@ export abstract class BaseMailFilterRuleRoute<T extends MailFilterRule> extends 
         if (!Array.isArray(actions)) {
             return;
         }
+        if (actions.length > MAX_RULE_ACTIONS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A rule can have at most ${MAX_RULE_ACTIONS} actions.`);
+        }
         for (const action of actions) {
+            if (action?.type === MailFilterActionType.FORWARD && !isPlainAddress(action.forwardTo)) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A forward action needs 'forwardTo' to be one plain email address.");
+            }
             const folderUid: unknown = action?.folderUid;
             if (folderUid !== undefined && folderUid !== null && folderUid !== "") {
                 const owner: string | undefined =
@@ -86,6 +110,57 @@ export abstract class BaseMailFilterRuleRoute<T extends MailFilterRule> extends 
         await super.prepareCreate(obj, user);
         this.validateSenderConditions(obj.conditions);
         await this.assertActionTargetsInMailbox(obj.actions, obj.mailboxUid);
+        if ((await this.repoUtils!.count({ mailboxUid: ModelUtils.literal(obj.mailboxUid) } as any, { ignoreACL: true })) >= MAX_RULES_PER_MAILBOX) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox can have at most ${MAX_RULES_PER_MAILBOX} rules.`);
+        }
+    }
+
+    /** Records `rule` being created or changed, naming the addresses it forwards to. */
+    private async auditRule(action: AuditAction, rule: T, user: JWTUser | undefined, req: HttpRequest | undefined): Promise<void> {
+        const forwardsTo: string[] = rule.actions
+            .filter((entry: MailFilterAction) => entry.type === MailFilterActionType.FORWARD)
+            .map((entry: MailFilterAction) => String(entry.forwardTo));
+        await recordAuditLog(
+            this._objectFactory!,
+            this.auditLogClass,
+            { config: this.config, req, user, logger: this.logger },
+            {
+                action,
+                targetType: "MailFilterRule",
+                targetUid: rule.uid,
+                mailboxUid: rule.mailboxUid,
+                details: { name: rule.name, enabled: rule.enabled, ...(forwardsTo.length > 0 ? { forwardsTo } : {}) },
+            },
+        );
+    }
+
+    public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
+        // `prepareCreate()` counts what is stored, once per object and before any of a bulk request is created, so a bulk create is counted
+        // as a whole here: the rules it adds to a mailbox on top of the ones that mailbox has can't pass the cap together.
+        if (Array.isArray(obj) && obj.length > 1) {
+            const adding: Map<string, number> = new Map();
+            for (const rule of obj) {
+                if (typeof rule?.mailboxUid === "string") {
+                    adding.set(rule.mailboxUid, (adding.get(rule.mailboxUid) ?? 0) + 1);
+                }
+            }
+            for (const [mailboxUid, count] of adding) {
+                if ((await this.repoUtils!.count({ mailboxUid: ModelUtils.literal(mailboxUid) } as any, { ignoreACL: true })) + count > MAX_RULES_PER_MAILBOX) {
+                    throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox can have at most ${MAX_RULES_PER_MAILBOX} rules.`);
+                }
+            }
+        }
+        const created: T | T[] = await super.create(obj, req, user);
+        for (const rule of Array.isArray(created) ? created : [created]) {
+            await this.auditRule(RULE_AUDIT_CREATE, rule, user, req);
+        }
+        return created;
+    }
+
+    public async update(id: string, obj: UpdateObject<T>, @Request req?: HttpRequest, @AuthUser user?: JWTUser): Promise<T> {
+        const updated: T = await super.update(id, obj, req, user);
+        await this.auditRule(RULE_AUDIT_UPDATE, updated, user, req);
+        return updated;
     }
 
     protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {

@@ -19,6 +19,21 @@ const ENCRYPTED_SMIME_TYPES = new Set(["enveloped-data", "authenveloped-data"]);
 const PKCS7_MIME_CONTENT_TYPES = new Set(["application/pkcs7-mime", "application/x-pkcs7-mime"]);
 
 /**
+ * Whether a `multipart/encrypted` message really is the RFC 3156 OpenPGP/MIME shape: `protocol="application/pgp-encrypted"` and
+ * exactly two parts, a control part (`application/pgp-encrypted`) and the ciphertext (`application/octet-stream`), with no readable
+ * body beside them. The declared type alone is not trusted - "encrypted" switches off the per-attachment virus scan, the HTML
+ * sanitizing and the attachment storage, so a sender could wrap a `text/html` body and an executable in `multipart/encrypted` to
+ * skip them all. Anything else is ordinary mail, and gets all of it.
+ */
+function isOpenPgpMimeEncrypted(parsed: ParsedMail, params: Record<string, string> | undefined): boolean {
+    if (params?.protocol?.toLowerCase() !== "application/pgp-encrypted" || typeof parsed.text === "string" || typeof parsed.html === "string") {
+        return false;
+    }
+    const types: string[] = (parsed.attachments ?? []).map((attachment) => attachment.contentType.toLowerCase().split(";")[0].trim()).sort();
+    return types.length === 2 && types[0] === "application/octet-stream" && types[1] === "application/pgp-encrypted";
+}
+
+/**
  * `true` if `parsed`'s top-level `Content-Type` marks this message's body as S/MIME (CMS) encrypted - either
  * an `enveloped-data`/`authEnveloped-data` `application/pkcs7-mime` (or legacy `application/x-pkcs7-mime`)
  * part, or `multipart/encrypted` (the OpenPGP/MIME shape, checked defensively for interop with a sender this
@@ -46,7 +61,7 @@ export function isEncryptedBody(parsed: ParsedMail): boolean {
     const { value, params } = contentType as { value: string; params?: Record<string, string> };
     const contentTypeValue: string = value.toLowerCase();
     if (contentTypeValue === "multipart/encrypted") {
-        return true;
+        return isOpenPgpMimeEncrypted(parsed, params);
     }
     if (PKCS7_MIME_CONTENT_TYPES.has(contentTypeValue)) {
         const smimeType: string | undefined = params?.["smime-type"]?.toLowerCase();

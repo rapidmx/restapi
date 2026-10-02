@@ -186,7 +186,9 @@ function makeEncryptedRawMessage(): Buffer {
 
 x509.cryptoProvider.set(crypto);
 
-async function makeCertBase64(cn: string): Promise<string> {
+/** A self-signed certificate for `cn`, naming `email` (by default `cn` itself, when it is an address) - a key must name the address it is
+ * pinned for (`parseContactKey()`). */
+async function makeCertBase64(cn: string, email: string | undefined = cn.includes("@") ? cn : undefined): Promise<string> {
     const keys: CryptoKeyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
         "sign",
         "verify",
@@ -197,6 +199,7 @@ async function makeCertBase64(cn: string): Promise<string> {
         notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
         keys,
         signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+        extensions: email ? [new x509.SubjectAlternativeNameExtension([{ type: "email", value: email }])] : [],
     });
     return Buffer.from(cert.rawData).toString("base64");
 }
@@ -269,6 +272,8 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             usedBytes: 0,
             ...data,
         });
+        // Replaces the mailbox every test starts with (see `beforeEach`).
+        await mailboxRepo.deleteMany({ uid: mailboxUid });
         return await mailboxRepo.save(obj);
     };
 
@@ -358,6 +363,8 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             }
         }
         (objectFactory.getInstance<RecordingMailTransport>("MailTransport")!).sent = [];
+        // Mail for a mailbox that does not exist is dropped (see "Drops mail for a mailbox that was deleted"), so by default there is one.
+        await createMailbox();
     });
 
     it("Exposes the configured cron schedule.", () => {
@@ -371,6 +378,22 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
 
     it("Does nothing when there are no pending entries.", async () => {
         await expect(job.run()).resolves.toBeUndefined();
+    });
+
+    it("Drops mail for a mailbox that was deleted after the address resolved (no erasure involved) instead of filing orphan folders and messages.", async () => {
+        await mailboxRepo.clear();
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const rawBlobKey = `raw/${uuid.v4()}`;
+        await blobStore.put(rawBlobKey, makePlainRawMessage());
+        const entry = await createIngestEntry({ rawBlobKey });
+        const warn = vi.spyOn((job as any).logger, "warn");
+
+        await job.run();
+
+        expect((await ingestQueueRepo.findOne({ uid: entry.uid } as any))!.status).toBe(IngestStatus.DELIVERED);
+        expect((await folderRepo.find({ mailboxUid }).toArray()).length).toBe(0);
+        expect((await messageRepo.find({ mailboxUid }).toArray()).length).toBe(0);
+        expect(warn.mock.calls.some((call: any[]) => String(call[0]).includes(`mailbox ${mailboxUid} no longer exists`))).toBe(true);
     });
 
     it("Publishes the Inbox's counts after each delivery, derived from its messages rather than added to whatever was stored, and refreshes the stored cache.", async () => {
@@ -638,6 +661,49 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             expect(contacts[0].keys![0].fingerprint).toMatch(/^[0-9a-f]+$/);
             expect(contacts[0].encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: expect.any(Number) });
             expect(contacts[0].lastMessageSeen).toEqual(expect.any(Number));
+        });
+
+        it("Creates no further Contact from a key header once the mailbox holds max_header_key_contacts of them, but still updates one it already has.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const deliver = async (address: string): Promise<void> => {
+                const keydata = await makeCertBase64(address);
+                const rawBlobKey = `raw/${uuid.v4()}`;
+                await blobStore.put(
+                    rawBlobKey,
+                    Buffer.from(
+                        [
+                            `From: ${address}`,
+                            "To: recipient@example.com",
+                            "Subject: Key",
+                            `RapidMX-Key: addr=${address}; prefer-encrypt=mutual; type=x509; keydata=${keydata}`,
+                            "Authentication-Results: mx.example.com; dkim=pass header.d=example.com",
+                            oversigningDkimSignature("example.com", "RapidMX-Key"),
+                            "",
+                            "Hello.",
+                            "",
+                        ].join(String.fromCharCode(13, 10)),
+                    ),
+                );
+                await createIngestEntry({ rawBlobKey, envelopeFrom: address });
+                await job.run();
+            };
+            const original = (job as any).maxHeaderKeyContacts;
+            (job as any).maxHeaderKeyContacts = 1;
+            const warn = vi.spyOn((job as any).logger, "warn");
+            try {
+                await deliver("first@example.com");
+                expect((await contactRepo.find({ mailboxUid }).toArray()).length).toBe(1);
+
+                await deliver("second@example.com");
+                expect((await contactRepo.find({ mailboxUid }).toArray()).length).toBe(1);
+                expect(warn.mock.calls.some((call: any[]) => String(call[0]).includes("second@example.com") && String(call[0]).includes("already holds 1 contacts"))).toBe(true);
+
+                // A sender that already is a contact is still processed.
+                await deliver("first@example.com");
+                expect((await contactRepo.find({ mailboxUid }).toArray()).length).toBe(1);
+            } finally {
+                (job as any).maxHeaderKeyContacts = original;
+            }
         });
 
         it("Ignores the header (and creates no Contact) when there is no Authentication-Results header at all.", async () => {
@@ -1068,6 +1134,32 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             expect(mailbox!.usedBytes).toBe(0);
         });
 
+        it("Charges an entry once even when a failed attempt could not hand its charge back: the retry sees the charge and does not add a second one.", async () => {
+            await createMailbox({ quotaBytes: 1_000_000, usedBytes: 0 });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makePlainRawMessage());
+            const entry = await createIngestEntry({ rawBlobKey });
+            vi.spyOn(job as any, "resolveTargetFolder").mockImplementationOnce(async () => {
+                vi.spyOn((job as any).mailboxRepo, "update").mockRejectedValue(new Error("simulated refund conflict"));
+                throw new Error("simulated filing failure");
+            });
+
+            await job.run();
+
+            vi.restoreAllMocks();
+            const bytes = (await blobStore.size(rawBlobKey)) as number;
+            expect((await mailboxRepo.findOne({ uid: mailboxUid } as any))!.usedBytes).toBe(bytes);
+            expect(await blobStore.exists(`ingest-markers/${entry.uid}/charged`)).toBe(true);
+
+            await ingestQueueRepo.updateOne({ uid: entry.uid } as any, { $set: { nextAttemptAt: new Date(Date.now() - 1000) } });
+            await job.run();
+
+            expect((await messageRepo.find({ mailboxUid }).toArray()).length).toBe(1);
+            expect((await mailboxRepo.findOne({ uid: mailboxUid } as any))!.usedBytes).toBe(bytes);
+            expect(await blobStore.exists(`ingest-markers/${entry.uid}/charged`)).toBe(false);
+        });
+
         it("Propagates an unexpected (non-quota, non-missing-mailbox) error from quota charging as a real processing failure, marking the entry FAILED rather than silently swallowing or skipping it.", async () => {
             await createMailbox();
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
@@ -1308,6 +1400,15 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         expect(forwarded!.envelopeFrom).toBe("recipient@example.com");
         expect(forwarded!.raw.toString()).toContain("X-RapidMX-Loop: recipient@example.com");
         expect(forwarded!.raw.toString()).toContain("From: sender@example.com");
+    });
+
+    it("Relays nothing for a rule forward when the mailbox no longer exists.", async () => {
+        const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const before: number = transport.sent.length;
+
+        await (job as any).forwardByRule({ mailboxUid: uuid.v4() }, Buffer.from("Subject: x\r\n\r\nbody"), {}, ["assistant@example.com"]);
+
+        expect(transport.sent.length).toBe(before);
     });
 
     it("Does not evaluate mail filter rules against junk-verdict mail.", async () => {
@@ -1779,7 +1880,15 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         });
 
         it("Logs a warning and continues when processing an iTIP message throws.", async () => {
-            const findSpy = vi.spyOn((job as any).calendarEventRepo, "find").mockRejectedValueOnce(new Error("simulated database failure"));
+            // Only the iTIP lookup of the event by its iCalendar UID fails (the automatic reply's own calendar lookup is not part of this).
+            const calendarEventRepoUtils = (job as any).calendarEventRepo;
+            const realFind = calendarEventRepoUtils.find.bind(calendarEventRepoUtils);
+            const findSpy = vi.spyOn(calendarEventRepoUtils, "find").mockImplementation(async (query: any, opts: any) => {
+                if (query.icalUid) {
+                    throw new Error("simulated database failure");
+                }
+                return realFind(query, opts);
+            });
 
             const ics = buildEventIcs(makeIcsEventFixture({ icalUid: uuid.v4() }), "REQUEST");
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
@@ -2792,6 +2901,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         });
 
         it("Sends no report when the recipient mailbox itself doesn't exist (defensive - shouldn't happen in practice).", async () => {
+            await mailboxRepo.clear();
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
             const rawBlobKey = `raw/${uuid.v4()}`;
             await blobStore.put(rawBlobKey, makeRecallRaw("whatever@example.com"));
@@ -3437,8 +3547,8 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         // parse, and always recomputes `fingerprint` from it rather than trusting an asserted value - `cn` is
         // only used to make each generated certificate distinguishable across tests; the real fingerprint is
         // returned alongside the response since it can't be dictated up front.
-        async function makeDiscoveryResponse(cn: string): Promise<{ response: any; fingerprint: string }> {
-            const publicKey = await makeCertBase64(cn);
+        async function makeDiscoveryResponse(cn: string, email?: string): Promise<{ response: any; fingerprint: string }> {
+            const publicKey = await makeCertBase64(cn, email);
             const cert = new nodeCrypto.X509Certificate(Buffer.from(publicKey, "base64"));
             const fingerprint = cert.fingerprint256.replace(/:/g, "").toLowerCase();
             return {
@@ -3457,7 +3567,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             dnsResolver.records.set("_rapidmx.rotated-peer-mongo.example", [
                 ["v=RMXv1; id=1; host=mail.rotated-peer-mongo.example;"],
             ]);
-            const { response: discoveryResponse, fingerprint: discoveredFingerprint } = await makeDiscoveryResponse("rotated-1");
+            const { response: discoveryResponse, fingerprint: discoveredFingerprint } = await makeDiscoveryResponse("rotated-1", "bob@rotated-peer-mongo.example");
             mockFetch.mockResolvedValue({
                 ok: true,
                 status: 200,
@@ -3499,7 +3609,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             dnsResolver.records.set("_rapidmx.rotated-peer-mongo-2.example", [
                 ["v=RMXv1; id=1; host=mail.rotated-peer-mongo-2.example;"],
             ]);
-            const { response: discoveryResponse2 } = await makeDiscoveryResponse("rotated-2");
+            const { response: discoveryResponse2 } = await makeDiscoveryResponse("rotated-2", "bob@rotated-peer-mongo-2.example");
             mockFetch.mockResolvedValue({
                 ok: true,
                 status: 200,
@@ -3533,7 +3643,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
 
         it("Reads the peer's keys from its own mailbox, with no DNS lookup and no fetch, when the peer lives on this deployment.", async () => {
             await createMailbox();
-            const localCert = await makeCertBase64("local-peer");
+            const localCert = await makeCertBase64("local-peer", "bob-local@example.com");
             const localFingerprint = new nodeCrypto.X509Certificate(Buffer.from(localCert, "base64")).fingerprint256.replace(/:/g, "").toLowerCase();
             await mailboxRepo.save(new MailboxMongo({
                     primarySmtpAddress: "bob-local@example.com",
@@ -4958,6 +5068,9 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         });
 
         it("Sends no delivery receipt when the recipient mailbox row doesn't exist.", async () => {
+            await mailboxRepo.clear();
+            // The mailbox vanishing after the quota was charged (a delivery to a mailbox that is already gone is dropped before that).
+            vi.spyOn(job as any, "chargeMailboxQuotaForDelivery").mockResolvedValue("charged");
             await domainRepo.save(new DomainMongo({ uid: "example.com", name: "example.com", enabled: true, verified: true, verificationToken: uuid.v4() }));
             await createIngestEntry({
                 rawBlobKey: await putRaw(
@@ -5183,6 +5296,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             });
 
             it("Drops mail for a completed erasure whose mailbox row is gone, and delivers when the mailbox row survived.", async () => {
+                await mailboxRepo.clear();
                 await saveErasure("completed");
                 const gone = await createIngestEntry({ rawBlobKey: await putRaw(makePlainRawMessage()) });
                 await job.run();
@@ -5634,6 +5748,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         };
 
         it("Drops, never defers or delivers, mail for a deleted mailbox with an approved or stale in-progress erasure, even past the deferral bound.", async () => {
+        await mailboxRepo.clear();
             const originalMax = (job as any).erasureDeferMaxSeconds;
             (job as any).erasureDeferMaxSeconds = 0;
             try {

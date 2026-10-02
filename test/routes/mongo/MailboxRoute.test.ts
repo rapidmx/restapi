@@ -691,7 +691,7 @@ describe("Route:MailboxMongo Tests", () => {
             const obj = await createMailboxMongo();
             await createMatter({ custodianMailboxUids: [obj.uid] });
 
-            const result = await request(server.getApplication()).delete(baseUrl).set("Authorization", "jwt " + adminToken);
+            const result = await request(server.getApplication()).delete(`${baseUrl}?uid=${obj.uid}`).set("Authorization", "jwt " + adminToken);
 
             expect(result.status).toBe(409);
             const stillExists: MailboxMongo | null = await repo.findOne({ uid: obj.uid } as any);
@@ -702,7 +702,7 @@ describe("Route:MailboxMongo Tests", () => {
             const obj = await createMailboxMongo();
             await createMatter({ custodianMailboxUids: [obj.uid], closedAt: new Date() });
 
-            const result = await request(server.getApplication()).delete(baseUrl).set("Authorization", "jwt " + adminToken);
+            const result = await request(server.getApplication()).delete(`${baseUrl}?uid=${obj.uid}`).set("Authorization", "jwt " + adminToken);
 
             expect(result.status).toBeGreaterThanOrEqual(200);
             expect(result.status).toBeLessThan(300);
@@ -710,8 +710,15 @@ describe("Route:MailboxMongo Tests", () => {
             expect(stillExists).toBeNull();
         });
 
+        it("Refuses a bulk truncate() that names a field mailboxes are not deleted by next to one that they are (400).", async () => {
+            const result = await request(server.getApplication()).delete(`${baseUrl}?uid=${uuid.v4()}&bogus=x`).set("Authorization", "jwt " + adminToken);
+
+            expect(result.status).toBe(400);
+            expect(JSON.stringify(result.body)).toContain("bogus");
+        });
+
         it("A bulk truncate() that matches no mailboxes at all succeeds as a no-op.", async () => {
-            const result = await request(server.getApplication()).delete(baseUrl).set("Authorization", "jwt " + adminToken);
+            const result = await request(server.getApplication()).delete(`${baseUrl}?uid=${uuid.v4()}`).set("Authorization", "jwt " + adminToken);
 
             expect(result.status).toBeGreaterThanOrEqual(200);
             expect(result.status).toBeLessThan(300);

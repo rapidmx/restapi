@@ -31,6 +31,8 @@ async function makeDiscoveryResponse(cn: string): Promise<{ response: any; finge
         notAfter: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
         keys,
         signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+        // A key is pinned for an address only when its certificate names it (`parseContactKey()`).
+        extensions: [new x509.SubjectAlternativeNameExtension([{ type: "email", value: cn }])],
     });
     const publicKey = Buffer.from(cert.rawData).toString("base64");
     const fingerprint = Buffer.from(await cert.getThumbprint("SHA-256")).toString("hex");

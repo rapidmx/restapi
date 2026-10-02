@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
-import { ApiErrors, BasePushRoute } from "@rapidrest/service-core";
+import { ACLAction, ApiErrors, BasePushRoute, RouteDecorators, type HttpRequest } from "@rapidrest/service-core";
 import { stripTrustedRoles } from "../util/MailAccessUtils.js";
 const { Config } = ObjectDecorators;
+const { Request, Socket, User } = RouteDecorators;
 
 /**
  * Real-time push notifications for the webmail client, built entirely on `service-core`'s own
@@ -19,6 +20,16 @@ const { Config } = ObjectDecorators;
  * (`util/MailAccessUtils.ts`), so a channel is granted only if it is the caller's own uid (always implicit) or the uid of a
  * mailbox/folder whose ACL gives THEM `READ` - by ownership or an explicit delegate record. An impersonation token is the
  * target user's own identity and works like theirs.
+ *
+ * **Access is rechecked while a socket is open.** The base class checks a channel only when it is subscribed and when a socket
+ * (re)connects, so a delegate removed from a mailbox, or a mailbox changing hands, would keep receiving its live payloads until
+ * the socket dropped. Every `mail:push:recheck_ms` each open socket's channels are checked again, and a socket that has lost one
+ * (or whose token has expired, when the caller carries an `exp`) is closed - the client reconnects, and the base class then
+ * grants only what is still allowed.
+ *
+ * **Origin.** A browser sends the page's `Origin` with a WebSocket upgrade, and cookies ride along with it, so a connection from any
+ * other site would be authenticated as the visitor. When `cors:origins` names an allow-list (the same one the CORS headers use), a
+ * connection whose `Origin` is not on it is refused (1008). A request without an `Origin` (a native client) is not a browser's.
  *
  * **A published message's own `from` field (when present) can't claim a different identity than the authenticated
  * caller.** `CREATE` on the channel only ever authorizes publishing TO it - nothing about that authorizes a message
@@ -64,9 +75,77 @@ export class MailPushRoute extends BasePushRoute {
     @Config("trusted_roles", ["admin"])
     protected trustedRoles: string[] = ["admin"];
 
+    /** The allowed origins - `cors:origins`, as for the CORS headers. Unset or `*`: any origin. */
+    @Config("cors:origins")
+    protected corsOrigins?: string[] | string;
+
+    /** How often (ms) an open socket's channels are checked again. `0` switches it off. */
+    @Config("mail:push:recheck_ms", 60_000)
+    protected recheckMs: number = 60_000;
+
+    /** Whether a connection from `origin` may be served - see this class's doc comment. */
+    protected isOriginAllowed(origin: string | undefined): boolean {
+        if (!origin || !this.corsOrigins || this.corsOrigins === "*") {
+            return true;
+        }
+        return Array.isArray(this.corsOrigins) ? this.corsOrigins.includes(origin) : this.corsOrigins === origin;
+    }
+
+    /** Closes `sock` once `user` has lost a channel it is subscribed to, or its token has expired - see this class's doc comment. */
+    private watchAccess(sock: any, user: JWTUser & { exp?: number }): void {
+        if (!(this.recheckMs > 0) || typeof sock?.on !== "function") {
+            return;
+        }
+        const timer: NodeJS.Timeout = setInterval(() => {
+            void this.recheckAccess(sock, user).then((keep) => {
+                if (!keep) {
+                    clearInterval(timer);
+                }
+            });
+        }, this.recheckMs);
+        timer.unref();
+        sock.on("close", () => clearInterval(timer));
+    }
+
+    /** `false` once `sock` is closed, or has just been closed here for lost access. */
+    private async recheckAccess(sock: any, user: JWTUser & { exp?: number }): Promise<boolean> {
+        if (typeof sock.readyState === "number" && sock.readyState >= 2) {
+            return false;
+        }
+        if (typeof user.exp === "number" && user.exp * 1000 <= Date.now()) {
+            sock.close(1008, "The session has expired.");
+            return false;
+        }
+        const channels: string[] = (this as any).activeSubs?.get(user.uid) ?? [];
+        for (const channel of channels) {
+            if (channel === user.uid) {
+                continue;
+            }
+            let allowed = true;
+            try {
+                allowed = !!(await (this as any).aclUtils?.hasPermission(user, channel, ACLAction.READ));
+            } catch {
+                // Not able to tell now: it is asked again on the next round.
+            }
+            if (!allowed) {
+                sock.close(1008, "Access to a channel was removed.");
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** `BasePushRoute.connect()` for the caller without their trusted roles - see this class's doc comment. */
-    public async connect(sock: any, user: any): Promise<void> {
-        return super.connect(sock, stripTrustedRoles(user as JWTUser, this.trustedRoles));
+    public async connect(@Socket sock: any, @User user: any, @Request req?: HttpRequest): Promise<void> {
+        if (!this.isOriginAllowed(req?.headers?.["origin"] as string | undefined)) {
+            sock.close(1008, "This origin is not allowed.");
+            return;
+        }
+        const stripped: JWTUser | undefined = stripTrustedRoles(user as JWTUser, this.trustedRoles);
+        await super.connect(sock, stripped);
+        if (stripped) {
+            this.watchAccess(sock, stripped);
+        }
     }
 
     /** `BasePushRoute.send()` for the caller without their trusted roles: publishing to a channel needs `CREATE` on it as

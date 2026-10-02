@@ -211,7 +211,84 @@ describe("MailboxQuotaRecalcJobMongo Tests (real DB + DI)", () => {
         expect(updated!.version).toBe(mailbox.version);
     });
 
-    it("Treats a body blob that fails to size as 0 bytes and still sums the rest.", async () => {
+    it("Counts a message in Deleted Items (soft-deleted, its blobs still stored) and its attachments, rather than handing their bytes back.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const mailbox = await createMailbox({ usedBytes: 0 });
+        const liveKey = `body/${uuid.v4()}`;
+        const deletedKey = `body/${uuid.v4()}`;
+        await blobStore.put(liveKey, Buffer.alloc(100));
+        await blobStore.put(deletedKey, Buffer.alloc(400));
+        await createMessage(mailbox.uid, { bodyBlobKey: liveKey });
+        const deleted = await createMessage(mailbox.uid, { bodyBlobKey: deletedKey, hasAttachments: true });
+        await createAttachment(deleted.uid, mailbox.uid, { sizeBytes: 25 });
+        await messageRepo.updateOne({ uid: deleted.uid } as any, { $set: { deleted: true } });
+
+        await job.run();
+
+        expect((await mailboxRepo.findOne({ uid: mailbox.uid } as any))!.usedBytes).toBe(525);
+    });
+
+    it("Leaves a mailbox alone that vanished, or already holds the corrected figure, or changed again as it was being corrected.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const bodyKey = `body/${uuid.v4()}`;
+        await blobStore.put(bodyKey, Buffer.alloc(100));
+        const mailbox = await createMailbox({ usedBytes: 5000 });
+        await createMessage(mailbox.uid, { bodyBlobKey: bodyKey });
+        const mailboxRepoUtils = (job as any).mailboxRepo;
+        const realFindOne = mailboxRepoUtils.findOne.bind(mailboxRepoUtils);
+
+        // Gone by the time the figure is applied.
+        const findSpy = vi.spyOn(mailboxRepoUtils, "findOne");
+        findSpy.mockImplementationOnce(realFindOne).mockResolvedValueOnce(undefined);
+        await job.run();
+        expect((await mailboxRepo.findOne({ uid: mailbox.uid } as any))!.usedBytes).toBe(5000);
+
+        // Moved on, and the correction on top of what it holds comes out to what it already holds.
+        findSpy.mockReset();
+        findSpy.mockImplementationOnce(realFindOne).mockImplementationOnce(async (...args: any[]) => {
+            const found = await realFindOne(...args);
+            return Object.assign(found, { version: found.version + 1, usedBytes: 0 });
+        });
+        const updateSpy = vi.spyOn(mailboxRepoUtils, "update");
+        await job.run();
+        expect(updateSpy).not.toHaveBeenCalled();
+
+        // The write itself loses a race: left for the next run, not an error.
+        findSpy.mockRestore();
+        updateSpy.mockRejectedValueOnce(new Error("simulated version conflict"));
+        const errorSpy = vi.spyOn((job as any).logger, "error");
+        await expect(job.run()).resolves.toBeUndefined();
+        expect(errorSpy).not.toHaveBeenCalled();
+        expect((await mailboxRepo.findOne({ uid: mailbox.uid } as any))!.usedBytes).toBe(5000);
+    });
+
+    it("Never writes a lower figure while the blob store is failing to size bodies (it would leave every mailbox unmetered), but still raises it.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const mailbox = await createMailbox({ usedBytes: 5000 });
+        const bodyKey = `body/${uuid.v4()}`;
+        await blobStore.put(bodyKey, Buffer.alloc(300));
+        const message = await createMessage(mailbox.uid, { bodyBlobKey: bodyKey, hasAttachments: true });
+        await createAttachment(message.uid, mailbox.uid, { sizeBytes: 50 });
+        await createMessage(mailbox.uid, { bodyBlobKey: `body/${uuid.v4()}` });
+        const sizeSpy = vi.spyOn(blobStore, "size").mockRejectedValue(new Error("simulated S3 outage"));
+
+        await job.run();
+
+        // 50 of attachments is all that could be summed: far below what is stored.
+        expect((await mailboxRepo.findOne({ uid: mailbox.uid } as any))!.usedBytes).toBe(5000);
+        sizeSpy.mockRestore();
+
+        // A partial figure that is higher than the stored one still corrects upward.
+        const small = await createMailbox({ usedBytes: 10 });
+        const smallMessage = await createMessage(small.uid, { bodyBlobKey: bodyKey, hasAttachments: true });
+        await createAttachment(smallMessage.uid, small.uid, { sizeBytes: 50 });
+        await createMessage(small.uid, { bodyBlobKey: `body/${uuid.v4()}` });
+        await job.run();
+        expect((await mailboxRepo.findOne({ uid: small.uid } as any))!.usedBytes).toBe(350);
+        expect((await mailboxRepo.findOne({ uid: mailbox.uid } as any))!.usedBytes).toBe(5000);
+    });
+
+    it("Sums the rest when one body blob fails to size (the figure can still only go up).", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const mailbox = await createMailbox({ usedBytes: 0 });
         // No blob was ever put at this key, so `blobStore.size()` rejects with a real "no blob" error.
@@ -229,12 +306,9 @@ describe("MailboxQuotaRecalcJobMongo Tests (real DB + DI)", () => {
     it("Sums ALL messages in a mailbox, not just the first page, when it has more than one page's worth.", async () => {
         // `RepoUtils.find()` defaults to a 100-row cap when no pagination is requested - `recalcMailbox()` used
         // to call it unpaginated, silently truncating usedBytes to only the first ~100 messages for any larger
-        // mailbox. Uses a small page size (10) via a stubbed default so 25 messages genuinely spans multiple
-        // pages without the test needing to create 100+ real documents.
-        const findAllPages = (job as any).findAllPages.bind(job);
-        const pageSizeSpy = vi
-            .spyOn(job as any, "findAllPages")
-            .mockImplementation((repo: any, criteria: any) => findAllPages(repo, criteria, 10));
+        // mailbox. Uses a small page size (10) so 25 messages genuinely spans multiple pages without the test needing
+        // to create 100+ real documents.
+        (job as any).messagePageSize = 10;
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const bodyKey = `body/${uuid.v4()}`;
         await blobStore.put(bodyKey, Buffer.alloc(10));
@@ -248,7 +322,7 @@ describe("MailboxQuotaRecalcJobMongo Tests (real DB + DI)", () => {
 
         const updated = await mailboxRepo.findOne({ uid: mailbox.uid } as any);
         expect(updated!.usedBytes).toBe(messageCount * 10);
-        pageSizeSpy.mockRestore();
+        (job as any).messagePageSize = 500;
     });
 
     it.each([5, 4])("Pages through every mailbox, batchSize at a time, not just the first page (%i mailboxes, batch size 2).", async (mailboxCount) => {
@@ -268,6 +342,26 @@ describe("MailboxQuotaRecalcJobMongo Tests (real DB + DI)", () => {
         const updatedMailboxes = await mailboxRepo.find({ uid: { $in: mailboxes.map((m) => m.uid) } }).toArray();
         const processedCount = updatedMailboxes.filter((m) => m.usedBytes === 42).length;
         expect(processedCount).toBe(mailboxCount);
+    });
+
+    it("Logs an error naming the mailbox when its recalculation rejects, and still recalculates the others.", async () => {
+        const badMailbox = await createMailbox({ usedBytes: 0 });
+        const goodMailbox = await createMailbox({ usedBytes: 0 });
+        const originalRecalc = (job as any).recalcMailbox.bind(job);
+        const recalc = vi.spyOn(job as any, "recalcMailbox").mockImplementation(async (mailbox: any) => {
+            if (mailbox.uid === badMailbox.uid) {
+                throw new Error("simulated recalculation failure");
+            }
+            return await originalRecalc(mailbox);
+        });
+        const errorSpy = vi.spyOn((job as any).logger, "error");
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining(badMailbox.uid));
+        expect(recalc).toHaveBeenCalledWith(expect.objectContaining({ uid: goodMailbox.uid }));
+        recalc.mockRestore();
+        errorSpy.mockRestore();
     });
 
     it("Logs an error and continues with the next mailbox when recalculating one mailbox throws.", async () => {

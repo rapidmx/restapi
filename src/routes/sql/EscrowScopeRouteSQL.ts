@@ -2,10 +2,10 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { Raw } from "typeorm";
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { AuditLogEntrySQL, EscrowAccessRequestSQL, EscrowScopeSQL, MailboxSQL, MatterSQL } from "../../sql.js";
 import { BaseEscrowScopeRoute } from "../BaseEscrowScopeRoute.js";
+import { escapeLike, rawLike } from "./LikeUtils.js";
 const { Model } = RouteDecorators;
 
 @Model(EscrowScopeSQL)
@@ -20,7 +20,7 @@ export class EscrowScopeRouteSQL extends BaseEscrowScopeRoute<EscrowScopeSQL> {
      * against the whole serialized string and never matches a single element. Mirrors `MailboxAccessRouteSQL.
      * aliasQueryValue()`'s identical LIKE-escape shape (itself mirroring `MailIngestRouteSQL.aliasQueryValue()`). */
     protected aliasQueryValue(address: string): any {
-        const escaped: string = address.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-        return Raw((alias) => `${alias} LIKE :pattern ESCAPE '\\'`, { pattern: `%"${escaped}"%` });
+        const escaped: string = escapeLike(address);
+        return rawLike(`%"${escaped}"%`);
     }
 }

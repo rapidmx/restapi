@@ -14,15 +14,15 @@ import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { retainedBodyBlobKeysOf } from "../util/DraftBodyRetentionUtils.js";
 import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
 import type { SearchEntityType, SearchProvider } from "../search/SearchProvider.js";
-import { AuditAction, DataSubjectErasureRequest, Mailbox, Plugin } from "../models/types.js";
+import { AuditAction, DataSubjectErasureRequest, DataSubjectErasureStatus, Mailbox, Plugin } from "../models/types.js";
 import { isMailboxScopedData, PluginRegistry } from "../plugins/PluginRegistry.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /**
  * The `DataSubjectErasureRequest.status` a request has while a worker is running its cascade - set by a version-checked
  * claim (see `ErasureExecutionJob.claimRequest()`), kept alive by periodic renewals, and handed back to `"approved"`
- * when the cascade has to wait (a legal hold, an unloaded plugin, an error). Not (yet) part of the
- * `DataSubjectErasureStatus` union in `models/types.ts`; the column is a plain string on both backends.
+ * when the cascade has to wait (a legal hold, an unloaded plugin, an error). A request whose purge keeps failing ends as
+ * `"failed"` and is no longer retried; both are in the `DataSubjectErasureStatus` union in `models/types.ts`.
  *
  * Anything that must not add content to a mailbox being erased (e.g. delivery) should treat only an `"in_progress"`
  * request whose claim is live (`dateModified` within `claim_lease_seconds`) as "cascade running". An `"approved"` request
@@ -30,10 +30,16 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * most, never dropping it; and a request created before the mailbox row it names belongs to an earlier mailbox at the
  * same address (the uid is the address). See `ScanQueueJob.erasureDisposition()`.
  */
-export const ERASURE_IN_PROGRESS = "in_progress" as DataSubjectErasureRequest["status"];
+export const ERASURE_IN_PROGRESS: DataSubjectErasureStatus = "in_progress";
 
 /** How many times `purgeByCriteria()` re-scans an entity type to catch rows written concurrently with the cascade. */
 const MAX_PURGE_PASSES = 3;
+
+/** How many times a request whose cascade left rows behind is retried before it is marked `"failed"` for an operator. */
+const DEFAULT_MAX_ATTEMPTS = 50;
+
+/** Prefix of the `reason` a request carries while it is retried, holding the count of attempts so far (the request has no field for it). */
+const ATTEMPT_REASON = /^Erasure attempt (\d+) /;
 
 /**
  * Processes `DataSubjectErasureRequest` rows an admin has already approved (see that entity's own doc
@@ -91,6 +97,10 @@ const MAX_PURGE_PASSES = 3;
  * is what frees the address for `BaseMailboxRoute.create()`. Idempotent and resumable like any request: a hold, an unloaded plugin
  * or a failure hands it back, and a re-run finds the rows already gone. Such a request never removes a mailbox row: one that
  * exists when it runs (created again after it was filed) gets the request denied and nothing purged.
+ *
+ * Candidates run oldest-`dateModified` first, and every path that hands a request back unfinished (a hold, an unloaded plugin, a failing row)
+ * writes it, so a request that stays blocked moves behind the others instead of starving them. A request whose cascade leaves rows behind is
+ * retried up to `max_attempts` runs (the count rides in its `reason`), then marked `"failed"` with the rows named, and logged as an error.
  *
  * Concrete entity classes are supplied by the Mongo/SQL subclasses (`ErasureExecutionJobMongo`/
  * `ErasureExecutionJobSQL`), following the same multi-entity-type generic pattern `ScanQueueJob`/
@@ -155,6 +165,9 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     /** This worker's current claim on the request it's processing - see `claimRequest()`. */
     private claim?: { request: T; renewedAt: number };
 
+    /** The rows (`<Entity> <uid>`) the cascade of the request being processed failed to purge - see `purgeByCriteria()`. */
+    private purgeFailures: string[] = [];
+
     /** How long an `"in_progress"` claim may go unrenewed before another worker treats it as abandoned. A running
      * cascade renews it every third of this. */
     @Config("mail:jobs:erasure_execution:claim_lease_seconds", 900)
@@ -163,6 +176,10 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     /** Rows read (and deleted) per keyset page while purging one entity type. */
     @Config("mail:jobs:erasure_execution:purge_page_size", 500)
     private purgePageSize: number = 500;
+
+    /** How many runs may leave rows behind (a failing delete or blob cleanup) before the request is marked `"failed"` for an operator. */
+    @Config("mail:jobs:erasure_execution:max_attempts", DEFAULT_MAX_ATTEMPTS)
+    private maxAttempts: number = DEFAULT_MAX_ATTEMPTS;
 
     @Config("mail:jobs:erasure_execution:schedule", "*/30 * * * * *")
     private scheduleExpr: string = "*/30 * * * * *";
@@ -209,13 +226,15 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
 
         // Candidates: approved requests, plus in-progress ones whose claim has gone stale (the worker that claimed it
         // died mid-cascade - an active worker renews its claim well within the lease, see `renewClaimIfDue()`).
-        // `limit` goes in both the query object (SQL) and `options` (Mongo); sorted so the oldest request runs first.
+        // `limit` goes in both the query object (SQL) and `options` (Mongo); sorted by `dateModified` so the request that has
+        // waited longest runs first, and one handed back unfinished (a hold, an unloaded plugin, a failing row - every such
+        // path writes the request) moves behind the others instead of being re-picked, and re-skipped, on every run.
         const limit: number = Math.max(1, Math.min(this.batchSize, 1000));
         const staleBefore: Date = new Date(Date.now() - this.claimLeaseSeconds * 1000);
         const candidates: T[] = await this.requestRepo.find(
             {
                 $or: [{ status: `eq(approved)` }, { status: `eq(${ERASURE_IN_PROGRESS})`, dateModified: `lt(${staleBefore.toISOString()})` }],
-                sort: { dateCreated: "ASC", uid: "ASC" },
+                sort: { dateModified: "ASC", uid: "ASC" },
                 limit,
             } as any,
             { ignoreACL: true, limit, skipCache: true },
@@ -276,12 +295,12 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
      * Best-effort: if it fails, the claim simply expires after `claim_lease_seconds`. Only ever called while this worker
      * holds a claim: every path that can fail or hand a request back (including `run()`'s catch - nothing in
      * `processRequest()` before `claimRequest()` can throw) runs after a successful `claimRequest()`. */
-    private async releaseClaim(): Promise<void> {
+    private async releaseClaim(patch: Record<string, any> = {}): Promise<void> {
         const claim = this.claim!;
         this.claim = undefined;
         try {
             await this.requestRepo!.update(
-                { uid: claim.request.uid, version: (claim.request as any).version, status: "approved" } as any,
+                { uid: claim.request.uid, version: (claim.request as any).version, status: "approved", ...patch } as any,
                 asEntity(this.requestRepo!, claim.request),
                 { ignoreACL: true },
             );
@@ -294,12 +313,12 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         try {
             await assertNotOnLegalHold(this._objectFactory!, this.matterClass, request.mailboxUid);
         } catch {
-            // Still held - skip, don't error. Retried automatically on a later run once the matter closes.
-            if (request.status !== "approved") {
-                // A stale in-progress request found held: hand it back so it reads as waiting, not running.
-                if (await this.claimRequest(request)) {
-                    await this.releaseClaim();
-                }
+            // Still held - skip, don't error. Retried automatically on a later run once the matter closes. Claiming and handing
+            // it straight back (an in-progress one so it reads as waiting, not running; an approved one) bumps its
+            // `dateModified`, which sends it to the back of the line - candidates run oldest-modified first, so a request that is
+            // held for as long as its matter lasts never starves the ones behind it.
+            if (await this.claimRequest(request)) {
+                await this.releaseClaim();
             }
             return;
         }
@@ -320,6 +339,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         }
 
         let purgedCount = 0;
+        this.purgeFailures = [];
         // Message content blobs are shared: one inbound raw blob is referenced by every recipient mailbox's
         // `Message`/`IngestQueueEntry`/`QuarantineEntry`, and attachment/sanitized-HTML blobs by a message and its
         // mail-filter copies. Each row is deleted first, then its blobs only if no other row (in any mailbox,
@@ -331,11 +351,14 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             quarantineEntryClass: this.quarantineEntryClass,
             ingestQueueEntryClass: this.ingestQueueEntryClass,
         });
-        const deleteSharedBlobs = async (...keys: (string | undefined)[]): Promise<void> => {
-            await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, keys);
+        // Run BEFORE the owning row is deleted (the row being purged is excluded from the reference check): a blob store
+        // failure then leaves the row, and so its blob keys, in place for the next run to retry, instead of an orphaned blob
+        // (personal data) that nothing points at and no later run can find.
+        const deleteSharedBlobs = async (entityClass: any, row: any, ...keys: (string | undefined)[]): Promise<void> => {
+            await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, keys, { entityClass, uid: row.uid });
         };
-        purgedCount += await this.purgeEntityType(this.attachmentClass, request.mailboxUid, undefined, async (row: any) => {
-            await deleteSharedBlobs(row.blobKey, row.extractedTextBlobKey);
+        purgedCount += await this.purgeEntityType(this.attachmentClass, request.mailboxUid, async (row: any) => {
+            await deleteSharedBlobs(this.attachmentClass, row, row.blobKey, row.extractedTextBlobKey);
         });
         // Every indexed entity type also has its search document removed once its row is gone - otherwise the search
         // provider keeps serving the erased subject/body/attachment text (the "message" document covers a message's
@@ -345,11 +368,15 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             async (row: any): Promise<void> => {
                 await removeFromSearchIndex(this.searchProvider, entityType, row.uid, this.logger);
             };
-        purgedCount += await this.purgeEntityType(this.messageClass, request.mailboxUid, undefined, async (row: any) => {
-            await removeFromIndex("message")(row);
-            // Including draft bodies kept for a (since released) legal hold - erasure never runs under a hold.
-            await deleteSharedBlobs(row.bodyBlobKey, row.sanitizedHtmlBlobKey, ...retainedBodyBlobKeysOf(row));
-        });
+        purgedCount += await this.purgeEntityType(
+            this.messageClass,
+            request.mailboxUid,
+            async (row: any) => {
+                // Including draft bodies kept for a (since released) legal hold - erasure never runs under a hold.
+                await deleteSharedBlobs(this.messageClass, row, row.bodyBlobKey, row.sanitizedHtmlBlobKey, ...retainedBodyBlobKeysOf(row));
+            },
+            removeFromIndex("message"),
+        );
         purgedCount += await this.purgeEntityType(
             this.contactClass,
             request.mailboxUid,
@@ -385,11 +412,11 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         for (const entityClass of this.pluginMailboxScopedClasses()) {
             purgedCount += await this.purgeEntityType(entityClass, request.mailboxUid);
         }
-        purgedCount += await this.purgeEntityType(this.quarantineEntryClass, request.mailboxUid, undefined, async (row: any) => {
-            await deleteSharedBlobs(row.rawBlobKey);
+        purgedCount += await this.purgeEntityType(this.quarantineEntryClass, request.mailboxUid, async (row: any) => {
+            await deleteSharedBlobs(this.quarantineEntryClass, row, row.rawBlobKey);
         });
-        purgedCount += await this.purgeEntityType(this.ingestQueueEntryClass, request.mailboxUid, undefined, async (row: any) => {
-            await deleteSharedBlobs(row.rawBlobKey);
+        purgedCount += await this.purgeEntityType(this.ingestQueueEntryClass, request.mailboxUid, async (row: any) => {
+            await deleteSharedBlobs(this.ingestQueueEntryClass, row, row.rawBlobKey);
         });
         purgedCount += await this.purgeEntityType(this.dataExportRequestClass, request.mailboxUid, async (row: any) => {
             if (row.blobKey) {
@@ -399,6 +426,26 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         purgedCount += await this.purgeEntityType(this.mailboxImportRequestClass, request.mailboxUid, async (row: any) => {
             await this.blobStore!.delete(row.sourceBlobKey);
         });
+
+        if (this.purgeFailures.length > 0) {
+            // Whatever failed is still there (or its blobs are): completing now would record an erasure that did not happen and
+            // delete the mailbox and its access list, the anchors a retry needs. The request stays `"approved"` and is retried.
+            const rows: string = `${this.purgeFailures.slice(0, 20).join(", ")}${this.purgeFailures.length > 20 ? ", ..." : ""}`;
+            const attempt: number = Number(ATTEMPT_REASON.exec(request.reason ?? "")?.[1] ?? 0) + 1;
+            if (attempt >= this.maxAttempts) {
+                // A row that has failed this many runs is not going to purge by itself: stop retrying and leave it to an operator.
+                this.logger?.error(
+                    `ErasureExecutionJob: erasure request ${request.uid} (mailbox ${request.mailboxUid}) FAILED after ${attempt} attempts and is no longer retried - ${this.purgeFailures.length} row(s) could not be purged and need operator attention: ${rows}.`,
+                );
+                await this.releaseClaim({ status: "failed", reason: `Erasure failed after ${attempt} attempts; these rows could not be purged: ${rows}`.slice(0, 2000) });
+                return;
+            }
+            this.logger?.error(
+                `ErasureExecutionJob: ${this.purgeFailures.length} row(s) could not be purged for erasure request ${request.uid} (mailbox ${request.mailboxUid}), so it is not complete and is retried on a later run (attempt ${attempt} of ${this.maxAttempts}): ${rows}.`,
+            );
+            await this.releaseClaim({ reason: `Erasure attempt ${attempt} of ${this.maxAttempts} left rows behind and is retried: ${rows}`.slice(0, 2000) });
+            return;
+        }
 
         try {
             // A final re-check: the top-of-method hold check only catches a hold already in place
@@ -529,8 +576,9 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     /** Purges every row of one entity type matching `criteria`, best-effort per row (a single row's failure is
      * logged and skipped, not fatal to the rest of the cascade - the same tolerance `RetentionEnforcementJob`'s
      * own per-record purge loop already accepts). `onBeforeDelete`, when given, runs first (a row's own unshared
-     * `BlobStore` content, or its dependent rows); `onAfterDelete` runs once the row is gone (shared blobs that no
-     * remaining row references). */
+     * `BlobStore` content, shared blobs that no remaining row references, or its dependent rows) - a failure there
+     * leaves the row for the next run to retry; `onAfterDelete` runs once the row is gone (best-effort cleanup that
+     * needs no retry, such as its search index document). */
     private async purgeByCriteria(
         entityClass: any,
         criteria: Record<string, any>,
@@ -571,6 +619,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
                             }
                         } catch (err: any) {
                             failed.add(row.uid);
+                            this.purgeFailures.push(`${entityClass.name} ${row.uid}`);
                             this.logger?.warn(`ErasureExecutionJob: failed to purge ${entityClass.name} ${row.uid}: ${err.message}`);
                         }
                     }

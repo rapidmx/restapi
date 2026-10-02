@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { Raw, type Repository as TypeOrmRepository } from "typeorm";
+import { type Repository as TypeOrmRepository } from "typeorm";
 import type { JWTUser } from "@rapidrest/core";
 import { AccessControlListSQL, DatabaseDecorators, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import {
@@ -18,6 +18,7 @@ import {
     MessageSQL,
 } from "../../sql.js";
 import { BaseMailboxRoute } from "../BaseMailboxRoute.js";
+import { escapeLike, rawLike } from "./LikeUtils.js";
 const { Model } = RouteDecorators;
 const { Repository } = DatabaseDecorators;
 
@@ -44,8 +45,8 @@ export class MailboxRouteSQL extends BaseMailboxRoute<MailboxSQL> {
 
     /** `aliasAddresses` is a serialized `simple-json` column here - see `MailIngestRouteSQL.aliasQueryValue()`. */
     protected aliasQueryValue(address: string): any {
-        const escaped: string = address.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-        return Raw((alias) => `${alias} LIKE :pattern ESCAPE '\\'`, { pattern: `%"${escaped}"%` });
+        const escaped: string = escapeLike(address);
+        return rawLike(`%"${escaped}"%`);
     }
 
     /**
@@ -64,12 +65,11 @@ export class MailboxRouteSQL extends BaseMailboxRoute<MailboxSQL> {
      */
     protected async findAccessibleMailboxUids(user: JWTUser): Promise<string[]> {
         const candidates: string[] = [user.uid, ...(user.roles ?? [])];
-        const where = candidates.map((id) => {
-            const escaped: string = id.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+        // One parameter name per branch of the OR (see `rawLike()`).
+        const where = candidates.map((id, index) => {
+            const escaped: string = escapeLike(id);
             return {
-                records: Raw((alias) => `${alias} LIKE :pattern ESCAPE '\\'`, {
-                    pattern: `%"userOrRoleId":"${escaped}"%`,
-                }),
+                records: rawLike(`%"userOrRoleId":"${escaped}"%`, `pattern${index}`),
             };
         });
         const acls: AccessControlListSQL[] = await this.aclRepo!.find({ where });

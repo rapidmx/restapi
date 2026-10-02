@@ -24,6 +24,9 @@ import { extractPublicHostname, isReservedDomainName } from "../util/DomainUtils
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
 import { AuditAction, Domain } from "../models/types.js";
 const { Get, Param, Post, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
+/** A host name in lowercase: dot-separated labels of letters, digits and hyphens (a label neither starts nor ends with one, at most 63 characters), at most 253 in all. */
+const DOMAIN_NAME_PATTERN: RegExp = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
+
 const { Config, Inject } = ObjectDecorators;
 
 const DMARC_POLICIES = new Set(["none", "quarantine", "reject"]);
@@ -149,7 +152,16 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
         validateDmarcPolicy(o.dmarcPolicy);
+        if (typeof o.name !== "string") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain's name must be text.");
+        }
         const uid: string = normalizeAddress(o.name);
+        // Everything below (the DKIM key file's name, every address-domain comparison) reads the name the way it is stored: the normalized one, a
+        // valid host name - checked before a key is generated for it.
+        if (!DOMAIN_NAME_PATTERN.test(uid)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain's name must be a host name: letters, digits and hyphens in dot-separated labels.");
+        }
+        (o as any).name = uid;
         (o as any).uid = uid;
         (o as any).verificationToken = this.newVerificationToken();
         await this.ensureDkimFields(o);

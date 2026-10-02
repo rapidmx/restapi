@@ -78,5 +78,10 @@ export function inspectZipArchive(content: Buffer, maxUncompressedBytes: number,
         const commentLength: number = content.readUInt16LE(offset + 32);
         offset += CENTRAL_HEADER_SIZE + nameLength + extraLength + commentLength;
     }
+    // A central directory that lies about its entry count (JSZip reads records until the signature stops matching, not for a counted
+    // number) is refused: a further record here means entries this walk did not add up.
+    if (offset + 4 <= eocd && content.readUInt32LE(offset) === CENTRAL_HEADER_SIGNATURE) {
+        return fail("the central directory holds more entries than it declares", totalEntries, declared);
+    }
     return { ok: true, entries: totalEntries, declaredUncompressedBytes: declared };
 }

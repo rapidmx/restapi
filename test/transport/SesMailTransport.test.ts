@@ -56,6 +56,14 @@ describe("SesMailTransport Tests", () => {
         expect(mockClientCtor).toHaveBeenCalledWith({});
     });
 
+    it("Names no FromEmailAddress for an empty envelope sender, which SES would refuse.", async () => {
+        mockSend.mockResolvedValue({ MessageId: "<abc@x.com>" });
+        await transport.send(makeMessage({ envelopeFrom: "" }));
+        const input = (mockSend.mock.calls[0][0] as any).input;
+        expect(input).not.toHaveProperty("FromEmailAddress");
+        expect(input.Destination).toEqual({ ToAddresses: ["b@x.com"] });
+    });
+
     it("Passes envelopeFrom/envelopeTo as explicit overrides and the raw source as Content.Raw.Data.", async () => {
         mockSend.mockResolvedValue({ MessageId: "<abc@x.com>" });
         const message = makeMessage({ envelopeTo: ["b@x.com", "c@x.com"] });

@@ -238,6 +238,11 @@ describe("Route:KeyDiscoveryMongo Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.body.keys).toEqual([key]);
+        // The certificates name the primary address: the response says so for an alias-domain question, and not for a literal one.
+        expect(result.body.address).toBe(`${localPart}@powerlevel.gg`);
+        const literal = await request(server.getApplication()).get(`${baseUrl}/${hash}?domain=powerlevel.gg`);
+        expect(literal.status).toBe(200);
+        expect(literal.body.address).toBeUndefined();
     });
 
     it("Never leaks a disabled/dangling alias domain into a match - falls back to the all-defaults response.", async () => {

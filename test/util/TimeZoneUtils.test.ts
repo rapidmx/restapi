@@ -17,4 +17,10 @@ describe("isValidTimeZone", () => {
             expect(isValidTimeZone(zone)).toBe(false);
         }
     });
+
+    it("refuses an offset zone and a lower-case spelling, which newer runtimes' Intl accepts but the doc excludes", () => {
+        for (const zone of ["+03:00", "-08:00", "-0800", "america/new_york", "utc", "Europe/paris"]) {
+            expect(isValidTimeZone(zone)).toBe(false);
+        }
+    });
 });

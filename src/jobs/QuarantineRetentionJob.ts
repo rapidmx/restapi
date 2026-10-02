@@ -23,7 +23,8 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
  * closes (conservatively regardless of the hold's date range), like `RetentionEnforcementJob`'s messages.
  *
  * Also purges `DELIVERED` `IngestQueueEntry` rows older than `delivered_ingest_retention_days`, with their raw blobs
- * when unreferenced - see `run()`.
+ * when unreferenced, and dead-lettered ones (`FAILED`, attempts exhausted) older than `failed_ingest_retention_days` - see
+ * `run()`.
  *
  * No search index cleanup is needed here: only `Message` rows are indexed (`SearchIndexJob`), and a quarantined
  * delivery never creates one (`QuarantineEntry.originalMessageUid` is never set); a released entry's delivered copy is
@@ -65,6 +66,12 @@ export abstract class QuarantineRetentionJob<Q extends QuarantineEntry> extends 
      * job purges it and its raw blob, if unreferenced. `0` disables that cleanup. */
     @Config("mail:jobs:quarantine_retention:delivered_ingest_retention_days", 30)
     private deliveredIngestRetentionDays: number = 30;
+
+    /** How long a dead-lettered `IngestQueueEntry` (`FAILED` with no further attempt scheduled: `ScanQueueJob` gave up on it) is kept for an
+     * operator to look at before this job purges it and its raw blob, if unreferenced - the raw message is personal data that
+     * would otherwise be kept for ever. `0` disables that cleanup. */
+    @Config("mail:jobs:quarantine_retention:failed_ingest_retention_days", 90)
+    private failedIngestRetentionDays: number = 90;
 
     @Logger
     private logger: any;
@@ -118,15 +125,17 @@ export abstract class QuarantineRetentionJob<Q extends QuarantineEntry> extends 
             { ...heldExclusion, dateCreated: `lt(${cutoff.toISOString()})` },
             "dateCreated",
             async (entry) => {
-                await this.quarantineEntryRepo!.delete(entry.uid, { ignoreACL: true, purge: true });
-                try {
-                    if (entry.scanResultUid) {
-                        await this.scanResultRepo!.delete(entry.scanResultUid, { ignoreACL: true, purge: true });
-                    }
-                    await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, [entry.rawBlobKey]);
-                } catch (err: any) {
-                    this.logger?.warn(`QuarantineRetentionJob: failed to clean up content of quarantine entry ${entry.uid}: ${err.message}`);
+                // Content first, the entry itself last (the entry being purged is excluded from the reference check): a failure
+                // on the way leaves the entry - and so its blob key - in place for the next run to retry, instead of an
+                // orphaned raw message (personal data) nothing points at any more.
+                await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, [entry.rawBlobKey], {
+                    entityClass: this.quarantineEntryClass,
+                    uid: entry.uid,
+                });
+                if (entry.scanResultUid) {
+                    await this.scanResultRepo!.delete(entry.scanResultUid, { ignoreACL: true, purge: true });
                 }
+                await this.quarantineEntryRepo!.delete(entry.uid, { ignoreACL: true, purge: true });
             },
             (entry, err) => this.logger?.warn(`QuarantineRetentionJob: failed to purge quarantine entry ${entry.uid}: ${err.message}`),
         );
@@ -144,17 +153,38 @@ export abstract class QuarantineRetentionJob<Q extends QuarantineEntry> extends 
                 this.ingestQueueEntryRepo,
                 { ...heldExclusion, status: `eq(${IngestStatus.DELIVERED})`, dateModified: `lt(${ingestCutoff.toISOString()})` },
                 "dateModified",
-                async (entry) => {
-                    await this.ingestQueueEntryRepo!.delete(entry.uid, { ignoreACL: true, purge: true });
-                    try {
-                        await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, [entry.rawBlobKey]);
-                    } catch (err: any) {
-                        this.logger?.warn(`QuarantineRetentionJob: failed to clean up the raw blob of delivered ingest entry ${entry.uid}: ${err.message}`);
-                    }
-                },
+                (entry) => this.purgeIngestEntry(entry, blobSources),
                 (entry, err) => this.logger?.warn(`QuarantineRetentionJob: failed to purge delivered ingest entry ${entry.uid}: ${err.message}`),
             );
         }
+
+        // Dead letters: `ScanQueueJob` gave up (`FAILED`, no `nextAttemptAt`), so nothing will ever read the row or its raw message
+        // again except an operator who has had `failed_ingest_retention_days` to look. A failed entry still waiting for a retry has a
+        // `nextAttemptAt` and is never touched.
+        if (this.ingestQueueEntryRepo && this.failedIngestRetentionDays > 0) {
+            const failedCutoff: Date = new Date(Date.now() - this.failedIngestRetentionDays * 24 * 60 * 60 * 1000);
+            await this.purgeSorted<any>(
+                this.ingestQueueEntryRepo,
+                { ...heldExclusion, status: `eq(${IngestStatus.FAILED})`, nextAttemptAt: "eq(null)", dateModified: `lt(${failedCutoff.toISOString()})` },
+                "dateModified",
+                async (entry) => {
+                    this.logger?.warn(
+                        `QuarantineRetentionJob: purging dead-lettered ingest entry ${entry.uid} (mailbox ${entry.mailboxUid}) after ${this.failedIngestRetentionDays} days: ${entry.errorMessage ?? "no error recorded"}`,
+                    );
+                    await this.purgeIngestEntry(entry, blobSources);
+                },
+                (entry, err) => this.logger?.warn(`QuarantineRetentionJob: failed to purge dead-lettered ingest entry ${entry.uid}: ${err.message}`),
+            );
+        }
+    }
+
+    /** Deletes an ingest entry's raw blob first (only if nothing else references it), the row last - see the quarantine purge in `run()`. */
+    private async purgeIngestEntry(entry: any, blobSources: BlobReferenceSource[]): Promise<void> {
+        await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, [entry.rawBlobKey], {
+            entityClass: this.ingestQueueEntryClass,
+            uid: entry.uid,
+        });
+        await this.ingestQueueEntryRepo!.delete(entry.uid, { ignoreACL: true, purge: true });
     }
 
     /**

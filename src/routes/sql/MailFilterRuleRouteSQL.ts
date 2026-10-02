@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { FolderSQL, LabelSQL, MailFilterRuleSQL } from "../../sql.js";
+import { AuditLogEntrySQL, FolderSQL, LabelSQL, MailFilterRuleSQL } from "../../sql.js";
 import { BaseMailFilterRuleRoute } from "../BaseMailFilterRuleRoute.js";
 const { Model } = RouteDecorators;
 
@@ -12,4 +12,5 @@ export class MailFilterRuleRouteSQL extends BaseMailFilterRuleRoute<MailFilterRu
     protected readonly repoUtilsClass: any = RepoUtils;
     protected folderClass: any = FolderSQL;
     protected labelClass: any = LabelSQL;
+    protected auditLogClass: any = AuditLogEntrySQL;
 }

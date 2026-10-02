@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { AuditLogEntrySQL, EscrowAccessRequestSQL, EscrowScopeSQL, MatterSQL } from "../../sql.js";
+import { AuditLogEntrySQL, EscrowAccessRequestSQL, EscrowScopeSQL, MailboxSQL, MatterSQL } from "../../sql.js";
 import { BaseMatterRoute } from "../BaseMatterRoute.js";
 const { Model } = RouteDecorators;
 
@@ -13,4 +13,5 @@ export class MatterRouteSQL extends BaseMatterRoute<MatterSQL> {
     protected escrowScopeClass: any = EscrowScopeSQL;
     protected auditLogClass: any = AuditLogEntrySQL;
     protected escrowAccessRequestClass: any = EscrowAccessRequestSQL;
+    protected mailboxClass: any = MailboxSQL;
 }

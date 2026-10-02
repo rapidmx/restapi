@@ -30,6 +30,7 @@ import {
     PublicKey,
     RecipientType,
 } from "../../../src/models/types.js";
+import { stampSanitizedHtml } from "../../../src/scan/HtmlSanitizer.js";
 import { registerTestDoubles, InMemoryBlobStore, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
 
 describe("Route:MessageSQL Tests", () => {
@@ -569,6 +570,7 @@ describe("Route:MessageSQL Tests", () => {
             const sentFolder = await createFolder(mailbox.uid, FolderType.SENT_ITEMS);
             const message = await createMessage(mailbox.uid, sentFolder.uid, {
                 messageId: "abc123@example.com",
+                sentByServerAt: new Date(),
                 from: { address: "owner@example.com", type: RecipientType.TO },
                 recipients: [
                     { address: "recipient1@example.com", type: RecipientType.TO },
@@ -609,7 +611,7 @@ describe("Route:MessageSQL Tests", () => {
         it("Rejects recalling a message with no Message-ID (400).", async () => {
             const mailbox = await createMailbox(owner.uid);
             const sentFolder = await createFolder(mailbox.uid, FolderType.SENT_ITEMS);
-            const message = await createMessage(mailbox.uid, sentFolder.uid, { messageId: "" });
+            const message = await createMessage(mailbox.uid, sentFolder.uid, { messageId: "", sentByServerAt: new Date() });
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}/${message.uid}/recall`)
@@ -643,6 +645,7 @@ describe("Route:MessageSQL Tests", () => {
             const sentFolder = await createFolder(mailbox.uid, FolderType.SENT_ITEMS);
             const message = await createMessage(mailbox.uid, sentFolder.uid, {
                 messageId: "recall-audit@example.com",
+                sentByServerAt: new Date(),
                 subject: "Recall Me",
             });
 
@@ -1051,7 +1054,7 @@ describe("Route:MessageSQL Tests", () => {
         const folder = await createFolder(mailbox.uid, FolderType.INBOX);
         const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
         const sanitizedHtmlBlobKey = `bodies/${uuid.v4()}.html`;
-        await blobStore.put(sanitizedHtmlBlobKey, Buffer.from("<p>Hello</p>"));
+        await blobStore.put(sanitizedHtmlBlobKey, Buffer.from(stampSanitizedHtml("<p>Hello</p>")));
         const message = await createMessage(mailbox.uid, folder.uid, { sanitizedHtmlBlobKey });
 
         const result = await request(server.getApplication())
@@ -1499,6 +1502,8 @@ describe("Route:MessageSQL Tests", () => {
             const message = await createMessage(mailbox.uid, folder.uid, {
                 messageId: "original@example.com",
                 dispositionNotificationTo: "colleague@example.com",
+                // Only received mail asks for a receipt (a delivered message carries the scan result).
+                scanResultUid: "scan-result",
             });
 
             const result = await request(server.getApplication())
@@ -1522,6 +1527,8 @@ describe("Route:MessageSQL Tests", () => {
             const message = await createMessage(mailbox.uid, folder.uid, {
                 messageId: "original@example.com",
                 dispositionNotificationTo: "stranger@outside.com",
+                // Only received mail asks for a receipt (a delivered message carries the scan result).
+                scanResultUid: "scan-result",
             });
 
             const result = await request(server.getApplication())
@@ -1544,6 +1551,8 @@ describe("Route:MessageSQL Tests", () => {
             const message = await createMessage(mailbox.uid, folder.uid, {
                 messageId: "original@example.com",
                 dispositionNotificationTo: "stranger@outside.com",
+                // Only received mail asks for a receipt (a delivered message carries the scan result).
+                scanResultUid: "scan-result",
             });
 
             const result = await request(server.getApplication())
@@ -1563,6 +1572,8 @@ describe("Route:MessageSQL Tests", () => {
             const message = await createMessage(mailbox.uid, folder.uid, {
                 messageId: "original@example.com",
                 dispositionNotificationTo: "colleague@example.com",
+                // Only received mail asks for a receipt (a delivered message carries the scan result).
+                scanResultUid: "scan-result",
             });
 
             const first = await request(server.getApplication())
@@ -1604,6 +1615,8 @@ describe("Route:MessageSQL Tests", () => {
             const message = await createMessage(mailbox.uid, folder.uid, {
                 messageId: "original@example.com",
                 dispositionNotificationTo: "stranger@outside.com",
+                // Only received mail asks for a receipt (a delivered message carries the scan result).
+                scanResultUid: "scan-result",
             });
             await mailboxRepo.delete({ uid: mailbox.uid });
 
@@ -1624,6 +1637,8 @@ describe("Route:MessageSQL Tests", () => {
             const message = await createMessage(mailbox.uid, folder.uid, {
                 messageId: "original@example.com",
                 dispositionNotificationTo: "colleague@example.com",
+                // Only received mail asks for a receipt (a delivered message carries the scan result).
+                scanResultUid: "scan-result",
             });
             const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
             const spy = vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("smtp is down"));

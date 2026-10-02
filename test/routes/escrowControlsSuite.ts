@@ -509,11 +509,12 @@ export function escrowControlsSuite(ctx: SecurityControlsSuiteContext): void {
             expect(scopeResult.body.uid).toMatch(UUID);
             expect(scopeResult.body.version).toBe(0);
 
+            const custodian = await createMailbox({ escrowScopeId: scopeResult.body.uid });
             const matterResult = await as(holder).post("/matters", {
                 uid: "chosen,matter",
                 name: "Investigation",
                 escrowScopeId: scopeResult.body.uid,
-                custodianMailboxUids: [uuid.v4()],
+                custodianMailboxUids: [custodian.uid],
             });
             expect(matterResult.status).toBe(200);
             expect(matterResult.body.uid).toMatch(UUID);

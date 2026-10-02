@@ -296,12 +296,76 @@ export function missingRequiredSettings(manifest: PluginManifest | undefined, va
     });
 }
 
+/** The configuration namespaces that belong to the server itself, each a key or the prefix of a whole group of keys (`auth` covers
+ * `auth:secret`, `auth:options:issuer`, ...). A plugin's setting may not live in (or under) one of them: its own settings belong
+ * under its own namespace, like `mail:videoconf:*`. The server's `PROTECTED_PLUGIN_SETTING_KEYS` is the same list. */
+export const CORE_CONFIG_NAMESPACES: readonly string[] = [
+    "trusted_roles",
+    "trusted_proxies",
+    "auth",
+    "cookie_secret",
+    "cookies",
+    "session",
+    "cors",
+    "ssl",
+    "datastores",
+    "base_path",
+    "rateLimit",
+    "telemetry_services",
+    "system",
+    "system:plugins",
+    "mail:transport",
+    "mail:internal",
+    "mail:escrow",
+    "mail:pki",
+    "mail:auth_server_url",
+    "mail:basic_auth",
+    "mail:security",
+    "mail:blob",
+    "mail:scan",
+    "mail:dns",
+    "mail:dkim",
+    "mail:domains",
+    "mail:auto_provision",
+    "mail:jobs",
+    "mail:compose",
+    "mail:search",
+    "mail:preferences",
+    "mail:autodiscover",
+    "mail:branding",
+    "mail:default_quota_bytes",
+    "metrics",
+    "diagnostics",
+    "class_loader",
+    "cluster_url",
+    "react",
+    "static_assets",
+    "giphy",
+    "logs",
+    "service_name",
+    "version",
+    "max_body_size",
+    "shutdown",
+];
+
+/**
+ * Whether a plugin may declare, read or save a setting under `key`: it must not be in, or under, one of the server's own
+ * configuration namespaces. `__` counts as `:` (as in the environment) and the comparison ignores case.
+ */
+export function isPluginSettingKeyAllowed(key: string): boolean {
+    const normalized: string = key.trim().toLowerCase().replace(/__/g, ":");
+    return !CORE_CONFIG_NAMESPACES.some((namespace) => normalized === namespace.toLowerCase() || normalized.startsWith(`${namespace.toLowerCase()}:`));
+}
+
 function checkSettingDefinition(setting: any): string | undefined {
     if (!setting || typeof setting.key !== "string" || setting.key === "" || typeof setting.label !== "string") {
         return "every setting needs a key and a label.";
     }
     if (RESERVED_KEYS.has(setting.key)) {
         return `'${setting.key}' is a reserved key.`;
+    }
+    if (!isPluginSettingKeyAllowed(setting.key)) {
+        return `'${setting.key}' names part of the server's own configuration.`;
     }
     if (!["string", "number", "boolean", "select"].includes(setting.type)) {
         return `'${setting.key}' has an unknown type '${setting.type}'.`;
@@ -313,6 +377,9 @@ function checkSettingDefinition(setting: any): string | undefined {
         if (!setting.options.every((option: any) => typeof option?.value === "string" && typeof option.label === "string")) {
             return `'${setting.key}' has an option without a value and a label.`;
         }
+    }
+    if (setting.secret !== undefined && typeof setting.secret !== "boolean") {
+        return `'${setting.key}' secret must be true or false.`;
     }
     if (setting.default !== undefined) {
         // A default has to be a value an administrator could have saved.
@@ -390,8 +457,42 @@ export function defaultPluginSettings(manifest: PluginManifest, host?: string): 
  * `config.defaults.ts`, and is left out when reporting what the deployment itself configures. */
 export const PLUGIN_SETTINGS_STORE = "plugins";
 
-/** Keys naming a secret, whose value is never sent to the browser. */
-const SECRET_SETTING_KEY = /secret|password|credential|token|api_?key/i;
+/** The words of a setting key: `smtp_password`, `smtp-password`, `m:smtpPassword` and `SMTPPassword` are all `smtp`, `password`, in lowercase. */
+function settingKeyWords(key: string): string[] {
+    return key
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+        .split(/[^A-Za-z0-9]+/)
+        .filter((word) => word !== "")
+        .map((word) => word.toLowerCase());
+}
+
+/** A word that is a secret by itself: `secret`, `password`/`passwd`/`passphrase`, `credential(s)`, `apikey`, `privatekey`, `bearer`, `dsn`, `authorization`, and a
+ * `token` (`access_token`, `authtoken` - but not `tokenizer`, nor the plural `max_tokens`). */
+const SECRET_WORD = /secret|passw(?:or)?d|passphrase|passcode|credential|^(?:api|private|access|signing|secret)key$|^(?:bearer|dsn|pwd|authori[sz]ation|connectionstring)$|^(?:[a-z]+)?token$/;
+
+/** What a word names a secret in when it follows `auth`/`api`/`private`/`access`/`signing`/`encryption`/`master`/`connection`: `api_key`, `auth_header`, `connection_string`. */
+const SECRET_PAIRS: Readonly<Record<string, ReadonlySet<string>>> = {
+    api: new Set(["key"]),
+    private: new Set(["key"]),
+    access: new Set(["key"]),
+    signing: new Set(["key"]),
+    encryption: new Set(["key"]),
+    master: new Set(["key"]),
+    auth: new Set(["header", "key"]),
+    connection: new Set(["string"]),
+};
+
+/**
+ * Whether a setting's key names a secret, whose value is never sent to the browser. Judged by the key's words (`settingKeyWords()`), not by whether it contains
+ * a few letters: `client_secret`, `smtp_password`, `passphrase`, `credentials`, `access_token`, `api_key`, `private_key`, `connection_string`, `dsn`, `bearer` and
+ * `authorization`/`auth_header` are secrets, `author`, `tokenizer`, `max_tokens`, `auth_method` and a plain `key` are not. A manifest can say so
+ * for any other key with `secret: true` (`PluginSettingDefinition.secret`).
+ */
+export function isSecretSettingKey(key: string): boolean {
+    const words: string[] = settingKeyWords(key);
+    return words.some((word, i) => SECRET_WORD.test(word) || (SECRET_PAIRS[word]?.has(words[i + 1]) ?? false));
+}
 
 /** What a config store holds for `key`: nothing for an unset value, an empty one (which nothing treats as set) or one that
  * isn't text, a number or a flag. */
@@ -414,12 +515,16 @@ export function configuredPluginSettings(config: any, manifest: PluginManifest):
     const stores: [string, any][] = Object.entries(config?.stores ?? {}).filter(([name]) => name !== PLUGIN_SETTINGS_STORE);
     const result: Record<string, PluginConfiguredSetting> = {};
     for (const setting of manifest.settings ?? []) {
+        if (!isPluginSettingKeyAllowed(setting.key)) {
+            // A manifest stored before keys were checked must not read the server's own configuration.
+            continue;
+        }
         for (const [, store] of stores) {
             const value: string | number | boolean | undefined = storedValue(store, setting.key);
             if (value === undefined) {
                 continue;
             }
-            const secret: boolean = SECRET_SETTING_KEY.test(setting.key);
+            const secret: boolean = setting.secret === true || isSecretSettingKey(setting.key);
             result[setting.key] = secret ? { secret } : { value, secret };
             break;
         }

@@ -54,7 +54,7 @@ import {
     parseFreeBusyRequest,
     type FreeBusyResponse,
 } from "../util/FreeBusyLookupUtils.js";
-import { isPlainAddress, safeDisplayName } from "../util/MimeHeaderUtils.js";
+import { isPlainAddress, safeDisplayName, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
 import { nameBasedUuid } from "../util/UuidUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
@@ -69,15 +69,24 @@ import {
     Mailbox,
     RecipientType,
 } from "../models/types.js";
-const { Inject } = ObjectDecorators;
+const { Config, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Auth, Get, Param, Post, RateLimit, Request, User: AuthUser } = RouteDecorators;
+
+/** The routes that mail an iTIP message (a reply, a change request, a proposal) are limited per user, so one account can't use them to send bulk mail. */
+const ITIP_MAIL_MAX_ATTEMPTS: number = 120;
+const ITIP_MAIL_WINDOW_SECONDS: number = 3600;
 
 const RESPOND_STATUS_MAP: Record<string, AttendeeResponseStatus> = {
     accepted: AttendeeResponseStatus.ACCEPTED,
     declined: AttendeeResponseStatus.DECLINED,
     tentative: AttendeeResponseStatus.TENTATIVE,
 };
+
+/** The status `answer` names - only an own key of `RESPOND_STATUS_MAP` (`constructor`/`toString`/`__proto__` name none). */
+function respondStatusOf(answer: unknown): AttendeeResponseStatus | undefined {
+    return typeof answer === "string" && Object.prototype.hasOwnProperty.call(RESPOND_STATUS_MAP, answer) ? RESPOND_STATUS_MAP[answer] : undefined;
+}
 
 /**
  * Extends `BaseScopedChildRoute` (scoped by `folderUid`, same as `Message`) with the two pieces of
@@ -138,6 +147,11 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
 
     @Inject("MailTransport")
     private mailTransport?: any;
+
+    /** The `authserv-id` of the MTA's own `Authentication-Results` header (`mail:security:trusted_authserv_id`): what makes a message's sender
+     * verified (`acceptProposal()`). Empty: nothing is. */
+    @Config("mail:security:trusted_authserv_id", "")
+    private trustedAuthservId: string = "";
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -291,8 +305,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
 
     /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `CalendarEvent` carries its
      * own denormalized `mailboxUid` that must never diverge from its actual folder's mailbox. */
-    protected async resolveMailboxUidFor(scopeUid: string): Promise<string | undefined> {
-        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid);
+    protected async resolveMailboxUidFor(scopeUid: string, rejectDeleted?: boolean): Promise<string | undefined> {
+        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid, rejectDeleted);
     }
 
     /** Coerces every date field to a real `Date` (a `400` for an unparseable one) before anything is saved - see
@@ -399,6 +413,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             "own copy of the event, matching Outlook/Exchange behavior.",
     )
     @Returns([Object])
+    @RateLimit({ perUser: true, maxAttempts: ITIP_MAIL_MAX_ATTEMPTS, windowSeconds: ITIP_MAIL_WINDOW_SECONDS })
     @Post("/:id/respond")
     public async respond(
         @Param("id") id: string,
@@ -417,7 +432,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
-        const responseStatus = RESPOND_STATUS_MAP[body?.responseStatus];
+        const responseStatus = respondStatusOf(body?.responseStatus);
         if (!responseStatus) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
@@ -532,6 +547,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             "guest permissions allow the caller to ask; nothing changes on the caller's own calendar.",
     )
     @Returns([Object])
+    @RateLimit({ perUser: true, maxAttempts: ITIP_MAIL_MAX_ATTEMPTS, windowSeconds: ITIP_MAIL_WINDOW_SECONDS })
     @Post("/:id/request-change")
     public async requestChange(
         @Param("id") id: string,
@@ -723,6 +739,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             "calendar, declining does not (and removes it if it was there), and an iTIP REPLY is mailed to the organizer either way.",
     )
     @Returns([Object])
+    @RateLimit({ perUser: true, maxAttempts: ITIP_MAIL_MAX_ATTEMPTS, windowSeconds: ITIP_MAIL_WINDOW_SECONDS })
     @Post("/invite/:messageUid/respond")
     public async respondToInvite(
         @Param("messageUid") messageUid: string,
@@ -731,10 +748,11 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     ): Promise<MessageInvite> {
         const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE);
         const answer: InviteResponse | undefined = body?.responseStatus;
-        const status: AttendeeResponseStatus | undefined = answer ? RESPOND_STATUS_MAP[answer] : undefined;
+        const status: AttendeeResponseStatus | undefined = answer ? respondStatusOf(answer) : undefined;
         if (!answer || !status) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'responseStatus' must be accepted, tentative or declined.");
         }
+        await this.assertFromOrganizer(context);
         const view: MessageInvite = await this.describe(context);
         const adding: boolean = view.canAdd && answer === "accepted";
         if (!view.canRespond && !adding) {
@@ -785,6 +803,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     @Post("/invite/:messageUid/remove")
     public async removeInvite(@Param("messageUid") messageUid: string, @AuthUser user?: JWTUser): Promise<MessageInvite> {
         const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE);
+        await this.assertFromOrganizer(context);
         const view: MessageInvite = await this.describe(context);
         if (!view.canRemove || !context.existing) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This message isn't a cancellation of a meeting on your calendar.");
@@ -801,6 +820,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     @Summary("Propose a new time for the meeting in a message")
     @Description("Mails the organizer an iTIP COUNTER proposing another start and end for the meeting; the caller's calendar is unchanged.")
     @Returns([Object])
+    @RateLimit({ perUser: true, maxAttempts: ITIP_MAIL_MAX_ATTEMPTS, windowSeconds: ITIP_MAIL_WINDOW_SECONDS })
     @Post("/invite/:messageUid/propose")
     public async proposeNewTime(
         @Param("messageUid") messageUid: string,
@@ -853,8 +873,14 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE);
         const view: MessageInvite = await this.describe(context);
         const existing: CalendarEvent | undefined = context.existing;
-        if (!view.canAcceptProposal || !existing || !context.parsed.startDate || !context.parsed.endDate) {
+        // "You organize it" is what the calendar copy says, not the file the sender wrote: a guest's counter-proposal naming the reader as `ORGANIZER`
+        // must not move a meeting the reader only attends.
+        if (!view.canAcceptProposal || !existing || !context.parsed.startDate || !context.parsed.endDate || !context.addresses.has(normalizeAddress(existing.organizer?.address ?? ""))) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This message isn't a proposed time for a meeting you organize.");
+        }
+        // The message's `From` is only as good as the DKIM result behind it: inbound processing applies a proposal from an authenticated sender only.
+        if (context.verifiedSender !== normalizeAddress(context.message.from.address)) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "This proposal's sender could not be verified.");
         }
         const proposer: string = normalizeAddress(view.reply!.address);
         const patch: any = {
@@ -981,15 +1007,58 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (!mailbox) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        return { message, mailbox, parsed, addresses: mailboxAddressSet(mailbox), existing: await this.findInviteRow(mailbox.uid, parsed) };
+        return {
+            verifiedSender: verifiedFromAddress(raw, this.trustedAuthservId),
+            message,
+            mailbox,
+            parsed,
+            addresses: mailboxAddressSet(mailbox),
+            existing: await this.findInviteRow(mailbox.uid, parsed),
+        };
     }
 
-    /** The mailbox's calendar row for this invitation's own occurrence (or the series, for no `RECURRENCE-ID`), if it has one. The `UID` is a
+    /**
+     * Refuses (403) acting on a `REQUEST` or `CANCEL` for a meeting already on the calendar unless it comes from that meeting's organizer: the
+     * file's `ORGANIZER`, the calendar's organizer for the meeting and the message's sender must all be the same address, and the sender must
+     * be DKIM-verified (`verifiedSender`, as `acceptProposal()` requires) - the `From` header alone is anyone's. Matching on the `UID` alone would
+     * let anybody who knows it (every co-attendee does) rewrite or delete the reader's real event with a forged invitation or cancellation when
+     * the reader clicks Accept or Remove. "On the calendar" is the whole series: an occurrence (`RECURRENCE-ID`) of a series whose other rows
+     * are there is held to the series' organizer, though that occurrence has no row of its own yet. Nothing is checked for a meeting that isn't
+     * on the calendar at all.
+     */
+    private async assertFromOrganizer(context: InviteContext): Promise<void> {
+        const method: string = context.parsed.method.toUpperCase();
+        if (method !== "REQUEST" && method !== "CANCEL") {
+            return;
+        }
+        const rows: T[] = await this.findInviteRows(context.mailbox.uid, context.parsed);
+        const onCalendar: CalendarEvent | undefined = context.existing ?? rows.find((row) => !row.recurrenceId) ?? rows[0];
+        if (!onCalendar) {
+            return;
+        }
+        const organizer: string = normalizeAddress(context.parsed.organizer?.address ?? "");
+        const known: string = normalizeAddress(onCalendar.organizer?.address ?? "");
+        const sender: string = normalizeAddress(context.message.from.address);
+        if (!organizer || organizer !== known || organizer !== sender || context.verifiedSender !== sender) {
+            throw new ApiError(
+                ApiErrors.AUTH_PERMISSION_FAILURE,
+                403,
+                "This message doesn't come from the organizer of the meeting on your calendar, so it can't change it.",
+            );
+        }
+    }
+
+    /** Every row of the mailbox's calendar that carries this invitation's `UID` (the series and its overridden occurrences). The `UID` is a
      * sender's value and is matched as a literal, exactly: a value like `ne(x)` would otherwise be read as a query operator. */
-    private async findInviteRow(mailboxUid: string, parsed: ParsedIcsEvent): Promise<CalendarEvent | undefined> {
+    private async findInviteRows(mailboxUid: string, parsed: ParsedIcsEvent): Promise<T[]> {
         const key: string = boundIndexedValue(parsed.uid);
         const rows: T[] = await this.repoUtils!.find({ mailboxUid, icalUid: ModelUtils.literal(key), limit: 50 } as any, { ignoreACL: true, limit: 50 });
-        return rows.filter((row) => row.icalUid === key).find((row) => sameRecurrenceId(row.recurrenceId, parsed.recurrenceId));
+        return rows.filter((row) => row.icalUid === key);
+    }
+
+    /** The mailbox's calendar row for this invitation's own occurrence (or the series, for no `RECURRENCE-ID`), if it has one. */
+    private async findInviteRow(mailboxUid: string, parsed: ParsedIcsEvent): Promise<CalendarEvent | undefined> {
+        return (await this.findInviteRows(mailboxUid, parsed)).find((row) => sameRecurrenceId(row.recurrenceId, parsed.recurrenceId));
     }
 
     /** A calendar-event value for `parsed` - the calendar row to create from it, or the event an iTIP reply is built for. */
@@ -1140,6 +1209,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
 
 /** What the invitation endpoints read from a message and its mailbox. */
 interface InviteContext {
+    /** The message's `From` address when its raw source carries a passing, aligned DKIM result from this deployment's trusted MTA hop. */
+    verifiedSender: string | undefined;
     message: any;
     mailbox: Mailbox;
     parsed: ParsedIcsEvent;

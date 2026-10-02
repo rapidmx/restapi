@@ -32,11 +32,61 @@ const IMAGE_CONTENT_TYPES: readonly string[] = ["image/png", "image/jpeg", "imag
 
 const STYLESHEET_CONTENT_TYPES: readonly string[] = ["text/css"];
 
+/** The inline style properties header/footer markup may use, each with the values it may take: layout and typography only. No `position` (a `fixed` overlay
+ * covers the page it is shown on, the sign-in page included), no `url()`/`expression()`/`@`/escapes in any value (no request to another host, no script), and
+ * `background-color` only, never the `background` shorthand that takes an image. */
+const SAFE_STYLE_VALUE: RegExp = /^(?!.*(?:url\s*\(|expression|javascript:|\\|@))[#a-z0-9\s.,%()\-+/'"!]*$/i;
+const ALLOWED_STYLES: Record<string, RegExp[]> = Object.fromEntries(
+    [
+        "color",
+        "background-color",
+        "font",
+        "font-family",
+        "font-size",
+        "font-weight",
+        "font-style",
+        "line-height",
+        "letter-spacing",
+        "text-align",
+        "text-decoration",
+        "text-transform",
+        "vertical-align",
+        "white-space",
+        "margin",
+        "margin-top",
+        "margin-right",
+        "margin-bottom",
+        "margin-left",
+        "padding",
+        "padding-top",
+        "padding-right",
+        "padding-bottom",
+        "padding-left",
+        "border",
+        "border-top",
+        "border-right",
+        "border-bottom",
+        "border-left",
+        "border-radius",
+        "border-color",
+        "width",
+        "max-width",
+        "height",
+        "max-height",
+        "display",
+        "gap",
+        "justify-content",
+        "align-items",
+        "opacity",
+    ].map((property) => [property, [SAFE_STYLE_VALUE]]),
+);
+
 /**
  * Sanitizes admin-supplied `headerHtml`/`footerHtml`: sanitize-html's default tag set (which has no `script`,
- * `style`, `iframe`, `object`, `form`...) plus `img`, only `http`/`https`/`mailto` URLs (so no `javascript:` or
- * `data:`), and no attributes beyond sanitize-html's defaults plus `class`/`style` - in particular no `on*` event
- * handlers. Disallowed tags are dropped along with their content where sanitize-html does so by default.
+ * `style`, `iframe`, `object`, `form`...) plus `img`, only `http`/`https`/`mailto` links (`img` sources `https` only, so a header
+ * can't make a request in the clear), no attributes beyond sanitize-html's defaults plus `class` and a `style` limited to
+ * `ALLOWED_STYLES` - in particular no `on*` event handlers. Disallowed tags are dropped along with their content where
+ * sanitize-html does so by default.
  */
 function sanitizeBrandingHtml(html: string): string {
     return sanitizeHtml(html, {
@@ -45,12 +95,48 @@ function sanitizeBrandingHtml(html: string): string {
             ...sanitizeHtml.defaults.allowedAttributes,
             "*": ["class", "style"],
         },
+        allowedStyles: { "*": ALLOWED_STYLES },
         allowedSchemes: ["http", "https", "mailto"],
+        allowedSchemesByTag: { img: ["https"] },
         allowedSchemesAppliedToAttributes: ["href", "src", "cite"],
         allowProtocolRelative: false,
         allowVulnerableTags: false,
         disallowedTagsMode: "discard",
     });
+}
+
+/** What a `url()` in an uploaded stylesheet may name: an embedded image, or a path on this server (no scheme, not protocol-relative). */
+const LOCAL_OR_EMBEDDED_URI: RegExp = /^(?:data:image\/(?:png|jpe?g|gif|webp);|(?![a-z][a-z0-9+.-]*:|\/\/))/i;
+
+/**
+ * An uploaded stylesheet without what reaches another host: CSS escapes are decoded first (so an escaped `u\72l(` can't hide), every `@import` is
+ * dropped, and every `url()`/`image-set()` that isn't an embedded image or a path on this server becomes `none` - the stylesheet is applied to every
+ * page, the sign-in page included, so a remote reference is a beacon on each of them (the same rule the web client applies to a message's styles).
+ */
+export function sanitizeBrandingCss(css: string): string {
+    return css
+        .replace(/\\([0-9a-f]{1,6})\s?/gi, (_match, hex: string) => String.fromCodePoint(Math.min(parseInt(hex, 16), 0x10ffff)))
+        .replace(/\\(.)/g, "$1")
+        .replace(/@import[^;]*;?/gi, "")
+        .replace(/(?:-webkit-)?image-set\((?:[^()]|\([^()]*\))*\)/gi, "none")
+        .replace(/url\(\s*(["']?)(.*?)\1\s*\)/gi, (match, _quote: string, uri: string) => (LOCAL_OR_EMBEDDED_URI.test(uri.trim()) ? match : "none"));
+}
+
+/** Whether `value` is a URL a brand asset may be loaded from: a path on this server, or an `https` URL with no credentials in it. */
+function isSafeBrandingUrl(value: string): boolean {
+    // eslint-disable-next-line no-control-regex
+    if (value.length > 2048 || /[\u0000-\u001f\u007f\\\s]/.test(value)) {
+        return false;
+    }
+    if (value.startsWith("/")) {
+        return !value.startsWith("//");
+    }
+    try {
+        const url = new URL(value);
+        return url.protocol === "https:" && url.username === "" && url.password === "";
+    } catch {
+        return false;
+    }
 }
 
 /** The public projection of `Branding` - omits the upload bookkeeping fields (`*BlobKey`/`*ContentType`),
@@ -272,6 +358,18 @@ export abstract class BaseBrandingRoute<T extends Branding> {
         delete patch.stylesheetBlobKey;
         delete patch.stylesheetContentType;
 
+        // The asset URLs are loaded by every page, the pre-sign-in ones included: a path on this server or an https URL, never `http:`/`data:`/`javascript:`.
+        // A value the row already holds (an object round-tripped, or a URL `publicUrl` made) isn't judged again.
+        for (const field of ["logoUrl", "iconUrl", "stylesheetUrl"] as const) {
+            const value: unknown = patch[field];
+            if (value === undefined || value === null || value === "" || value === (existing as any)[field]) {
+                continue;
+            }
+            if (typeof value !== "string" || !isSafeBrandingUrl(value)) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${field}' must be a path on this server or an https URL.`);
+            }
+        }
+
         // Sanitized here, once, so every client that renders the chrome gets markup that can't run script -
         // rather than trusting each of them to sanitize it themselves.
         for (const field of ["headerHtml", "footerHtml"] as const) {
@@ -286,22 +384,25 @@ export abstract class BaseBrandingRoute<T extends Branding> {
 
         // Setting a URL directly means "use this external asset instead" - clear and best-effort delete
         // whichever self-hosted blob it's replacing, so switching back and forth doesn't orphan storage.
+        // The blob is deleted only once the row stops pointing at it (below): a write that fails (a version
+        // conflict) would otherwise leave the row naming a blob that is gone.
+        const staleBlobKeys: string[] = [];
         // `null`, not `undefined`: TypeORM's `Repository.update()` silently drops any key whose value is
         // `undefined` from the generated SQL `UPDATE` (confirmed against a real SQLite datastore) - the
         // column would otherwise keep its stale value forever on the SQL backend. `null` is the only value
         // that actually clears a column on both backends.
         if (patch.logoUrl !== undefined && existing.logoBlobKey) {
-            await this.deleteBlobIfSet(existing.logoBlobKey);
+            staleBlobKeys.push(existing.logoBlobKey);
             patch.logoBlobKey = null;
             patch.logoContentType = null;
         }
         if (patch.iconUrl !== undefined && existing.iconBlobKey) {
-            await this.deleteBlobIfSet(existing.iconBlobKey);
+            staleBlobKeys.push(existing.iconBlobKey);
             patch.iconBlobKey = null;
             patch.iconContentType = null;
         }
         if (patch.stylesheetUrl !== undefined && existing.stylesheetBlobKey) {
-            await this.deleteBlobIfSet(existing.stylesheetBlobKey);
+            staleBlobKeys.push(existing.stylesheetBlobKey);
             patch.stylesheetBlobKey = null;
             patch.stylesheetContentType = null;
         }
@@ -311,6 +412,9 @@ export abstract class BaseBrandingRoute<T extends Branding> {
             existing,
             { user, ignoreACL: true },
         );
+        for (const key of staleBlobKeys) {
+            await this.deleteBlobIfSet(key);
+        }
         await this.recordUpdate(user, { companyName: updated.companyName, title: updated.title });
         return this.toPublicBranding(updated);
     }
@@ -406,28 +510,39 @@ export abstract class BaseBrandingRoute<T extends Branding> {
         if (!allowedContentTypes.includes(contentType)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `Content-Type must be one of: ${allowedContentTypes.join(", ")}.`);
         }
-        const raw: Buffer | undefined = req.rawBody;
+        let raw: Buffer | undefined = req.rawBody;
         if (!raw || raw.length === 0) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
+        if (contentType === "text/css") {
+            raw = Buffer.from(sanitizeBrandingCss(raw.toString("utf8")), "utf8");
+        }
 
         const existing: T = await this.findOrCreate();
-        await this.deleteBlobIfSet((existing as any)[fields.blobKeyField]);
 
         const blobKey: string = `${fields.keyPrefix}/${crypto.randomUUID()}`;
         await this.blobStore!.put(blobKey, raw, { contentType });
 
-        const updated: T = await this.brandingRepo!.update(
-            {
-                uid: existing.uid,
-                version: (existing as any).version,
-                [fields.urlField]: this.assetUrl(fields.path),
-                [fields.blobKeyField]: blobKey,
-                [fields.contentTypeField]: contentType,
-            } as any,
-            existing,
-            { user, ignoreACL: true },
-        );
+        let updated: T;
+        try {
+            updated = await this.brandingRepo!.update(
+                {
+                    uid: existing.uid,
+                    version: (existing as any).version,
+                    [fields.urlField]: this.assetUrl(fields.path),
+                    [fields.blobKeyField]: blobKey,
+                    [fields.contentTypeField]: contentType,
+                } as any,
+                existing,
+                { user, ignoreACL: true },
+            );
+        } catch (err) {
+            // The row still names the old asset (which stays): the new one was never used.
+            await this.deleteBlobIfSet(blobKey);
+            throw err;
+        }
+        // Only now that the row names the new asset is the old one deleted.
+        await this.deleteBlobIfSet((existing as any)[fields.blobKeyField]);
         await this.recordUpdate(user, { asset: fields.keyPrefix, uploaded: true });
         return this.toPublicBranding(updated);
     }
@@ -462,7 +577,6 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     ): Promise<void> {
         await this.init();
         const existing: T = await this.findOrCreate();
-        await this.deleteBlobIfSet((existing as any)[blobKeyField]);
         // `null`, not `undefined` - see the identical note in `update()` above.
         await this.brandingRepo!.update(
             {
@@ -475,6 +589,8 @@ export abstract class BaseBrandingRoute<T extends Branding> {
             existing,
             { user, ignoreACL: true },
         );
+        // After the row stopped naming it, so a failed write doesn't leave it pointing at a deleted blob.
+        await this.deleteBlobIfSet((existing as any)[blobKeyField]);
         await this.recordUpdate(user, { asset: assetName, deleted: true });
     }
 }

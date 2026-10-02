@@ -9,6 +9,7 @@ import { asEntity } from "../util/EntityUtils.js";
 import { retainedBodyBlobKeysOf } from "../util/DraftBodyRetentionUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { DEFAULT_MAX_EXPORT_BYTES } from "./DataExportJob.js";
+import { softDeletedContentLines } from "./SoftDeletedContent.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
 import { collectMailboxContentLines, DEFAULT_MAX_MAILBOX_CONTENT_ROWS, findPagesByUid, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
@@ -47,6 +48,14 @@ interface MatterExportLease<T> {
  * `"failed"` once `processingAttempts` reaches `mail:jobs:matter_export:max_attempts`) at the start of every
  * `run()`. Bundles are written under attempt-scoped blob keys and streamed into `BlobStore.put()` (see
  * `generateBundle()` for the per-custodian memory bound), capped at `mail:export:max_bytes`.
+ *
+ * A user's ordinary delete only flags a row (`deleted`), yet the row is still held and restorable - so each custodian's soft-deleted
+ * messages (and contacts, events and tasks) are exported too, tagged `deleted: true` (`SoftDeletedContent.ts`), and so are the
+ * retained draft bodies of soft-deleted messages. Without that, deleting the relevant mail would leave it out of the bundle.
+ *
+ * Attestations (`attestPending()`/`attestOwed()`): written by the replica that made the request `"ready"`; any replica finishes the ones
+ * a crash left owing, but only for requests untouched for `attestation_grace_seconds` and only after claiming them with a version-checked write,
+ * so the hash-chained ledger never gets the same entry twice.
  *
  * No legal-hold check - unlike a `purge` (see `util/LegalHoldUtils.ts`), a read-only export doesn't
  * destroy anything a hold is meant to preserve.
@@ -113,6 +122,11 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
     @Config("mail:export:max_bytes", DEFAULT_MAX_EXPORT_BYTES)
     private maxBytes: number = DEFAULT_MAX_EXPORT_BYTES;
 
+    /** How long a `"ready"` export that still owes attestations must have gone untouched before `attestOwed()` finishes them: the
+     * replica that made it ready records them itself straight away, so this only has to outlast that. */
+    @Config("mail:jobs:matter_export:attestation_grace_seconds", 300)
+    private attestationGraceSeconds: number = 300;
+
     /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
     @Config()
     private config: any;
@@ -154,6 +168,7 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
         }
 
         await this.reclaimAbandonedRequests();
+        await this.attestOwed();
 
         const pending: T[] = await this.requestRepo.find(
             { status: "pending", limit: this.batchSize } as any,
@@ -275,6 +290,7 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
         // Every failure from here on must mark against the currently-held lease version, not `request`'s stale
         // pre-claim one (which `run()`'s outer catch would use, and simply fail a second time).
         let blobStored = false;
+        let ready: T;
         try {
             try {
                 await this.blobStore!.put(blobKey, Readable.from(this.generateBundle(matter, request.uid, lease, includedMailboxUids)), {
@@ -290,8 +306,10 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
             // Version-checked against the lease this run still holds (renewed while streaming), deliberately
             // NOT a re-fetch: if this attempt's lease expired and another replica reclaimed the request, this
             // update must lose rather than stamp "ready" over the newer attempt.
-            await this.requestRepo!.update(
-                { uid: lease.held.uid, version: (lease.held as any).version, status: "ready", blobKey } as any,
+            // The attestations still owed are recorded on the request by this same update, so a crash (or a failed write)
+            // between "downloadable" and "attested" leaves a record `attestPending()` finishes on a later run.
+            ready = await this.requestRepo!.update(
+                { uid: lease.held.uid, version: (lease.held as any).version, status: "ready", blobKey, pendingAttestationMailboxUids: includedMailboxUids.length > 0 ? includedMailboxUids : null } as any,
                 asEntity(this.requestRepo!, lease.held),
                 { ignoreACL: true },
             );
@@ -306,27 +324,81 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
             return;
         }
 
-        // Best-effort per mailbox, deliberately NOT allowed to throw out of `processRequest()` - the
-        // request is already genuinely `"ready"` (the bundle above is real, stored, and downloadable) by
-        // this point, so a failure here (e.g. `recordEscrowAuditEntry()`'s own sequence-contention retries
-        // exhausted under a concurrent writer) must not route through `run()`'s `catch`/`markFailed()`:
-        // that would try to write a STALE pre-"ready" version, itself fail its own optimistic-lock check,
-        // and get silently swallowed. Logged loudly instead, so the gap is at least operator-visible rather
-        // than a silent, permanent hole in the hash-chained ledger.
-        for (const mailboxUid of includedMailboxUids) {
+        await this.attestPending(ready);
+    }
+
+    /**
+     * Records the `MATTER_EXPORT_READY` escrow audit entry of every custodian mailbox `request` (a `"ready"` export) still owes
+     * (`pendingAttestationMailboxUids`), then leaves on the request only those it could not record. Best-effort per mailbox,
+     * deliberately NOT allowed to throw: the request is already
+     * genuinely `"ready"` (its bundle is real, stored, and downloadable), so a failure here (e.g. `recordEscrowAuditEntry()`'s own
+     * sequence-contention retries exhausted under a concurrent writer) must not route through `run()`'s `catch`/`markFailed()`,
+     * which would write a stale version and fail its own optimistic lock. What could not be recorded stays on the request and is
+     * retried by the next run (`run()`), logged loudly meanwhile.
+     */
+    private async attestPending(request: T): Promise<void> {
+        const owed: string[] = request.pendingAttestationMailboxUids ?? [];
+        const stillOwed: string[] = [];
+        for (const mailboxUid of owed) {
             try {
                 await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
                     action: EscrowAuditAction.MATTER_EXPORT_READY,
                     holderUserUid: request.requestedByUserUid,
-                    matterId: matter.uid,
+                    matterId: request.matterId,
                     mailboxUid,
                     requestId: request.uid,
                 });
             } catch (err: any) {
+                stillOwed.push(mailboxUid);
                 this.logger?.error(
-                    `MatterExportJob: request ${request.uid} is ready and its bundle already includes mailbox ${mailboxUid}'s content, but recording that mailbox's own EscrowAuditLogEntry attestation failed and will NOT be retried: ${err.message}`,
+                    `MatterExportJob: request ${request.uid} is ready and its bundle already includes mailbox ${mailboxUid}'s content, but recording that mailbox's own EscrowAuditLogEntry attestation failed - it is retried on a later run: ${err.message}`,
                 );
             }
+        }
+        if (owed.length === 0) {
+            return;
+        }
+        try {
+            await this.requestRepo!.update(
+                { uid: request.uid, version: (request as any).version, pendingAttestationMailboxUids: stillOwed.length > 0 ? stillOwed : null } as any,
+                asEntity(this.requestRepo!, request),
+                { ignoreACL: true },
+            );
+        } catch (err: any) {
+            // Recorded, but not struck off the request: a later run records them a second time - a duplicate entry in the
+            // ledger, rather than a missing one.
+            this.logger?.error(`MatterExportJob: recorded the attestations of request ${request.uid} but could not update what it still owes: ${err.message}`);
+        }
+    }
+
+    /**
+     * Finishes the attestations of exports that became `"ready"` but did not get them all recorded - see `attestPending()`.
+     *
+     * Every replica runs this on every tick, and each attestation is a permanent entry in a hash-chained ledger, so two replicas
+     * must never record the same one. Only requests untouched for `attestation_grace_seconds` are considered (the replica that
+     * just made one `"ready"` is attesting it right now), and one is claimed with a version-checked write - which also bumps its
+     * `dateModified`, putting it out of reach of the other replicas' next tick - before anything is recorded: of two replicas
+     * that read the same row, exactly one wins the claim.
+     */
+    private async attestOwed(): Promise<void> {
+        const cutoff: Date = new Date(Date.now() - this.attestationGraceSeconds * 1000);
+        const owing: T[] = await this.requestRepo!.find(
+            { status: "ready", pendingAttestationMailboxUids: "ne(null)", dateModified: `lt(${cutoff.toISOString()})`, limit: this.batchSize } as any,
+            { ignoreACL: true, limit: this.batchSize },
+        );
+        for (const request of owing) {
+            let claimed: T;
+            try {
+                claimed = await this.requestRepo!.update(
+                    { uid: request.uid, version: (request as any).version, pendingAttestationMailboxUids: request.pendingAttestationMailboxUids } as any,
+                    asEntity(this.requestRepo!, request),
+                    { ignoreACL: true },
+                );
+            } catch (err: any) {
+                this.logger?.debug?.(`MatterExportJob: the attestations of request ${request.uid} were claimed by another replica: ${err.message}`);
+                continue;
+            }
+            await this.attestPending(claimed);
         }
     }
 
@@ -381,6 +453,10 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
             for (let i = 0; i < lines.length; i++) {
                 yield emit(lines[i]);
             }
+            // A user's ordinary delete only flags a row: the mail a custodian deleted is still held and must be produced. Tagged `deleted: true`.
+            for await (const line of softDeletedContentLines(this._objectFactory!, this.contentEntityClasses, mailboxUid, dateRange, lines.length, this.maxContentRows)) {
+                yield emit(line);
+            }
             for await (const line of this.retainedDraftBodyLines(mailboxUid, dateRange)) {
                 yield emit(line);
             }
@@ -403,18 +479,21 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
             retainedBodyBlobKeys: "ne(null)",
             sentDate: `range(${new Date(dateRange.start).toISOString()},${new Date(dateRange.end).toISOString()})`,
         };
-        for await (const messages of findPagesByUid<Message>(repo, criteria)) {
-            for (const message of messages) {
-                for (const blobKey of retainedBodyBlobKeysOf(message)) {
-                    const line: Record<string, unknown> = { entityType: "retainedDraftBody", messageUid: message.uid, mailboxUid, blobKey };
-                    try {
-                        const content: Buffer = await this.blobStore!.get(blobKey);
-                        Object.assign(line, { contentType: "message/rfc822", encoding: "base64", content: content.toString("base64") });
-                    } catch (err: any) {
-                        this.logger?.warn(`MatterExportJob: retained draft body ${blobKey} of message ${message.uid} could not be read: ${err.message}`);
-                        line.missing = true;
+        // Soft-deleted messages (a plain `find()` leaves them out) keep their retained bodies too.
+        for (const passCriteria of [criteria, { ...criteria, deleted: true }]) {
+            for await (const messages of findPagesByUid<Message>(repo, passCriteria)) {
+                for (const message of messages) {
+                    for (const blobKey of retainedBodyBlobKeysOf(message)) {
+                        const line: Record<string, unknown> = { entityType: "retainedDraftBody", messageUid: message.uid, mailboxUid, blobKey };
+                        try {
+                            const content: Buffer = await this.blobStore!.get(blobKey);
+                            Object.assign(line, { contentType: "message/rfc822", encoding: "base64", content: content.toString("base64") });
+                        } catch (err: any) {
+                            this.logger?.warn(`MatterExportJob: retained draft body ${blobKey} of message ${message.uid} could not be read: ${err.message}`);
+                            line.missing = true;
+                        }
+                        yield JSON.stringify(line);
                     }
-                    yield JSON.stringify(line);
                 }
             }
         }

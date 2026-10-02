@@ -7,7 +7,7 @@ import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, Rou
 import { createClient } from "redis";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
-import { AuditAction, Plugin, PluginManifest } from "../models/types.js";
+import { AuditAction, Plugin, PluginManifest, PluginSettingDefinition } from "../models/types.js";
 import {
     DEFAULT_PLUGIN_REGISTRY,
     NpmRegistryClient,
@@ -29,11 +29,13 @@ import { findPluginUiMountConflicts } from "../plugins/PluginUiUtils.js";
 import {
     computePluginStateHash,
     configuredPluginSettings,
+    CORE_CONFIG_NAMESPACES,
     DEFAULT_ALLOWED_PLUGIN_PACKAGES,
     DEFAULT_PLUGIN_NAMESPACES,
     findPluginNamespace,
     isExactVersion,
     isNewerVersion,
+    isPluginSettingKeyAllowed,
     isPrereleaseVersion,
     isValidPackageName,
     normalizeAllowedPackages,
@@ -46,11 +48,13 @@ import {
     PLUGIN_STATUS_KEY,
     PLUGIN_STATUS_MAX_AGE_MS,
     PluginInstanceStatus,
+    isSecretSettingKey,
     pluginHostOfRequest,
     pickLatestVersion,
     resolveHostDefault,
     validatePluginSettings,
 } from "../plugins/PluginUtils.js";
+import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 const { Config, Logger } = ObjectDecorators;
 const { Delete, Get, Param, Post, Put, Query, Request, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
 
@@ -163,6 +167,55 @@ class RegistrySession {
     }
 }
 
+/** Whether a setting is a secret, whose saved value is never sent to the browser: its key names one (`isSecretSettingKey()`), or the plugin's manifest
+ * says so (`secret: true`, or a `password` type) - the manifest is the plugin's own word for it, which a key like `private_key` or `dsn` can't give. */
+export function isSecretSetting(key: string, manifest?: Pick<PluginManifest, "settings">): boolean {
+    if (isSecretSettingKey(key)) {
+        return true;
+    }
+    const definition: PluginSettingDefinition | undefined = manifest?.settings?.find((setting) => setting.key === key);
+    return definition?.secret === true || (definition?.type as string | undefined) === "password";
+}
+
+/**
+ * What a response says of a saved setting that is a secret (`isSecretSetting()`: a key naming a secret, password, credential, token or api key, or
+ * one the manifest marks secret): the object `{ "secret": true }` in place of its value, so a stored API key or shared secret is never sent back to the
+ * console - the row keeps the value, and the server's own configuration loads it from there. A setting with no saved value has no entry.
+ */
+export function maskSecretSettings(settings: Record<string, unknown> | undefined, manifest?: Pick<PluginManifest, "settings">): Record<string, unknown> {
+    const masked: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(settings ?? {})) {
+        masked[key] = isSecretSetting(key, manifest) && value !== undefined && value !== null ? { secret: true } : value;
+    }
+    return masked;
+}
+
+/** Whether `value` is what `maskSecretSettings()` shows in place of a secret: a form that left the setting alone sends it back as it was given. */
+function isMaskedSecret(value: unknown): boolean {
+    return typeof value === "object" && value !== null && !Array.isArray(value) && (value as any).secret === true && Object.keys(value).length === 1;
+}
+
+/**
+ * The core configuration namespaces a plugin's settings may never write (the one list, `CORE_CONFIG_NAMESPACES` of `plugins/PluginUtils.ts`, which the server's
+ * plugin host applies when it loads the saved settings): a plugin's saved settings are loaded into the server's own configuration (the first layer, which wins
+ * over the environment), so a setting whose key lies in one of these would let a plugin manifest (or whoever edits its settings) overwrite the server's trust,
+ * authentication, session, transport, escrow or PKI configuration. Kept under its old name.
+ */
+export const PROTECTED_SETTING_NAMESPACES: readonly string[] = CORE_CONFIG_NAMESPACES;
+
+/** Whether `key` is a core configuration key or lies under a core namespace - what a plugin setting may never be (`isPluginSettingKeyAllowed()` is the
+ * allow side of the same rule: a saved setting must be declared by the plugin's manifest AND be allowed). */
+export function isProtectedSettingKey(key: string): boolean {
+    return !isPluginSettingKeyAllowed(key);
+}
+
+/** Refuses (400) a plugin version the registry published without an integrity hash (`dist.integrity`): nothing would be left to check the downloaded package against. */
+function assertHasIntegrity(name: string, version: string, integrity: string | undefined): void {
+    if (typeof integrity !== "string" || integrity.length === 0) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${name}@${version}' has no integrity hash in the plugin registry, so it can't be installed.`);
+    }
+}
+
 /**
  * Administers the plugins this deployment runs. Every endpoint is trusted-role only: a plugin runs arbitrary
  * code inside every server copy. Which packages may be added at all is limited by `system:plugins:allowed_packages`,
@@ -185,6 +238,14 @@ export abstract class BasePluginRoute<T extends Plugin> {
 
     @Config()
     private config: any;
+
+    /** The roles that may manage plugins - with an elevated token (`assertAdminScope()`): a plugin is code every replica of the server loads. */
+    @Config("trusted_roles", ["admin"])
+    protected trustedRoles: string[] = ["admin"];
+
+    /** How old an elevated token may be before it has to be elevated again, in seconds (`mail:security:elevation_max_age_seconds`, 0 = no limit). */
+    @Config("mail:security:elevation_max_age_seconds", DEFAULT_ELEVATION_MAX_AGE_SECONDS)
+    protected elevationMaxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS;
 
     @Config("system:plugins:registry", DEFAULT_PLUGIN_REGISTRY)
     private registryUrl: string = DEFAULT_PLUGIN_REGISTRY;
@@ -550,6 +611,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
 
     /** Creates, or revives the removed row of, a plugin at a resolved version, recording how to undo that. */
     private async installRow(install: PlannedPluginInstall, user: JWTUser | undefined, undo: PluginUndo[], host?: string): Promise<T> {
+        assertHasIntegrity(install.name, install.version, install.integrity);
         const [found]: T[] = await this.pluginRepo!.find({ name: install.name } as any, { ignoreACL: true, limit: 1, skipCache: true });
         // An entity instance, so reviving the row below is version-checked (see `installedPlugins()`).
         const existing: T | undefined = found ? asEntity(this.pluginRepo!, found) : undefined;
@@ -637,7 +699,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
      * is stored without it.
      */
     private withConfigured(plugin: T): T {
-        return { ...plugin, configured: configuredPluginSettings(this.config, plugin.manifest) };
+        return { ...plugin, settings: maskSecretSettings(plugin.settings, plugin.manifest), configured: configuredPluginSettings(this.config, plugin.manifest) };
     }
 
     @RequiresTrustedRole()
@@ -811,7 +873,10 @@ export abstract class BasePluginRoute<T extends Plugin> {
         @Query("name") name?: unknown,
         @Query("packageVersion") packageVersion?: unknown,
         @Query("prerelease") prerelease?: unknown,
+        @AuthUser user?: JWTUser,
     ): Promise<PluginPlanResponse> {
+        // Planning is the first half of a change (the plan is what `expectedPlan` confirms), and asks the registry on the server's behalf.
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const trimmed: string = typeof name === "string" ? name.trim() : "";
         if (!trimmed) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'name' is required.");
@@ -840,6 +905,8 @@ export abstract class BasePluginRoute<T extends Plugin> {
     @RequiresTrustedRole()
     @Post()
     public async add(obj: AddPluginRequest | undefined, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<AddPluginResponse<T>> {
+        // Installing a plugin loads its code into every replica of the server: an elevated administrator only.
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const name: string = typeof obj?.name === "string" ? obj.name.trim() : "";
         if (!name) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'name' is required.");
@@ -876,6 +943,8 @@ export abstract class BasePluginRoute<T extends Plugin> {
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
+        // Enabling, upgrading (or downgrading) a plugin and changing its settings all change what code runs and where it sends data.
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         await this.init();
         const existing: T = await this.findInstalled(id);
         const patch: Partial<Plugin> = {};
@@ -896,8 +965,9 @@ export abstract class BasePluginRoute<T extends Plugin> {
         if (changingVersion) {
             const found = await this.lookupVersion(session, existing.name, obj!.packageVersion);
             manifest = found.manifest;
+            assertHasIntegrity(existing.name, found.version, found.integrity);
             patch.packageVersion = found.version;
-            patch.integrity = found.integrity ?? (null as any);
+            patch.integrity = found.integrity;
             patch.manifest = found.manifest;
         }
         if (obj?.enabled !== undefined) {
@@ -919,9 +989,27 @@ export abstract class BasePluginRoute<T extends Plugin> {
             // A new version may drop or retype settings, so saved values are re-checked against its manifest -
             // values for settings that no longer exist are dropped rather than failing the upgrade.
             // Stored manifests always come through `parsePluginManifest()`, which fills in `settings`.
-            const known: Set<string> = new Set(manifest.settings!.map((setting) => setting.key));
+            // A stored manifest older than the key check may declare one of the server's own keys: its value is never carried over.
+            const known: Set<string> = new Set(manifest.settings!.map((setting) => setting.key).filter(isPluginSettingKeyAllowed));
             const candidate: Record<string, unknown> =
                 obj?.settings ?? Object.fromEntries(Object.entries(existing.settings).filter(([key]) => known.has(key)));
+            if (obj?.settings !== undefined) {
+                for (const key of Object.keys(candidate)) {
+                    if (!isPluginSettingKeyAllowed(key)) {
+                        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${key}' is part of the server's own configuration and can't be set as a plugin setting.`);
+                    }
+                }
+                // The placeholder a secret setting was shown as means "left alone": the saved value stays.
+                for (const [key, value] of Object.entries(candidate)) {
+                    if (isMaskedSecret(value)) {
+                        if (existing.settings?.[key] === undefined) {
+                            delete candidate[key];
+                        } else {
+                            candidate[key] = existing.settings[key];
+                        }
+                    }
+                }
+            }
             if (obj?.settings === undefined) {
                 // A version whose manifest names the host in a setting's default (`https://<host>/meet`) starts using it when the
                 // setting has no value yet - the way a fresh install would.
@@ -978,6 +1066,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
     @RequiresTrustedRole()
     @Delete("/:id")
     public async remove(@Param("id") id: string, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<void> {
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const existing: T = await this.findInstalled(id);
         const installed: T[] = await this.installedPlugins();
         this.assertNoDependents(installed, existing, "uninstalled");

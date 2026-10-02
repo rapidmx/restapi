@@ -70,7 +70,7 @@ async function makeRoute(overrides: {
     const objectFactory: ObjectFactory = new ObjectFactory(config, Logger());
     const route = objectFactory.newInstance<TestMailIngestRoute>(TestMailIngestRoute, { initialize: false });
     const logger = { warn: vi.fn() };
-    const ingestQueueRepo = { create: vi.fn() };
+    const ingestQueueRepo = { create: vi.fn(), findOne: vi.fn().mockResolvedValue(undefined) };
     const mailTransport = { send: vi.fn().mockResolvedValue({ accepted: ["x"], rejected: [] }) };
 
     (route as any).ingestSecret = "s3cr3t";
@@ -225,15 +225,35 @@ describe("BaseMailIngestRoute Tests (distribution list expansion/relay/unsubscri
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("failed to send unsubscribe confirmation"));
     });
 
-    it("Logs a warning (without failing the whole delivery) when relaying to an external member fails.", async () => {
+    it("Logs a warning and fails the delivery (503, so the MTA retries it) when relaying to an external member fails - answering 202 would lose the message.", async () => {
         const target = list("target", "target@example.com", ["ext@outside.com"]);
         const { route, logger, mailTransport } = await makeRoute({ lists: { "target@example.com": target } });
         mailTransport.send.mockRejectedValueOnce(new Error("simulated transport failure"));
         const res = makeRes();
 
-        await route.deliver(makeReq("sender@example.com", "target@example.com", "From: sender@example.com\r\n\r\nHi\r\n"), res);
+        await expect(route.deliver(makeReq("sender@example.com", "target@example.com", "From: sender@example.com\r\n\r\nHi\r\n"), res)).rejects.toMatchObject({
+            status: 503,
+        });
 
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("failed to relay distribution list message"));
+        expect(res.status).not.toHaveBeenCalledWith(202);
+    });
+
+    it("Treats a queue entry a concurrent retry made first (a duplicate-key error) as made, and fails on any other error.", async () => {
+        const target = list("target", "target@example.com", ["real@example.com"]);
+        const real = { uid: "real-uid", primarySmtpAddress: "real@example.com", aliasAddresses: [] };
+        const raw = "From: sender@example.com\r\n\r\nHi\r\n";
+        const duplicate = await makeRoute({ lists: { "target@example.com": target }, mailboxes: { "real@example.com": real } });
+        duplicate.ingestQueueRepo.create.mockRejectedValueOnce(Object.assign(new Error("E11000 duplicate key"), { code: 11000 }));
+        const res = makeRes();
+
+        await duplicate.route.deliver(makeReq("sender@example.com", "target@example.com", raw), res);
+
         expect(res.status).toHaveBeenCalledWith(202);
+
+        const broken = await makeRoute({ lists: { "target@example.com": target }, mailboxes: { "real@example.com": real } });
+        broken.ingestQueueRepo.create.mockRejectedValueOnce(new Error("connection reset"));
+
+        await expect(broken.route.deliver(makeReq("sender@example.com", "target@example.com", raw), makeRes())).rejects.toThrow("connection reset");
     });
 });

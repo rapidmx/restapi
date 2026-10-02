@@ -21,6 +21,18 @@ import { getPrimaryDomainNames } from "../util/DomainUtils.js";
 import { AuditAction, DistributionList, Mailbox } from "../models/types.js";
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
+/** Lowercases and trims `primarySmtpAddress` and every `aliasAddresses` entry in place, as `BaseMailboxRoute` does: mail is delivered by exact match on
+ * the lowercased recipient (`BaseMailIngestRoute`), so a list stored as `Sales@x.com` could never be reached - and its collision checks would miss
+ * a mailbox at `sales@x.com`. */
+function normalizeListAddresses(obj: Record<string, unknown>): void {
+    if (typeof obj.primarySmtpAddress === "string") {
+        obj.primarySmtpAddress = normalizeAddress(obj.primarySmtpAddress);
+    }
+    if (Array.isArray(obj.aliasAddresses)) {
+        obj.aliasAddresses = obj.aliasAddresses.map((alias) => (typeof alias === "string" ? normalizeAddress(alias) : alias));
+    }
+}
+
 /**
  * Extends the standard `CRUDRoute` CRUD scaffolding for `DistributionList` with trusted-role-only access to
  * every action - there is no self-service creation, per-list delegated ownership, or real per-record ACL (the
@@ -118,7 +130,7 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
      * mail is delivered by exact primary/alias match (`BaseMailIngestRoute.findDistributionListByAddressRaw()`/
      * `findMailboxByAddressRaw()`), so a duplicate anywhere would hijack the other recipient's mail.
      */
-    private async assertAliasAddressesAvailable(addresses: string[]): Promise<void> {
+    private async assertAliasAddressesAvailable(addresses: string[], exceptListUid?: string): Promise<void> {
         const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
         for (const address of new Set(addresses)) {
             const [listByUid, mailboxByUid, listsByPrimary, listsByAlias, mailboxesByPrimary, mailboxesByAlias] = await Promise.all([
@@ -129,11 +141,13 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
                 mailboxRepo.find({ primarySmtpAddress: ModelUtils.literal(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }),
                 mailboxRepo.find({ aliasAddresses: this.aliasQueryValue(address), limit: 1 } as any, { ignoreACL: true, limit: 1 }),
             ]);
+            // `exceptListUid` is the list being changed: an address it already holds (its uid is its first address) isn't a collision.
+            const others = (lists: any[]): number => lists.filter((list) => list.uid !== exceptListUid).length;
             if (
-                listByUid ||
+                (listByUid && listByUid.uid !== exceptListUid) ||
                 mailboxByUid ||
-                listsByPrimary.length > 0 ||
-                listsByAlias.length > 0 ||
+                others(listsByPrimary) > 0 ||
+                others(listsByAlias) > 0 ||
                 mailboxesByPrimary.length > 0 ||
                 mailboxesByAlias.length > 0
             ) {
@@ -188,6 +202,7 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         for (const o of objs) {
             // `_id` would replace another document on Mongo - see `util/RequestBodyUtils.ts`.
             stripClientCreateFields(o);
+            normalizeListAddresses(o as Record<string, unknown>);
             await this.assignUidAndCheckCollision(o, domains);
             await this.validateAliasAddresses(domains, o.aliasAddresses);
             if (seenUids.has((o as any).uid)) {
@@ -240,18 +255,9 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
             );
         }
 
-        const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
-        const [collidingLists, collidingMailboxes] = await Promise.all([
-            this.repoUtils!.find({ primarySmtpAddress: newAddress } as any, { ignoreACL: true, limit: 1 }),
-            mailboxRepo.find({ primarySmtpAddress: newAddress } as any, { ignoreACL: true, limit: 1 }),
-        ]);
-        if (collidingLists.length > 0 || collidingMailboxes.length > 0) {
-            throw new ApiError(
-                ApiErrors.IDENTIFIER_EXISTS,
-                409,
-                "This address is already in use by another mailbox or distribution list.",
-            );
-        }
+        // The same check a new alias gets (and a mailbox's): the address as a literal - never a query operator - against every list's and
+        // mailbox's uid, primary address and aliases.
+        await this.assertAliasAddressesAvailable([newAddress], existing.uid);
     }
 
     /**
@@ -277,12 +283,51 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
     protected async validateUpdate(id: string, obj: UpdateObject<T>, user?: JWTUser): Promise<void> {
         assertNoPathKeys(obj);
         stripClientId(obj);
+        normalizeListAddresses(obj);
         return super.validateUpdate(id, obj, user);
     }
 
-    public async updateProperty(id: string, propertyName: string, obj: any, user?: JWTUser): Promise<T> {
+    /** `CRUDRoute`'s own `PUT /:id/:property` would write any property - `primarySmtpAddress` onto a mailbox's address included - with none of
+     * `update()`'s address checks and no audit entry: routed through `update()`. */
+    @RequiresTrustedRole()
+    public async updateProperty(
+        @Param("id") id: string,
+        @Param("property") propertyName: string,
+        obj: any,
+        @AuthUser user?: JWTUser,
+    ): Promise<T> {
         assertPlainPropertyName(propertyName);
-        return super.updateProperty(id, propertyName, obj, user);
+        const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+        if (!existing) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        return await this.update(
+            id,
+            { uid: existing.uid, version: (existing as any).version, [propertyName]: obj } as any,
+            undefined as unknown as HttpRequest,
+            user,
+        );
+    }
+
+    /** `CRUDRoute`'s own `PUT /` goes straight to `doBulkUpdate()`: no address checks, no audit entry. Each entry goes through the guarded
+     * `update()` instead; one failing entry aborts the rest. */
+    @RequiresTrustedRole()
+    public async updateBulk(objs: UpdateObject<T>[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T[]> {
+        if (!Array.isArray(objs)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        assertNoPathKeys(objs);
+        const updated: T[] = [];
+        for (const obj of objs) {
+            updated.push(await this.update((obj as any)?.uid, obj, req, user));
+        }
+        return updated;
+    }
+
+    /** `CRUDRoute`'s own `DELETE /` would remove every list matching a query with no audit entry: lists are deleted one at a time (`DELETE /:id`). */
+    @RequiresTrustedRole()
+    public async truncate(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<void> {
+        throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Distribution lists must be deleted one at a time.");
     }
 
     @RequiresTrustedRole()
@@ -294,13 +339,14 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
     ): Promise<T> {
         assertNoPathKeys(obj);
         stripClientId(obj);
+        normalizeListAddresses(obj);
         const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
         // Only re-validate on a genuine change - a caller round-tripping the full object back unchanged must
         // not start failing because e.g. a domain was un-verified after the fact.
-        if (obj.primarySmtpAddress !== undefined && obj.primarySmtpAddress !== existing.primarySmtpAddress) {
+        if (obj.primarySmtpAddress !== undefined && obj.primarySmtpAddress !== normalizeAddress(existing.primarySmtpAddress)) {
             await this.validateAddressChange(existing, obj.primarySmtpAddress);
         }
         if (obj.aliasAddresses !== undefined) {

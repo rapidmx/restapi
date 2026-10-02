@@ -429,7 +429,17 @@ describe("getMailboxUidForFolder() Tests", () => {
         const result = await getMailboxUidForFolder(objectFactory, makeStubFolderClass(), "folder-1");
 
         expect(result).toBe("mailbox-real");
-        expect(repo.findOne).toHaveBeenCalledWith("folder-1", { ignoreACL: true });
+        // A soft-deleted folder resolves too (a plain find leaves it out, and its mailbox would then go unchecked).
+        expect(repo.findOne).toHaveBeenCalledWith("folder-1", { ignoreACL: true, includeDeleted: true });
+    });
+
+    it("Resolves a soft-deleted folder's mailbox, unless the caller asks for a folder that can be written to.", async () => {
+        const repo = { findOne: vi.fn().mockResolvedValue({ uid: "folder-1", mailboxUid: "mailbox-real", deleted: true }) };
+        const objectFactory = makeObjectFactory(repo);
+        const folderClass = makeStubFolderClass();
+
+        expect(await getMailboxUidForFolder(objectFactory, folderClass, "folder-1")).toBe("mailbox-real");
+        expect(await getMailboxUidForFolder(objectFactory, folderClass, "folder-1", true)).toBeUndefined();
     });
 
     it("Returns undefined when no such folder exists.", async () => {

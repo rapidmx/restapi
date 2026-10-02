@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import {
+    boundMailEvent,
     MAIL_EVENT_STREAM_KEY,
     MailEvent,
     MailEventConsumer,
@@ -40,6 +41,74 @@ function makeConsumer(stream: MailEventStream, overrides: Record<string, unknown
 }
 
 const sent = (messageId: string) => ({ type: "message.sent" as const, messageId, envelopeFrom: "a@a.example", recipients: ["b@b.example"], source: "compose" });
+
+describe("boundMailEvent()", () => {
+    const delivered = (overrides: Record<string, unknown> = {}): MailEvent =>
+        ({ type: "message.delivered", occurredAt: "t", mailboxUid: "mb", messageUid: "u", junk: false, envelopeFrom: "a@a.example", envelopeTo: ["b@b.example"], references: [], ...overrides });
+
+    it("Clips a delivered message's text fields, references and recipients, and publishes the clipped event.", async () => {
+        const long = "x".repeat(100_000);
+        const event = boundMailEvent(
+            delivered({
+                subject: long,
+                messageId: long,
+                inReplyTo: long,
+                fromAddress: long,
+                autoSubmitted: long,
+                precedence: long,
+                envelopeFrom: long,
+                envelopeTo: Array.from({ length: 500 }, (_, i) => `${i}${long}`),
+                references: Array.from({ length: 300 }, (_, i) => `${i}${long}`),
+            }),
+        ) as any;
+        expect(event.subject).toHaveLength(1000);
+        expect(event.messageId).toHaveLength(1000);
+        expect(event.envelopeFrom).toHaveLength(320);
+        expect(event.fromAddress).toHaveLength(320);
+        expect(event.envelopeTo).toHaveLength(100);
+        expect(event.envelopeTo[0]).toHaveLength(320);
+        // The nearest ancestors are kept: the last 20, in order.
+        expect(event.references).toHaveLength(20);
+        expect(event.references[19].startsWith("299")).toBe(true);
+        expect(event.references[0].startsWith("280")).toBe(true);
+        expect(JSON.stringify(event).length).toBeLessThan(64 * 1024);
+
+        const redis = new FakeRedisStream();
+        await makeStream(redis).stream.publish({ ...(delivered({ subject: long }) as any), occurredAt: undefined });
+        expect(JSON.parse(redis.entries[0].message.event).subject).toHaveLength(1000);
+    });
+
+    it("Leaves a small event untouched, and drops a parsed report only when the event is still over 64 KB.", () => {
+        const small = delivered({ subject: "Hi", references: ["<a@b>"], deliveryStatusReport: { recipients: [] } });
+        expect(boundMailEvent(small)).toEqual(small);
+        expect(boundMailEvent(delivered({ references: undefined }))).toMatchObject({ references: [] });
+        const huge = delivered({ deliveryStatusReport: { recipients: Array.from({ length: 200 }, () => ({ note: "y".repeat(1000) })) }, feedbackReport: { x: "z".repeat(70_000) } }) as any;
+        const bounded = boundMailEvent(huge) as any;
+        expect(bounded.deliveryStatusReport).toBeUndefined();
+        expect(bounded.feedbackReport).toBeUndefined();
+        expect(bounded.messageUid).toBe("u");
+    });
+
+    it("Clips a sent event's recipients and a failed one's failures.", () => {
+        const long = "q".repeat(5000);
+        const sentEvent = boundMailEvent({ type: "message.sent", occurredAt: "t", messageId: long, envelopeFrom: long, recipients: Array.from({ length: 300 }, () => long), source: "compose" }) as any;
+        expect(sentEvent.recipients).toHaveLength(100);
+        expect(sentEvent.recipients[0]).toHaveLength(320);
+        expect(sentEvent.messageId).toHaveLength(1000);
+        const failed = boundMailEvent({
+            type: "send.failed",
+            occurredAt: "t",
+            messageId: long,
+            envelopeFrom: long,
+            failures: Array.from({ length: 300 }, () => ({ recipient: long, temporary: true, message: long })),
+            source: "compose",
+        }) as any;
+        expect(failed.failures).toHaveLength(100);
+        expect(failed.failures[0].recipient).toHaveLength(320);
+        expect(failed.failures[0].message).toHaveLength(1000);
+        expect(failed.messageId).toHaveLength(1000);
+    });
+});
 
 describe("MailEventStream", () => {
     it("Appends a timestamped, JSON-encoded event to the stream, trimmed to the configured length", async () => {

@@ -7,6 +7,7 @@ import {
     ADMIN_SCOPE,
     assertAdminScope,
     assertMailAccess,
+    DEFAULT_ELEVATION_MAX_AGE_SECONDS,
     hasMailAccess,
     isAdminScope,
     isTrustedUser,
@@ -72,6 +73,27 @@ describe("MailAccessUtils", () => {
             expect(() => assertAdminScope({ uid: "u", roles: ["admin"], scopes: [] }, TRUSTED)).toThrow(expect.objectContaining({ status: 403, code: "api-104" }));
             expect(() => assertAdminScope({ uid: "u", roles: ["admin"], scopes: [], elevated: -1 }, TRUSTED)).toThrow(expect.objectContaining({ status: 403, code: "api-104" }));
             expect(() => assertAdminScope({ uid: "u", roles: ["admin"], scopes: [], elevated: Date.now() }, TRUSTED)).not.toThrow();
+        });
+
+        it("Refuses an elevation older than the maximum age (403 api-104), 900 seconds unless told otherwise (R2-08).", () => {
+            const admin = (ageMs: number): any => ({ uid: "u", roles: ["admin"], scopes: [], elevated: Date.now() - ageMs });
+            expect(DEFAULT_ELEVATION_MAX_AGE_SECONDS).toBe(900);
+            expect(() => assertAdminScope(admin(899_000), TRUSTED)).not.toThrow();
+            expect(() => assertAdminScope(admin(901_000), TRUSTED)).toThrow(expect.objectContaining({ status: 403, code: "api-104" }));
+            expect(() => assertAdminScope(admin(61_000), TRUSTED, 60)).toThrow(expect.objectContaining({ status: 403, code: "api-104" }));
+            expect(() => assertAdminScope(admin(30_000), TRUSTED, 60)).not.toThrow();
+            // 0 (or a negative or non-numeric value) means no limit.
+            expect(() => assertAdminScope(admin(30 * 24 * 3_600_000), TRUSTED, 0)).not.toThrow();
+            expect(() => assertAdminScope(admin(30 * 24 * 3_600_000), TRUSTED, -1)).not.toThrow();
+            expect(() => assertAdminScope(admin(30 * 24 * 3_600_000), TRUSTED, "x" as any)).not.toThrow();
+            // A timestamp in the future (clock skew between the servers) is not an old one.
+            expect(() => assertAdminScope(admin(-5_000), TRUSTED, 60)).not.toThrow();
+        });
+
+        it("Only holds an elevation to an age when the token carries a timestamp (a small value is a flag, not a time).", () => {
+            for (const elevated of [1, 5, 99, 1_700_000_000]) {
+                expect(() => assertAdminScope({ uid: "u", roles: ["admin"], scopes: [], elevated }, TRUSTED, 1)).not.toThrow();
+            }
         });
 
         it("Knows a trusted user.", () => {

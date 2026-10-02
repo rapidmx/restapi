@@ -193,7 +193,8 @@ export function sanitizedContentSuite(ctx: SanitizedContentSuiteContext): void {
             const result = await get(message.uid);
 
             expect(result.status).toBe(200);
-            expect(result.text).toBe("<table><tr><td>Sale</td></tr></table>");
+            // Fails closed: the old blob goes through the current sanitizer (which writes a whole document), never out as stored.
+            expect(result.text).toBe(sanitizeMailHtml("<table><tr><td>Sale</td></tr></table>"));
             expect((await ctx.blobStore().get(key)).toString()).toBe("<table><tr><td>Sale</td></tr></table>");
         });
     });

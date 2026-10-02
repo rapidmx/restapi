@@ -17,7 +17,9 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
+import { deleteBlobsIfUnreferenced, messageBlobReferenceSources } from "../util/BlobReferenceUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
+import { findActiveHoldsFor } from "../util/LegalHoldUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { chargeMailboxQuota, MailboxQuotaExceededError, refundMailboxQuota } from "../util/MailboxQuotaUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
@@ -119,6 +121,9 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
 
     protected readonly serverManagedFields: readonly string[] = SERVER_MANAGED_ATTACHMENT_FIELDS;
 
+    /** The blob keys are dropped from a trusted caller's body too (`download()` serves any key a record names, `delete()` removes it). */
+    protected readonly alwaysStrippedFields: readonly string[] = ["blobKey", "extractedTextBlobKey"];
+
     protected readonly dateFields: readonly string[] = ["extractionNextAttemptAt"];
 
     /** The class of the owning `Message` entity, supplied by the Mongo/SQL concrete subclass. */
@@ -128,6 +133,12 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
      * an attachment's size against it (`chargeMailboxQuota()`), the same accounting `MailboxQuotaRecalcJob`'s
      * hourly pass and `MailboxImportJob`'s historical import both already apply. */
     protected abstract mailboxClass: any;
+
+    /** The classes a purge needs to tell whether a blob is still referenced (`messageBlobReferenceSources()`), and the one the
+     * legal hold check reads. Supplied by the Mongo/SQL concrete subclasses; without `matterClass` no hold is checked. */
+    protected matterClass?: any;
+    protected quarantineEntryClass?: any;
+    protected ingestQueueEntryClass?: any;
 
     private messageRepo?: RecoverableRepoUtils<M>;
     private mailboxRepo?: RepoUtils<Mailbox>;
@@ -530,6 +541,100 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
             this.logger?.warn(`BaseAttachmentRoute: failed to update hasAttachments on message ${messageUid}: ${err.message}`);
         }
         /* v8 ignore stop */
+    }
+
+    /**
+     * An attachment is as held as its message: a permanent delete (`?purge=true`, and every truncate) of one whose message an open
+     * legal hold covers - by the message's own date, as `BaseMessageRoute.checkLegalHold()` judges it - is refused (409), and so is a
+     * rewrite of the fields that describe it (`prepareUpdate()`). `context` caches the messages and matters of one truncate.
+     */
+    protected async checkLegalHold(existing: T, user?: JWTUser, context?: Record<string, unknown>): Promise<void> {
+        if (!this.matterClass) {
+            return;
+        }
+        const messages: Map<string, Promise<M | undefined>> | undefined = context
+            ? ((context.messages as Map<string, Promise<M | undefined>> | undefined) ?? new Map())
+            : undefined;
+        if (context) {
+            context.messages = messages;
+        }
+        let pending: Promise<M | undefined> | undefined = messages?.get(existing.messageUid);
+        if (!pending) {
+            pending = this.findMessage(existing.messageUid);
+            messages?.set(existing.messageUid, pending);
+        }
+        const message: M | undefined = await pending;
+        const mailboxUid: string = message?.mailboxUid ?? existing.mailboxUid;
+        const dates: unknown[] = [message?.sentDate, message?.receivedDate, (message as any)?.dateCreated, (existing as any).dateCreated];
+        const reference: Date | undefined = dates
+            .map((value) => (value instanceof Date || typeof value === "string" || typeof value === "number" ? new Date(value) : undefined))
+            .find((date) => date && !Number.isNaN(date.getTime()));
+        // With no usable date any open hold on the mailbox blocks - the conservative direction for a hold.
+        const holds = await findActiveHoldsFor(this._objectFactory!, this.matterClass, mailboxUid, reference);
+        if (holds.length > 0) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                this.isTrusted(user)
+                    ? `This action is blocked by an active legal hold: ${holds.map((m) => m.uid).join(", ")}.`
+                    : "This action is blocked by an active legal hold.",
+            );
+        }
+    }
+
+    /** The fields of an attachment that say what it is (`filename`, `contentId`, `isInline`) can't be rewritten while it is held. */
+    protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
+        await super.prepareUpdate(obj, existing, user);
+        if (["filename", "contentId", "isInline"].some((field) => field in obj && (obj[field] ?? null) !== ((existing as any)[field] ?? null))) {
+            await this.checkLegalHold(existing, user);
+        }
+    }
+
+    /** The blob keys of `records` and what each mailbox is owed back for them, collected before they are deleted (`afterPurge()`). */
+    protected async beforePurge(records: T[]): Promise<unknown> {
+        const refunds: Map<string, number> = new Map();
+        const blobKeys: Set<string> = new Set();
+        for (const record of records) {
+            for (const key of [record.blobKey, record.extractedTextBlobKey]) {
+                if (typeof key === "string" && key.length > 0) {
+                    blobKeys.add(key);
+                }
+            }
+            if (record.mailboxUid && record.sizeBytes > 0) {
+                refunds.set(record.mailboxUid, (refunds.get(record.mailboxUid) ?? 0) + record.sizeBytes);
+            }
+        }
+        return { refunds, blobKeys: [...blobKeys] };
+    }
+
+    /**
+     * After permanently deleted attachments are gone: each blob no other row still names is deleted from the store, and the
+     * mailbox gets their size back (`refundMailboxQuota()`) - what `upload()` charged. Best-effort and logged: the rows are already
+     * deleted, so a blob or refund that fails is left (an orphan nothing references; the hourly quota recalc corrects the count).
+     */
+    protected async afterPurge(records: T[], prepared: unknown): Promise<void> {
+        const { refunds, blobKeys } = prepared as { refunds: Map<string, number>; blobKeys: string[] };
+        if (this.blobStore && blobKeys.length > 0) {
+            const sources = messageBlobReferenceSources({
+                messageClass: this.messageClass,
+                attachmentClass: this.modelClass,
+                quarantineEntryClass: this.quarantineEntryClass,
+                ingestQueueEntryClass: this.ingestQueueEntryClass,
+            });
+            for (const key of blobKeys) {
+                try {
+                    await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore, sources, [key]);
+                } catch (err: any) {
+                    this.logger?.warn(`BaseAttachmentRoute: failed to delete blob ${key}: ${err?.message}`);
+                }
+            }
+        }
+        const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
+        for (const [mailboxUid, bytes] of refunds) {
+            await refundMailboxQuota(mailboxRepo, mailboxUid, bytes, (err) => {
+                this.logger?.warn(`BaseAttachmentRoute: failed to refund ${bytes} quota bytes to mailbox ${mailboxUid}: ${(err as any)?.message}`);
+            });
+        }
     }
 
     /** As `BaseScopedChildRoute.delete()`, then re-derives the owning message's `hasAttachments`. */

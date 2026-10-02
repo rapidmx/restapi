@@ -11,6 +11,7 @@ import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { EscrowAccessRequestSQL } from "../../../src/models/sql/EscrowAccessRequestSQL.js";
 import { EscrowScopeSQL } from "../../../src/models/sql/EscrowScopeSQL.js";
+import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
@@ -22,6 +23,7 @@ describe("Route:MatterSQL Tests", () => {
     const baseUrl = "/sql/matters";
     let escrowScopeRepo: Repository<EscrowScopeSQL>;
     let matterRepo: Repository<MatterSQL>;
+    let mailboxRepo: Repository<MailboxSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
     let escrowAccessRequestRepo: Repository<EscrowAccessRequestSQL>;
 
@@ -58,6 +60,22 @@ describe("Route:MatterSQL Tests", () => {
         return await matterRepo.save(obj);
     };
 
+    /** A mailbox assigned to `escrowScopeId`: a matter can only hold mailboxes that exist and belong to its own scope. */
+    const createCustodian = async function (escrowScopeId: string): Promise<MailboxSQL> {
+        return await mailboxRepo.save(
+            new MailboxSQL({
+                ownerUserUid: uuid.v4(),
+                primarySmtpAddress: `${uuid.v4()}@example.com`,
+                aliasAddresses: [],
+                displayName: "Custodian",
+                timezone: "UTC",
+                quotaBytes: 1000,
+                usedBytes: 0,
+                escrowScopeId,
+            }),
+        );
+    };
+
     beforeAll(async () => {
         registerTestDoubles(objectFactory);
         await server.start();
@@ -67,6 +85,7 @@ describe("Route:MatterSQL Tests", () => {
         if (isSqlDataSource(conn)) {
             escrowScopeRepo = conn.getRepository(EscrowScopeSQL);
             matterRepo = conn.getRepository(MatterSQL);
+            mailboxRepo = conn.getRepository(MailboxSQL);
             auditLogRepo = conn.getRepository(AuditLogEntrySQL);
             escrowAccessRequestRepo = conn.getRepository(EscrowAccessRequestSQL);
         } else {
@@ -81,6 +100,7 @@ describe("Route:MatterSQL Tests", () => {
 
     beforeEach(async () => {
         await matterRepo.clear();
+        await mailboxRepo.clear();
         await escrowScopeRepo.clear();
         await auditLogRepo.clear();
         await escrowAccessRequestRepo.clear();
@@ -217,7 +237,7 @@ describe("Route:MatterSQL Tests", () => {
             .send({
                 name: "Investigation A",
                 escrowScopeId: scope.uid,
-                custodianMailboxUids: [uuid.v4()],
+                custodianMailboxUids: [(await createCustodian(scope.uid)).uid],
                 dateRangeStart: "2026-01-01",
                 dateRangeEnd: "2026-06-01",
             });
@@ -397,7 +417,7 @@ describe("Route:MatterSQL Tests", () => {
         const result = await request(server.getApplication())
             .post(baseUrl)
             .set("Authorization", "jwt " + holderAToken)
-            .send({ name: "Investigation A", escrowScopeId: scope.uid, custodianMailboxUids: [uuid.v4()], dateRangeStart: "2026-01-01" });
+            .send({ name: "Investigation A", escrowScopeId: scope.uid, custodianMailboxUids: [(await createCustodian(scope.uid)).uid], dateRangeStart: "2026-01-01" });
 
         expect(result.status).toBeGreaterThanOrEqual(200);
         expect(result.status).toBeLessThan(300);
@@ -413,14 +433,14 @@ describe("Route:MatterSQL Tests", () => {
                 {
                     name: "Investigation A",
                     escrowScopeId: scope.uid,
-                    custodianMailboxUids: [uuid.v4()],
+                    custodianMailboxUids: [(await createCustodian(scope.uid)).uid],
                     dateRangeStart: "2026-01-01",
                     dateRangeEnd: "2026-06-01",
                 },
                 {
                     name: "Investigation B",
                     escrowScopeId: scope.uid,
-                    custodianMailboxUids: [uuid.v4()],
+                    custodianMailboxUids: [(await createCustodian(scope.uid)).uid],
                     dateRangeStart: "2026-01-01",
                     dateRangeEnd: "2026-06-01",
                 },

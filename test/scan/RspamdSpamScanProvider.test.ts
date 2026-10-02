@@ -90,6 +90,28 @@ describe("RspamdSpamScanProvider Tests", () => {
         expect(result.symbols).toEqual(["FOO"]);
     });
 
+    it("Maps an action it doesn't know (a newer rspamd's 'quarantine', 'discard') to SUSPECT rather than CLEAN.", async () => {
+        for (const action of ["quarantine", "discard", ""]) {
+            mockFetch.mockResolvedValue(makeResponse({ json: vi.fn().mockResolvedValue({ action, score: 9, symbols: {} }) }));
+
+            expect((await provider.scoreMessage(Buffer.from("x"), makeEnvelope())).verdict).toBe(SpamVerdict.SUSPECT);
+        }
+    });
+
+    it("Sends header values fetch accepts (printable ASCII, bounded), whatever the envelope holds, rather than failing the scan.", async () => {
+        mockFetch.mockResolvedValue(makeResponse());
+
+        await provider.scoreMessage(Buffer.from("x"), makeEnvelope({ from: "müllerčĊ@exämple.com", to: ["a@example.com", `${"x".repeat(5000)}@example.com`] }));
+
+        const headers = mockFetch.mock.calls[0][1].headers;
+        for (const value of Object.values<string>(headers)) {
+            expect(value).toMatch(/^[\x20-\x7E]*$/);
+        }
+        expect(headers.From).toBe("m?ller??@ex?mple.com");
+        expect(headers.Rcpt.length).toBeLessThanOrEqual(998);
+        expect(headers.Rcpt.startsWith("a@example.com,")).toBe(true);
+    });
+
     it("Defaults symbols to an empty array when the response omits them.", async () => {
         mockFetch.mockResolvedValue(makeResponse({ json: vi.fn().mockResolvedValue({ action: "no action", score: 0 }) }));
 

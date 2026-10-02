@@ -10,6 +10,7 @@ export * from "./SigningCertificateEnrollment.js";
 export * from "./EnrollmentStages.js";
 export * from "./NullSigningCertificateEnrollment.js";
 export * from "./ManualSigningCertificateEnrollment.js";
+export * from "./EnrollmentLimits.js";
 export * from "./Rfc8823AcmeSigningCertificateEnrollment.js";
 export * from "./SigningEnrollmentHealth.js";
 export * from "./IssuedCertificateValidation.js";

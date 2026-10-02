@@ -675,7 +675,90 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect(updated!.purgedCount).toBe(1);
     });
 
-    it("Logs a warning and continues the cascade when one row's own delete throws.", async () => {
+    it("Keeps the request approved, the mailbox and the attachment row when its blob cleanup fails, and removes the blob on the retry rather than orphaning it.", async () => {
+        const mailbox = await createMailbox();
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const attachmentBlobKey = `attachments/${uuid.v4()}`;
+        await blobStore.put(attachmentBlobKey, Buffer.from("attachment bytes"));
+        await attachmentRepo.save(
+            new AttachmentSQL({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), messageUid: uuid.v4(), filename: "a.txt", mimeType: "text/plain", blobKey: attachmentBlobKey }),
+        );
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+        const deleteSpy = vi.spyOn(blobStore, "delete").mockRejectedValue(new Error("simulated S3 failure"));
+
+        await job.run();
+
+        expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("approved");
+        expect(await mailboxRepo.findOne({ where: { uid: mailbox.uid } })).not.toBeNull();
+        // The row, and so the blob key, is still there for the retry to find.
+        expect(await attachmentRepo.count({ where: { mailboxUid: mailbox.uid } })).toBe(1);
+        expect(await blobStore.exists(attachmentBlobKey)).toBe(true);
+
+        deleteSpy.mockRestore();
+        await job.run();
+
+        expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("completed");
+        expect(await attachmentRepo.count({ where: { mailboxUid: mailbox.uid } })).toBe(0);
+        expect(await blobStore.exists(attachmentBlobKey)).toBe(false);
+    });
+
+    it("Marks a request failed, with the rows it could not purge as the reason, once its attempts run out.", async () => {
+        const mailbox = await createMailbox();
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const attachmentBlobKey = `attachments/${uuid.v4()}`;
+        await blobStore.put(attachmentBlobKey, Buffer.from("attachment bytes"));
+        await attachmentRepo.save(
+            new AttachmentSQL({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), messageUid: uuid.v4(), filename: "a.txt", mimeType: "text/plain", blobKey: attachmentBlobKey }),
+        );
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+        vi.spyOn(blobStore, "delete").mockRejectedValue(new Error("simulated S3 failure"));
+        const original: number = (job as any).maxAttempts;
+        (job as any).maxAttempts = 2;
+        try {
+            await job.run();
+            const retrying = await requestRepo.findOne({ where: { uid: request.uid } });
+            expect(retrying!.status).toBe("approved");
+            expect(retrying!.reason).toContain("attempt 1 of 2");
+
+            await job.run();
+            const failed = await requestRepo.findOne({ where: { uid: request.uid } });
+            expect(failed!.status).toBe("failed");
+            expect(failed!.reason).toContain("failed after 2 attempts");
+            expect(failed!.reason).toContain("AttachmentSQL");
+
+            // No longer picked up: the mailbox and its row are left for an operator.
+            await job.run();
+            expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("failed");
+            expect(await mailboxRepo.findOne({ where: { uid: mailbox.uid } })).not.toBeNull();
+        } finally {
+            (job as any).maxAttempts = original;
+        }
+    });
+
+    it("Does not let a request that stays on legal hold starve the ones behind it.", async () => {
+        const heldMailbox = await createMailbox();
+        await matterRepo.save(
+            new MatterSQL({
+                name: "Held",
+                escrowScopeId: uuid.v4(),
+                custodianMailboxUids: [heldMailbox.uid],
+                dateRangeStart: new Date("2020-01-01"),
+                dateRangeEnd: new Date("2030-01-01"),
+            }),
+        );
+        const held = await createRequest({ mailboxUid: heldMailbox.uid });
+        const freeMailbox = await createMailbox();
+        const free = await createRequest({ mailboxUid: freeMailbox.uid });
+
+        await job.run();
+        await job.run();
+
+        expect((await requestRepo.findOne({ where: { uid: held.uid } }))!.status).toBe("approved");
+        expect((await requestRepo.findOne({ where: { uid: free.uid } }))!.status).toBe("completed");
+        expect(await mailboxRepo.findOne({ where: { uid: freeMailbox.uid } })).toBeNull();
+    });
+
+    it("Keeps the request approved, and the mailbox, when one row's own delete throws - then completes on the retry.", async () => {
         const mailbox = await createMailbox();
         await contactRepo.save(new ContactSQL({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "A" }));
         await contactRepo.save(new ContactSQL({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "B" }));
@@ -693,10 +776,17 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
 
         await job.run();
 
-        const updated = await requestRepo.findOne({ where: { uid: request.uid } });
-        expect(updated!.status).toBe("completed");
-        // One contact failed to delete and is still there; everything else (including the mailbox) is gone.
+        // One contact failed to delete and is still there: the erasure is not complete, so it must not be recorded as
+        // such, nor the mailbox (the anchor a retry needs) removed. The other contact is gone.
+        expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("approved");
         expect((await contactRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(1);
+        expect(await mailboxRepo.findOne({ where: { uid: mailbox.uid } })).not.toBeNull();
+
+        await job.run();
+
+        expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("completed");
+        expect((await contactRepo.find({ where: { mailboxUid: mailbox.uid } })).length).toBe(0);
+        expect(await mailboxRepo.findOne({ where: { uid: mailbox.uid } })).toBeNull();
     });
 
     it("Logs an error when the mailbox's own purge fails, still marking the request completed.", async () => {

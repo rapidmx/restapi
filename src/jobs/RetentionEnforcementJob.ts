@@ -318,22 +318,35 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
     private async purgeExpiredAuditLogEntries(maxAgeDays: number): Promise<void> {
         const cutoff: Date = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000);
 
-        const purgedCount: number = await this.purgeSortedBatches<AL>(
-            this.auditLogRepo!,
-            "dateCreated",
-            cutoff,
-            // No query-side exclusion: `mailboxUid NOT IN (...)` would also drop org-wide entries (a NULL
-            // `mailboxUid`) on SQL. Held entries are skipped past instead.
-            () => ({}),
-            // Without this check, a `Matter`'s own date range predating this policy's enforced minimum
-            // (`MIN_AUDIT_LOG_RETENTION_DAYS`) could have its audit trail purged out from under it. An entry with
-            // no `mailboxUid` (an org-wide action) has nothing to check a hold against.
-            (holds, entry) => !!entry.mailboxUid && holds.isHeld(entry.mailboxUid, entry.dateCreated),
-            async (entry) => {
-                await this.auditLogRepo!.delete(entry.uid, { ignoreACL: true, purge: true });
-            },
-            (entry, err) => this.logger?.warn(`RetentionEnforcementJob: failed to purge expired audit log entry ${entry.uid}: ${err.message}`),
-        );
+        // A held custodian's expired entries are left out of the query, or - sorted by `uid`, the cursor restarting every run - enough
+        // of them ahead of the purgeable ones would use up the whole examined budget and starve everything behind them. `mailboxUid
+        // NOT IN (...)` alone would also drop org-wide entries (a NULL `mailboxUid`) on SQL, so those are read by their own pass.
+        // (Mongo's `$nin` keeps them, which only means the second pass finds them already gone.)
+        const anyHeld: boolean = (await loadLegalHoldIndex(this._objectFactory!, this.matterClass)).heldMailboxUids.size > 0;
+        const scopes: Array<(holds: LegalHoldIndex) => Record<string, any>> = anyHeld
+            ? [() => ({ mailboxUid: "eq(null)" }), (holds) => (holds.heldMailboxUids.size > 0 ? { mailboxUid: `nin(${[...holds.heldMailboxUids].join(",")})` } : {})]
+            : [() => ({})];
+        let purgedCount = 0;
+        for (const scope of scopes) {
+            purgedCount += await this.purgeSortedBatches<AL>(
+                this.auditLogRepo!,
+                "dateCreated",
+                cutoff,
+                scope,
+                // Without this check, a `Matter`'s own date range predating this policy's enforced minimum
+                // (`MIN_AUDIT_LOG_RETENTION_DAYS`) could have its audit trail purged out from under it - a hold placed since the
+                // query was built included. An entry with no `mailboxUid` (an org-wide action) has nothing to check a hold against.
+                (holds, entry) => !!entry.mailboxUid && holds.isHeld(entry.mailboxUid, entry.dateCreated),
+                async (entry) => {
+                    await this.auditLogRepo!.delete(entry.uid, { ignoreACL: true, purge: true });
+                },
+                (entry, err) => this.logger?.warn(`RetentionEnforcementJob: failed to purge expired audit log entry ${entry.uid}: ${err.message}`),
+                this.batchSize - purgedCount,
+            );
+            if (purgedCount >= this.batchSize) {
+                break;
+            }
+        }
 
         if (purgedCount > 0) {
             await this.recordPurge("AuditLogEntry", purgedCount, maxAgeDays);

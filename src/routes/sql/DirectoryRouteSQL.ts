@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { LIKE_ESCAPE } from "./LikeUtils.js";
 import { Brackets, type SelectQueryBuilder, type Repository as TypeOrmRepository, type WhereExpressionBuilder } from "typeorm";
 import { DatabaseDecorators } from "@rapidrest/service-core";
 import { CalendarEventSQL, ContactSQL, CorrespondentSQL, DataSubjectErasureRequestSQL, DistributionListSQL, FolderSQL, MailboxSQL, MessageSQL } from "../../sql.js";
@@ -26,7 +27,7 @@ function andTerms<T extends object>(
         qb.andWhere(
             new Brackets((where: WhereExpressionBuilder) => {
                 const like = (column: string, name: string, pattern: string): void => {
-                    where.orWhere(`LOWER(${column}) LIKE :${name} ESCAPE '\\'`, { [name]: pattern });
+                    where.orWhere(`LOWER(${column}) LIKE :${name} ESCAPE '${LIKE_ESCAPE}'`, { [name]: pattern });
                 };
                 nameColumns.forEach((column, c) => {
                     like(column, `t${t}n${c}s`, `${escaped}%`);

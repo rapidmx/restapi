@@ -715,7 +715,8 @@ describe("Route:MailIngestRouteMongo Tests", () => {
             conditions: { subjectContains: ["blocked"] },
             actions: [{ type: TransportRuleActionType.REJECT }],
         });
-        const raw = Buffer.from(`From: sender@example.com\r\nSubject: blocked topic\r\n\r\nHello\r\n`);
+        // The notice goes only to a sender whose own DKIM signature verified (what this deployment's MTA stamps): to a forged envelope sender it would be backscatter.
+        const raw = Buffer.from(`Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\nFrom: sender@example.com\r\nSubject: blocked topic\r\n\r\nHello\r\n`);
 
         const result = await request(server.getApplication())
             .post(`${baseUrl}/deliver`)
@@ -742,7 +743,8 @@ describe("Route:MailIngestRouteMongo Tests", () => {
             conditions: { subjectContains: ["blocked"] },
             actions: [{ type: TransportRuleActionType.REJECT }],
         });
-        const raw = Buffer.from(`From: sender@example.com\r\nSubject: blocked topic\r\n\r\nHello\r\n`);
+        // The notice goes only to a sender whose own DKIM signature verified (what this deployment's MTA stamps): to a forged envelope sender it would be backscatter.
+        const raw = Buffer.from(`Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\nFrom: sender@example.com\r\nSubject: blocked topic\r\n\r\nHello\r\n`);
         const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
         vi.spyOn(transport, "send").mockRejectedValueOnce(new Error("simulated transport failure"));
 

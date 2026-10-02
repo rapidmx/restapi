@@ -12,6 +12,9 @@ import {
     findPluginNamespace,
     hasHostPlaceholder,
     isExactVersion,
+    CORE_CONFIG_NAMESPACES,
+    isPluginSettingKeyAllowed,
+    isSecretSettingKey,
     isNewerVersion,
     isPrereleaseVersion,
     pickLatestVersion,
@@ -113,6 +116,7 @@ describe("parsePluginManifest", () => {
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: {} } } }, /must be a list/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [null] } } }, /key and a label/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "date" }] } } }, /unknown type 'date'/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "string", secret: "yes" }] } } }, /secret must be true or false/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "select" }] } } }, /select with no options/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: ["@rapidmx/a"] } } }, /requires must map/],
         [{ name: "@rapidmx/x", rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", requires: { "@rapidmx/x": "^1.0.0" } } } }, /requires itself/],
@@ -123,6 +127,7 @@ describe("parsePluginManifest", () => {
         [JSON.parse('{"rapidmx": {"plugin": {"apiVersion": 1, "displayName": "X", "requires": {"__proto__": "1"}}}}'), /requires "__proto__"/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "string" }, { key: "k", label: "M", type: "number" }] } } }, /'k' is declared more than once/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "prototype", label: "L", type: "string" }] } } }, /'prototype' is a reserved key/],
+        [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "datastores:mongo:url", label: "L", type: "string" }] } } }, /names part of the server's own configuration/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "select", options: [null] }] } } }, /option without a value and a label/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "select", options: [{ value: 1, label: "One" }] }] } } }, /option without a value/],
         [{ rapidmx: { plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "X", settings: [{ key: "k", label: "L", type: "number", default: "5" }] } } }, /'k' has an invalid default: 'L' must be a number/],
@@ -498,11 +503,39 @@ describe("configuredPluginSettings", () => {
         }
     }
 
+    it("never reports a setting named in the server's own configuration", () => {
+        const config = provider({}, { datastores: { mongo: { url: "mongodb://u:p@h" } } });
+        const hostile: PluginManifest = { apiVersion: PLUGIN_API_VERSION, displayName: "Bad", settings: [{ key: "datastores:mongo:url", label: "U", type: "string" }] };
+        expect(configuredPluginSettings(config, hostile)).toEqual({});
+    });
+
     it("reports what the environment sets, and leaves a secret's value out", () => {
         const config = provider({ m__url: "turn:mail.example.com:3478", m__shared_secret: "hunter2", m__blank: "" }, {});
         expect(configuredPluginSettings(config, meet)).toEqual({
             "m:url": { value: "turn:mail.example.com:3478", secret: false },
             "m:shared_secret": { secret: true },
+        });
+    });
+
+    it("leaves out the value of a setting the manifest marks secret, whatever its key, and of a private key or DSN by its name", () => {
+        const manifest: PluginManifest = {
+            apiVersion: PLUGIN_API_VERSION,
+            displayName: "X",
+            settings: [
+                { key: "x:seed", label: "Seed", type: "string", secret: true },
+                { key: "x:private_key", label: "Key", type: "string" },
+                { key: "x:sentry_dsn", label: "DSN", type: "string" },
+                { key: "x:author", label: "Author", type: "string" },
+                { key: "x:tokenizer", label: "Tokenizer", type: "string" },
+            ],
+        };
+        const config = provider({ x__seed: "s", x__private_key: "k", x__sentry_dsn: "https://k@o/1", x__author: "jp", x__tokenizer: "bpe" }, {});
+        expect(configuredPluginSettings(config, manifest)).toEqual({
+            "x:seed": { secret: true },
+            "x:private_key": { secret: true },
+            "x:sentry_dsn": { secret: true },
+            "x:author": { value: "jp", secret: false },
+            "x:tokenizer": { value: "bpe", secret: false },
         });
     });
 
@@ -539,4 +572,66 @@ describe("configuredPluginSettings", () => {
         expect(configuredPluginSettings({ stores: { env: { get: () => ({ nested: true }) } } }, one)).toEqual({});
         expect(configuredPluginSettings({ stores: { env: { get: () => false } } }, one)).toEqual({ "o:value": { value: false, secret: false } });
     });
+});
+
+describe("isPluginSettingKeyAllowed", () => {
+    it("refuses every namespace in CORE_CONFIG_NAMESPACES and anything beneath it", () => {
+        for (const namespace of CORE_CONFIG_NAMESPACES) {
+            expect(isPluginSettingKeyAllowed(namespace)).toBe(false);
+            expect(isPluginSettingKeyAllowed(`${namespace}:x`)).toBe(false);
+        }
+    });
+
+    it.each(["trusted_roles", "AUTH:jwt", "datastores__mongo__url", "mail:transport:ingest:secret", "mail:transport", "System:Plugins", "system", "mail__blob__localfs__path", "Cookies", "shutdown", "mail:default_quota_bytes", "rateLimit:x", "mail:escrow", "cookie_secret"])("refuses %s", (key) => {
+        expect(isPluginSettingKeyAllowed(key)).toBe(false);
+    });
+    it.each(["mail:crm:url", "mail:videoconf:url", "mail:booking:x", "authx", "my_plugin:key", "mail:transportx"])("allows %s", (key) => {
+        expect(isPluginSettingKeyAllowed(key)).toBe(true);
+    });
+});
+
+describe("isSecretSettingKey", () => {
+    it.each([
+        "secret",
+        "m:shared_secret",
+        "clientSecret",
+        "client-secret",
+        "smtp_password",
+        "dbPassword",
+        "passphrase",
+        "key_passphrase",
+        "api_key",
+        "apiKey",
+        "APIKey",
+        "x-api-key",
+        "apikey",
+        "private_key",
+        "privateKey",
+        "m:signing_key",
+        "access_key",
+        "bearer",
+        "bearer_value",
+        "access_token",
+        "authToken",
+        "token",
+        "dsn",
+        "sentry_dsn",
+        "connection_string",
+        "connectionString",
+        "credentials",
+        "aws_credential",
+        "authorization",
+        "auth_header",
+        "authHeader",
+        "Authorization-Header",
+    ])("treats %s as a secret", (key) => {
+        expect(isSecretSettingKey(key)).toBe(true);
+    });
+
+    it.each(["author", "author_name", "tokenizer", "max_tokens", "auth", "auth_method", "authority", "header", "custom_header", "key", "sort_key", "keyboard", "connection", "string", "url", "domain", "limit", "privately", "dsnp", ""])(
+        "does not take %s for one",
+        (key) => {
+            expect(isSecretSettingKey(key)).toBe(false);
+        },
+    );
 });

@@ -969,6 +969,32 @@ describe("MailboxImportJobMongo Tests (real DB + DI)", () => {
         const updated = await requestRepo.findOne({ uid: request.uid } as any);
         expect(updated!.status).toBe("pending");
         expect((await messageRepo.find({ folderUid: folder.uid }).toArray()).length).toBe(1);
+        // The attempt that reclaimed the request is going to read the source - this one's lost lease must not delete it.
+        expect(await objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!.exists(sourceBlobKey)).toBe(true);
+    });
+
+    it("Keeps the uploaded source blob when it loses the claim race to another replica (the winner is still reading it).", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const sourceBlobKey = await putMbox([buildMboxEntry(makeRawMessage(), "alice@example.com", new Date("2020-01-01"))]);
+        const request = await createRequest({ mailboxUid: mailbox.uid, targetFolderUid: folder.uid, format: "mbox", sourceBlobKey });
+        // The other replica claimed it first: this one's copy of the row now carries a stale version.
+        await requestRepo.updateOne({ uid: request.uid } as any, { $inc: { version: 1 }, $set: { status: "processing" } });
+
+        await expect((job as any).processRequest(request)).rejects.toThrow();
+
+        expect(await objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!.exists(sourceBlobKey)).toBe(true);
+    });
+
+    it("Keeps the uploaded source blob when marking the request failed itself fails (the request stays pending to be retried).", async () => {
+        const request = await createRequest({ mailboxUid: uuid.v4(), targetFolderUid: uuid.v4(), format: "mbox" });
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        await blobStore.put(request.sourceBlobKey, Buffer.from("x"));
+        vi.spyOn(job as any, "transitionToFailed").mockRejectedValueOnce(new Error("database unavailable"));
+
+        await (job as any).processRequest(request);
+
+        expect(await blobStore.exists(request.sourceBlobKey)).toBe(true);
     });
 
     const importTwoMessages = async (): Promise<{ mailbox: any; folder: any; request: any }> => {
@@ -1135,6 +1161,128 @@ describe("MailboxImportJobMongo Tests (real DB + DI)", () => {
         expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated refund conflict"));
         const updated = await requestRepo.findOne({ uid: request.uid } as any);
         expect(updated!.failedCount).toBe(2);
+    });
+
+    it("On a reclaimed retry, imports again a message an interrupted attempt left without its attachments (and gives back its charge), but keeps one that is complete.", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const raw = makeRawMessage({ extraHeader: "Message-ID: <half-written@example.com>" });
+        const bodyBlobKey = `imported/${uuid.v4()}`;
+        await blobStore.put(bodyBlobKey, raw);
+        const stored = await messageRepo.save(
+            new MessageMongo({
+                mailboxUid: mailbox.uid,
+                folderUid: folder.uid,
+                messageId: "half-written@example.com",
+                subject: "Test message",
+                from: { address: "sender@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date("2020-01-01"),
+                receivedDate: new Date("2020-01-01"),
+                bodyBlobKey,
+                flags: { read: true, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: true,
+            }),
+        );
+        // The dead attempt wrote the message row (promising an attachment) and died before writing the attachment.
+        const sourceBlobKey = await putMbox([buildMboxEntry(raw, "alice@example.com", new Date("2020-01-01"))]);
+        const request = await createRequest({
+            mailboxUid: mailbox.uid,
+            targetFolderUid: folder.uid,
+            format: "mbox",
+            sourceBlobKey,
+            status: "processing",
+            processingAttempts: 1,
+            dateModified: new Date(Date.now() - 3 * 60 * 60_000),
+        });
+
+        await job.run();
+
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.status).toBe("completed");
+        const messages = await messageRepo.find({ folderUid: folder.uid }).toArray();
+        expect(messages.length).toBe(1);
+        expect(messages[0].uid).not.toBe(stored.uid);
+        const attachments = await attachmentRepo.find({ folderUid: folder.uid }).toArray();
+        expect(attachments.length).toBe(1);
+        expect(attachments[0].messageUid).toBe(messages[0].uid);
+        expect(await blobStore.exists(bodyBlobKey)).toBe(false);
+
+        // A complete message (its attachment present) is left alone by another retry.
+        const again = await createRequest({
+            mailboxUid: mailbox.uid,
+            targetFolderUid: folder.uid,
+            format: "mbox",
+            sourceBlobKey: await putMbox([buildMboxEntry(raw, "alice@example.com", new Date("2020-01-01"))]),
+            status: "processing",
+            processingAttempts: 1,
+            dateModified: new Date(Date.now() - 3 * 60 * 60_000),
+        });
+        await job.run();
+        expect((await requestRepo.findOne({ uid: again.uid } as any))!.importedCount).toBe(1);
+        expect((await messageRepo.find({ folderUid: folder.uid }).toArray()).length).toBe(1);
+        expect((await attachmentRepo.find({ folderUid: folder.uid }).toArray()).length).toBe(1);
+        expect((await mailboxRepo.findOne({ uid: mailbox.uid } as any))!.usedBytes).toBe(raw.length + "fake attachment content".length);
+    });
+
+    it("On a reclaimed retry, removes the attachments a half-written message did keep (a failed removal is only logged) and imports it again whole.", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const base = makeRawMessage({ extraHeader: "Message-ID: <half-two@example.com>" }).toString();
+        const second = ["--BOUNDARY", 'Content-Type: application/octet-stream; name="b.txt"', 'Content-Disposition: attachment; filename="b.txt"', "Content-Transfer-Encoding: base64", "", Buffer.from("second").toString("base64"), "", "--BOUNDARY--", ""].join("\r\n");
+        const raw = Buffer.from(base.replace(/--BOUNDARY--\r\n$/, second));
+        const bodyBlobKey = `imported/${uuid.v4()}`;
+        const attBlobKey = `imported/${uuid.v4()}`;
+        await blobStore.put(bodyBlobKey, raw);
+        await blobStore.put(attBlobKey, Buffer.from("fake attachment content"));
+        const stored = await messageRepo.save(
+            new MessageMongo({
+                mailboxUid: mailbox.uid,
+                folderUid: folder.uid,
+                messageId: "half-two@example.com",
+                subject: "Test message",
+                from: { address: "sender@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date("2020-01-01"),
+                receivedDate: new Date("2020-01-01"),
+                bodyBlobKey,
+                flags: { read: true, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: true,
+            }),
+        );
+        // The dead attempt wrote the message and the first of its two attachments, then died.
+        await attachmentRepo.save(
+            new AttachmentMongo({ messageUid: stored.uid, folderUid: folder.uid, mailboxUid: mailbox.uid, filename: "file.txt", mimeType: "application/octet-stream", sizeBytes: 23, blobKey: attBlobKey }),
+        );
+        const warn = vi.spyOn((job as any).logger, "warn");
+        const del = vi.spyOn((job as any).attachmentRepo, "delete").mockRejectedValueOnce(new Error("simulated delete failure"));
+        const request = await createRequest({
+            mailboxUid: mailbox.uid,
+            targetFolderUid: folder.uid,
+            format: "mbox",
+            sourceBlobKey: await putMbox([buildMboxEntry(raw, "alice@example.com", new Date("2020-01-01"))]),
+            status: "processing",
+            processingAttempts: 1,
+            dateModified: new Date(Date.now() - 3 * 60 * 60_000),
+        });
+
+        try {
+            await job.run();
+        } finally {
+            del.mockRestore();
+        }
+
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("simulated delete failure"));
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.status).toBe("completed");
+        const messages = await messageRepo.find({ folderUid: folder.uid }).toArray();
+        expect(messages.length).toBe(1);
+        expect(messages[0].uid).not.toBe(stored.uid);
+        expect(await blobStore.exists(bodyBlobKey)).toBe(false);
+        expect(await blobStore.exists(attBlobKey)).toBe(false);
+        expect((await attachmentRepo.find({ folderUid: folder.uid }).toArray()).filter((a: any) => a.messageUid === messages[0].uid).length).toBe(2);
     });
 
     it("Does nothing when the repos are not yet initialized.", async () => {

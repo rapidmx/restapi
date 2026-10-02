@@ -22,6 +22,12 @@ import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { scanAndRelay } from "../util/MailSendUtils.js";
 import { createFileExclusive, lockKeyForPath, readFileIfExists, updateJsonFile, withLock, writeFileAtomic } from "./FileStoreUtils.js";
 import { AcmeMilestones, classifyOrderFailure, classifyTransientFailure, computeStages, FailureClass } from "./EnrollmentStages.js";
+import {
+    enrollmentLimitProblem,
+    MAX_ENROLLMENTS_PER_IDENTITY_PER_DAY,
+    MAX_PENDING_ENROLLMENTS_PER_IDENTITY,
+    pruneFinishedEnrollments,
+} from "./EnrollmentLimits.js";
 import { sanitizeErrorText, SigningEnrollmentHealth } from "./SigningEnrollmentHealth.js";
 import {
     AdminEnrollmentSummary,
@@ -53,6 +59,8 @@ const DEFAULT_CHECK_MIN_INTERVAL_MS = 10_000;
  * never a promise; "check now" skips the wait for a tick.
  */
 export const TYPICAL_DURATION_MINUTES = 20;
+
+export { MAX_ENROLLMENTS_PER_IDENTITY_PER_DAY, MAX_PENDING_ENROLLMENTS_PER_IDENTITY };
 
 /** The lowercased domain part of an email address (bare `local@domain`, or a trailing `<local@domain>`), or
  * `undefined` if `address` doesn't look like a single address at all. */
@@ -396,6 +404,13 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The provided CSR's self-signature does not verify.");
         }
 
+        // Checked before an order is created at the CA, and again under the store lock where the record is written, so a burst of
+        // requests that all passed the first check cannot all be recorded.
+        const problem: ApiError | undefined = enrollmentLimitProblem(await this.loadStore(), identity, Date.now());
+        if (problem) {
+            throw problem;
+        }
+
         let client: acme.Client;
         let order: acme.Order;
         let authorization: Awaited<ReturnType<acme.Client["getAuthorizations"]>>[number];
@@ -423,6 +438,11 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
         const enrollmentId: string = crypto.randomUUID();
         const { from: challengeFrom, token: tokenPart2 } = challenge;
         await this.updateStore((store) => {
+            const limit: ApiError | undefined = enrollmentLimitProblem(store, identity, Date.now());
+            if (limit) {
+                throw limit;
+            }
+            pruneFinishedEnrollments(store, Date.now());
             store[enrollmentId] = {
                 identity,
                 csr,
@@ -655,7 +675,7 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
     public async getIssuedMaterial(
         enrollmentId: string,
     ): Promise<
-        | { certificate: string; wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">; mailboxUid?: string; masterKeyGeneration?: number }
+        | { certificate: string; wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">; mailboxUid?: string; masterKeyGeneration?: number; createdAt?: string }
         | undefined
     > {
         const store: Record<string, PendingEnrollment> = await this.loadStore();
@@ -668,6 +688,7 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
             wrappedKey: enrollment.wrappedKey,
             mailboxUid: enrollment.mailboxUid,
             masterKeyGeneration: enrollment.masterKeyGeneration,
+            createdAt: enrollment.createdAt,
         };
     }
 

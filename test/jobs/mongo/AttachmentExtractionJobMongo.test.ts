@@ -194,6 +194,44 @@ describe("AttachmentExtractionJobMongo Tests (real DB + DI)", () => {
         expect(updatedMessage!.searchIndexedAt).toBeNull();
     });
 
+    it("Matches the MIME type by its bare, lower-cased type/subtype, so a Content-Type with parameters or odd casing is still extracted.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const blobKey = `attachments/${uuid.v4()}`;
+        await blobStore.put(blobKey, Buffer.from("parameterised text"));
+        const message = await createMessage();
+        const attachment = await createAttachment({ messageUid: message.uid, mimeType: "Text/Plain; charset=utf-8; name=a.txt", blobKey });
+
+        await job.run();
+
+        const updated = await attachmentRepo.findOne({ uid: attachment.uid } as any);
+        expect((await blobStore.get(updated!.extractedTextBlobKey!)).toString()).toBe("parameterised text");
+    });
+
+    it("Does not download an attachment whose declared size is above the extraction ceiling, stamping it with an empty text blob.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const message = await createMessage();
+        const attachment = await createAttachment({ messageUid: message.uid, mimeType: "text/plain", sizeBytes: (job as any).maxExtractBytes + 1 });
+        const getSpy = vi.spyOn(blobStore, "get");
+
+        await job.run();
+
+        expect(getSpy).not.toHaveBeenCalledWith(attachment.blobKey);
+        const updated = await attachmentRepo.findOne({ uid: attachment.uid } as any);
+        expect((await blobStore.get(updated!.extractedTextBlobKey!)).toString()).toBe("");
+
+        // An image is never downloaded either.
+        const image = await createAttachment({ messageUid: message.uid, mimeType: "Image/PNG", sizeBytes: 10 });
+        await job.run();
+        expect(getSpy).not.toHaveBeenCalledWith(image.blobKey);
+        expect((await attachmentRepo.findOne({ uid: image.uid } as any))!.extractedTextBlobKey).toContain("attachment-text/");
+
+        // A type the registry has no extractor for (not just media) is never downloaded either.
+        const archive = await createAttachment({ messageUid: message.uid, mimeType: "application/zip", sizeBytes: 10 });
+        await job.run();
+        expect(getSpy).not.toHaveBeenCalledWith(archive.blobKey);
+        getSpy.mockRestore();
+    });
+
     it("Extracts non-empty text but does not touch the parent message when it was never search-indexed.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const blobKey = `attachments/${uuid.v4()}`;

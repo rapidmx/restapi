@@ -106,3 +106,68 @@ describe("readPublicBranding() / fetchBrandingPropsForSSR() Tests (no route inst
         expect(result).toEqual({ branding: { companyName: "", title: "" } });
     });
 });
+
+describe("BaseBrandingRoute Tests (an asset's old blob is deleted only after the row stops naming it)", () => {
+    const objectFactory: ObjectFactory = new ObjectFactory(config, Logger());
+
+    const setup = (update: any) => {
+        const route = objectFactory.newInstance<TestBrandingRoute>(TestBrandingRoute, { initialize: false });
+        const existing = { uid: "branding", version: 3, logoUrl: "/branding/logo", logoBlobKey: "branding/logo/old", logoContentType: "image/png" };
+        const blobStore = { put: vi.fn().mockResolvedValue(undefined), delete: vi.fn().mockResolvedValue(undefined) };
+        (route as any).brandingRepo = { findOne: vi.fn().mockResolvedValue(existing), update };
+        (route as any).blobStore = blobStore;
+        (route as any).recordUpdate = vi.fn().mockResolvedValue(undefined);
+        return { route: route as any, blobStore };
+    };
+
+    it("keeps the old blob when the update that would drop it fails, and deletes it once it succeeds.", async () => {
+        const failing = setup(vi.fn().mockRejectedValue(new Error("conflict")));
+        await expect(failing.route.update({ logoUrl: "https://example.com/logo.png" })).rejects.toThrow("conflict");
+        expect(failing.blobStore.delete).not.toHaveBeenCalled();
+
+        const working = setup(vi.fn().mockResolvedValue({ companyName: "", title: "" }));
+        await working.route.update({ logoUrl: "https://example.com/logo.png" });
+        expect(working.blobStore.delete).toHaveBeenCalledWith("branding/logo/old");
+    });
+
+    it("keeps the old blob and drops the new one when an upload's update fails, and deletes the old one once it succeeds.", async () => {
+        const upload = (route: any) => route.uploadAsset(
+            { headers: { "content-type": "image/png" }, rawBody: Buffer.from("png") },
+            undefined,
+            ["image/png"],
+            { urlField: "logoUrl", blobKeyField: "logoBlobKey", contentTypeField: "logoContentType", keyPrefix: "branding/logo", path: "/branding/logo" },
+        );
+        const failing = setup(vi.fn().mockRejectedValue(new Error("conflict")));
+        await expect(upload(failing.route)).rejects.toThrow("conflict");
+        const newKey: string = failing.blobStore.put.mock.calls[0][0];
+        expect(failing.blobStore.delete).toHaveBeenCalledTimes(1);
+        expect(failing.blobStore.delete).toHaveBeenCalledWith(newKey);
+
+        const working = setup(vi.fn().mockResolvedValue({ companyName: "", title: "" }));
+        await upload(working.route);
+        expect(working.blobStore.delete).toHaveBeenCalledTimes(1);
+        expect(working.blobStore.delete).toHaveBeenCalledWith("branding/logo/old");
+    });
+
+    it("keeps the blob when the update that clears an asset fails, and deletes it once it succeeds.", async () => {
+        const failing = setup(vi.fn().mockRejectedValue(new Error("conflict")));
+        await expect(failing.route.deleteLogo(undefined)).rejects.toThrow("conflict");
+        expect(failing.blobStore.delete).not.toHaveBeenCalled();
+
+        const working = setup(vi.fn().mockResolvedValue({}));
+        await working.route.deleteLogo(undefined);
+        expect(working.blobStore.delete).toHaveBeenCalledWith("branding/logo/old");
+    });
+});
+
+describe("BaseBrandingRoute update() URL validation", () => {
+    const objectFactory: ObjectFactory = new ObjectFactory(config, Logger());
+
+    it("Refuses an asset URL that does not parse as a URL.", async () => {
+        const route: any = objectFactory.newInstance<TestBrandingRoute>(TestBrandingRoute, { initialize: false });
+        route.init = vi.fn().mockResolvedValue(undefined);
+        route.findOrCreate = vi.fn().mockResolvedValue({ uid: "branding" });
+
+        await expect(route.update({ logoUrl: "https://" }, { uid: "u1" })).rejects.toMatchObject({ status: 400 });
+    });
+});

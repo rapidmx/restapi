@@ -202,11 +202,27 @@ describe("DomainVerificationJobSQL Tests (real DB + DI)", () => {
         await job.run();
 
         const found = await domainRepo.findOne({ where: { uid: domain.uid } });
-        expect(found!.version).toBe(domain.version + 1);
         expect(found!.dkimSelector).toBe("edited");
         expect(found!.verified).toBe(false);
-        expect(found!.lastCheckedAt ?? null).toBeNull();
+        // The conflicting write was dropped, but the check itself is recorded (on the fresh row) so the domain goes to the back of the line.
+        expect(found!.lastCheckedAt).toBeTruthy();
         expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("raced.com"));
+    });
+
+    it("Stamps lastCheckedAt even when the check or its write throws, so a persistently failing domain does not hold its place in the batch.", async () => {
+        const domain = await createDomain({ name: "throws.com" });
+        const repoUtils = (job as any).domainRepo;
+        const originalUpdate = repoUtils.update.bind(repoUtils);
+        vi.spyOn(repoUtils, "update").mockImplementationOnce(async () => {
+            throw new Error("simulated database failure");
+        });
+        vi.spyOn(repoUtils, "update").mockImplementation(originalUpdate);
+
+        await job.run();
+
+        const found = await domainRepo.findOne({ where: { uid: domain.uid } });
+        expect(found!.verified).toBe(false);
+        expect(found!.lastCheckedAt).toBeTruthy();
     });
 
     it("Bounds how many domains are checked per run to the configured batch size.", async () => {
@@ -218,5 +234,25 @@ describe("DomainVerificationJobSQL Tests (real DB + DI)", () => {
         const found = await domainRepo.find({ where: { uid: In(domains.map((d) => d.uid)) } });
         const checked = found.filter((d) => d.lastCheckedAt);
         expect(checked.length).toBe(2);
+    });
+
+    it("Checks never-checked domains first and then the longest-unchecked, so more unverifiable domains than the batch size are all reached.", async () => {
+        (job as any).batchSize = 2;
+        const day = 24 * 60 * 60 * 1000;
+        const older = await createDomain({ lastCheckedAt: new Date(Date.now() - 3 * day) });
+        const old = await createDomain({ lastCheckedAt: new Date(Date.now() - 2 * day) });
+        const never = await createDomain();
+        const recent = await createDomain({ lastCheckedAt: new Date(Date.now() - 1 * day) });
+        const checkedJustNow = async (): Promise<string[]> =>
+            (await domainRepo.find({ where: { uid: In([older, old, never, recent].map((d) => d.uid)) } }))
+                .filter((d) => d.lastCheckedAt && Date.now() - new Date(d.lastCheckedAt).getTime() < 60_000)
+                .map((d) => d.uid);
+
+        await job.run();
+        expect((await checkedJustNow()).sort()).toEqual([never.uid, older.uid].sort());
+
+        // The two just checked are now the newest: the next run reaches the others.
+        await job.run();
+        expect((await checkedJustNow()).sort()).toEqual([never.uid, older.uid, old.uid, recent.uid].sort());
     });
 });

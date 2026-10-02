@@ -257,4 +257,16 @@ describe("Route:TransportRuleSQL Tests", () => {
         expect(Array.isArray(result.body)).toBe(true);
         expect(result.body.length).toBe(2);
     });
+
+    it("Refuses a non-object rule, and more rules than the limit allows.", async () => {
+        const notObject = await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + adminToken).send([5]);
+        expect(notObject.status).toBe(400);
+
+        const rule = { name: "Rule", enabled: true, sequence: 0, stopProcessingRules: false, conditions: {}, actions: [] };
+        const tooMany = await request(server.getApplication())
+            .post(baseUrl)
+            .set("Authorization", "jwt " + adminToken)
+            .send(Array.from({ length: 501 }, () => ({ ...rule })));
+        expect(tooMany.status).toBe(400);
+    });
 });

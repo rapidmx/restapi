@@ -37,13 +37,51 @@ describe("PostgresFullTextSearchProvider Tests", () => {
 
             await (provider as any).init();
 
-            expect(mockConnection.query).toHaveBeenCalledTimes(6);
+            expect(mockConnection.query).toHaveBeenCalledTimes(7);
             expect(mockConnection.query.mock.calls[0][0]).toMatch(/CREATE TABLE IF NOT EXISTS mail_search_index/);
-            expect(mockConnection.query.mock.calls[1][0]).toMatch(/ALTER TABLE mail_search_index/);
-            expect(mockConnection.query.mock.calls[2][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_vector/);
-            expect(mockConnection.query.mock.calls[3][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_mailbox/);
-            expect(mockConnection.query.mock.calls[4][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_folder/);
-            expect(mockConnection.query.mock.calls[5][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_date/);
+            expect(mockConnection.query.mock.calls[1][0]).toMatch(/information_schema\.columns/);
+            expect(mockConnection.query.mock.calls[2][0]).toMatch(/ALTER TABLE mail_search_index/);
+            expect(mockConnection.query.mock.calls[3][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_vector/);
+            expect(mockConnection.query.mock.calls[4][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_mailbox/);
+            expect(mockConnection.query.mock.calls[5][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_folder/);
+            expect(mockConnection.query.mock.calls[6][0]).toMatch(/CREATE INDEX IF NOT EXISTS mail_search_index_date/);
+        });
+
+        it("Leaves the table alone (no ALTER, which locks it) when every column is there and mailbox_uid is wide enough, and alters only what is missing otherwise.", async () => {
+            wireConnection();
+            const all = ["from_address", "to_addresses", "cc_addresses", "folder_uid", "flags", "label_uids", "has_attachments", "metadata_only"];
+            const catalog = (mailboxLength: number, without: string[] = []) => [
+                { column_name: "mailbox_uid", character_maximum_length: mailboxLength },
+                ...all.filter((name) => !without.includes(name)).map((column_name) => ({ column_name, character_maximum_length: null })),
+            ];
+
+            mockConnection.query.mockResolvedValueOnce([]).mockResolvedValueOnce(catalog(320));
+            await (provider as any).init();
+            expect(mockConnection.query.mock.calls.some((call: any[]) => /ALTER TABLE/.test(call[0]))).toBe(false);
+            expect(mockConnection.query.mock.calls[1][1]).toEqual(["mail_search_index"]);
+
+            mockConnection.query.mockClear();
+            mockConnection.query.mockResolvedValueOnce([]).mockResolvedValueOnce(catalog(64, ["flags", "metadata_only"]));
+            await (provider as any).init();
+            const alter: string = mockConnection.query.mock.calls.map((call: any[]) => call[0]).find((sql: string) => /ALTER TABLE/.test(sql));
+            expect(alter).toMatch(/ALTER COLUMN mailbox_uid TYPE varchar\(320\)/);
+            expect(alter).toMatch(/ADD COLUMN IF NOT EXISTS flags text\[\]/);
+            expect(alter).toMatch(/ADD COLUMN IF NOT EXISTS metadata_only boolean/);
+            expect(alter).not.toMatch(/from_address/);
+
+            mockConnection.query.mockClear();
+            mockConnection.query.mockResolvedValueOnce([]).mockResolvedValueOnce(undefined);
+            await (provider as any).init();
+            expect(mockConnection.query.mock.calls.some((call: any[]) => /ADD COLUMN IF NOT EXISTS from_address/.test(call[0]))).toBe(true);
+        });
+
+        it("Sizes mailbox_uid for a mailbox address (up to 320 characters), widening a table an earlier version created at 64.", async () => {
+            wireConnection();
+
+            await (provider as any).init();
+
+            expect(mockConnection.query.mock.calls[0][0]).toMatch(/mailbox_uid varchar\(320\) NOT NULL/);
+            expect(mockConnection.query.mock.calls[2][0]).toMatch(/ALTER COLUMN mailbox_uid TYPE varchar\(320\)/);
         });
 
         it("Throws when no connection is found for the configured datasource.", async () => {
@@ -398,6 +436,32 @@ describe("PostgresFullTextSearchProvider Tests", () => {
 
             const [sql] = mockConnection.query.mock.calls[0];
             expect(sql).toMatch(/ORDER BY date_for_sort DESC NULLS LAST/);
+        });
+    });
+
+    describe("paging order and wildcard participants", () => {
+        it("Breaks ties by entity type and uid in every ordering, so OFFSET paging is stable.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            for (const run of [
+                () => provider.search({ mailboxUid: "mbx-1", text: "budget" }),
+                () => provider.search({ mailboxUid: "mbx-1" }),
+                () => provider.candidates({ mailboxUid: "mbx-1" }),
+            ]) {
+                mockConnection.query.mockClear();
+                mockConnection.query.mockResolvedValueOnce([]);
+                await run();
+                expect(mockConnection.query.mock.calls[0][0]).toMatch(/ORDER BY (rank DESC|date_for_sort DESC NULLS LAST), entity_type, entity_uid\s+LIMIT/);
+            }
+        });
+
+        it("Escapes the wildcards of a participant term, so % and _ match themselves rather than every row.", async () => {
+            wireConnection();
+            await (provider as any).init();
+            mockConnection.query.mockClear();
+            mockConnection.query.mockResolvedValueOnce([]);
+            await provider.candidates({ mailboxUid: "mbx-1", participants: ["%", "a_b@x.com", "back\\slash"] });
+            expect(mockConnection.query.mock.calls[0][1].slice(1, 4)).toEqual(["\\%", "a\\_b@x.com", "back\\\\slash"]);
         });
     });
 

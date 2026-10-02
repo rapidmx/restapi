@@ -31,6 +31,8 @@ export interface CalendarInviteSuiteContext {
     findMessage: (uid: string) => Promise<any>;
     /** Every calendar event row of a mailbox. */
     findEvents: (mailboxUid: string) => Promise<any[]>;
+    /** Clears the organizer recorded on a calendar event row. */
+    deleteEventOrganizer: (uid: string) => Promise<void>;
 }
 
 const HOUR = 60 * 60 * 1000;
@@ -85,11 +87,14 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
 
     /** A stored message from someone else carrying `content` as a `text/calendar` part (the shape a mail client sends). */
     const receive = async (mailboxUid: string, folderUid: string, content: string | undefined, method: string = "request", data?: any) => {
+        const { unverified, ...fields } = data ?? {};
         const composer = new MailComposer({
             from: "boss@boss.example.com",
             to: "me@example.com",
             subject: "Invitation: Video Test",
             text: "You have been invited to: Video Test",
+            // What this deployment's MTA stamps on a message whose sender's DKIM signature verified.
+            ...(unverified ? {} : { headers: { "Authentication-Results": "mx.example.com; dkim=pass header.d=boss.example.com" } }),
             ...(content ? { icalEvent: { method, content } } : {}),
         });
         const raw: Buffer = await composer.compile().build();
@@ -99,7 +104,7 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             bodyBlobKey,
             from: { address: "boss@boss.example.com", type: RecipientType.TO },
             hasAttachments: !!content,
-            ...data,
+            ...fields,
         });
     };
 
@@ -484,6 +489,107 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             expect(events[0].attendees[0].responseStatus).toBe("accepted");
         });
 
+        it("Refuses a status that is an Object.prototype key, not only one that isn't a status.", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const message = await receive(mailbox.uid, inbox.uid, requestFor(me));
+
+            for (const responseStatus of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+                expect((await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({ responseStatus })).status).toBe(400);
+            }
+            expect(await ctx.findEvents(mailbox.uid)).toHaveLength(0);
+            expect(ctx.transport().sent).toHaveLength(0);
+        });
+
+        it("Won't let an invitation that isn't from the organizer of the meeting on the calendar change or remove it.", async () => {
+            const { mailbox, inbox, calendar, me } = await setup();
+            const filed = await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                icalUid: eventUid,
+                title: "Real title",
+                organizer: { address: "boss@boss.example.com", type: RecipientType.TO },
+                attendees: [{ address: me, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+                sequence: 0,
+                inviteSequenceSent: 0,
+            });
+            const evil = { from: { address: "evil@evil.example.com", type: RecipientType.TO } };
+            // An invitation naming another organizer, and one that names the organizer but isn't from them.
+            const rewritten = await receive(mailbox.uid, inbox.uid, requestFor(me, { sequence: 5, organizer: "evil@evil.example.com" }), "request", evil);
+            const spoofed = await receive(mailbox.uid, inbox.uid, requestFor(me, { sequence: 5 }), "request", evil);
+            const cancelled = await receive(mailbox.uid, inbox.uid, requestFor(me, { method: "CANCEL", status: "CANCELLED" }), "cancel", evil);
+
+            for (const message of [rewritten, spoofed]) {
+                for (const responseStatus of ["accepted", "declined"]) {
+                    expect((await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({ responseStatus })).status).toBe(403);
+                }
+            }
+            expect((await owner(request(ctx.app()).post(inviteUrl(cancelled.uid, "/remove")))).status).toBe(403);
+            const events = await ctx.findEvents(mailbox.uid);
+            expect(events).toHaveLength(1);
+            expect(events[0]).toMatchObject({ uid: filed.uid, title: "Real title", sequence: 0 });
+        });
+
+        it("Holds an occurrence of a series on the calendar to the series' organizer, though the occurrence has no row yet.", async () => {
+            const { mailbox, inbox, calendar, me } = await setup();
+            await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                icalUid: eventUid,
+                title: "Real series",
+                recurrenceRule: "FREQ=WEEKLY;COUNT=5",
+                organizer: { address: "boss@boss.example.com", type: RecipientType.TO },
+                attendees: [{ address: me, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+            });
+            const evil = { from: { address: "evil@evil.example.com", type: RecipientType.TO } };
+            const forged = await receive(
+                mailbox.uid,
+                inbox.uid,
+                requestFor(me, { sequence: 5, organizer: "evil@evil.example.com", extra: [`RECURRENCE-ID:${stamp(start)}`] }),
+                "request",
+                evil,
+            );
+            expect((await owner(request(ctx.app()).post(inviteUrl(forged.uid, "/respond"))).send({ responseStatus: "accepted" })).status).toBe(403);
+            expect(await ctx.findEvents(mailbox.uid)).toHaveLength(1);
+        });
+
+        it("Needs the sender of an update to a meeting on the calendar to be DKIM-verified, not only to be named as its organizer.", async () => {
+            const { mailbox, inbox, calendar, me } = await setup();
+            await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                icalUid: eventUid,
+                title: "Real title",
+                organizer: { address: "boss@boss.example.com", type: RecipientType.TO },
+                attendees: [{ address: me, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+            });
+            const answer = (uid: string) => owner(request(ctx.app()).post(inviteUrl(uid, "/respond"))).send({ responseStatus: "accepted" });
+            const spoofed = await receive(mailbox.uid, inbox.uid, requestFor(me, { sequence: 5 }), "request", { unverified: true });
+            expect((await answer(spoofed.uid)).status).toBe(403);
+            const signed = await receive(mailbox.uid, inbox.uid, requestFor(me, { sequence: 5 }));
+            expect((await answer(signed.uid)).status).toBe(200);
+        });
+
+        it("Checks the organizer of an invitation against the calendar copy whatever is missing: no ORGANIZER in the file, none on the copy, and a file with no METHOD is no invitation to act on.", async () => {
+            const { mailbox, inbox, calendar, me } = await setup();
+            const crlf = String.fromCharCode(13, 10);
+            const withoutOrganizer = requestFor(me, { sequence: 5 })
+                .split(crlf)
+                .filter((line) => !line.startsWith("ORGANIZER"))
+                .join(crlf);
+            const noOrganizerFile = await receive(mailbox.uid, inbox.uid, withoutOrganizer);
+            const noMethodFile = await receive(mailbox.uid, inbox.uid, ics({ uid: eventUid, start, end, organizer: "boss@boss.example.com", attendees: [] }), "publish");
+            const answer = (uid: string) => owner(request(ctx.app()).post(inviteUrl(uid, "/respond"))).send({ responseStatus: "accepted" });
+            await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                icalUid: eventUid,
+                organizer: { address: "boss@boss.example.com", type: RecipientType.TO },
+                attendees: [{ address: me, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+            });
+
+            expect((await answer(noOrganizerFile.uid)).status).toBe(403);
+            // A file with no METHOD isn't one of the kinds checked here; it is refused for what it is.
+            expect((await answer(noMethodFile.uid)).status).toBe(400);
+
+            // A calendar copy that records no organizer matches nobody.
+            const [row] = await ctx.findEvents(mailbox.uid);
+            const mine = await receive(mailbox.uid, inbox.uid, requestFor(me, { sequence: 6 }));
+            await ctx.deleteEventOrganizer(row.uid);
+            expect((await answer(mine.uid)).status).toBe(403);
+        });
+
         it("Will not answer the reader's own invitation, a cancellation, a reply, or with a status that isn't one.", async () => {
             const { mailbox, inbox, me } = await setup();
             const own = await receive(mailbox.uid, inbox.uid, requestFor(me, { organizer: me, attendees: [{ address: "friend@example.com" }] }));
@@ -665,6 +771,17 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             expect(row.attendees.find((a: any) => a.address === "boss@boss.example.com").responseStatus).toBe("accepted");
             expect(row.attendees.find((a: any) => a.address === "other@example.com").responseStatus).toBe("needsAction");
             expect((await ctx.findMessage(message.uid)).meetingResponse).toBe("accepted");
+        });
+
+        it("Refuses a proposal whose sender's DKIM signature wasn't verified, changing nothing.", async () => {
+            const { mailbox, inbox, me, event } = await organized();
+            const message = await receive(mailbox.uid, inbox.uid, counter(me, end, new Date(end.getTime() + HOUR)), "counter", { unverified: true });
+
+            expect((await owner(request(ctx.app()).get(inviteUrl(message.uid)))).body).toMatchObject({ canAcceptProposal: true });
+            expect((await owner(request(ctx.app()).post(inviteUrl(message.uid, "/accept-proposal")))).status).toBe(403);
+            const [row] = await ctx.findEvents(mailbox.uid);
+            expect(row.uid).toBe(event.uid);
+            expect(row.sequence).toBe(1);
         });
 
         it("Refuses a proposal from someone the meeting doesn't list, and one for a meeting the reader doesn't organize.", async () => {

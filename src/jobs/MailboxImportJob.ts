@@ -285,38 +285,42 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     }
 
     private async processRequest(request: MIR): Promise<void> {
-        try {
-            await this.doProcessRequest(request);
-        } finally {
-            // The uploaded source blob (`BaseMailboxImportRoute.create()`'s own `blobStore.put()`) is never
-            // needed again once this request has been attempted - successfully, or failed for ANY reason,
-            // including a target mailbox/folder that no longer exists or a quota rejection - so it's removed
-            // here regardless of outcome, not on just the happy path. Without this, every attempted import
-            // permanently orphans its (potentially many-GB, now that uploads are genuinely streamed rather
-            // than size-limited by buffering) uploaded blob in storage forever: the only other caller that
-            // ever deletes a `sourceBlobKey` blob is `ErasureExecutionJob`, which runs solely on GDPR
-            // erasure, not on ordinary import completion. Best-effort: a delete failure here must not turn
-            // an otherwise-successful (or already-failed-for-its-own-reason) request into something worse -
-            // just logged, the same "don't let cleanup mask the real outcome" posture
-            // `resolveLocalSourcePath()`'s own temp-file `cleanup()` already has. `reclaimAbandonedRequests()`
-            // has the one other terminal outcome this doesn't cover (giving up after `maxAttempts` - it never
-            // calls this method at all) and deletes the same way at its own call site.
-            await this.blobStore!.delete(request.sourceBlobKey).catch((err: any) => {
-                this.logger?.warn(`MailboxImportJob: failed to delete source blob ${request.sourceBlobKey} for request ${request.uid}: ${err.message}`);
-            });
+        // Only when this attempt itself brought the request to its end (`doProcessRequest()` returns `true`) - an attempt
+        // that lost the claim to another replica (which throws), or whose lease was lost to a reclaim mid-import, must
+        // leave the blob alone: the attempt that now holds the request is reading it.
+        const finished: boolean = await this.doProcessRequest(request);
+        if (!finished) {
+            return;
         }
+        // The uploaded source blob (`BaseMailboxImportRoute.create()`'s own `blobStore.put()`) is never
+        // needed again once this request has been brought to its end - successfully, or failed for ANY reason,
+        // including a target mailbox/folder that no longer exists or a quota rejection - so it's removed
+        // here regardless of outcome, not on just the happy path. Without this, every attempted import
+        // permanently orphans its (potentially many-GB, now that uploads are genuinely streamed rather
+        // than size-limited by buffering) uploaded blob in storage forever: the only other caller that
+        // ever deletes a `sourceBlobKey` blob is `ErasureExecutionJob`, which runs solely on GDPR
+        // erasure, not on ordinary import completion. Best-effort: a delete failure here must not turn
+        // an otherwise-successful (or already-failed-for-its-own-reason) request into something worse -
+        // just logged, the same "don't let cleanup mask the real outcome" posture
+        // `resolveLocalSourcePath()`'s own temp-file `cleanup()` already has. `reclaimAbandonedRequests()`
+        // has the one other terminal outcome this doesn't cover (giving up after `maxAttempts` - it never
+        // calls this method at all) and deletes the same way at its own call site.
+        await this.blobStore!.delete(request.sourceBlobKey).catch((err: any) => {
+            this.logger?.warn(`MailboxImportJob: failed to delete source blob ${request.sourceBlobKey} for request ${request.uid}: ${err.message}`);
+        });
     }
 
-    private async doProcessRequest(request: MIR): Promise<void> {
+    /** Imports one claimed request. Resolves `true` once this attempt recorded the request's end (completed or failed),
+     * `false` when it could not (its lease was lost, or even marking the request failed failed - it stays to be retried).
+     * Throws when the claim itself is lost to another replica. */
+    private async doProcessRequest(request: MIR): Promise<boolean> {
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(request.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
-            await this.markFailed(request, "The target mailbox no longer exists.");
-            return;
+            return await this.markFailed(request, "The target mailbox no longer exists.");
         }
         const folder: F | undefined = await this.folderRepo!.findOne(request.targetFolderUid, { ignoreACL: true });
         if (!folder) {
-            await this.markFailed(request, "The target folder no longer exists.");
-            return;
+            return await this.markFailed(request, "The target folder no longer exists.");
         }
 
         // Every failure path below must mark against the lease's own held version, never `request`'s - this
@@ -348,7 +352,7 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                     // Deliberately outside the per-message try/catch below: a lost lease must abort the whole run.
                     await this.renewLease(lease);
                     try {
-                        if (attempt > 1 && (await this.alreadyImported(raw, folder))) {
+                        if (attempt > 1 && (await this.alreadyImported(raw, folder, quota))) {
                             // Persisted by an earlier attempt that died before completing - see this class's doc comment.
                             importedCount++;
                             continue;
@@ -418,8 +422,9 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                     mailboxUid: updated.mailboxUid,
                 },
             );
+            return true;
         } catch (err: any) {
-            await this.markFailed(lease.held, err.message);
+            return await this.markFailed(lease.held, err.message);
         }
     }
 
@@ -463,8 +468,10 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     }
 
     /** Whether a message with `raw`'s own `Message-ID` already exists in `folder` - used only on a retried
-     * attempt, to skip what the earlier (abandoned) attempt already persisted. */
-    private async alreadyImported(raw: Buffer, folder: F): Promise<boolean> {
+     * attempt, to skip what the earlier (abandoned) attempt already persisted. An attempt that died while writing the message's
+     * attachments left a message row without all of them (the row is written first): that half-written message is removed - its
+     * attachments, blobs and quota charge with it - and reported as not imported, so it is imported again, whole. */
+    private async alreadyImported(raw: Buffer, folder: F, quota: ImportQuota): Promise<boolean> {
         const header: string | undefined = extractHeader(raw, "Message-ID");
         // Bounded the same way `Message` bounds the stored value (an over-long Message-ID is stored as its SHA-256),
         // or an over-long Message-ID would never match and a retry would duplicate the message.
@@ -473,14 +480,37 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             return false;
         }
         const existing: M[] = await this.messageRepo!.find({ folderUid: folder.uid, messageId: ModelUtils.literal(messageId), limit: 1 } as any, { ignoreACL: true, limit: 1 });
-        return existing.length > 0;
+        if (existing.length === 0) {
+            return false;
+        }
+        const message: M = existing[0];
+        if (!message.hasAttachments) {
+            return true;
+        }
+        const result: ScanPipelineResult = await this.scanPipeline!.run(raw, { from: "", to: [] });
+        const attachments: any[] = await this.attachmentRepo!.find({ messageUid: ModelUtils.literal(message.uid), limit: 500 } as any, { ignoreACL: true, limit: 500 });
+        if (attachments.length >= result.attachments.length) {
+            return true;
+        }
+        this.logger?.warn(`MailboxImportJob: message ${message.uid} was left without all of its attachments by an interrupted attempt - importing it again.`);
+        await this.rollbackImportedMessage({
+            blobKeys: [message.bodyBlobKey, message.sanitizedHtmlBlobKey, ...attachments.map((a: any) => a.blobKey)].filter((key): key is string => !!key),
+            attachmentUids: attachments.map((a: any) => a.uid),
+            messageUid: message.uid,
+        });
+        await this.refundQuota(quota, raw.length + result.attachments.reduce((sum, a) => sum + a.content.length, 0));
+        return false;
     }
 
-    private async markFailed(request: MIR, errorMessage: string): Promise<void> {
+    /** Records `request` as failed. Resolves `false` (logged, never thrown) when that couldn't be recorded - the request is
+     * then not failed, and whatever it still needs (its source blob) must stay. */
+    private async markFailed(request: MIR, errorMessage: string): Promise<boolean> {
         try {
             await this.transitionToFailed(request, errorMessage);
+            return true;
         } catch (err: any) {
             this.logger?.error(`MailboxImportJob: failed to mark import request ${request.uid} as failed: ${err.message}`);
+            return false;
         }
     }
 
@@ -539,13 +569,55 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
         }
     }
 
+    /** Stores one imported message and its attachments. A failure part-way undoes what was written (`rollbackImportedMessage()`):
+     * the caller refunds the quota it charged, so nothing may stay behind that this message's bytes still account for. */
     private async storeImportedMessage(raw: Buffer, result: ScanPipelineResult, mailbox: MB, folder: F): Promise<boolean> {
+        const written: { blobKeys: string[]; attachmentUids: string[]; messageUid?: string } = { blobKeys: [], attachmentUids: [] };
+        try {
+            return await this.writeImportedMessage(raw, result, mailbox, folder, written);
+        } catch (err) {
+            await this.rollbackImportedMessage(written);
+            throw err;
+        }
+    }
+
+    /** Best-effort removal of what a failed `writeImportedMessage()` already wrote - attachment rows, the message row, then every
+     * blob it put (a key is recorded before its put, so one that failed part-way is cleaned up too). Never throws: the store failure
+     * is what the caller reports. */
+    private async rollbackImportedMessage(written: { blobKeys: string[]; attachmentUids: string[]; messageUid?: string }): Promise<void> {
+        const quietly = async (what: string, action: () => Promise<unknown>): Promise<void> => {
+            try {
+                await action();
+            } catch (err: any) {
+                this.logger?.warn(`MailboxImportJob: failed to remove ${what} of an import that failed to store: ${err.message}`);
+            }
+        };
+        for (const uid of written.attachmentUids) {
+            await quietly(`attachment ${uid}`, () => this.attachmentRepo!.delete(uid, { ignoreACL: true, purge: true }));
+        }
+        if (written.messageUid) {
+            await quietly(`message ${written.messageUid}`, () => this.messageRepo!.delete(written.messageUid!, { ignoreACL: true, purge: true }));
+        }
+        for (const key of written.blobKeys) {
+            await quietly(`blob ${key}`, () => this.blobStore!.delete(key));
+        }
+    }
+
+    private async writeImportedMessage(
+        raw: Buffer,
+        result: ScanPipelineResult,
+        mailbox: MB,
+        folder: F,
+        written: { blobKeys: string[]; attachmentUids: string[]; messageUid?: string },
+    ): Promise<boolean> {
         const bodyBlobKey = `imported/${crypto.randomUUID()}`;
+        written.blobKeys.push(bodyBlobKey);
         await this.blobStore!.put(bodyBlobKey, raw, { contentType: "message/rfc822" });
 
         let sanitizedHtmlBlobKey: string | undefined;
         if (result.sanitizedHtml !== undefined) {
             sanitizedHtmlBlobKey = `sanitized/${crypto.randomUUID()}`;
+            written.blobKeys.push(sanitizedHtmlBlobKey);
             await this.blobStore!.put(sanitizedHtmlBlobKey, Buffer.from(result.sanitizedHtml, "utf-8"), { contentType: "text/html" });
         }
 
@@ -597,10 +669,12 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             { ignoreACL: true },
         );
 
+        written.messageUid = message.uid;
         for (const attachment of result.attachments) {
             const blobKey = `attachments/${crypto.randomUUID()}`;
+            written.blobKeys.push(blobKey);
             await this.blobStore!.put(blobKey, attachment.content, { contentType: attachment.contentType });
-            await this.attachmentRepo!.create(
+            const row = await this.attachmentRepo!.create(
                 new this.attachmentClass({
                     messageUid: message.uid,
                     folderUid: folder.uid,
@@ -614,6 +688,7 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                 }),
                 { ignoreACL: true },
             );
+            written.attachmentUids.push(row.uid);
         }
 
         return true;

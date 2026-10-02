@@ -233,6 +233,42 @@ describe("SearchIndexJobSQL Tests (real DB + DI)", () => {
         expect(doc!.body).toContain("Hi there");
     });
 
+    it("Does not inline a related image as a data: URI into the indexed text (skipImageLinks).", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const blobKey = `body/${uuid.v4()}`;
+        const png = Buffer.alloc(3000, 7).toString("base64");
+        await blobStore.put(
+            blobKey,
+            Buffer.from(
+                [
+                    "Content-Type: multipart/related; boundary=REL",
+                    "",
+                    "--REL",
+                    "Content-Type: text/html",
+                    "",
+                    '<p>Logo below</p><img src="cid:logo@example.com" alt="Logo">',
+                    "--REL",
+                    "Content-Type: image/png",
+                    "Content-ID: <logo@example.com>",
+                    "Content-Transfer-Encoding: base64",
+                    "",
+                    png,
+                    "--REL--",
+                    "",
+                ].join("\r\n"),
+            ),
+        );
+        const message = await createMessage({ bodyBlobKey: blobKey });
+
+        await job.run();
+
+        const searchProvider = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
+        const doc = searchProvider.indexed.get(`message:${message.uid}`);
+        expect(doc!.body).toContain("Logo below");
+        expect(doc!.body).not.toContain("data:image");
+        expect(doc!.body.length).toBeLessThan(500);
+    });
+
     it("Falls back to an empty body when the parsed message has neither plain-text nor HTML content.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const blobKey = `body/${uuid.v4()}`;

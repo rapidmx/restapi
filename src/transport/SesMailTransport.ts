@@ -75,7 +75,9 @@ export class SesMailTransport implements MailTransport {
             const client = await this.getClient();
             const result: SendEmailCommandOutput = await client.send(
                 new sdk.SendEmailCommand({
-                    FromEmailAddress: message.envelopeFrom,
+                    // SES refuses an empty address, and cannot send with a null sender either (the bounce and notice case, empty
+                    // `envelopeFrom`): it sends those from its own, so none is named.
+                    ...(message.envelopeFrom ? { FromEmailAddress: message.envelopeFrom } : {}),
                     Destination: { ToAddresses: message.envelopeTo },
                     Content: { Raw: { Data: message.raw } },
                     ConfigurationSetName: this.configurationSet,

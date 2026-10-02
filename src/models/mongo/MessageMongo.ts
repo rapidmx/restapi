@@ -233,6 +233,11 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     public scheduledSendRelayedAt?: Date;
 
     @Column()
+    @Description("Set by the server when it relayed this message and filed it into Sent Items - only such a message can be recalled.")
+    @Nullable
+    public sentByServerAt?: Date;
+
+    @Column()
     @Description("While in the future, a send of this message is in flight (claimed for relay) and it can't leave Outbox.")
     @Nullable
     public scheduledSendLeaseExpiresAt?: Date;
@@ -384,6 +389,7 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.scheduledSendAttempts = "scheduledSendAttempts" in other ? other.scheduledSendAttempts : this.scheduledSendAttempts;
             this.scheduledSendError = "scheduledSendError" in other ? other.scheduledSendError : this.scheduledSendError;
             this.scheduledSendRelayedAt = "scheduledSendRelayedAt" in other ? other.scheduledSendRelayedAt : this.scheduledSendRelayedAt;
+            this.sentByServerAt = "sentByServerAt" in other ? other.sentByServerAt : this.sentByServerAt;
             this.scheduledSendLeaseExpiresAt =
                 "scheduledSendLeaseExpiresAt" in other ? other.scheduledSendLeaseExpiresAt : this.scheduledSendLeaseExpiresAt;
             this.retainedBodyBlobKeys = "retainedBodyBlobKeys" in other ? other.retainedBodyBlobKeys : this.retainedBodyBlobKeys;

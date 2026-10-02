@@ -137,8 +137,8 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
 
     /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `Contact` carries its own
      * denormalized `mailboxUid` that must never diverge from its actual folder's mailbox. */
-    protected async resolveMailboxUidFor(scopeUid: string): Promise<string | undefined> {
-        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid);
+    protected async resolveMailboxUidFor(scopeUid: string, rejectDeleted?: boolean): Promise<string | undefined> {
+        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid, rejectDeleted);
     }
 
     @Post()

@@ -15,7 +15,7 @@ export class NoteRouteSQL extends BaseScopedChildRoute<NoteSQL> {
 
     /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `Note` carries its own
      * denormalized `mailboxUid` that must never diverge from its actual folder's mailbox. */
-    protected async resolveMailboxUidFor(scopeUid: string): Promise<string | undefined> {
-        return getMailboxUidForFolder(this._objectFactory!, FolderSQL, scopeUid);
+    protected async resolveMailboxUidFor(scopeUid: string, rejectDeleted?: boolean): Promise<string | undefined> {
+        return getMailboxUidForFolder(this._objectFactory!, FolderSQL, scopeUid, rejectDeleted);
     }
 }

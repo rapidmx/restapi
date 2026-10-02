@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, ACLUtils, RepoUtils, type AccessControlList } from "@rapidrest/service-core";
+import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { CalendarShareLink } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
@@ -72,26 +73,26 @@ export abstract class ExternalShareExpirationJob<S extends CalendarShareLink> ex
         // where it's unset, on both Mongo (`$lt` against a missing field never matches) and SQL (comparing
         // NULL is never true), so this needs no additional in-process filtering for that case.
         //
-        // `limit` is passed both via `options` (all the Mongo backend of `RepoUtils.find()` actually reads)
-        // *and* baked into the query object itself (all `ModelUtils.buildSearchQuerySQL` reads - it ignores
-        // `options.limit` entirely and falls back to its own default of 100 otherwise). Confirmed by
-        // real-database testing: on the SQL backend, `options.limit` alone silently caps at 100 regardless of
-        // the configured batch size.
-        const links: S[] = await this.calendarShareLinkRepo.find(
-            { expiresAt: `lt(${now.toISOString()})`, limit: this.batchSize } as any,
-            { ignoreACL: true, limit: this.batchSize },
-        );
-
-        for (const link of links) {
-            try {
-                // Revoke the token's ACL grant BEFORE deleting the row: the row is the only thing that
-                // remembers which token/folder pair needs revoking, so if revocation fails the row must
-                // survive for the next run to retry. Deleting first would leave a live anonymous ACL grant
-                // with nothing left to ever clean it up.
-                await this.revokeShareTokenAccess(link.folderUid, link.token);
-                await this.calendarShareLinkRepo.delete(link.uid, { ignoreACL: true, purge: true });
-            } catch (err: any) {
-                this.logger?.warn(`ExternalShareExpirationJob: failed to delete expired share link ${link.uid}: ${err.message}`);
+        // Read in keyset pages (`findPagesByUid()` - which also bakes `limit` into the query for the SQL backend, see there) and purged
+        // until `batchSize` links are gone: a link that keeps failing is stepped over, not re-read at the head of every run, so no number of
+        // them can occupy the batch and starve the expired links behind them.
+        let purged = 0;
+        for await (const links of findPagesByUid<S>(this.calendarShareLinkRepo, { expiresAt: `lt(${now.toISOString()})` }, this.batchSize)) {
+            for (const link of links) {
+                if (purged >= this.batchSize) {
+                    return;
+                }
+                try {
+                    // Revoke the token's ACL grant BEFORE deleting the row: the row is the only thing that
+                    // remembers which token/folder pair needs revoking, so if revocation fails the row must
+                    // survive for the next run to retry. Deleting first would leave a live anonymous ACL grant
+                    // with nothing left to ever clean it up.
+                    await this.revokeShareTokenAccess(link.folderUid, link.token);
+                    await this.calendarShareLinkRepo.delete(link.uid, { ignoreACL: true, purge: true });
+                    purged++;
+                } catch (err: any) {
+                    this.logger?.warn(`ExternalShareExpirationJob: failed to delete expired share link ${link.uid}: ${err.message}`);
+                }
             }
         }
     }

@@ -76,6 +76,20 @@ describe("findActiveHoldsFor() Tests", () => {
         expect(result).toEqual([matter]);
     });
 
+    it("Reads a stored date range given as strings, and still holds when a bound can't be read at all.", async () => {
+        const asStrings = makeMatter({ dateRangeStart: "2020-01-01T00:00:00.000Z", dateRangeEnd: "2025-01-01T00:00:00.000Z" });
+        const unreadable = makeMatter({ uid: "matter-2", dateRangeStart: "not a date", dateRangeEnd: undefined });
+        const repo = { find: vi.fn().mockResolvedValue([asStrings, unreadable]) };
+        const objectFactory = makeObjectFactory(repo);
+        const stubClass = makeStubClass();
+
+        expect(await findActiveHoldsFor(objectFactory, stubClass, "mailbox-1", new Date("2021-06-01"))).toEqual([asStrings, unreadable]);
+        // Outside the readable range only the matter whose range can't be read (it fails closed) still holds.
+        expect(await findActiveHoldsFor(objectFactory, stubClass, "mailbox-1", new Date("2026-06-01"))).toEqual([unreadable]);
+        const index = await loadLegalHoldIndex(objectFactory, stubClass);
+        expect(index.isHeld("mailbox-1", new Date("2026-06-01"))).toBe(true);
+    });
+
     it("Returns every matching open matter, not just the first.", async () => {
         const matterA = makeMatter({ uid: "matter-a" });
         const matterB = makeMatter({ uid: "matter-b" });
