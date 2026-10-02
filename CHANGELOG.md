@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-10-02
+
+### Changed
+- Install a plugin from an npm pack file uploaded by an elevated administrator, storing the pack in the blob store and recording its integrity, with a switch and a size limit for the operator
+- Inspect an uploaded pack without extracting it, refusing anything that is not a gzipped tar of a package, an unsafe or oversized one, or one with an invalid manifest
+- Replace an installed plugin with an uploaded pack of the same name, keeping its settings and whether it is enabled, and go back to the registry through an update
+- Leave the plugins that were uploaded out of the checks for updates
+
 ## [0.28.1] - 2026-10-02
 
 ### Changed
@@ -1325,7 +1333,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.28.1...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/rapidmx/restapi/compare/v0.28.1...v0.29.0
 [0.28.1]: https://github.com/rapidmx/restapi/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/rapidmx/restapi/compare/v0.27.1...v0.28.0
 [0.27.1]: https://github.com/rapidmx/restapi/compare/v0.27.0...v0.27.1
