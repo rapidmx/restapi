@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-10-02
+
+### Changed
+- Protect the server's own jobs by name rather than every job, and no longer the autodiscover settings, so the ActiveSync and autodiscover plugins still load
+- Update nodemailer to 10.0.13
+
 ## [0.28.0] - 2026-10-02
 
 ### Changed
@@ -1319,7 +1325,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.28.1...HEAD
+[0.28.1]: https://github.com/rapidmx/restapi/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/rapidmx/restapi/compare/v0.27.1...v0.28.0
 [0.27.1]: https://github.com/rapidmx/restapi/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/rapidmx/restapi/compare/v0.26.0...v0.27.0
