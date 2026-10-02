@@ -585,6 +585,13 @@ describe("isPluginSettingKeyAllowed", () => {
     it.each(["trusted_roles", "AUTH:jwt", "datastores__mongo__url", "mail:transport:ingest:secret", "mail:transport", "System:Plugins", "system", "mail__blob__localfs__path", "Cookies", "shutdown", "mail:default_quota_bytes", "rateLimit:x", "mail:escrow", "cookie_secret"])("refuses %s", (key) => {
         expect(isPluginSettingKeyAllowed(key)).toBe(false);
     });
+    // The settings the shipped plugins (activesync, autodiscover, booking, crm, meet) declare: a plugin that names one is not loaded.
+    it.each(["mail:eas:sync_window_size", "mail:eas:provision:password_enabled", "mail:jobs:eas_device_cleanup:device_ttl_days", "mail:autodiscover:public_url", "mail:booking:public_url", "mail:crm:public_url", "mail:crm:verp", "mail:videoconf:public_url", "mail:videoconf:turn:shared_secret", "mail:videoconf:relay:enabled"])("allows the shipped plugin setting %s", (key) => {
+        expect(isPluginSettingKeyAllowed(key)).toBe(true);
+    });
+    it.each(["mail:jobs:scan_queue:schedule", "mail:jobs:scheduled_send", "mail:jobs:search_index:batch_size"])("still refuses the core job setting %s", (key) => {
+        expect(isPluginSettingKeyAllowed(key)).toBe(false);
+    });
     it.each(["mail:crm:url", "mail:videoconf:url", "mail:booking:x", "authx", "my_plugin:key", "mail:transportx"])("allows %s", (key) => {
         expect(isPluginSettingKeyAllowed(key)).toBe(true);
     });
