@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-10-02
+
+### Changed
+- Cap the recipients and the field lengths of the delivery status and feedback reports published on the mail event stream, and mark whether the report came from an authenticated sender
+- Stop an administrator setting a contact's picture to another blob, and only erase a picture from the contact's own folder of the blob store
+- Make a contact's picture revalidate on every request, so a revoked or deleted picture stops showing at once
+- Stop a Redis outage from holding up sending and delivery by giving up on publishing to the mail event stream after two seconds
+- Index the picture of a contact so removing or replacing one does not scan every contact
+- Return the plugins one of the two registry searches found when the other fails
+- Say on a published delivery status or feedback report when recipients beyond the cap were left out
+- Fall back to two seconds when the time to wait for the mail event stream is not a positive number, and say in the log that a publish given up on may still be delivered
+- Stop any caller, an administrator included, from setting the blob keys of a message, an attachment or an ingest or quarantine entry, and refuse to create the entries through the API
+- Find a soft deleted folder when working out the mailbox of a record and refuse to create or move a record into one
+- Require an elevated administrator to change the owner of a mailbox, delete another's mailbox, empty the mailboxes, change the retention policy, export another mailbox or approve an erasure, and keep the one who asked from approving their own
+- Require an elevated administrator to write transport rules and to add, update, remove or plan plugins, and stop an elevation older than fifteen minutes from counting
+- Refuse to create a mail folder type through the API and ignore the type on an update
+- Force the sender of a message made outside Drafts to the mailbox's own address and scrub a draft moved to Deleted Items
+- Let only a message the server relayed be recalled, send the notice once, keep Bcc recipients out of it and limit how often it is done
+- Freeze the subject, sender, recipients and dates of a message under legal hold, and hold the attachments of such a message too
+- Delete the blobs of an attachment and give back its quota when it is purged
+- Require the organizer of an invitation to be the sender, verified, before answering, removing or accepting it
+- Check the filter rule forwards, cap them and their actions, and audit them
+- Keep a delegate from reading the key vault or wiping the published keys of a mailbox
+- Bound the actions of a share link to what its creator holds, cap the links of a calendar and expire them
+- Check the custodians of a matter against its escrow scope, rate limit and audit its searches and exports
+- Mask the secret settings of a plugin, including those its manifest names, and let it set only the keys its manifest declares outside the server's own configuration
+- Validate the transport rules, the domain names and the urls and styles of the branding
+- Make the MTA delivery repeatable, and stop answering a retry after the external relays went through
+- Use a LIKE escape that MySQL accepts
+- Search only for single strings and leave out soft deleted messages
+- Stop an unscanned self declared encrypted body from skipping the attachment scan
+- Rebuild the recurrence rule of an invitation from validated parts, treat an invalid rule as no recurrence and bound the work of expanding one
+- Treat a truncated expansion as busy in free and busy
+- Make the mbox parser linear and cap the size of a message
+- Encode the header values added to a message so a character cannot turn into a line break, and check the sender of the final message
+- Keep the leading headers of a list and a transport rule from being forged, and honour the null sender in bounces
+- Check the certificate of a first pinned key and of the one the OpenBao CA issues, and refuse discovery hosts that resolve to private addresses
+- Limit the signing certificate enrollments and refuse one made before its mailbox
+- Close the websocket of a user who lost the channel and refuse an origin the CORS settings do not allow
+- Create the files of the local blob store readable by the server alone and lock the shared files across replicas
+- Keep the Postgres columns as they are and widen the text columns for MySQL only
+- Do not delete the source of a mailbox import that lost its claim, and clean up a message half imported
+- Keep an erasure request that failed to purge open, stop one held request from starving the others, and end a request that keeps failing
+- Charge a delivery once, give it back when it failed and drop mail for a mailbox that is gone
+- Recalculate the quota without losing a charge made meanwhile, counting the soft deleted
+- Include the soft deleted content in matter exports and keep the escrow attestations from being written twice
+- Purge dead ingest entries and the audit log of held mailboxes, and cap the contacts made from key headers
+- Check the domains never checked first
+
 ## [0.27.1] - 2026-09-30
 
 ### Changed
@@ -1270,7 +1319,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.27.1...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/rapidmx/restapi/compare/v0.27.1...v0.28.0
 [0.27.1]: https://github.com/rapidmx/restapi/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/rapidmx/restapi/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/rapidmx/restapi/compare/v0.25.2...v0.26.0
