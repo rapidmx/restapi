@@ -1845,6 +1845,9 @@ export enum AuditAction {
     PLUGIN_INSTALL = "plugin.install",
     PLUGIN_UPDATE = "plugin.update",
     PLUGIN_REMOVE = "plugin.remove",
+    /** An elevated administrator installed or replaced a plugin from an uploaded `npm pack` file (`POST /plugins/upload`) - code that
+     * bypassed the registry allow-list by design, so it is always audited. */
+    PLUGIN_UPLOAD = "plugin.upload",
     RETENTION_POLICY_UPDATE = "retention_policy.update",
     MAILBOX_POLICY_UPDATE = "mailbox_policy.update",
     /** A user was granted access to a mailbox, or had their role on it changed (`BaseMailboxAccessRoute.setMember()`).
@@ -2786,6 +2789,9 @@ export interface PluginManifest {
     ui?: PluginUi;
 }
 
+/** Where a plugin's package came from - see `Plugin.source`. */
+export type PluginSource = "registry" | "upload";
+
 /**
  * A plugin an administrator has added to this deployment. Every server copy installs and loads each enabled
  * row at startup, and restarts (one copy at a time) when the set changes. Removing a row does not remove any
@@ -2809,6 +2815,23 @@ export interface Plugin extends BaseEntity {
      * server's default plugin list never re-adds a plugin an administrator deliberately removed; adding the
      * package again revives it. */
     removed?: boolean;
+
+    /** Where the package came from: the plugin registry (absent means this) or an administrator's uploaded `npm pack` file
+     * (`POST /plugins/upload`). An uploaded plugin bypasses the registry allow-list and is never offered registry updates; its
+     * `integrity` is `sha512-<base64>` of the exact pack bytes. */
+    source?: PluginSource;
+
+    /** Server-managed, never in a response: the blob store key of an uploaded plugin's stored pack (`plugins/uploads/<sha256 hex>.tgz`). */
+    uploadBlobKey?: string;
+
+    /** The (sanitized, display-only) file name the pack was uploaded as. */
+    uploadFilename?: string;
+
+    /** When the pack was uploaded. */
+    uploadedAt?: Date;
+
+    /** The uid of the administrator who uploaded the pack. */
+    uploadedByUserUid?: string;
 
     /** Saved setting values, keyed by `PluginSettingDefinition.key`. */
     settings: Record<string, string | number | boolean>;

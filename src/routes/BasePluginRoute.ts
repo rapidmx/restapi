@@ -2,12 +2,16 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { Readable } from "stream";
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
-import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
+import { ApiErrorMessages, ApiErrors, HttpRequest, HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { createClient } from "redis";
+import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
-import { AuditAction, Plugin, PluginManifest, PluginSettingDefinition } from "../models/types.js";
+import { AuditAction, Plugin, PluginManifest, PluginSettingDefinition, PluginSource } from "../models/types.js";
+import { inspectPack, PackInspection, PackInspectionError } from "../plugins/PackInspector.js";
+import { discardSmallBody, parseContentLength } from "./BaseMailboxImportRoute.js";
 import {
     DEFAULT_PLUGIN_REGISTRY,
     NpmRegistryClient,
@@ -43,20 +47,76 @@ import {
     PluginNamespace,
     defaultPluginSettings,
     matchesAllowedPackage,
+    parsePluginManifest,
     PLUGIN_CHANGED_EVENT,
     PLUGIN_EVENTS_CHANNEL,
     PLUGIN_STATUS_KEY,
     PLUGIN_STATUS_MAX_AGE_MS,
     PluginInstanceStatus,
     isSecretSettingKey,
+    packIntegrity,
     pluginHostOfRequest,
+    pluginUploadBlobKey,
     pickLatestVersion,
     resolveHostDefault,
     validatePluginSettings,
 } from "../plugins/PluginUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
-const { Config, Logger } = ObjectDecorators;
-const { Delete, Get, Param, Post, Put, Query, Request, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
+const { Config, Inject, Logger } = ObjectDecorators;
+const { Delete, Get, Param, Post, Put, Query, RateLimit, Request, RequiresTrustedRole, Response, StreamingBody, User: AuthUser } = RouteDecorators;
+
+/** `system:plugins:uploads:max_bytes` default: the largest pack `POST /upload` accepts, 50 MiB (413 beyond). */
+export const DEFAULT_MAX_PLUGIN_UPLOAD_BYTES: number = 50 * 1024 * 1024;
+
+/** `upload()` is limited per user: each one is code every server copy loads, and up to `maxBytes` of memory while it is checked. */
+const UPLOAD_MAX_ATTEMPTS: number = 10;
+const UPLOAD_WINDOW_SECONDS: number = 3600;
+
+/** The longest upload file name kept for display. */
+const MAX_UPLOAD_FILENAME_LENGTH: number = 255;
+
+/** What a row's upload fields are once it is a registry plugin again (a `null` clears the column in both databases). */
+const REGISTRY_SOURCE_FIELDS: any = { source: "registry", uploadBlobKey: null, uploadFilename: null, uploadedAt: null, uploadedByUserUid: null };
+
+/** A row's upload fields as they are now, for the undo of a change that clears or replaces them. */
+function uploadFieldsOf(row: Plugin): any {
+    return {
+        source: row.source ?? null,
+        uploadBlobKey: row.uploadBlobKey ?? null,
+        uploadFilename: row.uploadFilename ?? null,
+        uploadedAt: row.uploadedAt ?? null,
+        uploadedByUserUid: row.uploadedByUserUid ?? null,
+    };
+}
+
+/** What a row of a plugin uploaded as a pack is stored with. */
+type UploadFields = Required<Pick<Plugin, "source" | "uploadBlobKey" | "uploadFilename" | "uploadedAt">> & Pick<Plugin, "uploadedByUserUid">;
+
+/**
+ * Reads a request body into one buffer, giving up with a `413` the moment more than `maxBytes` have arrived - never after the
+ * whole body is in memory - and destroying the stream so the rest isn't read.
+ */
+async function readCapped(stream: Readable, maxBytes: number): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of stream) {
+        const buffer: Buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        total += buffer.length;
+        if (total > maxBytes) {
+            stream.destroy();
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 413, `The uploaded pack is larger than the ${maxBytes} bytes allowed.`);
+        }
+        chunks.push(buffer);
+    }
+    return Buffer.concat(chunks);
+}
+
+/** The display name for an uploaded pack: its `filename` without any directory, control characters or excess length, or `undefined` when nothing is left. */
+function sanitizeUploadFilename(filename: string): string | undefined {
+    // eslint-disable-next-line no-control-regex
+    const cleaned: string = (filename.split(/[\\/]/).pop() ?? "").replace(/[\u0000-\u001f\u007f]/g, "").trim();
+    return cleaned.slice(0, MAX_UPLOAD_FILENAME_LENGTH) || undefined;
+}
 
 /** What an administrator saw a change would also install and enable when they confirmed it (from `GET /plan`). */
 export interface PluginExpectedPlan {
@@ -99,8 +159,10 @@ export interface PluginSearchResult extends RegistrySearchResult {
     installedUid?: string;
     /** The installed version, when this package is already installed. */
     installedVersion?: string;
-    /** Whether a newer version than the installed one is published. */
+    /** Whether a newer version than the installed one is published. Never for a plugin installed from an uploaded pack. */
     updateAvailable: boolean;
+    /** `"upload"` when the installed copy is an uploaded pack. */
+    installedSource?: PluginSource;
 }
 
 /** One entry of `GET /updates`. */
@@ -117,6 +179,8 @@ export interface PluginUpdateInfo {
     allowed: boolean;
     /** Why the registry couldn't be checked for this plugin, if it couldn't. */
     error?: string;
+    /** `"upload"` for a plugin installed from an uploaded pack: the registry isn't asked about it and it never reports an update. */
+    source?: PluginSource;
 }
 
 /** `GET /plan` - what adding a package, or changing an installed plugin to a version, also installs and enables.
@@ -135,6 +199,8 @@ export interface AddPluginResponse<T extends Plugin = Plugin> {
 export interface PluginStatusResponse {
     hash: string;
     instances: PluginInstanceStatus[];
+    /** Whether `POST /upload` is switched on (`system:plugins:uploads:enabled`) and the largest pack it accepts (`system:plugins:uploads:max_bytes`). */
+    uploads: { enabled: boolean; maxBytes: number };
 }
 
 /** Undoes one write of a plugin change that failed part way. */
@@ -259,6 +325,18 @@ export abstract class BasePluginRoute<T extends Plugin> {
     @Config("system:plugins:namespaces", DEFAULT_PLUGIN_NAMESPACES)
     private namespacesConfig: unknown = DEFAULT_PLUGIN_NAMESPACES;
 
+    /** Whether `POST /upload` is switched on (`system:plugins:uploads:enabled`, default true) - an operator who allows only registry plugins turns it off. */
+    @Config("system:plugins:uploads:enabled", true)
+    private uploadsEnabledConfig: unknown = true;
+
+    /** The largest pack `POST /upload` accepts, in bytes (`system:plugins:uploads:max_bytes`). */
+    @Config("system:plugins:uploads:max_bytes", DEFAULT_MAX_PLUGIN_UPLOAD_BYTES)
+    private uploadMaxBytesConfig: unknown = DEFAULT_MAX_PLUGIN_UPLOAD_BYTES;
+
+    /** Where uploaded packs are stored (`plugins/uploads/<sha256>.tgz`), for the server copies to install from. */
+    @Inject("BlobStore")
+    private blobStore?: BlobStore;
+
     @Config("datastores:events", null)
     private eventsConfig: any;
 
@@ -280,6 +358,18 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 args: [this.pluginClass],
             });
         }
+    }
+
+    /** Whether uploading packs is switched on. An environment variable arrives as a string, where `false` and `0` mean off. */
+    protected get uploadsEnabled(): boolean {
+        const value: string = String(this.uploadsEnabledConfig).trim().toLowerCase();
+        return value !== "false" && value !== "0";
+    }
+
+    /** The largest pack `POST /upload` accepts, in bytes: the configured limit, or the default when it isn't a positive number. */
+    protected get uploadMaxBytes(): number {
+        const value: number = Number(this.uploadMaxBytesConfig);
+        return Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_MAX_PLUGIN_UPLOAD_BYTES;
     }
 
     /** The configured plugin namespaces (`system:plugins:namespaces`). */
@@ -401,13 +491,18 @@ export abstract class BasePluginRoute<T extends Plugin> {
 
     /** A `prerelease` query parameter: whether prerelease versions (`1.0.0-beta.2`) count. Absent or empty is `false`. */
     private queryPrerelease(prerelease: unknown): boolean {
-        if (prerelease === undefined || prerelease === "" || prerelease === "false" || prerelease === "0") {
+        return this.queryFlag("prerelease", prerelease);
+    }
+
+    /** A true/false query parameter: absent or empty is `false`, anything but `true`, `1`, `false` or `0` a `400`. */
+    private queryFlag(name: string, value: unknown): boolean {
+        if (value === undefined || value === "" || value === "false" || value === "0") {
             return false;
         }
-        if (prerelease === "true" || prerelease === "1") {
+        if (value === "true" || value === "1") {
             return true;
         }
-        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'prerelease' must be true or false.");
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${name}' must be true or false.`);
     }
 
     /**
@@ -609,8 +704,9 @@ export abstract class BasePluginRoute<T extends Plugin> {
         );
     }
 
-    /** Creates, or revives the removed row of, a plugin at a resolved version, recording how to undo that. */
-    private async installRow(install: PlannedPluginInstall, user: JWTUser | undefined, undo: PluginUndo[], host?: string): Promise<T> {
+    /** Creates, or revives the removed row of, a plugin at a resolved version, recording how to undo that. With `upload` the
+     * package is an uploaded pack; without it a revived row that was one is a registry plugin again. */
+    private async installRow(install: PlannedPluginInstall, user: JWTUser | undefined, undo: PluginUndo[], host?: string, upload?: UploadFields): Promise<T> {
         assertHasIntegrity(install.name, install.version, install.integrity);
         const [found]: T[] = await this.pluginRepo!.find({ name: install.name } as any, { ignoreACL: true, limit: 1, skipCache: true });
         // An entity instance, so reviving the row below is version-checked (see `installedPlugins()`).
@@ -627,7 +723,13 @@ export abstract class BasePluginRoute<T extends Plugin> {
             removed: false,
             settings: defaultPluginSettings(install.manifest, host),
             manifest: install.manifest,
+            ...(upload ?? {}),
         };
+        // What a revived row that was an uploaded pack keeps of it, and gets back if the change is undone.
+        const wasUpload: boolean = existing?.source === "upload";
+        if (wasUpload && !upload) {
+            Object.assign(fields, REGISTRY_SOURCE_FIELDS);
+        }
         const options = { user, ignoreACL: true };
         if (existing) {
             // A previously removed plugin's row is revived rather than duplicated - see `Plugin.removed`.
@@ -641,6 +743,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 removed: true,
                 settings: existing.settings,
                 manifest: existing.manifest,
+                ...(wasUpload || upload ? uploadFieldsOf(existing) : {}),
             };
             undo.push(async () => {
                 await this.pluginRepo!.update({ uid: revived.uid, version: revived.version, ...previous } as any, revived, options);
@@ -699,7 +802,10 @@ export abstract class BasePluginRoute<T extends Plugin> {
      * is stored without it.
      */
     private withConfigured(plugin: T): T {
-        return { ...plugin, settings: maskSecretSettings(plugin.settings, plugin.manifest), configured: configuredPluginSettings(this.config, plugin.manifest) };
+        const shown: T = { ...plugin, settings: maskSecretSettings(plugin.settings, plugin.manifest), configured: configuredPluginSettings(this.config, plugin.manifest) };
+        // Where the pack is stored is the server's own business - a response never carries it.
+        delete shown.uploadBlobKey;
+        return shown;
     }
 
     @RequiresTrustedRole()
@@ -711,7 +817,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
         const instances: PluginInstanceStatus[] = (await this.readInstanceStatuses())
             .filter((instance) => Date.parse(instance.updatedAt) >= cutoff)
             .sort((a, b) => a.instance.localeCompare(b.instance));
-        return { hash: computePluginStateHash(plugins), instances };
+        return { hash: computePluginStateHash(plugins), instances, uploads: { enabled: this.uploadsEnabled, maxBytes: this.uploadMaxBytes } };
     }
 
     /** The configured plugin namespaces, without their registry tokens. */
@@ -759,8 +865,9 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 allowed,
                 installedUid: plugin?.uid,
                 installedVersion: plugin?.packageVersion,
-                // As in `GET /updates`: upgrading a plugin outside the allow-list would be refused.
-                updateAvailable: allowed && !!plugin && isNewerVersion(result.version, plugin.packageVersion),
+                ...(plugin?.source === "upload" ? { installedSource: "upload" as const } : {}),
+                // As in `GET /updates`: upgrading a plugin outside the allow-list would be refused. An uploaded pack is never compared with the registry's versions.
+                updateAvailable: allowed && !!plugin && plugin.source !== "upload" && isNewerVersion(result.version, plugin.packageVersion),
             };
         });
     }
@@ -796,6 +903,10 @@ export abstract class BasePluginRoute<T extends Plugin> {
             plugins.map(async (plugin): Promise<PluginUpdateInfo> => {
                 const allowed: boolean = matchesAllowedPackage(plugin.name, this.allowedPackages);
                 const base = { uid: plugin.uid, name: plugin.name, installedVersion: plugin.packageVersion, allowed };
+                if (plugin.source === "upload") {
+                    // The registry knows nothing of an uploaded pack's version, so it isn't asked.
+                    return { ...base, updateAvailable: false, source: "upload" };
+                }
                 try {
                     const pkg: RegistryPackage | undefined = await this.createRegistryClient(plugin.name).getPackage(plugin.name);
                     const latestVersion: string | undefined = pkg ? pickLatestVersion(pkg.versions, { latest: pkg.latest, prerelease: includePrerelease }) : undefined;
@@ -881,14 +992,18 @@ export abstract class BasePluginRoute<T extends Plugin> {
         if (!trimmed) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'name' is required.");
         }
-        this.assertAllowed(trimmed);
         const requested: string | undefined = this.queryVersion(packageVersion);
         const includePrerelease: boolean = this.queryPrerelease(prerelease);
         const session: RegistrySession = this.registrySession();
         const installed: T[] = await this.installedPlugins();
         const current: T | undefined = installed.find((row) => row.name === trimmed);
+        const unchanged: boolean = !!current && (requested === undefined || requested === current.packageVersion);
+        // An uploaded plugin was never checked against the allow-list, and enabling it as it is doesn't ask the registry.
+        if (!(unchanged && current!.source === "upload")) {
+            this.assertAllowed(trimmed);
+        }
         let target: PlannedPluginChange;
-        if (current && (requested === undefined || requested === current.packageVersion)) {
+        if (current && unchanged) {
             target = { name: trimmed, version: current.packageVersion, manifest: current.manifest };
         } else {
             const found = await this.lookupVersion(session, trimmed, requested ?? (await this.defaultVersion(session, trimmed, includePrerelease)));
@@ -935,6 +1050,199 @@ export abstract class BasePluginRoute<T extends Plugin> {
         });
     }
 
+    /**
+     * Deletes the uploaded pack stored under `key`, unless a plugin row still names it (the same bytes are the same key, so two
+     * rows - or the row being replaced by the very same bytes - can share one). A removed row doesn't count: it was taken away
+     * with its pack. A failure is logged, not thrown: the change that made the pack unused is already saved, and a pack left
+     * behind is only disk.
+     */
+    private async dropUnreferencedBlob(key: string | undefined): Promise<void> {
+        if (!key) {
+            return;
+        }
+        try {
+            const rows: T[] = await this.pluginRepo!.find({} as any, { ignoreACL: true, skipCache: true });
+            if (!rows.some((row) => !row.removed && row.uploadBlobKey === key)) {
+                await this.blobStore!.delete(key);
+            }
+        } catch (err: any) {
+            this.logger?.warn(`Could not delete the unused plugin pack '${key}': ${err.message}`);
+        }
+    }
+
+    /** Checks an uploaded pack's `package.json` the way `add()` checks a registry version - everything but the allow-list, which an uploaded pack
+     * bypasses by design. */
+    private validatePack(packageJson: Record<string, unknown>): { name: string; version: string; manifest: PluginManifest } {
+        const { name, version } = packageJson;
+        if (!isValidPackageName(name)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `The pack's package.json name ${JSON.stringify(name)} is not a valid npm package name.`);
+        }
+        if (!isExactVersion(version)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `The pack's package.json version ${JSON.stringify(version)} is not an exact version such as 1.2.3.`);
+        }
+        const manifest: PluginManifest | string = parsePluginManifest(packageJson);
+        if (typeof manifest === "string") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, manifest);
+        }
+        return { name, version, manifest };
+    }
+
+    /** The saved settings of a plugin that is moving to `manifest`'s version: the ones it still declares, with a new host-named default filled
+     * in where there is no value, checked against it - as `update()` does for a new version. */
+    private carriedSettings(manifest: PluginManifest, saved: Record<string, unknown> | undefined, host: string | undefined): Record<string, string | number | boolean> {
+        const known: Set<string> = new Set(manifest.settings!.map((setting) => setting.key).filter(isPluginSettingKeyAllowed));
+        const candidate: Record<string, unknown> = Object.fromEntries(Object.entries(saved ?? {}).filter(([key]) => known.has(key)));
+        for (const setting of manifest.settings!) {
+            const suggested: string | undefined = resolveHostDefault(setting, host);
+            if (suggested !== undefined && (candidate[setting.key] === undefined || candidate[setting.key] === "")) {
+                candidate[setting.key] = suggested;
+            }
+        }
+        try {
+            return validatePluginSettings(manifest, candidate);
+        } catch (err: any) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, err.message);
+        }
+    }
+
+    /**
+     * Installs a plugin from an uploaded \`npm pack\` file (\`.tgz\`), the body of the request as raw bytes (not multipart; \`Content-Type\`
+     * \`application/gzip\` or \`application/octet-stream\`). \`?filename=\` names it for display, \`?replace=true\` replaces an installed plugin of
+     * the same name (a \`409\` naming the installed version and source without it). \`201\` with the plugin, \`200\` when it replaced one.
+     *
+     * An uploaded pack is code the administrator vouches for, so it skips the registry allow-list - and is held to everything else: the
+     * route is for an elevated administrator only (\`assertAdminScope()\`), can be switched off (\`system:plugins:uploads:enabled\`), is rate
+     * limited per user, is capped at \`system:plugins:uploads:max_bytes\` while it streams in (\`413\`), is read in memory without ever
+     * being unpacked to disk (\`inspectPack()\`: only a plain \`package/\` tree, no links, no gzip bomb), must carry a valid manifest (the
+     * same \`parsePluginManifest()\` check, including the server's protected settings), and is audited (\`plugin.upload\`). The pack is
+     * stored in the blob store under \`plugins/uploads/<sha256>.tgz\` before the row is written (and taken out again if the write fails);
+     * the row's \`integrity\` is \`sha512-<base64>\` of its bytes.
+     *
+     * Replacing keeps the row's saved settings (re-checked against the new manifest) and \`enabled\`. A plugin the manifest requires must
+     * already be installed and enabled in range (\`409\` otherwise) - nothing is fetched from the registry.
+     */
+    @RequiresTrustedRole()
+    @Post("/upload")
+    @StreamingBody()
+    @RateLimit({ perUser: true, maxAttempts: UPLOAD_MAX_ATTEMPTS, windowSeconds: UPLOAD_WINDOW_SECONDS })
+    public async upload(
+        @Request req: HttpRequest,
+        @Response res: HttpResponse,
+        @Query("filename") filename?: unknown,
+        @Query("replace") replace?: unknown,
+        @AuthUser user?: JWTUser,
+    ): Promise<void> {
+        await this.init();
+        const maxBytes: number = this.uploadMaxBytes;
+        let replacing: boolean;
+        let displayName: string | undefined;
+        try {
+            // A plugin is code every replica of the server loads: an elevated administrator only.
+            assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
+            if (!this.uploadsEnabled) {
+                throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Uploading plugins is turned off on this server (system:plugins:uploads:enabled).");
+            }
+            if (!this.blobStore) {
+                throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+            }
+            replacing = this.queryFlag("replace", replace);
+            if (filename !== undefined && typeof filename !== "string") {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'filename' must be a single file name.");
+            }
+            displayName = filename === undefined ? undefined : sanitizeUploadFilename(filename);
+            const declaredLength: number | undefined = parseContentLength(req.headers["content-length"]);
+            if (declaredLength !== undefined && declaredLength > maxBytes) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 413, `The uploaded pack is larger than the ${maxBytes} bytes allowed.`);
+            }
+        } catch (err: any) {
+            // A rejection that never touched the body must still let a small one finish, or the client sees a reset instead of the error.
+            await discardSmallBody(req.bodyStream, parseContentLength(req.headers["content-length"]));
+            throw err;
+        }
+
+        const bytes: Buffer = await readCapped(req.bodyStream!, maxBytes);
+        if (bytes.length === 0) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The request body is empty. Send the .tgz file `npm pack` produced as the body.");
+        }
+        let inspected: PackInspection;
+        try {
+            inspected = await inspectPack(bytes);
+        } catch (err: any) {
+            if (err instanceof PackInspectionError) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, err.message);
+            }
+            /* v8 ignore next -- inspectPack() only refuses with a PackInspectionError */
+            throw err;
+        }
+        const { name, version, manifest } = this.validatePack(inspected.packageJson);
+        const integrity: string = packIntegrity(bytes);
+        const blobKey: string = pluginUploadBlobKey(bytes);
+
+        const installed: T[] = await this.installedPlugins();
+        const live: T | undefined = installed.find((row) => row.name === name);
+        if (live && !replacing) {
+            const from: string = live.source === "upload" ? "uploaded pack" : "plugin registry";
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                `${name} ${live.packageVersion} is already installed (${from}). Upload it again with replace=true to replace it.`,
+            );
+        }
+        // What the plugin set would be, to refuse a pack whose requirements (or whose dependents' requirements, or UI mounts) wouldn't hold.
+        const after: T[] = [...installed.filter((row) => row !== live), { ...live, name, packageVersion: version, enabled: live?.enabled ?? true, manifest } as T];
+        const before: Set<string> = new Set([...findUnmetRequirements(installed, [name]), ...this.mountConflicts(installed, [name])]);
+        const problems: string[] = [...findUnmetRequirements(after, [name]), ...this.mountConflicts(after, [name])].filter((problem) => !before.has(problem));
+        if (problems.length > 0) {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, `'${name}@${version}' can't be installed: ${problems.join(" ")}`);
+        }
+        const host: string | undefined = pluginHostOfRequest(req.headers);
+        const settings: Record<string, string | number | boolean> | undefined = live ? this.carriedSettings(manifest, live.settings, host) : undefined;
+
+        // The pack is stored before the row names it, so a row never points at a pack that isn't there.
+        await this.blobStore.put(blobKey, bytes, { contentType: "application/gzip" });
+        const upload: UploadFields = { source: "upload", uploadBlobKey: blobKey, uploadFilename: displayName ?? `${name.replace(/^@/, "").replace("/", "-")}-${version}.tgz`, uploadedAt: new Date(), uploadedByUserUid: user?.uid };
+        let row: T;
+        try {
+            row = await this.applyChange(installed, [name], async (undo) => {
+                const options = { user, ignoreACL: true };
+                let written: T;
+                if (live) {
+                    const patch: Partial<Plugin> = { packageVersion: version, integrity, manifest, settings, removed: false, ...upload };
+                    written = await this.pluginRepo!.update({ uid: live.uid, version: live.version, ...patch } as any, live, options);
+                    const previous: Partial<Plugin> = {
+                        packageVersion: live.packageVersion,
+                        integrity: live.integrity ?? (null as any),
+                        settings: live.settings,
+                        manifest: live.manifest,
+                        ...uploadFieldsOf(live),
+                    };
+                    undo.push(async () => {
+                        await this.pluginRepo!.update({ uid: written.uid, version: written.version, ...previous } as any, written, options);
+                    });
+                } else {
+                    written = await this.installRow({ name, version, integrity, manifest }, user, undo, host, upload);
+                }
+                await this.audit(req, user, AuditAction.PLUGIN_UPLOAD, written, {
+                    packageVersion: version,
+                    integrity: integrity.slice(0, 19),
+                    bytes: bytes.length,
+                    filename: upload.uploadFilename,
+                    replaced: live !== undefined,
+                    previousVersion: live?.packageVersion,
+                });
+                return written;
+            });
+        } catch (err) {
+            await this.dropUnreferencedBlob(blobKey);
+            throw err;
+        }
+        if (live?.uploadBlobKey !== blobKey) {
+            await this.dropUnreferencedBlob(live?.uploadBlobKey);
+        }
+        res.status(live ? 200 : 201);
+        res.json(this.withConfigured(row));
+    }
+
     @RequiresTrustedRole()
     @Put("/:id")
     public async update(
@@ -957,9 +1265,12 @@ export abstract class BasePluginRoute<T extends Plugin> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'packageVersion' must be a version.");
         }
         const expectedPlan: PluginExpectedPlan | undefined = this.parseExpectedPlan(obj?.expectedPlan);
-        const changingVersion: boolean = obj?.packageVersion !== undefined && obj.packageVersion !== existing.packageVersion;
-        if (changingVersion || (obj?.enabled === true && !existing.enabled)) {
+        // Naming a version of an uploaded plugin switches it back to the registry, whatever the version.
+        const fromUpload: boolean = existing.source === "upload";
+        const changingVersion: boolean = obj?.packageVersion !== undefined && (obj.packageVersion !== existing.packageVersion || fromUpload);
+        if (changingVersion || (obj?.enabled === true && !existing.enabled && !fromUpload)) {
             // An allow-list narrowed since the plugin was added also stops it being re-enabled or moved to another version.
+            // (An uploaded plugin bypassed it when it was added, so re-enabling it as it is doesn't need it.)
             this.assertAllowed(existing.name);
         }
         if (changingVersion) {
@@ -969,6 +1280,9 @@ export abstract class BasePluginRoute<T extends Plugin> {
             patch.packageVersion = found.version;
             patch.integrity = found.integrity;
             patch.manifest = found.manifest;
+            if (fromUpload) {
+                Object.assign(patch, REGISTRY_SOURCE_FIELDS);
+            }
         }
         if (obj?.enabled !== undefined) {
             if (typeof obj.enabled !== "boolean") {
@@ -1035,7 +1349,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
             // Checked before any dependency is touched, so a stale edit changes nothing.
             throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, ApiErrorMessages.INVALID_OBJECT_VERSION);
         }
-        return this.applyChange(installed, this.changedNames(existing.name, dependencyPlan), async (undo) => {
+        const result: T = await this.applyChange(installed, this.changedNames(existing.name, dependencyPlan), async (undo) => {
             if (dependencyPlan) {
                 await this.applyPlan(dependencyPlan, installed, req, user, undo);
             }
@@ -1050,6 +1364,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 enabled: existing.enabled,
                 settings: existing.settings,
                 manifest: existing.manifest,
+                ...(fromUpload && changingVersion ? uploadFieldsOf(existing) : {}),
             };
             undo.push(async () => {
                 await this.pluginRepo!.update({ uid: updated.uid, version: updated.version, ...previous } as any, updated, options);
@@ -1061,6 +1376,10 @@ export abstract class BasePluginRoute<T extends Plugin> {
             });
             return this.withConfigured(updated);
         });
+        if (fromUpload && changingVersion) {
+            await this.dropUnreferencedBlob(existing.uploadBlobKey);
+        }
+        return result;
     }
 
     @RequiresTrustedRole()
@@ -1078,5 +1397,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
             });
             await this.audit(req, user, AuditAction.PLUGIN_REMOVE, existing, { packageVersion: existing.packageVersion });
         });
+        await this.dropUnreferencedBlob(existing.uploadBlobKey);
     }
 }

@@ -55,7 +55,7 @@ export const DEFAULT_MAX_IMPORT_BYTES = 50 * 1024 * 1024 * 1024;
  * string, an array from a proxy that split/duplicated it, or absent entirely) into a byte count. Returns
  * `undefined` for anything absent or unparseable - callers must treat that as "length unknown," never as 0,
  * since a chunked-transfer-encoded request legitimately sends no `Content-Length` at all. */
-function parseContentLength(value: string | string[] | undefined): number | undefined {
+export function parseContentLength(value: string | string[] | undefined): number | undefined {
     const raw: string | undefined = Array.isArray(value) ? value[0] : value;
     if (raw === undefined) {
         return undefined;
@@ -84,7 +84,7 @@ const DISCARD_BODY_TIMEOUT_MS = 5_000;
  * `DISCARD_BODY_TIMEOUT_MS`. In each of those cases the framework's forced close applies, as it should for an
  * upload nobody is going to finish sending.
  */
-async function discardSmallBody(stream: Readable | undefined, declaredLength: number | undefined): Promise<void> {
+export async function discardSmallBody(stream: Readable | undefined, declaredLength: number | undefined): Promise<void> {
     if (!stream || stream.destroyed || stream.readableEnded) {
         return;
     }

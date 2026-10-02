@@ -615,9 +615,13 @@ function checkSettingValue(definition: PluginSettingDefinition, value: unknown):
  * A stable fingerprint of what a server copy should have loaded: every enabled plugin's name, version, recorded
  * integrity and settings, independent of row order and key order. Two copies with the same hash loaded the same
  * plugins with the same settings, so a change message whose hash matches a copy's own is a no-op for it. An unset
- * integrity (`undefined`, or `null` as SQL reads it back) hashes the same.
+ * integrity (`undefined`, or `null` as SQL reads it back) hashes the same. An uploaded plugin (`source: "upload"`, whose
+ * integrity is the hash of the pack) also counts that it was uploaded; a registry plugin's entry is exactly what it was before
+ * uploads existed, so the hash of a deployment without them doesn't change.
  */
-export function computePluginStateHash(plugins: (Pick<Plugin, "name" | "packageVersion" | "enabled" | "settings"> & { integrity?: string | null })[]): string {
+export function computePluginStateHash(
+    plugins: (Pick<Plugin, "name" | "packageVersion" | "enabled" | "settings"> & { integrity?: string | null; source?: string | null })[],
+): string {
     const normalized = plugins
         .filter((plugin) => plugin.enabled)
         .map((plugin) => [
@@ -627,7 +631,21 @@ export function computePluginStateHash(plugins: (Pick<Plugin, "name" | "packageV
             Object.keys(plugin.settings ?? {})
                 .sort()
                 .map((key) => [key, plugin.settings[key]]),
+            ...(plugin.source === "upload" ? ["upload"] : []),
         ])
         .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
     return crypto.createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
+/** The blob store key prefix of the packs administrators uploaded (`POST /plugins/upload`). */
+export const PLUGIN_UPLOAD_BLOB_PREFIX = "plugins/uploads/";
+
+/** Where an uploaded pack is stored: `plugins/uploads/<sha256 of the bytes in hex>.tgz`, so the same bytes are the same key. */
+export function pluginUploadBlobKey(bytes: Buffer): string {
+    return `${PLUGIN_UPLOAD_BLOB_PREFIX}${crypto.createHash("sha256").update(bytes).digest("hex")}.tgz`;
+}
+
+/** The integrity of an uploaded pack as npm writes it: `sha512-<base64 of the SHA-512 of the exact tgz bytes>`. */
+export function packIntegrity(bytes: Buffer): string {
+    return `sha512-${crypto.createHash("sha512").update(bytes).digest("base64")}`;
 }

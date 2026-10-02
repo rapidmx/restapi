@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 // The Redis and registry-client paths the HTTP suites replace with test doubles.
+import { Readable } from "stream";
 import { ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 
@@ -159,5 +160,57 @@ describe("BasePluginRoute configured settings", () => {
         expect(shown.configured).toEqual({ "mail:videoconf:turn:url": { value: "turn:mail.example.com:3478", secret: false } });
         expect(shown).toEqual({ ...row, configured: shown.configured });
         expect(row).not.toHaveProperty("configured");
+    });
+});
+
+describe("BasePluginRoute uploads", () => {
+    const admin: any = { uid: "admin-1", roles: ["admin"], elevated: Date.now() };
+    const res = (): any => ({ status: vi.fn(), json: vi.fn() });
+
+    it("reads the switch and the size limit from config, falling back to the defaults", async () => {
+        const defaults = await newRoute({});
+        expect([defaults.uploadsEnabled, defaults.uploadMaxBytes]).toEqual([true, 50 * 1024 * 1024]);
+        for (const off of [false, "false", " FALSE ", "0", 0]) {
+            expect((await newRoute({ uploadsEnabledConfig: off })).uploadsEnabled).toBe(false);
+        }
+        expect((await newRoute({ uploadsEnabledConfig: "true" })).uploadsEnabled).toBe(true);
+        expect((await newRoute({ uploadMaxBytesConfig: "1000" })).uploadMaxBytes).toBe(1000);
+        for (const bad of ["lots", -5, 0, NaN]) {
+            expect((await newRoute({ uploadMaxBytesConfig: bad })).uploadMaxBytes).toBe(50 * 1024 * 1024);
+        }
+    });
+
+    it("refuses with a 403 when uploads are switched off, and with a 500 without a blob store", async () => {
+        const off = await newRoute({ pluginRepo: {}, uploadsEnabledConfig: "false", blobStore: {} });
+        await expect(off.upload({ headers: {} }, res(), undefined, undefined, admin)).rejects.toMatchObject({
+            status: 403,
+            message: expect.stringContaining("system:plugins:uploads:enabled"),
+        });
+        const none = await newRoute({ pluginRepo: {} });
+        await expect(none.upload({ headers: {} }, res(), undefined, undefined, admin)).rejects.toMatchObject({ status: 500 });
+        // An unelevated administrator never gets as far as the switch.
+        await expect(off.upload({ headers: {} }, res(), undefined, undefined, { uid: "a", roles: ["admin"] })).rejects.toMatchObject({ status: 403 });
+    });
+
+    it("stops reading a body that has no declared length once it passes the limit", async () => {
+        const route = await newRoute({ pluginRepo: {}, blobStore: {}, uploadMaxBytesConfig: 10 });
+        const stream = Readable.from([Buffer.alloc(6), "abcdef", Buffer.alloc(6)]);
+        const err: any = await route.upload({ headers: {}, bodyStream: stream }, res(), undefined, undefined, admin).catch((e: any) => e);
+        expect([err.status, err.message]).toEqual([413, "The uploaded pack is larger than the 10 bytes allowed."]);
+        expect(stream.destroyed).toBe(true);
+    });
+
+    it("logs, rather than fails on, a pack it can't delete", async () => {
+        const warn = vi.fn();
+        const blobStore = { delete: vi.fn().mockRejectedValue(new Error("disk")) };
+        const route = await newRoute({ pluginRepo: { find: async () => [{ uploadBlobKey: "k1", removed: true }] }, blobStore, logger: { warn } });
+        await route.dropUnreferencedBlob(undefined);
+        await route.dropUnreferencedBlob("k1");
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("Could not delete the unused plugin pack 'k1': disk"));
+        // A pack a live row still names stays.
+        route.pluginRepo = { find: async () => [{ uploadBlobKey: "k1" }] };
+        blobStore.delete.mockClear();
+        await route.dropUnreferencedBlob("k1");
+        expect(blobStore.delete).not.toHaveBeenCalled();
     });
 });

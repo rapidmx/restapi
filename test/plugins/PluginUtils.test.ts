@@ -3,10 +3,13 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import "reflect-metadata";
+import { createHash } from "crypto";
 import nconf from "nconf";
 import { PluginManifest } from "../../src/models/types.js";
 import {
     computePluginStateHash,
+    packIntegrity,
+    pluginUploadBlobKey,
     configuredPluginSettings,
     defaultPluginSettings,
     findPluginNamespace,
@@ -641,4 +644,23 @@ describe("isSecretSettingKey", () => {
             expect(isSecretSettingKey(key)).toBe(false);
         },
     );
+});
+
+describe("uploaded plugins", () => {
+    it("hashes an uploaded plugin differently from the same plugin from the registry, leaving a registry plugin's hash alone", () => {
+        const a = { name: "a", packageVersion: "1.0.0", enabled: true, settings: {}, integrity: "sha512-x" };
+        const registry = computePluginStateHash([a]);
+        expect(computePluginStateHash([{ ...a, source: "registry" }])).toBe(registry);
+        expect(computePluginStateHash([{ ...a, source: null }])).toBe(registry);
+        expect(computePluginStateHash([{ ...a, source: "upload" }])).not.toBe(registry);
+        expect(computePluginStateHash([{ ...a, source: "upload", integrity: "sha512-y" }])).not.toBe(computePluginStateHash([{ ...a, source: "upload" }]));
+    });
+
+    it("names a pack by the hash of its bytes, and gives its integrity as npm writes it", () => {
+        const bytes = Buffer.from("pack bytes");
+        expect(pluginUploadBlobKey(bytes)).toBe(`plugins/uploads/${createHash("sha256").update(bytes).digest("hex")}.tgz`);
+        expect(pluginUploadBlobKey(bytes)).toBe(pluginUploadBlobKey(Buffer.from("pack bytes")));
+        expect(pluginUploadBlobKey(bytes)).not.toBe(pluginUploadBlobKey(Buffer.from("other")));
+        expect(packIntegrity(bytes)).toMatch(/^sha512-[A-Za-z0-9+/]{86}==$/);
+    });
 });

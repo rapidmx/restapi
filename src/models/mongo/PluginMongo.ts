@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { Plugin, PluginManifest } from "../types.js";
+import { Plugin, PluginManifest, PluginSource } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity, Index } = PersistenceDecorators;
@@ -54,6 +54,31 @@ export class PluginMongo extends BaseMongoEntity implements Plugin {
     public removed?: boolean;
 
     @Column()
+    @Description("Where the package came from: the plugin registry (absent) or an uploaded npm pack file.")
+    @Nullable
+    public source?: PluginSource;
+
+    @Column()
+    @Description("The blob store key of an uploaded plugin's stored pack (server-managed, never returned).")
+    @Nullable
+    public uploadBlobKey?: string;
+
+    @Column()
+    @Description("The file name an uploaded plugin's pack was uploaded as.")
+    @Nullable
+    public uploadFilename?: string;
+
+    @Column()
+    @Description("When an uploaded plugin's pack was uploaded.")
+    @Nullable
+    public uploadedAt?: Date;
+
+    @Column()
+    @Description("The uid of the administrator who uploaded the pack.")
+    @Nullable
+    public uploadedByUserUid?: string;
+
+    @Column()
     @Description("Saved setting values, keyed by config key.")
     public settings: Record<string, string | number | boolean> = {};
 
@@ -70,6 +95,11 @@ export class PluginMongo extends BaseMongoEntity implements Plugin {
             this.integrity = "integrity" in other ? other.integrity : this.integrity;
             this.enabled = other.enabled !== undefined ? other.enabled : this.enabled;
             this.removed = "removed" in other ? other.removed : this.removed;
+            this.source = "source" in other ? other.source : this.source;
+            this.uploadBlobKey = "uploadBlobKey" in other ? other.uploadBlobKey : this.uploadBlobKey;
+            this.uploadFilename = "uploadFilename" in other ? other.uploadFilename : this.uploadFilename;
+            this.uploadedAt = "uploadedAt" in other ? other.uploadedAt : this.uploadedAt;
+            this.uploadedByUserUid = "uploadedByUserUid" in other ? other.uploadedByUserUid : this.uploadedByUserUid;
             this.settings = other.settings !== undefined ? other.settings : this.settings;
             this.manifest = other.manifest !== undefined ? other.manifest : this.manifest;
         }

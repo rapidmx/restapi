@@ -13,3 +13,4 @@ export * from "./PluginRegistry.js";
 export * from "./PluginUtils.js";
 export * from "./PluginUiUtils.js";
 export * from "./PluginDependencies.js";
+export * from "./PackInspector.js";

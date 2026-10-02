@@ -5,14 +5,16 @@
 import config from "../../config.sql.js";
 
 // Two namespaces: the default one and a company one on its own registry.
+config.set("system:plugins:uploads:max_bytes", UPLOAD_TEST_MAX_BYTES);
 config.set("system:plugins:namespaces", ["@rapidmx", { name: "@acme", registry: "https://npm.acme.test", token: "secret" }]);
 import { ConnectionManager, isSqlDataSource, ObjectFactory, Server } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { PluginSQL } from "../../../src/models/sql/PluginSQL.js";
-import { registerTestDoubles } from "../../testDoubles.js";
+import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 import { pluginRouteSuite } from "../../plugins/pluginRouteSuite.js";
+import { pluginUploadSuite, UPLOAD_TEST_MAX_BYTES } from "../../plugins/pluginUploadSuite.js";
 
 describe("Route:PluginSQL Tests", () => {
     const logger = Logger();
@@ -37,7 +39,7 @@ describe("Route:PluginSQL Tests", () => {
         await objectFactory.destroy();
     });
 
-    pluginRouteSuite({
+    const context = {
         config,
         app: () => server.getApplication(),
         baseUrl: "/sql/plugins",
@@ -47,7 +49,7 @@ describe("Route:PluginSQL Tests", () => {
         },
         auditActions: async () => (await auditLogRepo.find()).map((entry) => entry.action),
         insertPlugin: async (fields) => {
-            await pluginRepo.save(new PluginSQL(fields as any));
+            await pluginRepo.save(new PluginSQL(fields));
         },
         rows: async () => (await pluginRepo.find()).sort((a, b) => a.name.localeCompare(b.name)),
         bumpVersion: async (uid) => {
@@ -56,5 +58,12 @@ describe("Route:PluginSQL Tests", () => {
         updatePlugin: async (uid, fields) => {
             await pluginRepo.update({ uid }, fields);
         },
+    };
+
+    pluginRouteSuite(context);
+    pluginUploadSuite({
+        ...context,
+        blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        auditEntries: async () => (await auditLogRepo.find()).map((entry) => ({ action: entry.action, details: entry.details })),
     });
 });

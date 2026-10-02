@@ -5,14 +5,16 @@
 import config from "../../config.js";
 
 // Two namespaces: the default one and a company one on its own registry.
+config.set("system:plugins:uploads:max_bytes", UPLOAD_TEST_MAX_BYTES);
 config.set("system:plugins:namespaces", ["@rapidmx", { name: "@acme", registry: "https://npm.acme.test", token: "secret" }]);
 import { ConnectionManager, MongoConnection, MongoRepository, ObjectFactory, Server } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { PluginMongo } from "../../../src/models/mongo/PluginMongo.js";
-import { registerTestDoubles } from "../../testDoubles.js";
+import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 import { pluginRouteSuite } from "../../plugins/pluginRouteSuite.js";
+import { pluginUploadSuite, UPLOAD_TEST_MAX_BYTES } from "../../plugins/pluginUploadSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
@@ -43,7 +45,7 @@ describe("Route:PluginMongo Tests", () => {
         await objectFactory.destroy();
     });
 
-    pluginRouteSuite({
+    const context = {
         config,
         app: () => server.getApplication(),
         baseUrl: "/mongo/plugins",
@@ -62,5 +64,12 @@ describe("Route:PluginMongo Tests", () => {
         updatePlugin: async (uid, fields) => {
             await pluginRepo.updateOne({ uid }, { $set: fields });
         },
+    };
+
+    pluginRouteSuite(context);
+    pluginUploadSuite({
+        ...context,
+        blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        auditEntries: async () => (await auditLogRepo.find({}).toArray()).map((entry) => ({ action: entry.action, details: entry.details })),
     });
 });
