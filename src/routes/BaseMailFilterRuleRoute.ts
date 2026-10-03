@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, type JWTUser } from "@rapidrest/core";
+import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrors, HttpRequest, ModelUtils, RepoUtils, RouteDecorators, type UpdateObject } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { getMailboxUidForFolder } from "../util/FolderUtils.js";
@@ -10,6 +10,7 @@ import { isPlainAddress } from "../util/MimeHeaderUtils.js";
 import { normalizeFilterSenderList } from "../util/SenderListUtils.js";
 import { AuditAction, Label, MailFilterAction, MailFilterActionType, MailFilterRule } from "../models/types.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
+const { Init } = ObjectDecorators;
 const { Request, User: AuthUser } = RouteDecorators;
 
 /** The most actions one rule may carry: every `forward` action relays each matching message once more, from this server's domain. */
@@ -50,7 +51,17 @@ export abstract class BaseMailFilterRuleRoute<T extends MailFilterRule> extends 
     /** The concrete `Label` model class, supplied by the Mongo/SQL subclass. */
     protected abstract labelClass: any;
 
-    private labelRepo?: RepoUtils<Label>;
+    protected labelRepo?: RepoUtils<Label>;
+
+    @Init
+    protected async initMailFilterRuleRepos(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.labelRepo && this.labelClass) {
+            this.labelRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.labelClass.name, args: [this.labelClass] });
+        }
+    }
 
     private async assertActionTargetsInMailbox(actions: unknown, mailboxUid: string): Promise<void> {
         if (!Array.isArray(actions)) {
@@ -73,14 +84,8 @@ export abstract class BaseMailFilterRuleRoute<T extends MailFilterRule> extends 
             }
             const labelUid: unknown = action?.labelUid;
             if (labelUid !== undefined && labelUid !== null && labelUid !== "") {
-                if (!this.labelRepo) {
-                    this.labelRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                        name: this.labelClass.name,
-                        args: [this.labelClass],
-                    });
-                }
                 const label: Label | undefined =
-                    typeof labelUid === "string" ? await this.labelRepo.findOne(labelUid, { ignoreACL: true }) : undefined;
+                    typeof labelUid === "string" ? await this.labelRepo!.findOne(labelUid, { ignoreACL: true }) : undefined;
                 if (label?.mailboxUid !== mailboxUid) {
                     throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A rule can only apply a label from its own mailbox.");
                 }

@@ -165,7 +165,6 @@ describe("BaseBrandingRoute update() URL validation", () => {
 
     it("Refuses an asset URL that does not parse as a URL.", async () => {
         const route: any = objectFactory.newInstance<TestBrandingRoute>(TestBrandingRoute, { initialize: false });
-        route.init = vi.fn().mockResolvedValue(undefined);
         route.findOrCreate = vi.fn().mockResolvedValue({ uid: "branding" });
 
         await expect(route.update({ logoUrl: "https://" }, { uid: "u1" })).rejects.toMatchObject({ status: 400 });

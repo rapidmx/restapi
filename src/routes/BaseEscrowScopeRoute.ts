@@ -28,7 +28,7 @@ import {
 } from "../util/PrincipalResolutionUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
 import { AuditAction, EscrowAccessRequest, EscrowScope, EscrowScopePublicKey, Mailbox, Matter } from "../models/types.js";
-const { Config } = ObjectDecorators;
+const { Config, Init } = ObjectDecorators;
 const { Get, Param, Query, RateLimit, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /** Page size for scanning a scope's matters and their access requests - see `hasActiveApprovals()`. */
@@ -200,18 +200,35 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
     @Config("mail:auto_provision:timeout_ms", 10_000)
     private authTimeoutMs: number = 10_000;
 
-    private matterRepo?: RepoUtils<Matter>;
+    protected matterRepo?: RepoUtils<Matter>;
 
-    private mailboxRepo?: RepoUtils<Mailbox>;
+    protected mailboxRepo?: RepoUtils<Mailbox>;
 
-    private async getMailboxRepo(): Promise<RepoUtils<Mailbox>> {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    protected accessRequestRepo?: RepoUtils<EscrowAccessRequest>;
+
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.matterClass.name,
+                args: [this.matterClass],
+            });
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
-        return this.mailboxRepo;
+        if (!this.accessRequestRepo && this.escrowAccessRequestClass) {
+            this.accessRequestRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.escrowAccessRequestClass.name,
+                args: [this.escrowAccessRequestClass],
+            });
+        }
     }
 
     /** The query value matching one element of `Mailbox.aliasAddresses` - mirrors `BaseMailIngestRoute.
@@ -223,36 +240,14 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
     }
 
     /** This route's own `PrincipalResolutionContext` (see `resolveHolder()`). */
-    private async principalResolutionContext(): Promise<PrincipalResolutionContext> {
+    private principalResolutionContext(): PrincipalResolutionContext {
         return {
-            mailboxRepo: await this.getMailboxRepo(),
+            mailboxRepo: this.mailboxRepo!,
             aliasQueryValue: (address) => this.aliasQueryValue(address),
             authServerUrl: this.authServerUrl,
             staticAliases: this.staticAliases,
             authTimeoutMs: this.authTimeoutMs,
         };
-    }
-
-    private accessRequestRepo?: RepoUtils<EscrowAccessRequest>;
-
-    private async getMatterRepo(): Promise<RepoUtils<Matter>> {
-        if (!this.matterRepo) {
-            this.matterRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.matterClass.name,
-                args: [this.matterClass],
-            });
-        }
-        return this.matterRepo;
-    }
-
-    private async getAccessRequestRepo(): Promise<RepoUtils<EscrowAccessRequest>> {
-        if (!this.accessRequestRepo) {
-            this.accessRequestRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.escrowAccessRequestClass.name,
-                args: [this.escrowAccessRequestClass],
-            });
-        }
-        return this.accessRequestRepo;
     }
 
     /** Rule 1: the editing user can't be (or add themselves to) the holders. */
@@ -269,8 +264,8 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
     /** `true` if any approved or fulfilled access request for a matter under `scope` is still within its
      * approval TTL - see dual-control rule 3 in this class's doc comment. */
     private async hasActiveApprovals(scope: T): Promise<boolean> {
-        const matterRepo: RepoUtils<Matter> = await this.getMatterRepo();
-        const requestRepo: RepoUtils<EscrowAccessRequest> = await this.getAccessRequestRepo();
+        const matterRepo: RepoUtils<Matter> = this.matterRepo!;
+        const requestRepo: RepoUtils<EscrowAccessRequest> = this.accessRequestRepo!;
         const ttlHours: number = resolveEscrowApprovalTtlHours(this.config);
         for (let page = 0; ; page++) {
             const matters: Matter[] = await matterRepo.find(
@@ -329,7 +324,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         if (typeof principal !== "string" || principal.trim().length === 0 || principal.length > MAX_PRINCIPAL_LENGTH) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The 'principal' query parameter must be an address, username or user uid.");
         }
-        const resolved: ResolvedPrincipal | undefined = await resolvePrincipal(await this.principalResolutionContext(), principal, user, req);
+        const resolved: ResolvedPrincipal | undefined = await resolvePrincipal(this.principalResolutionContext(), principal, user, req);
         if (!resolved) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, principalNotFoundMessage(principal.trim()));
         }
@@ -500,7 +495,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        const matterRepo: RepoUtils<Matter> = await this.getMatterRepo();
+        const matterRepo: RepoUtils<Matter> = this.matterRepo!;
         const referencingMatters: Matter[] = await matterRepo.find(
             { escrowScopeId: existing.uid, limit: 1 } as any,
             { ignoreACL: true, limit: 1 },
@@ -516,7 +511,7 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         // (`BaseMailboxRoute`), and a scope delete that silently unassigned every mailbox would let one administrator
         // drop escrow coverage for all of them in a single step. Left dangling instead, `Mailbox.escrowScopeId` names a
         // scope that no longer exists, which breaks the owner's key rotation (no escrow wrap can be made for it).
-        const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
+        const mailboxRepo: RepoUtils<Mailbox> = this.mailboxRepo!;
         const assignedMailboxes: number = await mailboxRepo.count({ escrowScopeId: ModelUtils.literal(existing.uid) } as any, {
             ignoreACL: true,
             includeDeleted: true,

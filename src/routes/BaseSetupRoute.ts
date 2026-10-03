@@ -7,7 +7,7 @@ import { ApiErrors, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { findOrCreateSingleton } from "../util/MailboxPolicyUtils.js";
 import { AuditAction, Domain, SetupState } from "../models/types.js";
-const { Config, Logger } = ObjectDecorators;
+const { Config, Init, Logger } = ObjectDecorators;
 const { Get, Post, Put, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
 
 /** The fixed identifier of the one `SetupState` row. */
@@ -54,10 +54,16 @@ export abstract class BaseSetupRoute<T extends SetupState> {
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.repo) {
-            this.repo = await this._objectFactory!.newInstance(RepoUtils, { name: this.setupStateClass.name, args: [this.setupStateClass] });
-            this.domainRepo = await this._objectFactory!.newInstance(RepoUtils, { name: this.domainClass.name, args: [this.domainClass] });
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.repo && this.setupStateClass) {
+            this.repo = await this._objectFactory.newInstance(RepoUtils, { name: this.setupStateClass.name, args: [this.setupStateClass] });
+        }
+        if (!this.domainRepo && this.domainClass) {
+            this.domainRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.domainClass.name, args: [this.domainClass] });
         }
     }
 
@@ -107,7 +113,6 @@ export abstract class BaseSetupRoute<T extends SetupState> {
     @RequiresTrustedRole()
     @Get()
     public async get(): Promise<SetupStatus> {
-        await this.init();
         return this.toStatus(await this.findState());
     }
 
@@ -124,7 +129,6 @@ export abstract class BaseSetupRoute<T extends SetupState> {
         if (typeof step !== "string" || step.trim() === "" || step.length > 64) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'currentStep' must be a step name.");
         }
-        await this.init();
         for (let attempt = 1; ; attempt++) {
             const existing: T = await this.findOrCreate();
             const patch: Partial<SetupState> = { currentStep: step };
@@ -149,7 +153,6 @@ export abstract class BaseSetupRoute<T extends SetupState> {
     @RequiresTrustedRole()
     @Post("/complete")
     public async complete(@AuthUser user?: JWTUser): Promise<SetupStatus> {
-        await this.init();
         const existing: T = await this.findOrCreate();
         const updated: T = await this.save(existing, { completedAt: new Date(), startedAt: existing.startedAt ?? new Date() }, user);
         await this.audit(AuditAction.SETUP_COMPLETE, user);
@@ -160,7 +163,6 @@ export abstract class BaseSetupRoute<T extends SetupState> {
     @RequiresTrustedRole()
     @Post("/reopen")
     public async reopen(@AuthUser user?: JWTUser): Promise<SetupStatus> {
-        await this.init();
         const existing: T = await this.findOrCreate();
         const updated: T = await this.save(existing, { completedAt: null as any, startedAt: new Date(), currentStep: null as any }, user);
         await this.audit(AuditAction.SETUP_REOPEN, user);

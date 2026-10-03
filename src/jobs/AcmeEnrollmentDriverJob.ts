@@ -69,8 +69,8 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private mailboxRepo?: RepoUtils<MB>;
-    private keyVaultRepo?: RepoUtils<K>;
+    protected mailboxRepo?: RepoUtils<MB>;
+    protected keyVaultRepo?: RepoUtils<K>;
 
     @Inject("SigningCertificateEnrollment")
     private signingCertificateEnrollment?: AcmeDrivenEnrollment;
@@ -110,14 +110,21 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
 
     @Init
     public async init(): Promise<void> {
-        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.mailboxClass.name,
-            args: [this.mailboxClass],
-        });
-        this.keyVaultRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.keyVaultClass.name,
-            args: [this.keyVaultClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
+        if (!this.keyVaultRepo && this.keyVaultClass) {
+            this.keyVaultRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.keyVaultClass.name,
+                args: [this.keyVaultClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {

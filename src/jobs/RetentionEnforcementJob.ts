@@ -89,11 +89,11 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private retentionPolicyRepo?: RepoUtils<RP>;
-    private messageRepo?: RecoverableRepoUtils<M>;
-    private auditLogRepo?: RepoUtils<AL>;
-    private attachmentRepo?: RepoUtils<AT>;
-    private folderRepo?: RecoverableRepoUtils<any>;
+    protected retentionPolicyRepo?: RepoUtils<RP>;
+    protected messageRepo?: RecoverableRepoUtils<M>;
+    protected auditLogRepo?: RepoUtils<AL>;
+    protected attachmentRepo?: RepoUtils<AT>;
+    protected folderRepo?: RecoverableRepoUtils<any>;
 
     @Inject(NotificationUtils)
     private notificationUtils?: NotificationUtils;
@@ -124,24 +124,35 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
 
     @Init
     public async init(): Promise<void> {
-        this.retentionPolicyRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.retentionPolicyClass.name,
-            args: [this.retentionPolicyClass],
-        });
-        this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.messageClass.name,
-            args: [this.messageClass],
-        });
-        this.auditLogRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.auditLogClass.name,
-            args: [this.auditLogClass],
-        });
-        this.attachmentRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.attachmentClass.name,
-            args: [this.attachmentClass],
-        });
-        if (this.folderClass) {
-            this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.retentionPolicyRepo && this.retentionPolicyClass) {
+            this.retentionPolicyRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.retentionPolicyClass.name,
+                args: [this.retentionPolicyClass],
+            });
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.attachmentRepo && this.attachmentClass) {
+            this.attachmentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.attachmentClass.name,
+                args: [this.attachmentClass],
+            });
+        }
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
                 name: this.folderClass.name,
                 args: [this.folderClass],
             });

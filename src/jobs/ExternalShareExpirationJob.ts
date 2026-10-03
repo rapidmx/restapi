@@ -26,7 +26,7 @@ export abstract class ExternalShareExpirationJob<S extends CalendarShareLink> ex
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private calendarShareLinkRepo?: RepoUtils<S>;
+    protected calendarShareLinkRepo?: RepoUtils<S>;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
@@ -46,10 +46,15 @@ export abstract class ExternalShareExpirationJob<S extends CalendarShareLink> ex
 
     @Init
     public async init(): Promise<void> {
-        this.calendarShareLinkRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.calendarShareLinkClass.name,
-            args: [this.calendarShareLinkClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.calendarShareLinkRepo && this.calendarShareLinkClass) {
+            this.calendarShareLinkRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.calendarShareLinkClass.name,
+                args: [this.calendarShareLinkClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {

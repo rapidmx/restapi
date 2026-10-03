@@ -9,7 +9,7 @@ import { ACLAction, ACLUtils, ApiErrors, ModelUtils, ObjectFactory, RepoUtils, R
 import { Contact, Correspondent, DataSubjectErasureRequest, DistributionList, Folder, FolderType, Mailbox } from "../models/types.js";
 import { ensureCorrespondentsBackfilled } from "../util/CorrespondentUtils.js";
 import { hasMailAccess } from "../util/MailAccessUtils.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Auth, Get, Query, RateLimit, User: AuthUser } = RouteDecorators;
 
 /** What a directory entry names: a person's mailbox, a shared mailbox, a room or equipment resource, a distribution
@@ -201,14 +201,19 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
      * most often seen, at most `limit`. Only `address`, `displayName`, `lastSeenAt` and `count` are read. */
     protected abstract findCorrespondentCandidates(mailboxUids: string[], terms: string[], limit: number): Promise<Correspondent[]>;
 
-    private async init(): Promise<void> {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
-            this.folderRepo = await this._objectFactory!.newInstance(RepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
-            this.erasureRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.erasureRequestClass.name,
-                args: [this.erasureRequestClass],
-            });
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
+        }
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
+        }
+        if (!this.erasureRepo && this.erasureRequestClass) {
+            this.erasureRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.erasureRequestClass.name, args: [this.erasureRequestClass] });
         }
     }
 
@@ -251,7 +256,6 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
     @Get()
     public async search(@Query("q") q: unknown, @Query("limit") limit: unknown, @AuthUser user?: JWTUser): Promise<DirectoryEntry[]> {
         const query: DirectoryQuery = parseDirectoryQuery(q, limit);
-        await this.init();
         if (!UserUtils.hasRoles(user, this.trustedRoles) && (await this.ownedMailboxes(user!)).length === 0) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Only users with a mailbox on this server can search its directory.");
         }
@@ -288,7 +292,6 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
         @AuthUser user?: JWTUser,
     ): Promise<DirectoryEntry[]> {
         const query: DirectoryQuery = parseDirectoryQuery(q, limit);
-        await this.init();
         const mailboxUids = new Set<string>((await this.ownedMailboxes(user!)).map((mailbox) => mailbox.uid));
         if (typeof mailboxUid === "string" && mailboxUid && !mailboxUids.has(mailboxUid)) {
             if (await hasMailAccess(this.aclUtils, this.trustedRoles, user, mailboxUid, ACLAction.READ)) {
@@ -344,7 +347,6 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
         @AuthUser user?: JWTUser,
     ): Promise<DirectoryEntry[]> {
         const query: DirectoryQuery = parseDirectoryQuery(q, limit);
-        await this.init();
         const mailboxes = new Map<string, M>((await this.ownedMailboxes(user!)).map((mailbox) => [mailbox.uid, mailbox]));
         if (typeof mailboxUid === "string" && mailboxUid && !mailboxes.has(mailboxUid)) {
             if (await hasMailAccess(this.aclUtils, this.trustedRoles, user, mailboxUid, ACLAction.READ)) {

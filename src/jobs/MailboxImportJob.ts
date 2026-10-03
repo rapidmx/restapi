@@ -127,11 +127,11 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private requestRepo?: RepoUtils<MIR>;
-    private mailboxRepo?: RepoUtils<MB>;
-    private folderRepo?: RepoUtils<F>;
-    private messageRepo?: RepoUtils<M>;
-    private attachmentRepo?: RepoUtils<Attachment>;
+    protected requestRepo?: RepoUtils<MIR>;
+    protected mailboxRepo?: RepoUtils<MB>;
+    protected folderRepo?: RepoUtils<F>;
+    protected messageRepo?: RepoUtils<M>;
+    protected attachmentRepo?: RepoUtils<Attachment>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -173,26 +173,39 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
 
     @Init
     public async init(): Promise<void> {
-        this.requestRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.mailboxImportRequestClass.name,
-            args: [this.mailboxImportRequestClass],
-        });
-        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.mailboxClass.name,
-            args: [this.mailboxClass],
-        });
-        this.folderRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.folderClass.name,
-            args: [this.folderClass],
-        });
-        this.messageRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.messageClass.name,
-            args: [this.messageClass],
-        });
-        this.attachmentRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.attachmentClass.name,
-            args: [this.attachmentClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.requestRepo && this.mailboxImportRequestClass) {
+            this.requestRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailboxImportRequestClass.name,
+                args: [this.mailboxImportRequestClass],
+            });
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.folderClass.name,
+                args: [this.folderClass],
+            });
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
+        if (!this.attachmentRepo && this.attachmentClass) {
+            this.attachmentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.attachmentClass.name,
+                args: [this.attachmentClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {

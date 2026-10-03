@@ -62,7 +62,7 @@ import {
     validatePluginSettings,
 } from "../plugins/PluginUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Delete, Get, Param, Post, Put, Query, RateLimit, Request, RequiresTrustedRole, Response, StreamingBody, User: AuthUser } = RouteDecorators;
 
 /** `system:plugins:uploads:max_bytes` default: the largest pack `POST /upload` accepts, 50 MiB (413 beyond). */
@@ -351,12 +351,13 @@ export abstract class BasePluginRoute<T extends Plugin> {
 
     private normalizedAllowedPackages?: string[];
 
-    private async init(): Promise<void> {
-        if (!this.pluginRepo) {
-            this.pluginRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.pluginClass.name,
-                args: [this.pluginClass],
-            });
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.pluginRepo && this.pluginClass) {
+            this.pluginRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.pluginClass.name, args: [this.pluginClass] });
         }
     }
 
@@ -416,7 +417,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
     }
 
     private async installedPlugins(): Promise<T[]> {
-        await this.init();
         // Entity instances (`asEntity()`), since `applyPlan()` updates these rows: MongoDB's `find()` returns plain
         // documents, which `RepoUtils.update()` writes without its version check.
         return (await this.pluginRepo!.find({} as any, { ignoreACL: true, skipCache: true }))
@@ -544,7 +544,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
 
     /** The plugin row `id`, unless it doesn't exist or was removed. */
     private async findInstalled(id: string): Promise<T> {
-        await this.init();
         const existing: T | undefined = await this.pluginRepo!.findOne(id, { ignoreACL: true });
         if (!existing || existing.removed) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -788,7 +787,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
     @RequiresTrustedRole()
     @Get()
     public async list(): Promise<T[]> {
-        await this.init();
         const plugins: T[] = await this.pluginRepo!.find({} as any, { ignoreACL: true });
         return plugins
             .filter((plugin) => !plugin.removed)
@@ -811,7 +809,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
     @RequiresTrustedRole()
     @Get("/status")
     public async status(): Promise<PluginStatusResponse> {
-        await this.init();
         const plugins: T[] = await this.pluginRepo!.find({} as any, { ignoreACL: true });
         const cutoff: number = Date.now() - PLUGIN_STATUS_MAX_AGE_MS;
         const instances: PluginInstanceStatus[] = (await this.readInstanceStatuses())
@@ -1132,7 +1129,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
         @Query("replace") replace?: unknown,
         @AuthUser user?: JWTUser,
     ): Promise<void> {
-        await this.init();
         const maxBytes: number = this.uploadMaxBytes;
         let replacing: boolean;
         let displayName: string | undefined;
@@ -1253,7 +1249,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
     ): Promise<T> {
         // Enabling, upgrading (or downgrading) a plugin and changing its settings all change what code runs and where it sends data.
         assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
-        await this.init();
         const existing: T = await this.findInstalled(id);
         const patch: Partial<Plugin> = {};
         let manifest: PluginManifest = existing.manifest;

@@ -15,7 +15,7 @@ import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, DataSubjectErasureRequest, Mailbox } from "../models/types.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Query, RateLimit, Request, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
 
 /** `create()` is limited per user: a request files a review an administrator has to handle. */
@@ -26,7 +26,7 @@ const CREATE_WINDOW_SECONDS: number = 3600;
  * A GDPR Article 17 ("right to erasure") request - see `DataSubjectErasureRequest`'s own doc comment for
  * why `create()` is self-service only (no admin-on-behalf-of path, unlike `BaseDataExportRoute`/
  * `BaseMailboxImportRoute`) and why the actual destructive cascade happens in `ErasureExecutionJob`
- * rather than synchronously here. Bespoke class (own `init()`-built `RepoUtils`, no `@Model`-driven CRUD),
+ * rather than synchronously here. Bespoke class (own `@Init`-built `RepoUtils`, no `@Model`-driven CRUD),
  * same permission shape as `BaseDataExportRoute`: visibility is "the requester, the target mailbox's own
  * owner, or a trusted admin".
  *
@@ -84,30 +84,20 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.requestRepo) {
-            this.requestRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.dataSubjectErasureRequestClass.name,
-                args: [this.dataSubjectErasureRequestClass],
-            });
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
         }
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.mailboxClass.name,
-                args: [this.mailboxClass],
-            });
+        if (!this.requestRepo && this.dataSubjectErasureRequestClass) {
+            this.requestRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.dataSubjectErasureRequestClass.name, args: [this.dataSubjectErasureRequestClass] });
         }
-    }
-
-    /** Built on first use, by `eraseLeftover()` alone. */
-    private async getFolderRepo(): Promise<RepoUtils<any>> {
-        if (!this.folderRepo) {
-            this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-                name: this.folderClass.name,
-                args: [this.folderClass],
-            });
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
         }
-        return this.folderRepo;
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
+        }
     }
 
     private async requireRequest(id: string): Promise<T> {
@@ -134,7 +124,6 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
     @Post()
     @RateLimit({ perUser: true, maxAttempts: CREATE_MAX_ATTEMPTS, windowSeconds: CREATE_WINDOW_SECONDS })
     public async create(@AuthUser user?: JWTUser): Promise<T> {
-        await this.init();
         if (!user) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
@@ -211,14 +200,13 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
     @RequiresTrustedRole()
     @Post("/leftover")
     public async eraseLeftover(body: { mailboxUid?: unknown } | undefined, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T> {
-        await this.init();
         assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const mailboxUid: string = requireMailboxUid(body?.mailboxUid);
         const { request } = await fileLeftoverErasure(
             {
                 objectFactory: this._objectFactory!,
                 mailboxRepo: this.mailboxRepo!,
-                folderRepo: await this.getFolderRepo(),
+                folderRepo: this.folderRepo!,
                 requestRepo: this.requestRepo!,
                 requestClass: this.dataSubjectErasureRequestClass,
                 matterClass: this.matterClass,
@@ -236,7 +224,6 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
     @RequiresTrustedRole()
     @Post("/:id/approve")
     public async approve(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<T> {
-        await this.init();
         // An approval queues an irreversible deletion: a trusted role alone isn't enough, the token must be elevated.
         assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const request: T = await this.requireRequest(id);
@@ -276,7 +263,6 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
     @RequiresTrustedRole()
     @Post("/:id/deny")
     public async deny(@Param("id") id: string, body: { reason?: string }, @AuthUser user?: JWTUser): Promise<T> {
-        await this.init();
         if (!body?.reason) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "reason is required.");
         }
@@ -303,7 +289,6 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
      * `util/RequestListUtils.ts`. */
     @Get()
     public async find(@Query("limit") limitParam: unknown, @Query("page") pageParam: unknown, @AuthUser user?: JWTUser): Promise<T[]> {
-        await this.init();
         const { limit, page } = parseListPaging({ limit: limitParam, page: pageParam });
         if (!user) {
             return [];
@@ -317,7 +302,6 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
 
     @Get("/:id")
     public async findById(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<T> {
-        await this.init();
         const request: T = await this.requireRequest(id);
         if (!(await this.canView(request, user))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);

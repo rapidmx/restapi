@@ -100,7 +100,7 @@ function sameOwner(a: string | undefined, b: string | undefined): boolean {
 const MAILBOX_DATE_FIELDS = ["oofStartTime", "oofEndTime"] as const;
 /** How many uids `truncate()` deletes per `RepoUtils.truncate()` call, keeping each SQL `IN` list bounded. */
 const TRUNCATE_BATCH_SIZE = 500;
-const { Config } = ObjectDecorators;
+const { Config, Init } = ObjectDecorators;
 
 /** `Mailbox` fields that only server-side code may set - the CA-issued `keys` (`BaseKeyVaultRoute.enrollKey()`/
  * `rekey()`) and the address-derived `keyDiscoveryHash` (this route's own `validateUpdate()`/`create()`). A
@@ -484,15 +484,37 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * `ErasureExecutionJob` runs, and so `create()` can see one in flight - see `util/LeftoverMailboxUtils.ts`. */
     protected abstract dataSubjectErasureRequestClass: any;
 
-    private folderRepo?: RecoverableRepoUtils<any>;
+    protected folderRepo?: RecoverableRepoUtils<any>;
 
-    private messageRepo?: RecoverableRepoUtils<any>;
+    protected messageRepo?: RecoverableRepoUtils<any>;
 
-    private erasureRequestRepo?: RepoUtils<any>;
+    protected erasureRequestRepo?: RepoUtils<any>;
 
-    private distributionListRepo?: RepoUtils<DistributionList>;
+    protected distributionListRepo?: RepoUtils<DistributionList>;
 
-    private escrowScopeRepo?: RepoUtils<EscrowScope>;
+    protected escrowScopeRepo?: RepoUtils<EscrowScope>;
+
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
+        }
+        if (!this.erasureRequestRepo && this.dataSubjectErasureRequestClass) {
+            this.erasureRequestRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.dataSubjectErasureRequestClass.name, args: [this.dataSubjectErasureRequestClass] });
+        }
+        if (!this.distributionListRepo && this.distributionListClass) {
+            this.distributionListRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.distributionListClass.name, args: [this.distributionListClass] });
+        }
+        if (!this.escrowScopeRepo && this.escrowScopeClass) {
+            this.escrowScopeRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.escrowScopeClass.name, args: [this.escrowScopeClass] });
+        }
+    }
 
     /**
      * Returns the uids of every mailbox this user has any ACL grant on — as owner, as a shared delegate, or
@@ -567,7 +589,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * own alias. Mail is delivered by exact primary/alias match, so a duplicate would hijack the other recipient's mail.
      */
     private async assertAddressesAvailable(selfUid: string | undefined, addresses: string[]): Promise<void> {
-        const distributionListRepo: RepoUtils<DistributionList> = await this.getDistributionListRepo();
+        const distributionListRepo: RepoUtils<DistributionList> = this.distributionListRepo!;
         for (const address of new Set(addresses)) {
             const [mailboxByUid, listByUid, mailboxesByPrimary, mailboxesByAlias, listsByPrimary, listsByAlias] = await Promise.all([
                 this.repoUtils!.findOne(address, { ignoreACL: true }),
@@ -629,8 +651,8 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * the running request's `erasure: { uid, status }` (wait for it) - besides `mailboxUid`.
      */
     private async assertNoLeftoverMailboxData(uid: string): Promise<void> {
-        const { folderCount, hasAcl } = await findLeftoverEvidence(await this.getFolderRepo(), this.aclUtils, uid);
-        const running = await findRunningErasure(await this.getErasureRequestRepo(), uid);
+        const { folderCount, hasAcl } = await findLeftoverEvidence(this.folderRepo!, this.aclUtils, uid);
+        const running = await findRunningErasure(this.erasureRequestRepo!, uid);
         if (running) {
             throw leftoverConflict("mailbox-data-erasing", "The data at this address is being erased. Try again once that has finished.", {
                 mailboxUid: uid,
@@ -646,44 +668,14 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
     }
 
-    private async getFolderRepo(): Promise<RecoverableRepoUtils<any>> {
-        if (!this.folderRepo) {
-            this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-                name: this.folderClass.name,
-                args: [this.folderClass],
-            });
-        }
-        return this.folderRepo;
-    }
-
-    private async getMessageRepo(): Promise<RecoverableRepoUtils<any>> {
-        if (!this.messageRepo) {
-            this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-                name: this.messageClass.name,
-                args: [this.messageClass],
-            });
-        }
-        return this.messageRepo;
-    }
-
-    private async getErasureRequestRepo(): Promise<RepoUtils<any>> {
-        if (!this.erasureRequestRepo) {
-            this.erasureRequestRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.dataSubjectErasureRequestClass.name,
-                args: [this.dataSubjectErasureRequestClass],
-            });
-        }
-        return this.erasureRequestRepo;
-    }
-
     /** What the leftover-data helpers (`util/LeftoverMailboxUtils.ts`) work through. */
     private async leftoverContext(): Promise<LeftoverListContext> {
         return {
             objectFactory: this._objectFactory!,
             mailboxRepo: this.repoUtils!,
-            folderRepo: await this.getFolderRepo(),
-            messageRepo: await this.getMessageRepo(),
-            requestRepo: await this.getErasureRequestRepo(),
+            folderRepo: this.folderRepo!,
+            messageRepo: this.messageRepo!,
+            requestRepo: this.erasureRequestRepo!,
             requestClass: this.dataSubjectErasureRequestClass,
             matterClass: this.matterClass,
             auditLogClass: this.auditLogClass,
@@ -691,26 +683,6 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             config: this.config,
             logger: this.logger,
         };
-    }
-
-    private async getDistributionListRepo(): Promise<RepoUtils<DistributionList>> {
-        if (!this.distributionListRepo) {
-            this.distributionListRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.distributionListClass.name,
-                args: [this.distributionListClass],
-            });
-        }
-        return this.distributionListRepo;
-    }
-
-    private async getEscrowScopeRepo(): Promise<RepoUtils<EscrowScope>> {
-        if (!this.escrowScopeRepo) {
-            this.escrowScopeRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.escrowScopeClass.name,
-                args: [this.escrowScopeClass],
-            });
-        }
-        return this.escrowScopeRepo;
     }
 
     /**
@@ -744,7 +716,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             );
         }
         if (normalizedNew !== undefined) {
-            const repo: RepoUtils<EscrowScope> = await this.getEscrowScopeRepo();
+            const repo: RepoUtils<EscrowScope> = this.escrowScopeRepo!;
             const scope: EscrowScope | undefined = await repo.findOne(normalizedNew, { ignoreACL: true });
             if (!scope) {
                 throw new ApiError(ApiErrors.NOT_FOUND, 404, "The referenced escrow scope does not exist.");
@@ -946,7 +918,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // note on `DistributionList`. Unconditionally overwrites any client-supplied `uid`, same override-style
         // already used above for `ownerUserUid`. Only newly-created mailboxes get this treatment; an
         // already-provisioned mailbox keeps whatever `uid` it already has.
-        const distributionListRepo: RepoUtils<DistributionList> = await this.getDistributionListRepo();
+        const distributionListRepo: RepoUtils<DistributionList> = this.distributionListRepo!;
         const seenUids: Set<string> = new Set();
         for (const o of objs) {
             if (!o.primarySmtpAddress) {
@@ -1007,7 +979,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             }
         }
 
-        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        const folderRepo: RecoverableRepoUtils<any> = this.folderRepo!;
         for (const mailbox of created) {
             await ensureWellKnownFolders(folderRepo, this.folderClass, mailbox.uid, user);
         }

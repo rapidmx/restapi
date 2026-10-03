@@ -18,7 +18,7 @@ import { BlobStore } from "../blob/BlobStore.js";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { assertNoPathKeys } from "../util/RequestBodyUtils.js";
 import { AuditAction, Branding } from "../models/types.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Delete, Get, Post, Put, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /** The fixed, well-known identifier of the one `Branding` row this route ever reads/writes - there is no
@@ -217,7 +217,7 @@ function firstHeader(req: HttpRequest, name: string): string | undefined {
  * Admin-managed, publicly-readable custom branding for downstream servers/web clients - logo, product
  * title/company name, stylesheet, and web-client UI chrome (`headerHtml`/`footerHtml`). A bespoke class, not
  * a `CRUDRoute`/`BaseScopedChildRoute` subclass - same shape as `BaseMailIngestRoute` (its
- * own `init()`-built `RepoUtils<Branding>`, no `@Model` needed since nothing here uses `@Transactional()`) -
+ * own `@Init`-built `RepoUtils<Branding>`, no `@Model` needed since nothing here uses `@Transactional()`) -
  * because there is exactly one row, never a real collection, and its read/write halves need entirely
  * different authorization (public read, trusted-role-only write) that no generic CRUD base class expresses.
  *
@@ -262,12 +262,13 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.brandingRepo) {
-            this.brandingRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.brandingClass.name,
-                args: [this.brandingClass],
-            });
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.brandingRepo && this.brandingClass) {
+            this.brandingRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.brandingClass.name, args: [this.brandingClass] });
         }
     }
 
@@ -335,7 +336,6 @@ export abstract class BaseBrandingRoute<T extends Branding> {
 
     @Get()
     public async get(): Promise<PublicBranding> {
-        await this.init();
         const existing: T | undefined = await this.brandingRepo!.findOne(BRANDING_UID, { ignoreACL: true });
         return existing ? this.toPublicBranding(existing) : EMPTY_BRANDING;
     }
@@ -345,7 +345,6 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     public async update(obj: Partial<T> | undefined, @AuthUser user?: JWTUser): Promise<PublicBranding> {
         // A dotted/`$` key is a Mongo update path past the field stripping below (see `util/RequestBodyUtils.ts`).
         assertNoPathKeys(obj);
-        await this.init();
         const existing: T = await this.findOrCreate();
 
         // `*BlobKey`/`*ContentType` are never client-settable - strip whatever the caller sent so only the
@@ -504,7 +503,6 @@ export abstract class BaseBrandingRoute<T extends Branding> {
             path: string;
         },
     ): Promise<PublicBranding> {
-        await this.init();
         // Only the media type itself, lowercased, is compared and stored - parameters (`; charset=...`) dropped.
         const contentType: string = (firstHeader(req, "content-type") ?? "").split(";")[0].trim().toLowerCase();
         if (!allowedContentTypes.includes(contentType)) {
@@ -552,7 +550,6 @@ export abstract class BaseBrandingRoute<T extends Branding> {
         blobKeyField: "logoBlobKey" | "iconBlobKey" | "stylesheetBlobKey",
         contentTypeField: "logoContentType" | "iconContentType" | "stylesheetContentType",
     ): Promise<void> {
-        await this.init();
         const existing: T | undefined = await this.brandingRepo!.findOne(BRANDING_UID, { ignoreACL: true });
         const blobKey: string | undefined = existing ? (existing as any)[blobKeyField] : undefined;
         if (!existing || !blobKey) {
@@ -575,7 +572,6 @@ export abstract class BaseBrandingRoute<T extends Branding> {
         contentTypeField: "logoContentType" | "iconContentType" | "stylesheetContentType",
         assetName: string,
     ): Promise<void> {
-        await this.init();
         const existing: T = await this.findOrCreate();
         // `null`, not `undefined` - see the identical note in `update()` above.
         await this.brandingRepo!.update(

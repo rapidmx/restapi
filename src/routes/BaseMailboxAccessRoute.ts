@@ -38,7 +38,7 @@ import {
 import { normalizeUserUid } from "../util/UserUidUtils.js";
 
 export { LOOKUP_MAX_ATTEMPTS, LOOKUP_WINDOW_SECONDS, type ResolvedPrincipal } from "../util/PrincipalResolutionUtils.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Auth, Delete, Get, Param, Put, Query, RateLimit, Request, User: AuthUser } = RouteDecorators;
 
 /** This route's own simplified 2-tier vocabulary, layered on top of the richer, arbitrary-string
@@ -155,7 +155,7 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
-    private mailboxRepo?: RepoUtils<M>;
+    protected mailboxRepo?: RepoUtils<M>;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
@@ -186,16 +186,20 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
     }
 
-    /** This route's own `PrincipalResolutionContext` - `init()` must have already run, so `mailboxRepo` is set. */
+    /** This route's own `PrincipalResolutionContext` - `initialize()` must have already run, so `mailboxRepo` is set. */
     private principalResolutionContext(): PrincipalResolutionContext {
         return {
             mailboxRepo: this.mailboxRepo!,
@@ -234,7 +238,6 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
      * (404 only for an administrator, who is shown every mailbox's address in the admin console anyway).
      */
     private async requireManagePermission(mailboxId: string, user?: JWTUser): Promise<{ mailbox: M; acl: AccessControlList; admin: boolean }> {
-        await this.init();
         const mailbox: M | undefined = await this.mailboxRepo!.findOne(mailboxId, { ignoreACL: true });
         if (!mailbox) {
             throw isTrustedUser(user, this.trustedRoles)
@@ -467,7 +470,6 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
     @Auth(["jwt"])
     @Get("/:id/access/me")
     public async myAccess(@Param("id") mailboxId: string, @AuthUser user?: JWTUser): Promise<MailboxMyAccess> {
-        await this.init();
         const mailbox: M | undefined = await this.mailboxRepo!.findOne(mailboxId, { ignoreACL: true });
         if (!mailbox) {
             // The same answer as for a mailbox the caller has no access to - it doesn't reveal which addresses have one.
@@ -524,7 +526,6 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         // A mailbox's uid is its lowercased address when it was created, which matches regardless of the case its
         // address was stored in. It's only used while the mailbox still has that address - `uid` stays put when the
         // address changes - otherwise the stored addresses are queried.
-        await this.init();
         const mailbox: Mailbox | undefined = await findMailboxByAddress(this.principalResolutionContext(), address);
         if (!mailbox || !mailbox.ownerUserUid) {
             return null;

@@ -25,7 +25,7 @@ import { chargeMailboxQuota, MailboxQuotaExceededError, refundMailboxQuota } fro
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { Attachment, Mailbox, Message } from "../models/types.js";
-const { Config, Inject } = ObjectDecorators;
+const { Config, Init, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Delete, Get, Head, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
@@ -140,8 +140,8 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
     protected quarantineEntryClass?: any;
     protected ingestQueueEntryClass?: any;
 
-    private messageRepo?: RecoverableRepoUtils<M>;
-    private mailboxRepo?: RepoUtils<Mailbox>;
+    protected messageRepo?: RecoverableRepoUtils<M>;
+    protected mailboxRepo?: RepoUtils<Mailbox>;
 
     /** Page size for the folder-scoped scans that filter or re-stamp in memory (`count()`/`truncate()`). */
     protected folderScanPageSize: number = 500;
@@ -156,30 +156,23 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
     @Inject("BlobStore")
     private blobStore?: BlobStore;
 
-    private async getMessageRepo(): Promise<RecoverableRepoUtils<M>> {
-        if (!this.messageRepo) {
-            this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-                name: this.messageClass.name,
-                args: [this.messageClass],
-            });
+    @Init
+    protected async initAttachmentRepos(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
         }
-        return this.messageRepo;
-    }
-
-    private async getMailboxRepo(): Promise<RepoUtils<Mailbox>> {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.mailboxClass.name,
-                args: [this.mailboxClass],
-            });
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
         }
-        return this.mailboxRepo;
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
+        }
     }
 
 
     /** The message `messageUid` names, soft-deleted included. */
     private async findMessage(messageUid: string): Promise<M | undefined> {
-        const messageRepo: RecoverableRepoUtils<M> = await this.getMessageRepo();
+        const messageRepo: RecoverableRepoUtils<M> = this.messageRepo!;
         return messageRepo.findOne(messageUid, { ignoreACL: true, includeDeleted: true });
     }
 
@@ -448,7 +441,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         // its own). Resolving the message server-side and checking permission against *its* `folderUid` closes
         // that gap entirely: an attacker can no longer create an attachment against a message they don't have
         // UPDATE access to, regardless of what folder/mailbox uids they supply.
-        const messageRepo: RecoverableRepoUtils<M> = await this.getMessageRepo();
+        const messageRepo: RecoverableRepoUtils<M> = this.messageRepo!;
         const message: M | undefined = await messageRepo.findOne(messageUid, { ignoreACL: true });
         if (!message) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
@@ -461,7 +454,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         // charge-before-store ordering - `MailboxQuotaRecalcJob`'s hourly pass was previously the ONLY thing
         // that ever reconciled `usedBytes` against an attachment's actual size, which only ever caught an
         // over-quota mailbox after the fact rather than blocking the write that caused it.
-        const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
+        const mailboxRepo: RepoUtils<Mailbox> = this.mailboxRepo!;
         try {
             await chargeMailboxQuota(mailboxRepo, message.mailboxUid, raw.length);
         } catch (err) {
@@ -512,7 +505,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
      * Version-checked and retried on a concurrent write; best-effort (logged) beyond that.
      */
     private async syncMessageHasAttachments(messageUid: string): Promise<void> {
-        const messageRepo: RecoverableRepoUtils<M> = await this.getMessageRepo();
+        const messageRepo: RecoverableRepoUtils<M> = this.messageRepo!;
         try {
             for (let attempt = 1; ; attempt++) {
                 const count: number = await this.repoUtils!.count({ messageUid: `eq(${messageUid})` } as any, { ignoreACL: true });
@@ -629,7 +622,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
                 }
             }
         }
-        const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
+        const mailboxRepo: RepoUtils<Mailbox> = this.mailboxRepo!;
         for (const [mailboxUid, bytes] of refunds) {
             await refundMailboxQuota(mailboxRepo, mailboxUid, bytes, (err) => {
                 this.logger?.warn(`BaseAttachmentRoute: failed to refund ${bytes} quota bytes to mailbox ${mailboxUid}: ${(err as any)?.message}`);

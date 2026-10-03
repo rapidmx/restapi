@@ -6,7 +6,7 @@ import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { AuditAction, EncryptionPolicy, PolicyState } from "../models/types.js";
-const { Config, Logger } = ObjectDecorators;
+const { Config, Init, Logger } = ObjectDecorators;
 const { Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorators;
 
 /** The fixed, well-known identifier of the one `EncryptionPolicy` row this route ever reads/writes - same
@@ -34,7 +34,7 @@ const VALID_POLICY_STATES: ReadonlySet<string> = new Set<PolicyState>(["automati
 /**
  * The system-wide encryption policy (`specs/end-to-end_encryption.md`'s "Encryption Policy States" section) -
  * a singleton row, admin-editable, readable by any authenticated user. Modeled directly on
- * `BaseBrandingRoute.ts`: a bespoke class (own `init()`-built `RepoUtils`, no `@Model`) since there is exactly
+ * `BaseBrandingRoute.ts`: a bespoke class (own `@Init`-built `RepoUtils`, no `@Model`) since there is exactly
  * one row, never a real collection, and its read/write halves need different authorization (any authenticated
  * user MAY read, only a trusted role may write).
  *
@@ -64,12 +64,13 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.encryptionPolicyRepo) {
-            this.encryptionPolicyRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.encryptionPolicyClass.name,
-                args: [this.encryptionPolicyClass],
-            });
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.encryptionPolicyRepo && this.encryptionPolicyClass) {
+            this.encryptionPolicyRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.encryptionPolicyClass.name, args: [this.encryptionPolicyClass] });
         }
     }
 
@@ -139,7 +140,6 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
         if (!user) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
-        await this.init();
         const existing: T | undefined = await this.encryptionPolicyRepo!.findOne(ENCRYPTION_POLICY_UID, { ignoreACL: true });
         return existing ? this.toPublic(existing) : DEFAULT_ENCRYPTION_POLICY;
     }
@@ -149,8 +149,6 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
     @Validate("validateUpdate")
     public async update(obj: Partial<PublicEncryptionPolicy> | undefined, @AuthUser user?: JWTUser): Promise<PublicEncryptionPolicy> {
         const patch: Partial<PublicEncryptionPolicy> = this.extractPatch(obj);
-
-        await this.init();
         const existing: T = await this.findOrCreate();
 
         const updated: T = await this.encryptionPolicyRepo!.update(

@@ -32,7 +32,7 @@ export abstract class DomainVerificationJob<D extends Domain> extends Background
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private domainRepo?: RepoUtils<D>;
+    protected domainRepo?: RepoUtils<D>;
 
     @Config("mail:jobs:domain_verification:schedule", "0 */5 * * * *")
     private scheduleExpr: string = "0 */5 * * * *";
@@ -57,10 +57,15 @@ export abstract class DomainVerificationJob<D extends Domain> extends Background
 
     @Init
     public async init(): Promise<void> {
-        this.domainRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.domainClass.name,
-            args: [this.domainClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.domainRepo && this.domainClass) {
+            this.domainRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.domainClass.name,
+                args: [this.domainClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {

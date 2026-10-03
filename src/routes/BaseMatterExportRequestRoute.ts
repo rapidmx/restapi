@@ -17,7 +17,7 @@ import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
 import { exactInFilter, findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, EscrowAuditAction, Mailbox, Matter, MatterExportRequest } from "../models/types.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Query, RateLimit, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** `create()` is limited per user: each request queues a whole-mailbox export of every custodian and writes a ledger entry for each. */
@@ -31,7 +31,7 @@ const MATTER_PAGE_SIZE = 500;
  * A holder-invoked eDiscovery export spanning a `Matter`'s full custodian set - see
  * `MatterExportRequest`'s own doc comment for why this needs no dual-control approval (unlike
  * `BaseEscrowAccessRequestRoute`) and why only a `"json"` bundle format is offered. Bespoke class (own
- * `init()`-built `RepoUtils`, no `@Model`-driven CRUD), same shape as `BaseDataExportRoute`.
+ * `@Init`-built `RepoUtils`, no `@Model`-driven CRUD), same shape as `BaseDataExportRoute`.
  *
  * Visibility/creation is gated by `requireEscrowHolder()`/`findHeldScopeIds()` against the matter's own
  * `escrowScopeId` - the same "holder of this specific scope, not just any trusted admin" gate
@@ -58,9 +58,9 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
     @Config()
     private config: any;
 
-    private requestRepo?: RepoUtils<T>;
-    private matterRepo?: RepoUtils<M>;
-    private mailboxRepo?: RepoUtils<MB>;
+    protected requestRepo?: RepoUtils<T>;
+    protected matterRepo?: RepoUtils<M>;
+    protected mailboxRepo?: RepoUtils<MB>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -68,21 +68,25 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.requestRepo) {
-            this.requestRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.requestRepo && this.matterExportRequestClass) {
+            this.requestRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.matterExportRequestClass.name,
                 args: [this.matterExportRequestClass],
             });
         }
-        if (!this.matterRepo) {
-            this.matterRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.matterClass.name,
                 args: [this.matterClass],
             });
         }
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
@@ -108,7 +112,6 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
     @Post()
     @RateLimit({ perUser: true, maxAttempts: CREATE_MAX_ATTEMPTS, windowSeconds: CREATE_WINDOW_SECONDS })
     public async create(body: { matterId: string }, @AuthUser user?: JWTUser): Promise<T> {
-        await this.init();
         const matter: M = await this.requireMatter(body?.matterId);
         await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
         // A closed matter is over - same rule as `BaseEscrowAccessRequestRoute.create()`.
@@ -159,7 +162,6 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
         @Query("matterId") matterIdParam: unknown,
         @AuthUser user?: JWTUser,
     ): Promise<T[]> {
-        await this.init();
         const { limit, page } = parseListPaging({ limit: limitParam, page: pageParam });
         // `exactInFilter()`: a uid holding `,` would otherwise widen these `in(...)` filters to other scopes/matters.
         const heldScopes: string | undefined = exactInFilter(await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user));
@@ -194,7 +196,6 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
 
     @Get("/:id")
     public async findById(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<T> {
-        await this.init();
         const request: T = await this.requireRequest(id);
         const matter: M = await this.requireMatter(request.matterId);
         await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
@@ -208,7 +209,6 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
         @Request req?: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<void> {
-        await this.init();
         if (!this.blobStore) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }

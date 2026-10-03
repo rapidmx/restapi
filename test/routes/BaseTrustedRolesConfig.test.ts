@@ -29,9 +29,16 @@ describe("trusted_roles of the routes that aren't CRUD routes (R2-07)", () => {
         ["MailboxImportRequestRoute", MailboxImportRequestRouteSQL],
         ["PluginRoute", PluginRouteSQL],
     ])("%s uses the configured roles", async (_name, routeClass: any) => {
+        // The routes build their repositories in an `@Init` hook; there is no datastore here, and only the injected configuration is under
+        // test, so a subclass replaces that hook (the framework calls the hook by name, so the override is what runs).
+        class WithoutRepos extends routeClass {
+            protected async initialize(): Promise<void> {
+                // No repositories: nothing but the configuration is read.
+            }
+        }
         const objectFactory = new ObjectFactory(config, Logger());
         registerTestDoubles(objectFactory);
-        const route: any = await objectFactory.newInstance(routeClass, { name: "default" });
+        const route: any = await objectFactory.newInstance(WithoutRepos, { name: "default" });
         expect(route.trustedRoles).toEqual(["privacy-officer"]);
     });
 });

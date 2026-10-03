@@ -18,7 +18,7 @@ import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, Folder, Mailbox, MailboxImportFormat, MailboxImportRequest } from "../models/types.js";
 /** The mailboxes an upload is streaming into right now, in this process - see `create()`. */
 const UPLOADS_IN_FLIGHT: Set<string> = new Set();
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Query, RateLimit, Request, StreamingBody, User: AuthUser } = RouteDecorators;
 
 /** `create()` is limited per user: each upload can be many GiB of disk until `MailboxImportJob` runs. */
@@ -148,7 +148,7 @@ function withByteLimit(source: Readable, maxBytes: number): { stream: Readable; 
  * uploaded Mbox or PST file (via `req.bodyStream`, a genuine stream - see `create()`'s own doc comment; NOT
  * the `req.rawBody` raw-byte-upload convention `BaseMailIngestRoute.deliver()` uses, deliberately, given how
  * large a real upload here can be) and queuing it for `MailboxImportJob` to process. Bespoke class
- * (own `init()`-built `RepoUtils`, no `@Model`-driven CRUD), same permission shape as
+ * (own `@Init`-built `RepoUtils`, no `@Model`-driven CRUD), same permission shape as
  * `BaseDataExportRoute`: visibility is "the requester, the target mailbox's own owner, or a trusted
  * admin" - not a class of grant this platform's record-level ACL model expresses.
  *
@@ -174,9 +174,9 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private requestRepo?: RepoUtils<T>;
-    private mailboxRepo?: RepoUtils<MB>;
-    private folderRepo?: RepoUtils<F>;
+    protected requestRepo?: RepoUtils<T>;
+    protected mailboxRepo?: RepoUtils<MB>;
+    protected folderRepo?: RepoUtils<F>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -197,21 +197,25 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.requestRepo) {
-            this.requestRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.requestRepo && this.mailboxImportRequestClass) {
+            this.requestRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxImportRequestClass.name,
                 args: [this.mailboxImportRequestClass],
             });
         }
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
-        if (!this.folderRepo) {
-            this.folderRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.folderClass.name,
                 args: [this.folderClass],
             });
@@ -276,7 +280,6 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         @Query("mailboxUid") mailboxUidParam: string | undefined,
         @AuthUser user?: JWTUser,
     ): Promise<T> {
-        await this.init();
         let target: { mailboxUid: string; remainingQuota: number };
         try {
             target = await this.resolveUploadTarget(req, targetFolderUid, format, mailboxUidParam, user);
@@ -475,7 +478,6 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
      * `util/RequestListUtils.ts`. */
     @Get()
     public async find(@Query("limit") limitParam: unknown, @Query("page") pageParam: unknown, @AuthUser user?: JWTUser): Promise<T[]> {
-        await this.init();
         const { limit, page } = parseListPaging({ limit: limitParam, page: pageParam });
         if (!user) {
             return [];
@@ -507,7 +509,6 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
 
     @Get("/:id")
     public async findById(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<T> {
-        await this.init();
         const request: T = await this.requireRequest(id);
         if (!(await this.canView(request, user))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);

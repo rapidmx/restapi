@@ -906,15 +906,15 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         });
     });
     it("runs one relay at a time on a single-connection SQLite driver, and as many as `concurrency` says on any other", () => {
-        const original = (job as any).appConfig;
+        const original = (job as any).sqlDriver;
         try {
             expect((job as any).maxParallel()).toBe(1);
-            (job as any).appConfig = { get: () => "mysql" };
+            (job as any).sqlDriver = "mysql";
             expect((job as any).maxParallel()).toBe(Math.max(1, Number((job as any).concurrency)));
-            (job as any).appConfig = undefined;
+            (job as any).sqlDriver = "";
             expect((job as any).maxParallel()).toBe(Math.max(1, Number((job as any).concurrency)));
         } finally {
-            (job as any).appConfig = original;
+            (job as any).sqlDriver = original;
         }
     });
 

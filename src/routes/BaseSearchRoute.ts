@@ -9,7 +9,7 @@ import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { Mailbox, Message } from "../models/types.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Auth, Get, Query, User: AuthUser } = RouteDecorators;
 
@@ -69,8 +69,8 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private mailboxRepo?: RepoUtils<M>;
-    private messageRepo?: RecoverableRepoUtils<Message>;
+    protected mailboxRepo?: RepoUtils<M>;
+    protected messageRepo?: RecoverableRepoUtils<Message>;
 
     @Inject("SearchProvider")
     private searchProvider?: SearchProvider;
@@ -84,14 +84,20 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
     @Logger
     private logger: any;
 
-    private async getMailboxRepo(): Promise<RepoUtils<M>> {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
-        return this.mailboxRepo;
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
+        }
     }
 
     /**
@@ -104,11 +110,8 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
         if (uids.length === 0) {
             return hits;
         }
-        if (!this.messageRepo) {
-            this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
-        }
         // `deleted: true` is how a query asks for the soft-deleted rows (a plain `find()` leaves them out).
-        const rows: Message[] = await this.messageRepo.find(
+        const rows: Message[] = await this.messageRepo!.find(
             { uid: ModelUtils.literal(uids, "in"), deleted: true, limit: uids.length } as any,
             { ignoreACL: true, includeDeleted: true, limit: uids.length },
         );
@@ -122,7 +125,7 @@ export abstract class BaseSearchRoute<M extends Mailbox> {
         if (!user) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
-        const mailboxRepo: RepoUtils<M> = await this.getMailboxRepo();
+        const mailboxRepo: RepoUtils<M> = this.mailboxRepo!;
         if (requestedMailboxUid !== undefined) {
             if (typeof requestedMailboxUid !== "string" || requestedMailboxUid.length === 0) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);

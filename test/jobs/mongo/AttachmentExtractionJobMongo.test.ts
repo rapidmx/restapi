@@ -6,7 +6,7 @@
 // real `ObjectFactory` construct the job exactly as production wiring would - its own `@Init` builds real
 // `RepoUtils` against the live connection, `@Inject("BlobStore")` resolves to the registered `InMemoryBlobStore`
 // test double, and `extractorRegistry` is a genuine `ExtractorRegistry` (real PDF/DOCX/plain-text/HTML
-// extractors) since it's a plain instantiated field on the job, never DI-injected. No repo is hand-mocked. See
+// extractors) since the job injects it through the ObjectFactory. No repo is hand-mocked. See
 // ScanQueueJobMongo.test.ts's file header for the full rationale behind bypassing `Server`/`ClassLoader`.
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { ACLUtils, ConnectionManager, MongoConnection, MongoRepository, ObjectFactory } from "@rapidrest/service-core";

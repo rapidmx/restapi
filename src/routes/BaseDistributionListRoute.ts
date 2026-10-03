@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, type JWTUser } from "@rapidrest/core";
+import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import {
     ApiErrorMessages,
     ApiErrors,
@@ -19,6 +19,7 @@ import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 import { getPrimaryDomainNames } from "../util/DomainUtils.js";
 import { AuditAction, DistributionList, Mailbox } from "../models/types.js";
+const { Init } = ObjectDecorators;
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /** Lowercases and trims `primarySmtpAddress` and every `aliasAddresses` entry in place, as `BaseMailboxRoute` does: mail is delivered by exact match on
@@ -67,16 +68,19 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
 
-    private mailboxRepo?: RepoUtils<Mailbox>;
+    protected mailboxRepo?: RepoUtils<Mailbox>;
 
-    private async getMailboxRepo(): Promise<RepoUtils<Mailbox>> {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
-        return this.mailboxRepo;
     }
 
     /**
@@ -103,7 +107,7 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         const uid: string = normalizeAddress(o.primarySmtpAddress);
         (o as any).uid = uid;
 
-        const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
+        const mailboxRepo: RepoUtils<Mailbox> = this.mailboxRepo!;
         const [existingList, existingMailbox] = await Promise.all([
             this.repoUtils!.findOne(uid, { ignoreACL: true, includeDeleted: true }),
             mailboxRepo.findOne(uid, { ignoreACL: true, includeDeleted: true }),
@@ -131,7 +135,7 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
      * `findMailboxByAddressRaw()`), so a duplicate anywhere would hijack the other recipient's mail.
      */
     private async assertAliasAddressesAvailable(addresses: string[], exceptListUid?: string): Promise<void> {
-        const mailboxRepo: RepoUtils<Mailbox> = await this.getMailboxRepo();
+        const mailboxRepo: RepoUtils<Mailbox> = this.mailboxRepo!;
         for (const address of new Set(addresses)) {
             const [listByUid, mailboxByUid, listsByPrimary, listsByAlias, mailboxesByPrimary, mailboxesByAlias] = await Promise.all([
                 this.repoUtils!.findOne(address, { ignoreACL: true, includeDeleted: true }),

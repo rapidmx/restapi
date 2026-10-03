@@ -9,14 +9,53 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { Logger } from "@rapidrest/core";
+import { ObjectFactory } from "@rapidrest/service-core";
+import config from "../../config.js";
+import { DocxTextExtractor } from "../../../src/search/extraction/DocxTextExtractor.js";
+import { HtmlTextExtractor } from "../../../src/search/extraction/HtmlTextExtractor.js";
+import { PdfTextExtractor } from "../../../src/search/extraction/PdfTextExtractor.js";
+import { PlainTextExtractor } from "../../../src/search/extraction/PlainTextExtractor.js";
 import { ExtractorRegistry, resolveExtractionWorkerUrl } from "../../../src/search/extraction/ExtractorRegistry.js";
 import type { TextExtractor } from "../../../src/search/extraction/TextExtractor.js";
+
+const factories: ObjectFactory[] = [];
+
+/** A registry the way the server gets one: created by its own ObjectFactory, which runs its init hook. */
+async function newRegistry(factory: ObjectFactory = new ObjectFactory(config, Logger())): Promise<ExtractorRegistry> {
+    factories.push(factory);
+    return factory.newInstance<ExtractorRegistry>(ExtractorRegistry, { name: `registry-${factories.length}` });
+}
+
+afterEach(async () => {
+    await Promise.all(factories.splice(0).map((factory) => factory.destroy()));
+});
 
 describe("ExtractorRegistry Tests", () => {
     let registry: ExtractorRegistry;
 
-    beforeEach(() => {
-        registry = new ExtractorRegistry();
+    beforeEach(async () => {
+        registry = await newRegistry();
+    });
+
+    it("Obtains its built-in extractors from the ObjectFactory, one shared instance of each.", async () => {
+        const factory = new ObjectFactory(config, Logger());
+        const first = await newRegistry(factory);
+        const second = await newRegistry(factory);
+
+        for (const type of [PlainTextExtractor, HtmlTextExtractor, PdfTextExtractor, DocxTextExtractor]) {
+            const instance = factory.getInstance(type);
+            expect(instance).toBeInstanceOf(type);
+            expect((first as any).extractors).toContain(instance);
+            expect((second as any).extractors).toContain(instance);
+        }
+        expect((first as any).extractors).toHaveLength(4);
+        expect(first.supports("application/pdf")).toBe(true);
+    });
+
+    it("Refuses to initialize without an ObjectFactory.", async () => {
+        const bare: any = new ExtractorRegistry();
+        await expect(bare.initExtractors()).rejects.toThrow("objectFactory is not set.");
     });
 
     it("Dispatches to the registered extractor for a known MIME type.", async () => {
@@ -103,7 +142,7 @@ describe("ExtractorRegistry output/zip caps (in-process) Tests", () => {
     const DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
     it("Truncates extracted text beyond max_output_chars.", async () => {
-        const registry = new ExtractorRegistry();
+        const registry = await newRegistry();
         (registry as any).maxOutputChars = 3;
         (registry as any).logger = { debug: vi.fn(), warn: vi.fn() };
         await expect(registry.extract("text/plain", Buffer.from("abcdef"))).resolves.toBe("abc");
@@ -112,13 +151,13 @@ describe("ExtractorRegistry output/zip caps (in-process) Tests", () => {
     });
 
     it("Normalizes an extractor resolving undefined to an empty string.", async () => {
-        const registry = new ExtractorRegistry();
+        const registry = await newRegistry();
         (registry as any).byMimeType.set("text/plain", { mimeTypes: ["text/plain"], extract: async () => undefined });
         await expect(registry.extract("text/plain", Buffer.from("x"))).resolves.toBe("");
     });
 
     it("Skips a DOCX that fails the zip pre-check without calling the extractor.", async () => {
-        const registry = new ExtractorRegistry();
+        const registry = await newRegistry();
         const warn = vi.fn();
         (registry as any).logger = { debug: vi.fn(), warn };
         const extract = vi.fn().mockResolvedValue("never");
@@ -133,7 +172,7 @@ describe("ExtractorRegistry output/zip caps (in-process) Tests", () => {
     });
 
     it("Passes a DOCX within the declared decompressed cap to the extractor.", async () => {
-        const registry = new ExtractorRegistry();
+        const registry = await newRegistry();
         const extract = vi.fn().mockResolvedValue("docx text");
         (registry as any).byMimeType.set(DOCX, { mimeTypes: [DOCX], extract });
         const eocd = Buffer.alloc(22);
@@ -142,8 +181,8 @@ describe("ExtractorRegistry output/zip caps (in-process) Tests", () => {
         await expect(registry.extract(DOCX, eocd)).resolves.toBe("docx text");
     });
 
-    it("Runs in-process under vitest (no compiled ExtractionWorker.js next to the TypeScript source).", () => {
-        const registry = new ExtractorRegistry();
+    it("Runs in-process under vitest (no compiled ExtractionWorker.js next to the TypeScript source).", async () => {
+        const registry = await newRegistry();
         expect((registry as any).workerUrl).toBeUndefined();
     });
 });
@@ -202,8 +241,8 @@ describe("ExtractorRegistry worker isolation Tests", () => {
         fs.rmSync(dir, { recursive: true, force: true });
     });
 
-    beforeEach(() => {
-        registry = new ExtractorRegistry();
+    beforeEach(async () => {
+        registry = await newRegistry();
         warn = vi.fn();
         (registry as any).workerUrl = workerUrl;
         (registry as any).logger = { debug: vi.fn(), warn };
@@ -226,7 +265,7 @@ describe("ExtractorRegistry worker isolation Tests", () => {
         await expect(registry.extract("text/html", Buffer.from("x"))).resolves.toBe("custom");
         expect((registry as any).workerHandle).toBeUndefined();
 
-        const inProcess = new ExtractorRegistry();
+        const inProcess = await newRegistry();
         (inProcess as any).workerUrl = workerUrl;
         (inProcess as any).isolation = "in_process";
         await expect(inProcess.extract("text/html", Buffer.from("<p>hi</p>"))).resolves.toBe("hi");

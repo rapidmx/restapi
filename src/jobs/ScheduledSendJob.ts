@@ -126,9 +126,9 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private messageRepo?: RecoverableRepoUtils<M>;
-    private folderRepo?: RecoverableRepoUtils<any>;
-    private mailboxRepo?: RepoUtils<Mailbox>;
+    protected messageRepo?: RecoverableRepoUtils<M>;
+    protected folderRepo?: RecoverableRepoUtils<any>;
+    protected mailboxRepo?: RepoUtils<Mailbox>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -194,18 +194,27 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
 
     @Init
     public async init(): Promise<void> {
-        this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.messageClass.name,
-            args: [this.messageClass],
-        });
-        this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.folderClass.name,
-            args: [this.folderClass],
-        });
-        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.mailboxClass.name,
-            args: [this.mailboxClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.folderClass.name,
+                args: [this.folderClass],
+            });
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
     }
 
     /** Sweeps once, without waiting: whatever a process that died left due or half-finished (a background send queued but not

@@ -6,8 +6,10 @@
 // progress tests (the class itself, and the key-vault routes on both backends). Nothing here touches a network: the CA is
 // whatever `FakeAcmeClient`'s statics say it is, so a test drives an enrollment through every stage by changing them.
 import "reflect-metadata";
+import * as path from "node:path";
 import * as x509 from "@peculiar/x509";
 import { Rfc8823AcmeSigningCertificateEnrollment } from "../../src/pki/Rfc8823AcmeSigningCertificateEnrollment.js";
+import { SigningEnrollmentHealth } from "../../src/pki/SigningEnrollmentHealth.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -140,6 +142,15 @@ export class FakeAcmeClient {
     public async getCertificate(_order: any): Promise<string> {
         return FakeAcmeClient.certificatePem;
     }
+}
+
+/**
+ * Gives an enrollment its `health` the way its `@Init` hook does when the ObjectFactory creates it (the tests that build one with `new` have no
+ * factory), reading `storeDir` when the file is used so a test may set it after this call.
+ */
+export function withHealth<T extends Rfc8823AcmeSigningCertificateEnrollment>(enrollment: T): T {
+    enrollment.health = new SigningEnrollmentHealth(() => path.join((enrollment as any).storeDir, "health.json"));
+    return enrollment;
 }
 
 export class TestEnrollment extends Rfc8823AcmeSigningCertificateEnrollment {

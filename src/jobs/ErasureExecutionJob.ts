@@ -148,8 +148,12 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private requestRepo?: RepoUtils<T>;
-    private mailboxRepo?: RepoUtils<MB>;
+    protected requestRepo?: RepoUtils<T>;
+    protected mailboxRepo?: RepoUtils<MB>;
+
+    /** The repo of every entity class the cascade purges, keyed by class: built in `init()` for each class the subclass
+     * supplies, and by `getRepo()` on first use for a class only known at run time (a plugin's `@MailboxScopedData()` model). */
+    protected entityRepos: Map<any, RepoUtils<any>> = new Map();
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -201,14 +205,53 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
 
     @Init
     public async init(): Promise<void> {
-        this.requestRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.dataSubjectErasureRequestClass.name,
-            args: [this.dataSubjectErasureRequestClass],
-        });
-        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.mailboxClass.name,
-            args: [this.mailboxClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.requestRepo && this.dataSubjectErasureRequestClass) {
+            this.requestRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.dataSubjectErasureRequestClass.name,
+                args: [this.dataSubjectErasureRequestClass],
+            });
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
+        const entityClasses: any[] = [
+            this.attachmentClass,
+            this.messageClass,
+            this.contactClass,
+            this.contactListClass,
+            this.calendarEventClass,
+            this.taskClass,
+            this.noteClass,
+            this.folderClass,
+            this.calendarShareLinkClass,
+            this.focusedInboxOverrideClass,
+            this.taskListClass,
+            this.labelClass,
+            this.mailFilterRuleClass,
+            this.mailSignatureClass,
+            this.oofReplySuppressionClass,
+            this.correspondentClass,
+            this.keyVaultClass,
+            this.quarantineEntryClass,
+            this.ingestQueueEntryClass,
+            this.dataExportRequestClass,
+            this.mailboxImportRequestClass,
+            this.pluginClass,
+        ];
+        for (const entityClass of entityClasses) {
+            if (entityClass && !this.entityRepos.has(entityClass)) {
+                this.entityRepos.set(
+                    entityClass,
+                    await this._objectFactory.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] }),
+                );
+            }
+        }
     }
 
     public async start(): Promise<void> {
@@ -646,7 +689,13 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     }
 
     private async getRepo(entityClass: any): Promise<RepoUtils<any>> {
-        return await this._objectFactory!.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
+        const known: RepoUtils<any> | undefined = this.entityRepos.get(entityClass);
+        if (known) {
+            return known;
+        }
+        const repo: RepoUtils<any> = await this._objectFactory!.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
+        this.entityRepos.set(entityClass, repo);
+        return repo;
     }
 
 

@@ -23,7 +23,7 @@ import { coerceDateFields } from "../util/DateCoercionUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS, hasMailAccess, isAdminScope, isTrustedUser } from "../util/MailAccessUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
-const { Config, Inject } = ObjectDecorators;
+const { Config, Init, Inject } = ObjectDecorators;
 const { Delete, Get, Head, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /**
@@ -177,7 +177,17 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * Mongo backend otherwise stores a JSON body's ISO string as-is. See `util/DateCoercionUtils.ts`. */
     protected readonly dateFields: readonly string[] = [];
 
-    private shareLinkRepo?: RepoUtils<CalendarShareLink>;
+    protected shareLinkRepo?: RepoUtils<CalendarShareLink>;
+
+    @Init
+    protected async initScopedChildRepos(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.shareLinkRepo && this.shareLinkClass) {
+            this.shareLinkRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.shareLinkClass.name, args: [this.shareLinkClass] });
+        }
+    }
 
     private scopeUidOf(obj: any): string | undefined {
         const value: unknown = obj?.[this.scopeProperty];
@@ -265,13 +275,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!this.shareLinkClass || !scopeUid || typeof token !== "string" || !SHARE_TOKEN_PATTERN.test(token)) {
             return undefined;
         }
-        if (!this.shareLinkRepo) {
-            this.shareLinkRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.shareLinkClass.name,
-                args: [this.shareLinkClass],
-            });
-        }
-        const links: CalendarShareLink[] = await this.shareLinkRepo.find({ token: ModelUtils.literal(token), limit: 1 } as any, {
+        const links: CalendarShareLink[] = await this.shareLinkRepo!.find({ token: ModelUtils.literal(token), limit: 1 } as any, {
             ignoreACL: true,
             limit: 1,
         });

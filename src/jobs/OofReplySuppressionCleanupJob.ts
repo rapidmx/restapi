@@ -24,7 +24,7 @@ export abstract class OofReplySuppressionCleanupJob<OS extends OofReplySuppressi
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private oofReplySuppressionRepo?: RepoUtils<OS>;
+    protected oofReplySuppressionRepo?: RepoUtils<OS>;
 
     @Config("mail:jobs:oof_suppression_cleanup:schedule", "0 30 6 * * *")
     private scheduleExpr: string = "0 30 6 * * *";
@@ -44,10 +44,15 @@ export abstract class OofReplySuppressionCleanupJob<OS extends OofReplySuppressi
 
     @Init
     public async init(): Promise<void> {
-        this.oofReplySuppressionRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.oofReplySuppressionClass.name,
-            args: [this.oofReplySuppressionClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.oofReplySuppressionRepo && this.oofReplySuppressionClass) {
+            this.oofReplySuppressionRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.oofReplySuppressionClass.name,
+                args: [this.oofReplySuppressionClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {

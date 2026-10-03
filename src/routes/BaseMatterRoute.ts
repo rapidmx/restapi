@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, type JWTUser } from "@rapidrest/core";
+import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import {
     ApiErrorMessages,
     ApiErrors,
@@ -19,6 +19,7 @@ import { coerceDateFields, MATTER_DATE_FIELDS } from "../util/DateCoercionUtils.
 import { exactInFilter, findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
 import { AuditAction, Mailbox, Matter } from "../models/types.js";
+const { Init } = ObjectDecorators;
 const { Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** Validates the parts of a `Matter` a client can actually set, against the merged (existing + patch, for
@@ -107,7 +108,28 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
     /** Supplied by the Mongo/SQL concrete subclasses so a matter's custodian mailboxes can be checked against its escrow scope. */
     protected abstract mailboxClass: any;
 
-    private mailboxRepo?: RepoUtils<Mailbox>;
+    protected mailboxRepo?: RepoUtils<Mailbox>;
+
+    protected accessRequestRepo?: RepoUtils<any>;
+
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
+        if (!this.accessRequestRepo && this.escrowAccessRequestClass) {
+            this.accessRequestRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.escrowAccessRequestClass.name,
+                args: [this.escrowAccessRequestClass],
+            });
+        }
+    }
 
     /**
      * Refuses (400) a matter naming a custodian mailbox that doesn't exist or isn't assigned to the matter's own escrow scope
@@ -122,11 +144,8 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         // On an update only the mailboxes being added are judged: one the matter already holds (whose mailbox was deleted or moved to another scope
         // since) is no reason to refuse an update that round-trips the list unchanged - only removing it from the list is the holder's to do.
         const already: Set<string> = new Set(current ?? []);
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
-        }
         for (const uid of new Set((custodianMailboxUids as string[]).filter((uid) => !already.has(uid)))) {
-            const mailbox: Mailbox | undefined = await this.mailboxRepo.findOne(uid, { ignoreACL: true });
+            const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(uid, { ignoreACL: true });
             if (!mailbox || mailbox.escrowScopeId !== escrowScopeId) {
                 throw new ApiError(
                     ApiErrors.INVALID_REQUEST,
@@ -327,12 +346,8 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             return;
         }
 
-        const accessRequestRepo: RepoUtils<any> = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.escrowAccessRequestClass.name,
-            args: [this.escrowAccessRequestClass],
-        });
         for (const existing of matched) {
-            const referencing = await accessRequestRepo.find({ matterId: existing.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+            const referencing = await this.accessRequestRepo!.find({ matterId: existing.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
             if (referencing.length > 0) {
                 throw new ApiError(
                     ApiErrors.IDENTIFIER_EXISTS,
@@ -372,11 +387,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         }
         await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, existing.escrowScopeId, user);
 
-        const accessRequestRepo: RepoUtils<any> = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.escrowAccessRequestClass.name,
-            args: [this.escrowAccessRequestClass],
-        });
-        const referencing = await accessRequestRepo.find({ matterId: existing.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
+        const referencing = await this.accessRequestRepo!.find({ matterId: existing.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
         if (referencing.length > 0) {
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This matter has EscrowAccessRequests referencing it and cannot be deleted.");
         }

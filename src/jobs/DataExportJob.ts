@@ -86,8 +86,9 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private dataExportRequestRepo?: RepoUtils<DER>;
-    private mailboxRepo?: RepoUtils<MB>;
+    protected dataExportRequestRepo?: RepoUtils<DER>;
+    protected mailboxRepo?: RepoUtils<MB>;
+    protected messageRepo?: RepoUtils<any>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -129,14 +130,27 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
 
     @Init
     public async init(): Promise<void> {
-        this.dataExportRequestRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.dataExportRequestClass.name,
-            args: [this.dataExportRequestClass],
-        });
-        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.mailboxClass.name,
-            args: [this.mailboxClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.dataExportRequestRepo && this.dataExportRequestClass) {
+            this.dataExportRequestRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.dataExportRequestClass.name,
+                args: [this.dataExportRequestClass],
+            });
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {
@@ -247,7 +261,7 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
         try {
             try {
                 if (processing.format === "mbox") {
-                    const messageRepo: RepoUtils<any> = await this.getRepo(this.messageClass);
+                    const messageRepo: RepoUtils<any> = this.messageRepo!;
                     await this.blobStore!.put(blobKey, Readable.from(this.generateMbox(messageRepo, processing.mailboxUid, lease)), { contentType });
                 } else {
                     await this.blobStore!.put(blobKey, await this.buildJsonBundle(processing.mailboxUid, mailbox), { contentType });
@@ -328,10 +342,6 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
             { config: this.config, logger: this.logger },
             { action: AuditAction.DATA_EXPORT_FAILED, targetType: "DataExportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid },
         );
-    }
-
-    private async getRepo(entityClass: any): Promise<RepoUtils<any>> {
-        return await this._objectFactory!.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
     }
 
     /** Yields one mbox entry per message, paging through `repo.find()` (a bare, unpaginated `find()` silently

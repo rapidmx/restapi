@@ -13,7 +13,7 @@ import { ScanPipeline } from "../../src/scan/ScanPipeline.js";
 import { AvVerdict, SpamVerdict } from "../../src/models/types.js";
 import { SIGNING_ENROLLMENT_UNKNOWN } from "../../src/pki/SigningCertificateEnrollment.js";
 import { TYPICAL_DURATION_MINUTES } from "../../src/pki/Rfc8823AcmeSigningCertificateEnrollment.js";
-import { FakeAcmeClient, generateCsr, TestEnrollment } from "./acmeTestDoubles.js";
+import { FakeAcmeClient, generateCsr, TestEnrollment, withHealth } from "./acmeTestDoubles.js";
 
 describe("Rfc8823AcmeSigningCertificateEnrollment backend Tests", () => {
     let tmpDir: string;
@@ -22,7 +22,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment backend Tests", () => {
     let logger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn> };
 
     const newEnrollment = (): TestEnrollment => {
-        const instance = new TestEnrollment();
+        const instance = withHealth(new TestEnrollment());
         (instance as any).storeDir = storeDir;
         const pipeline = new ScanPipeline();
         (pipeline as any).spamScanProvider = { name: "test-spam", scoreMessage: async () => ({ score: 0, verdict: SpamVerdict.CLEAN, symbols: [] }) };
@@ -141,7 +141,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment backend Tests", () => {
                     return client;
                 }
             }
-            const down = new Down();
+            const down = withHealth(new Down());
             (down as any).storeDir = storeDir;
 
             await expect(down.startEnrollment("bob@example.com", await generateCsr("bob@example.com"))).rejects.toThrow("ENOTFOUND");
@@ -157,7 +157,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment backend Tests", () => {
                     return client;
                 }
             }
-            const noEmail = new NoEmail();
+            const noEmail = withHealth(new NoEmail());
             (noEmail as any).storeDir = storeDir;
 
             await expect(noEmail.startEnrollment("bob@example.com", await generateCsr("bob@example.com"))).rejects.toThrow(/did not offer an email-reply-00/);
@@ -189,7 +189,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment backend Tests", () => {
                     return client;
                 }
             }
-            const down = new Down();
+            const down = withHealth(new Down());
             (down as any).storeDir = storeDir;
             (down.health as any).record = async () => {
                 throw new Error("disk full");
@@ -206,7 +206,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment backend Tests", () => {
                     return client;
                 }
             }
-            const noEmail = new NoEmail();
+            const noEmail = withHealth(new NoEmail());
             (noEmail as any).storeDir = storeDir;
             (noEmail.health as any).record = async () => {
                 throw new Error("disk full");

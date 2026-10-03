@@ -14,7 +14,7 @@ import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/Mai
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, DataExportFormat, DataExportRequest, Mailbox } from "../models/types.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Query, RateLimit, Response, User: AuthUser } = RouteDecorators;
 
 /** `create()` is limited per user: each request makes `DataExportJob` build an archive of a whole mailbox. */
@@ -25,7 +25,7 @@ const VALID_FORMATS: ReadonlySet<string> = new Set<DataExportFormat>(["json", "m
 
 /**
  * A GDPR data-portability/access request for one mailbox's content (see `DataExportRequest`'s own doc
- * comment) - a bespoke class (own `init()`-built `RepoUtils`, no `@Model`-driven CRUD), same shape as
+ * comment) - a bespoke class (own `@Init`-built `RepoUtils`, no `@Model`-driven CRUD), same shape as
  * `BaseEscrowAccessRequestRoute`: creation resolves and validates a mailbox, `find`/`findById`/
  * `download` are permission-scoped by hand rather than through the generic ACL system, since visibility
  * here is "the requester, the mailbox's own owner, or a trusted admin" - not a class of ACL grant this
@@ -75,18 +75,16 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.requestRepo) {
-            this.requestRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.dataExportRequestClass.name,
-                args: [this.dataExportRequestClass],
-            });
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
         }
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.mailboxClass.name,
-                args: [this.mailboxClass],
-            });
+        if (!this.requestRepo && this.dataExportRequestClass) {
+            this.requestRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.dataExportRequestClass.name, args: [this.dataExportRequestClass] });
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
         }
     }
 
@@ -126,7 +124,6 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
     @Post()
     @RateLimit({ perUser: true, maxAttempts: CREATE_MAX_ATTEMPTS, windowSeconds: CREATE_WINDOW_SECONDS })
     public async create(body: { mailboxUid?: string; format: DataExportFormat }, @AuthUser user?: JWTUser): Promise<T> {
-        await this.init();
         if (!user) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
@@ -177,7 +174,6 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
      * otherwise silently broken for the one entry point meant to let them discover it exists at all. */
     @Get()
     public async find(@Query("limit") limitParam: unknown, @Query("page") pageParam: unknown, @AuthUser user?: JWTUser): Promise<T[]> {
-        await this.init();
         // Newest first, `?limit=` (default 100, at most 500) / `?page=` (0-based) - see `util/RequestListUtils.ts`.
         const { limit, page } = parseListPaging({ limit: limitParam, page: pageParam });
         if (!user) {
@@ -207,7 +203,6 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
 
     @Get("/:id")
     public async findById(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<T> {
-        await this.init();
         const request: T = await this.requireRequest(id);
         if (!(await this.canView(request, user))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
@@ -217,7 +212,6 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
 
     @Get("/:id/download")
     public async download(@Param("id") id: string, @Response res: HttpResponse, @AuthUser user?: JWTUser): Promise<void> {
-        await this.init();
         if (!this.blobStore) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }

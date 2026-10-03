@@ -2,9 +2,11 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { ObjectDecorators } from "@rapidrest/core";
 import type { BlobStore } from "../blob/BlobStore.js";
 import { readSanitizerVersion, resolveInlineImages, SANITIZER_VERSION, stripSanitizerStamp } from "./HtmlSanitizer.js";
-import type { ScanPipeline } from "./ScanPipeline.js";
+import { ScanPipeline } from "./ScanPipeline.js";
+const { Config, Inject, Logger } = ObjectDecorators;
 
 /**
  * Serving a message's sanitized HTML: the stored blob, brought up to date when the sanitizer that wrote it is older than the current
@@ -43,23 +45,26 @@ export interface SanitizedBodySource {
     sanitizedHtmlBlobKey: string;
 }
 
-export interface SanitizedBodyOptions {
-    /** A raw message larger than this many bytes is not re-parsed. */
-    maxRawBytes: number;
-    /** How long a reader waits for a re-sanitization before being served the stored HTML. */
-    timeoutMs: number;
-}
-
 export class SanitizedBodyLoader {
     private readonly running: Map<string, Promise<string | undefined>> = new Map();
     private readonly failed: Map<string, number> = new Map();
 
-    public constructor(
-        private readonly blobStore: BlobStore,
-        private readonly pipeline: ScanPipeline,
-        private readonly options: SanitizedBodyOptions,
-        private readonly logger?: { warn: (...args: any[]) => void },
-    ) {}
+    @Inject("BlobStore")
+    private blobStore!: BlobStore;
+
+    @Inject(ScanPipeline)
+    private pipeline!: ScanPipeline;
+
+    /** A message stored by an older sanitizer is re-sanitized on first read unless its raw MIME is larger than this many bytes. */
+    @Config("mail:scan:sanitize:lazy_max_raw_bytes", 16 * 1024 * 1024)
+    private maxRawBytes: number = 16 * 1024 * 1024;
+
+    /** How long a reader waits for a re-sanitization before being served the stored HTML. */
+    @Config("mail:scan:sanitize:lazy_timeout_ms", 10_000)
+    private timeoutMs: number = 10_000;
+
+    @Logger
+    private logger?: { warn: (...args: any[]) => void };
 
     /** The message's sanitized HTML, current and without its version stamp. */
     public async load(message: SanitizedBodySource): Promise<string> {
@@ -94,7 +99,7 @@ export class SanitizedBodyLoader {
         }
         let timer: NodeJS.Timeout | undefined;
         const timeout: Promise<undefined> = new Promise((resolve) => {
-            timer = setTimeout(() => resolve(undefined), this.options.timeoutMs);
+            timer = setTimeout(() => resolve(undefined), this.timeoutMs);
         });
         try {
             return await Promise.race([run, timeout]);
@@ -107,7 +112,7 @@ export class SanitizedBodyLoader {
     private async rebuild(message: SanitizedBodySource): Promise<string | undefined> {
         const key: string = message.sanitizedHtmlBlobKey;
         try {
-            if (!message.bodyBlobKey || (await this.blobStore.size(message.bodyBlobKey)) > this.options.maxRawBytes) {
+            if (!message.bodyBlobKey || (await this.blobStore.size(message.bodyBlobKey)) > this.maxRawBytes) {
                 return this.giveUp(key);
             }
             const html: string | undefined = await this.pipeline.sanitizeRaw(await this.blobStore.get(message.bodyBlobKey));

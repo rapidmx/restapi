@@ -5,6 +5,7 @@
 // See test/jobs/sql/ScanQueueJobSQL.AcmeChallenge.test.ts's identical file header - kept as its own file
 // for the same reason.
 import "reflect-metadata";
+import { withHealth } from "../../pki/acmeTestDoubles.js";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -179,7 +180,7 @@ describe("ScanQueueJobMongo Tests - RFC 8823 challenge-email correlation", () =>
         mailboxRepo = conn.getMongoRepository("MailboxMongo");
 
         job = await objectFactory.newInstance(ScanQueueJobMongo, { name: "default" });
-        enrollment = new TestEnrollment();
+        enrollment = withHealth(new TestEnrollment());
         (enrollment as any).storeDir = tmpDir;
         (job as any).signingCertificateEnrollment = enrollment;
     });

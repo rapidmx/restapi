@@ -71,7 +71,7 @@ import {
     Recipient,
     RecipientType,
 } from "../models/types.js";
-const { Config, Inject } = ObjectDecorators;
+const { Config, Init, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Delete, Get, Param, Post, Put, Query, RateLimit, Request, Response, User: AuthUser } = RouteDecorators;
 
@@ -448,13 +448,15 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * images at its attachments. Left unset (a downstream subclass that predates it), a message has no inline attachments to point at. */
     protected attachmentClass?: any;
 
-    private keyVaultRepo?: RepoUtils<KeyVault>;
+    protected keyVaultRepo?: RepoUtils<KeyVault>;
 
-    private folderRepo?: RecoverableRepoUtils<any>;
+    protected folderRepo?: RecoverableRepoUtils<any>;
 
-    private focusedInboxOverrideRepo?: RepoUtils<FocusedInboxOverride>;
+    protected focusedInboxOverrideRepo?: RepoUtils<FocusedInboxOverride>;
 
-    private mailboxRepo?: RepoUtils<Mailbox>;
+    protected mailboxRepo?: RepoUtils<Mailbox>;
+
+    protected attachmentRepo?: RepoUtils<any>;
 
     /** This server's own inbound mail-exchange hostname, reused as the `Reporting-UA` half of a generated
      * receipt MDN - same config `ScanQueueJob`/`BaseDomainRoute` already read. */
@@ -510,51 +512,55 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     @Config("mail:scan:sanitize:attachment_url_prefix", "/api/mail/attachments")
     private attachmentUrlPrefix: string = "/api/mail/attachments";
 
-    /** A message stored by an older sanitizer is re-sanitized on first read (`SanitizedBodyLoader`) unless its raw MIME is larger than this. */
-    @Config("mail:scan:sanitize:lazy_max_raw_bytes", 16 * 1024 * 1024)
-    private lazySanitizeMaxRawBytes: number = 16 * 1024 * 1024;
-
-    /** How long a reader waits for that re-sanitization before being served the HTML already stored. */
-    @Config("mail:scan:sanitize:lazy_timeout_ms", 10_000)
-    private lazySanitizeTimeoutMs: number = 10_000;
-
+    /** Serves a message's sanitized HTML, re-sanitizing it first when an older sanitizer stored it. Obtained from the ObjectFactory, which injects what it reads. */
     private sanitizedBodyLoader?: SanitizedBodyLoader;
 
-    private async getFolderRepo(): Promise<RecoverableRepoUtils<any>> {
-        if (!this.folderRepo) {
-            this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+    /** Builds the repositories and collaborators this route reads and writes beyond its own model, once on instantiation. */
+    @Init
+    protected async initMessageRepos(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
                 name: this.folderClass.name,
                 args: [this.folderClass],
             });
         }
-        return this.folderRepo;
-    }
-
-    private async getFocusedInboxOverrideRepo(): Promise<RepoUtils<FocusedInboxOverride>> {
-        if (!this.focusedInboxOverrideRepo) {
-            this.focusedInboxOverrideRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.focusedInboxOverrideRepo && this.focusedInboxOverrideClass) {
+            this.focusedInboxOverrideRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.focusedInboxOverrideClass.name,
                 args: [this.focusedInboxOverrideClass],
             });
         }
-        return this.focusedInboxOverrideRepo;
-    }
-
-    private async getMailboxRepo(): Promise<RepoUtils<Mailbox>> {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
-        return this.mailboxRepo;
+        if (!this.keyVaultRepo && this.keyVaultClass) {
+            this.keyVaultRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.keyVaultClass.name,
+                args: [this.keyVaultClass],
+            });
+        }
+        if (!this.attachmentRepo && this.attachmentClass) {
+            this.attachmentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.attachmentClass.name,
+                args: [this.attachmentClass],
+            });
+        }
+        if (!this.sanitizedBodyLoader) {
+            this.sanitizedBodyLoader = await this._objectFactory.newInstance<SanitizedBodyLoader>(SanitizedBodyLoader, { name: "default" });
+        }
     }
 
     /** What `util/FolderCountUtils.ts` needs to recompute, cache and publish the counts of this route's folders. */
     private async folderCountsContext(): Promise<FolderCountsContext> {
         return {
             messageRepo: this.repoUtils!,
-            folderRepo: await this.getFolderRepo(),
+            folderRepo: this.folderRepo!,
             folderClass: this.folderClass,
             notificationUtils: this.notificationUtils,
             logger: this.logger,
@@ -573,7 +579,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
     /** Every caller passes a folder uid that already passed a permission check, so it's always a real string. */
     private async folderTypeOf(folderUid: string): Promise<FolderType | undefined> {
-        const folder: any = await (await this.getFolderRepo()).findOne(folderUid, { ignoreACL: true });
+        const folder: any = await this.folderRepo!.findOne(folderUid, { ignoreACL: true });
         return folder?.type;
     }
 
@@ -625,7 +631,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * mailbox (a delegate included) must not be able to plant mail "from" anyone else in it. Left as it is without a resolvable mailbox. */
     private async forceOwnSender(message: any): Promise<void> {
         const mailbox: Mailbox | undefined =
-            typeof message.mailboxUid === "string" ? await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true }) : undefined;
+            typeof message.mailboxUid === "string" ? await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true }) : undefined;
         if (!mailbox) {
             return;
         }
@@ -1133,7 +1139,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         }
         const requestedSendTime: Date | undefined = coerceDateValue((body as any)?.scheduledSendTime, "scheduledSendTime") || undefined;
 
-        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        const folderRepo: RecoverableRepoUtils<any> = this.folderRepo!;
         const currentFolderType: FolderType | undefined = await this.folderTypeOf(message.folderUid);
         if ((message as any).scheduledSendRelayedAt || currentFolderType === FolderType.SENT_ITEMS) {
             throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "This message has already been sent.");
@@ -1166,7 +1172,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A message needs at least one To, Cc or Bcc recipient to be sent.");
         }
 
-        const sendingMailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, {
+        const sendingMailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(message.mailboxUid, {
             ignoreACL: true,
         });
         await this.assertSenderAllowed(sendingMailbox, message);
@@ -1318,7 +1324,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const sink = {
             messageRepo: this.repoUtils!,
             messageClass: this.modelClass,
-            folderRepo: await this.getFolderRepo(),
+            folderRepo: this.folderRepo!,
             folderClass: this.folderClass,
             blobStore: this.blobStore!,
             notificationUtils: this.notificationUtils,
@@ -1393,7 +1399,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             await this.blobStore!.put(message.bodyBlobKey, relayedRaw, { contentType: "message/rfc822" });
         }
 
-        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        const folderRepo: RecoverableRepoUtils<any> = this.folderRepo!;
         const sentFolder: any = await findOrCreateWellKnownFolder(
             folderRepo,
             this.folderClass,
@@ -1613,7 +1619,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
-        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        const folderRepo: RecoverableRepoUtils<any> = this.folderRepo!;
         const folder: any = await folderRepo.findOne(message.folderUid, { ignoreACL: true });
         if (folder?.type !== FolderType.SENT_ITEMS) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Only a message in Sent Items can be recalled.");
@@ -1635,7 +1641,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A message to more than ${MAX_RECALL_RECIPIENTS} recipients cannot be recalled.`);
         }
         // The recall notice goes out with `from.address` as its sender - same rule as `send()`.
-        await this.assertSenderAllowed(await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true }), message);
+        await this.assertSenderAllowed(await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true }), message);
 
         const envelopeTo: string[] = message.recipients.map((r) => r.address);
         // `from.displayName` is ordinary client-writable data - an address-like one is left out (`safeDisplayName()`).
@@ -1719,7 +1725,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
-        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        const folderRepo: RecoverableRepoUtils<any> = this.folderRepo!;
         const currentFolder: any = await folderRepo.findOne(message.folderUid, { ignoreACL: true });
         if (currentFolder?.type === FolderType.DRAFTS || currentFolder?.type === FolderType.OUTBOX) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A message in Drafts or Outbox cannot be archived.");
@@ -1871,7 +1877,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (alwaysTrustSender === true && !(await this.hasMailAccess(user, message.mailboxUid, ACLAction.FULL))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Only the mailbox's owner can add a sender to its safe senders.");
         }
-        const folderRepo: RecoverableRepoUtils<any> = await this.getFolderRepo();
+        const folderRepo: RecoverableRepoUtils<any> = this.folderRepo!;
         const sourceFolder: any = await folderRepo.findOne(message.folderUid, { ignoreACL: true });
         if (sourceFolder?.type === FolderType.DRAFTS || sourceFolder?.type === FolderType.OUTBOX) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A message in Drafts or Outbox cannot be reported.");
@@ -1889,7 +1895,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             await this.notifyFolders([message.folderUid, target.uid]);
         }
 
-        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
+        const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true });
         const learning: { learned: boolean; learnSkipped?: MessageLearnSkipped; raw?: Buffer } = await this.teachSpamFilter(
             current,
             reportKind,
@@ -2051,7 +2057,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (!address) {
             return undefined;
         }
-        const change = await changeMailboxSenderList(await this.getMailboxRepo(), message.mailboxUid, "safeSenders", address, true);
+        const change = await changeMailboxSenderList(this.mailboxRepo!, message.mailboxUid, "safeSenders", address, true);
         return change ? address : undefined;
     }
 
@@ -2168,10 +2174,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     /** The mailbox's `KeyVault.masterKeyGeneration` (absent = 0), or `undefined` when the mailbox has no key vault. Read
      * uncached, so a rekey is seen at once. */
     private async currentMasterKeyGeneration(mailboxUid: string): Promise<number | undefined> {
-        if (!this.keyVaultRepo) {
-            this.keyVaultRepo = await this._objectFactory!.newInstance(RepoUtils, { name: this.keyVaultClass.name, args: [this.keyVaultClass] });
-        }
-        const vaults: KeyVault[] = await this.keyVaultRepo.find({ mailboxUid: ModelUtils.literal(mailboxUid), limit: 1 } as any, {
+        const vaults: KeyVault[] = await this.keyVaultRepo!.find({ mailboxUid: ModelUtils.literal(mailboxUid), limit: 1 } as any, {
             ignoreACL: true,
             limit: 1,
             skipCache: true,
@@ -2187,7 +2190,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         classifyAs: MessageClassification,
     ): Promise<void> {
         const normalized: string = normalizeAddress(senderAddress);
-        const repo: RepoUtils<FocusedInboxOverride> = await this.getFocusedInboxOverrideRepo();
+        const repo: RepoUtils<FocusedInboxOverride> = this.focusedInboxOverrideRepo!;
         // `find()` returns plain documents on Mongo, which `update()` doesn't version-check (`asEntity()`). A lost race -
         // a concurrent update (409) or a concurrent create hitting the (mailbox, sender) unique index - re-reads and
         // applies this instruction to the row that won.
@@ -2378,7 +2381,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * `readReceiptSentAt`/`readReceiptPending` reflected.
      */
     private async maybeSendReadReceipt(message: T): Promise<T> {
-        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
+        const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
             return message;
         }
@@ -2456,7 +2459,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     ): Promise<T> {
         const { message, type } = await this.requirePendingReceipt(id, body, user);
 
-        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
+        const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
@@ -2689,7 +2692,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // entirely - content is still served below regardless of whether the mailbox lookup succeeded, so
         // failing to resolve ownership is exactly the uncertain case `isNonOwnerAccess()`'s own doc comment
         // says to treat defensively as non-owner, not to silently pass over.
-        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
+        const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true });
         if (!mailbox || isNonOwnerAccess(mailbox, user)) {
             await recordAuditLog(
                 this._objectFactory!,
@@ -2730,15 +2733,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * `fetch()`/XHR (`Sec-Fetch-Dest: empty`) gets `keep` and everything else - a browser opening the URL, curl - gets `attachment`.
      */
     private async sanitizedHtmlOf(message: T, req?: HttpRequest): Promise<string> {
-        if (!this.sanitizedBodyLoader) {
-            this.sanitizedBodyLoader = new SanitizedBodyLoader(
-                this.blobStore!,
-                this.scanPipeline!,
-                { maxRawBytes: this.lazySanitizeMaxRawBytes, timeoutMs: this.lazySanitizeTimeoutMs },
-                this.logger,
-            );
-        }
-        const html: string = await this.sanitizedBodyLoader.load({
+        const html: string = await this.sanitizedBodyLoader!.load({
             uid: message.uid,
             bodyBlobKey: message.bodyBlobKey,
             sanitizedHtmlBlobKey: message.sanitizedHtmlBlobKey!,
@@ -2750,12 +2745,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const fetched: boolean = String(req?.headers?.["sec-fetch-dest"] ?? "").toLowerCase() === "empty";
         const mode: InlineImageMode = requested === "keep" || requested === "attachment" ? requested : fetched ? "keep" : "attachment";
         const attachments: { uid: string; contentId?: string }[] = [];
-        if (this.attachmentClass) {
-            const repo: RepoUtils<any> = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.attachmentClass.name,
-                args: [this.attachmentClass],
-            });
-            for await (const page of findPagesByUid<any>(repo, { messageUid: message.uid })) {
+        if (this.attachmentRepo) {
+            for await (const page of findPagesByUid<any>(this.attachmentRepo, { messageUid: message.uid })) {
                 attachments.push(...page.map((attachment) => ({ uid: attachment.uid, contentId: attachment.contentId })));
             }
         }

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, UserUtils, type JWTUser } from "@rapidrest/core";
+import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import {
     ACLAction,
     ApiErrorMessages,
@@ -20,6 +20,7 @@ import { countMessagesByFolder, healStoredFolderCounts } from "../util/FolderCou
 import { ensureWellKnownFolders } from "../util/FolderUtils.js";
 import { hasMailAccess, stripTrustedRoles } from "../util/MailAccessUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
+const { Init } = ObjectDecorators;
 const { Get, Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** See the identical constants (and why they're duplicated rather than shared) on `BaseScopedChildRoute.ts`. */
@@ -138,9 +139,22 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
      * Unset: the stored counts are returned as they are. */
     protected messageClass?: any;
 
-    private shareLinkRepo?: RepoUtils<CalendarShareLink>;
+    protected shareLinkRepo?: RepoUtils<CalendarShareLink>;
 
-    private messageRepo?: RepoUtils<any>;
+    protected messageRepo?: RepoUtils<any>;
+
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.shareLinkRepo && this.shareLinkClass) {
+            this.shareLinkRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.shareLinkClass.name, args: [this.shareLinkClass] });
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
+        }
+    }
 
     /** Whether `user` holds `action` on `uid` (a mailbox or folder uid) by ownership or an ACL record - never by a
      * trusted role. */
@@ -184,13 +198,7 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         if (!this.messageClass || folders.length === 0) {
             return;
         }
-        if (!this.messageRepo) {
-            this.messageRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.messageClass.name,
-                args: [this.messageClass],
-            });
-        }
-        const counts = await countMessagesByFolder(this.messageRepo, folders.map((folder) => folder.uid));
+        const counts = await countMessagesByFolder(this.messageRepo!, folders.map((folder) => folder.uid));
         await healStoredFolderCounts(this.repoUtils!, folders, counts);
         for (const folder of folders) {
             const derived = counts.get(folder.uid)!;
@@ -208,13 +216,7 @@ export abstract class BaseFolderRoute<T extends Folder> extends CRUDRoute<T> {
         if (!this.shareLinkClass || typeof token !== "string" || !SHARE_TOKEN_PATTERN.test(token)) {
             return undefined;
         }
-        if (!this.shareLinkRepo) {
-            this.shareLinkRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.shareLinkClass.name,
-                args: [this.shareLinkClass],
-            });
-        }
-        const links: CalendarShareLink[] = await this.shareLinkRepo.find({ token: ModelUtils.literal(token), limit: 1 } as any, {
+        const links: CalendarShareLink[] = await this.shareLinkRepo!.find({ token: ModelUtils.literal(token), limit: 1 } as any, {
             ignoreACL: true,
             limit: 1,
         });

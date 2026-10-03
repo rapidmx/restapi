@@ -28,7 +28,7 @@ import { LocalKeyDiscovery } from "../util/LocalKeyDiscoveryUtils.js";
 import { isPlainAddress } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { parseContactKey, parseTrustedSignerKey } from "../util/SignerCertificateUtils.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Query, RateLimit, Request, User: AuthUser } = RouteDecorators;
 
 /** The wire shape `GET /mailbox/:id/keys/lookup`, `POST /mailbox/:id/keys/trust` and `POST /mailbox/:id/keys/resolve`
@@ -116,10 +116,10 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private mailboxRepo?: RepoUtils<M>;
-    private keyVaultRepo?: RepoUtils<any>;
-    private contactRepo?: RecoverableRepoUtils<C>;
-    private folderRepo?: RecoverableRepoUtils<F>;
+    protected mailboxRepo?: RepoUtils<M>;
+    protected keyVaultRepo?: RepoUtils<any>;
+    protected contactRepo?: RecoverableRepoUtils<C>;
+    protected folderRepo?: RecoverableRepoUtils<F>;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
@@ -142,27 +142,31 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
-        if (!this.keyVaultRepo) {
-            this.keyVaultRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.keyVaultRepo && this.keyVaultClass) {
+            this.keyVaultRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.keyVaultClass.name,
                 args: [this.keyVaultClass],
             });
         }
-        if (!this.contactRepo) {
-            this.contactRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+        if (!this.contactRepo && this.contactClass) {
+            this.contactRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
                 name: this.contactClass.name,
                 args: [this.contactClass],
             });
         }
-        if (!this.folderRepo) {
-            this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
                 name: this.folderClass.name,
                 args: [this.folderClass],
             });
@@ -269,7 +273,6 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         @Query("addr") addr: string | undefined,
         @AuthUser user?: JWTUser,
     ): Promise<PublicKeyLookupResult> {
-        await this.init();
 
         if (!addr) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The 'addr' query parameter is required.");
@@ -321,7 +324,6 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         @Request req?: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<PublicKeyLookupResult> {
-        await this.init();
 
         if (!body || typeof body !== "object" || Array.isArray(body)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The request body must be an object with 'address' and 'certificate'.");
@@ -409,7 +411,6 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         @Request req?: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<PublicKeyLookupResult> {
-        await this.init();
 
         if (!body || typeof body !== "object" || Array.isArray(body)) {
             throw new ApiError(

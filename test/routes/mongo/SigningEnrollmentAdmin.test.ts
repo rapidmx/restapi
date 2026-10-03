@@ -17,7 +17,7 @@ import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo
 import { KeyVaultMongo } from "../../../src/models/mongo/KeyVaultMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { ManualSigningCertificateEnrollment } from "../../../src/pki/ManualSigningCertificateEnrollment.js";
-import { TestEnrollment } from "../../pki/acmeTestDoubles.js";
+import { TestEnrollment, withHealth } from "../../pki/acmeTestDoubles.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 import { signingEnrollmentAdminSuite, SwitchableEnrollment } from "../signingEnrollmentAdminSuite.js";
 
@@ -111,7 +111,7 @@ describe("Route:SigningEnrollment Mongo Tests", () => {
             return manual;
         },
         newAutomatic: () => {
-            const automatic = new TestEnrollment();
+            const automatic = withHealth(new TestEnrollment());
             (automatic as any).storeDir = path.join(tmpDir, `rfc8823-${Math.random()}`);
             return automatic;
         },

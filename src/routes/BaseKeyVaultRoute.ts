@@ -38,7 +38,7 @@ import {
 } from "../util/CertificateInstallUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { AuditAction, EscrowScope, KeyVault, Mailbox, MasterKeyWrap, PublicKey, WrappedPrivateKey } from "../models/types.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
 const { Delete, Get, Param, Post, Put, Query, Response, User: AuthUser } = RouteDecorators;
 
@@ -278,7 +278,7 @@ export interface RekeyRequest extends ExpectedMasterKeyGeneration {
 
 /**
  * Implements `specs/end-to-end_encryption.md`'s key-vault endpoints (`GET`/enroll/wrap-CRUD/re-key under
- * `/mailbox/:id/keyvault`) - a bespoke class (own `init()`-built `RepoUtils`, no `@Model`-driven CRUD, same
+ * `/mailbox/:id/keyvault`) - a bespoke class (own `@Init`-built `RepoUtils`, no `@Model`-driven CRUD, same
  * shape as `BaseEncryptionPolicyRoute`), because this is private key material, not an
  * ordinary collection.
  *
@@ -305,9 +305,9 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private keyVaultRepo?: RepoUtils<K>;
-    private mailboxRepo?: RepoUtils<M>;
-    private escrowScopeRepo?: RepoUtils<EscrowScope>;
+    protected keyVaultRepo?: RepoUtils<K>;
+    protected mailboxRepo?: RepoUtils<M>;
+    protected escrowScopeRepo?: RepoUtils<EscrowScope>;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
@@ -335,21 +335,25 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.keyVaultRepo) {
-            this.keyVaultRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.keyVaultRepo && this.keyVaultClass) {
+            this.keyVaultRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.keyVaultClass.name,
                 args: [this.keyVaultClass],
             });
         }
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
-        if (!this.escrowScopeRepo) {
-            this.escrowScopeRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.escrowScopeRepo && this.escrowScopeClass) {
+            this.escrowScopeRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.escrowScopeClass.name,
                 args: [this.escrowScopeClass],
             });
@@ -458,7 +462,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
 
     @Get("/:id/keyvault")
     public async get(@Param("id") mailboxId: string, @AuthUser user?: JWTUser): Promise<PublicKeyVault> {
-        await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         await this.requireVaultReader(mailbox, user);
 
@@ -501,7 +504,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         body: EnrollKeyRequest,
         @AuthUser user?: JWTUser,
     ): Promise<PublicKeyVault> {
-        await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         this.requireMailboxOwner(mailbox, user);
 
@@ -647,7 +649,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         body: SignEnrollmentRequest,
         @AuthUser user?: JWTUser,
     ): Promise<{ enrollmentId: string }> {
-        await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         this.requireMailboxOwner(mailbox, user);
 
@@ -688,7 +689,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         @Param("enrollmentId") enrollmentId: string,
         @AuthUser user?: JWTUser,
     ): Promise<EnrollmentProgress> {
-        await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
         await this.requireEnrollmentOf(mailbox, enrollmentId);
@@ -707,7 +707,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         @Param("id") mailboxId: string,
         @AuthUser user?: JWTUser,
     ): Promise<EnrollmentProgress & { enrollmentId: string }> {
-        await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
 
@@ -738,7 +737,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         @Response res: HttpResponse,
         @AuthUser user?: JWTUser,
     ): Promise<EnrollmentProgress> {
-        await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
         await this.requireEnrollmentOf(mailbox, enrollmentId);
@@ -779,7 +777,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         @Param("enrollmentId") enrollmentId: string,
         @AuthUser user?: JWTUser,
     ): Promise<EnrollmentProgress> {
-        await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         this.requireMailboxOwner(mailbox, user);
         const found: "own" | "other" | "unknown" = await this.findEnrollmentOf(mailbox, enrollmentId);
@@ -893,7 +890,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         body: AddMasterKeyWrapRequest,
         @AuthUser user?: JWTUser,
     ): Promise<PublicKeyVault> {
-        await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         this.requireMailboxOwner(mailbox, user);
         validateMasterKeyWrap(body, { allowEscrow: await this.resolveAllowEscrow(mailbox, body) });
@@ -955,7 +951,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         @Query("methodId") methodId: string | undefined,
         @AuthUser user?: JWTUser,
     ): Promise<PublicKeyVault> {
-        await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         this.requireMailboxOwner(mailbox, user);
         // See `validateMasterKeyWrap()`'s doc comment - the mailbox owner/delegate path must never be able to
@@ -1049,7 +1044,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
      */
     @Put("/:id/keyvault/rekey")
     public async rekey(@Param("id") mailboxId: string, body: RekeyRequest, @AuthUser user?: JWTUser): Promise<PublicKeyVault> {
-        await this.init();
         const mailbox: M = await this.requireMailbox(mailboxId);
         this.requireMailboxOwner(mailbox, user);
 

@@ -39,9 +39,9 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private mailboxRepo?: RepoUtils<MB>;
-    private messageRepo?: RecoverableRepoUtils<M>;
-    private attachmentRepo?: RepoUtils<A>;
+    protected mailboxRepo?: RepoUtils<MB>;
+    protected messageRepo?: RecoverableRepoUtils<M>;
+    protected attachmentRepo?: RepoUtils<A>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -64,18 +64,27 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
 
     @Init
     public async init(): Promise<void> {
-        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.mailboxClass.name,
-            args: [this.mailboxClass],
-        });
-        this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.messageClass.name,
-            args: [this.messageClass],
-        });
-        this.attachmentRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.attachmentClass.name,
-            args: [this.attachmentClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
+        if (!this.attachmentRepo && this.attachmentClass) {
+            this.attachmentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.attachmentClass.name,
+                args: [this.attachmentClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {

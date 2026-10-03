@@ -25,8 +25,6 @@ import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { buildEventIcs, expandOccurrencesDetailed, OccurrenceExpansion, OccurrenceWindow, parseIcsEvent, ParsedIcsEvent } from "../util/IcsUtils.js";
 import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
 import type { SearchProvider } from "../search/SearchProvider.js";
-import { DataSubjectErasureRequestMongo } from "../models/mongo/DataSubjectErasureRequestMongo.js";
-import { DataSubjectErasureRequestSQL } from "../models/sql/DataSubjectErasureRequestSQL.js";
 import { ERASURE_IN_PROGRESS } from "./ErasureExecutionJob.js";
 import { writeContactKeys } from "../util/ContactKeyUtils.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
@@ -215,24 +213,24 @@ export abstract class ScanQueueJob<
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private ingestQueueRepo?: RepoUtils<Q>;
-    private folderRepo?: RecoverableRepoUtils<F>;
-    private messageRepo?: RecoverableRepoUtils<M>;
-    private attachmentRepo?: RepoUtils<A>;
-    private quarantineEntryRepo?: RepoUtils<QE>;
-    private scanResultRepo?: RepoUtils<SR>;
-    private mailboxRepo?: RepoUtils<X>;
-    private keyVaultRepo?: RepoUtils<any>;
-    private mailFilterRuleRepo?: RepoUtils<MFR>;
-    private calendarEventRepo?: RecoverableRepoUtils<CE>;
-    private oofReplySuppressionRepo?: RepoUtils<OS>;
-    private focusedInboxOverrideRepo?: RepoUtils<FIO>;
-    private contactRepo?: RecoverableRepoUtils<C>;
+    protected ingestQueueRepo?: RepoUtils<Q>;
+    protected folderRepo?: RecoverableRepoUtils<F>;
+    protected messageRepo?: RecoverableRepoUtils<M>;
+    protected attachmentRepo?: RepoUtils<A>;
+    protected quarantineEntryRepo?: RepoUtils<QE>;
+    protected scanResultRepo?: RepoUtils<SR>;
+    protected mailboxRepo?: RepoUtils<X>;
+    protected keyVaultRepo?: RepoUtils<any>;
+    protected mailFilterRuleRepo?: RepoUtils<MFR>;
+    protected calendarEventRepo?: RecoverableRepoUtils<CE>;
+    protected oofReplySuppressionRepo?: RepoUtils<OS>;
+    protected focusedInboxOverrideRepo?: RepoUtils<FIO>;
+    protected contactRepo?: RecoverableRepoUtils<C>;
     /** Read-only: consulted before filing so nothing is delivered into a mailbox `ErasureExecutionJob` is erasing. */
-    private erasureRequestRepo?: RepoUtils<any>;
+    protected erasureRequestRepo?: RepoUtils<any>;
 
-    /** The `DataSubjectErasureRequest` model class for this backend. Defaults to the Mongo or SQL class matching
-     * `ingestQueueClass`'s backend; a subclass may set it explicitly. */
+    /** The `DataSubjectErasureRequest` model class for this backend, supplied by the Mongo/SQL subclasses. Left unset,
+     * the erasure-status check is skipped. */
     protected dataSubjectErasureRequestClass?: any;
 
     /** Optional - when search isn't configured, index removal is a no-op (see `removeFromSearchIndex()`). */
@@ -353,66 +351,98 @@ export abstract class ScanQueueJob<
 
     @Init
     public async init(): Promise<void> {
-        this.ingestQueueRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.ingestQueueClass.name,
-            args: [this.ingestQueueClass],
-        });
-        this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.folderClass.name,
-            args: [this.folderClass],
-        });
-        this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.messageClass.name,
-            args: [this.messageClass],
-        });
-        this.attachmentRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.attachmentClass.name,
-            args: [this.attachmentClass],
-        });
-        this.quarantineEntryRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.quarantineEntryClass.name,
-            args: [this.quarantineEntryClass],
-        });
-        this.scanResultRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.scanResultClass.name,
-            args: [this.scanResultClass],
-        });
-        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.mailboxClass.name,
-            args: [this.mailboxClass],
-        });
-        this.mailFilterRuleRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.mailFilterRuleClass.name,
-            args: [this.mailFilterRuleClass],
-        });
-        this.calendarEventRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.calendarEventClass.name,
-            args: [this.calendarEventClass],
-        });
-        this.oofReplySuppressionRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.oofReplySuppressionClass.name,
-            args: [this.oofReplySuppressionClass],
-        });
-        this.focusedInboxOverrideRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.focusedInboxOverrideClass.name,
-            args: [this.focusedInboxOverrideClass],
-        });
-        this.contactRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.contactClass.name,
-            args: [this.contactClass],
-        });
-        const erasureClass: any =
-            this.dataSubjectErasureRequestClass ??
-            (String(this.ingestQueueClass?.name ?? "").endsWith("SQL") ? DataSubjectErasureRequestSQL : DataSubjectErasureRequestMongo);
-        try {
-            this.erasureRequestRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: erasureClass.name,
-                args: [erasureClass],
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.ingestQueueRepo && this.ingestQueueClass) {
+            this.ingestQueueRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.ingestQueueClass.name,
+                args: [this.ingestQueueClass],
             });
+        }
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.folderClass.name,
+                args: [this.folderClass],
+            });
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
+        if (!this.attachmentRepo && this.attachmentClass) {
+            this.attachmentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.attachmentClass.name,
+                args: [this.attachmentClass],
+            });
+        }
+        if (!this.quarantineEntryRepo && this.quarantineEntryClass) {
+            this.quarantineEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.quarantineEntryClass.name,
+                args: [this.quarantineEntryClass],
+            });
+        }
+        if (!this.scanResultRepo && this.scanResultClass) {
+            this.scanResultRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.scanResultClass.name,
+                args: [this.scanResultClass],
+            });
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
+        if (!this.mailFilterRuleRepo && this.mailFilterRuleClass) {
+            this.mailFilterRuleRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailFilterRuleClass.name,
+                args: [this.mailFilterRuleClass],
+            });
+        }
+        if (!this.calendarEventRepo && this.calendarEventClass) {
+            this.calendarEventRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.calendarEventClass.name,
+                args: [this.calendarEventClass],
+            });
+        }
+        if (!this.oofReplySuppressionRepo && this.oofReplySuppressionClass) {
+            this.oofReplySuppressionRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.oofReplySuppressionClass.name,
+                args: [this.oofReplySuppressionClass],
+            });
+        }
+        if (!this.focusedInboxOverrideRepo && this.focusedInboxOverrideClass) {
+            this.focusedInboxOverrideRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.focusedInboxOverrideClass.name,
+                args: [this.focusedInboxOverrideClass],
+            });
+        }
+        if (!this.contactRepo && this.contactClass) {
+            this.contactRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.contactClass.name,
+                args: [this.contactClass],
+            });
+        }
+        if (!this.keyVaultRepo && this.keyVaultClass) {
+            this.keyVaultRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.keyVaultClass.name,
+                args: [this.keyVaultClass],
+            });
+        }
+        try {
+            if (!this.erasureRequestRepo && this.dataSubjectErasureRequestClass) {
+                this.erasureRequestRepo = await this._objectFactory.newInstance(RepoUtils, {
+                    name: this.dataSubjectErasureRequestClass.name,
+                    args: [this.dataSubjectErasureRequestClass],
+                });
+            }
         } catch (err: any) {
             // Only possible when the datastore wasn't given this model at all (a trimmed-down wiring) - the erasure
             // check then can't run, which is logged on every delivery attempt rather than blocking all mail.
-            this.logger?.warn(`ScanQueueJob: erasure-status checks unavailable (${erasureClass.name} repo failed to initialize): ${err?.message}`);
+            this.logger?.warn(`ScanQueueJob: erasure-status checks unavailable (${this.dataSubjectErasureRequestClass.name} repo failed to initialize): ${err?.message}`);
         }
     }
 
@@ -1725,8 +1755,6 @@ export abstract class ScanQueueJob<
      */
     private async maybeRefreshRotatedKey(mailboxUid: string, peerAddress: string): Promise<void> {
         const now: number = Date.now();
-        // Only a rotation notice needs it, so it isn't set up for every delivery.
-        this.keyVaultRepo ??= await this._objectFactory!.newInstance(RepoUtils, { name: this.keyVaultClass.name, args: [this.keyVaultClass] });
         await this.persistContactKeyUpdate(mailboxUid, peerAddress, now, (existingContact) =>
             discoverAndMergeKeys(this.dnsResolver!, peerAddress, existingContact, now, {
                 mailboxRepo: this.mailboxRepo!,

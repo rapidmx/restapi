@@ -11,7 +11,7 @@ import * as path from "path";
 import { Rfc8823AcmeSigningCertificateEnrollment } from "../../src/pki/Rfc8823AcmeSigningCertificateEnrollment.js";
 import { ScanPipeline } from "../../src/scan/ScanPipeline.js";
 import { AvVerdict, SpamVerdict } from "../../src/models/types.js";
-import { FakeAcmeClient, generateCsr, generateSelfSignedCertificate, TestEnrollment } from "./acmeTestDoubles.js";
+import { FakeAcmeClient, generateCsr, generateSelfSignedCertificate, TestEnrollment, withHealth } from "./acmeTestDoubles.js";
 
 describe("Rfc8823AcmeSigningCertificateEnrollment progress Tests", () => {
     let tmpDir: string;
@@ -19,7 +19,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment progress Tests", () => {
     let enrollment: TestEnrollment;
 
     const newEnrollment = (): TestEnrollment => {
-        const instance = new TestEnrollment();
+        const instance = withHealth(new TestEnrollment());
         (instance as any).storeDir = storeDir;
         const pipeline = new ScanPipeline();
         (pipeline as any).spamScanProvider = { name: "test-spam", scoreMessage: async () => ({ score: 0, verdict: SpamVerdict.CLEAN, symbols: [] }) };

@@ -10,6 +10,7 @@
 // touching the shared `SigningCertificateEnrollment` DI registration every other test file relies on
 // staying `NullSigningCertificateEnrollment`).
 import "reflect-metadata";
+import { withHealth } from "../../pki/acmeTestDoubles.js";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -180,7 +181,7 @@ describe("ScanQueueJobSQL Tests - RFC 8823 challenge-email correlation", () => {
         mailboxRepo = conn.getRepository(MailboxSQL);
 
         job = await objectFactory.newInstance(ScanQueueJobSQL, { name: "default" });
-        enrollment = new TestEnrollment();
+        enrollment = withHealth(new TestEnrollment());
         (enrollment as any).storeDir = tmpDir;
         (job as any).signingCertificateEnrollment = enrollment;
     });

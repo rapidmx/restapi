@@ -28,7 +28,7 @@ import {
     validateAppearancePatch,
 } from "../util/AppearanceUtils.js";
 import type { AppearanceBackground, AppearancePreferences, PublicAppearancePreferences } from "../models/types.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Auth, Delete, Get, Param, Post, Put, RateLimit, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** Generous per-user limits (per minute) - a slider being dragged sends many small saves, an upload is one big one. */
@@ -117,12 +117,13 @@ export abstract class BaseAppearanceRoute<T extends AppearancePreferences> {
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.repo) {
-            this.repo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.appearanceClass.name,
-                args: [this.appearanceClass],
-            });
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.repo && this.appearanceClass) {
+            this.repo = await this._objectFactory.newInstance(RepoUtils, { name: this.appearanceClass.name, args: [this.appearanceClass] });
         }
     }
 
@@ -194,7 +195,6 @@ export abstract class BaseAppearanceRoute<T extends AppearancePreferences> {
     @Get()
     public async get(@AuthUser user?: JWTUser): Promise<PublicAppearancePreferences> {
         const userUid: string = BaseAppearanceRoute.userUidOf(user);
-        await this.init();
         const row: T | undefined = await this.findRow(userUid);
         return row ? toPublicAppearance(row) : defaultAppearance();
     }
@@ -205,7 +205,6 @@ export abstract class BaseAppearanceRoute<T extends AppearancePreferences> {
     public async update(obj: unknown, @AuthUser user?: JWTUser): Promise<PublicAppearancePreferences> {
         const userUid: string = BaseAppearanceRoute.userUidOf(user);
         const patch: AppearancePatch = validateAppearancePatch(obj);
-        await this.init();
         const saved: T | undefined = await this.modify(userUid, (row) => {
             if (Object.keys(patch).length === 0) {
                 return undefined;
@@ -259,8 +258,6 @@ export abstract class BaseAppearanceRoute<T extends AppearancePreferences> {
         if (!contentType) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 415, "The file is not a PNG, JPEG, WebP or AVIF image.");
         }
-
-        await this.init();
         const version: string = crypto.randomUUID();
         const key: string = appearanceImageKey(userUid, version);
         await this.blobStore!.put(key, raw, { contentType });
@@ -295,7 +292,6 @@ export abstract class BaseAppearanceRoute<T extends AppearancePreferences> {
     @Get("/background/:version")
     public async getBackground(@Param("version") version: string, @Response res: HttpResponse, @AuthUser user?: JWTUser): Promise<void> {
         const userUid: string = BaseAppearanceRoute.userUidOf(user);
-        await this.init();
         const row: T | undefined = await this.findRow(userUid);
         const current: string | undefined = row?.background?.imageVersion;
         if (!row || !current || current !== version || !row.backgroundContentType) {
@@ -328,7 +324,6 @@ export abstract class BaseAppearanceRoute<T extends AppearancePreferences> {
     @Delete("/background")
     public async deleteBackground(@AuthUser user?: JWTUser): Promise<PublicAppearancePreferences> {
         const userUid: string = BaseAppearanceRoute.userUidOf(user);
-        await this.init();
         let previous: string | undefined;
         const saved: T | undefined = await this.modify(userUid, (row) => {
             previous = row?.background?.imageVersion;

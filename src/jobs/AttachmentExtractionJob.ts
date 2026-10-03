@@ -46,13 +46,16 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private attachmentRepo?: RepoUtils<A>;
-    private messageRepo?: RecoverableRepoUtils<M>;
+    protected attachmentRepo?: RepoUtils<A>;
+    protected messageRepo?: RecoverableRepoUtils<M>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
 
-    private extractorRegistry: ExtractorRegistry = new ExtractorRegistry();
+    /** Injected (never built with `new`) so the registry's `mail:search:extraction:*` limits and logger are populated, and so the
+     * ObjectFactory disposes its worker thread on shutdown. */
+    @Inject(ExtractorRegistry)
+    protected extractorRegistry?: ExtractorRegistry;
 
     @Config("mail:jobs:attachment_extraction:schedule", "*/20 * * * * *")
     private scheduleExpr: string = "*/20 * * * * *";
@@ -79,14 +82,21 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
 
     @Init
     public async init(): Promise<void> {
-        this.attachmentRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.attachmentClass.name,
-            args: [this.attachmentClass],
-        });
-        this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.messageClass.name,
-            args: [this.messageClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.attachmentRepo && this.attachmentClass) {
+            this.attachmentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.attachmentClass.name,
+                args: [this.attachmentClass],
+            });
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {
@@ -203,9 +213,9 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
         // whose declared size already exceeds what the registry would take is not downloaded at all.
         const mimeType: string = (attachment.mimeType ?? "").split(";")[0].trim().toLowerCase();
         const text: string | undefined =
-            !message || message.encrypted || (attachment.sizeBytes ?? 0) > this.maxExtractBytes || !this.extractorRegistry.supports(mimeType)
+            !message || message.encrypted || (attachment.sizeBytes ?? 0) > this.maxExtractBytes || !this.extractorRegistry!.supports(mimeType)
                 ? undefined
-                : await this.extractorRegistry.extract(mimeType, await this.blobStore!.get(attachment.blobKey));
+                : await this.extractorRegistry!.extract(mimeType, await this.blobStore!.get(attachment.blobKey));
 
         const extractedTextBlobKey = `attachment-text/${crypto.randomUUID()}`;
         await this.blobStore!.put(extractedTextBlobKey, Buffer.from(text ?? "", "utf-8"), {

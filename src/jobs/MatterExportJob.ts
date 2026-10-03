@@ -86,9 +86,10 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private requestRepo?: RepoUtils<T>;
-    private matterRepo?: RepoUtils<M>;
-    private mailboxRepo?: RepoUtils<MB>;
+    protected requestRepo?: RepoUtils<T>;
+    protected matterRepo?: RepoUtils<M>;
+    protected mailboxRepo?: RepoUtils<MB>;
+    protected messageRepo?: RepoUtils<any>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -140,18 +141,33 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
 
     @Init
     public async init(): Promise<void> {
-        this.requestRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.matterExportRequestClass.name,
-            args: [this.matterExportRequestClass],
-        });
-        this.matterRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.matterClass.name,
-            args: [this.matterClass],
-        });
-        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.mailboxClass.name,
-            args: [this.mailboxClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.requestRepo && this.matterExportRequestClass) {
+            this.requestRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.matterExportRequestClass.name,
+                args: [this.matterExportRequestClass],
+            });
+        }
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.matterClass.name,
+                args: [this.matterClass],
+            });
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {
@@ -473,7 +489,7 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
      * `missing: true` when the blob can't be read. One message page and one body are held at a time.
      */
     private async *retainedDraftBodyLines(mailboxUid: string, dateRange: { start: Date; end: Date }): AsyncGenerator<string> {
-        const repo: RepoUtils<any> = await this._objectFactory!.newInstance(RepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
+        const repo: RepoUtils<any> = this.messageRepo!;
         const criteria: Record<string, any> = {
             mailboxUid: ModelUtils.literal(mailboxUid),
             retainedBodyBlobKeys: "ne(null)",

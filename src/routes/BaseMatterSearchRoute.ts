@@ -15,7 +15,7 @@ import { SearchEntityType, SearchProvider, SearchResultPage } from "../search/Se
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { requireEscrowHolder } from "../util/EscrowUtils.js";
 import { AuditAction, Mailbox, Matter } from "../models/types.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Query, RateLimit, Request, User: AuthUser } = RouteDecorators;
 
 /** A review search is limited per user: each one runs a full-text query against every custodian mailbox of the matter. */
@@ -92,8 +92,8 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
     @Config()
     private config: any;
 
-    private matterRepo?: RepoUtils<M>;
-    private mailboxRepo?: RepoUtils<MB>;
+    protected matterRepo?: RepoUtils<M>;
+    protected mailboxRepo?: RepoUtils<MB>;
 
     @Inject("SearchProvider")
     private searchProvider?: SearchProvider;
@@ -101,29 +101,27 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
     @Logger
     private logger: any;
 
-    private async getMatterRepo(): Promise<RepoUtils<M>> {
-        if (!this.matterRepo) {
-            this.matterRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.matterClass.name,
                 args: [this.matterClass],
             });
         }
-        return this.matterRepo;
-    }
-
-    private async getMailboxRepo(): Promise<RepoUtils<MB>> {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
-        return this.mailboxRepo;
     }
 
     private async requireHolderMatter(matterId: string, user: JWTUser | undefined): Promise<M> {
-        const matterRepo: RepoUtils<M> = await this.getMatterRepo();
-        const matter: M | undefined = await matterRepo.findOne(matterId, { ignoreACL: true });
+        const matter: M | undefined = await this.matterRepo!.findOne(matterId, { ignoreACL: true });
         if (!matter) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
@@ -213,7 +211,7 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
 
         const entityTypes: SearchEntityType[] | undefined = typesParam ? (typesParam.split(",") as SearchEntityType[]) : undefined;
 
-        const mailboxRepo: RepoUtils<MB> = await this.getMailboxRepo();
+        const mailboxRepo: RepoUtils<MB> = this.mailboxRepo!;
         const resultsByMailbox: Record<string, SearchResultPage> = {};
         // Read as a number of results per custodian: anything that isn't a positive whole number is no limit at all (the provider's own default applies).
         const limit: number | undefined = limitParam !== undefined && /^[1-9][0-9]{0,6}$/.test(limitParam) ? parseInt(limitParam, 10) : undefined;

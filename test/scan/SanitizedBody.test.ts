@@ -2,9 +2,56 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { Logger } from "@rapidrest/core";
+import { ObjectFactory } from "@rapidrest/service-core";
+import config from "../config.js";
+import { ScanPipeline } from "../../src/scan/ScanPipeline.js";
 import { readSanitizerVersion, SANITIZER_VERSION, stampSanitizedHtml } from "../../src/scan/HtmlSanitizer.js";
 import { pointInlineImages, RETRY_AFTER_MS, SanitizedBodyLoader } from "../../src/scan/SanitizedBody.js";
-import { InMemoryBlobStore } from "../testDoubles.js";
+import { InMemoryBlobStore, registerTestDoubles } from "../testDoubles.js";
+
+/** A loader with its collaborators and limits set the way the ObjectFactory's injection would. */
+function newLoader(blobStore: any, pipeline: any, options: { maxRawBytes: number; timeoutMs: number }, logger?: any): SanitizedBodyLoader {
+    const instance: any = new SanitizedBodyLoader();
+    instance.blobStore = blobStore;
+    instance.pipeline = pipeline;
+    instance.maxRawBytes = options.maxRawBytes;
+    instance.timeoutMs = options.timeoutMs;
+    instance.logger = logger;
+    return instance;
+}
+
+describe("SanitizedBodyLoader injection", () => {
+    const keys = ["mail:scan:sanitize:lazy_max_raw_bytes", "mail:scan:sanitize:lazy_timeout_ms"];
+    let factory: ObjectFactory;
+    let previous: any[];
+
+    beforeEach(() => {
+        previous = keys.map((key) => config.get(key));
+        config.set(keys[0], 123);
+        config.set(keys[1], 456);
+        factory = new ObjectFactory(config, Logger());
+        registerTestDoubles(factory);
+    });
+
+    afterEach(async () => {
+        await factory.destroy();
+        keys.forEach((key, i) => config.set(key, previous[i]));
+    });
+
+    it("gets the blob store, the scan pipeline, its limits and a logger from the ObjectFactory, and is one shared instance", async () => {
+        const loader: any = await factory.newInstance<SanitizedBodyLoader>(SanitizedBodyLoader, { name: "default" });
+
+        expect(loader).toBeInstanceOf(SanitizedBodyLoader);
+        expect(loader.blobStore).toBe(factory.getInstance("BlobStore"));
+        expect(loader.pipeline).toBeInstanceOf(ScanPipeline);
+        expect(loader.pipeline).toBe(factory.getInstance(ScanPipeline));
+        expect(loader.maxRawBytes).toBe(123);
+        expect(loader.timeoutMs).toBe(456);
+        expect(loader.logger).toBeDefined();
+        expect(await factory.newInstance(SanitizedBodyLoader, { name: "default" })).toBe(loader);
+    });
+});
 
 describe("SanitizedBodyLoader", () => {
     const OLD = "<p>old sanitizer output</p>";
@@ -25,7 +72,7 @@ describe("SanitizedBodyLoader", () => {
         sanitizeRaw = vi.fn(async () => stampSanitizedHtml(FRESH));
         sanitizeStoredHtml = vi.fn((html: string) => stampSanitizedHtml(CLEAN(html)));
         logger = { warn: vi.fn() };
-        loader = new SanitizedBodyLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 2000 }, logger);
+        loader = newLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 2000 }, logger);
     });
 
     const stored = async (): Promise<string> => (await blobs.get(message.sanitizedHtmlBlobKey)).toString();
@@ -94,12 +141,12 @@ describe("SanitizedBodyLoader", () => {
 
             expect(await loader.load(message)).toBe("");
             expect(logger.warn.mock.calls.map((call) => call[0]).join(" ")).toContain("too large");
-            loader = new SanitizedBodyLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 2000 });
+            loader = newLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 2000 });
             expect(await loader.load(message)).toBe("");
         });
 
         it("works without a logger", async () => {
-            loader = new SanitizedBodyLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 2000 });
+            loader = newLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 2000 });
             sanitizeRaw.mockRejectedValue(new Error("x"));
 
             expect(await loader.load(message)).toBe(CLEAN(OLD));
@@ -130,7 +177,7 @@ describe("SanitizedBodyLoader", () => {
         });
 
         it("answers with the stored HTML, sanitized again, when the re-sanitization takes too long, and lets it finish for the next reader", async () => {
-            loader = new SanitizedBodyLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 10 }, logger);
+            loader = newLoader(blobs, { sanitizeRaw, sanitizeStoredHtml } as any, { maxRawBytes: 1000, timeoutMs: 10 }, logger);
             sanitizeRaw.mockImplementation(async () => {
                 await new Promise((resolve) => setTimeout(resolve, 80));
                 return stampSanitizedHtml(FRESH);

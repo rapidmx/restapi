@@ -12,7 +12,7 @@ import { KeyDiscoveryResponse, KeyVault, Mailbox } from "../models/types.js";
 import { resolveDomainAliasName } from "../util/DomainUtils.js";
 import { isValidKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { buildKeyDiscoveryResponse } from "../util/LocalKeyDiscoveryUtils.js";
-const { Config } = ObjectDecorators;
+const { Config, Init } = ObjectDecorators;
 const { Get, Param, Query, RateLimit, Request, Response } = RouteDecorators;
 
 /**
@@ -77,8 +77,8 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private mailboxRepo?: RepoUtils<M>;
-    private keyVaultRepo?: RepoUtils<K>;
+    protected mailboxRepo?: RepoUtils<M>;
+    protected keyVaultRepo?: RepoUtils<K>;
 
     /** How long a requesting server may cache a response before revalidating - the spec requires this be set,
      * but leaves the duration to the deployment; per-user key freshness (not domain policy, see
@@ -86,15 +86,19 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
     @Config("mail:discovery:public_endpoint:max_age_seconds", 3600)
     private maxAgeSeconds: number = 3600;
 
-    private async init(): Promise<void> {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
-        if (!this.keyVaultRepo) {
-            this.keyVaultRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.keyVaultRepo && this.keyVaultClass) {
+            this.keyVaultRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.keyVaultClass.name,
                 args: [this.keyVaultClass],
             });
@@ -120,7 +124,6 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
         @Request req: HttpRequest,
         @Response res: HttpResponse,
     ): Promise<void> {
-        await this.init();
 
         if (!isValidKeyDiscoveryHash(hash)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The discovery hash is malformed.");

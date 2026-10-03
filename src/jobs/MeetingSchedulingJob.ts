@@ -105,9 +105,9 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private calendarEventRepo?: RecoverableRepoUtils<CE>;
-    private mailboxRepo?: RepoUtils<any>;
-    private attendeeLinkRepo?: RepoUtils<any>;
+    protected calendarEventRepo?: RecoverableRepoUtils<CE>;
+    protected mailboxRepo?: RepoUtils<any>;
+    protected attendeeLinkRepo?: RepoUtils<any>;
 
     @Inject("MailTransport")
     private mailTransport?: MailTransport;
@@ -150,20 +150,29 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
 
     @Init
     public async init(): Promise<void> {
-        this.calendarEventRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.calendarEventClass.name,
-            args: [this.calendarEventClass],
-        });
-        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.mailboxClass.name,
-            args: [this.mailboxClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.calendarEventRepo && this.calendarEventClass) {
+            this.calendarEventRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.calendarEventClass.name,
+                args: [this.calendarEventClass],
+            });
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.mailboxClass.name,
+                args: [this.mailboxClass],
+            });
+        }
         // Built here with the others because building it is cheap and query-free - it issues no query at all
         // until an event that actually has a linked video meeting is being invited to.
-        this.attendeeLinkRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.attendeeLinkClass.name,
-            args: [this.attendeeLinkClass],
-        });
+        if (!this.attendeeLinkRepo && this.attendeeLinkClass) {
+            this.attendeeLinkRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.attendeeLinkClass.name,
+                args: [this.attendeeLinkClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {

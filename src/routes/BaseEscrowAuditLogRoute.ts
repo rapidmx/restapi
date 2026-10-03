@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, UserUtils, type JWTUser } from "@rapidrest/core";
+import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import {
     ApiErrorMessages,
     ApiErrors,
@@ -16,6 +16,7 @@ import {
 import { verifyEscrowAuditChain, type EscrowAuditVerificationResult } from "../util/EscrowAuditUtils.js";
 import { exactInFilter, findHeldScopeIds, isQuerySafeUid } from "../util/EscrowUtils.js";
 import { EscrowAuditLogEntry, Matter } from "../models/types.js";
+const { Init } = ObjectDecorators;
 const { Before, Delete, Get, Param, Post, Put, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /** Page size for reading every matter under a holder's scopes - see `resolveVisibleMatterIds()`. */
@@ -51,16 +52,19 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
      * decorator-only-gated `verify()`. */
     protected trustedRoles: string[] = ["admin"];
 
-    private matterRepo?: RepoUtils<Matter>;
+    protected matterRepo?: RepoUtils<Matter>;
 
-    private async getMatterRepo(): Promise<RepoUtils<Matter>> {
-        if (!this.matterRepo) {
-            this.matterRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.matterClass.name,
                 args: [this.matterClass],
             });
         }
-        return this.matterRepo;
     }
 
     /** Resolves the `matterId`s a non-trusted caller may see entries for - every `Matter` under a scope
@@ -75,7 +79,7 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
         if (!heldScopes) {
             return [];
         }
-        const matterRepo: RepoUtils<Matter> = await this.getMatterRepo();
+        const matterRepo: RepoUtils<Matter> = this.matterRepo!;
         // Every page - a single `find()` stops at the framework's default page size, which would silently hide
         // the entries of every matter past the first 100 from their own holders.
         const matterIds: string[] = [];

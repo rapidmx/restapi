@@ -15,7 +15,7 @@ import * as x509 from "@peculiar/x509";
 import * as acme from "acme-client";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
-import { ApiErrors } from "@rapidrest/service-core";
+import { ApiErrors, type ObjectFactory } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import { WrappedPrivateKey } from "../models/types.js";
 import { ScanPipeline } from "../scan/ScanPipeline.js";
@@ -246,7 +246,20 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
 
     /** How the CA contacts of this deployment have gone (`health.json` in the store directory) - written by `AcmeEnrollmentDriverJob` and by
      * `startEnrollment()`, read for `describeBackend()`. */
-    public readonly health: SigningEnrollmentHealth = new SigningEnrollmentHealth(() => path.join(this.storeDir, "health.json"));
+    public health!: SigningEnrollmentHealth;
+
+    // Automatically injected by ObjectFactory on instantiation
+    private _objectFactory?: ObjectFactory;
+
+    /** Obtains `health` from the ObjectFactory, once on instantiation. It is named after the file it keeps, which is all that tells two apart. */
+    @Init
+    protected async initHealth(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        const file: string = path.join(this.storeDir, "health.json");
+        this.health = await this._objectFactory.newInstance<SigningEnrollmentHealth>(SigningEnrollmentHealth, { name: file, args: [() => file] });
+    }
 
     /**
      * Logs, once at startup, which CA this deployment enrolls signing certificates with and whether its ACME account already exists in the

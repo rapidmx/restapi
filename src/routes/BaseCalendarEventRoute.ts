@@ -69,7 +69,7 @@ import {
     Mailbox,
     RecipientType,
 } from "../models/types.js";
-const { Config, Inject } = ObjectDecorators;
+const { Config, Init, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Auth, Get, Param, Post, RateLimit, Request, User: AuthUser } = RouteDecorators;
 
@@ -141,9 +141,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * message's calendar file and record the reader's answer on it. */
     protected abstract messageClass: any;
 
-    private mailboxRepo?: RepoUtils<any>;
-    private messageRepo?: RepoUtils<any>;
-    private folderRepo?: RepoUtils<any>;
+    protected mailboxRepo?: RepoUtils<any>;
+    protected messageRepo?: RepoUtils<any>;
+    protected folderRepo?: RepoUtils<any>;
 
     @Inject("MailTransport")
     private mailTransport?: any;
@@ -221,7 +221,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (!organizer) {
             return true;
         }
-        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(existing.mailboxUid, { ignoreACL: true });
+        const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(existing.mailboxUid, { ignoreACL: true });
         return mailboxAddressSet(mailbox).has(organizer);
     }
 
@@ -283,24 +283,20 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         }
     }
 
-    private async getMailboxRepo(): Promise<RepoUtils<any>> {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.mailboxClass.name,
-                args: [this.mailboxClass],
-            });
+    @Init
+    protected async initCalendarEventRepos(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
         }
-        return this.mailboxRepo;
-    }
-
-    private async getMessageRepo(): Promise<RepoUtils<any>> {
-        this.messageRepo ??= await this._objectFactory!.newInstance(RepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
-        return this.messageRepo;
-    }
-
-    private async getFolderRepo(): Promise<RepoUtils<any>> {
-        this.folderRepo ??= await this._objectFactory!.newInstance(RepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
-        return this.folderRepo;
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
+        }
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
+        }
     }
 
     /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `CalendarEvent` carries its
@@ -396,8 +392,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             {
                 caller: user!,
                 isTrusted: this.isTrusted(user),
-                mailboxRepo: await this.getMailboxRepo(),
-                folderRepo: await this.getFolderRepo(),
+                mailboxRepo: this.mailboxRepo!,
+                folderRepo: this.folderRepo!,
                 eventRepo: this.repoUtils!,
                 aliasQueryValue: (address) => this.aliasQueryValue(address),
                 hasAccess: (uid, action) => this.hasMailAccess(user, uid, action),
@@ -437,7 +433,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
 
-        const mailboxRepo = await this.getMailboxRepo();
+        const mailboxRepo = this.mailboxRepo!;
         const mailbox: Mailbox | undefined = await mailboxRepo.findOne(event.mailboxUid, { ignoreACL: true });
         const mailboxAddresses = mailbox ? [mailbox.primarySmtpAddress, ...mailbox.aliasAddresses].map((a) => a.toLowerCase()) : [];
         const respondingAttendee: Attendee | undefined = event.attendees.find((attendee) =>
@@ -577,7 +573,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             throw invalid(ApiErrorMessages.INVALID_REQUEST);
         }
 
-        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(event.mailboxUid, { ignoreACL: true });
+        const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(event.mailboxUid, { ignoreACL: true });
         const addresses: Set<string> = mailboxAddressSet(mailbox);
         const guest: Attendee | undefined = event.attendees.find((attendee) => addresses.has(normalizeAddress(attendee.address)));
         if (!guest || guest.isOrganizer || addresses.has(normalizeAddress(event.organizer?.address ?? ""))) {
@@ -978,7 +974,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (!this.repoUtils || !this.blobStore) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
-        const message: any = await (await this.getMessageRepo()).findOne(messageUid, { ignoreACL: true });
+        const message: any = await this.messageRepo!.findOne(messageUid, { ignoreACL: true });
         if (!message) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
@@ -1003,7 +999,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (!parsed) {
             throw noInvite();
         }
-        const mailbox: Mailbox | undefined = await (await this.getMailboxRepo()).findOne(message.mailboxUid, { ignoreACL: true });
+        const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
@@ -1140,7 +1136,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                 }
             }
 
-            const folder = await findOrCreateWellKnownFolder(await this.getFolderRepo(), this.folderClass, mailbox.uid, FolderType.CALENDAR);
+            const folder = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, mailbox.uid, FolderType.CALENDAR);
             // A copy the reader declined or removed earlier is only soft-deleted and still holds this uid; clear it so the fresh copy can be filed
             // (answering Accept after a Decline would otherwise fail as a duplicate).
             const filedUid: string = nameBasedUuid(`itip:${mailbox.uid}:${parsed.uid}:${parsed.recurrenceId ? parsed.recurrenceId.toISOString() : "master"}`);
@@ -1185,7 +1181,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
 
     /** Remembers the reader's answer on the message, retrying once on a version conflict. A failure is logged: the answer itself already stands. */
     private async recordInviteAnswer(message: any, answer: InviteResponse): Promise<void> {
-        const repo: RepoUtils<any> = await this.getMessageRepo();
+        const repo: RepoUtils<any> = this.messageRepo!;
         try {
             for (let attempt = 1; ; attempt++) {
                 const current: any = attempt === 1 ? message : await repo.findOne(message.uid, { ignoreACL: true });

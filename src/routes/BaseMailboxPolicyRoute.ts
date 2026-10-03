@@ -13,7 +13,7 @@ import {
     MailboxPolicySeed,
 } from "../util/MailboxPolicyUtils.js";
 import { AuditAction, MailboxPolicy } from "../models/types.js";
-const { Config, Logger } = ObjectDecorators;
+const { Config, Init, Logger } = ObjectDecorators;
 const { Auth, Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorators;
 
 export { DEFAULT_MAILBOX_QUOTA_BYTES };
@@ -70,12 +70,13 @@ export abstract class BaseMailboxPolicyRoute<T extends MailboxPolicy> {
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.repo) {
-            this.repo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.mailboxPolicyClass.name,
-                args: [this.mailboxPolicyClass],
-            });
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.repo && this.mailboxPolicyClass) {
+            this.repo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxPolicyClass.name, args: [this.mailboxPolicyClass] });
         }
     }
 
@@ -133,8 +134,6 @@ export abstract class BaseMailboxPolicyRoute<T extends MailboxPolicy> {
                 (patch as any)[field] = obj[field];
             }
         }
-
-        await this.init();
         // Writes need the real row, so unlike `get()` a datastore failure here is an error, not a config fallback.
         const existing: T = await findOrCreateSingleton(this.repo!, this.mailboxPolicyClass, MAILBOX_POLICY_UID, { ...this.seed() });
         const updated: T = await this.repo!.update({ uid: existing.uid, version: (existing as any).version, ...patch } as any, existing, {

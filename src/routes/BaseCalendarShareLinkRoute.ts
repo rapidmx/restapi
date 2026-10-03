@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
-import { ApiError, type JWTUser } from "@rapidrest/core";
+import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ACLAction, ApiErrors, HttpRequest, RepoUtils, RouteDecorators, type AccessControlList, type UpdateObject } from "@rapidrest/service-core";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { CalendarShareLink, Folder, FolderType } from "../models/types.js";
+const { Init } = ObjectDecorators;
 const { Param, Query, Request, User: AuthUser } = RouteDecorators;
 
 /** The `userOrRoleId` a link's grant is written under - see the identical constant (and why it's duplicated) on
@@ -54,7 +55,17 @@ export abstract class BaseCalendarShareLinkRoute<T extends CalendarShareLink> ex
     /** The concrete `Folder` entity class, supplied by the Mongo/SQL concrete subclass - a link can only share a calendar folder. */
     protected abstract folderClass: any;
 
-    private folderRepo?: RepoUtils<Folder>;
+    protected folderRepo?: RepoUtils<Folder>;
+
+    @Init
+    protected async initCalendarShareLinkRepos(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
+        }
+    }
 
     /**
      * Checks what a link grants against its creator and the folder, for a create or an update that names `permittedActions` or `folderUid`:
@@ -70,10 +81,7 @@ export abstract class BaseCalendarShareLinkRoute<T extends CalendarShareLink> ex
         if (!Array.isArray(actions) || actions.length === 0 || actions.some((action) => typeof action !== "string" || !SHAREABLE_ACTIONS.includes(action))) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'permittedActions' must be a list of: ${SHAREABLE_ACTIONS.join(", ")}.`);
         }
-        if (!this.folderRepo) {
-            this.folderRepo = await this._objectFactory!.newInstance(RepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
-        }
-        const folder: Folder | undefined = await this.folderRepo.findOne(folderUid, { ignoreACL: true });
+        const folder: Folder | undefined = await this.folderRepo!.findOne(folderUid, { ignoreACL: true });
         if (folder?.type !== FolderType.CALENDAR) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A share link can only share a calendar folder.");
         }

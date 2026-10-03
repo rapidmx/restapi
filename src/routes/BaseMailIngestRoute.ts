@@ -34,7 +34,7 @@ import { asEntity } from "../util/EntityUtils.js";
 import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import { nameBasedUuid } from "../util/UuidUtils.js";
 import { buildTransportRuleContext, evaluateTransportRules } from "../util/TransportRuleUtils.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Description, Summary } = DocDecorators;
 const { Get, Post, Query, Request, Response } = RouteDecorators;
 
@@ -87,10 +87,10 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private mailboxRepo?: RepoUtils<M>;
-    private ingestQueueRepo?: RepoUtils<Q>;
-    private distributionListRepo?: RepoUtils<DistributionList>;
-    private transportRuleRepo?: RepoUtils<TransportRule>;
+    protected mailboxRepo?: RepoUtils<M>;
+    protected ingestQueueRepo?: RepoUtils<Q>;
+    protected distributionListRepo?: RepoUtils<DistributionList>;
+    protected transportRuleRepo?: RepoUtils<TransportRule>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -132,27 +132,31 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         return ModelUtils.literal(address);
     }
 
-    private async init() {
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
-        if (!this.ingestQueueRepo) {
-            this.ingestQueueRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.ingestQueueRepo && this.ingestQueueClass) {
+            this.ingestQueueRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.ingestQueueClass.name,
                 args: [this.ingestQueueClass],
             });
         }
-        if (!this.distributionListRepo) {
-            this.distributionListRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.distributionListRepo && this.distributionListClass) {
+            this.distributionListRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.distributionListClass.name,
                 args: [this.distributionListClass],
             });
         }
-        if (!this.transportRuleRepo) {
-            this.transportRuleRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.transportRuleRepo && this.transportRuleClass) {
+            this.transportRuleRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.transportRuleClass.name,
                 args: [this.transportRuleClass],
             });
@@ -605,7 +609,6 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         @Response res: HttpResponse,
     ): Promise<HttpResponse> {
         this.authorizeInternalCaller(req);
-        await this.init();
 
         if (!name) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
@@ -627,7 +630,6 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         @Response res: HttpResponse,
     ): Promise<HttpResponse> {
         this.authorizeInternalCaller(req);
-        await this.init();
 
         if (!rcpt) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
@@ -650,7 +652,6 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
     @Post("/deliver")
     public async deliver(@Request req: HttpRequest, @Response res: HttpResponse): Promise<HttpResponse> {
         this.authorizeInternalCaller(req);
-        await this.init();
 
         if (!this.blobStore) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);

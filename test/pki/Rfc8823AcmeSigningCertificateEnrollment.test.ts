@@ -6,6 +6,7 @@
 // convention) - only the `acme-client` `Client` itself is faked, since driving a real ACME CA over the
 // network is neither deterministic nor appropriate for a unit test.
 import "reflect-metadata";
+import { withHealth } from "./acmeTestDoubles.js";
 // Node's `crypto` module (for `createHash`) is imported under its own name, NOT `crypto` - the
 // ambient global `crypto` (WebCrypto) is what `x509.cryptoProvider.set()`/`crypto.subtle` below need -
 // see `Rfc8823AcmeSigningCertificateEnrollment.ts`'s identical note.
@@ -144,7 +145,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
         FakeAcmeClient.orderErrorDetail = true;
         FakeAcmeClient.completeChallengeCallCount = 0;
         FakeAcmeClient.finalizeCallCount = 0;
-        enrollment = new TestEnrollment();
+        enrollment = withHealth(new TestEnrollment());
         (enrollment as any).storeDir = path.join(tmpDir, `store-${Math.random()}`);
 
         const pipeline = new ScanPipeline();
@@ -280,7 +281,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
         const csr: string = await generateCsr("carried@example.com");
         await enrollment.startEnrollment("carried@example.com", csr);
 
-        const other = new TestEnrollment();
+        const other = withHealth(new TestEnrollment());
         (other as any).storeDir = (enrollment as any).storeDir;
         await other.startEnrollment("carried2@example.com", await generateCsr("carried2@example.com"));
 
@@ -435,7 +436,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
 
     it("Creates the store directory if it doesn't exist yet.", async () => {
         const nestedDir: string = path.join(tmpDir, "nested", "dir", "store");
-        const nested = new TestEnrollment();
+        const nested = withHealth(new TestEnrollment());
         (nested as any).storeDir = nestedDir;
 
         await nested.startEnrollment("nested@example.com", await generateCsr("nested@example.com"));
@@ -480,7 +481,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
                 return new CapturingClient(opts);
             }
         }
-        const capturing = new CapturingEnrollment();
+        const capturing = withHealth(new CapturingEnrollment());
         (capturing as any).storeDir = (enrollment as any).storeDir;
         (capturing as any).contactEmail = "admin@example.com";
 
@@ -532,7 +533,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
                     return super.createClient(opts);
                 }
             }
-            const recovering = new KeyCapturingEnrollment();
+            const recovering = withHealth(new KeyCapturingEnrollment());
             (recovering as any).storeDir = storeDir;
             await recovering.startEnrollment("after@example.com", await generateCsr("after@example.com"));
 
@@ -561,7 +562,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
                     return new FlakyClient(opts);
                 }
             }
-            const flaky = new FlakyEnrollment();
+            const flaky = withHealth(new FlakyEnrollment());
             (flaky as any).storeDir = storeDir;
 
             await expect(flaky.startEnrollment("flaky@example.com", await generateCsr("flaky@example.com"))).rejects.toThrow("CA unreachable");
@@ -594,7 +595,7 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
         });
 
         it("Concurrent startEnrollment() calls across instances register the account once and persist every enrollment.", async () => {
-            const other = new TestEnrollment();
+            const other = withHealth(new TestEnrollment());
             (other as any).storeDir = (enrollment as any).storeDir;
             const csrs: string[] = await Promise.all(Array.from({ length: 8 }, (_, i) => generateCsr(`many${i}@example.com`)));
 

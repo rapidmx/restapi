@@ -6,13 +6,14 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { ObjectDecorators } from "@rapidrest/core";
+import type { ObjectFactory } from "@rapidrest/service-core";
 import { DocxTextExtractor } from "./DocxTextExtractor.js";
 import { HtmlTextExtractor } from "./HtmlTextExtractor.js";
 import { PdfTextExtractor } from "./PdfTextExtractor.js";
 import { PlainTextExtractor } from "./PlainTextExtractor.js";
 import { TextExtractor } from "./TextExtractor.js";
 import { inspectZipArchive } from "./ZipBombGuard.js";
-const { Config, Logger } = ObjectDecorators;
+const { Config, Destroy, Init, Logger } = ObjectDecorators;
 
 const noop = (): void => undefined;
 
@@ -116,16 +117,27 @@ export class ExtractorRegistry {
     /** The worker entry point; `undefined` means in-process only. Overridable for tests. */
     private workerUrl: URL | undefined = resolveExtractionWorkerUrl(import.meta.url);
 
-    private extractors: TextExtractor[] = [
-        new PlainTextExtractor(),
-        new HtmlTextExtractor(),
-        new PdfTextExtractor(),
-        new DocxTextExtractor(),
-    ];
+    // Automatically injected by ObjectFactory on instantiation
+    private _objectFactory?: ObjectFactory;
 
-    private byMimeType: Map<string, TextExtractor> = new Map(
-        this.extractors.flatMap((extractor) => extractor.mimeTypes.map((mimeType) => [mimeType, extractor])),
-    );
+    private extractors: TextExtractor[] = [];
+
+    private byMimeType: Map<string, TextExtractor> = new Map();
+
+    /** Obtains the built-in extractors from the ObjectFactory and indexes them by MIME type, once on instantiation. */
+    @Init
+    protected async initExtractors(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        this.extractors = [
+            await this._objectFactory.newInstance<PlainTextExtractor>(PlainTextExtractor, { name: "default" }),
+            await this._objectFactory.newInstance<HtmlTextExtractor>(HtmlTextExtractor, { name: "default" }),
+            await this._objectFactory.newInstance<PdfTextExtractor>(PdfTextExtractor, { name: "default" }),
+            await this._objectFactory.newInstance<DocxTextExtractor>(DocxTextExtractor, { name: "default" }),
+        ];
+        this.byMimeType = new Map(this.extractors.flatMap((extractor) => extractor.mimeTypes.map((mimeType) => [mimeType, extractor])));
+    }
 
     /** Whether an extractor is registered for `mimeType`, taken as its bare, lower-cased `type/subtype` (parameters and casing ignored). */
     public supports(mimeType: string): boolean {
@@ -198,7 +210,9 @@ export class ExtractorRegistry {
         }
     }
 
-    /** Terminates the extraction worker, if one is running. Safe to call at any time; a later `extract()` starts a new one. */
+    /** Terminates the extraction worker, if one is running. Safe to call at any time; a later `extract()` starts a new one.
+     * Also run by the ObjectFactory when it destroys this instance. */
+    @Destroy
     public async dispose(): Promise<void> {
         const handle = this.workerHandle;
         if (handle) {

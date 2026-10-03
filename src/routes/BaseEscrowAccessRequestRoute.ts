@@ -35,7 +35,7 @@ import {
     Matter,
     MasterKeyWrap,
 } from "../models/types.js";
-const { Config, Logger } = ObjectDecorators;
+const { Config, Init, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
 const { Get, Param, Post, Query, Request, User: AuthUser } = RouteDecorators;
 
@@ -53,7 +53,7 @@ export interface EscrowAccessMaterial {
 }
 
 /**
- * Implements `specs/end-to-end_encryption.md`'s M-of-N dual control - a bespoke class (own `init()`-built
+ * Implements `specs/end-to-end_encryption.md`'s M-of-N dual control - a bespoke class (own `@Init`-built
  * `RepoUtils`, no `@Model`-driven CRUD, same shape as `BaseKeyVaultRoute`), because this lifecycle doesn't
  * fit `POST`/`PUT`/generic `find()`: creation cross-validates three other entities and seeds `approvals`;
  * mutation only ever happens via `/approve`/`/deny`, never a raw `PUT`; `/material` returns a shape that
@@ -83,10 +83,10 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private requestRepo?: RepoUtils<R>;
-    private matterRepo?: RepoUtils<M>;
-    private mailboxRepo?: RepoUtils<MB>;
-    private keyVaultRepo?: RepoUtils<KeyVault>;
+    protected requestRepo?: RepoUtils<R>;
+    protected matterRepo?: RepoUtils<M>;
+    protected mailboxRepo?: RepoUtils<MB>;
+    protected keyVaultRepo?: RepoUtils<KeyVault>;
 
     /** Exposes the `@Model(...)`-supplied entity class so `@Transactional()` on `persistCreate()`/
      * `persistApprove()`/`persistMaterialRead()` can resolve which datasource to open a transaction
@@ -102,27 +102,31 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.requestRepo) {
-            this.requestRepo = await this._objectFactory!.newInstance(RepoUtils, {
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.requestRepo && this.escrowAccessRequestClass) {
+            this.requestRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.escrowAccessRequestClass.name,
                 args: [this.escrowAccessRequestClass],
             });
         }
-        if (!this.matterRepo) {
-            this.matterRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.matterClass.name,
                 args: [this.matterClass],
             });
         }
-        if (!this.mailboxRepo) {
-            this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
             });
         }
-        if (!this.keyVaultRepo) {
-            this.keyVaultRepo = await this._objectFactory!.newInstance(RepoUtils, {
+        if (!this.keyVaultRepo && this.keyVaultClass) {
+            this.keyVaultRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.keyVaultClass.name,
                 args: [this.keyVaultClass],
             });
@@ -175,7 +179,6 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
 
     @Post()
     public async create(body: { matterId: string; mailboxUid: string }, @AuthUser user?: JWTUser): Promise<R> {
-        await this.init();
         if (!user) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
@@ -237,7 +240,6 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
 
     @Post("/:id/approve")
     public async approve(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<R> {
-        await this.init();
         // Holder-gated BEFORE any state check below (matches `deny()`/`findById()`'s already-correct order in
         // this same class): otherwise this request's own pending/not-pending status is a distinguishable-409
         // oracle for anyone who knows or guesses its id, holder or not.
@@ -286,7 +288,6 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
 
     @Post("/:id/deny")
     public async deny(@Param("id") id: string, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<R> {
-        await this.init();
         const request: R = await this.requireRequest(id);
         const matter: M = await this.requireMatter(request.matterId);
         await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
@@ -329,7 +330,6 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
      */
     @Get("/:id/material")
     public async material(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<EscrowAccessMaterial> {
-        await this.init();
         // Holder-gated BEFORE any state check below (matches `deny()`/`findById()`'s already-correct order in
         // this same class): otherwise this request's own approval status is a distinguishable-403 oracle for
         // anyone who knows or guesses its id, holder or not - precisely learning when someone else's mailbox
@@ -408,7 +408,6 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
      */
     @Get()
     public async find(@Query() query: any, @AuthUser user?: JWTUser): Promise<R[]> {
-        await this.init();
         const { limit, page } = parseListPaging(query);
         const heldScopes: string | undefined = exactInFilter(await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user));
         if (!heldScopes) {
@@ -456,7 +455,6 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
 
     @Get("/:id")
     public async findById(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<R> {
-        await this.init();
         const request: R = await this.requireRequest(id);
         const matter: M = await this.requireMatter(request.matterId);
         await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);

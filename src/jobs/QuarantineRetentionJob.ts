@@ -46,9 +46,9 @@ export abstract class QuarantineRetentionJob<Q extends QuarantineEntry> extends 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private quarantineEntryRepo?: RepoUtils<Q>;
-    private scanResultRepo?: RepoUtils<any>;
-    private ingestQueueEntryRepo?: RepoUtils<any>;
+    protected quarantineEntryRepo?: RepoUtils<Q>;
+    protected scanResultRepo?: RepoUtils<any>;
+    protected ingestQueueEntryRepo?: RepoUtils<any>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -82,18 +82,27 @@ export abstract class QuarantineRetentionJob<Q extends QuarantineEntry> extends 
 
     @Init
     public async init(): Promise<void> {
-        this.quarantineEntryRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.quarantineEntryClass.name,
-            args: [this.quarantineEntryClass],
-        });
-        this.scanResultRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.scanResultClass.name,
-            args: [this.scanResultClass],
-        });
-        this.ingestQueueEntryRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.ingestQueueEntryClass.name,
-            args: [this.ingestQueueEntryClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.quarantineEntryRepo && this.quarantineEntryClass) {
+            this.quarantineEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.quarantineEntryClass.name,
+                args: [this.quarantineEntryClass],
+            });
+        }
+        if (!this.scanResultRepo && this.scanResultClass) {
+            this.scanResultRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.scanResultClass.name,
+                args: [this.scanResultClass],
+            });
+        }
+        if (!this.ingestQueueEntryRepo && this.ingestQueueEntryClass) {
+            this.ingestQueueEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.ingestQueueEntryClass.name,
+                args: [this.ingestQueueEntryClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {

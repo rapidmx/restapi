@@ -60,7 +60,7 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private calendarEventRepo?: RecoverableRepoUtils<CE>;
+    protected calendarEventRepo?: RecoverableRepoUtils<CE>;
 
     @Inject(NotificationUtils)
     private notificationUtils?: NotificationUtils;
@@ -99,10 +99,15 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
 
     @Init
     public async init(): Promise<void> {
-        this.calendarEventRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.calendarEventClass.name,
-            args: [this.calendarEventClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.calendarEventRepo && this.calendarEventClass) {
+            this.calendarEventRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.calendarEventClass.name,
+                args: [this.calendarEventClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {

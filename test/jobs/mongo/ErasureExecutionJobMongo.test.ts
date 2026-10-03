@@ -771,15 +771,7 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         await contactRepo.save(new ContactMongo({ mailboxUid: mailbox.uid, folderUid: uuid.v4(), displayName: "B" }));
         const request = await createRequest({ mailboxUid: mailbox.uid });
 
-        const originalNewInstance = objectFactory.newInstance.bind(objectFactory);
-        let contactRepoUtilsCreated = 0;
-        vi.spyOn(objectFactory, "newInstance").mockImplementation(async (...args: any[]) => {
-            const instance: any = await originalNewInstance(...args);
-            if (args[1]?.name === "ContactMongo" && contactRepoUtilsCreated++ === 0) {
-                vi.spyOn(instance, "delete").mockRejectedValueOnce(new Error("simulated delete failure"));
-            }
-            return instance;
-        });
+        vi.spyOn((job as any).entityRepos.get(ContactMongo), "delete").mockRejectedValueOnce(new Error("simulated delete failure"));
 
         await job.run();
 

@@ -7,7 +7,7 @@ import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators 
 import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { AuditAction, MIN_AUDIT_LOG_RETENTION_DAYS, RetentionPolicy } from "../models/types.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
-const { Config, Logger } = ObjectDecorators;
+const { Config, Init, Logger } = ObjectDecorators;
 const { Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorators;
 
 /** The fixed, well-known identifier of the one `RetentionPolicy` row this route ever reads/writes - same
@@ -36,7 +36,7 @@ const DEFAULT_RETENTION_POLICY: PublicRetentionPolicy = {};
 /**
  * This deployment's data-retention policy (see `RetentionPolicy`'s own doc comment) - a singleton row,
  * admin-editable, readable by any authenticated user. Modeled directly on
- * `BaseEncryptionPolicyRoute.ts`/`BaseBrandingRoute.ts`: a bespoke class (own `init()`-built `RepoUtils`,
+ * `BaseEncryptionPolicyRoute.ts`/`BaseBrandingRoute.ts`: a bespoke class (own `@Init`-built `RepoUtils`,
  * no `@Model`) since there is exactly one row, never a real collection, and its read/write halves need
  * different authorization.
  *
@@ -72,12 +72,13 @@ export abstract class BaseRetentionPolicyRoute<T extends RetentionPolicy> {
     @Logger
     private logger: any;
 
-    private async init(): Promise<void> {
-        if (!this.retentionPolicyRepo) {
-            this.retentionPolicyRepo = await this._objectFactory!.newInstance(RepoUtils, {
-                name: this.retentionPolicyClass.name,
-                args: [this.retentionPolicyClass],
-            });
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.retentionPolicyRepo && this.retentionPolicyClass) {
+            this.retentionPolicyRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.retentionPolicyClass.name, args: [this.retentionPolicyClass] });
         }
     }
 
@@ -176,7 +177,6 @@ export abstract class BaseRetentionPolicyRoute<T extends RetentionPolicy> {
         if (!user) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
-        await this.init();
         const existing: T | undefined = await this.retentionPolicyRepo!.findOne(RETENTION_POLICY_UID, { ignoreACL: true });
         return existing ? this.toPublic(existing) : DEFAULT_RETENTION_POLICY;
     }
@@ -188,8 +188,6 @@ export abstract class BaseRetentionPolicyRoute<T extends RetentionPolicy> {
         // A shorter period purges every user's mail: a trusted role alone isn't enough, the token must be elevated.
         assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const patch: RetentionPolicyUpdate = this.extractPatch(obj);
-
-        await this.init();
         this.assertFloors(patch, await this.retentionPolicyRepo!.findOne(RETENTION_POLICY_UID, { ignoreACL: true }));
         const existing: T = await this.findOrCreate();
 

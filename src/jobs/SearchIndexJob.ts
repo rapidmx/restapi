@@ -51,8 +51,8 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    private messageRepo?: RecoverableRepoUtils<M>;
-    private attachmentRepo?: RepoUtils<A>;
+    protected messageRepo?: RecoverableRepoUtils<M>;
+    protected attachmentRepo?: RepoUtils<A>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -81,14 +81,21 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
 
     @Init
     public async init(): Promise<void> {
-        this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-            name: this.messageClass.name,
-            args: [this.messageClass],
-        });
-        this.attachmentRepo = await this._objectFactory!.newInstance(RepoUtils, {
-            name: this.attachmentClass.name,
-            args: [this.attachmentClass],
-        });
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
+        if (!this.attachmentRepo && this.attachmentClass) {
+            this.attachmentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.attachmentClass.name,
+                args: [this.attachmentClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {

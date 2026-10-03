@@ -2,12 +2,13 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { type JWTUser } from "@rapidrest/core";
+import { ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { HttpRequest, RepoFindOptions, RouteDecorators } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { Label, Message } from "../models/types.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
+const { Init } = ObjectDecorators;
 const { Delete, Param, Query, Request, User: AuthUser } = RouteDecorators;
 
 /** How many `Message`s `cleanUpDeletedLabel()` fetches per page while scanning a mailbox for messages that
@@ -49,16 +50,16 @@ export abstract class BaseLabelRoute<T extends Label, M extends Message> extends
      * the Mongo/SQL concrete subclass - `Message.labelUids` is a native array on Mongo and JSON text on SQL. */
     protected abstract buildLabelUidsFilter(labelUids: string[]): Record<string, any>;
 
-    private messageRepo?: RecoverableRepoUtils<M>;
+    protected messageRepo?: RecoverableRepoUtils<M>;
 
-    private async getMessageRepo(): Promise<RecoverableRepoUtils<M>> {
-        if (!this.messageRepo) {
-            this.messageRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
-                name: this.messageClass.name,
-                args: [this.messageClass],
-            });
+    @Init
+    protected async initLabelRepos(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
         }
-        return this.messageRepo;
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
+        }
     }
 
     /**
@@ -68,7 +69,7 @@ export abstract class BaseLabelRoute<T extends Label, M extends Message> extends
      * page of the mailbox's messages rather than just the first (see class doc comment).
      */
     private async cleanUpDeletedLabel(mailboxUid: string, labelUid: string): Promise<void> {
-        const repo: RecoverableRepoUtils<M> = await this.getMessageRepo();
+        const repo: RecoverableRepoUtils<M> = this.messageRepo!;
         // Only the messages that carry the label (`buildLabelUidsFilter()`), never the whole mailbox. Each one stripped drops out of that
         // filter, so every round reads the first page again; a round that stripped nothing ends it. A message the user deleted is still
         // there to be restored, so a second pass covers those (`find()` only returns them for an explicit `deleted: true`).
