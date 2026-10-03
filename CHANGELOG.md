@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-10-03
+
+### Changed
+- Build the repositories of the additional models of every route once in a single @Init hook, rather than lazily in the method that uses them or in an init() that each handler called, and keep the hooks of the classes that share a base under names that cannot shadow each other
+- Build the repositories that a job used to make on demand, or on every call, in its @Init hook, and make its repositories protected
+- Build a repository the routes made on every call only once
+- Inject the extraction registry into the job that extracts attachment text so that its limits and its logger are configured, and stop its worker thread when the server shuts down
+- Take the extractors of the extraction registry, the health of a signing enrollment and the loader of sanitized bodies from the ObjectFactory instead of making them with new
+- Read the type of the SQL database of the scheduled send job from its own configuration key and take the model of the erasure requests of the scan queue job from its binding rather than from the name of another class
+- Record the audit log through an AuditLogUtils service that is built once from the audit log repository, rather than through a function that took the ObjectFactory and the model class on every call
+- Resolve the domains of a mailbox, record the escrow audit chain and keep the correspondents of a mailbox through DomainUtils, EscrowAuditUtils and CorrespondentUtils services, with the backfill of the correspondents in its own service
+- Pass the repository instead of the ObjectFactory and the model class to the utilities for the legal hold, the escrow holder, the folder of a record, the blob references, the purge of a message, the content of a mailbox and the policy of a mailbox
+- Take the repositories and services that the routes and the jobs need from their @Init hooks, and stop caching the repositories of the utilities by model class, which could hand one ObjectFactory the repository of another
+- Fall back to the unkeyed hash with a warning when the key of the escrow audit chain is not set, as the old function did
+
 ## [0.29.0] - 2026-10-02
 
 ### Changed
@@ -1333,7 +1348,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/rapidmx/restapi/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/rapidmx/restapi/compare/v0.28.1...v0.29.0
 [0.28.1]: https://github.com/rapidmx/restapi/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/rapidmx/restapi/compare/v0.27.1...v0.28.0
