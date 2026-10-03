@@ -10,6 +10,7 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    RepoUtils,
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
@@ -17,7 +18,7 @@ import type { DkimKeyProvider } from "../dkim/DkimKeyProvider.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { PluginRegistry } from "../plugins/PluginRegistry.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { checkDnsSetup, type DnsRecordCheck } from "../util/DnsSetupUtils.js";
 import { checkDomainVerification } from "../util/DomainVerificationUtils.js";
 import { extractPublicHostname, isReservedDomainName } from "../util/DomainUtils.js";
@@ -27,7 +28,7 @@ const { Get, Param, Post, Query, Request, RequiresTrustedRole, Response, User: A
 /** A host name in lowercase: dot-separated labels of letters, digits and hyphens (a label neither starts nor ends with one, at most 63 characters), at most 253 in all. */
 const DOMAIN_NAME_PATTERN: RegExp = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
 
-const { Config, Inject } = ObjectDecorators;
+const { Config, Init, Inject } = ObjectDecorators;
 
 const DMARC_POLICIES = new Set(["none", "quarantine", "reject"]);
 
@@ -61,9 +62,28 @@ function validateDmarcPolicy(dmarcPolicy: unknown): void {
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
-    /** Supplied by the Mongo/SQL concrete subclasses so `recordAuditLog()` can persist an `AuditLogEntry`
+    /** Supplied by the Mongo/SQL concrete subclasses so `AuditLogUtils` can persist an `AuditLogEntry`
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
+
+    /** The `AuditLogEntry` repository, built once by `initDomainRepos()`. */
+    protected auditLogRepo?: RepoUtils<any>;
+
+    /** Records the audit entries, built once by `initDomainRepos()` from `auditLogRepo`. */
+    protected auditLogUtils?: AuditLogUtils;
+
+    @Init
+    protected async initDomainRepos(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
+        }
+    }
 
     @Inject("DnsResolver")
     private dnsResolver?: DnsResolver;
@@ -210,11 +230,9 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
             : [await this.doCreateObject(objs[0], { req, user, ignoreACL: true })];
 
         for (const domain of created) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, req, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 { action: AuditAction.DOMAIN_CREATE, targetType: "Domain", targetUid: domain.uid, details: { name: domain.name } },
+                { req, user },
             );
         }
 
@@ -268,11 +286,9 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
 
         const updated: T = await this.repoUtils!.update(patch, existing, { user, version: (obj as any).version, ignoreACL: true });
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.DOMAIN_UPDATE, targetType: "Domain", targetUid: updated.uid, details: { name: updated.name } },
+            { req, user },
         );
 
         return updated;
@@ -337,11 +353,9 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         await this.assertNoDependentAliases(existing.uid);
         await this.repoUtils!.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.DOMAIN_DELETE, targetType: "Domain", targetUid: existing.uid, details: { name: existing.name } },
+            { req, user },
         );
     }
 
@@ -409,11 +423,9 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         const updated: T = await this.repoUtils!.update(patch, domain, { user, version: domain.version, ignoreACL: true });
 
         if (nowVerified) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, req, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 { action: AuditAction.DOMAIN_VERIFIED, targetType: "Domain", targetUid: updated.uid, details: { name: updated.name } },
+                { req, user },
             );
         }
 

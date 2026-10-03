@@ -2,22 +2,15 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import type { JWTUser, ObjectFactory } from "@rapidrest/core";
-import { type AccessControlList, type ACLRecord, type ACLUtils, ModelUtils, RepoUtils } from "@rapidrest/service-core";
+import type { JWTUser } from "@rapidrest/core";
+import { type AccessControlList, type ACLRecord, type ACLUtils, ModelUtils, type RepoUtils } from "@rapidrest/service-core";
 import { Folder, FolderType } from "../models/types.js";
 import { nameBasedUuid } from "./UuidUtils.js";
 
-/** Caches one `RepoUtils` per concrete `Folder` class (Mongo vs SQL) - mirrors `EscrowUtils.ts`'s
- * identical `getEscrowScopeRepo()` pattern. */
-const folderRepoCache = new WeakMap<any, Promise<RepoUtils<Folder>>>();
-
-function getCachedFolderRepo(objectFactory: ObjectFactory, folderClass: any): Promise<RepoUtils<Folder>> {
-    let cached = folderRepoCache.get(folderClass);
-    if (!cached) {
-        cached = Promise.resolve(objectFactory.newInstance(RepoUtils, { name: folderClass.name, args: [folderClass] }));
-        folderRepoCache.set(folderClass, cached);
-    }
-    return cached;
+/** What `getMailboxUidForFolder()` can be asked. */
+export interface MailboxUidForFolderOptions {
+    /** A soft-deleted folder resolves to `undefined` too (a write into it is refused). */
+    rejectDeleted?: boolean;
 }
 
 /**
@@ -35,14 +28,12 @@ function getCachedFolderRepo(objectFactory: ObjectFactory, folderClass: any): Pr
  * authoritative).
  */
 export async function getMailboxUidForFolder(
-    objectFactory: ObjectFactory,
-    folderClass: any,
+    folderRepo: RepoUtils<Folder>,
     folderUid: string,
-    rejectDeleted: boolean = false,
+    options: MailboxUidForFolderOptions = {},
 ): Promise<string | undefined> {
-    const repo: RepoUtils<Folder> = await getCachedFolderRepo(objectFactory, folderClass);
-    const folder: Folder | undefined = await repo.findOne(folderUid, { ignoreACL: true, includeDeleted: true });
-    if (rejectDeleted && (folder as any)?.deleted) {
+    const folder: Folder | undefined = await folderRepo.findOne(folderUid, { ignoreACL: true, includeDeleted: true });
+    if (options.rejectDeleted && (folder as any)?.deleted) {
         return undefined;
     }
     return folder?.mailboxUid;

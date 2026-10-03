@@ -2,23 +2,10 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, type ObjectFactory } from "@rapidrest/core";
-import { ApiErrors, RepoUtils } from "@rapidrest/service-core";
+import { ApiError } from "@rapidrest/core";
+import { ApiErrors, type RepoUtils } from "@rapidrest/service-core";
 import { Matter } from "../models/types.js";
 import { findPagesByUid } from "./MailboxContentUtils.js";
-
-/** Caches one `RepoUtils` per concrete `Matter` class (Mongo vs SQL) - mirrors `EscrowUtils.ts`'s
- * identical `getEscrowScopeRepo()` pattern. */
-const matterRepoCache = new WeakMap<any, Promise<RepoUtils<Matter>>>();
-
-function getMatterRepo(objectFactory: ObjectFactory, matterClass: any): Promise<RepoUtils<Matter>> {
-    let cached = matterRepoCache.get(matterClass);
-    if (!cached) {
-        cached = Promise.resolve(objectFactory.newInstance(RepoUtils, { name: matterClass.name, args: [matterClass] }));
-        matterRepoCache.set(matterClass, cached);
-    }
-    return cached;
-}
 
 /** Fetches every page of `repo.find()` results - see `MailboxContentUtils`' identical rationale
  * (a bare, unpaginated `find()` silently truncates at 100 rows). Unlike `EscrowScope` (admin-only,
@@ -49,8 +36,7 @@ export interface LegalHoldIndex {
 }
 
 /** Loads a `LegalHoldIndex` - see its doc comment. */
-export async function loadLegalHoldIndex(objectFactory: ObjectFactory, matterClass: any): Promise<LegalHoldIndex> {
-    const repo: RepoUtils<Matter> = await getMatterRepo(objectFactory, matterClass);
+export async function loadLegalHoldIndex(repo: RepoUtils<Matter>): Promise<LegalHoldIndex> {
     const open: Matter[] = (await findAllMatters(repo)).filter((matter) => !matter.closedAt);
     const byMailbox: Map<string, Matter[]> = new Map();
     for (const matter of open) {
@@ -92,13 +78,7 @@ function matterCovers(matter: Matter, referenceDate: Date): boolean {
  * `EscrowUtils.findHeldScopeIds()`'s admin-only `EscrowScope`, `Matter` is holder-gated CRUD, so the row
  * count isn't bounded the same way and a bare, unpaginated `find()` could silently miss a real hold.
  */
-export async function findActiveHoldsFor(
-    objectFactory: ObjectFactory,
-    matterClass: any,
-    mailboxUid: string,
-    referenceDate?: Date,
-): Promise<Matter[]> {
-    const repo: RepoUtils<Matter> = await getMatterRepo(objectFactory, matterClass);
+export async function findActiveHoldsFor(repo: RepoUtils<Matter>, mailboxUid: string, referenceDate?: Date): Promise<Matter[]> {
     const matters: Matter[] = await findAllMatters(repo);
     return matters.filter((matter) => {
         if (matter.closedAt || !matter.custodianMailboxUids.includes(mailboxUid)) {
@@ -119,13 +99,8 @@ export async function findActiveHoldsFor(
  * discoverable. Blocking erasure this way is the legally correct behavior under GDPR Article 17(3), not
  * a workaround to route around.
  */
-export async function assertNotOnLegalHold(
-    objectFactory: ObjectFactory,
-    matterClass: any,
-    mailboxUid: string,
-    referenceDate?: Date,
-): Promise<void> {
-    const holds: Matter[] = await findActiveHoldsFor(objectFactory, matterClass, mailboxUid, referenceDate);
+export async function assertNotOnLegalHold(repo: RepoUtils<Matter>, mailboxUid: string, referenceDate?: Date): Promise<void> {
+    const holds: Matter[] = await findActiveHoldsFor(repo, mailboxUid, referenceDate);
     if (holds.length > 0) {
         throw new ApiError(
             ApiErrors.IDENTIFIER_EXISTS,

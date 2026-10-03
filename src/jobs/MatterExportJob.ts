@@ -10,9 +10,16 @@ import { retainedBodyBlobKeysOf } from "../util/DraftBodyRetentionUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
 import { DEFAULT_MAX_EXPORT_BYTES } from "./DataExportJob.js";
 import { softDeletedContentLines } from "./SoftDeletedContent.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
-import { collectMailboxContentLines, DEFAULT_MAX_MAILBOX_CONTENT_ROWS, findPagesByUid, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
+import { EscrowAuditUtils } from "../util/EscrowAuditUtils.js";
+import {
+    collectMailboxContentLines,
+    DEFAULT_MAX_MAILBOX_CONTENT_ROWS,
+    findPagesByUid,
+    MailboxContentEntity,
+    MailboxContentEntityClasses,
+    MailboxContentRepos,
+} from "../util/MailboxContentUtils.js";
 import { AuditAction, EscrowAuditAction, Mailbox, Matter, MatterExportRequest, Message } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
@@ -38,7 +45,7 @@ interface MatterExportLease<T> {
  * Every custodian mailbox actually included is logged as its own `EscrowAuditAction.MATTER_EXPORT_READY`
  * hash-chained entry (that ledger's schema is inherently one-mailbox-per-entry) once the bundle as a whole
  * is stored; a request-level failure (e.g. the `Matter` itself was deleted before this job could run) goes
- * through the ordinary `AuditAction.MATTER_EXPORT_FAILED`/`recordAuditLog()` instead, since it isn't a
+ * through the ordinary `AuditAction.MATTER_EXPORT_FAILED`/`AuditLogUtils.record()` instead, since it isn't a
  * per-mailbox content disclosure event the hash chain is meant to capture - no `mailboxUid` to attribute it
  * to at all in that case, unlike `DataExportJob.markFailed()`'s own always-single-mailboxUid failure.
  *
@@ -90,6 +97,15 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
     protected matterRepo?: RepoUtils<M>;
     protected mailboxRepo?: RepoUtils<MB>;
     protected messageRepo?: RepoUtils<any>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected escrowAuditEntryRepo?: RepoUtils<any>;
+    protected escrowAuditHeadRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
+    protected escrowAuditUtils?: EscrowAuditUtils;
+
+    /** The repository of every entity type a custodian mailbox's content export reads, built once in `init()` for each model class
+     * the subclass supplies (the `message` one is `messageRepo`). */
+    protected contentRepos?: MailboxContentRepos;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -128,10 +144,6 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
     @Config("mail:jobs:matter_export:attestation_grace_seconds", 300)
     private attestationGraceSeconds: number = 300;
 
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
-    @Config()
-    private config: any;
-
     @Logger
     private logger: any;
 
@@ -166,6 +178,50 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
             this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.escrowAuditEntryRepo && this.escrowAuditLogClass) {
+            this.escrowAuditEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.escrowAuditLogClass.name,
+                args: [this.escrowAuditLogClass],
+            });
+        }
+        const escrowAuditHeadClass: any = this.escrowAuditLogClass?.escrowAuditHeadClass;
+        if (!this.escrowAuditHeadRepo && escrowAuditHeadClass) {
+            this.escrowAuditHeadRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: escrowAuditHeadClass.name,
+                args: [escrowAuditHeadClass],
+            });
+        }
+        if (!this.contentRepos) {
+            const contentRepos: Partial<MailboxContentRepos> = {};
+            for (const [entityType, entityClass] of Object.entries(this.contentEntityClasses) as [MailboxContentEntity, any][]) {
+                if (!entityClass) {
+                    continue;
+                }
+                contentRepos[entityType] =
+                    entityType === "message"
+                        ? this.messageRepo
+                        : await this._objectFactory.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
+            }
+            this.contentRepos = contentRepos as MailboxContentRepos;
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
+            });
+        }
+        if (!this.escrowAuditUtils && this.escrowAuditLogClass) {
+            this.escrowAuditUtils = await this._objectFactory.newInstance(EscrowAuditUtils, {
+                name: this.escrowAuditLogClass.name,
+                args: [this.escrowAuditEntryRepo, this.escrowAuditHeadRepo],
             });
         }
     }
@@ -347,7 +403,7 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
      * Records the `MATTER_EXPORT_READY` escrow audit entry of every custodian mailbox `request` (a `"ready"` export) still owes
      * (`pendingAttestationMailboxUids`), then leaves on the request only those it could not record. Best-effort per mailbox,
      * deliberately NOT allowed to throw: the request is already
-     * genuinely `"ready"` (its bundle is real, stored, and downloadable), so a failure here (e.g. `recordEscrowAuditEntry()`'s own
+     * genuinely `"ready"` (its bundle is real, stored, and downloadable), so a failure here (e.g. `EscrowAuditUtils.record()`'s own
      * sequence-contention retries exhausted under a concurrent writer) must not route through `run()`'s `catch`/`markFailed()`,
      * which would write a stale version and fail its own optimistic lock. What could not be recorded stays on the request and is
      * retried by the next run (`run()`), logged loudly meanwhile.
@@ -357,7 +413,7 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
         const stillOwed: string[] = [];
         for (const mailboxUid of owed) {
             try {
-                await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
+                await this.escrowAuditUtils!.record({
                     action: EscrowAuditAction.MATTER_EXPORT_READY,
                     holderUserUid: request.requestedByUserUid,
                     matterId: request.matterId,
@@ -450,8 +506,7 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
                 continue;
             }
             const lines: string[] = await collectMailboxContentLines(
-                this._objectFactory!,
-                this.contentEntityClasses,
+                this.contentRepos!,
                 mailboxUid,
                 mailbox,
                 dateRange,
@@ -470,7 +525,7 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
                 yield emit(lines[i]);
             }
             // A user's ordinary delete only flags a row: the mail a custodian deleted is still held and must be produced. Tagged `deleted: true`.
-            for await (const line of softDeletedContentLines(this._objectFactory!, this.contentEntityClasses, mailboxUid, dateRange, lines.length, this.maxContentRows)) {
+            for await (const line of softDeletedContentLines(this.contentRepos!, mailboxUid, dateRange, lines.length, this.maxContentRows)) {
                 yield emit(line);
             }
             for await (const line of this.retainedDraftBodyLines(mailboxUid, dateRange)) {
@@ -537,11 +592,6 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
             asEntity(this.requestRepo!, request),
             { ignoreACL: true },
         );
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, logger: this.logger },
-            { action: AuditAction.MATTER_EXPORT_FAILED, targetType: "MatterExportRequest", targetUid: updated.uid },
-        );
+        await this.auditLogUtils!.record({ action: AuditAction.MATTER_EXPORT_FAILED, targetType: "MatterExportRequest", targetUid: updated.uid });
     }
 }

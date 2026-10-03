@@ -6,9 +6,7 @@
 import { Logger } from "@rapidrest/core";
 import { ObjectFactory } from "@rapidrest/service-core";
 
-const audit = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
-vi.mock("../../src/util/AuditLogUtils.js", async (importOriginal) => ({ ...(await importOriginal<any>()), recordAuditLog: audit }));
-vi.mock("../../src/util/LegalHoldUtils.js", async (importOriginal) => ({ ...(await importOriginal<any>()), assertNotOnLegalHold: vi.fn().mockResolvedValue(undefined) }));
+const audit = vi.fn().mockResolvedValue(undefined);
 
 import { DataSubjectErasureRequestRouteSQL } from "../../src/routes/sql/DataSubjectErasureRequestRouteSQL.js";
 
@@ -23,6 +21,8 @@ describe("DataSubjectErasureRequest approval of one's own request", () => {
             trustedRoles: ["admin"],
             allowSelfApproval,
             init: async () => undefined,
+            auditLogUtils: { record: audit },
+            matterRepo: { find: async () => [] },
             requestRepo: { findOne: async () => request, update: async (patch: any) => ({ ...request, ...patch }) },
         });
         return route;
@@ -38,6 +38,6 @@ describe("DataSubjectErasureRequest approval of one's own request", () => {
     it("is allowed when the deployment says it has no one else, and audited as a self-approval", async () => {
         const approved = await (await newRoute(true)).approve("r1", admin);
         expect(approved).toMatchObject({ status: "approved", reviewedByUserUid: admin.uid });
-        expect(audit.mock.calls[0][3]).toMatchObject({ details: { selfApproved: true } });
+        expect(audit.mock.calls[0][0]).toMatchObject({ details: { selfApproved: true } });
     });
 });

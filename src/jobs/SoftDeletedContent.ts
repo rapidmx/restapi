@@ -2,9 +2,8 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import type { ObjectFactory } from "@rapidrest/core";
-import { ModelUtils, RecoverableBaseEntity, RepoUtils } from "@rapidrest/service-core";
-import { findPagesByUid, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
+import { ModelUtils, RecoverableBaseEntity } from "@rapidrest/service-core";
+import { findPagesByUid, MailboxContentRepos } from "../util/MailboxContentUtils.js";
 
 /**
  * Yields one JSON line, tagged `deleted: true`, for every soft-deleted row of the recoverable entity types
@@ -15,21 +14,22 @@ import { findPagesByUid, MailboxContentEntityClasses } from "../util/MailboxCont
  *
  * `rowsHeld` is how many rows the caller already has; going past `maxRows` in total throws, as `collectMailboxContentLines()`
  * does, rather than yielding a bundle that is silently cut short.
+ *
+ * `repos` holds one repository per entity type; a repository is skipped unless its model class is a `RecoverableBaseEntity` (read off
+ * the repository itself, as `RepoUtils` does for its own soft-delete handling).
  */
 export async function* softDeletedContentLines(
-    objectFactory: ObjectFactory,
-    entityClasses: MailboxContentEntityClasses,
+    repos: MailboxContentRepos,
     mailboxUid: string,
     messageDateRange: { start: Date; end: Date } | undefined,
     rowsHeld: number,
     maxRows: number,
 ): AsyncGenerator<string> {
     let rows = rowsHeld;
-    for (const [entityType, entityClass] of Object.entries(entityClasses)) {
-        if (!(new entityClass() instanceof RecoverableBaseEntity)) {
+    for (const [entityType, repo] of Object.entries(repos)) {
+        if (!((repo as any).modelClass?.prototype instanceof RecoverableBaseEntity)) {
             continue;
         }
-        const repo: RepoUtils<any> = await objectFactory.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
         const criteria: Record<string, any> = { mailboxUid: ModelUtils.literal(mailboxUid), deleted: true };
         if (entityType === "message" && messageDateRange) {
             criteria.sentDate = `range(${new Date(messageDateRange.start).toISOString()},${new Date(messageDateRange.end).toISOString()})`;

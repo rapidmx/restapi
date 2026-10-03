@@ -15,9 +15,9 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { normalizeAddress } from "../util/AddressUtils.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
-import { getPrimaryDomainNames } from "../util/DomainUtils.js";
+import { DomainUtils } from "../util/DomainUtils.js";
 import { AuditAction, DistributionList, Mailbox } from "../models/types.js";
 const { Init } = ObjectDecorators;
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
@@ -64,11 +64,15 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
      * domains without depending on either backend directly - see `util/DomainUtils.ts`. */
     protected abstract domainClass: any;
 
-    /** Supplied by the Mongo/SQL concrete subclasses so `recordAuditLog()` can persist an `AuditLogEntry`
+    /** Supplied by the Mongo/SQL concrete subclasses so `AuditLogUtils` can persist an `AuditLogEntry`
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
 
     protected mailboxRepo?: RepoUtils<Mailbox>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
+    protected domainRepo?: RepoUtils<any>;
+    protected domainUtils?: DomainUtils;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -79,6 +83,30 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
             this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
+            });
+        }
+        if (!this.domainRepo && this.domainClass) {
+            this.domainRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.domainClass.name,
+                args: [this.domainClass],
+            });
+        }
+        if (!this.domainUtils && this.domainClass) {
+            this.domainUtils = await this._objectFactory.newInstance(DomainUtils, {
+                name: this.domainClass.name,
+                args: [this.domainRepo],
             });
         }
     }
@@ -200,7 +228,7 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
     @RequiresTrustedRole()
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         const objs: T[] = Array.isArray(obj) ? obj : [obj];
-        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
+        const domains: string[] = await this.domainUtils!.getPrimaryDomainNames();
 
         const seenUids: Set<string> = new Set();
         for (const o of objs) {
@@ -220,16 +248,14 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
             : [await this.doCreateObject(objs[0], { req, user, ignoreACL: true })];
 
         for (const list of created) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, req, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 {
                     action: AuditAction.DISTRIBUTION_LIST_CREATE,
                     targetType: "DistributionList",
                     targetUid: list.uid,
                     details: { primarySmtpAddress: list.primarySmtpAddress, name: list.name },
                 },
+                { req, user },
             );
         }
 
@@ -249,7 +275,7 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
      * be caught by a `uid`-keyed check alone.
      */
     private async validateAddressChange(existing: T, newAddress: string): Promise<void> {
-        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
+        const domains: string[] = await this.domainUtils!.getPrimaryDomainNames();
         const domain: string | undefined = newAddress.split("@")[1]?.toLowerCase();
         if (domains.length > 0 && (!domain || !domains.includes(domain))) {
             throw new ApiError(
@@ -279,7 +305,7 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         if (added.length === 0) {
             return;
         }
-        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
+        const domains: string[] = await this.domainUtils!.getPrimaryDomainNames();
         await this.validateAliasAddresses(domains, added);
     }
 
@@ -358,16 +384,14 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         }
         const updated: T = await this.repoUtils!.update(obj, existing, { user, version: (obj as any).version, ignoreACL: true });
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.DISTRIBUTION_LIST_UPDATE,
                 targetType: "DistributionList",
                 targetUid: updated.uid,
                 details: { primarySmtpAddress: updated.primarySmtpAddress, name: updated.name },
             },
+            { req, user },
         );
 
         return updated;
@@ -387,16 +411,14 @@ export abstract class BaseDistributionListRoute<T extends DistributionList> exte
         }
         await this.repoUtils!.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.DISTRIBUTION_LIST_DELETE,
                 targetType: "DistributionList",
                 targetUid: existing.uid,
                 details: { primarySmtpAddress: existing.primarySmtpAddress, name: existing.name },
             },
+            { req, user },
         );
     }
 

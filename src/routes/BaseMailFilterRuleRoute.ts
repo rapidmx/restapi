@@ -4,11 +4,10 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrors, HttpRequest, ModelUtils, RepoUtils, RouteDecorators, type UpdateObject } from "@rapidrest/service-core";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
 import { getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { isPlainAddress } from "../util/MimeHeaderUtils.js";
 import { normalizeFilterSenderList } from "../util/SenderListUtils.js";
-import { AuditAction, Label, MailFilterAction, MailFilterActionType, MailFilterRule } from "../models/types.js";
+import { AuditAction, Folder, Label, MailFilterAction, MailFilterActionType, MailFilterRule } from "../models/types.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 const { Init } = ObjectDecorators;
 const { Request, User: AuthUser } = RouteDecorators;
@@ -52,6 +51,7 @@ export abstract class BaseMailFilterRuleRoute<T extends MailFilterRule> extends 
     protected abstract labelClass: any;
 
     protected labelRepo?: RepoUtils<Label>;
+    protected folderRepo?: RepoUtils<Folder>;
 
     @Init
     protected async initMailFilterRuleRepos(): Promise<void> {
@@ -60,6 +60,9 @@ export abstract class BaseMailFilterRuleRoute<T extends MailFilterRule> extends 
         }
         if (!this.labelRepo && this.labelClass) {
             this.labelRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.labelClass.name, args: [this.labelClass] });
+        }
+        if (!this.folderRepo && this.folderClass) {
+            this.folderRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
         }
     }
 
@@ -77,7 +80,7 @@ export abstract class BaseMailFilterRuleRoute<T extends MailFilterRule> extends 
             const folderUid: unknown = action?.folderUid;
             if (folderUid !== undefined && folderUid !== null && folderUid !== "") {
                 const owner: string | undefined =
-                    typeof folderUid === "string" ? await getMailboxUidForFolder(this._objectFactory!, this.folderClass, folderUid) : undefined;
+                    typeof folderUid === "string" ? await getMailboxUidForFolder(this.folderRepo!, folderUid) : undefined;
                 if (owner !== mailboxUid) {
                     throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A rule can only move or copy mail to a folder in its own mailbox.");
                 }
@@ -125,10 +128,7 @@ export abstract class BaseMailFilterRuleRoute<T extends MailFilterRule> extends 
         const forwardsTo: string[] = rule.actions
             .filter((entry: MailFilterAction) => entry.type === MailFilterActionType.FORWARD)
             .map((entry: MailFilterAction) => String(entry.forwardTo));
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action,
                 targetType: "MailFilterRule",
@@ -136,6 +136,7 @@ export abstract class BaseMailFilterRuleRoute<T extends MailFilterRule> extends 
                 mailboxUid: rule.mailboxUid,
                 details: { name: rule.name, enabled: rule.enabled, ...(forwardsTo.length > 0 ? { forwardsTo } : {}) },
             },
+            { req, user },
         );
     }
 

@@ -16,7 +16,7 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
-import { eventObservations, recordCorrespondents } from "../util/CorrespondentUtils.js";
+import { CorrespondentUtils, eventObservations } from "../util/CorrespondentUtils.js";
 import { boundIndexedValue } from "../util/ConversationUtils.js";
 import { coerceCalendarEventDates } from "../util/DateCoercionUtils.js";
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
@@ -144,6 +144,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     protected mailboxRepo?: RepoUtils<any>;
     protected messageRepo?: RepoUtils<any>;
     protected folderRepo?: RepoUtils<any>;
+    protected correspondentRepo?: RepoUtils<any>;
+    protected correspondentUtils?: CorrespondentUtils;
 
     @Inject("MailTransport")
     private mailTransport?: any;
@@ -297,12 +299,24 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (!this.folderRepo && this.folderClass) {
             this.folderRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
         }
+        if (!this.correspondentRepo && this.correspondentClass) {
+            this.correspondentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.correspondentClass.name,
+                args: [this.correspondentClass],
+            });
+        }
+        if (!this.correspondentUtils && this.correspondentClass) {
+            this.correspondentUtils = await this._objectFactory.newInstance(CorrespondentUtils, {
+                name: this.correspondentClass.name,
+                args: [this.correspondentRepo, this.mailboxRepo],
+            });
+        }
     }
 
     /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `CalendarEvent` carries its
      * own denormalized `mailboxUid` that must never diverge from its actual folder's mailbox. */
     protected async resolveMailboxUidFor(scopeUid: string, rejectDeleted?: boolean): Promise<string | undefined> {
-        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid, rejectDeleted);
+        return getMailboxUidForFolder(this.folderRepo!, scopeUid, { rejectDeleted });
     }
 
     /** Coerces every date field to a real `Date` (a `400` for an unparseable one) before anything is saved - see
@@ -319,14 +333,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     }
 
     /** Records an event's organizer and attendees as correspondents of the mailbox it is on, for recipient suggestions.
-     * Best-effort - `recordCorrespondents()` never throws. */
+     * Best-effort - `CorrespondentUtils.recordCorrespondents()` never throws. */
     private async recordEventCorrespondents(event: CalendarEvent): Promise<void> {
-        await recordCorrespondents(
-            { objectFactory: this._objectFactory!, correspondentClass: this.correspondentClass, mailboxClass: this.mailboxClass, logger: this.logger },
-            event.mailboxUid,
-            eventObservations(event),
-            "event",
-        );
+        await this.correspondentUtils!.recordCorrespondents(event.mailboxUid, eventObservations(event), "event");
     }
 
     /** Also serves `updateBulk()`/`updateProperty()`, which `BaseScopedChildRoute` routes through `update()`. */

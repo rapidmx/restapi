@@ -8,7 +8,7 @@
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import { ACLUtils, ApiErrorMessages, ApiErrors, type HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { fileLeftoverErasure, requireMailboxUid } from "../util/LeftoverMailboxUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
@@ -66,14 +66,11 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
     private requestRepo?: RepoUtils<T>;
     private mailboxRepo?: RepoUtils<MB>;
     private folderRepo?: RepoUtils<any>;
+    protected matterRepo?: RepoUtils<any>;
 
     /** Reads the access list of a deleted mailbox, for `eraseLeftover()`. */
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
-
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
-    @Config()
-    private config: any;
 
     /** `mail:erasure:allow_self_approval` (default `false`): whether an administrator may approve the erasure request they made themselves. Off, a
      * request needs a second administrator (four eyes) - which a deployment with a single administrator doesn't have, and can switch this on for;
@@ -83,6 +80,12 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
 
     @Logger
     private logger: any;
+
+    /** The `AuditLogEntry` repository, built once by `initialize()`. */
+    protected auditLogRepo?: RepoUtils<any>;
+
+    /** Records the audit entries, built once by `initialize()` from `auditLogRepo`. */
+    protected auditLogUtils?: AuditLogUtils;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -97,6 +100,15 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
         }
         if (!this.folderRepo && this.folderClass) {
             this.folderRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
+        }
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.matterClass.name, args: [this.matterClass] });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
+        }
+        if (!this.auditLogUtils && this.auditLogRepo) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
         }
     }
 
@@ -169,11 +181,9 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
             }
         }
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.ERASURE_REQUEST_CREATED, targetType: "DataSubjectErasureRequest", targetUid: created.uid, mailboxUid },
+            { user },
         );
         return created;
     }
@@ -204,15 +214,13 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
         const mailboxUid: string = requireMailboxUid(body?.mailboxUid);
         const { request } = await fileLeftoverErasure(
             {
-                objectFactory: this._objectFactory!,
                 mailboxRepo: this.mailboxRepo!,
                 folderRepo: this.folderRepo!,
                 requestRepo: this.requestRepo!,
                 requestClass: this.dataSubjectErasureRequestClass,
-                matterClass: this.matterClass,
-                auditLogClass: this.auditLogClass,
+                matterRepo: this.matterRepo!,
+                auditLogUtils: this.auditLogUtils!,
                 aclUtils: this.aclUtils,
-                config: this.config,
                 logger: this.logger,
             },
             { user: user!, req },
@@ -238,17 +246,14 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
         // 409 (citing the blocking Matter) if held - the correct GDPR Article 17(3) behavior, not a
         // failure to route around. `ErasureExecutionJob` re-checks this again immediately before the
         // actual cascade, since a hold can be placed in the gap between this approval and that job run.
-        await assertNotOnLegalHold(this._objectFactory!, this.matterClass, request.mailboxUid);
+        await assertNotOnLegalHold(this.matterRepo!, request.mailboxUid);
 
         const updated: T = await this.requestRepo!.update(
             { uid: request.uid, version: (request as any).version, status: "approved", reviewedByUserUid: user!.uid } as any,
             request,
             { ignoreACL: true },
         );
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.ERASURE_REQUEST_APPROVED,
                 targetType: "DataSubjectErasureRequest",
@@ -256,6 +261,7 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
                 mailboxUid: updated.mailboxUid,
                 ...(selfApproval ? { details: { selfApproved: true } } : {}),
             },
+            { user },
         );
         return updated;
     }
@@ -276,11 +282,9 @@ export abstract class BaseDataSubjectErasureRequestRoute<T extends DataSubjectEr
             request,
             { ignoreACL: true },
         );
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.ERASURE_REQUEST_DENIED, targetType: "DataSubjectErasureRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid },
+            { user },
         );
         return updated;
     }

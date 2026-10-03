@@ -24,7 +24,7 @@ import { extractHeader } from "../util/MimeHeaderUtils.js";
 import { parseMbox } from "../util/MboxUtils.js";
 import { buildDeliveredRecipients } from "../util/RecipientUtils.js";
 import { extractPstMessages } from "../util/PstImportUtils.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import {
     Attachment,
     AuditAction,
@@ -132,6 +132,8 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     protected folderRepo?: RepoUtils<F>;
     protected messageRepo?: RepoUtils<M>;
     protected attachmentRepo?: RepoUtils<Attachment>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -159,10 +161,6 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     /** How many claims a request gets before an abandoned `"processing"` row is marked `"failed"`. */
     @Config("mail:jobs:mailbox_import:max_attempts", 3)
     private maxAttempts: number = 3;
-
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
-    @Config()
-    private config: any;
 
     @Logger
     private logger: any;
@@ -204,6 +202,18 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             this.attachmentRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.attachmentClass.name,
                 args: [this.attachmentClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
             });
         }
     }
@@ -424,17 +434,12 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                 asEntity(this.requestRepo!, lease.held),
                 { ignoreACL: true },
             );
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, logger: this.logger },
-                {
-                    action: quotaError ? AuditAction.MAILBOX_IMPORT_FAILED : AuditAction.MAILBOX_IMPORT_COMPLETED,
-                    targetType: "MailboxImportRequest",
-                    targetUid: updated.uid,
-                    mailboxUid: updated.mailboxUid,
-                },
-            );
+            await this.auditLogUtils!.record({
+                action: quotaError ? AuditAction.MAILBOX_IMPORT_FAILED : AuditAction.MAILBOX_IMPORT_COMPLETED,
+                targetType: "MailboxImportRequest",
+                targetUid: updated.uid,
+                mailboxUid: updated.mailboxUid,
+            });
             return true;
         } catch (err: any) {
             return await this.markFailed(lease.held, err.message);
@@ -533,12 +538,7 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             asEntity(this.requestRepo!, request),
             { ignoreACL: true },
         );
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, logger: this.logger },
-            { action: AuditAction.MAILBOX_IMPORT_FAILED, targetType: "MailboxImportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid },
-        );
+        await this.auditLogUtils!.record({ action: AuditAction.MAILBOX_IMPORT_FAILED, targetType: "MailboxImportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid });
     }
 
     /** Persists one already-extracted raw RFC 5322 message as a `Message` (plus any `Attachment` rows) in

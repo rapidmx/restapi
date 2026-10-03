@@ -14,7 +14,7 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { evaluateEscrowApprovals, exactInFilter, resolveEscrowApprovalTtlHours } from "../util/EscrowUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import {
@@ -163,7 +163,7 @@ function validateEscrowScope(o: Partial<EscrowScope>): void {
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRoute<T> {
-    /** Supplied by the Mongo/SQL concrete subclasses so `recordAuditLog()` can persist an `AuditLogEntry`
+    /** Supplied by the Mongo/SQL concrete subclasses so `AuditLogUtils` can persist an `AuditLogEntry`
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
 
@@ -206,6 +206,9 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
 
     protected accessRequestRepo?: RepoUtils<EscrowAccessRequest>;
 
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
+
     @Init
     protected async initialize(): Promise<void> {
         if (!this._objectFactory) {
@@ -227,6 +230,18 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
             this.accessRequestRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.escrowAccessRequestClass.name,
                 args: [this.escrowAccessRequestClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
             });
         }
     }
@@ -352,16 +367,14 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
             : [await this.doCreateObject(objs[0], { req, user, ignoreACL: true })];
 
         for (const scope of created) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, req, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 {
                     action: AuditAction.ESCROW_SCOPE_CREATE,
                     targetType: "EscrowScope",
                     targetUid: scope.uid,
                     details: { name: scope.name, after: auditSnapshot(scope) },
                 },
+                { req, user },
             );
         }
 
@@ -422,16 +435,14 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
 
         const updated: T = await this.repoUtils!.update(obj, existing, { user, version: patch.version, ignoreACL: true });
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.ESCROW_SCOPE_UPDATE,
                 targetType: "EscrowScope",
                 targetUid: updated.uid,
                 details: { name: updated.name, before: auditSnapshot(existing), after: auditSnapshot(updated) },
             },
+            { req, user },
         );
 
         return updated;
@@ -525,16 +536,14 @@ export abstract class BaseEscrowScopeRoute<T extends EscrowScope> extends CRUDRo
         }
         await this.repoUtils!.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.ESCROW_SCOPE_DELETE,
                 targetType: "EscrowScope",
                 targetUid: existing.uid,
                 details: { name: existing.name, before: auditSnapshot(existing) },
             },
+            { req, user },
         );
     }
 

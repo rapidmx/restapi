@@ -25,8 +25,8 @@ import type { SpamScanProvider } from "../scan/SpamScanProvider.js";
 import { pointInlineImages, SanitizedBodyLoader, type InlineImageMode } from "../scan/SanitizedBody.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
-import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
-import { classifyRecipientTier, createFederatedPeerCheck, getAliasDomainNames } from "../util/DomainUtils.js";
+import { AuditLogUtils, isNonOwnerAccess } from "../util/AuditLogUtils.js";
+import { createFederatedPeerCheck, DomainUtils } from "../util/DomainUtils.js";
 import { coalesceFolderCounts, notifyFolderCounts, type FolderCountsContext } from "../util/FolderCountUtils.js";
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { findActiveHoldsFor } from "../util/LegalHoldUtils.js";
@@ -36,7 +36,7 @@ import type { ScheduledSendJob } from "../jobs/ScheduledSendJob.js";
 import { deliveryFailureKey, describeOriginal, tryFileDeliveryFailureNotice } from "../util/DeliveryFailureNoticeUtils.js";
 import { coerceDateValue } from "../util/DateCoercionUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
-import { messageObservations, recordCorrespondents } from "../util/CorrespondentUtils.js";
+import { CorrespondentUtils, messageObservations } from "../util/CorrespondentUtils.js";
 import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
 import {
     MESSAGE_LIST_FIELDS,
@@ -458,6 +458,24 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
     protected attachmentRepo?: RepoUtils<any>;
 
+    protected auditLogRepo?: RepoUtils<any>;
+
+    protected domainRepo?: RepoUtils<any>;
+
+    protected matterRepo?: RepoUtils<any>;
+
+    protected correspondentRepo?: RepoUtils<any>;
+
+    protected quarantineEntryRepo?: RepoUtils<any>;
+
+    protected ingestQueueEntryRepo?: RepoUtils<any>;
+
+    protected auditLogUtils?: AuditLogUtils;
+
+    protected domainUtils?: DomainUtils;
+
+    protected correspondentUtils?: CorrespondentUtils;
+
     /** This server's own inbound mail-exchange hostname, reused as the `Reporting-UA` half of a generated
      * receipt MDN - same config `ScanQueueJob`/`BaseDomainRoute` already read. */
     @Config("mail:dns:mx_hostname", "")
@@ -549,6 +567,60 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             this.attachmentRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.attachmentClass.name,
                 args: [this.attachmentClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.domainRepo && this.domainClass) {
+            this.domainRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.domainClass.name,
+                args: [this.domainClass],
+            });
+        }
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.matterClass.name,
+                args: [this.matterClass],
+            });
+        }
+        if (!this.correspondentRepo && this.correspondentClass) {
+            this.correspondentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.correspondentClass.name,
+                args: [this.correspondentClass],
+            });
+        }
+        if (!this.quarantineEntryRepo && this.quarantineEntryClass) {
+            this.quarantineEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.quarantineEntryClass.name,
+                args: [this.quarantineEntryClass],
+            });
+        }
+        if (!this.ingestQueueEntryRepo && this.ingestQueueEntryClass) {
+            this.ingestQueueEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.ingestQueueEntryClass.name,
+                args: [this.ingestQueueEntryClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogRepo) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
+            });
+        }
+        if (!this.domainUtils && this.domainRepo) {
+            this.domainUtils = await this._objectFactory.newInstance(DomainUtils, {
+                name: this.domainClass.name,
+                args: [this.domainRepo],
+            });
+        }
+        if (!this.correspondentUtils && this.correspondentRepo && this.mailboxRepo) {
+            this.correspondentUtils = await this._objectFactory.newInstance(CorrespondentUtils, {
+                name: this.correspondentClass.name,
+                args: [this.correspondentRepo, this.mailboxRepo],
             });
         }
         if (!this.sanitizedBodyLoader) {
@@ -816,7 +888,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
         const ownDomains: Set<string> = new Set(ownAddresses.map((a) => normalizeAddress(a).split("@")[1]).filter((d): d is string => !!d));
         for (const ownDomain of ownDomains) {
-            const aliasDomains: string[] = await getAliasDomainNames(this._objectFactory!, this.domainClass, ownDomain);
+            const aliasDomains: string[] = await this.domainUtils!.getAliasDomainNames(ownDomain);
             if (aliasDomains.length === 0) {
                 continue;
             }
@@ -1245,8 +1317,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             raw,
             message,
             mailbox: sendingMailbox,
-            objectFactory: this._objectFactory!,
-            domainClass: this.domainClass,
+            domainUtils: this.domainUtils,
             dnsResolver: this.dnsResolver,
         });
         raw = prepared.raw;
@@ -1282,9 +1353,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             undelivered,
         } = await this.relayClaimed(claimed, message.folderUid, raw, envelopeTo);
         // Recipient suggestions: everyone the message went to, once the transport has accepted it. Best-effort -
-        // `recordCorrespondents()` never throws. (`ScheduledSendJob` does the same for a deferred send.)
-        await recordCorrespondents(
-            { objectFactory: this._objectFactory!, correspondentClass: this.correspondentClass, mailboxClass: this.mailboxClass, logger: this.logger },
+        // `CorrespondentUtils.recordCorrespondents()` never throws. (`ScheduledSendJob` does the same for a deferred send.)
+        await this.correspondentUtils!.recordCorrespondents(
             sendingMailbox!,
             messageObservations(message, { from: false, types: [RecipientType.TO, RecipientType.CC, RecipientType.BCC] }),
             "sent",
@@ -1679,10 +1749,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 502, "The recall could not be sent. Try again later.");
         }
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.MESSAGE_RECALL,
                 targetType: "Message",
@@ -1690,6 +1757,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 mailboxUid: message.mailboxUid,
                 details: { subjectDigest: subjectDigest(message.subject), recipientCount: envelopeTo.length },
             },
+            { user },
         );
 
         return updated;
@@ -1916,10 +1984,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             ...(learning.learnSkipped ? { learnSkipped: learning.learnSkipped } : {}),
             ...(safeSender ? { safeSender } : {}),
         };
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.MESSAGE_REPORTED,
                 targetType: "Message",
@@ -1935,6 +2000,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                     alwaysTrustSender: alwaysTrustSender === true,
                 },
             },
+            { req, user },
         );
         return result;
     }
@@ -2254,15 +2320,14 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     }
 
     /** What `util/MessagePurgeUtils.ts` needs to remove a permanently deleted message's attachments and blobs. */
-    private async purgeContext(): Promise<MessagePurgeContext> {
+    private purgeContext(): MessagePurgeContext {
         return {
-            objectFactory: this._objectFactory!,
             blobStore: this.blobStore,
-            classes: {
-                messageClass: this.modelClass,
-                attachmentClass: this.attachmentClass,
-                quarantineEntryClass: this.quarantineEntryClass,
-                ingestQueueEntryClass: this.ingestQueueEntryClass,
+            repos: {
+                messageRepo: this.repoUtils,
+                attachmentRepo: this.attachmentRepo,
+                quarantineEntryRepo: this.quarantineEntryRepo,
+                ingestQueueEntryRepo: this.ingestQueueEntryRepo,
             },
             logger: this.logger,
         };
@@ -2276,7 +2341,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * `Attachment` rows and every blob behind for good.
      */
     protected async beforePurge(records: T[]): Promise<unknown> {
-        return await collectMessagePurge(await this.purgeContext(), records);
+        return await collectMessagePurge(this.purgeContext(), records);
     }
 
     /**
@@ -2286,15 +2351,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * logged, never fails the delete that already happened. Legal-hold refusals (`checkLegalHold()`) come before any of this.
      */
     protected async afterPurge(records: T[], prepared: unknown): Promise<void> {
-        await finishMessagePurge(await this.purgeContext(), prepared as PreparedMessagePurge);
+        await finishMessagePurge(this.purgeContext(), prepared as PreparedMessagePurge);
     }
 
     /** Audits an emptied folder: one `message.truncate` entry per call (a folder can hold thousands of messages) with the folder and the number removed. */
     protected async afterTruncate(scopeUid: string, count: number, user: JWTUser | undefined, req: HttpRequest | undefined): Promise<void> {
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.MESSAGE_TRUNCATE,
                 targetType: "Folder",
@@ -2302,15 +2364,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 mailboxUid: await this.resolveMailboxUidFor(scopeUid),
                 details: { folderUid: scopeUid, count },
             },
+            { req, user },
         );
     }
 
     /** Audits a truncate a legal hold refused, as the refusal of a single purge is (`legal_hold.blocked_delete`), with `details.truncate`. */
     protected async onTruncateRefused(scopeUid: string, count: number, error: unknown, user: JWTUser | undefined, req: HttpRequest | undefined): Promise<void> {
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.LEGAL_HOLD_BLOCKED_DELETE,
                 targetType: "Folder",
@@ -2318,6 +2378,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 mailboxUid: await this.resolveMailboxUidFor(scopeUid),
                 details: { folderUid: scopeUid, truncate: true, count },
             },
+            { req, user },
         );
     }
 
@@ -2386,9 +2447,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             return message;
         }
 
-        const tier = await classifyRecipientTier(
-            this._objectFactory!,
-            this.domainClass,
+        const tier = await this.domainUtils!.classifyRecipientTier(
             message.dispositionNotificationTo!,
             createFederatedPeerCheck(this.dnsResolver!),
         );
@@ -2563,7 +2622,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         }
         let pending: Promise<Matter[]> | undefined = cache?.get(existing.mailboxUid);
         if (!pending) {
-            pending = findActiveHoldsFor(this._objectFactory!, this.matterClass, existing.mailboxUid);
+            pending = findActiveHoldsFor(this.matterRepo!, existing.mailboxUid);
             cache?.set(existing.mailboxUid, pending);
         }
         const holds: Matter[] = await pending;
@@ -2593,7 +2652,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * entity that doc comment's compliance-job list (`ErasureExecutionJob`/`RetentionEnforcementJob`/
      * `LegalHoldUtils`) names as trusting `mailboxUid` directly. */
     protected async resolveMailboxUidFor(scopeUid: string, rejectDeleted?: boolean): Promise<string | undefined> {
-        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid, rejectDeleted);
+        return getMailboxUidForFolder(this.folderRepo!, scopeUid, { rejectDeleted });
     }
 
     /**
@@ -2626,10 +2685,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             try {
                 await this.checkLegalHold(existing, user);
             } catch (err) {
-                await recordAuditLog(
-                    this._objectFactory!,
-                    this.auditLogClass,
-                    { config: this.config, req, user, logger: this.logger },
+                await this.auditLogUtils!.record(
                     {
                         action: AuditAction.LEGAL_HOLD_BLOCKED_DELETE,
                         targetType: "Message",
@@ -2637,6 +2693,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                         mailboxUid: existing.mailboxUid,
                         details: { subjectDigest: subjectDigest(existing.subject) },
                     },
+                    { req, user },
                 );
                 throw err;
             }
@@ -2648,10 +2705,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             // A soft delete or a purge takes a live message out of its folder (`existing` is undefined for one that was
             // already soft-deleted, which changes nothing).
             await this.notifyFolders([existing.folderUid]);
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, req, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 {
                     action: AuditAction.MESSAGE_DELETE,
                     targetType: "Message",
@@ -2659,6 +2713,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                     mailboxUid: existing.mailboxUid,
                     details: { subjectDigest: subjectDigest(existing.subject), folderUid: existing.folderUid },
                 },
+                { req, user },
             );
         }
     }
@@ -2694,10 +2749,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // says to treat defensively as non-owner, not to silently pass over.
         const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true });
         if (!mailbox || isNonOwnerAccess(mailbox, user)) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 {
                     action: AuditAction.MESSAGE_CONTENT_ACCESSED,
                     targetType: "Message",
@@ -2705,6 +2757,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                     mailboxUid: message.mailboxUid,
                     details: { subjectDigest: subjectDigest(message.subject) },
                 },
+                { user },
             );
         }
 

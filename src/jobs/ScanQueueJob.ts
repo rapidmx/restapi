@@ -16,7 +16,7 @@ import { normalizeAddress } from "../util/AddressUtils.js";
 import { hasAlignedPassingDkim } from "../util/AuthenticationResultsUtils.js";
 import { isAutoReplyEligible } from "../util/AutoReplyUtils.js";
 import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
-import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames, resolveDomainAlias } from "../util/DomainUtils.js";
+import { createFederatedPeerCheck, DomainUtils } from "../util/DomainUtils.js";
 import { classifyMessage, FocusedInboxSignals } from "../util/FocusedInboxUtils.js";
 import { chargeMailboxQuota, MailboxNotFoundError, MailboxQuotaExceededError, refundMailboxQuota } from "../util/MailboxQuotaUtils.js";
 import { isHeaderOversignedByAlignedDkim, topmostTrustedAuthenticationResults } from "../util/DkimOversignUtils.js";
@@ -38,7 +38,7 @@ import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { buildDispositionNotification, parseDispositionNotification } from "../util/ReceiptUtils.js";
 import { parseRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
 import { buildDeliveredRecipients } from "../util/RecipientUtils.js";
-import { eventObservations, messageObservations, recordCorrespondents, type CorrespondentContext } from "../util/CorrespondentUtils.js";
+import { CorrespondentUtils, eventObservations, messageObservations } from "../util/CorrespondentUtils.js";
 import { nameBasedUuid } from "../util/UuidUtils.js";
 import { sendOrThrow } from "../transport/TransportResultUtils.js";
 import {
@@ -205,7 +205,7 @@ export abstract class ScanQueueJob<
     protected abstract focusedInboxOverrideClass: any;
     protected abstract contactClass: any;
     /** The `Correspondent` model class: everyone a delivered message or received invitation names is recorded into it
-     * (`recordCorrespondents()`), for recipient suggestions. */
+     * (`CorrespondentUtils.recordCorrespondents()`), for recipient suggestions. */
     protected abstract correspondentClass: any;
     protected abstract domainClass: any;
     protected abstract keyVaultClass: any;
@@ -226,6 +226,10 @@ export abstract class ScanQueueJob<
     protected oofReplySuppressionRepo?: RepoUtils<OS>;
     protected focusedInboxOverrideRepo?: RepoUtils<FIO>;
     protected contactRepo?: RecoverableRepoUtils<C>;
+    protected correspondentRepo?: RepoUtils<any>;
+    protected domainRepo?: RepoUtils<any>;
+    protected correspondentUtils?: CorrespondentUtils;
+    protected domainUtils?: DomainUtils;
     /** Read-only: consulted before filing so nothing is delivered into a mailbox `ErasureExecutionJob` is erasing. */
     protected erasureRequestRepo?: RepoUtils<any>;
 
@@ -432,6 +436,18 @@ export abstract class ScanQueueJob<
                 args: [this.keyVaultClass],
             });
         }
+        if (!this.correspondentRepo && this.correspondentClass) {
+            this.correspondentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.correspondentClass.name,
+                args: [this.correspondentClass],
+            });
+        }
+        if (!this.domainRepo && this.domainClass) {
+            this.domainRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.domainClass.name,
+                args: [this.domainClass],
+            });
+        }
         try {
             if (!this.erasureRequestRepo && this.dataSubjectErasureRequestClass) {
                 this.erasureRequestRepo = await this._objectFactory.newInstance(RepoUtils, {
@@ -443,6 +459,18 @@ export abstract class ScanQueueJob<
             // Only possible when the datastore wasn't given this model at all (a trimmed-down wiring) - the erasure
             // check then can't run, which is logged on every delivery attempt rather than blocking all mail.
             this.logger?.warn(`ScanQueueJob: erasure-status checks unavailable (${this.dataSubjectErasureRequestClass.name} repo failed to initialize): ${err?.message}`);
+        }
+        if (!this.correspondentUtils && this.correspondentClass) {
+            this.correspondentUtils = await this._objectFactory.newInstance(CorrespondentUtils, {
+                name: this.correspondentClass.name,
+                args: [this.correspondentRepo, this.mailboxRepo],
+            });
+        }
+        if (!this.domainUtils && this.domainClass) {
+            this.domainUtils = await this._objectFactory.newInstance(DomainUtils, {
+                name: this.domainClass.name,
+                args: [this.domainRepo],
+            });
         }
     }
 
@@ -914,26 +942,15 @@ export abstract class ScanQueueJob<
         });
     }
 
-    /** What `recordCorrespondents()` needs to reach the datastore from this job. */
-    private correspondentContext(): CorrespondentContext {
-        return {
-            objectFactory: this._objectFactory!,
-            correspondentClass: this.correspondentClass,
-            mailboxClass: this.mailboxClass,
-            logger: this.logger,
-        };
-    }
-
     /**
      * Records the sender and the To/Cc recipients of a message delivered to `entry`'s mailbox as its correspondents
      * (`util/CorrespondentUtils.ts`). The sender is the `From` header's address (falling back to the envelope sender), the
-     * recipients are those the headers name; the mailbox's own addresses are skipped by `recordCorrespondents()`, which
+     * recipients are those the headers name; the mailbox's own addresses are skipped by `CorrespondentUtils.recordCorrespondents()`, which
      * also never throws. Runs once per delivered message, for the one mailbox it was delivered to.
      */
     private async recordInboundCorrespondents(entry: Q, result: ScanPipelineResult): Promise<void> {
         const recipients: Recipient[] = buildDeliveredRecipients(result.headerRecipients, entry.envelopeTo);
-        await recordCorrespondents(
-            this.correspondentContext(),
+        await this.correspondentUtils!.recordCorrespondents(
             entry.mailboxUid,
             messageObservations(
                 { from: { address: result.fromAddress || entry.envelopeFrom, displayName: result.fromDisplayName }, recipients },
@@ -1420,12 +1437,7 @@ export abstract class ScanQueueJob<
             return;
         }
 
-        const tier = await classifyRecipientTier(
-            this._objectFactory!,
-            this.domainClass,
-            result.dispositionNotificationTo,
-            createFederatedPeerCheck(this.dnsResolver!),
-        );
+        const tier = await this.domainUtils!.classifyRecipientTier(result.dispositionNotificationTo, createFederatedPeerCheck(this.dnsResolver!));
         const autoSend: boolean =
             tier === "same-org"
                 ? mailbox.autoSendReceiptsInternal
@@ -1759,9 +1771,9 @@ export abstract class ScanQueueJob<
             discoverAndMergeKeys(this.dnsResolver!, peerAddress, existingContact, now, {
                 mailboxRepo: this.mailboxRepo!,
                 keyVaultRepo: this.keyVaultRepo!,
-                domainNames: () => getVerifiedDomainNames(this._objectFactory!, this.domainClass),
+                domainNames: () => this.domainUtils!.getVerifiedDomainNames(),
                 aliasQueryValue: (address) => this.aliasQueryValue(address),
-                resolveDomainAlias: (address) => resolveDomainAlias(this._objectFactory!, this.domainClass, address),
+                resolveDomainAlias: (address) => this.domainUtils!.resolveDomainAlias(address),
                 plusAddressing: this.plusAddressingEnabled,
             }),
         );
@@ -1793,7 +1805,7 @@ export abstract class ScanQueueJob<
         const [override, isKnownCorrespondent, domains] = await Promise.all([
             this.findFocusedInboxOverride(entry.mailboxUid, senderAddress),
             this.isKnownCorrespondent(entry.mailboxUid, senderAddress, conversationId),
-            getVerifiedDomainNames(this._objectFactory!, this.domainClass),
+            this.domainUtils!.getVerifiedDomainNames(),
         ]);
 
         const senderDomain: string | undefined = senderAddress.split("@")[1];
@@ -2376,7 +2388,7 @@ export abstract class ScanQueueJob<
         }
 
         // Everyone the invitation names is somebody this mailbox now knows of - the organizer and the guests.
-        await recordCorrespondents(this.correspondentContext(), entry.mailboxUid, eventObservations(parsed), "event");
+        await this.correspondentUtils!.recordCorrespondents(entry.mailboxUid, eventObservations(parsed), "event");
 
         try {
             switch (parsed.method) {

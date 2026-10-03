@@ -12,5 +12,5 @@ const { Model } = RouteDecorators;
 export class ContactRouteMongo extends BaseContactRoute<ContactMongo> {
     protected readonly repoUtilsClass: any = RecoverableRepoUtils;
     protected readonly scopeProperty: string = "folderUid";
-    protected folderClass: any = FolderMongo;
+    protected scopeFolderClass: any = FolderMongo;
 }

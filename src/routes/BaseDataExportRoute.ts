@@ -8,13 +8,13 @@
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { exactInFilter } from "../util/EscrowUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, DataExportFormat, DataExportRequest, Mailbox } from "../models/types.js";
-const { Config, Init, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject } = ObjectDecorators;
 const { Get, Param, Post, Query, RateLimit, Response, User: AuthUser } = RouteDecorators;
 
 /** `create()` is limited per user: each request makes `DataExportJob` build an archive of a whole mailbox. */
@@ -68,12 +68,11 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
     @Inject("BlobStore")
     private blobStore?: BlobStore;
 
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
-    @Config()
-    private config: any;
+    /** The `AuditLogEntry` repository, built once by `initialize()`. */
+    protected auditLogRepo?: RepoUtils<any>;
 
-    @Logger
-    private logger: any;
+    /** Records the audit entries, built once by `initialize()` from `auditLogRepo`. */
+    protected auditLogUtils?: AuditLogUtils;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -85,6 +84,12 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
         }
         if (!this.mailboxRepo && this.mailboxClass) {
             this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
+        }
+        if (!this.auditLogUtils && this.auditLogRepo) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
         }
     }
 
@@ -155,11 +160,9 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
             new this.dataExportRequestClass({ mailboxUid, requestedByUserUid: user.uid, format: body.format, status: "pending" }),
             { ignoreACL: true },
         );
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.DATA_EXPORT_REQUESTED, targetType: "DataExportRequest", targetUid: created.uid, mailboxUid },
+            { user },
         );
         return created;
     }
@@ -227,16 +230,14 @@ export abstract class BaseDataExportRoute<T extends DataExportRequest, MB extend
         const extension = request.format === "mbox" ? "mbox" : "ndjson";
         const owner: MB | undefined = await this.mailboxRepo!.findOne(request.mailboxUid, { ignoreACL: true });
         if (!owner || (owner as any).ownerUserUid !== user!.uid) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 {
                     action: AuditAction.DATA_EXPORT_DOWNLOADED,
                     targetType: "DataExportRequest",
                     targetUid: request.uid,
                     mailboxUid: request.mailboxUid,
                 },
+                { user },
             );
         }
         res.setHeader("content-type", request.format === "mbox" ? "application/mbox" : "application/x-ndjson");

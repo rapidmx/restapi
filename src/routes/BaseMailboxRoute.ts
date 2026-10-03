@@ -17,11 +17,11 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import { AuditAction, DistributionList, EscrowScope, Mailbox } from "../models/types.js";
+import { AuditAction, DistributionList, EscrowScope, Mailbox, MailboxPolicy, Matter } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
-import { isNonOwnerAccess, recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils, isNonOwnerAccess } from "../util/AuditLogUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS, hasMailAccess, isAdminScope, isTrustedUser, stripTrustedRoles } from "../util/MailAccessUtils.js";
-import { getPrimaryDomainNames } from "../util/DomainUtils.js";
+import { DomainUtils } from "../util/DomainUtils.js";
 import { ensureWellKnownFolders } from "../util/FolderUtils.js";
 import { assertFreeBusyVisibility, effectiveFreeBusyVisibility } from "../util/FreeBusyLookupUtils.js";
 import { DEFAULT_TIME_ZONE, isValidTimeZone } from "../util/TimeZoneUtils.js";
@@ -494,6 +494,18 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
 
     protected escrowScopeRepo?: RepoUtils<EscrowScope>;
 
+    protected auditLogRepo?: RepoUtils<any>;
+
+    protected domainRepo?: RepoUtils<any>;
+
+    protected matterRepo?: RepoUtils<Matter>;
+
+    protected mailboxPolicyRepo?: RepoUtils<MailboxPolicy>;
+
+    protected auditLogUtils?: AuditLogUtils;
+
+    protected domainUtils?: DomainUtils;
+
     @Init
     protected async initialize(): Promise<void> {
         if (!this._objectFactory) {
@@ -513,6 +525,24 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         if (!this.escrowScopeRepo && this.escrowScopeClass) {
             this.escrowScopeRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.escrowScopeClass.name, args: [this.escrowScopeClass] });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
+        }
+        if (!this.domainRepo && this.domainClass) {
+            this.domainRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.domainClass.name, args: [this.domainClass] });
+        }
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.matterClass.name, args: [this.matterClass] });
+        }
+        if (!this.mailboxPolicyRepo && this.mailboxPolicyClass) {
+            this.mailboxPolicyRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxPolicyClass.name, args: [this.mailboxPolicyClass] });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
+        }
+        if (!this.domainUtils && this.domainClass) {
+            this.domainUtils = await this._objectFactory.newInstance(DomainUtils, { name: this.domainClass.name, args: [this.domainRepo] });
         }
     }
 
@@ -569,11 +599,9 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         targetUid: string,
         details: Record<string, any>,
     ): Promise<void> {
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action, targetType: "Mailbox", targetUid, ...(targetUid === "*" ? {} : { mailboxUid: targetUid }), details },
+            { req, user },
         );
     }
 
@@ -671,16 +699,14 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     /** What the leftover-data helpers (`util/LeftoverMailboxUtils.ts`) work through. */
     private async leftoverContext(): Promise<LeftoverListContext> {
         return {
-            objectFactory: this._objectFactory!,
             mailboxRepo: this.repoUtils!,
             folderRepo: this.folderRepo!,
             messageRepo: this.messageRepo!,
             requestRepo: this.erasureRequestRepo!,
             requestClass: this.dataSubjectErasureRequestClass,
-            matterClass: this.matterClass,
-            auditLogClass: this.auditLogClass,
+            matterRepo: this.matterRepo!,
+            auditLogUtils: this.auditLogUtils!,
             aclUtils: this.aclUtils,
-            config: this.config,
             logger: this.logger,
         };
     }
@@ -839,7 +865,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * policy's self-service quota with nothing yet used, whatever the request says.
      */
     private async assertSelfServiceCreate(objs: T[], req: HttpRequest, user: JWTUser): Promise<void> {
-        const policy = await findOrSeedMailboxPolicy(this._objectFactory!, this.mailboxPolicyClass, {
+        const policy = await findOrSeedMailboxPolicy(this.mailboxPolicyRepo!, {
             defaultQuotaBytes: this.defaultQuotaBytes,
             autoProvisionEnabled: this.autoProvisionEnabled,
             autoProvisionQuotaBytes: this.autoProvisionQuotaBytes,
@@ -847,7 +873,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // A pure alias `Domain` (`Domain.aliasOf`) has no mailboxes of its own by design - a self-service
         // caller must not be able to claim an address on one any more than a trusted caller can (see
         // `createMailboxes()`'s own `getPrimaryDomainNames()` check below, which this mirrors).
-        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
+        const domains: string[] = await this.domainUtils!.getPrimaryDomainNames();
         const hasAliasSource: boolean = this.staticAliases.length > 0 || !!this.authServerUrl;
         if (!policy.autoProvisionEnabled || domains.length === 0 || !hasAliasSource) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Creating your own mailbox is not enabled on this server.");
@@ -886,7 +912,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // not just a self-service guard. A pure alias `Domain` (`Domain.aliasOf`) is deliberately excluded:
         // it has no mailboxes of its own by design (mail addressed to it is delivered via
         // `resolveDomainAlias()` to a mailbox on the domain it aliases instead - see `BaseMailIngestRoute`).
-        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
+        const domains: string[] = await this.domainUtils!.getPrimaryDomainNames();
         if (domains.length > 0) {
             for (const o of objs) {
                 const domain = o.primarySmtpAddress?.split("@")[1]?.toLowerCase();
@@ -988,10 +1014,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // (org-wide/admin actions), not routine self-service signup.
         if (isTrusted) {
             for (const mailbox of created) {
-                await recordAuditLog(
-                    this._objectFactory!,
-                    this.auditLogClass,
-                    { config: this.config, req, user, logger: this.logger },
+                await this.auditLogUtils!.record(
                     {
                         action: AuditAction.MAILBOX_CREATE,
                         targetType: "Mailbox",
@@ -1003,6 +1026,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                             ...(mailbox.ownerUserUid ? {} : { sharedWithCreator: user.uid }),
                         },
                     },
+                    { req, user },
                 );
             }
         }
@@ -1175,7 +1199,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         // mailboxes of its own, so letting one through here would let a caller add e.g. `boss@plc.gg` (a pure
         // alias of `powerlevel.gg`) directly to their OWN mailbox's `aliasAddresses`, hijacking mail/send-as/
         // key-discovery for whatever mailbox `boss@powerlevel.gg` actually resolves to via `resolveDomainAlias()`.
-        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
+        const domains: string[] = await this.domainUtils!.getPrimaryDomainNames();
         if (domains.length > 0 && added.some((alias) => !domains.includes(alias.split("@")[1]))) {
             throw new ApiError(
                 ApiErrors.INVALID_REQUEST,
@@ -1293,7 +1317,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         assertPlainAddresses([newAddress]);
         // Same non-alias restriction `createMailboxes()` applies to a brand-new mailbox's address - a rename
         // can't land a mailbox on a pure alias domain any more than creating one there could.
-        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
+        const domains: string[] = await this.domainUtils!.getPrimaryDomainNames();
         if (domains.length > 0) {
             const domain = newAddress.split("@")[1]?.toLowerCase();
             if (!domain || !domains.includes(domain)) {
@@ -1609,8 +1633,8 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         const hasAliasSource = this.staticAliases.length > 0 || !!this.authServerUrl;
         // Non-alias domains only - auto-provisioning creates a real `Mailbox`, so it's bound by the same
         // domain restriction `createMailboxes()` enforces (see `getPrimaryDomainNames()`'s own doc comment).
-        const domains: string[] = await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
-        const policy = await findOrSeedMailboxPolicy(this._objectFactory!, this.mailboxPolicyClass, {
+        const domains: string[] = await this.domainUtils!.getPrimaryDomainNames();
+        const policy = await findOrSeedMailboxPolicy(this.mailboxPolicyRepo!, {
             defaultQuotaBytes: this.defaultQuotaBytes,
             autoProvisionEnabled: this.autoProvisionEnabled,
             autoProvisionQuotaBytes: this.autoProvisionQuotaBytes,
@@ -1664,7 +1688,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
     @Auth(["jwt"])
     @Get("/domains")
     public async listDomains(): Promise<string[]> {
-        return await getPrimaryDomainNames(this._objectFactory!, this.domainClass);
+        return await this.domainUtils!.getPrimaryDomainNames();
     }
 
     /**
@@ -1986,16 +2010,14 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         const found: T | null = await super.findById(id, query, this.mailUser(user));
         const result: T | null = found && user ? this.withAccessRole(found, user) : found;
         if (result && isNonOwnerAccess(result, user)) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 {
                     action: AuditAction.MAILBOX_ACCESSED,
                     targetType: "Mailbox",
                     targetUid: result.uid,
                     details: { primarySmtpAddress: result.primarySmtpAddress },
                 },
+                { user },
             );
         }
         return result;
@@ -2046,18 +2068,16 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         if (existing) {
             try {
-                await assertNotOnLegalHold(this._objectFactory!, this.matterClass, existing.uid);
+                await assertNotOnLegalHold(this.matterRepo!, existing.uid);
             } catch (err) {
-                await recordAuditLog(
-                    this._objectFactory!,
-                    this.auditLogClass,
-                    { config: this.config, req, user, logger: this.logger },
+                await this.auditLogUtils!.record(
                     {
                         action: AuditAction.LEGAL_HOLD_BLOCKED_DELETE,
                         targetType: "Mailbox",
                         targetUid: existing.uid,
                         details: { primarySmtpAddress: existing.primarySmtpAddress },
                     },
+                    { req, user },
                 );
                 throw err;
             }
@@ -2148,18 +2168,16 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         for (const existing of matched) {
             try {
-                await assertNotOnLegalHold(this._objectFactory!, this.matterClass, existing.uid);
+                await assertNotOnLegalHold(this.matterRepo!, existing.uid);
             } catch (err) {
-                await recordAuditLog(
-                    this._objectFactory!,
-                    this.auditLogClass,
-                    { config: this.config, user, logger: this.logger },
+                await this.auditLogUtils!.record(
                     {
                         action: AuditAction.LEGAL_HOLD_BLOCKED_DELETE,
                         targetType: "Mailbox",
                         targetUid: existing.uid,
                         details: { primarySmtpAddress: existing.primarySmtpAddress },
                     },
+                    { user },
                 );
                 throw err;
             }

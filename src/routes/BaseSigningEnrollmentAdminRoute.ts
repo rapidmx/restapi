@@ -5,13 +5,13 @@
 // The consuming application must apply `@Route("admin/signing-enrollments")` to its own concrete subclass (see `BaseKeyVaultRoute`'s identical note) -
 // every method here is defined relative to that.
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
-import { ApiErrors, HttpRequest, HttpResponse, ObjectFactory, RouteDecorators } from "@rapidrest/service-core";
+import { ApiErrors, HttpRequest, HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { ValidatedCertificate } from "../pki/IssuedCertificateValidation.js";
 import { AdminEnrollmentSummary, SigningCertificateEnrollment } from "../pki/SigningCertificateEnrollment.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { AuditAction } from "../models/types.js";
-const { Config, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject } = ObjectDecorators;
 const { Get, Param, Post, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** The longest rejection reason accepted (characters) - it is shown to the mailbox's owner. */
@@ -66,19 +66,29 @@ export abstract class BaseSigningEnrollmentAdminRoute {
     @Inject("SigningCertificateEnrollment")
     private signingCertificateEnrollment?: SigningCertificateEnrollment;
 
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
-    @Config()
-    private config: any;
+    /** The `AuditLogEntry` repository, built once by `initialize()`. */
+    protected auditLogRepo?: RepoUtils<any>;
 
-    @Logger
-    private logger: any;
+    /** Records the audit entries, built once by `initialize()` from `auditLogRepo`. */
+    protected auditLogUtils?: AuditLogUtils;
+
+    @Init
+    protected async initialize(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
+        }
+    }
 
     private async audit(req: HttpRequest | undefined, user: JWTUser | undefined, action: AuditAction, enrollmentId: string, mailboxUid: string | undefined, details: Record<string, unknown>): Promise<void> {
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action, targetType: "SigningEnrollment", targetUid: enrollmentId, ...(mailboxUid ? { mailboxUid } : {}), details },
+            { req, user },
         );
     }
 

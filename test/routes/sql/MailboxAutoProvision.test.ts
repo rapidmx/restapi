@@ -12,7 +12,7 @@ config.set("mail:auto_provision:enabled", true);
 config.set("mail:auth_server_url", "http://auth.test");
 
 import { request } from "@rapidrest/service-core/test";
-import { AccessControlListSQL, Server, ObjectFactory, ConnectionManager, isSqlDataSource } from "@rapidrest/service-core";
+import { AccessControlListSQL, Server, ObjectFactory, ConnectionManager, RepoUtils, isSqlDataSource } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
@@ -149,10 +149,10 @@ describe("Route:MailboxSQL auto-provision/domain Tests", () => {
     });
 
     it("Returns 503, creating nothing, when the mailbox policy can't be read - never falling back to config's 'enabled'.", async () => {
-        const newInstance = objectFactory.newInstance.bind(objectFactory);
-        const spy = vi.spyOn(objectFactory, "newInstance").mockImplementation((...args: any[]) =>
-            args[1]?.name === "MailboxPolicySQL" ? Promise.reject(new Error("datastore offline")) : (newInstance as any)(...args),
-        );
+        const findOne = RepoUtils.prototype.findOne;
+        const spy = vi.spyOn(RepoUtils.prototype, "findOne").mockImplementation(function (this: any, ...args: any[]) {
+            return this.modelClass === MailboxPolicySQL ? Promise.reject(new Error("datastore offline")) : (findOne as any).apply(this, args);
+        });
         try {
             const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
             expect(result.status).toBe(503);

@@ -16,10 +16,11 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import { AuditAction, type CalendarShareLink } from "../models/types.js";
+import { AuditAction, type CalendarShareLink, type Folder } from "../models/types.js";
 import type { SearchEntityType, SearchProvider } from "../search/SearchProvider.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { coerceDateFields } from "../util/DateCoercionUtils.js";
+import { getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS, hasMailAccess, isAdminScope, isTrustedUser } from "../util/MailAccessUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
@@ -150,6 +151,17 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
     /** The concrete `AuditLogEntry` class (supplied by the Mongo/SQL subclasses of an `adminScope` route). */
     protected auditLogClass?: any;
 
+    protected auditLogRepo?: RepoUtils<any>;
+
+    protected auditLogUtils?: AuditLogUtils;
+
+    /** The concrete `Folder` class, set by a route whose records carry a denormalized `mailboxUid` that is always the one of the folder they are in
+     * (`Task`, `Note`) - the default `resolveMailboxUidFor()` then resolves it through `scopeFolderRepo`. Unset, the default resolves nothing. A route
+     * that resolves it another way overrides `resolveMailboxUidFor()`. */
+    protected scopeFolderClass?: any;
+
+    protected scopeFolderRepo?: RepoUtils<Folder>;
+
     /** Set by a subclass whose entity is independently full-text-indexed (currently only `BaseMessageRoute`,
      * `"message"` - `SearchEntityType` also names `"contact"`/`"calendarEvent"`/`"note"`/`"task"` for future
      * use, but `SearchIndexJob` doesn't populate the index for any of those yet). `undefined` (the default)
@@ -187,6 +199,15 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         if (!this.shareLinkRepo && this.shareLinkClass) {
             this.shareLinkRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.shareLinkClass.name, args: [this.shareLinkClass] });
         }
+        if (!this.scopeFolderRepo && this.scopeFolderClass) {
+            this.scopeFolderRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.scopeFolderClass.name, args: [this.scopeFolderClass] });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
+        }
     }
 
     private scopeUidOf(obj: any): string | undefined {
@@ -217,10 +238,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
 
     /** Records one administration-scope access to `mailboxUid`'s records. */
     private async auditAdminAccess(user: JWTUser | undefined, operation: string, mailboxUid: string, count?: number): Promise<void> {
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.MAIL_QUEUE_ADMIN_ACCESS,
                 targetType: this.modelClass.name,
@@ -228,6 +246,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
                 mailboxUid,
                 details: { operation, ...(count === undefined ? {} : { count }) },
             },
+            { user },
         );
     }
 
@@ -455,7 +474,10 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * folder's mailbox.
      */
     protected async resolveMailboxUidFor(scopeUid: string, rejectDeleted?: boolean): Promise<string | null | undefined> {
-        return null;
+        if (!this.scopeFolderRepo) {
+            return null;
+        }
+        return getMailboxUidForFolder(this.scopeFolderRepo, scopeUid, { rejectDeleted });
     }
 
     /** Force-sets `obj.mailboxUid` from the scope (`resolveMailboxUidFor()`). A route that resolves it but finds no such folder - or, with

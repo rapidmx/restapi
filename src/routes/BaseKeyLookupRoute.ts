@@ -19,9 +19,9 @@ import {
 } from "@rapidrest/service-core";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { AuditAction, Contact, EncryptionPreference, Folder, KeyConflict, Mailbox, PreviousKey, PublicKey } from "../models/types.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { ContactKeyMerge, ContactKeyWriteResult, ContactKeyWriteTarget, writeContactKeys } from "../util/ContactKeyUtils.js";
-import { getVerifiedDomainNames, resolveDomainAlias } from "../util/DomainUtils.js";
+import { DomainUtils } from "../util/DomainUtils.js";
 import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { addPreviousKey, addRejectedKey, discoverAndMergeKeys, listField, normalizeKeyConflicts, withoutKey } from "../util/KeyringUtils.js";
 import { LocalKeyDiscovery } from "../util/LocalKeyDiscoveryUtils.js";
@@ -120,6 +120,10 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
     protected keyVaultRepo?: RepoUtils<any>;
     protected contactRepo?: RecoverableRepoUtils<C>;
     protected folderRepo?: RecoverableRepoUtils<F>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
+    protected domainRepo?: RepoUtils<any>;
+    protected domainUtils?: DomainUtils;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
@@ -134,13 +138,6 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
 
     @Inject("DnsResolver")
     private dnsResolver?: DnsResolver;
-
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
-    @Config()
-    private config: any;
-
-    @Logger
-    private logger: any;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -169,6 +166,30 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
             this.folderRepo = await this._objectFactory.newInstance(RecoverableRepoUtils, {
                 name: this.folderClass.name,
                 args: [this.folderClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
+            });
+        }
+        if (!this.domainRepo && this.domainClass) {
+            this.domainRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.domainClass.name,
+                args: [this.domainClass],
+            });
+        }
+        if (!this.domainUtils && this.domainClass) {
+            this.domainUtils = await this._objectFactory.newInstance(DomainUtils, {
+                name: this.domainClass.name,
+                args: [this.domainRepo],
             });
         }
     }
@@ -200,9 +221,9 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         return {
             mailboxRepo: this.mailboxRepo!,
             keyVaultRepo: this.keyVaultRepo!,
-            domainNames: () => getVerifiedDomainNames(this._objectFactory!, this.domainClass),
+            domainNames: () => this.domainUtils!.getVerifiedDomainNames(),
             aliasQueryValue: (address) => this.aliasQueryValue(address),
-            resolveDomainAlias: (address) => resolveDomainAlias(this._objectFactory!, this.domainClass, address),
+            resolveDomainAlias: (address) => this.domainUtils!.resolveDomainAlias(address),
             plusAddressing: this.plusAddressingEnabled,
         };
     }
@@ -361,10 +382,7 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         );
 
         if (written) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, req, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 {
                     action: AuditAction.CONTACT_KEY_TRUSTED,
                     targetType: "Contact",
@@ -372,6 +390,7 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
                     mailboxUid: mailbox.uid,
                     details: { address, fingerprint: key.fingerprint },
                 },
+                { req, user },
             );
         }
         return this.toPublic(contact!);
@@ -510,11 +529,9 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         });
 
         if (audit) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, req, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 { action: audit.action, targetType: "Contact", targetUid: contact!.uid, mailboxUid: mailbox.uid, details: audit.details },
+                { req, user },
             );
         }
         return this.toPublic(contact!);

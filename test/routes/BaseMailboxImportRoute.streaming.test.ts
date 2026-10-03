@@ -37,11 +37,6 @@ vi.mock("@aws-sdk/client-s3", () => ({
         return { name: "AbortMultipartUploadCommand", input };
     }),
 }));
-// Audit logging needs a real repo/DB connection this file deliberately has none of - it's not what's under
-// test here, and every real-server test (mongo/sql) already covers "an audit entry is recorded".
-vi.mock("../../src/util/AuditLogUtils.js", () => ({
-    recordAuditLog: vi.fn().mockResolvedValue(undefined),
-}));
 
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -124,8 +119,9 @@ describe("BaseMailboxImportRoute.create() streaming upload (req.bodyStream, @Str
         (route as any).folderRepo = { findOne: vi.fn(async (uid: string) => (uid === folder.uid ? folder : undefined)) };
         (route as any).blobStore = blobStore;
         (route as any).maxImportBytes = maxImportBytes;
-        (route as any).config = config;
-        (route as any).logger = Logger();
+        // Audit logging needs a real repo/DB connection this file deliberately has none of - it's not what's under
+        // test here, and every real-server test (mongo/sql) already covers "an audit entry is recorded".
+        (route as any).auditLogUtils = { record: vi.fn().mockResolvedValue(undefined) };
         return route;
     }
 

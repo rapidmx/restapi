@@ -2,8 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import type { ObjectFactory } from "@rapidrest/core";
-import { RepoUtils } from "@rapidrest/service-core";
+import type { RepoUtils } from "@rapidrest/service-core";
 import type { BlobStore } from "../blob/BlobStore.js";
 import { IngestStatus } from "../models/types.js";
 
@@ -11,20 +10,23 @@ import { IngestStatus } from "../models/types.js";
  * One entity type whose rows can point at a shared `BlobStore` key, and the fields that hold those keys.
  * `extraCriteria` narrows which rows count as a live reference (e.g. an `IngestQueueEntry` that has already been
  * delivered no longer needs its raw blob - the delivered `Message` row is what references it from then on).
+ * `entityType` (a stable name such as `"message"`) lets a `BlobReferenceExclusion` identify the source without holding
+ * the same repository instance.
  */
 export interface BlobReferenceSource {
-    entityClass: any;
+    repo: RepoUtils<any>;
+    entityType?: string;
     fields: string[];
     extraCriteria?: Record<string, any>;
 }
 
-/** The entity classes a message's content blobs can be shared between. Any may be omitted (a job that doesn't
- * know a class simply can't count its references - pass every one it has). */
-export interface MessageBlobClasses {
-    messageClass?: any;
-    attachmentClass?: any;
-    quarantineEntryClass?: any;
-    ingestQueueEntryClass?: any;
+/** The already-built repositories a message's content blobs can be shared between. Any may be omitted (a job that doesn't
+ * know a repository simply can't count its references - pass every one it has). */
+export interface MessageBlobRepos {
+    messageRepo?: RepoUtils<any>;
+    attachmentRepo?: RepoUtils<any>;
+    quarantineEntryRepo?: RepoUtils<any>;
+    ingestQueueEntryRepo?: RepoUtils<any>;
 }
 
 /**
@@ -43,31 +45,35 @@ export interface MessageBlobClasses {
  * first) could miss the reference on both sides of that transition - `Message` checked just before it was created,
  * the ingest entry just after it was marked delivered - and delete the raw blob out from under a freshly delivered
  * message.
+ * Each source is tagged with its `entityType` (`"ingestQueueEntry"`, `"quarantineEntry"`, `"message"`, `"attachment"`).
  */
-export function messageBlobReferenceSources(classes: MessageBlobClasses): BlobReferenceSource[] {
+export function messageBlobReferenceSources(repos: MessageBlobRepos): BlobReferenceSource[] {
     const sources: BlobReferenceSource[] = [];
-    if (classes.ingestQueueEntryClass) {
+    if (repos.ingestQueueEntryRepo) {
         sources.push({
-            entityClass: classes.ingestQueueEntryClass,
+            repo: repos.ingestQueueEntryRepo,
+            entityType: "ingestQueueEntry",
             fields: ["rawBlobKey"],
             extraCriteria: { status: `ne(${IngestStatus.DELIVERED})` },
         });
     }
-    if (classes.quarantineEntryClass) {
-        sources.push({ entityClass: classes.quarantineEntryClass, fields: ["rawBlobKey"] });
+    if (repos.quarantineEntryRepo) {
+        sources.push({ repo: repos.quarantineEntryRepo, entityType: "quarantineEntry", fields: ["rawBlobKey"] });
     }
-    if (classes.messageClass) {
-        sources.push({ entityClass: classes.messageClass, fields: ["bodyBlobKey", "sanitizedHtmlBlobKey"] });
+    if (repos.messageRepo) {
+        sources.push({ repo: repos.messageRepo, entityType: "message", fields: ["bodyBlobKey", "sanitizedHtmlBlobKey"] });
     }
-    if (classes.attachmentClass) {
-        sources.push({ entityClass: classes.attachmentClass, fields: ["blobKey", "extractedTextBlobKey"] });
+    if (repos.attachmentRepo) {
+        sources.push({ repo: repos.attachmentRepo, entityType: "attachment", fields: ["blobKey", "extractedTextBlobKey"] });
     }
     return sources;
 }
 
-/** One row that must NOT count as a reference - see `isBlobKeyReferenced()`'s `exclude` parameter. */
+/** One row that must NOT count as a reference - see `isBlobKeyReferenced()`'s `exclude` parameter. It names the row `uid` of the
+ * source whose `repo` is `repo` (the same instance) or whose `entityType` is `entityType`. */
 export interface BlobReferenceExclusion {
-    entityClass: any;
+    repo?: RepoUtils<any>;
+    entityType?: string;
     uid: string;
 }
 
@@ -80,26 +86,32 @@ export interface BlobReferenceExclusion {
  * That lets a caller delete a row's blobs BEFORE the row itself, so a blob-store failure leaves the row (and thus its
  * blob keys) in place to be retried, instead of an orphaned blob nothing points at any more.
  */
-export async function isBlobKeyReferenced(
-    objectFactory: ObjectFactory,
-    sources: BlobReferenceSource[],
-    key: string,
-    exclude?: BlobReferenceExclusion,
-): Promise<boolean> {
+export async function isBlobKeyReferenced(sources: BlobReferenceSource[], key: string, exclude?: BlobReferenceExclusion): Promise<boolean> {
     for (const source of sources) {
-        const repo: RepoUtils<any> = await objectFactory.newInstance(RepoUtils, {
-            name: source.entityClass.name,
-            args: [source.entityClass],
+        const excludes: boolean =
+            !!exclude && ((exclude.repo !== undefined && exclude.repo === source.repo) || (exclude.entityType !== undefined && exclude.entityType === source.entityType));
+        if (await sourceReferences(source.repo, source, key, excludes ? exclude!.uid : undefined)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** `true` if any row of `repo` has `key` in one of `source.fields` (and matches `source.extraCriteria`), other than the row `excludedUid`. */
+async function sourceReferences(
+    repo: RepoUtils<any>,
+    source: { fields: string[]; extraCriteria?: Record<string, any> },
+    key: string,
+    excludedUid: string | undefined,
+): Promise<boolean> {
+    const excluded: Record<string, any> = excludedUid !== undefined ? { uid: `ne(${excludedUid})` } : {};
+    for (const field of source.fields) {
+        const count: number = await repo.count({ ...(source.extraCriteria ?? {}), ...excluded, [field]: `eq(${key})` } as any, {
+            ignoreACL: true,
+            includeDeleted: true,
         });
-        const excluded: Record<string, any> = exclude && exclude.entityClass === source.entityClass ? { uid: `ne(${exclude.uid})` } : {};
-        for (const field of source.fields) {
-            const count: number = await repo.count({ ...(source.extraCriteria ?? {}), ...excluded, [field]: `eq(${key})` } as any, {
-                ignoreACL: true,
-                includeDeleted: true,
-            });
-            if (count > 0) {
-                return true;
-            }
+        if (count > 0) {
+            return true;
         }
     }
     return false;
@@ -118,7 +130,6 @@ export async function isBlobKeyReferenced(
  * whose blob is gone - which is the right one for a purge that will retry that same row anyway.
  */
 export async function deleteBlobsIfUnreferenced(
-    objectFactory: ObjectFactory,
     blobStore: BlobStore,
     sources: BlobReferenceSource[],
     keys: (string | undefined | null)[],
@@ -126,7 +137,7 @@ export async function deleteBlobsIfUnreferenced(
 ): Promise<string[]> {
     const deleted: string[] = [];
     for (const key of new Set(keys.filter((k): k is string => typeof k === "string" && k.length > 0))) {
-        if (await isBlobKeyReferenced(objectFactory, sources, key, exclude)) {
+        if (await isBlobKeyReferenced(sources, key, exclude)) {
             continue;
         }
         await blobStore.delete(key);

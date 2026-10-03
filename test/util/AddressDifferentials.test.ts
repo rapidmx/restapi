@@ -5,7 +5,7 @@
 // Every place that reads an address's domain must read the same one, and an address a reader would see differently from
 // how a parser reads it must not be accepted as a plain address.
 import { addressDomainOf } from "../../src/util/AddressUtils.js";
-import { createFederatedPeerCheck, isInternalAddress } from "../../src/util/DomainUtils.js";
+import { createFederatedPeerCheck, DomainUtils } from "../../src/util/DomainUtils.js";
 import { isPlainAddress, safeDisplayName } from "../../src/util/MimeHeaderUtils.js";
 
 /** The character with the given code point (written out as a number so no invisible character sits in this file). */
@@ -20,9 +20,10 @@ describe("Address parsing differentials", () => {
     });
 
     it("Does not class an address with a second @ as one of this server's own.", async () => {
-        expect(await isInternalAddress({} as any, class {}, "a@internal.com", ["internal.com"])).toBe(true);
-        expect(await isInternalAddress({} as any, class {}, "a@internal.com@evil.com", ["internal.com"])).toBe(false);
-        expect(await isInternalAddress({} as any, class {}, "a@evil.com@internal.com", ["internal.com"])).toBe(false);
+        const domainUtils = new DomainUtils({} as any);
+        expect(await domainUtils.isInternalAddress("a@internal.com", ["internal.com"])).toBe(true);
+        expect(await domainUtils.isInternalAddress("a@internal.com@evil.com", ["internal.com"])).toBe(false);
+        expect(await domainUtils.isInternalAddress("a@evil.com@internal.com", ["internal.com"])).toBe(false);
     });
 
     it("Does not look up a second domain's federation policy for an address with a second @.", async () => {

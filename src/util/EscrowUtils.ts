@@ -2,23 +2,9 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, type JWTUser, type ObjectFactory } from "@rapidrest/core";
-import { ApiErrorMessages, ApiErrors, RepoUtils } from "@rapidrest/service-core";
+import { ApiError, type JWTUser } from "@rapidrest/core";
+import { ApiErrorMessages, ApiErrors, type RepoUtils } from "@rapidrest/service-core";
 import { EscrowAccessRequest, EscrowScope } from "../models/types.js";
-
-/** Caches one `RepoUtils` per concrete `EscrowScope` class (Mongo vs SQL) - shared across every calling
- * route rather than each maintaining its own lazy-repo field/getter, mirroring `AuditLogUtils.ts`'s
- * identical `getAuditLogRepo()` pattern. */
-const escrowScopeRepoCache = new WeakMap<any, Promise<RepoUtils<EscrowScope>>>();
-
-function getEscrowScopeRepo(objectFactory: ObjectFactory, escrowScopeClass: any): Promise<RepoUtils<EscrowScope>> {
-    let cached = escrowScopeRepoCache.get(escrowScopeClass);
-    if (!cached) {
-        cached = Promise.resolve(objectFactory.newInstance(RepoUtils, { name: escrowScopeClass.name, args: [escrowScopeClass] }));
-        escrowScopeRepoCache.set(escrowScopeClass, cached);
-    }
-    return cached;
-}
 
 /**
  * Fetches `scopeId`, throwing `404` if no such `EscrowScope` exists or `403` if `user` isn't one of its
@@ -31,12 +17,10 @@ function getEscrowScopeRepo(objectFactory: ObjectFactory, escrowScopeClass: any)
  * with no holder grant on this specific scope gets the same `403` as anyone else.
  */
 export async function requireEscrowHolder(
-    objectFactory: ObjectFactory,
-    escrowScopeClass: any,
+    repo: RepoUtils<EscrowScope>,
     scopeId: string,
     user: JWTUser | undefined,
 ): Promise<EscrowScope> {
-    const repo: RepoUtils<EscrowScope> = await getEscrowScopeRepo(objectFactory, escrowScopeClass);
     const scope: EscrowScope | undefined = await repo.findOne(scopeId, { ignoreACL: true });
     if (!scope) {
         throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -58,15 +42,10 @@ export async function requireEscrowHolder(
  * roles) is nothing like the mailbox-count scale `findAccessibleMailboxUids()` has to handle via a real
  * indexed query.
  */
-export async function findHeldScopeIds(
-    objectFactory: ObjectFactory,
-    escrowScopeClass: any,
-    user: JWTUser | undefined,
-): Promise<string[]> {
+export async function findHeldScopeIds(repo: RepoUtils<EscrowScope>, user: JWTUser | undefined): Promise<string[]> {
     if (!user) {
         return [];
     }
-    const repo: RepoUtils<EscrowScope> = await getEscrowScopeRepo(objectFactory, escrowScopeClass);
     const scopes: EscrowScope[] = await repo.find({}, { ignoreACL: true });
     return scopes.filter((s) => s.holderUserUids.includes(user.uid)).map((s) => s.uid);
 }

@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import {
     DEFAULT_MAILBOX_QUOTA_BYTES,
     findOrCreateSingleton,
@@ -55,9 +55,6 @@ export abstract class BaseMailboxPolicyRoute<T extends MailboxPolicy> {
 
     private repo?: RepoUtils<T>;
 
-    @Config()
-    private config: any;
-
     @Config("mail:default_quota_bytes", DEFAULT_MAILBOX_QUOTA_BYTES)
     private configDefaultQuotaBytes: number = DEFAULT_MAILBOX_QUOTA_BYTES;
 
@@ -70,6 +67,12 @@ export abstract class BaseMailboxPolicyRoute<T extends MailboxPolicy> {
     @Logger
     private logger: any;
 
+    /** The `AuditLogEntry` repository, built once by `initialize()`. */
+    protected auditLogRepo?: RepoUtils<any>;
+
+    /** Records the audit entries, built once by `initialize()` from `auditLogRepo`. */
+    protected auditLogUtils?: AuditLogUtils;
+
     @Init
     protected async initialize(): Promise<void> {
         if (!this._objectFactory) {
@@ -77,6 +80,12 @@ export abstract class BaseMailboxPolicyRoute<T extends MailboxPolicy> {
         }
         if (!this.repo && this.mailboxPolicyClass) {
             this.repo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxPolicyClass.name, args: [this.mailboxPolicyClass] });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
+        }
+        if (!this.auditLogUtils && this.auditLogRepo) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
         }
     }
 
@@ -120,7 +129,7 @@ export abstract class BaseMailboxPolicyRoute<T extends MailboxPolicy> {
     @Get()
     public async get(): Promise<MailboxPolicyResponse> {
         const seed = this.seed();
-        const policy = await findOrSeedMailboxPolicy(this._objectFactory!, this.mailboxPolicyClass, seed, this.logger);
+        const policy = await findOrSeedMailboxPolicy(this.repo as RepoUtils<MailboxPolicy>, seed, this.logger);
         return { ...policy, defaults: seed };
     }
 
@@ -135,16 +144,14 @@ export abstract class BaseMailboxPolicyRoute<T extends MailboxPolicy> {
             }
         }
         // Writes need the real row, so unlike `get()` a datastore failure here is an error, not a config fallback.
-        const existing: T = await findOrCreateSingleton(this.repo!, this.mailboxPolicyClass, MAILBOX_POLICY_UID, { ...this.seed() });
+        const existing: T = await findOrCreateSingleton(this.repo!, MAILBOX_POLICY_UID, { ...this.seed() });
         const updated: T = await this.repo!.update({ uid: existing.uid, version: (existing as any).version, ...patch } as any, existing, {
             user,
             ignoreACL: true,
         });
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.MAILBOX_POLICY_UPDATE, targetType: "MailboxPolicy", targetUid: MAILBOX_POLICY_UID, details: patch },
+            { user },
         );
         return this.toPublic(updated);
     }

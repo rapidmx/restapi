@@ -9,7 +9,7 @@ import * as crypto from "crypto";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors, type HttpRequest, type HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { KeyDiscoveryResponse, KeyVault, Mailbox } from "../models/types.js";
-import { resolveDomainAliasName } from "../util/DomainUtils.js";
+import { DomainUtils } from "../util/DomainUtils.js";
 import { isValidKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { buildKeyDiscoveryResponse } from "../util/LocalKeyDiscoveryUtils.js";
 const { Config, Init } = ObjectDecorators;
@@ -79,6 +79,8 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
 
     protected mailboxRepo?: RepoUtils<M>;
     protected keyVaultRepo?: RepoUtils<K>;
+    protected domainRepo?: RepoUtils<any>;
+    protected domainUtils?: DomainUtils;
 
     /** How long a requesting server may cache a response before revalidating - the spec requires this be set,
      * but leaves the duration to the deployment; per-user key freshness (not domain policy, see
@@ -101,6 +103,18 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
             this.keyVaultRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.keyVaultClass.name,
                 args: [this.keyVaultClass],
+            });
+        }
+        if (!this.domainRepo && this.domainClass) {
+            this.domainRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.domainClass.name,
+                args: [this.domainClass],
+            });
+        }
+        if (!this.domainUtils && this.domainClass) {
+            this.domainUtils = await this._objectFactory.newInstance(DomainUtils, {
+                name: this.domainClass.name,
+                args: [this.domainRepo],
             });
         }
     }
@@ -150,7 +164,7 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
         let match: M | undefined = domain ? matchesDomain(domain) : undefined;
         let viaAliasDomain: boolean = false;
         if (!match && domain) {
-            const primaryDomain: string | undefined = await resolveDomainAliasName(this._objectFactory!, this.domainClass, domain);
+            const primaryDomain: string | undefined = await this.domainUtils!.resolveDomainAliasName(domain);
             if (primaryDomain) {
                 match = matchesDomain(primaryDomain);
                 viaAliasDomain = match !== undefined;

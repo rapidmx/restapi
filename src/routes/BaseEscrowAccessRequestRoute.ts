@@ -15,8 +15,8 @@ import {
     RepoUtils,
     RouteDecorators,
 } from "@rapidrest/service-core";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
+import { EscrowAuditUtils } from "../util/EscrowAuditUtils.js";
 import {
     evaluateEscrowApprovals,
     exactInFilter,
@@ -87,6 +87,12 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
     protected matterRepo?: RepoUtils<M>;
     protected mailboxRepo?: RepoUtils<MB>;
     protected keyVaultRepo?: RepoUtils<KeyVault>;
+    protected escrowScopeRepo?: RepoUtils<EscrowScope>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected escrowAuditEntryRepo?: RepoUtils<any>;
+    protected escrowAuditHeadRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
+    protected escrowAuditUtils?: EscrowAuditUtils;
 
     /** Exposes the `@Model(...)`-supplied entity class so `@Transactional()` on `persistCreate()`/
      * `persistApprove()`/`persistMaterialRead()` can resolve which datasource to open a transaction
@@ -95,7 +101,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         return (this.constructor as any).modelClass;
     }
 
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
+    /** The whole application config, needed to resolve the escrow approval TTL. */
     @Config()
     private config: any;
 
@@ -131,11 +137,48 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
                 args: [this.keyVaultClass],
             });
         }
+        if (!this.escrowScopeRepo && this.escrowScopeClass) {
+            this.escrowScopeRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.escrowScopeClass.name,
+                args: [this.escrowScopeClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.escrowAuditEntryRepo && this.escrowAuditLogClass) {
+            this.escrowAuditEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.escrowAuditLogClass.name,
+                args: [this.escrowAuditLogClass],
+            });
+        }
+        const escrowAuditHeadClass: any = this.escrowAuditLogClass?.escrowAuditHeadClass;
+        if (!this.escrowAuditHeadRepo && escrowAuditHeadClass) {
+            this.escrowAuditHeadRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: escrowAuditHeadClass.name,
+                args: [escrowAuditHeadClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
+            });
+        }
+        if (!this.escrowAuditUtils && this.escrowAuditLogClass) {
+            this.escrowAuditUtils = await this._objectFactory.newInstance(EscrowAuditUtils, {
+                name: this.escrowAuditLogClass.name,
+                args: [this.escrowAuditEntryRepo, this.escrowAuditHeadRepo],
+            });
+        }
     }
 
     /**
      * Runs one of the `@Transactional()` `persist*()` methods, retrying the WHOLE call (a fresh transaction each
-     * time) when it fails with anything but an `ApiError`. `recordEscrowAuditEntry()` already retries a
+     * time) when it fails with anything but an `ApiError`. `EscrowAuditUtils.record()` already retries a
      * `sequence` collision with a concurrent append on its own, but inside a transaction that can't work: on
      * PostgreSQL the failed insert aborts the transaction, so every retry within it fails too. `attempt` lets the
      * caller re-read state a previous, non-transactional attempt (a MongoDB deployment without transactions) may
@@ -187,7 +230,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         // to be open or closed, rather than a 400 revealing the matter's own state to someone who isn't
         // entitled to know it at all.
         const matter: M = await this.requireMatter(body.matterId);
-        const scope = await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        const scope = await requireEscrowHolder(this.escrowScopeRepo!, matter.escrowScopeId, user);
         if (matter.closedAt) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This matter is closed.");
         }
@@ -228,7 +271,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         const created: R =
             (await this.requestRepo!.findOne(instance.uid, { ignoreACL: true, skipCache: true })) ??
             (await this.requestRepo!.create(instance, { ignoreACL: true }));
-        await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
+        await this.escrowAuditUtils!.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: created.requestedByUserUid,
             matterId: created.matterId,
@@ -245,7 +288,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         // oracle for anyone who knows or guesses its id, holder or not.
         const request: R = await this.requireRequest(id);
         const matter: M = await this.requireMatter(request.matterId);
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, matter.escrowScopeId, user);
         if (request.status !== "pending") {
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This request is not pending approval.");
         }
@@ -276,7 +319,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
                   request,
                   { ignoreACL: true },
               );
-        await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
+        await this.escrowAuditUtils!.record({
             action: EscrowAuditAction.REQUEST_APPROVED,
             holderUserUid,
             matterId: updated.matterId,
@@ -290,7 +333,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
     public async deny(@Param("id") id: string, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<R> {
         const request: R = await this.requireRequest(id);
         const matter: M = await this.requireMatter(request.matterId);
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, matter.escrowScopeId, user);
         if (request.status !== "pending") {
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This request is not pending approval.");
         }
@@ -301,10 +344,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
             { user, ignoreACL: true },
         );
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.ESCROW_ACCESS_REQUEST_DENIED,
                 targetType: "EscrowAccessRequest",
@@ -312,6 +352,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
                 mailboxUid: updated.mailboxUid,
                 details: { matterId: updated.matterId },
             },
+            { req, user },
         );
 
         return updated;
@@ -336,7 +377,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         // met its dual-control release threshold, without being a holder of anything at all.
         const request: R = await this.requireRequest(id);
         const matter: M = await this.requireMatter(request.matterId);
-        const scope: EscrowScope = await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        const scope: EscrowScope = await requireEscrowHolder(this.escrowScopeRepo!, matter.escrowScopeId, user);
         if (request.status !== "approved" && request.status !== "fulfilled") {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "Dual control threshold not yet met.");
         }
@@ -382,7 +423,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
     @Transactional()
     protected async persistMaterialRead(request: R, holderUserUid: string, escrowScopeId: string): Promise<void> {
         // Audit first - if this throws, the caller's material() never returns anything.
-        await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
+        await this.escrowAuditUtils!.record({
             action: EscrowAuditAction.MATERIAL_READ,
             holderUserUid,
             matterId: request.matterId,
@@ -409,7 +450,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
     @Get()
     public async find(@Query() query: any, @AuthUser user?: JWTUser): Promise<R[]> {
         const { limit, page } = parseListPaging(query);
-        const heldScopes: string | undefined = exactInFilter(await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user));
+        const heldScopes: string | undefined = exactInFilter(await findHeldScopeIds(this.escrowScopeRepo!, user));
         if (!heldScopes) {
             return [];
         }
@@ -457,7 +498,7 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
     public async findById(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<R> {
         const request: R = await this.requireRequest(id);
         const matter: M = await this.requireMatter(request.matterId);
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, matter.escrowScopeId, user);
         return request;
     }
 }

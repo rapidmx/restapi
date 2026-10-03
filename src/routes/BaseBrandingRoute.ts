@@ -15,7 +15,7 @@ import {
     RouteDecorators,
 } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { assertNoPathKeys } from "../util/RequestBodyUtils.js";
 import { AuditAction, Branding } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
@@ -222,7 +222,7 @@ function firstHeader(req: HttpRequest, name: string): string | undefined {
  * different authorization (public read, trusted-role-only write) that no generic CRUD base class expresses.
  *
  * Mixes two patterns: unauthenticated public reads, and `BaseDomainRoute`'s `@RequiresTrustedRole()` admin writes plus
- * its `recordAuditLog()` usage.
+ * its `AuditLogUtils.record()` usage.
  *
  * `logoUrl`/`iconUrl`/`stylesheetUrl` each support two independent ways for an admin to set them - see
  * `Branding`'s own doc comment (`models/types.ts`) for the full rationale. Uploading
@@ -252,15 +252,14 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     @Config("mail:branding:public_url", "")
     private publicUrl: string = "";
 
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`,
-     * used for `trusted_proxies`/`Event` construction) - `@Config()` with no arguments injects the whole
-     * object, the same way `ModelRoute.config` does for every `CRUDRoute`-based route. This class isn't one
-     * of those, so it needs its own. */
-    @Config()
-    private config: any;
-
     @Logger
     private logger: any;
+
+    /** The `AuditLogEntry` repository, built once by `initialize()`. */
+    protected auditLogRepo?: RepoUtils<any>;
+
+    /** Records the audit entries, built once by `initialize()` from `auditLogRepo`. */
+    protected auditLogUtils?: AuditLogUtils;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -269,6 +268,12 @@ export abstract class BaseBrandingRoute<T extends Branding> {
         }
         if (!this.brandingRepo && this.brandingClass) {
             this.brandingRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.brandingClass.name, args: [this.brandingClass] });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
+        }
+        if (!this.auditLogUtils && this.auditLogRepo) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
         }
     }
 
@@ -326,11 +331,9 @@ export abstract class BaseBrandingRoute<T extends Branding> {
     }
 
     private async recordUpdate(user: JWTUser | undefined, details: Record<string, any>): Promise<void> {
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.BRANDING_UPDATE, targetType: "Branding", targetUid: BRANDING_UID, details },
+            { user },
         );
     }
 

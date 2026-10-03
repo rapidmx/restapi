@@ -409,24 +409,11 @@ describe("ensureWellKnownFolders() Tests", () => {
     });
 });
 
-// Isolated unit tests for getMailboxUidForFolder() - a hand-built objectFactory/repo mock stands in for a
-// real Mongo/SQL repository, matching test/util/LegalHoldUtils.test.ts's identical rationale (this
-// function caches one RepoUtils per `folderClass` object identity in a module-level WeakMap, so each test
-// declares its own fresh, locally-scoped stub class rather than a single shared one).
 describe("getMailboxUidForFolder() Tests", () => {
-    function makeStubFolderClass(): any {
-        return class StubFolder {};
-    }
-
-    function makeObjectFactory(repo: any): any {
-        return { newInstance: vi.fn().mockResolvedValue(repo) };
-    }
-
     it("Returns the real mailboxUid of the resolved folder.", async () => {
-        const repo = { findOne: vi.fn().mockResolvedValue({ uid: "folder-1", mailboxUid: "mailbox-real" }) };
-        const objectFactory = makeObjectFactory(repo);
+        const repo: any = { findOne: vi.fn().mockResolvedValue({ uid: "folder-1", mailboxUid: "mailbox-real" }) };
 
-        const result = await getMailboxUidForFolder(objectFactory, makeStubFolderClass(), "folder-1");
+        const result = await getMailboxUidForFolder(repo, "folder-1");
 
         expect(result).toBe("mailbox-real");
         // A soft-deleted folder resolves too (a plain find leaves it out, and its mailbox would then go unchecked).
@@ -434,20 +421,23 @@ describe("getMailboxUidForFolder() Tests", () => {
     });
 
     it("Resolves a soft-deleted folder's mailbox, unless the caller asks for a folder that can be written to.", async () => {
-        const repo = { findOne: vi.fn().mockResolvedValue({ uid: "folder-1", mailboxUid: "mailbox-real", deleted: true }) };
-        const objectFactory = makeObjectFactory(repo);
-        const folderClass = makeStubFolderClass();
+        const repo: any = { findOne: vi.fn().mockResolvedValue({ uid: "folder-1", mailboxUid: "mailbox-real", deleted: true }) };
 
-        expect(await getMailboxUidForFolder(objectFactory, folderClass, "folder-1")).toBe("mailbox-real");
-        expect(await getMailboxUidForFolder(objectFactory, folderClass, "folder-1", true)).toBeUndefined();
+        expect(await getMailboxUidForFolder(repo, "folder-1")).toBe("mailbox-real");
+        expect(await getMailboxUidForFolder(repo, "folder-1", {})).toBe("mailbox-real");
+        expect(await getMailboxUidForFolder(repo, "folder-1", { rejectDeleted: true })).toBeUndefined();
+    });
+
+    it("Resolves a live folder's mailbox even when the caller asks for a writable folder.", async () => {
+        const repo: any = { findOne: vi.fn().mockResolvedValue({ mailboxUid: "mailbox-real", deleted: false }) };
+
+        expect(await getMailboxUidForFolder(repo, "folder-1", { rejectDeleted: true })).toBe("mailbox-real");
     });
 
     it("Returns undefined when no such folder exists.", async () => {
-        const repo = { findOne: vi.fn().mockResolvedValue(undefined) };
-        const objectFactory = makeObjectFactory(repo);
+        const repo: any = { findOne: vi.fn().mockResolvedValue(undefined) };
 
-        const result = await getMailboxUidForFolder(objectFactory, makeStubFolderClass(), "no-such-folder");
-
-        expect(result).toBeUndefined();
+        expect(await getMailboxUidForFolder(repo, "no-such-folder")).toBeUndefined();
+        expect(await getMailboxUidForFolder(repo, "no-such-folder", { rejectDeleted: true })).toBeUndefined();
     });
 });

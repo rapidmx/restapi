@@ -9,6 +9,10 @@
 // whose model class is unset. The jobs' behavior against a real database is covered in test/jobs/{mongo,sql}/*.test.ts.
 import "reflect-metadata";
 import { RepoUtils } from "@rapidrest/service-core";
+import { AuditLogUtils } from "../../src/util/AuditLogUtils.js";
+import { CorrespondentUtils } from "../../src/util/CorrespondentUtils.js";
+import { DomainUtils } from "../../src/util/DomainUtils.js";
+import { EscrowAuditUtils } from "../../src/util/EscrowAuditUtils.js";
 import { RecoverableRepoUtils } from "../../src/util/RecoverableRepoUtils.js";
 import {
     AcmeEnrollmentDriverJobMongo,
@@ -43,6 +47,7 @@ const JOBS: [name: string, ctor: new () => any, repos: Repo[]][] = [
         [
             ["mailboxRepo", "mailboxClass", "RepoUtils"],
             ["keyVaultRepo", "keyVaultClass", "RepoUtils"],
+            ["auditLogRepo", "auditLogClass", "RepoUtils"],
         ],
     ],
     [
@@ -61,15 +66,25 @@ const JOBS: [name: string, ctor: new () => any, repos: Repo[]][] = [
             ["dataExportRequestRepo", "dataExportRequestClass", "RepoUtils"],
             ["messageRepo", "messageClass", "RepoUtils"],
             ["mailboxRepo", "mailboxClass", "RepoUtils"],
+            ["auditLogRepo", "auditLogClass", "RepoUtils"],
         ],
     ],
-    ["DomainVerificationJob", DomainVerificationJobMongo, [["domainRepo", "domainClass", "RepoUtils"]]],
+    [
+        "DomainVerificationJob",
+        DomainVerificationJobMongo,
+        [
+            ["domainRepo", "domainClass", "RepoUtils"],
+            ["auditLogRepo", "auditLogClass", "RepoUtils"],
+        ],
+    ],
     [
         "ErasureExecutionJob",
         ErasureExecutionJobMongo,
         [
             ["requestRepo", "dataSubjectErasureRequestClass", "RepoUtils"],
             ["mailboxRepo", "mailboxClass", "RepoUtils"],
+            ["matterRepo", "matterClass", "RepoUtils"],
+            ["auditLogRepo", "auditLogClass", "RepoUtils"],
         ],
     ],
     ["ExternalShareExpirationJob", ExternalShareExpirationJobMongo, [["calendarShareLinkRepo", "calendarShareLinkClass", "RepoUtils"]]],
@@ -82,6 +97,7 @@ const JOBS: [name: string, ctor: new () => any, repos: Repo[]][] = [
             ["folderRepo", "folderClass", "RepoUtils"],
             ["messageRepo", "messageClass", "RepoUtils"],
             ["attachmentRepo", "attachmentClass", "RepoUtils"],
+            ["auditLogRepo", "auditLogClass", "RepoUtils"],
         ],
     ],
     [
@@ -101,6 +117,8 @@ const JOBS: [name: string, ctor: new () => any, repos: Repo[]][] = [
             ["matterRepo", "matterClass", "RepoUtils"],
             ["messageRepo", "messageClass", "RepoUtils"],
             ["mailboxRepo", "mailboxClass", "RepoUtils"],
+            ["auditLogRepo", "auditLogClass", "RepoUtils"],
+            ["escrowAuditEntryRepo", "escrowAuditLogClass", "RepoUtils"],
         ],
     ],
     [
@@ -120,6 +138,9 @@ const JOBS: [name: string, ctor: new () => any, repos: Repo[]][] = [
             ["quarantineEntryRepo", "quarantineEntryClass", "RepoUtils"],
             ["scanResultRepo", "scanResultClass", "RepoUtils"],
             ["ingestQueueEntryRepo", "ingestQueueEntryClass", "RepoUtils"],
+            ["messageRepo", "messageClass", "RepoUtils"],
+            ["attachmentRepo", "attachmentClass", "RepoUtils"],
+            ["matterRepo", "matterClass", "RepoUtils"],
         ],
     ],
     [
@@ -131,6 +152,9 @@ const JOBS: [name: string, ctor: new () => any, repos: Repo[]][] = [
             ["auditLogRepo", "auditLogClass", "RepoUtils"],
             ["attachmentRepo", "attachmentClass", "RepoUtils"],
             ["folderRepo", "folderClass", "RecoverableRepoUtils"],
+            ["matterRepo", "matterClass", "RepoUtils"],
+            ["quarantineEntryRepo", "quarantineEntryClass", "RepoUtils"],
+            ["ingestQueueEntryRepo", "ingestQueueEntryClass", "RepoUtils"],
         ],
     ],
     [
@@ -151,6 +175,8 @@ const JOBS: [name: string, ctor: new () => any, repos: Repo[]][] = [
             ["contactRepo", "contactClass", "RecoverableRepoUtils"],
             ["keyVaultRepo", "keyVaultClass", "RepoUtils"],
             ["erasureRequestRepo", "dataSubjectErasureRequestClass", "RepoUtils"],
+            ["correspondentRepo", "correspondentClass", "RepoUtils"],
+            ["domainRepo", "domainClass", "RepoUtils"],
         ],
     ],
     [
@@ -160,6 +186,8 @@ const JOBS: [name: string, ctor: new () => any, repos: Repo[]][] = [
             ["messageRepo", "messageClass", "RecoverableRepoUtils"],
             ["folderRepo", "folderClass", "RecoverableRepoUtils"],
             ["mailboxRepo", "mailboxClass", "RepoUtils"],
+            ["correspondentRepo", "correspondentClass", "RepoUtils"],
+            ["domainRepo", "domainClass", "RepoUtils"],
         ],
     ],
     [
@@ -170,6 +198,59 @@ const JOBS: [name: string, ctor: new () => any, repos: Repo[]][] = [
             ["attachmentRepo", "attachmentClass", "RepoUtils"],
         ],
     ],
+];
+
+type Service = [serviceField: string, serviceType: any, classField: string, argFields: string[]];
+
+/** Every job with the services its hook builds, after its repos: [service field, service type, class field the service is named
+ * after, fields holding the repos it is built from, in order]. */
+const SERVICES: [name: string, ctor: new () => any, services: Service[]][] = [
+    ["AcmeEnrollmentDriverJob", AcmeEnrollmentDriverJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],
+    ["DataExportJob", DataExportJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],
+    ["DomainVerificationJob", DomainVerificationJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],
+    ["ErasureExecutionJob", ErasureExecutionJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],
+    ["MailboxImportJob", MailboxImportJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],
+    [
+        "MatterExportJob",
+        MatterExportJobMongo,
+        [
+            ["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]],
+            ["escrowAuditUtils", EscrowAuditUtils, "escrowAuditLogClass", ["escrowAuditEntryRepo", "escrowAuditHeadRepo"]],
+        ],
+    ],
+    ["RetentionEnforcementJob", RetentionEnforcementJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],
+    [
+        "ScanQueueJob",
+        ScanQueueJobMongo,
+        [
+            ["correspondentUtils", CorrespondentUtils, "correspondentClass", ["correspondentRepo", "mailboxRepo"]],
+            ["domainUtils", DomainUtils, "domainClass", ["domainRepo"]],
+        ],
+    ],
+    [
+        "ScheduledSendJob",
+        ScheduledSendJobMongo,
+        [
+            ["correspondentUtils", CorrespondentUtils, "correspondentClass", ["correspondentRepo", "mailboxRepo"]],
+            ["domainUtils", DomainUtils, "domainClass", ["domainRepo"]],
+        ],
+    ],
+];
+
+/** The jobs that build the per-entity-type repositories their mailbox content export reads. */
+const CONTENT_JOBS: [name: string, ctor: new () => any][] = [
+    ["DataExportJob", DataExportJobMongo],
+    ["MatterExportJob", MatterExportJobMongo],
+];
+
+const CONTENT_ENTITIES: [entityType: string, classField: string][] = [
+    ["message", "messageClass"],
+    ["contact", "contactClass"],
+    ["contactList", "contactListClass"],
+    ["calendarEvent", "calendarEventClass"],
+    ["task", "taskClass"],
+    ["note", "noteClass"],
+    ["attachment", "attachmentClass"],
 ];
 
 /** Gives a job built with `new` (so the ObjectFactory never injected anything) a stand-in factory. */
@@ -232,6 +313,131 @@ describe("Background job init() hook Tests", () => {
 
                 expect(job[repoField]).toBeUndefined();
             }
+        });
+    });
+
+    describe.each(SERVICES)("%s services", (_name, Ctor, services) => {
+        it("builds each service once through the factory, named after its model class, from the repos built before it.", async () => {
+            const factory = stubFactory();
+            const job: any = withFactory(new Ctor(), factory);
+
+            await job.init();
+
+            for (const [serviceField, serviceType, classField, argFields] of services) {
+                const options = { name: job[classField].name, args: argFields.map((field) => job[field]) };
+                expect(factory.newInstance).toHaveBeenCalledWith(serviceType, options);
+                expect(factory.newInstance.mock.calls.filter(([type]: any[]) => type === serviceType)).toHaveLength(1);
+                expect(job[serviceField]).toMatchObject({ built: true, type: serviceType, options });
+            }
+        });
+
+        it("does not rebuild a service that is already set.", async () => {
+            const factory = stubFactory();
+            const job: any = withFactory(new Ctor(), factory);
+            const existing: any = {};
+            for (const [serviceField] of services) {
+                job[serviceField] = existing;
+            }
+
+            await job.init();
+
+            for (const [serviceField, serviceType] of services) {
+                expect(job[serviceField]).toBe(existing);
+                expect(factory.newInstance).not.toHaveBeenCalledWith(serviceType, expect.anything());
+            }
+        });
+
+        it("skips a service whose model class is not set.", async () => {
+            for (const [serviceField, , classField] of services) {
+                const job: any = withFactory(new Ctor(), stubFactory());
+                job[classField] = undefined;
+
+                await job.init();
+
+                expect(job[serviceField]).toBeUndefined();
+            }
+        });
+    });
+
+    describe("MatterExportJob escrow audit head repo", () => {
+        it("is built from the escrow audit log class's own head class, and skipped when it has none.", async () => {
+            const factory = stubFactory();
+            const job: any = withFactory(new MatterExportJobMongo(), factory);
+            const headClass: any = job.escrowAuditLogClass.escrowAuditHeadClass;
+
+            await job.init();
+
+            expect(factory.newInstance).toHaveBeenCalledWith(RepoUtils, { name: headClass.name, args: [headClass] });
+            expect(job.escrowAuditHeadRepo).toMatchObject({ built: true, options: { name: headClass.name, args: [headClass] } });
+
+            const bare: any = withFactory(new MatterExportJobMongo(), stubFactory());
+            bare.escrowAuditLogClass = class NoHeadEntry {};
+            await bare.init();
+
+            expect(bare.escrowAuditHeadRepo).toBeUndefined();
+            expect(bare.escrowAuditUtils).toMatchObject({ built: true, type: EscrowAuditUtils });
+        });
+
+        it("does not rebuild a head repo that is already set.", async () => {
+            const factory = stubFactory();
+            const job: any = withFactory(new MatterExportJobMongo(), factory);
+            const existing: any = {};
+            job.escrowAuditHeadRepo = existing;
+
+            await job.init();
+
+            expect(job.escrowAuditHeadRepo).toBe(existing);
+            const headClass: any = job.escrowAuditLogClass.escrowAuditHeadClass;
+            expect(factory.newInstance).not.toHaveBeenCalledWith(RepoUtils, { name: headClass.name, args: [headClass] });
+        });
+    });
+
+    describe.each(CONTENT_JOBS)("%s content repos", (_name, Ctor) => {
+        it("builds one repo per entity type, once, in init(), sharing messageRepo for the messages.", async () => {
+            const factory = stubFactory();
+            const job: any = withFactory(new Ctor(), factory);
+
+            await job.init();
+
+            for (const [entityType, classField] of CONTENT_ENTITIES) {
+                const modelClass: any = job[classField];
+                if (entityType === "message") {
+                    expect(job.contentRepos.message).toBe(job.messageRepo);
+                } else {
+                    expect(job.contentRepos[entityType]).toMatchObject({
+                        built: true,
+                        type: RepoUtils,
+                        options: { name: modelClass.name, args: [modelClass] },
+                    });
+                }
+            }
+            expect(Object.keys(job.contentRepos)).toHaveLength(CONTENT_ENTITIES.length);
+        });
+
+        it("skips an entity type whose model class is not set.", async () => {
+            const job: any = withFactory(new Ctor(), stubFactory());
+            job.messageClass = undefined;
+            job.noteClass = undefined;
+
+            await job.init();
+
+            expect(job.messageRepo).toBeUndefined();
+            expect(job.contentRepos.message).toBeUndefined();
+            expect(job.contentRepos.note).toBeUndefined();
+            expect(job.contentRepos.task).toBeDefined();
+        });
+
+        it("does not rebuild content repos that are already set.", async () => {
+            const factory = stubFactory();
+            const job: any = withFactory(new Ctor(), factory);
+            const existing: any = {};
+            job.contentRepos = existing;
+
+            await job.init();
+
+            expect(job.contentRepos).toBe(existing);
+            const taskClass: any = job.taskClass;
+            expect(factory.newInstance).not.toHaveBeenCalledWith(RepoUtils, { name: taskClass.name, args: [taskClass] });
         });
     });
 

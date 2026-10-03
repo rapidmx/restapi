@@ -7,7 +7,7 @@ import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { createClient } from "redis";
 import { BlobStore } from "../blob/BlobStore.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { AuditAction, Plugin, PluginManifest, PluginSettingDefinition, PluginSource } from "../models/types.js";
 import { inspectPack, PackInspection, PackInspectionError } from "../plugins/PackInspector.js";
@@ -302,9 +302,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
 
     private pluginRepo?: RepoUtils<T>;
 
-    @Config()
-    private config: any;
-
     /** The roles that may manage plugins - with an elevated token (`assertAdminScope()`): a plugin is code every replica of the server loads. */
     @Config("trusted_roles", ["admin"])
     protected trustedRoles: string[] = ["admin"];
@@ -351,6 +348,15 @@ export abstract class BasePluginRoute<T extends Plugin> {
 
     private normalizedAllowedPackages?: string[];
 
+    @Config()
+    private config: any;
+
+    /** The `AuditLogEntry` repository, built once by `initialize()`. */
+    protected auditLogRepo?: RepoUtils<any>;
+
+    /** Records the audit entries, built once by `initialize()` from `auditLogRepo`. */
+    protected auditLogUtils?: AuditLogUtils;
+
     @Init
     protected async initialize(): Promise<void> {
         if (!this._objectFactory) {
@@ -358,6 +364,12 @@ export abstract class BasePluginRoute<T extends Plugin> {
         }
         if (!this.pluginRepo && this.pluginClass) {
             this.pluginRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.pluginClass.name, args: [this.pluginClass] });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
+        }
+        if (!this.auditLogUtils && this.auditLogRepo) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
         }
     }
 
@@ -695,11 +707,9 @@ export abstract class BasePluginRoute<T extends Plugin> {
     }
 
     private async audit(req: HttpRequest, user: JWTUser | undefined, action: AuditAction, plugin: T, details: Record<string, unknown>): Promise<void> {
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action, targetType: "Plugin", targetUid: plugin.uid, details: { name: plugin.name, ...details } },
+            { req, user },
         );
     }
 

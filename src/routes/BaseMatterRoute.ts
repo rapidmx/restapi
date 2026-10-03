@@ -14,11 +14,11 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { coerceDateFields, MATTER_DATE_FIELDS } from "../util/DateCoercionUtils.js";
 import { exactInFilter, findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
-import { AuditAction, Mailbox, Matter } from "../models/types.js";
+import { AuditAction, EscrowScope, Mailbox, Matter } from "../models/types.js";
 const { Init } = ObjectDecorators;
 const { Head, Param, Post, Query, Request, Response, User: AuthUser } = RouteDecorators;
 
@@ -97,7 +97,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
      * resolve an `EscrowScope` without depending on either backend directly - see `util/EscrowUtils.ts`. */
     protected abstract escrowScopeClass: any;
 
-    /** Supplied by the Mongo/SQL concrete subclasses so `recordAuditLog()` can persist an `AuditLogEntry`
+    /** Supplied by the Mongo/SQL concrete subclasses so `AuditLogUtils` can persist an `AuditLogEntry`
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
 
@@ -111,6 +111,10 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
     protected mailboxRepo?: RepoUtils<Mailbox>;
 
     protected accessRequestRepo?: RepoUtils<any>;
+
+    protected escrowScopeRepo?: RepoUtils<EscrowScope>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -127,6 +131,24 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             this.accessRequestRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.escrowAccessRequestClass.name,
                 args: [this.escrowAccessRequestClass],
+            });
+        }
+        if (!this.escrowScopeRepo && this.escrowScopeClass) {
+            this.escrowScopeRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.escrowScopeClass.name,
+                args: [this.escrowScopeClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
             });
         }
     }
@@ -170,7 +192,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             if (!o.escrowScopeId) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "escrowScopeId is required.");
             }
-            await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, o.escrowScopeId, user);
+            await requireEscrowHolder(this.escrowScopeRepo!, o.escrowScopeId, user);
             coerceDateFields(o, MATTER_DATE_FIELDS);
             validateMatter(o);
             await this.assertCustodiansInScope(o.custodianMailboxUids, o.escrowScopeId);
@@ -181,11 +203,9 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             : [await this.doCreateObject(objs[0], { req, user, ignoreACL: true })];
 
         for (const matter of created) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, req, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 { action: AuditAction.MATTER_CREATE, targetType: "Matter", targetUid: matter.uid, details: { name: matter.name } },
+                { req, user },
             );
         }
 
@@ -198,7 +218,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, existing.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, existing.escrowScopeId, user);
         if (existing.closedAt) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This matter is already closed.");
         }
@@ -209,11 +229,9 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             { user, ignoreACL: true },
         );
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.MATTER_CLOSE, targetType: "Matter", targetUid: updated.uid, details: { name: updated.name } },
+            { req, user },
         );
 
         return updated;
@@ -234,7 +252,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, existing.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, existing.escrowScopeId, user);
         if (existing.closedAt) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A closed matter cannot be modified.");
         }
@@ -247,11 +265,9 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
 
         const updated: T = await this.repoUtils!.update(obj, existing, { user, version: (obj as any).version, ignoreACL: true });
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.MATTER_UPDATE, targetType: "Matter", targetUid: updated.uid, details: { name: updated.name } },
+            { req, user },
         );
 
         return updated;
@@ -292,7 +308,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, existing.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, existing.escrowScopeId, user);
         if (existing.closedAt) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A closed matter cannot be modified.");
         }
@@ -313,11 +329,9 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             { user, ignoreACL: true },
         );
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.MATTER_UPDATE, targetType: "Matter", targetUid: updated.uid, details: { name: updated.name } },
+            { user },
         );
 
         return updated;
@@ -365,11 +379,9 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         });
 
         for (const existing of matched) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 { action: AuditAction.MATTER_DELETE, targetType: "Matter", targetUid: existing.uid, details: { name: existing.name } },
+                { user },
             );
         }
     }
@@ -385,7 +397,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         if (!existing) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, existing.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, existing.escrowScopeId, user);
 
         const referencing = await this.accessRequestRepo!.find({ matterId: existing.uid, limit: 1 } as any, { ignoreACL: true, limit: 1 });
         if (referencing.length > 0) {
@@ -394,18 +406,16 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
 
         await this.repoUtils!.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.MATTER_DELETE, targetType: "Matter", targetUid: existing.uid, details: { name: existing.name } },
+            { req, user },
         );
     }
 
     /** The `escrowScopeId` filter matching exactly the scopes `user` holds (see `exactInFilter()`), `undefined` for
      * none. */
     private async heldScopeFilter(user: JWTUser | undefined): Promise<string | undefined> {
-        return exactInFilter(await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user));
+        return exactInFilter(await findHeldScopeIds(this.escrowScopeRepo!, user));
     }
 
     public async find(@Param() params: any, @Query() query: any, @AuthUser user?: JWTUser): Promise<T[]> {
@@ -446,7 +456,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
         if (!result) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, result.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, result.escrowScopeId, user);
         return result;
     }
 
@@ -470,7 +480,7 @@ export abstract class BaseMatterRoute<T extends Matter> extends CRUDRoute<T> {
             return res.status(404).setHeader("content-length", 0);
         }
         try {
-            await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, result.escrowScopeId, user);
+            await requireEscrowHolder(this.escrowScopeRepo!, result.escrowScopeId, user);
         } catch {
             return res.status(404).setHeader("content-length", 0);
         }

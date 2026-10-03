@@ -7,9 +7,9 @@
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrors, ModelUtils, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { Contact, Correspondent, DataSubjectErasureRequest, DistributionList, Folder, FolderType, Mailbox } from "../models/types.js";
-import { ensureCorrespondentsBackfilled } from "../util/CorrespondentUtils.js";
+import { CorrespondentBackfillUtils, CorrespondentUtils } from "../util/CorrespondentUtils.js";
 import { hasMailAccess } from "../util/MailAccessUtils.js";
-const { Config, Init, Inject, Logger } = ObjectDecorators;
+const { Config, Init, Inject } = ObjectDecorators;
 const { Auth, Get, Query, RateLimit, User: AuthUser } = RouteDecorators;
 
 /** What a directory entry names: a person's mailbox, a shared mailbox, a room or equipment resource, a distribution
@@ -166,7 +166,7 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
     protected abstract folderClass: any;
     protected abstract erasureRequestClass: any;
     /** The `Message`, `CalendarEvent` and `Correspondent` model classes: `GET /correspondents` reads the first two, once per
-     * mailbox, to build the third (`ensureCorrespondentsBackfilled()`). */
+     * mailbox, to build the third (`CorrespondentBackfillUtils.ensureCorrespondentsBackfilled()`). */
     protected abstract messageClass: any;
     protected abstract calendarEventClass: any;
     protected abstract correspondentClass: any;
@@ -176,9 +176,15 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
     private mailboxRepo?: RepoUtils<M>;
     private folderRepo?: RepoUtils<F>;
     private erasureRepo?: RepoUtils<DataSubjectErasureRequest>;
+    protected messageRepo?: RepoUtils<any>;
+    protected calendarEventRepo?: RepoUtils<any>;
+    protected correspondentRepo?: RepoUtils<any>;
 
-    @Logger
-    private logger: any;
+    /** Records the correspondents, built once by `initialize()` from the repositories above. */
+    protected correspondentUtils?: CorrespondentUtils;
+
+    /** Backfills a mailbox's correspondents from its existing mail and events, built once by `initialize()` on `correspondentUtils`. */
+    protected correspondentBackfillUtils?: CorrespondentBackfillUtils;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
@@ -214,6 +220,27 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
         }
         if (!this.erasureRepo && this.erasureRequestClass) {
             this.erasureRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.erasureRequestClass.name, args: [this.erasureRequestClass] });
+        }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.messageClass.name, args: [this.messageClass] });
+        }
+        if (!this.calendarEventRepo && this.calendarEventClass) {
+            this.calendarEventRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.calendarEventClass.name, args: [this.calendarEventClass] });
+        }
+        if (!this.correspondentRepo && this.correspondentClass) {
+            this.correspondentRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.correspondentClass.name, args: [this.correspondentClass] });
+        }
+        if (!this.correspondentUtils && this.correspondentRepo && this.mailboxRepo) {
+            this.correspondentUtils = await this._objectFactory.newInstance(CorrespondentUtils, {
+                name: this.correspondentClass.name,
+                args: [this.correspondentRepo, this.mailboxRepo],
+            });
+        }
+        if (!this.correspondentBackfillUtils && this.correspondentUtils && this.folderRepo && this.messageRepo && this.calendarEventRepo) {
+            this.correspondentBackfillUtils = await this._objectFactory.newInstance(CorrespondentBackfillUtils, {
+                name: this.correspondentClass.name,
+                args: [this.correspondentUtils, this.folderRepo, this.messageRepo, this.calendarEventRepo],
+            });
         }
     }
 
@@ -335,7 +362,7 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
      * `correspondent`, one per address across those mailboxes, most recently seen first and then most often seen.
      *
      * The first time a mailbox is searched its correspondents are built from the mail and events it already holds
-     * (`ensureCorrespondentsBackfilled()`, bounded), so the first search of an old mailbox is slower than the rest.
+     * (`CorrespondentBackfillUtils.ensureCorrespondentsBackfilled()`, bounded), so the first search of an old mailbox is slower than the rest.
      */
     @Auth(["jwt"])
     @RateLimit({ perUser: true, maxAttempts: DIRECTORY_MAX_ATTEMPTS, windowSeconds: DIRECTORY_WINDOW_SECONDS })
@@ -360,18 +387,7 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
             return [];
         }
         for (const mailbox of mailboxes.values()) {
-            await ensureCorrespondentsBackfilled(
-                {
-                    objectFactory: this._objectFactory!,
-                    correspondentClass: this.correspondentClass,
-                    mailboxClass: this.mailboxClass,
-                    messageClass: this.messageClass,
-                    folderClass: this.folderClass,
-                    calendarEventClass: this.calendarEventClass,
-                    logger: this.logger,
-                },
-                mailbox,
-            );
+            await this.correspondentBackfillUtils!.ensureCorrespondentsBackfilled(mailbox);
         }
         const rows: Correspondent[] = await this.findCorrespondentCandidates([...mailboxes.keys()], query.terms, query.limit * 2);
         // The same person in several mailboxes is one suggestion: the candidates are ordered per query, so re-order across

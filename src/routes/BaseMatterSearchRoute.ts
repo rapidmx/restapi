@@ -12,9 +12,9 @@ import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import * as crypto from "crypto";
 import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { SearchEntityType, SearchProvider, SearchResultPage } from "../search/SearchProvider.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { requireEscrowHolder } from "../util/EscrowUtils.js";
-import { AuditAction, Mailbox, Matter } from "../models/types.js";
+import { AuditAction, EscrowScope, Mailbox, Matter } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Query, RateLimit, Request, User: AuthUser } = RouteDecorators;
 
@@ -89,11 +89,11 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    @Config()
-    private config: any;
-
     protected matterRepo?: RepoUtils<M>;
     protected mailboxRepo?: RepoUtils<MB>;
+    protected escrowScopeRepo?: RepoUtils<EscrowScope>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
 
     @Inject("SearchProvider")
     private searchProvider?: SearchProvider;
@@ -118,6 +118,24 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
                 args: [this.mailboxClass],
             });
         }
+        if (!this.escrowScopeRepo && this.escrowScopeClass) {
+            this.escrowScopeRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.escrowScopeClass.name,
+                args: [this.escrowScopeClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
+            });
+        }
     }
 
     private async requireHolderMatter(matterId: string, user: JWTUser | undefined): Promise<M> {
@@ -125,7 +143,7 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
         if (!matter) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, matter.escrowScopeId, user);
         return matter;
     }
 
@@ -242,11 +260,8 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
         }
         // Reading every custodian's mail is the point of a hold review, and the holder's own searches are what an audit has to be able to show:
         // the matter, how many mailboxes were searched and a digest of the query - not the text, which can itself be what is sensitive.
-        if (this.auditLogClass) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, req, user, logger: this.logger },
+        if (this.auditLogUtils) {
+            await this.auditLogUtils.record(
                 {
                     action: AuditAction.MATTER_SEARCH,
                     targetType: "Matter",
@@ -260,6 +275,7 @@ export abstract class BaseMatterSearchRoute<M extends Matter, MB extends Mailbox
                             .slice(0, 16),
                     },
                 },
+                { req, user },
             );
         }
         return resultsByMailbox;

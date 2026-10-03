@@ -27,7 +27,7 @@ const { Before, Delete, Param, Post, Put, Query, Request, RequiresTrustedRole, R
  * permission", confirmed by reading its source), there is no way to block *every* caller, admins
  * included, via the ACL system alone. An audit trail an admin could edit through the same API it's meant
  * to hold them accountable through wouldn't be trustworthy. The only writer is `util/AuditLogUtils.ts`'s
- * `recordAuditLog()`, called directly from the handful of routes this covers (see `AuditAction`'s own
+ * `AuditLogUtils.record()`, called directly from the handful of routes this covers (see `AuditAction`'s own
  * doc comment, `models/types.ts`) with `{ ignoreACL: true }`, bypassing this route entirely.
  *
  * @author Jean-Philippe Steinmetz

@@ -12,5 +12,5 @@ const { Model } = RouteDecorators;
 export class ContactRouteSQL extends BaseContactRoute<ContactSQL> {
     protected readonly repoUtilsClass: any = RecoverableRepoUtils;
     protected readonly scopeProperty: string = "folderUid";
-    protected folderClass: any = FolderSQL;
+    protected scopeFolderClass: any = FolderSQL;
 }

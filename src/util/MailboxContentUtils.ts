@@ -2,15 +2,18 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { type ObjectFactory } from "@rapidrest/core";
-import { RepoUtils } from "@rapidrest/service-core";
+import type { RepoUtils } from "@rapidrest/service-core";
 import { Mailbox } from "../models/types.js";
 
 /** Every entity type (besides `Mailbox` itself) `collectMailboxContentLines()` collects - each
  * denormalizes `mailboxUid` directly, so no `Folder` join is needed to scope any of them. */
 export type MailboxContentEntity = "message" | "contact" | "contactList" | "calendarEvent" | "task" | "note" | "attachment";
 
+/** The concrete model class of each entity type - what a job builds the `MailboxContentRepos` from. */
 export type MailboxContentEntityClasses = Record<MailboxContentEntity, any>;
+
+/** The repository of each entity type `collectMailboxContentLines()` collects. */
+export type MailboxContentRepos = Record<MailboxContentEntity, RepoUtils<any>>;
 
 /** Default ceiling on the number of NDJSON lines (rows, across every entity type combined)
  * `collectMailboxContentLines()` will accumulate in memory for a single mailbox before giving up - see
@@ -19,10 +22,6 @@ export type MailboxContentEntityClasses = Record<MailboxContentEntity, any>;
  * depends on the deployment's available memory, not a value this library can confidently pick for every
  * installation. */
 export const DEFAULT_MAX_MAILBOX_CONTENT_ROWS = 250_000;
-
-async function getRepo(objectFactory: ObjectFactory, entityClass: any): Promise<RepoUtils<any>> {
-    return await objectFactory.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
-}
 
 /**
  * Reads every row of `repo` matching `criteria`, one page at a time, using keyset paging on `uid`: each page is
@@ -96,8 +95,7 @@ export async function* findPagesByUid<T extends { uid: string } = any>(
  * mailbox/matter already takes, so no new error handling is needed at the call site.
  */
 export async function collectMailboxContentLines(
-    objectFactory: ObjectFactory,
-    entityClasses: MailboxContentEntityClasses,
+    repos: MailboxContentRepos,
     mailboxUid: string,
     mailbox: Mailbox,
     messageDateRange?: { start: Date; end: Date },
@@ -106,8 +104,7 @@ export async function collectMailboxContentLines(
 ): Promise<string[]> {
     const lines: string[] = [JSON.stringify({ entityType: "Mailbox", ...mailbox })];
 
-    for (const [entityType, entityClass] of Object.entries(entityClasses) as [MailboxContentEntity, any][]) {
-        const repo: RepoUtils<any> = await getRepo(objectFactory, entityClass);
+    for (const [entityType, repo] of Object.entries(repos) as [MailboxContentEntity, RepoUtils<any>][]) {
         const criteria: Record<string, any> = { mailboxUid };
         if (entityType === "message" && messageDateRange) {
             criteria.sentDate = `range(${messageDateRange.start.toISOString()},${messageDateRange.end.toISOString()})`;

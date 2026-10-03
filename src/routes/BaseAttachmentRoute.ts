@@ -24,7 +24,7 @@ import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { chargeMailboxQuota, MailboxQuotaExceededError, refundMailboxQuota } from "../util/MailboxQuotaUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
-import { Attachment, Mailbox, Message } from "../models/types.js";
+import { Attachment, Mailbox, Matter, Message } from "../models/types.js";
 const { Config, Init, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Delete, Get, Head, Param, Post, Put, Query, Request, Response, User: AuthUser } = RouteDecorators;
@@ -142,6 +142,9 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
 
     protected messageRepo?: RecoverableRepoUtils<M>;
     protected mailboxRepo?: RepoUtils<Mailbox>;
+    protected matterRepo?: RepoUtils<Matter>;
+    protected quarantineEntryRepo?: RepoUtils<any>;
+    protected ingestQueueEntryRepo?: RepoUtils<any>;
 
     /** Page size for the folder-scoped scans that filter or re-stamp in memory (`count()`/`truncate()`). */
     protected folderScanPageSize: number = 500;
@@ -166,6 +169,21 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         }
         if (!this.mailboxRepo && this.mailboxClass) {
             this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
+        }
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.matterClass.name, args: [this.matterClass] });
+        }
+        if (!this.quarantineEntryRepo && this.quarantineEntryClass) {
+            this.quarantineEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.quarantineEntryClass.name,
+                args: [this.quarantineEntryClass],
+            });
+        }
+        if (!this.ingestQueueEntryRepo && this.ingestQueueEntryClass) {
+            this.ingestQueueEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.ingestQueueEntryClass.name,
+                args: [this.ingestQueueEntryClass],
+            });
         }
     }
 
@@ -542,7 +560,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
      * rewrite of the fields that describe it (`prepareUpdate()`). `context` caches the messages and matters of one truncate.
      */
     protected async checkLegalHold(existing: T, user?: JWTUser, context?: Record<string, unknown>): Promise<void> {
-        if (!this.matterClass) {
+        if (!this.matterRepo) {
             return;
         }
         const messages: Map<string, Promise<M | undefined>> | undefined = context
@@ -563,7 +581,7 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
             .map((value) => (value instanceof Date || typeof value === "string" || typeof value === "number" ? new Date(value) : undefined))
             .find((date) => date && !Number.isNaN(date.getTime()));
         // With no usable date any open hold on the mailbox blocks - the conservative direction for a hold.
-        const holds = await findActiveHoldsFor(this._objectFactory!, this.matterClass, mailboxUid, reference);
+        const holds = await findActiveHoldsFor(this.matterRepo, mailboxUid, reference);
         if (holds.length > 0) {
             throw new ApiError(
                 ApiErrors.IDENTIFIER_EXISTS,
@@ -609,14 +627,14 @@ export abstract class BaseAttachmentRoute<T extends Attachment, M extends Messag
         const { refunds, blobKeys } = prepared as { refunds: Map<string, number>; blobKeys: string[] };
         if (this.blobStore && blobKeys.length > 0) {
             const sources = messageBlobReferenceSources({
-                messageClass: this.messageClass,
-                attachmentClass: this.modelClass,
-                quarantineEntryClass: this.quarantineEntryClass,
-                ingestQueueEntryClass: this.ingestQueueEntryClass,
+                messageRepo: this.messageRepo,
+                attachmentRepo: this.repoUtils,
+                quarantineEntryRepo: this.quarantineEntryRepo,
+                ingestQueueEntryRepo: this.ingestQueueEntryRepo,
             });
             for (const key of blobKeys) {
                 try {
-                    await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore, sources, [key]);
+                    await deleteBlobsIfUnreferenced(this.blobStore, sources, [key]);
                 } catch (err: any) {
                     this.logger?.warn(`BaseAttachmentRoute: failed to delete blob ${key}: ${err?.message}`);
                 }

@@ -4,55 +4,73 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { findOrCreateSingleton, findOrSeedMailboxPolicy, MAILBOX_POLICY_UID } from "../../src/util/MailboxPolicyUtils.js";
 
-class Row {
-    constructor(fields: any) {
-        Object.assign(this, fields);
+describe("MailboxPolicyUtils Tests", () => {
+    class PolicyModel {
+        constructor(data: any) {
+            Object.assign(this, data);
+        }
     }
-}
+    const seed = { defaultQuotaBytes: 10, autoProvisionEnabled: true, autoProvisionQuotaBytes: 20 };
 
-const seed = { defaultQuotaBytes: 10, autoProvisionEnabled: true, autoProvisionQuotaBytes: 20 };
+    it("findOrCreateSingleton() returns the existing row without creating.", async () => {
+        const row = { uid: "x" };
+        const repo: any = { findOne: vi.fn().mockResolvedValue(row), create: vi.fn() };
 
-describe("findOrCreateSingleton", () => {
-    it("returns the existing row without creating one", async () => {
-        const repo: any = { findOne: vi.fn().mockResolvedValue({ uid: "x" }), create: vi.fn() };
-        expect(await findOrCreateSingleton(repo, Row, "x", { a: 1 })).toEqual({ uid: "x" });
+        expect(await findOrCreateSingleton(repo, "x", { a: 1 })).toBe(row);
         expect(repo.create).not.toHaveBeenCalled();
     });
 
-    it("creates the row from the seed", async () => {
-        const repo: any = { findOne: vi.fn().mockResolvedValue(undefined), create: vi.fn(async (row: any) => row) };
-        expect(await findOrCreateSingleton(repo, Row, "x", { a: 1 })).toEqual(new Row({ a: 1, uid: "x" }));
+    it("findOrCreateSingleton() creates the row as the repository's model class, seeded with the uid.", async () => {
+        const repo: any = { modelClass: PolicyModel, findOne: vi.fn().mockResolvedValue(undefined), create: vi.fn(async (obj: any) => obj) };
+
+        const created: any = await findOrCreateSingleton(repo, "x", { a: 1 });
+
+        expect(created).toBeInstanceOf(PolicyModel);
+        expect(created).toMatchObject({ a: 1, uid: "x" });
+        expect(repo.create).toHaveBeenCalledWith(created, { ignoreACL: true });
     });
 
-    it("returns the row a concurrent caller created first, and rethrows when there is none", async () => {
-        const raced: any = { findOne: vi.fn().mockResolvedValueOnce(undefined).mockResolvedValueOnce({ uid: "x", winner: true }), create: vi.fn().mockRejectedValue(new Error("duplicate key")) };
-        expect(await findOrCreateSingleton(raced, Row, "x")).toEqual({ uid: "x", winner: true });
+    it("findOrCreateSingleton() defaults the seed, returns the winner of a create race, and rethrows otherwise.", async () => {
+        const winner = { uid: "x", winner: true };
+        const raced: any = { findOne: vi.fn().mockResolvedValueOnce(undefined).mockResolvedValueOnce(winner), create: vi.fn().mockRejectedValue(new Error("dup")) };
+        expect(await findOrCreateSingleton(raced, "x")).toBe(winner);
 
-        const broken: any = { findOne: vi.fn().mockResolvedValue(undefined), create: vi.fn().mockRejectedValue(new Error("disk full")) };
-        await expect(findOrCreateSingleton(broken, Row, "x")).rejects.toThrow("disk full");
-    });
-});
-
-describe("findOrSeedMailboxPolicy", () => {
-    it("fills fields the saved row leaves unset from config", async () => {
-        const repo = { findOne: vi.fn().mockResolvedValue({ uid: MAILBOX_POLICY_UID, autoProvisionEnabled: false, defaultQuotaBytes: null }) };
-        const objectFactory: any = { newInstance: vi.fn().mockResolvedValue(repo) };
-        expect(await findOrSeedMailboxPolicy(objectFactory, Row, seed)).toEqual({ defaultQuotaBytes: 10, autoProvisionEnabled: false, autoProvisionQuotaBytes: 20 });
+        const broken: any = { findOne: vi.fn().mockResolvedValue(undefined), create: vi.fn().mockRejectedValue(new Error("down")) };
+        await expect(findOrCreateSingleton(broken, "x")).rejects.toThrow("down");
     });
 
-    it("falls back to config, logging an error, when the policy can't be read", async () => {
-        const objectFactory: any = { newInstance: vi.fn().mockRejectedValue(new Error("datastore offline")) };
+    it("findOrSeedMailboxPolicy() seeds the first row and returns its values, falling back per field to the seed.", async () => {
+        const repo: any = { modelClass: PolicyModel, findOne: vi.fn().mockResolvedValue(undefined), create: vi.fn(async (obj: any) => obj) };
+
+        expect(await findOrSeedMailboxPolicy(repo, seed)).toEqual(seed);
+        expect(repo.create.mock.calls[0][0]).toMatchObject({ ...seed, uid: MAILBOX_POLICY_UID });
+
+        const stored: any = { findOne: vi.fn().mockResolvedValue({ defaultQuotaBytes: 1, autoProvisionEnabled: false }) };
+        expect(await findOrSeedMailboxPolicy(stored, seed)).toEqual({ defaultQuotaBytes: 1, autoProvisionEnabled: false, autoProvisionQuotaBytes: 20 });
+    });
+
+    it("findOrSeedMailboxPolicy() falls back to the seed (logging) when the row can't be read, unless failClosed.", async () => {
+        const repo: any = { findOne: vi.fn().mockRejectedValue(new Error("db down")) };
         const logger = { error: vi.fn() };
-        expect(await findOrSeedMailboxPolicy(objectFactory, Row, seed, logger)).toEqual(seed);
-        expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/datastore offline/));
-        expect(await findOrSeedMailboxPolicy(objectFactory, Row, seed)).toEqual(seed);
+
+        expect(await findOrSeedMailboxPolicy(repo, seed, logger)).toEqual(seed);
+        expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("using server config instead: db down"));
+        // No logger is fine too.
+        expect(await findOrSeedMailboxPolicy(repo, seed)).toEqual(seed);
     });
 
-    it("fails closed with a 503, rather than falling back to config, for a caller that acts on the policy", async () => {
-        const objectFactory: any = { newInstance: vi.fn().mockRejectedValue(new Error("datastore offline")) };
+    it("findOrSeedMailboxPolicy() fills fields the saved row leaves null from the seed.", async () => {
+        const repo: any = { findOne: vi.fn().mockResolvedValue({ uid: MAILBOX_POLICY_UID, autoProvisionEnabled: false, defaultQuotaBytes: null }) };
+
+        expect(await findOrSeedMailboxPolicy(repo, seed)).toEqual({ defaultQuotaBytes: 10, autoProvisionEnabled: false, autoProvisionQuotaBytes: 20 });
+    });
+
+    it("findOrSeedMailboxPolicy() turns a failing read into a 503 when failClosed.", async () => {
+        const repo: any = { findOne: vi.fn().mockRejectedValue(new Error("db down")) };
         const logger = { error: vi.fn() };
-        await expect(findOrSeedMailboxPolicy(objectFactory, Row, seed, logger, true)).rejects.toMatchObject({ status: 503 });
-        expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/datastore offline/));
-        await expect(findOrSeedMailboxPolicy(objectFactory, Row, seed, undefined, true)).rejects.toMatchObject({ status: 503 });
+
+        await expect(findOrSeedMailboxPolicy(repo, seed, logger, true)).rejects.toMatchObject({ status: 503 });
+        expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("Could not read the mailbox policy: db down"));
+        await expect(findOrSeedMailboxPolicy(repo, seed, undefined, true)).rejects.toMatchObject({ status: 503 });
     });
 });

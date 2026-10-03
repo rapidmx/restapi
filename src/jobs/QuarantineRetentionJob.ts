@@ -49,6 +49,9 @@ export abstract class QuarantineRetentionJob<Q extends QuarantineEntry> extends 
     protected quarantineEntryRepo?: RepoUtils<Q>;
     protected scanResultRepo?: RepoUtils<any>;
     protected ingestQueueEntryRepo?: RepoUtils<any>;
+    protected messageRepo?: RepoUtils<any>;
+    protected attachmentRepo?: RepoUtils<any>;
+    protected matterRepo?: RepoUtils<any>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -103,6 +106,24 @@ export abstract class QuarantineRetentionJob<Q extends QuarantineEntry> extends 
                 args: [this.ingestQueueEntryClass],
             });
         }
+        if (!this.messageRepo && this.messageClass) {
+            this.messageRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.messageClass.name,
+                args: [this.messageClass],
+            });
+        }
+        if (!this.attachmentRepo && this.attachmentClass) {
+            this.attachmentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.attachmentClass.name,
+                args: [this.attachmentClass],
+            });
+        }
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.matterClass.name,
+                args: [this.matterClass],
+            });
+        }
     }
 
     public async start(): Promise<void> {
@@ -120,12 +141,12 @@ export abstract class QuarantineRetentionJob<Q extends QuarantineEntry> extends 
 
         const cutoff: Date = new Date(Date.now() - this.retentionDays * 24 * 60 * 60 * 1000);
         const blobSources: BlobReferenceSource[] = messageBlobReferenceSources({
-            messageClass: this.messageClass,
-            attachmentClass: this.attachmentClass,
-            quarantineEntryClass: this.quarantineEntryClass,
-            ingestQueueEntryClass: this.ingestQueueEntryClass,
+            messageRepo: this.messageRepo,
+            attachmentRepo: this.attachmentRepo,
+            quarantineEntryRepo: this.quarantineEntryRepo,
+            ingestQueueEntryRepo: this.ingestQueueEntryRepo,
         });
-        const holds: LegalHoldIndex = await loadLegalHoldIndex(this._objectFactory!, this.matterClass);
+        const holds: LegalHoldIndex = await loadLegalHoldIndex(this.matterRepo!);
         const heldExclusion: Record<string, any> =
             holds.heldMailboxUids.size > 0 ? { mailboxUid: `nin(${[...holds.heldMailboxUids].join(",")})` } : {};
 
@@ -137,8 +158,8 @@ export abstract class QuarantineRetentionJob<Q extends QuarantineEntry> extends 
                 // Content first, the entry itself last (the entry being purged is excluded from the reference check): a failure
                 // on the way leaves the entry - and so its blob key - in place for the next run to retry, instead of an
                 // orphaned raw message (personal data) nothing points at any more.
-                await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, [entry.rawBlobKey], {
-                    entityClass: this.quarantineEntryClass,
+                await deleteBlobsIfUnreferenced(this.blobStore!, blobSources, [entry.rawBlobKey], {
+                    repo: this.quarantineEntryRepo,
                     uid: entry.uid,
                 });
                 if (entry.scanResultUid) {
@@ -189,8 +210,8 @@ export abstract class QuarantineRetentionJob<Q extends QuarantineEntry> extends 
 
     /** Deletes an ingest entry's raw blob first (only if nothing else references it), the row last - see the quarantine purge in `run()`. */
     private async purgeIngestEntry(entry: any, blobSources: BlobReferenceSource[]): Promise<void> {
-        await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, [entry.rawBlobKey], {
-            entityClass: this.ingestQueueEntryClass,
+        await deleteBlobsIfUnreferenced(this.blobStore!, blobSources, [entry.rawBlobKey], {
+            repo: this.ingestQueueEntryRepo,
             uid: entry.uid,
         });
         await this.ingestQueueEntryRepo!.delete(entry.uid, { ignoreACL: true, purge: true });

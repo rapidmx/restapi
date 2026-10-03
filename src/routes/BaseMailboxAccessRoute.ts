@@ -21,7 +21,7 @@ import {
 } from "@rapidrest/service-core";
 import { AuditAction, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS, hasMailAccess, isTrustedUser } from "../util/MailAccessUtils.js";
 import {
     findMailboxByAddress,
@@ -156,12 +156,11 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
     protected mailboxRepo?: RepoUtils<M>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
-
-    @Config()
-    private config: any;
 
     @Config("trusted_roles", ["admin"])
     private trustedRoles: string[] = ["admin"];
@@ -195,6 +194,18 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
             this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
             });
         }
     }
@@ -318,14 +329,12 @@ export abstract class BaseMailboxAccessRoute<M extends Mailbox> {
         mailbox: M,
         details: { userOrRoleId: string; previousRole?: MailboxAccessRole; role?: MailboxAccessRole },
     ): Promise<void> {
-        if (!this.auditLogClass) {
+        if (!this.auditLogUtils) {
             return;
         }
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils.record(
             { action, targetType: "Mailbox", targetUid: mailbox.uid, mailboxUid: mailbox.uid, details },
+            { req, user },
         );
     }
 

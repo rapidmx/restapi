@@ -845,6 +845,23 @@ describe("Route:MailboxMongo Tests", () => {
         expect(names).toEqual(["Owner's own mailbox", "Shared Mailbox"]);
     });
 
+    it("A caller with a delegate ACL grant reading a shared mailbox by uid gets it, audited as a mailbox access by someone other than its owner.", async () => {
+        const shared = await createMailboxMongo({ displayName: "Shared Mailbox" }, otherUser.uid);
+        const acl: any = await aclRepo.findOne({ uid: shared.uid } as any);
+        acl.records.push({ userOrRoleId: owner.uid, actions: [ACLAction.READ] });
+        await aclRepo.save(acl);
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${shared.uid}`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(200);
+        const entries = await auditLogRepo.find({ action: AuditAction.MAILBOX_ACCESSED }).toArray();
+        expect(entries.length).toBe(1);
+        expect(entries[0].actorUserUid).toBe(owner.uid);
+        expect(entries[0].targetUid).toBe(shared.uid);
+    });
+
     it("A trusted (admin) caller's plain list is only their own and shared-with-them mailboxes - here none - and `?scope=admin` lists every mailbox as metadata, audited.", async () => {
         await createMailboxMongo({ displayName: "Owner's mailbox", oofMessage: "Away" });
         await createMailboxMongo({ displayName: "Other user's mailbox" }, otherUser.uid);

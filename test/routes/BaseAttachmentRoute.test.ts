@@ -131,22 +131,20 @@ describe("BaseAttachmentRoute Tests (repoUtils/blobStore guard clauses only)", (
 
     describe("checkLegalHold()", () => {
         const makeHeldRoute = (): any => {
-            const factory: ObjectFactory = new ObjectFactory(config, Logger());
-            const route: any = factory.newInstance<TestAttachmentRoute>(TestAttachmentRoute, { initialize: false });
+            const route: any = objectFactory.newInstance<TestAttachmentRoute>(TestAttachmentRoute, { initialize: false });
             const matter = {
                 uid: "matter-1",
                 custodianMailboxUids: ["mb"],
                 dateRangeStart: new Date("2000-01-01"),
                 dateRangeEnd: new Date("2100-01-01"),
             };
-            route.matterClass = class FakeMatter {};
-            vi.spyOn(factory, "newInstance").mockImplementation((() => ({ find: vi.fn().mockResolvedValueOnce([matter]).mockResolvedValue([]) })) as any);
+            route.matterRepo = { find: vi.fn().mockResolvedValueOnce([matter]).mockResolvedValue([]) };
             route.messageRepo = { findOne: vi.fn().mockResolvedValue({ uid: "m1", mailboxUid: "mb", sentDate: new Date("2020-01-01") }) };
             return route;
         };
         const existing: any = { uid: "a1", messageUid: "m1", mailboxUid: "mb" };
 
-        it("returns without looking anything up when the route has no matter class.", async () => {
+        it("returns without looking anything up when the route has no matter repository.", async () => {
             const route: any = objectFactory.newInstance<TestAttachmentRoute>(TestAttachmentRoute, { initialize: false });
             route.messageRepo = { findOne: vi.fn() };
 

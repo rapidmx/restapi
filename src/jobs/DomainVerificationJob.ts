@@ -6,7 +6,7 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { checkDomainVerification } from "../util/DomainVerificationUtils.js";
 import { AuditAction, Domain } from "../models/types.js";
 const { Config, Inject, Init, Logger } = ObjectDecorators;
@@ -33,17 +33,14 @@ export abstract class DomainVerificationJob<D extends Domain> extends Background
     private _objectFactory?: ObjectFactory;
 
     protected domainRepo?: RepoUtils<D>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
 
     @Config("mail:jobs:domain_verification:schedule", "0 */5 * * * *")
     private scheduleExpr: string = "0 */5 * * * *";
 
     @Config("mail:jobs:domain_verification:batch_size", 100)
     private batchSize: number = 100;
-
-    // No key = the whole config object, the same decorator `ModelRoute.config` itself uses - needed by
-    // `recordAuditLog()`, which constructs a real `Event(config, ...)`.
-    @Config()
-    private config: any;
 
     @Inject("DnsResolver")
     private dnsResolver?: DnsResolver;
@@ -64,6 +61,18 @@ export abstract class DomainVerificationJob<D extends Domain> extends Background
             this.domainRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.domainClass.name,
                 args: [this.domainClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
             });
         }
     }
@@ -115,12 +124,7 @@ export abstract class DomainVerificationJob<D extends Domain> extends Background
                 await this.domainRepo.update(patch, asEntity(this.domainRepo, domain), { version: domain.version, ignoreACL: true });
 
                 if (verified) {
-                    await recordAuditLog(
-                        this._objectFactory!,
-                        this.auditLogClass,
-                        { config: this.config, logger: this.logger },
-                        { action: AuditAction.DOMAIN_VERIFIED, targetType: "Domain", targetUid: domain.uid, details: { name: domain.name } },
-                    );
+                    await this.auditLogUtils!.record({ action: AuditAction.DOMAIN_VERIFIED, targetType: "Domain", targetUid: domain.uid, details: { name: domain.name } });
                 }
             } catch (err: any) {
                 this.logger?.warn(`DomainVerificationJob: failed to check domain '${domain.name}': ${err.message}`);

@@ -82,6 +82,10 @@ async function makeRoute(overrides: {
     (route as any).distributionListRepo = makeAddressRepo(overrides.lists ?? {});
     (route as any).transportRuleRepo = { find: vi.fn().mockResolvedValue([]) };
     (route as any).ingestQueueRepo = ingestQueueRepo;
+    (route as any).domainUtils = {
+        getVerifiedDomainNames: vi.fn().mockResolvedValue([]),
+        resolveDomainAlias: vi.fn().mockResolvedValue(undefined),
+    };
     if (overrides.maxListDepth !== undefined) {
         (route as any).maxListDepth = overrides.maxListDepth;
     }

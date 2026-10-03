@@ -301,7 +301,7 @@ export function escrowControlsSuite(ctx: SecurityControlsSuiteContext): void {
             const mailbox = await createMailbox({ escrowScopeId: scope.uid });
             const matter = await createMatter(scope.uid, [mailbox.uid]);
 
-            // `recordEscrowAuditEntry()` makes 5 attempts of its own - fail every one of the first call's.
+            // `EscrowAuditUtils.record()` makes 5 attempts of its own - fail every one of the first call's.
             let failures = 5;
             const original = RepoUtils.prototype.create;
             const spy = vi.spyOn(RepoUtils.prototype, "create").mockImplementation(async function (this: any, ...args: any[]) {

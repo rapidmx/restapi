@@ -21,7 +21,8 @@ import { ScanPipeline } from "../scan/ScanPipeline.js";
 import { MailEventStream } from "../events/MailEventStream.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
-import { messageObservations, recordCorrespondents } from "../util/CorrespondentUtils.js";
+import { CorrespondentUtils, messageObservations } from "../util/CorrespondentUtils.js";
+import { DomainUtils } from "../util/DomainUtils.js";
 import { prepareOutboundMime, scanAndRelay, seedReceiptStatus } from "../util/MailSendUtils.js";
 import { deriveMessageListFields } from "../util/MessageListUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
@@ -129,6 +130,10 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
     protected messageRepo?: RecoverableRepoUtils<M>;
     protected folderRepo?: RecoverableRepoUtils<any>;
     protected mailboxRepo?: RepoUtils<Mailbox>;
+    protected correspondentRepo?: RepoUtils<any>;
+    protected domainRepo?: RepoUtils<any>;
+    protected correspondentUtils?: CorrespondentUtils;
+    protected domainUtils?: DomainUtils;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -213,6 +218,30 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
+            });
+        }
+        if (!this.correspondentRepo && this.correspondentClass) {
+            this.correspondentRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.correspondentClass.name,
+                args: [this.correspondentClass],
+            });
+        }
+        if (!this.domainRepo && this.domainClass) {
+            this.domainRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.domainClass.name,
+                args: [this.domainClass],
+            });
+        }
+        if (!this.correspondentUtils && this.correspondentClass) {
+            this.correspondentUtils = await this._objectFactory.newInstance(CorrespondentUtils, {
+                name: this.correspondentClass.name,
+                args: [this.correspondentRepo, this.mailboxRepo],
+            });
+        }
+        if (!this.domainUtils && this.domainClass) {
+            this.domainUtils = await this._objectFactory.newInstance(DomainUtils, {
+                name: this.domainClass.name,
+                args: [this.domainRepo],
             });
         }
     }
@@ -429,8 +458,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     raw,
                     message: claimed,
                     mailbox: sendingMailbox,
-                    objectFactory: this._objectFactory!,
-                    domainClass: this.domainClass,
+                    domainUtils: this.domainUtils,
                     dnsResolver: this.dnsResolver,
                 });
                 attachesReceiptRequest = prepared.attachesReceiptRequest;
@@ -456,10 +484,9 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 );
                 sanitizedHtmlBlobKey = result.sanitizedHtmlBlobKey ?? sanitizedHtmlBlobKey;
                 undelivered = result.undelivered;
-                // Recipient suggestions: everyone the message went to. Best-effort - `recordCorrespondents()` never throws.
+                // Recipient suggestions: everyone the message went to. Best-effort - `CorrespondentUtils.recordCorrespondents()` never throws.
                 if (sendingMailbox) {
-                    await recordCorrespondents(
-                        { objectFactory: this._objectFactory!, correspondentClass: this.correspondentClass, mailboxClass: this.mailboxClass, logger: this.logger },
+                    await this.correspondentUtils!.recordCorrespondents(
                         sendingMailbox,
                         messageObservations(claimed, { from: false, types: [RecipientType.TO, RecipientType.CC, RecipientType.BCC] }),
                         "sent",

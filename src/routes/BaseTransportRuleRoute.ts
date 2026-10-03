@@ -9,15 +9,16 @@ import {
     CRUDRoute,
     HttpRequest,
     HttpResponse,
+    RepoUtils,
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { isPlainAddress } from "../util/MimeHeaderUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields, stripClientId } from "../util/RequestBodyUtils.js";
 import { AuditAction, TransportRule, TransportRuleActionType } from "../models/types.js";
-const { Config } = ObjectDecorators;
+const { Config, Init } = ObjectDecorators;
 const { Param, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
 /** The most transport rules there can be: every inbound message is evaluated against all of them. */
@@ -178,9 +179,29 @@ function assertValidAction(action: any): void {
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CRUDRoute<T> {
-    /** Supplied by the Mongo/SQL concrete subclasses so `recordAuditLog()` can persist an `AuditLogEntry`
+    /** Supplied by the Mongo/SQL concrete subclasses so `AuditLogUtils` can persist an `AuditLogEntry`
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
+
+    /** The `AuditLogEntry` repository, built once by `initTransportRuleRepos()`. */
+    protected auditLogRepo?: RepoUtils<any>;
+
+    /** Records the audit entries, built once by `initTransportRuleRepos()` from `auditLogRepo`. */
+    protected auditLogUtils?: AuditLogUtils;
+
+    @Init
+    protected async initTransportRuleRepos(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
+        }
+    }
+
     /** How old an elevated token may be before it has to be elevated again, in seconds (`mail:security:elevation_max_age_seconds`, 0 = no limit). */
     @Config("mail:security:elevation_max_age_seconds", DEFAULT_ELEVATION_MAX_AGE_SECONDS)
     protected elevationMaxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS;
@@ -210,10 +231,7 @@ export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CR
             : [await this.doCreateObject(obj, { req, user, ignoreACL: true })];
 
         for (const rule of created) {
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, req, user, logger: this.logger },
+            await this.auditLogUtils!.record(
                 {
                     action: AuditAction.TRANSPORT_RULE_CREATE,
                     targetType: "TransportRule",
@@ -221,6 +239,7 @@ export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CR
                     // The actions are what the rule does to every message (an `add_recipient` copies all mail to an address): the entry names them.
                     details: { name: rule.name, enabled: rule.enabled, conditions: rule.conditions, actions: rule.actions },
                 },
+                { req, user },
             );
         }
 
@@ -290,10 +309,7 @@ export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CR
         assertValidTransportRule(obj as Record<string, any>, false);
         const updated: T = await this.repoUtils!.update(obj, existing, { user, version: (obj as any).version, ignoreACL: true });
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.TRANSPORT_RULE_UPDATE,
                 targetType: "TransportRule",
@@ -307,6 +323,7 @@ export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CR
                     previous: { name: existing.name, enabled: existing.enabled, conditions: existing.conditions, actions: existing.actions },
                 },
             },
+            { req, user },
         );
 
         return updated;
@@ -327,16 +344,14 @@ export abstract class BaseTransportRuleRoute<T extends TransportRule> extends CR
         }
         await this.repoUtils!.delete(existing.uid, { user, version, purge: purge === "true", ignoreACL: true });
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, req, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.TRANSPORT_RULE_DELETE,
                 targetType: "TransportRule",
                 targetUid: existing.uid,
                 details: { name: existing.name, enabled: existing.enabled, conditions: existing.conditions, actions: existing.actions },
             },
+            { req, user },
         );
     }
 

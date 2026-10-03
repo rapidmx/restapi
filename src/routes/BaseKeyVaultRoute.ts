@@ -28,7 +28,7 @@ import {
     SigningCertificateEnrollment,
 } from "../pki/SigningCertificateEnrollment.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import {
     publicKeyFromCertificatePem,
     REVOCATION_REASONS,
@@ -308,6 +308,8 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     protected keyVaultRepo?: RepoUtils<K>;
     protected mailboxRepo?: RepoUtils<M>;
     protected escrowScopeRepo?: RepoUtils<EscrowScope>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
@@ -327,13 +329,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     public get modelClass(): any {
         return (this.constructor as any).modelClass;
     }
-
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
-    @Config()
-    private config: any;
-
-    @Logger
-    private logger: any;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -356,6 +351,18 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             this.escrowScopeRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.escrowScopeClass.name,
                 args: [this.escrowScopeClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
             });
         }
     }
@@ -471,11 +478,9 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         // of decrypting the mailbox). `specs/end-to-end_encryption.md`'s escrow audit requirement ("every
         // escrow use MUST be recorded ... capturing the holder ... and the time") depends on this read being
         // visible after the fact, same as this class's own doc comment already promises for every mutation.
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.KEY_VAULT_READ, targetType: "KeyVault", targetUid: existing?.uid ?? mailbox.uid, mailboxUid: mailbox.uid },
+            { user },
         );
         return existing ? toPublicKeyVault(existing) : { ...EMPTY_KEY_VAULT };
     }
@@ -571,10 +576,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
 
         const persisted = await this.persistEnrollment(mailbox, publicKey, wrappedKey, body.masterKeyWraps, expectedGeneration);
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.KEY_VAULT_ENROLL,
                 targetType: "KeyVault",
@@ -582,6 +584,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                 mailboxUid: mailbox.uid,
                 details: { useType: body.useType, fingerprint },
             },
+            { user },
         );
 
         return toPublicKeyVault(persisted.keyVault);
@@ -919,10 +922,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { ignoreACL: true },
         );
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             {
                 action: AuditAction.KEY_VAULT_WRAP_ADD,
                 targetType: "KeyVault",
@@ -930,6 +930,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                 mailboxUid: mailbox.uid,
                 details: { method: body.method, methodId: body.methodId },
             },
+            { user },
         );
 
         return toPublicKeyVault(updated);
@@ -1001,11 +1002,9 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { ignoreACL: true },
         );
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.KEY_VAULT_WRAP_REMOVE, targetType: "KeyVault", targetUid: keyVault.uid, mailboxUid: mailbox.uid, details: { method, methodId } },
+            { user },
         );
 
         return toPublicKeyVault(updated);
@@ -1125,11 +1124,9 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
 
         const updated: K = await this.persistRekey(mailbox, keyVault, { ...body, keys: revokeInactiveKeys(keys, rekeyedAt) });
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.KEY_VAULT_REKEY, targetType: "KeyVault", targetUid: keyVault.uid, mailboxUid: mailbox.uid },
+            { user },
         );
 
         return toPublicKeyVault(updated);

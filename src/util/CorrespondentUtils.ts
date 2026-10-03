@@ -2,21 +2,24 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ModelUtils, RepoUtils, type ObjectFactory } from "@rapidrest/service-core";
+import { ObjectDecorators } from "@rapidrest/core";
+import { ModelUtils, type RepoUtils } from "@rapidrest/service-core";
 import { CorrespondentSource, FolderType, Mailbox } from "../models/types.js";
 import { normalizeAddress } from "./AddressUtils.js";
 import { asEntity } from "./EntityUtils.js";
 import { isDuplicateKeyError } from "./RequestBodyUtils.js";
 
+const { Logger } = ObjectDecorators;
+
 /**
  * Keeps each mailbox's `Correspondent` list - everyone it has exchanged mail or calendar invitations with - up to
  * date, for `GET /mail/directory/correspondents` (recipient suggestions). Three entry points:
  *
- * - `recordCorrespondents()`: called from the choke points where mail or events enter a mailbox (`ScanQueueJob` for
+ * - `CorrespondentUtils.recordCorrespondents()`: called from the choke points where mail or events enter a mailbox (`ScanQueueJob` for
  * delivered mail and received invitations, `BaseMessageRoute.send()`/`ScheduledSendJob` for sent mail,
  * `BaseCalendarEventRoute` for events a user creates or edits). It NEVER throws: suggestions are a convenience, and a
  * failure to record one must not fail a delivery, a send or an event save.
- * - `ensureCorrespondentsBackfilled()`: builds the list for a mailbox that predates this feature from its existing
+ * - `CorrespondentBackfillUtils.ensureCorrespondentsBackfilled()`: builds the list for a mailbox that predates this feature from its existing
  * messages and events, once (see its doc comment).
  * - `mergeCorrespondentObservations()`: the pure part of both, exported so it can be tested on its own.
  *
@@ -51,22 +54,6 @@ const PLAIN_ADDRESS = /^[^\s@<>",;:\\()[\]]+@[^\s@<>",;:\\()[\]]+\.[^\s@<>",;:\\
 
 /** The parts of a `Mailbox` that decide which addresses are its own. */
 export type CorrespondentMailbox = Pick<Mailbox, "uid" | "primarySmtpAddress" | "aliasAddresses"> & Partial<Pick<Mailbox, "correspondentsBackfilledAt">>;
-
-/** What the functions here need to reach the datastore. `mailboxClass` is only used to look a mailbox up by uid and the
- * backfill's three classes only by `ensureCorrespondentsBackfilled()`. */
-export interface CorrespondentContext {
-    objectFactory: ObjectFactory;
-    correspondentClass: any;
-    mailboxClass: any;
-    logger?: any;
-}
-
-/** `CorrespondentContext` plus the classes the backfill reads. */
-export interface CorrespondentBackfillContext extends CorrespondentContext {
-    messageClass: any;
-    folderClass: any;
-    calendarEventClass: any;
-}
 
 /** One sighting of an address. `count` and `seenAt` default to one time, now; the backfill passes both for a history. */
 export interface CorrespondentObservation {
@@ -176,7 +163,6 @@ export function mergeCorrespondentObservations(
 /** Writes `merged` for `address` into `mailboxUid`: creates the row, or updates the one `existing` names (a stale
  * `existing`, or a create that lost the race to another writer, is retried against a fresh read). */
 async function upsertCorrespondent(
-    context: CorrespondentContext,
     repo: RepoUtils<any>,
     mailboxUid: string,
     address: string,
@@ -201,7 +187,7 @@ async function upsertCorrespondent(
                 );
             } else {
                 await repo.create(
-                    new context.correspondentClass({
+                    asEntity(repo, {
                         mailboxUid,
                         address,
                         displayName: merged.displayName,
@@ -225,71 +211,6 @@ async function upsertCorrespondent(
                 skipCache: true,
             })
         )[0];
-    }
-}
-
-/** Upserts every entry of `merged` into `mailboxUid`'s correspondents: one read of the existing rows, then a write per
- * address (`RepoUtils` has no bulk write). The writes are made one at a time, not concurrently: on a single-connection SQL
- * driver (SQLite) overlapping writes fail each other's transactions. One address failing is logged and doesn't stop the rest. */
-async function upsertAll(context: CorrespondentContext, mailboxUid: string, merged: Map<string, MergedCorrespondent>): Promise<void> {
-    if (merged.size === 0) {
-        return;
-    }
-    const repo: RepoUtils<any> = await context.objectFactory.newInstance(RepoUtils, {
-        name: context.correspondentClass.name,
-        args: [context.correspondentClass],
-    });
-    const addresses: string[] = [...merged.keys()];
-    const found: any[] = await repo.find(
-        { mailboxUid: ModelUtils.literal(mailboxUid), address: ModelUtils.literal(addresses, "in"), limit: addresses.length } as any,
-        { ignoreACL: true, limit: addresses.length, skipCache: true },
-    );
-    const existing = new Map<string, any>(found.map((row) => [row.address, row]));
-    for (const address of addresses) {
-        try {
-            await upsertCorrespondent(context, repo, mailboxUid, address, merged.get(address)!, existing.get(address));
-        } catch (err: any) {
-            context.logger?.warn(`CorrespondentUtils: could not record ${address} for mailbox ${mailboxUid}: ${err?.message}`);
-        }
-    }
-}
-
-/** The mailbox `mailboxUid`, or `undefined` if there is none. */
-async function loadMailbox(context: CorrespondentContext, mailboxUid: string): Promise<any> {
-    const mailboxRepo: RepoUtils<any> = await context.objectFactory.newInstance(RepoUtils, {
-        name: context.mailboxClass.name,
-        args: [context.mailboxClass],
-    });
-    return await mailboxRepo.findOne(mailboxUid, { ignoreACL: true });
-}
-
-/**
- * Records that `mailbox` encountered `observations` (by `source`): for each distinct address, lowercased, creates its
- * `Correspondent` or - keeping the name of the latest sighting that had one - adds one to its `count`, moves
- * `lastSeenAt` forward and sets `lastSource`. The mailbox's own primary address and aliases and anything that is not a
- * plain address are skipped, and at most `CORRESPONDENT_MAX_PER_CALL` addresses are recorded per call.
- *
- * `mailbox` is the mailbox, or just its uid (loaded here; a mailbox that has gone records nothing). Never throws: a
- * failure is logged as a warning, since this is called from delivery, sending and event saving, none of which may fail
- * over a suggestion. Cheap: one read of the addresses' existing rows and one write per address.
- */
-export async function recordCorrespondents(
-    context: CorrespondentContext,
-    mailbox: CorrespondentMailbox | string,
-    observations: CorrespondentObservation[],
-    source: CorrespondentSource,
-): Promise<void> {
-    try {
-        if (observations.length === 0) {
-            return;
-        }
-        const identity: CorrespondentMailbox | undefined = typeof mailbox === "string" ? await loadMailbox(context, mailbox) : mailbox;
-        if (!identity) {
-            return;
-        }
-        await upsertAll(context, identity.uid, mergeCorrespondentObservations(identity, observations, source, new Date()));
-    } catch (err: any) {
-        context.logger?.warn(`CorrespondentUtils: could not record correspondents: ${err?.message}`);
     }
 }
 
@@ -319,114 +240,201 @@ export function eventObservations(event: {
 }
 
 /**
- * Builds `mailbox`'s correspondents from what it already holds - the From and recipients of its most recent
+ * Records a mailbox's `Correspondent`s: for each distinct address among `observations`, lowercased, creates its row or - keeping
+ * the name of the latest sighting that had one - adds one to its `count`, moves `lastSeenAt` forward and sets `lastSource`.
+ * Built once by the consuming route/job's `@Init` hook through the `ObjectFactory` with the (already built) repositories -
+ * `await objectFactory.newInstance(CorrespondentUtils, { name: CorrespondentClass.name, args: [correspondentRepo, mailboxRepo] })`.
+ * Every consumer builds it with exactly these two repositories, so the factory's one-instance-per-name sharing is safe; the
+ * backfill, which needs more repositories, is the separate `CorrespondentBackfillUtils`.
+ */
+export class CorrespondentUtils {
+    @Logger
+    protected logger: any;
+
+    constructor(
+        public readonly correspondentRepo: RepoUtils<any>,
+        public readonly mailboxRepo: RepoUtils<any>,
+    ) {}
+
+    /**
+     * Records that `mailbox` encountered `observations` (by `source`): for each distinct address, lowercased, creates its
+     * `Correspondent` or - keeping the name of the latest sighting that had one - adds one to its `count`, moves
+     * `lastSeenAt` forward and sets `lastSource`. The mailbox's own primary address and aliases and anything that is not a
+     * plain address are skipped, and at most `CORRESPONDENT_MAX_PER_CALL` addresses are recorded per call.
+     *
+     * `mailbox` is the mailbox, or just its uid (loaded here; a mailbox that has gone records nothing). Never throws: a
+     * failure is logged as a warning, since this is called from delivery, sending and event saving, none of which may fail
+     * over a suggestion. Cheap: one read of the addresses' existing rows and one write per address.
+     */
+    public async recordCorrespondents(
+        mailbox: CorrespondentMailbox | string,
+        observations: CorrespondentObservation[],
+        source: CorrespondentSource,
+    ): Promise<void> {
+        try {
+            if (observations.length === 0) {
+                return;
+            }
+            const identity: CorrespondentMailbox | undefined =
+                typeof mailbox === "string" ? await this.mailboxRepo.findOne(mailbox, { ignoreACL: true }) : mailbox;
+            if (!identity) {
+                return;
+            }
+            await this.upsertAll(identity.uid, mergeCorrespondentObservations(identity, observations, source, new Date()));
+        } catch (err: any) {
+            this.logger?.warn(`CorrespondentUtils: could not record correspondents: ${err?.message}`);
+        }
+    }
+
+    /** Upserts every entry of `merged` into `mailboxUid`'s correspondents: one read of the existing rows, then a write per
+     * address (`RepoUtils` has no bulk write). The writes are made one at a time, not concurrently: on a single-connection SQL
+     * driver (SQLite) overlapping writes fail each other's transactions. One address failing is logged and doesn't stop the rest.
+     * Public for `CorrespondentBackfillUtils`, which records a mailbox's whole history through it. */
+    public async upsertAll(mailboxUid: string, merged: Map<string, MergedCorrespondent>): Promise<void> {
+        if (merged.size === 0) {
+            return;
+        }
+        const repo: RepoUtils<any> = this.correspondentRepo;
+        const addresses: string[] = [...merged.keys()];
+        const found: any[] = await repo.find(
+            { mailboxUid: ModelUtils.literal(mailboxUid), address: ModelUtils.literal(addresses, "in"), limit: addresses.length } as any,
+            { ignoreACL: true, limit: addresses.length, skipCache: true },
+        );
+        const existing = new Map<string, any>(found.map((row) => [row.address, row]));
+        for (const address of addresses) {
+            try {
+                await upsertCorrespondent(repo, mailboxUid, address, merged.get(address)!, existing.get(address));
+            } catch (err: any) {
+                this.logger?.warn(`CorrespondentUtils: could not record ${address} for mailbox ${mailboxUid}: ${err?.message}`);
+            }
+        }
+    }
+}
+
+/**
+ * Builds a mailbox's correspondents from what it already holds - the From and recipients of its most recent
  * `CORRESPONDENT_BACKFILL_MAX_MESSAGES` messages (leaving out Junk, Drafts, Deleted Items and Outbox; a message the
  * mailbox sent contributes its recipients, any other its sender, To and Cc) and the organizer and attendees of its
  * `CORRESPONDENT_BACKFILL_MAX_EVENTS` most recently modified events - keeping the `CORRESPONDENT_BACKFILL_MAX_ADDRESSES`
  * most recently seen addresses. One sighting per message or event, dated by when the message arrived or the event was
- * last changed.
- *
- * Design: run on demand, the first time a mailbox is searched (`BaseDirectoryRoute.searchCorrespondents()`), rather than
- * by a job. It is bounded, so it fits in a request (three bounded reads and at most 500 writes, one at a time), needs no
- * scheduler or per-deployment wiring, and only mailboxes that use recipient suggestions ever pay for it. The marker is
- * `Mailbox.correspondentsBackfilledAt`, written BEFORE the work starts with a version-checked update, so of two searches
- * racing on a fresh mailbox only one backfills (history is never counted twice); if the work then fails the marker is
- * cleared again so the next search retries. Correspondents recorded live in the meantime are simply added to.
- *
- * Never throws (a failure is logged). Resolves once the backfill has finished, or straight away if the mailbox was
- * already backfilled or another request holds the claim.
+ * last changed. Built once through the `ObjectFactory` -
+ * `await objectFactory.newInstance(CorrespondentBackfillUtils, { name: CorrespondentClass.name, args: [correspondentUtils, folderRepo, messageRepo, eventRepo] })`
+ * - on top of the `CorrespondentUtils`, whose mailbox and correspondent repositories it reuses. It is a class of its own
+ * (not extra repositories on `CorrespondentUtils`) because the `ObjectFactory` keeps one instance per name: consumers that only
+ * record build `CorrespondentUtils` with two repositories, and the backfill's callers need the other three as well.
  */
-export async function ensureCorrespondentsBackfilled(context: CorrespondentBackfillContext, mailbox: CorrespondentMailbox): Promise<void> {
-    if (mailbox.correspondentsBackfilledAt) {
-        return;
+export class CorrespondentBackfillUtils {
+    @Logger
+    protected logger: any;
+
+    constructor(
+        protected readonly correspondentUtils: CorrespondentUtils,
+        protected readonly folderRepo: RepoUtils<any>,
+        protected readonly messageRepo: RepoUtils<any>,
+        protected readonly eventRepo: RepoUtils<any>,
+    ) {}
+
+    /**
+     * Builds `mailbox`'s correspondents from its existing messages and events, once.
+     *
+     * Design: run on demand, the first time a mailbox is searched (`BaseDirectoryRoute.searchCorrespondents()`), rather than
+     * by a job. It is bounded, so it fits in a request (three bounded reads and at most 500 writes, one at a time), needs no
+     * scheduler or per-deployment wiring, and only mailboxes that use recipient suggestions ever pay for it. The marker is
+     * `Mailbox.correspondentsBackfilledAt`, written BEFORE the work starts with a version-checked update, so of two searches
+     * racing on a fresh mailbox only one backfills (history is never counted twice); if the work then fails the marker is
+     * cleared again so the next search retries. Correspondents recorded live in the meantime are simply added to.
+     *
+     * Never throws (a failure is logged). Resolves once the backfill has finished, or straight away if the mailbox was
+     * already backfilled or another request holds the claim.
+     */
+    public async ensureCorrespondentsBackfilled(mailbox: CorrespondentMailbox): Promise<void> {
+        if (mailbox.correspondentsBackfilledAt) {
+            return;
+        }
+        try {
+            const mailboxRepo: RepoUtils<any> = this.correspondentUtils.mailboxRepo;
+            const row: any = await mailboxRepo.findOne(mailbox.uid, { ignoreACL: true, skipCache: true });
+            if (!row || row.correspondentsBackfilledAt) {
+                return;
+            }
+            try {
+                await mailboxRepo.update({ uid: row.uid, version: row.version, correspondentsBackfilledAt: new Date() } as any, asEntity(mailboxRepo, row), {
+                    ignoreACL: true,
+                });
+            } catch (err: any) {
+                // Another search claimed the backfill first (a version conflict) - it is theirs to do.
+                this.logger?.debug?.(`CorrespondentBackfillUtils: backfill of mailbox ${mailbox.uid} claimed elsewhere: ${err?.message}`);
+                return;
+            }
+            try {
+                await this.backfill(row);
+            } catch (err: any) {
+                this.logger?.warn(`CorrespondentBackfillUtils: backfill of mailbox ${mailbox.uid} failed: ${err?.message}`);
+                await this.releaseClaim(mailboxRepo, mailbox.uid);
+            }
+        } catch (err: any) {
+            this.logger?.warn(`CorrespondentBackfillUtils: could not check whether mailbox ${mailbox.uid} needs a backfill: ${err?.message}`);
+        }
     }
-    try {
-        const mailboxRepo: RepoUtils<any> = await context.objectFactory.newInstance(RepoUtils, {
-            name: context.mailboxClass.name,
-            args: [context.mailboxClass],
+
+    /** Clears the marker `ensureCorrespondentsBackfilled()` set, so a failed backfill is attempted again. Best-effort. */
+    protected async releaseClaim(mailboxRepo: RepoUtils<any>, mailboxUid: string): Promise<void> {
+        try {
+            const current: any = await mailboxRepo.findOne(mailboxUid, { ignoreACL: true, skipCache: true });
+            if (current) {
+                await mailboxRepo.update({ uid: current.uid, version: current.version, correspondentsBackfilledAt: null } as any, asEntity(mailboxRepo, current), {
+                    ignoreACL: true,
+                });
+            }
+            /* v8 ignore start -- only a second failure while releasing */
+        } catch {
+            // The marker stays set: this mailbox's suggestions then only ever come from live mail.
+        }
+        /* v8 ignore stop */
+    }
+
+    /** The reads and writes of `ensureCorrespondentsBackfilled()`. */
+    protected async backfill(mailbox: CorrespondentMailbox): Promise<void> {
+        const own = new Set<string>([mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].map((address) => normalizeAddress(String(address ?? ""))));
+
+        const folders: any[] = await this.folderRepo.find({ mailboxUid: ModelUtils.literal(mailbox.uid), limit: BACKFILL_MAX_FOLDERS } as any, {
+            ignoreACL: true,
+            limit: BACKFILL_MAX_FOLDERS,
         });
-        const row: any = await mailboxRepo.findOne(mailbox.uid, { ignoreACL: true, skipCache: true });
-        if (!row || row.correspondentsBackfilledAt) {
-            return;
+        const excluded = new Set<string>(folders.filter((folder) => BACKFILL_EXCLUDED_FOLDER_TYPES.has(folder.type)).map((folder) => folder.uid));
+        const messages: any[] = await this.messageRepo.find(
+            { mailboxUid: ModelUtils.literal(mailbox.uid), sort: { receivedDate: "DESC" }, limit: CORRESPONDENT_BACKFILL_MAX_MESSAGES } as any,
+            { ignoreACL: true, limit: CORRESPONDENT_BACKFILL_MAX_MESSAGES },
+        );
+        const events: any[] = await this.eventRepo.find(
+            { mailboxUid: ModelUtils.literal(mailbox.uid), sort: { dateModified: "DESC" }, limit: CORRESPONDENT_BACKFILL_MAX_EVENTS } as any,
+            { ignoreACL: true, limit: CORRESPONDENT_BACKFILL_MAX_EVENTS },
+        );
+
+        const observations: CorrespondentObservation[] = [];
+        for (const message of messages) {
+            if (excluded.has(message.folderUid)) {
+                continue;
+            }
+            const seenAt: Date | undefined = toDate(message.receivedDate) ?? toDate(message.sentDate) ?? toDate(message.dateCreated);
+            const sent: boolean = own.has(normalizeAddress(String(message.from?.address ?? "")));
+            const source: CorrespondentSource = sent ? "sent" : "received";
+            for (const observation of messageObservations(message, { from: !sent, types: sent ? ["to", "cc", "bcc"] : ["to", "cc"] })) {
+                observations.push({ ...observation, seenAt, count: 1, source });
+            }
         }
-        try {
-            await mailboxRepo.update({ uid: row.uid, version: row.version, correspondentsBackfilledAt: new Date() } as any, asEntity(mailboxRepo, row), {
-                ignoreACL: true,
-            });
-        } catch (err: any) {
-            // Another search claimed the backfill first (a version conflict) - it is theirs to do.
-            context.logger?.debug?.(`CorrespondentUtils: backfill of mailbox ${mailbox.uid} claimed elsewhere: ${err?.message}`);
-            return;
+        for (const event of events) {
+            const seenAt: Date | undefined = toDate(event.dateModified) ?? toDate(event.dateCreated);
+            for (const observation of eventObservations(event)) {
+                observations.push({ ...observation, seenAt, count: 1, source: "event" });
+            }
         }
-        try {
-            await backfill(context, row);
-        } catch (err: any) {
-            context.logger?.warn(`CorrespondentUtils: backfill of mailbox ${mailbox.uid} failed: ${err?.message}`);
-            await releaseBackfillClaim(mailboxRepo, mailbox.uid);
-        }
-    } catch (err: any) {
-        context.logger?.warn(`CorrespondentUtils: could not check whether mailbox ${mailbox.uid} needs a backfill: ${err?.message}`);
+        // Every message and event above is one sighting (`count: 1` explicitly, so an address on many of them counts them all);
+        // newest first, so the address cap keeps the most recently seen.
+        observations.sort((a, b) => (b.seenAt?.getTime() ?? 0) - (a.seenAt?.getTime() ?? 0));
+        await this.correspondentUtils.upsertAll(
+            mailbox.uid,
+            mergeCorrespondentObservations(mailbox, observations, "received", new Date(), CORRESPONDENT_BACKFILL_MAX_ADDRESSES),
+        );
     }
 }
-
-/** Clears the marker `ensureCorrespondentsBackfilled()` set, so a failed backfill is attempted again. Best-effort. */
-async function releaseBackfillClaim(mailboxRepo: RepoUtils<any>, mailboxUid: string): Promise<void> {
-    try {
-        const current: any = await mailboxRepo.findOne(mailboxUid, { ignoreACL: true, skipCache: true });
-        if (current) {
-            await mailboxRepo.update({ uid: current.uid, version: current.version, correspondentsBackfilledAt: null } as any, asEntity(mailboxRepo, current), {
-                ignoreACL: true,
-            });
-        }
-        /* v8 ignore start -- only a second failure while releasing */
-    } catch {
-        // The marker stays set: this mailbox's suggestions then only ever come from live mail.
-    }
-    /* v8 ignore stop */
-}
-
-/** The reads and writes of `ensureCorrespondentsBackfilled()`. */
-async function backfill(context: CorrespondentBackfillContext, mailbox: CorrespondentMailbox): Promise<void> {
-    const repoFor = async (clazz: any): Promise<RepoUtils<any>> =>
-        await context.objectFactory.newInstance(RepoUtils, { name: clazz.name, args: [clazz] });
-    const [folderRepo, messageRepo, eventRepo] = await Promise.all([repoFor(context.folderClass), repoFor(context.messageClass), repoFor(context.calendarEventClass)]);
-    const own = new Set<string>([mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].map((address) => normalizeAddress(String(address ?? ""))));
-
-    const folders: any[] = await folderRepo.find({ mailboxUid: ModelUtils.literal(mailbox.uid), limit: BACKFILL_MAX_FOLDERS } as any, {
-        ignoreACL: true,
-        limit: BACKFILL_MAX_FOLDERS,
-    });
-    const excluded = new Set<string>(folders.filter((folder) => BACKFILL_EXCLUDED_FOLDER_TYPES.has(folder.type)).map((folder) => folder.uid));
-    const messages: any[] = await messageRepo.find(
-        { mailboxUid: ModelUtils.literal(mailbox.uid), sort: { receivedDate: "DESC" }, limit: CORRESPONDENT_BACKFILL_MAX_MESSAGES } as any,
-        { ignoreACL: true, limit: CORRESPONDENT_BACKFILL_MAX_MESSAGES },
-    );
-    const events: any[] = await eventRepo.find(
-        { mailboxUid: ModelUtils.literal(mailbox.uid), sort: { dateModified: "DESC" }, limit: CORRESPONDENT_BACKFILL_MAX_EVENTS } as any,
-        { ignoreACL: true, limit: CORRESPONDENT_BACKFILL_MAX_EVENTS },
-    );
-
-    const observations: CorrespondentObservation[] = [];
-    for (const message of messages) {
-        if (excluded.has(message.folderUid)) {
-            continue;
-        }
-        const seenAt: Date | undefined = toDate(message.receivedDate) ?? toDate(message.sentDate) ?? toDate(message.dateCreated);
-        const sent: boolean = own.has(normalizeAddress(String(message.from?.address ?? "")));
-        const source: CorrespondentSource = sent ? "sent" : "received";
-        for (const observation of messageObservations(message, { from: !sent, types: sent ? ["to", "cc", "bcc"] : ["to", "cc"] })) {
-            observations.push({ ...observation, seenAt, count: 1, source });
-        }
-    }
-    for (const event of events) {
-        const seenAt: Date | undefined = toDate(event.dateModified) ?? toDate(event.dateCreated);
-        for (const observation of eventObservations(event)) {
-            observations.push({ ...observation, seenAt, count: 1, source: "event" });
-        }
-    }
-    // Every message and event above is one sighting (`count: 1` explicitly, so an address on many of them counts them all);
-    // newest first, so the address cap keeps the most recently seen.
-    observations.sort((a, b) => (b.seenAt?.getTime() ?? 0) - (a.seenAt?.getTime() ?? 0));
-    await upsertAll(context, mailbox.uid, mergeCorrespondentObservations(mailbox, observations, "received", new Date(), CORRESPONDENT_BACKFILL_MAX_ADDRESSES));
-}
-

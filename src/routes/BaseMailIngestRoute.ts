@@ -22,7 +22,7 @@ import { sendOrThrow, TransportRejectedError, transportFailuresOf } from "../tra
 import { DistributionList, IngestQueueEntry, IngestStatus, Mailbox, QuarantineReason, TransportRule } from "../models/types.js";
 import { normalizeAddress, stripPlusTag } from "../util/AddressUtils.js";
 import { rewriteHeadersForList } from "../util/DistributionListUtils.js";
-import { getVerifiedDomainNames, resolveDomainAlias } from "../util/DomainUtils.js";
+import { DomainUtils } from "../util/DomainUtils.js";
 import {
     buildDeliveryFailureNotice,
     deliveryFailureKey,
@@ -91,6 +91,8 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
     protected ingestQueueRepo?: RepoUtils<Q>;
     protected distributionListRepo?: RepoUtils<DistributionList>;
     protected transportRuleRepo?: RepoUtils<TransportRule>;
+    protected domainRepo?: RepoUtils<any>;
+    protected domainUtils?: DomainUtils;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -161,6 +163,18 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 args: [this.transportRuleClass],
             });
         }
+        if (!this.domainRepo && this.domainClass) {
+            this.domainRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.domainClass.name,
+                args: [this.domainClass],
+            });
+        }
+        if (!this.domainUtils && this.domainClass) {
+            this.domainUtils = await this._objectFactory.newInstance(DomainUtils, {
+                name: this.domainClass.name,
+                args: [this.domainRepo],
+            });
+        }
     }
 
     /**
@@ -213,7 +227,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         if (direct) {
             return direct;
         }
-        const rewritten: string | undefined = await resolveDomainAlias(this._objectFactory!, this.domainClass, address);
+        const rewritten: string | undefined = await this.domainUtils!.resolveDomainAlias(address);
         return rewritten ? await this.findExactMailboxByAddressRaw(rewritten) : undefined;
     }
 
@@ -275,7 +289,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         if (direct) {
             return direct;
         }
-        const rewritten: string | undefined = await resolveDomainAlias(this._objectFactory!, this.domainClass, address);
+        const rewritten: string | undefined = await this.domainUtils!.resolveDomainAlias(address);
         return rewritten ? await this.findDistributionListByAddressRaw(rewritten) : undefined;
     }
 
@@ -473,7 +487,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             return { reject: false, raw, envelopeTo };
         }
 
-        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        const domains: string[] = await this.domainUtils!.getVerifiedDomainNames();
         const context = await buildTransportRuleContext(raw, envelopeFrom, envelopeTo, domains, this.plusAddressingEnabled);
         const evaluation = evaluateTransportRules(rules, context);
 
@@ -614,7 +628,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
 
-        const domains: string[] = await getVerifiedDomainNames(this._objectFactory!, this.domainClass);
+        const domains: string[] = await this.domainUtils!.getVerifiedDomainNames();
         return domains.includes(name.toLowerCase()) ? res.status(200) : res.status(404);
     }
 

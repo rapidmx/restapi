@@ -801,6 +801,23 @@ describe("Route:MailboxSQL Tests", () => {
         expect(names).toEqual(["Owner's own mailbox", "Shared Mailbox"]);
     });
 
+    it("A caller with a delegate ACL grant reading a shared mailbox by uid gets it, audited as a mailbox access by someone other than its owner.", async () => {
+        const shared = await createMailboxSQL({ displayName: "Shared Mailbox" }, otherUser.uid);
+        const acl: any = await aclRepo.findOne({ where: { uid: shared.uid } });
+        acl.records.push({ userOrRoleId: owner.uid, actions: [ACLAction.READ] });
+        await aclRepo.save(acl);
+
+        const result = await request(server.getApplication())
+            .get(`${baseUrl}/${shared.uid}`)
+            .set("Authorization", "jwt " + ownerToken);
+
+        expect(result.status).toBe(200);
+        const entries = await auditLogRepo.find({ where: { action: AuditAction.MAILBOX_ACCESSED } });
+        expect(entries.length).toBe(1);
+        expect(entries[0].actorUserUid).toBe(owner.uid);
+        expect(entries[0].targetUid).toBe(shared.uid);
+    });
+
     it("A trusted (admin) caller's plain list is only their own and shared-with-them mailboxes - here none - and `?scope=admin` lists every mailbox as metadata, audited.", async () => {
         await createMailboxSQL({ displayName: "Owner's mailbox", oofMessage: "Away" });
         await createMailboxSQL({ displayName: "Other user's mailbox" }, otherUser.uid);

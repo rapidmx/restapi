@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import config from "../../config.sql.js";
 import { request } from "@rapidrest/service-core/test";
-import { Server, ObjectFactory, ConnectionManager, isSqlDataSource } from "@rapidrest/service-core";
+import { Server, ObjectFactory, ConnectionManager, isSqlDataSource, RepoUtils } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
@@ -13,7 +13,7 @@ import { EscrowAuditLogEntrySQL } from "../../../src/models/sql/EscrowAuditLogEn
 import { EscrowScopeSQL } from "../../../src/models/sql/EscrowScopeSQL.js";
 import { MatterSQL } from "../../../src/models/sql/MatterSQL.js";
 import { EscrowAuditAction } from "../../../src/models/types.js";
-import { recordEscrowAuditEntry, verifyEscrowAuditChain } from "../../../src/util/EscrowAuditUtils.js";
+import { EscrowAuditUtils } from "../../../src/util/EscrowAuditUtils.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
 describe("Route:EscrowAuditLogSQL Tests", () => {
@@ -21,6 +21,8 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
     const objectFactory: ObjectFactory = new ObjectFactory(config, logger);
     const server: Server = new Server({ config, basePath: "./test/server-sql", logger, objectFactory });
     const baseUrl = "/sql/escrow-audit-log";
+    /** Records and verifies the chain, built over the same repositories the route reads (no HMAC key configured). */
+    let escrowAudit: EscrowAuditUtils;
     let escrowScopeRepo: Repository<EscrowScopeSQL>;
     let matterRepo: Repository<MatterSQL>;
     let auditRepo: Repository<EscrowAuditLogEntrySQL>;
@@ -53,6 +55,13 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
         );
     };
 
+    /** An `EscrowAuditUtils` over the real entry and head repositories, built through the factory like a route's `@Init` hook. */
+    const buildEscrowAudit = async (name: string): Promise<EscrowAuditUtils> => {
+        const entryRepo = await objectFactory.newInstance(RepoUtils, { name: EscrowAuditLogEntrySQL.name, args: [EscrowAuditLogEntrySQL] });
+        const headRepo = await objectFactory.newInstance(RepoUtils, { name: EscrowAuditHeadSQL.name, args: [EscrowAuditHeadSQL] });
+        return await objectFactory.newInstance(EscrowAuditUtils, { name, args: [entryRepo, headRepo] });
+    };
+
     beforeAll(async () => {
         registerTestDoubles(objectFactory);
         await server.start();
@@ -67,6 +76,7 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
         } else {
             throw new Error("Could not find sql connection");
         }
+        escrowAudit = await buildEscrowAudit("EscrowAuditLogEntrySQL");
     });
 
     afterAll(async () => {
@@ -111,14 +121,14 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
         const matterA = await createMatter(scopeA.uid);
         const matterB = await createMatter(scopeB.uid);
 
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
             mailboxUid: uuid.v4(),
             requestId: uuid.v4(),
         });
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderB.uid,
             matterId: matterB.uid,
@@ -136,7 +146,7 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
     it("A holder who holds no scope at all sees an empty list.", async () => {
         const scopeA = await createEscrowScope([holderA.uid]);
         const matterA = await createMatter(scopeA.uid);
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
@@ -156,14 +166,14 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
         const matterA = await createMatter(scopeA.uid);
         const matterB = await createMatter(scopeB.uid);
 
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
             mailboxUid: uuid.v4(),
             requestId: uuid.v4(),
         });
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderB.uid,
             matterId: matterB.uid,
@@ -183,14 +193,14 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
         const matterA = await createMatter(scopeA.uid);
         const matterB = await createMatter(scopeB.uid);
 
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
             mailboxUid: uuid.v4(),
             requestId: uuid.v4(),
         });
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderB.uid,
             matterId: matterB.uid,
@@ -208,7 +218,7 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
     it("A holder who holds no scope at all gets a zero count via count(), without ever calling repoUtils.count().", async () => {
         const scopeA = await createEscrowScope([holderA.uid]);
         const matterA = await createMatter(scopeA.uid);
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
@@ -227,14 +237,14 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
         const matterA = await createMatter(scopeA.uid);
         const matterB = await createMatter(scopeB.uid);
 
-        const entryA = await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        const entryA = await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
             mailboxUid: uuid.v4(),
             requestId: uuid.v4(),
         });
-        const entryB = await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        const entryB = await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderB.uid,
             matterId: matterB.uid,
@@ -278,14 +288,14 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
     it("A trusted admin gets {valid:true} on an intact chain and detects tampering after a direct repo mutation.", async () => {
         const scope = await createEscrowScope([holderA.uid]);
         const matter = await createMatter(scope.uid);
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matter.uid,
             mailboxUid: uuid.v4(),
             requestId: uuid.v4(),
         });
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntrySQL, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_APPROVED,
             holderUserUid: holderA.uid,
             matterId: matter.uid,
@@ -312,15 +322,13 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
 
     it("Persists HMAC-keyed entries and the head record, and detects tail truncation via the head.", async () => {
         const hmacKey = "escrow-audit-test-key";
+        // A separate instance (the factory shares one per name) keyed with this test's HMAC key.
+        const keyedAudit: any = await buildEscrowAudit("EscrowAuditKeyed");
+        keyedAudit.hmacKey = hmacKey;
         for (const action of [EscrowAuditAction.REQUEST_CREATED, EscrowAuditAction.REQUEST_APPROVED, EscrowAuditAction.MATERIAL_READ]) {
-            await recordEscrowAuditEntry(
-                objectFactory,
-                EscrowAuditLogEntrySQL,
-                { action, holderUserUid: holderA.uid, matterId: uuid.v4(), mailboxUid: uuid.v4(), requestId: uuid.v4() },
-                { hmacKey },
-            );
+            await keyedAudit.record({ action, holderUserUid: holderA.uid, matterId: uuid.v4(), mailboxUid: uuid.v4(), requestId: uuid.v4() });
         }
-        expect(await verifyEscrowAuditChain(objectFactory, EscrowAuditLogEntrySQL, { hmacKey })).toEqual({ valid: true });
+        expect(await keyedAudit.verifyChain()).toEqual({ valid: true });
 
         const [head] = await auditHeadRepo.find();
         expect(head.sequence).toBe(2);
@@ -329,7 +337,7 @@ describe("Route:EscrowAuditLogSQL Tests", () => {
 
         await auditRepo.delete({ sequence: 2 });
 
-        expect(await verifyEscrowAuditChain(objectFactory, EscrowAuditLogEntrySQL, { hmacKey })).toEqual({
+        expect(await keyedAudit.verifyChain()).toEqual({
             valid: false,
             brokenAtSequence: 2,
             reason: "truncated",

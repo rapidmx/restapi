@@ -4,14 +4,15 @@
 ///////////////////////////////////////////////////////////////////////////////
 import config from "../../config.js";
 import { request } from "@rapidrest/service-core/test";
-import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager } from "@rapidrest/service-core";
+import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager, RepoUtils } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
+import { EscrowAuditHeadMongo } from "../../../src/models/mongo/EscrowAuditHeadMongo.js";
 import { EscrowAuditLogEntryMongo } from "../../../src/models/mongo/EscrowAuditLogEntryMongo.js";
 import { EscrowScopeMongo } from "../../../src/models/mongo/EscrowScopeMongo.js";
 import { MatterMongo } from "../../../src/models/mongo/MatterMongo.js";
 import { EscrowAuditAction } from "../../../src/models/types.js";
-import { recordEscrowAuditEntry, verifyEscrowAuditChain } from "../../../src/util/EscrowAuditUtils.js";
+import { EscrowAuditUtils } from "../../../src/util/EscrowAuditUtils.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles } from "../../testDoubles.js";
 
@@ -27,6 +28,8 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
     const objectFactory: ObjectFactory = new ObjectFactory(config, logger);
     const server: Server = new Server({ config, basePath: "./test/server-mongo", logger, objectFactory });
     const baseUrl = "/mongo/escrow-audit-log";
+    /** Records and verifies the chain, built over the same repositories the route reads (no HMAC key configured). */
+    let escrowAudit: EscrowAuditUtils;
     let escrowScopeRepo: MongoRepository<EscrowScopeMongo>;
     let matterRepo: MongoRepository<MatterMongo>;
     let auditRepo: MongoRepository<EscrowAuditLogEntryMongo>;
@@ -59,6 +62,13 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
         );
     };
 
+    /** An `EscrowAuditUtils` over the real entry and head repositories, built through the factory like a route's `@Init` hook. */
+    const buildEscrowAudit = async (name: string): Promise<EscrowAuditUtils> => {
+        const entryRepo = await objectFactory.newInstance(RepoUtils, { name: EscrowAuditLogEntryMongo.name, args: [EscrowAuditLogEntryMongo] });
+        const headRepo = await objectFactory.newInstance(RepoUtils, { name: EscrowAuditHeadMongo.name, args: [EscrowAuditHeadMongo] });
+        return await objectFactory.newInstance(EscrowAuditUtils, { name, args: [entryRepo, headRepo] });
+    };
+
     beforeAll(async () => {
         await mongod.start();
         registerTestDoubles(objectFactory);
@@ -74,6 +84,7 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
         } else {
             throw new Error("Could not find mongo connection");
         }
+        escrowAudit = await buildEscrowAudit("EscrowAuditLogEntryMongo");
     });
 
     afterAll(async () => {
@@ -124,14 +135,14 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
         const matterA = await createMatter(scopeA.uid);
         const matterB = await createMatter(scopeB.uid);
 
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
             mailboxUid: uuid.v4(),
             requestId: uuid.v4(),
         });
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderB.uid,
             matterId: matterB.uid,
@@ -149,7 +160,7 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
     it("A holder who holds no scope at all sees an empty list.", async () => {
         const scopeA = await createEscrowScope([holderA.uid]);
         const matterA = await createMatter(scopeA.uid);
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
@@ -169,14 +180,14 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
         const matterA = await createMatter(scopeA.uid);
         const matterB = await createMatter(scopeB.uid);
 
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
             mailboxUid: uuid.v4(),
             requestId: uuid.v4(),
         });
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderB.uid,
             matterId: matterB.uid,
@@ -196,14 +207,14 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
         const matterA = await createMatter(scopeA.uid);
         const matterB = await createMatter(scopeB.uid);
 
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
             mailboxUid: uuid.v4(),
             requestId: uuid.v4(),
         });
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderB.uid,
             matterId: matterB.uid,
@@ -221,7 +232,7 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
     it("A holder who holds no scope at all gets a zero count via count(), without ever calling repoUtils.count().", async () => {
         const scopeA = await createEscrowScope([holderA.uid]);
         const matterA = await createMatter(scopeA.uid);
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
@@ -240,14 +251,14 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
         const matterA = await createMatter(scopeA.uid);
         const matterB = await createMatter(scopeB.uid);
 
-        const entryA = await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        const entryA = await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matterA.uid,
             mailboxUid: uuid.v4(),
             requestId: uuid.v4(),
         });
-        const entryB = await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        const entryB = await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderB.uid,
             matterId: matterB.uid,
@@ -291,14 +302,14 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
     it("A trusted admin gets {valid:true} on an intact chain and detects tampering after a direct repo mutation.", async () => {
         const scope = await createEscrowScope([holderA.uid]);
         const matter = await createMatter(scope.uid);
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_CREATED,
             holderUserUid: holderA.uid,
             matterId: matter.uid,
             mailboxUid: uuid.v4(),
             requestId: uuid.v4(),
         });
-        await recordEscrowAuditEntry(objectFactory, EscrowAuditLogEntryMongo, {
+        await escrowAudit.record({
             action: EscrowAuditAction.REQUEST_APPROVED,
             holderUserUid: holderA.uid,
             matterId: matter.uid,
@@ -325,15 +336,13 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
 
     it("Persists HMAC-keyed entries and the head record, and detects tail truncation via the head.", async () => {
         const hmacKey = "escrow-audit-test-key";
+        // A separate instance (the factory shares one per name) keyed with this test's HMAC key.
+        const keyedAudit: any = await buildEscrowAudit("EscrowAuditKeyed");
+        keyedAudit.hmacKey = hmacKey;
         for (const action of [EscrowAuditAction.REQUEST_CREATED, EscrowAuditAction.REQUEST_APPROVED, EscrowAuditAction.MATERIAL_READ]) {
-            await recordEscrowAuditEntry(
-                objectFactory,
-                EscrowAuditLogEntryMongo,
-                { action, holderUserUid: holderA.uid, matterId: uuid.v4(), mailboxUid: uuid.v4(), requestId: uuid.v4() },
-                { hmacKey },
-            );
+            await keyedAudit.record({ action, holderUserUid: holderA.uid, matterId: uuid.v4(), mailboxUid: uuid.v4(), requestId: uuid.v4() });
         }
-        expect(await verifyEscrowAuditChain(objectFactory, EscrowAuditLogEntryMongo, { hmacKey })).toEqual({ valid: true });
+        expect(await keyedAudit.verifyChain()).toEqual({ valid: true });
 
         const [head] = await auditHeadRepo.find({}).toArray();
         expect(head.sequence).toBe(2);
@@ -342,7 +351,7 @@ describe("Route:EscrowAuditLogMongo Tests", () => {
 
         await auditRepo.deleteOne({ sequence: 2 });
 
-        expect(await verifyEscrowAuditChain(objectFactory, EscrowAuditLogEntryMongo, { hmacKey })).toEqual({
+        expect(await keyedAudit.verifyChain()).toEqual({
             valid: false,
             brokenAtSequence: 2,
             reason: "truncated",

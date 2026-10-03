@@ -18,7 +18,7 @@ config.set("mail:auth_server_url", "http://auth.test");
 config.set("mail:auto_provision:timeout_ms", 50);
 
 import { request } from "@rapidrest/service-core/test";
-import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager } from "@rapidrest/service-core";
+import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager, RepoUtils } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
@@ -151,10 +151,10 @@ describe("Route:MailboxMongo auto-provision/domain Tests", () => {
     });
 
     it("Returns 503, creating nothing, when the mailbox policy can't be read - never falling back to config's 'enabled'.", async () => {
-        const newInstance = objectFactory.newInstance.bind(objectFactory);
-        const spy = vi.spyOn(objectFactory, "newInstance").mockImplementation((...args: any[]) =>
-            args[1]?.name === "MailboxPolicyMongo" ? Promise.reject(new Error("datastore offline")) : (newInstance as any)(...args),
-        );
+        const findOne = RepoUtils.prototype.findOne;
+        const spy = vi.spyOn(RepoUtils.prototype, "findOne").mockImplementation(function (this: any, ...args: any[]) {
+            return this.modelClass === MailboxPolicyMongo ? Promise.reject(new Error("datastore offline")) : (findOne as any).apply(this, args);
+        });
         try {
             const result = await withAuth(request(server.getApplication()).post(`${baseUrl}/auto-provision`), userToken);
             expect(result.status).toBe(503);

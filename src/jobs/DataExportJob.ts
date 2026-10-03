@@ -7,8 +7,15 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { collectMailboxContentLines, DEFAULT_MAX_MAILBOX_CONTENT_ROWS, findPagesByUid, MailboxContentEntityClasses } from "../util/MailboxContentUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
+import {
+    collectMailboxContentLines,
+    DEFAULT_MAX_MAILBOX_CONTENT_ROWS,
+    findPagesByUid,
+    MailboxContentEntity,
+    MailboxContentEntityClasses,
+    MailboxContentRepos,
+} from "../util/MailboxContentUtils.js";
 import { buildMboxEntry } from "../util/MboxUtils.js";
 import { softDeletedContentLines } from "./SoftDeletedContent.js";
 import { AuditAction, DataExportRequest, Mailbox, Message } from "../models/types.js";
@@ -89,6 +96,12 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
     protected dataExportRequestRepo?: RepoUtils<DER>;
     protected mailboxRepo?: RepoUtils<MB>;
     protected messageRepo?: RepoUtils<any>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
+
+    /** The repository of every entity type a mailbox's content export reads, built once in `init()` for each model class the
+     * subclass supplies (the `message` one is `messageRepo`). */
+    protected contentRepos?: MailboxContentRepos;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -116,10 +129,6 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
     /** Total byte ceiling for one export bundle (default 2 GiB). */
     @Config("mail:export:max_bytes", DEFAULT_MAX_EXPORT_BYTES)
     private maxBytes: number = DEFAULT_MAX_EXPORT_BYTES;
-
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
-    @Config()
-    private config: any;
 
     @Logger
     private logger: any;
@@ -149,6 +158,31 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
             this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.contentRepos) {
+            const contentRepos: Partial<MailboxContentRepos> = {};
+            for (const [entityType, entityClass] of Object.entries(this.contentEntityClasses) as [MailboxContentEntity, any][]) {
+                if (!entityClass) {
+                    continue;
+                }
+                contentRepos[entityType] =
+                    entityType === "message"
+                        ? this.messageRepo
+                        : await this._objectFactory.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] });
+            }
+            this.contentRepos = contentRepos as MailboxContentRepos;
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
             });
         }
     }
@@ -284,12 +318,7 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
                 { ignoreACL: true },
             );
             blobStored = false;
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, logger: this.logger },
-                { action: AuditAction.DATA_EXPORT_READY, targetType: "DataExportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid },
-            );
+            await this.auditLogUtils!.record({ action: AuditAction.DATA_EXPORT_READY, targetType: "DataExportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid });
         } catch (err: any) {
             if (blobStored) {
                 // The bundle was stored but the request never reached "ready" - nothing references the blob.
@@ -336,12 +365,7 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
             asEntity(this.dataExportRequestRepo!, request),
             { ignoreACL: true },
         );
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, logger: this.logger },
-            { action: AuditAction.DATA_EXPORT_FAILED, targetType: "DataExportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid },
-        );
+        await this.auditLogUtils!.record({ action: AuditAction.DATA_EXPORT_FAILED, targetType: "DataExportRequest", targetUid: updated.uid, mailboxUid: updated.mailboxUid });
     }
 
     /** Yields one mbox entry per message, paging through `repo.find()` (a bare, unpaginated `find()` silently
@@ -396,8 +420,7 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
 
     private async buildJsonBundle(mailboxUid: string, mailbox: MB): Promise<Buffer> {
         const lines: string[] = await collectMailboxContentLines(
-            this._objectFactory!,
-            this.contentEntityClasses,
+            this.contentRepos!,
             mailboxUid,
             mailbox,
             undefined,
@@ -405,7 +428,7 @@ export abstract class DataExportJob<DER extends DataExportRequest, MB extends Ma
         );
         // The rows a user deleted are still held (restorable) and still their data: appended, tagged `deleted: true`. The mbox format
         // carries live mail only.
-        for await (const line of softDeletedContentLines(this._objectFactory!, this.contentEntityClasses, mailboxUid, undefined, lines.length, this.maxContentRows)) {
+        for await (const line of softDeletedContentLines(this.contentRepos!, mailboxUid, undefined, lines.length, this.maxContentRows)) {
             lines.push(line);
         }
         // Checked before joining, so an oversized bundle never costs a second full-size copy.

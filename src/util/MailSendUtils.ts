@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
-import { ApiError, type ObjectFactory } from "@rapidrest/core";
+import { ApiError } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
@@ -12,7 +12,7 @@ import { type MailSendContext, publishTransportOutcome } from "../events/MailEve
 import { MailRelayError, type MailRelayFailureDetails, relayFailureDetails } from "../transport/TransportResultUtils.js";
 import { normalizeAddress } from "./AddressUtils.js";
 import { deriveConversationId } from "./ConversationUtils.js";
-import { classifyRecipientTier, createFederatedPeerCheck, getVerifiedDomainNames } from "./DomainUtils.js";
+import { createFederatedPeerCheck, type DomainUtils } from "./DomainUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders } from "./MimeHeaderUtils.js";
 import { buildRapidMxKeyHeader } from "./RapidMxKeyHeaderUtils.js";
 import { resolveDeliveryVerdict, ScanPipeline } from "../scan/ScanPipeline.js";
@@ -240,29 +240,29 @@ export interface OutboundMessageInfo {
  *
  * - `Disposition-Notification-To` when a receipt is requested for any recipient. A receipt request is a single message-level
  * header (RFC 3798 has no "only for these recipients"), so it is attached when it applies to *any* recipient: each one is
- * classified same-organisation/federated/external (`classifyRecipientTier()`) and the per-draft `requestReceipt` overrides all
+ * classified same-organisation/federated/external (`DomainUtils.classifyRecipientTier()`) and the per-draft `requestReceipt` overrides all
  * three of the mailbox's `alwaysRequestReceipt*` defaults at once when set.
  * - `RapidMX-Key`, announcing the mailbox's active (non-revoked, non-expired) encryption key.
  *
  * Shared by `BaseMessageRoute.send()` and `ScheduledSendJob`, so a message goes out the same whichever of them sends it - a
  * background send is relayed by the job. `attachesReceiptRequest` says whether the first header was added (the Sent Items
- * copy then tracks the receipts, see `seedReceiptStatus()`). Without a `domainClass` and a `dnsResolver` no recipient can be
+ * copy then tracks the receipts, see `seedReceiptStatus()`). Without a `domainUtils` and a `dnsResolver` no recipient can be
  * classified and no receipt is requested.
  */
 export async function prepareOutboundMime(args: {
     raw: Buffer;
     message: OutboundMessageInfo;
     mailbox: Mailbox | undefined;
-    objectFactory: ObjectFactory;
-    domainClass?: any;
+    /** The built domain service used to classify the recipients. */
+    domainUtils?: DomainUtils;
     dnsResolver?: DnsResolver;
 }): Promise<{ raw: Buffer; attachesReceiptRequest: boolean }> {
-    const { message, mailbox, objectFactory } = args;
+    const { message, mailbox, domainUtils } = args;
     let raw: Buffer = args.raw;
     const envelopeTo: string[] = message.recipients.map((recipient) => recipient.address);
 
     let attachesReceiptRequest = false;
-    if (mailbox && args.domainClass && args.dnsResolver) {
+    if (mailbox && domainUtils && args.dnsResolver) {
         const effectiveInternal: boolean = message.requestReceipt ?? mailbox.alwaysRequestReceiptInternal;
         const effectiveFederated: boolean = message.requestReceipt ?? mailbox.alwaysRequestReceiptFederated;
         const effectiveExternal: boolean = message.requestReceipt ?? mailbox.alwaysRequestReceiptExternal;
@@ -270,10 +270,10 @@ export async function prepareOutboundMime(args: {
             // Fetched once and passed to every `classifyRecipientTier()` call (`verifiedDomainNames`) rather than each one
             // re-querying "this server's domains" from scratch. The per-recipient DNS federated-peer checks are independent
             // of each other, so they run concurrently - `resolveFederationPolicy()` already caches per domain.
-            const verifiedDomainNames: string[] = await getVerifiedDomainNames(objectFactory, args.domainClass);
+            const verifiedDomainNames: string[] = await domainUtils.getVerifiedDomainNames();
             const federatedPeerCheck = createFederatedPeerCheck(args.dnsResolver);
             const tiers = await Promise.all(
-                envelopeTo.map((address) => classifyRecipientTier(objectFactory, args.domainClass, address, federatedPeerCheck, verifiedDomainNames)),
+                envelopeTo.map((address) => domainUtils.classifyRecipientTier(address, federatedPeerCheck, verifiedDomainNames)),
             );
             attachesReceiptRequest = tiers.some(
                 (tier) =>

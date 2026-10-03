@@ -2,14 +2,8 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-// Isolated unit tests for requireEscrowHolder()/findHeldScopeIds() - objectFactory/repo are hand-built
-// mocks so this can assert behavior without a real DB.
-//
-// Both functions cache one repo per `escrowScopeClass` *object identity* in a module-level WeakMap (see
-// EscrowUtils.ts's own doc comment on getEscrowScopeRepo()) - shared across every call in this process, not
-// reset between tests. Each test below therefore declares its own fresh, locally-scoped stub class rather
-// than a single shared one, so no test's cache entry can leak into (and mask a missing `newInstance()`
-// call in) another.
+// Isolated unit tests for requireEscrowHolder()/findHeldScopeIds() - the repository is a hand-built mock so this can assert
+// behavior without a real DB.
 import {
     DEFAULT_ESCROW_APPROVAL_TTL_HOURS,
     evaluateEscrowApprovals,
@@ -20,48 +14,36 @@ import {
     resolveEscrowApprovalTtlHours,
 } from "../../src/util/EscrowUtils.js";
 
-function makeStubClass(): any {
-    return class StubEscrowScope {};
-}
-
-function makeObjectFactory(repo: any): any {
-    return { newInstance: vi.fn().mockResolvedValue(repo) };
-}
-
 describe("requireEscrowHolder() Tests", () => {
     it("Throws NOT_FOUND when the scope doesn't exist.", async () => {
         const repo = { findOne: vi.fn().mockResolvedValue(undefined) };
-        const objectFactory = makeObjectFactory(repo);
 
         await expect(
-            requireEscrowHolder(objectFactory, makeStubClass(), "scope-1", { uid: "user-1" } as any),
+            requireEscrowHolder(repo as any, "scope-1", { uid: "user-1" } as any),
         ).rejects.toThrow();
     });
 
     it("Throws AUTH_PERMISSION_FAILURE when the user is not a holder.", async () => {
         const scope = { uid: "scope-1", holderUserUids: ["holder-a"] };
         const repo = { findOne: vi.fn().mockResolvedValue(scope) };
-        const objectFactory = makeObjectFactory(repo);
 
         await expect(
-            requireEscrowHolder(objectFactory, makeStubClass(), "scope-1", { uid: "user-1" } as any),
+            requireEscrowHolder(repo as any, "scope-1", { uid: "user-1" } as any),
         ).rejects.toThrow();
     });
 
     it("Throws AUTH_PERMISSION_FAILURE when no user is given at all.", async () => {
         const scope = { uid: "scope-1", holderUserUids: ["holder-a"] };
         const repo = { findOne: vi.fn().mockResolvedValue(scope) };
-        const objectFactory = makeObjectFactory(repo);
 
-        await expect(requireEscrowHolder(objectFactory, makeStubClass(), "scope-1", undefined)).rejects.toThrow();
+        await expect(requireEscrowHolder(repo as any, "scope-1", undefined)).rejects.toThrow();
     });
 
     it("Returns the scope when the user is a listed holder.", async () => {
         const scope = { uid: "scope-1", holderUserUids: ["holder-a", "user-1"] };
         const repo = { findOne: vi.fn().mockResolvedValue(scope) };
-        const objectFactory = makeObjectFactory(repo);
 
-        const result = await requireEscrowHolder(objectFactory, makeStubClass(), "scope-1", { uid: "user-1" } as any);
+        const result = await requireEscrowHolder(repo as any, "scope-1", { uid: "user-1" } as any);
 
         expect(result).toBe(scope);
     });
@@ -70,9 +52,8 @@ describe("requireEscrowHolder() Tests", () => {
 describe("findHeldScopeIds() Tests", () => {
     it("Returns an empty array for no user at all, without ever fetching scopes.", async () => {
         const repo = { find: vi.fn() };
-        const objectFactory = makeObjectFactory(repo);
 
-        const result = await findHeldScopeIds(objectFactory, makeStubClass(), undefined);
+        const result = await findHeldScopeIds(repo as any, undefined);
 
         expect(result).toEqual([]);
         expect(repo.find).not.toHaveBeenCalled();
@@ -80,9 +61,8 @@ describe("findHeldScopeIds() Tests", () => {
 
     it("Returns an empty array when the user holds no scope.", async () => {
         const repo = { find: vi.fn().mockResolvedValue([{ uid: "scope-1", holderUserUids: ["someone-else"] }]) };
-        const objectFactory = makeObjectFactory(repo);
 
-        const result = await findHeldScopeIds(objectFactory, makeStubClass(), { uid: "user-1" } as any);
+        const result = await findHeldScopeIds(repo as any, { uid: "user-1" } as any);
 
         expect(result).toEqual([]);
     });
@@ -95,9 +75,8 @@ describe("findHeldScopeIds() Tests", () => {
                 { uid: "scope-3", holderUserUids: ["user-1", "someone-else"] },
             ]),
         };
-        const objectFactory = makeObjectFactory(repo);
 
-        const result = await findHeldScopeIds(objectFactory, makeStubClass(), { uid: "user-1" } as any);
+        const result = await findHeldScopeIds(repo as any, { uid: "user-1" } as any);
 
         expect(result.sort()).toEqual(["scope-1", "scope-3"]);
     });

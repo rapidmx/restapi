@@ -10,7 +10,7 @@ import { Readable } from "stream";
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { exactInFilter } from "../util/EscrowUtils.js";
 import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
@@ -177,6 +177,8 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
     protected requestRepo?: RepoUtils<T>;
     protected mailboxRepo?: RepoUtils<MB>;
     protected folderRepo?: RepoUtils<F>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -189,13 +191,6 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
      * enforced against a streamed (not buffered) upload. */
     @Config("mail:import:max_bytes", DEFAULT_MAX_IMPORT_BYTES)
     private maxImportBytes: number = DEFAULT_MAX_IMPORT_BYTES;
-
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
-    @Config()
-    private config: any;
-
-    @Logger
-    private logger: any;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -218,6 +213,18 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
             this.folderRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.folderClass.name,
                 args: [this.folderClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
             });
         }
     }
@@ -465,11 +472,9 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
             await this.blobStore!.delete(sourceBlobKey).catch(() => undefined);
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "An import into this mailbox is already in progress.");
         }
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.MAILBOX_IMPORT_REQUESTED, targetType: "MailboxImportRequest", targetUid: created.uid, mailboxUid },
+            { user },
         );
         return created;
     }

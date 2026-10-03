@@ -2,11 +2,10 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import type { ObjectFactory } from "@rapidrest/core";
-import { ModelUtils, RepoUtils } from "@rapidrest/service-core";
+import { ModelUtils } from "@rapidrest/service-core";
 import type { BlobStore } from "../blob/BlobStore.js";
 import { Message } from "../models/types.js";
-import { BlobReferenceSource, deleteBlobsIfUnreferenced, messageBlobReferenceSources, MessageBlobClasses } from "./BlobReferenceUtils.js";
+import { deleteBlobsIfUnreferenced, messageBlobReferenceSources, MessageBlobRepos } from "./BlobReferenceUtils.js";
 import { retainedBodyBlobKeysOf } from "./DraftBodyRetentionUtils.js";
 import { findPagesByUid } from "./MailboxContentUtils.js";
 
@@ -14,15 +13,16 @@ import { findPagesByUid } from "./MailboxContentUtils.js";
  * find (they stay, orphaned from a deleted message, and are logged) rather than holding an unbounded list in memory. */
 export const MAX_PURGE_ATTACHMENT_ROWS = 20_000;
 
-/** What `purgeMessageContent()` works with. */
+/** What `collectMessagePurge()`/`finishMessagePurge()` work with: `repos.attachmentRepo` is the one the purge reads and deletes, and
+ * every repository present is also a blob reference source (see `messageBlobReferenceSources()`; the sources are derived from it
+ * per call). */
 export interface MessagePurgeContext {
-    objectFactory: ObjectFactory;
     /** Absent: nothing can be deleted from the store, so only the rows are purged. */
     blobStore?: BlobStore;
-    /** Every entity class a message's blobs can be shared with - see `messageBlobReferenceSources()`. The `Message` and `Attachment`
-     * classes are always needed; `quarantineEntryClass` and `ingestQueueEntryClass` are what keep a raw message that another
-     * recipient's queued or quarantined copy still points at, so a purge without BOTH deletes no message-level blob at all. */
-    classes: MessageBlobClasses;
+    /** Every repository a message's blobs can be shared with. The message and attachment ones are always needed;
+     * `quarantineEntryRepo` and `ingestQueueEntryRepo` are what keep a raw message that another recipient's queued or
+     * quarantined copy still points at, so a purge without BOTH deletes no message-level blob at all. */
+    repos: MessageBlobRepos;
     logger?: any;
 }
 
@@ -45,9 +45,9 @@ export interface PreparedMessagePurge {
  */
 export async function collectMessagePurge(ctx: MessagePurgeContext, messages: Message[]): Promise<PreparedMessagePurge> {
     const keys: Set<string> = new Set();
-    const sharesRaw: boolean = !!ctx.classes.quarantineEntryClass && !!ctx.classes.ingestQueueEntryClass;
+    const sharesRaw: boolean = !!ctx.repos.quarantineEntryRepo && !!ctx.repos.ingestQueueEntryRepo;
     for (const message of messages) {
-        // Without the two classes that hold the other holders of a raw message, whether it may go can't be told: it stays.
+        // Without the two repositories that hold the other holders of a raw message, whether it may go can't be told: it stays.
         if (sharesRaw) {
             for (const key of [message.bodyBlobKey, message.sanitizedHtmlBlobKey, ...retainedBodyBlobKeysOf(message)]) {
                 if (typeof key === "string" && key.length > 0) {
@@ -58,13 +58,9 @@ export async function collectMessagePurge(ctx: MessagePurgeContext, messages: Me
     }
     const attachmentUids: string[] = [];
     let truncated: boolean = false;
-    if (ctx.classes.attachmentClass && messages.length > 0) {
-        const repo: RepoUtils<any> = await ctx.objectFactory.newInstance(RepoUtils, {
-            name: ctx.classes.attachmentClass.name,
-            args: [ctx.classes.attachmentClass],
-        });
+    if (ctx.repos.attachmentRepo && messages.length > 0) {
         const criteria: Record<string, any> = { messageUid: ModelUtils.literal(messages.map((message) => message.uid), "in") };
-        collecting: for await (const page of findPagesByUid<any>(repo, criteria)) {
+        collecting: for await (const page of findPagesByUid<any>(ctx.repos.attachmentRepo, criteria)) {
             for (const attachment of page) {
                 if (attachmentUids.length >= MAX_PURGE_ATTACHMENT_ROWS) {
                     truncated = true;
@@ -94,14 +90,10 @@ export async function finishMessagePurge(ctx: MessagePurgeContext, prepared: Pre
     if (prepared.truncated) {
         ctx.logger?.warn(`Permanent message delete: more than ${MAX_PURGE_ATTACHMENT_ROWS} attachments, the rest were left behind.`);
     }
-    if (prepared.attachmentUids.length > 0 && ctx.classes.attachmentClass) {
-        const repo: RepoUtils<any> = await ctx.objectFactory.newInstance(RepoUtils, {
-            name: ctx.classes.attachmentClass.name,
-            args: [ctx.classes.attachmentClass],
-        });
+    if (prepared.attachmentUids.length > 0 && ctx.repos.attachmentRepo) {
         for (const uid of prepared.attachmentUids) {
             try {
-                await repo.delete(uid, { ignoreACL: true, purge: true });
+                await ctx.repos.attachmentRepo.delete(uid, { ignoreACL: true, purge: true });
             } catch (err: any) {
                 ctx.logger?.warn(`Permanent message delete: failed to delete attachment ${uid}: ${err?.message}`);
             }
@@ -110,10 +102,10 @@ export async function finishMessagePurge(ctx: MessagePurgeContext, prepared: Pre
     if (!ctx.blobStore) {
         return;
     }
-    const sources: BlobReferenceSource[] = messageBlobReferenceSources(ctx.classes);
+    const sources = messageBlobReferenceSources(ctx.repos);
     for (const key of prepared.blobKeys) {
         try {
-            await deleteBlobsIfUnreferenced(ctx.objectFactory, ctx.blobStore, sources, [key]);
+            await deleteBlobsIfUnreferenced(ctx.blobStore, sources, [key]);
         } catch (err: any) {
             ctx.logger?.warn(`Permanent message delete: failed to delete blob ${key}: ${err?.message}`);
         }

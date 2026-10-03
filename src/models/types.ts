@@ -325,7 +325,7 @@ export interface MatterExportRequest extends BaseEntity {
  * material, or the authority over it, changes hands or comes into existence, plus a Matter-scoped
  * eDiscovery export (not key material, but still an escrow-holder-gated bulk content disclosure worth the
  * same tamper-evident trail). Deliberately excludes a denied `EscrowAccessRequest` (nothing was ever
- * granted or used there) - that goes through the ordinary `AuditAction`/`recordAuditLog()` instead. */
+ * granted or used there) - that goes through the ordinary `AuditAction`/`AuditLogUtils.record()` instead. */
 export enum EscrowAuditAction {
     REQUEST_CREATED = "escrow_access_request.created",
     REQUEST_APPROVED = "escrow_access_request.approved",
@@ -337,15 +337,15 @@ export enum EscrowAuditAction {
 
 /**
  * One hash-chained, tamper-evident record of an escrow *access* lifecycle event - deliberately separate
- * from the general-purpose `AuditLogEntry`/`recordAuditLog()` (best-effort, not chained, used for
+ * from the general-purpose `AuditLogEntry`/`AuditLogUtils.record()` (best-effort, not chained, used for
  * `EscrowScope`/`Matter` config-change events instead - see those routes). `previousHash`/`hash` form a
  * chain: editing or deleting any row directly against the database breaks `hash` for that row and
- * `previousHash` for every row after it - see `util/EscrowAuditUtils.ts`'s `verifyEscrowAuditChain()`.
+ * `previousHash` for every row after it - see `util/EscrowAuditUtils.ts`'s `EscrowAuditUtils.verifyChain()`.
  *
  * @author Jean-Philippe Steinmetz
  */
 export interface EscrowAuditLogEntry extends BaseEntity {
-    /** Monotonic, global (not per-scope) sequence number - see `EscrowAuditUtils.recordEscrowAuditEntry()`. */
+    /** Monotonic, global (not per-scope) sequence number - see `EscrowAuditUtils.record()`. */
     sequence: number;
 
     /** The immediately-preceding entry's `hash`. `undefined` only for the very first entry (`sequence === 0`). */
@@ -389,7 +389,7 @@ export enum EscrowAuditHashAlgorithm {
 /**
  * The singleton (one row per `chainId`, currently always `"global"`) record of the escrow audit chain's
  * latest `sequence`/`hash`, stored separately from the entries themselves so deleting the chain's tail is
- * detectable by `EscrowAuditUtils.verifyEscrowAuditChain()` - see that file.
+ * detectable by `EscrowAuditUtils.verifyChain()` - see that file.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -473,7 +473,7 @@ export interface RetentionPolicy extends BaseEntity {
      * least `MIN_AUDIT_LOG_RETENTION_DAYS`. Deliberately does NOT apply to `EscrowAuditLogEntry`: that
      * entity is a hash-chained, tamper-evident ledger (`util/EscrowAuditUtils.ts`) where every entry's
      * `hash` depends on the previous one's - deleting any entry out of the middle of the chain would
-     * break `verifyEscrowAuditChain()` for every entry after it. It has no retention-driven deletion path
+     * break `EscrowAuditUtils.verifyChain()` for every entry after it. It has no retention-driven deletion path
      * at all, by design - it is meant to be permanent. */
     auditLogRetentionDays?: number;
 }
@@ -775,7 +775,7 @@ export interface Mailbox extends BaseEntity {
     keyDiscoveryHash?: string;
 
     /** When this mailbox's `Correspondent` list was built from its existing messages and calendar events
-     * (`util/CorrespondentUtils.ts`'s `backfillCorrespondents()`, run the first time the mailbox is searched for
+     * (`util/CorrespondentUtils.ts`'s `CorrespondentBackfillUtils.ensureCorrespondentsBackfilled()`, run the first time the mailbox is searched for
      * recipient suggestions). Unset until then; set BEFORE the backfill starts, so two searches racing on a fresh
      * mailbox don't both count its history. Nothing outside the server reads it, and a value a client writes only
      * changes whether that client's own mailbox is rebuilt. */
@@ -1262,7 +1262,7 @@ export type CorrespondentSource = "received" | "sent" | "event";
  * Someone a mailbox has encountered by e-mail or calendar - a sender or recipient of one of its messages, or the
  * organizer or an attendee of one of its events - so that recipient suggestions (`GET /mail/directory/correspondents`)
  * can offer people who are in neither the user's address book nor the server's directory. One row per (mailbox,
- * address), kept up to date by `util/CorrespondentUtils.ts`'s `recordCorrespondents()`; deleted with the mailbox's
+ * address), kept up to date by `util/CorrespondentUtils.ts`'s `CorrespondentUtils.recordCorrespondents()`; deleted with the mailbox's
  * other data by `ErasureExecutionJob`. Internal bookkeeping only - no CRUD route exists for it.
  *
  * @author Jean-Philippe Steinmetz
@@ -2047,7 +2047,7 @@ export interface Branding extends BaseEntity {
 
 /**
  * A single durable, admin-queryable record of "who did what, when" - Exchange's Admin/Mailbox Audit Log
- * concept. Written only by `util/AuditLogUtils.ts`'s `recordAuditLog()` (called directly from the handful
+ * concept. Written only by `util/AuditLogUtils.ts`'s `AuditLogUtils.record()` (called directly from the handful
  * of admin/policy and sensitive mailbox-content routes this covers - see `AuditAction`'s own doc comment
  * for the exact scope), never created/updated/deleted through this entity's own route (see
  * `BaseAuditLogRoute`'s doc comment for how that's enforced) - an audit trail that could be edited via the

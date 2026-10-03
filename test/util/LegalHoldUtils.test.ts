@@ -2,19 +2,9 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-// Isolated unit tests for findActiveHoldsFor()/assertNotOnLegalHold() - objectFactory/repo are hand-built
-// mocks so this can assert behavior without a real DB. See test/util/EscrowUtils.test.ts's identical
-// rationale for why each test declares its own fresh, locally-scoped stub class rather than a single
-// shared one - both functions cache one repo per `matterClass` object identity in a module-level WeakMap.
+// Isolated unit tests for findActiveHoldsFor()/assertNotOnLegalHold()/loadLegalHoldIndex() - the repository is a hand-built mock so
+// this can assert behavior without a real DB.
 import { assertNotOnLegalHold, findActiveHoldsFor, loadLegalHoldIndex } from "../../src/util/LegalHoldUtils.js";
-
-function makeStubClass(): any {
-    return class StubMatter {};
-}
-
-function makeObjectFactory(repo: any): any {
-    return { newInstance: vi.fn().mockResolvedValue(repo) };
-}
 
 function makeMatter(overrides: any = {}) {
     return {
@@ -30,18 +20,16 @@ function makeMatter(overrides: any = {}) {
 describe("findActiveHoldsFor() Tests", () => {
     it("Returns an empty array when no matter names the mailbox as a custodian.", async () => {
         const repo = { find: vi.fn().mockResolvedValue([makeMatter({ custodianMailboxUids: ["someone-else"] })]) };
-        const objectFactory = makeObjectFactory(repo);
 
-        const result = await findActiveHoldsFor(objectFactory, makeStubClass(), "mailbox-1");
+        const result = await findActiveHoldsFor(repo as any, "mailbox-1");
 
         expect(result).toEqual([]);
     });
 
     it("Excludes a closed matter even when the mailbox is a named custodian.", async () => {
         const repo = { find: vi.fn().mockResolvedValue([makeMatter({ closedAt: new Date() })]) };
-        const objectFactory = makeObjectFactory(repo);
 
-        const result = await findActiveHoldsFor(objectFactory, makeStubClass(), "mailbox-1");
+        const result = await findActiveHoldsFor(repo as any, "mailbox-1");
 
         expect(result).toEqual([]);
     });
@@ -49,9 +37,8 @@ describe("findActiveHoldsFor() Tests", () => {
     it("Matches an open matter naming the mailbox when no reference date is given (whole-record scope).", async () => {
         const matter = makeMatter();
         const repo = { find: vi.fn().mockResolvedValue([matter]) };
-        const objectFactory = makeObjectFactory(repo);
 
-        const result = await findActiveHoldsFor(objectFactory, makeStubClass(), "mailbox-1");
+        const result = await findActiveHoldsFor(repo as any, "mailbox-1");
 
         expect(result).toEqual([matter]);
     });
@@ -59,9 +46,8 @@ describe("findActiveHoldsFor() Tests", () => {
     it("Excludes a matter whose date range doesn't cover the given reference date.", async () => {
         const matter = makeMatter({ dateRangeStart: new Date("2020-01-01"), dateRangeEnd: new Date("2020-06-01") });
         const repo = { find: vi.fn().mockResolvedValue([matter]) };
-        const objectFactory = makeObjectFactory(repo);
 
-        const result = await findActiveHoldsFor(objectFactory, makeStubClass(), "mailbox-1", new Date("2021-01-01"));
+        const result = await findActiveHoldsFor(repo as any, "mailbox-1", new Date("2021-01-01"));
 
         expect(result).toEqual([]);
     });
@@ -69,9 +55,8 @@ describe("findActiveHoldsFor() Tests", () => {
     it("Includes a matter whose date range covers the given reference date.", async () => {
         const matter = makeMatter({ dateRangeStart: new Date("2020-01-01"), dateRangeEnd: new Date("2025-01-01") });
         const repo = { find: vi.fn().mockResolvedValue([matter]) };
-        const objectFactory = makeObjectFactory(repo);
 
-        const result = await findActiveHoldsFor(objectFactory, makeStubClass(), "mailbox-1", new Date("2021-06-01"));
+        const result = await findActiveHoldsFor(repo as any, "mailbox-1", new Date("2021-06-01"));
 
         expect(result).toEqual([matter]);
     });
@@ -80,13 +65,11 @@ describe("findActiveHoldsFor() Tests", () => {
         const asStrings = makeMatter({ dateRangeStart: "2020-01-01T00:00:00.000Z", dateRangeEnd: "2025-01-01T00:00:00.000Z" });
         const unreadable = makeMatter({ uid: "matter-2", dateRangeStart: "not a date", dateRangeEnd: undefined });
         const repo = { find: vi.fn().mockResolvedValue([asStrings, unreadable]) };
-        const objectFactory = makeObjectFactory(repo);
-        const stubClass = makeStubClass();
 
-        expect(await findActiveHoldsFor(objectFactory, stubClass, "mailbox-1", new Date("2021-06-01"))).toEqual([asStrings, unreadable]);
+        expect(await findActiveHoldsFor(repo as any, "mailbox-1", new Date("2021-06-01"))).toEqual([asStrings, unreadable]);
         // Outside the readable range only the matter whose range can't be read (it fails closed) still holds.
-        expect(await findActiveHoldsFor(objectFactory, stubClass, "mailbox-1", new Date("2026-06-01"))).toEqual([unreadable]);
-        const index = await loadLegalHoldIndex(objectFactory, stubClass);
+        expect(await findActiveHoldsFor(repo as any, "mailbox-1", new Date("2026-06-01"))).toEqual([unreadable]);
+        const index = await loadLegalHoldIndex(repo as any);
         expect(index.isHeld("mailbox-1", new Date("2026-06-01"))).toBe(true);
     });
 
@@ -94,9 +77,8 @@ describe("findActiveHoldsFor() Tests", () => {
         const matterA = makeMatter({ uid: "matter-a" });
         const matterB = makeMatter({ uid: "matter-b" });
         const repo = { find: vi.fn().mockResolvedValue([matterA, matterB]) };
-        const objectFactory = makeObjectFactory(repo);
 
-        const result = await findActiveHoldsFor(objectFactory, makeStubClass(), "mailbox-1");
+        const result = await findActiveHoldsFor(repo as any, "mailbox-1");
 
         expect(result.map((m) => m.uid).sort()).toEqual(["matter-a", "matter-b"]);
     });
@@ -121,9 +103,8 @@ describe("findActiveHoldsFor() Tests", () => {
             return [];
         });
         const repo = { find };
-        const objectFactory = makeObjectFactory(repo);
 
-        const result = await findActiveHoldsFor(objectFactory, makeStubClass(), "mailbox-1");
+        const result = await findActiveHoldsFor(repo as any, "mailbox-1");
 
         expect(result.map((m) => m.uid)).toEqual(["matter-late"]);
         // Page 1 returns fewer than `pageSize` rows, so the loop correctly stops there without a 3rd call.
@@ -140,16 +121,22 @@ describe("findActiveHoldsFor() Tests", () => {
 describe("assertNotOnLegalHold() Tests", () => {
     it("Resolves without throwing when no hold matches.", async () => {
         const repo = { find: vi.fn().mockResolvedValue([]) };
-        const objectFactory = makeObjectFactory(repo);
 
-        await expect(assertNotOnLegalHold(objectFactory, makeStubClass(), "mailbox-1")).resolves.toBeUndefined();
+        await expect(assertNotOnLegalHold(repo as any, "mailbox-1")).resolves.toBeUndefined();
+    });
+
+    it("Names every blocking matter in the 409, and passes for another mailbox or a reference date outside every range.", async () => {
+        const repo = { find: vi.fn().mockResolvedValue([makeMatter({ uid: "matter-1" }), makeMatter({ uid: "m2" })]) };
+
+        await expect(assertNotOnLegalHold(repo as any, "mailbox-1")).rejects.toMatchObject({ status: 409, message: expect.stringContaining("matter-1, m2") });
+        await expect(assertNotOnLegalHold(repo as any, "someone-else")).resolves.toBeUndefined();
+        await expect(assertNotOnLegalHold(repo as any, "mailbox-1", new Date("2040-01-01"))).resolves.toBeUndefined();
     });
 
     it("Throws, naming the blocking matter, when an active hold matches.", async () => {
         const repo = { find: vi.fn().mockResolvedValue([makeMatter({ uid: "matter-1" })]) };
-        const objectFactory = makeObjectFactory(repo);
 
-        await expect(assertNotOnLegalHold(objectFactory, makeStubClass(), "mailbox-1")).rejects.toThrow(/matter-1/);
+        await expect(assertNotOnLegalHold(repo as any, "mailbox-1")).rejects.toThrow(/matter-1/);
     });
 });
 
@@ -163,7 +150,7 @@ describe("loadLegalHoldIndex() Tests", () => {
             ]),
         };
 
-        const index = await loadLegalHoldIndex(makeObjectFactory(repo), makeStubClass());
+        const index = await loadLegalHoldIndex(repo as any);
 
         expect([...index.heldMailboxUids].sort()).toEqual(["both", "held"]);
         expect(index.isHeld("held")).toBe(true);

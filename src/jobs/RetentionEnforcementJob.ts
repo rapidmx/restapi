@@ -7,7 +7,7 @@ import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "
 import { BlobStore } from "../blob/BlobStore.js";
 import { BlobReferenceSource, deleteBlobsIfUnreferenced, messageBlobReferenceSources } from "../util/BlobReferenceUtils.js";
 import { LegalHoldIndex, loadLegalHoldIndex } from "../util/LegalHoldUtils.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { retainedBodyBlobKeysOf } from "../util/DraftBodyRetentionUtils.js";
@@ -94,6 +94,10 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
     protected auditLogRepo?: RepoUtils<AL>;
     protected attachmentRepo?: RepoUtils<AT>;
     protected folderRepo?: RecoverableRepoUtils<any>;
+    protected matterRepo?: RepoUtils<any>;
+    protected quarantineEntryRepo?: RepoUtils<any>;
+    protected ingestQueueEntryRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
 
     @Inject(NotificationUtils)
     private notificationUtils?: NotificationUtils;
@@ -110,10 +114,6 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
 
     @Config("mail:jobs:retention_enforcement:batch_size", 500)
     private batchSize: number = 500;
-
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
-    @Config()
-    private config: any;
 
     @Logger
     private logger: any;
@@ -157,6 +157,30 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
                 args: [this.folderClass],
             });
         }
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.matterClass.name,
+                args: [this.matterClass],
+            });
+        }
+        if (!this.quarantineEntryRepo && this.quarantineEntryClass) {
+            this.quarantineEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.quarantineEntryClass.name,
+                args: [this.quarantineEntryClass],
+            });
+        }
+        if (!this.ingestQueueEntryRepo && this.ingestQueueEntryClass) {
+            this.ingestQueueEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.ingestQueueEntryClass.name,
+                args: [this.ingestQueueEntryClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
+            });
+        }
     }
 
     public async start(): Promise<void> {
@@ -193,10 +217,10 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
      */
     private async releaseRetainedDraftBodies(): Promise<void> {
         const blobSources: BlobReferenceSource[] = messageBlobReferenceSources({
-            messageClass: this.messageClass,
-            attachmentClass: this.attachmentClass,
-            quarantineEntryClass: this.quarantineEntryClass,
-            ingestQueueEntryClass: this.ingestQueueEntryClass,
+            messageRepo: this.messageRepo,
+            attachmentRepo: this.attachmentRepo,
+            quarantineEntryRepo: this.quarantineEntryRepo,
+            ingestQueueEntryRepo: this.ingestQueueEntryRepo,
         });
         const pageSize: number = Math.max(1, Math.min(this.batchSize, 1000));
         const maxExamined: number = pageSize * 20;
@@ -204,7 +228,7 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
         let examined = 0;
         for (const deletedCriteria of [{}, { deleted: true }]) {
             for await (const page of findPagesByUid<M>(this.messageRepo!, { retainedBodyBlobKeys: "ne(null)", ...deletedCriteria }, pageSize)) {
-                const holds: LegalHoldIndex = await loadLegalHoldIndex(this._objectFactory!, this.matterClass);
+                const holds: LegalHoldIndex = await loadLegalHoldIndex(this.matterRepo!);
                 for (const message of page) {
                     if (released >= this.batchSize || examined >= maxExamined) {
                         return;
@@ -215,7 +239,7 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
                     }
                     try {
                         const keys: string[] = retainedBodyBlobKeysOf(message).filter((key) => key !== (message as any).bodyBlobKey);
-                        await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, keys);
+                        await deleteBlobsIfUnreferenced(this.blobStore!, blobSources, keys);
                         await this.messageRepo!.update(
                             { uid: message.uid, version: (message as any).version, retainedBodyBlobKeys: null } as any,
                             asEntity(this.messageRepo!, message),
@@ -233,10 +257,10 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
     private async purgeExpiredMessages(maxAgeDays: number): Promise<void> {
         const cutoff: Date = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000);
         const blobSources: BlobReferenceSource[] = messageBlobReferenceSources({
-            messageClass: this.messageClass,
-            attachmentClass: this.attachmentClass,
-            quarantineEntryClass: this.quarantineEntryClass,
-            ingestQueueEntryClass: this.ingestQueueEntryClass,
+            messageRepo: this.messageRepo,
+            attachmentRepo: this.attachmentRepo,
+            quarantineEntryRepo: this.quarantineEntryRepo,
+            ingestQueueEntryRepo: this.ingestQueueEntryRepo,
         });
 
         // The folders a live message was purged from - a soft-deleted one was already out of its folder's counts.
@@ -255,11 +279,10 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
             for await (const attachments of findPagesByUid<AT>(this.attachmentRepo!, { messageUid: message.uid })) {
                 for (const attachment of attachments) {
                     await deleteBlobsIfUnreferenced(
-                        this._objectFactory!,
                         this.blobStore!,
                         blobSources,
                         [(attachment as any).blobKey, (attachment as any).extractedTextBlobKey],
-                        { entityClass: this.attachmentClass, uid: attachment.uid },
+                        { repo: this.attachmentRepo, uid: attachment.uid },
                     );
                     await this.attachmentRepo!.delete(attachment.uid, { ignoreACL: true, purge: true });
                 }
@@ -267,11 +290,10 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
 
             // Draft bodies superseded under a hold go with the message (the query below leaves held mailboxes out).
             await deleteBlobsIfUnreferenced(
-                this._objectFactory!,
                 this.blobStore!,
                 blobSources,
                 [(message as any).bodyBlobKey, (message as any).sanitizedHtmlBlobKey, ...retainedBodyBlobKeysOf(message)],
-                { entityClass: this.messageClass, uid: message.uid },
+                { repo: this.messageRepo, uid: message.uid },
             );
             await this.messageRepo!.delete(message.uid, { ignoreACL: true, purge: true });
             if (!message.deleted) {
@@ -333,7 +355,7 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
         // of them ahead of the purgeable ones would use up the whole examined budget and starve everything behind them. `mailboxUid
         // NOT IN (...)` alone would also drop org-wide entries (a NULL `mailboxUid`) on SQL, so those are read by their own pass.
         // (Mongo's `$nin` keeps them, which only means the second pass finds them already gone.)
-        const anyHeld: boolean = (await loadLegalHoldIndex(this._objectFactory!, this.matterClass)).heldMailboxUids.size > 0;
+        const anyHeld: boolean = (await loadLegalHoldIndex(this.matterRepo!)).heldMailboxUids.size > 0;
         const scopes: Array<(holds: LegalHoldIndex) => Record<string, any>> = anyHeld
             ? [() => ({ mailboxUid: "eq(null)" }), (holds) => (holds.heldMailboxUids.size > 0 ? { mailboxUid: `nin(${[...holds.heldMailboxUids].join(",")})` } : {})]
             : [() => ({})];
@@ -398,7 +420,7 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
         let examined = 0;
         let after: string | undefined;
         while (purged < budget && examined < maxExamined) {
-            const holds: LegalHoldIndex = await loadLegalHoldIndex(this._objectFactory!, this.matterClass);
+            const holds: LegalHoldIndex = await loadLegalHoldIndex(this.matterRepo!);
             const query: Record<string, any> = {
                 ...queryExclusions(holds),
                 [dateField]: `lt(${cutoff.toISOString()})`,
@@ -443,16 +465,11 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
     /** One audit entry per entity type per run, not one per record - a routine background job purging
      * hundreds of expired rows would otherwise flood the audit trail it's supposed to keep readable. */
     private async recordPurge(targetType: string, count: number, maxAgeDays: number): Promise<void> {
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, logger: this.logger },
-            {
-                action: AuditAction.RETENTION_PURGE_EXECUTED,
-                targetType,
-                targetUid: "batch",
-                details: { count, maxAgeDays },
-            },
-        );
+        await this.auditLogUtils!.record({
+            action: AuditAction.RETENTION_PURGE_EXECUTED,
+            targetType,
+            targetUid: "batch",
+            details: { count, maxAgeDays },
+        });
     }
 }

@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
-import { type ObjectFactory } from "@rapidrest/core";
+import { ObjectDecorators } from "@rapidrest/core";
 import { RepoUtils } from "@rapidrest/service-core";
 import { EscrowAuditAction, EscrowAuditHashAlgorithm, EscrowAuditHead, EscrowAuditLogEntry } from "../models/types.js";
 import { asEntity } from "./EntityUtils.js";
+
+const { Config, Logger } = ObjectDecorators;
 
 /**
  * The config key holding the HMAC-SHA256 key new escrow audit entries (and the chain's head record) are keyed
@@ -19,27 +21,14 @@ export const ESCROW_AUDIT_HMAC_KEY_CONFIG = "mail:escrow:audit_hmac_key";
 /** The `chainId` of the single, global escrow audit chain's head record. */
 export const ESCROW_AUDIT_HEAD_CHAIN_ID = "global";
 
-/** Caches one `RepoUtils` per concrete model class (entry and head, Mongo vs SQL), mirroring
- * `AuditLogUtils.ts`'s/`EscrowUtils.ts`'s identical lazy-repo caching pattern. */
-const escrowAuditRepoCache = new WeakMap<any, Promise<RepoUtils<any>>>();
-
-function getRepo<T extends EscrowAuditLogEntry | EscrowAuditHead>(objectFactory: ObjectFactory, modelClass: any): Promise<RepoUtils<T>> {
-    let cached = escrowAuditRepoCache.get(modelClass);
-    if (!cached) {
-        cached = Promise.resolve(objectFactory.newInstance(RepoUtils, { name: modelClass.name, args: [modelClass] }));
-        escrowAuditRepoCache.set(modelClass, cached);
-    }
-    return cached as Promise<RepoUtils<T>>;
-}
-
-/** How many times `recordEscrowAuditEntry()` retries a `sequence` collision before giving up - see its own
+/** How many times `EscrowAuditUtils.record()` retries a `sequence` collision before giving up - see its own
  * doc comment for why this is a retry loop rather than a transaction. */
 const MAX_APPEND_ATTEMPTS = 5;
 
 /** How many times `advanceHead()` retries an optimistic-lock conflict (or create race) on the head record. */
 const MAX_HEAD_ATTEMPTS = 5;
 
-/** How many entries `verifyEscrowAuditChain()` fetches per page - same pattern/size as
+/** How many entries `EscrowAuditUtils.verifyChain()` fetches per page - same pattern/size as
  * `MailboxQuotaRecalcJob.findAllPages()`. */
 const VERIFY_PAGE_SIZE = 500;
 
@@ -52,69 +41,25 @@ export interface RecordEscrowAuditEntryParams {
     details?: Record<string, any>;
 }
 
-/**
- * Optional overrides for `recordEscrowAuditEntry()`/`verifyEscrowAuditChain()`. Every field falls back to a
- * sensible default, so existing callers passing only `(objectFactory, escrowAuditLogClass, ...)` keep working.
- */
-export interface EscrowAuditOptions {
-    /** The `EscrowAuditHead` model class. Defaults to `escrowAuditLogClass.escrowAuditHeadClass` (a static set on
-     * `EscrowAuditLogEntryMongo`/`EscrowAuditLogEntrySQL`); an explicit `null` disables head maintenance and
-     * tail-truncation checking. */
-    escrowAuditHeadClass?: any;
-    /** The HMAC key. Defaults to the `mail:escrow:audit_hmac_key` config value read from `objectFactory`. */
-    hmacKey?: string;
-    /** Defaults to `objectFactory`'s own logger. */
-    logger?: any;
-}
-
-interface ResolvedContext {
-    headClass?: any;
+/** What `appendEntry()`/`verifyChain()` work with: the repositories (the head one only when head maintenance is on, and
+ * fetched lazily - a failure building it is retried and logged by `advanceHead()`, never thrown from an append), how a
+ * model row is instantiated, and the resolved key and logger. Built by `EscrowAuditUtils`. */
+interface ChainContext {
+    entryRepo: RepoUtils<EscrowAuditLogEntry>;
+    getHeadRepo?: () => Promise<RepoUtils<EscrowAuditHead>>;
+    makeEntry: (data: Record<string, any>) => any;
+    makeHead: (data: Record<string, any>) => any;
     hmacKey: string;
     logger: any;
 }
 
-function resolveContext(objectFactory: ObjectFactory, escrowAuditLogClass: any, options?: EscrowAuditOptions): ResolvedContext {
-    const factory: any = objectFactory;
-    let hmacKey: unknown = options?.hmacKey;
-    if (hmacKey === undefined) {
-        hmacKey = typeof factory?.config?.get === "function" ? factory.config.get(ESCROW_AUDIT_HMAC_KEY_CONFIG) : undefined;
-    }
-    const headClass: any =
-        options && "escrowAuditHeadClass" in options ? options.escrowAuditHeadClass : escrowAuditLogClass?.escrowAuditHeadClass;
-    return {
-        headClass: headClass ?? undefined,
-        // nconf's `parseValues` turns an all-digit env value into a number - accept that rather than silently
-        // falling back to the unkeyed scheme.
-        hmacKey: typeof hmacKey === "string" || typeof hmacKey === "number" ? String(hmacKey) : "",
-        logger: options?.logger ?? factory?.logger ?? console,
-    };
-}
-
-/** Tracks which `ObjectFactory` (i.e. which running application) has already been warned about a missing
- * HMAC key, so the warning is logged once rather than on every escrow access. */
-const warnedMissingKey = new WeakSet<object>();
-
-/**
- * Logs (once per application, lazily on first escrow audit use) that `mail:escrow:audit_hmac_key` is unset.
- * Deliberately never throws, even in production: escrow is an optional feature, and failing startup (or every
- * escrow access) on an unset key would take down all mail for deployments that never use escrow. The unkeyed
- * SHA-256 fallback still detects accidental corruption and non-recomputing edits - it just can't stop a
- * DB-write attacker from rewriting the chain consistently - so production logs at `error` level to be loud.
- */
-function warnIfKeyMissing(objectFactory: ObjectFactory, ctx: ResolvedContext): void {
-    if (ctx.hmacKey || !objectFactory || warnedMissingKey.has(objectFactory)) {
-        return;
-    }
-    warnedMissingKey.add(objectFactory);
-    const message =
+/** The warning logged when `mail:escrow:audit_hmac_key` is unset. */
+function missingKeyMessage(): string {
+    return (
         `EscrowAuditUtils: ${ESCROW_AUDIT_HMAC_KEY_CONFIG} is not set - escrow audit entries are hash-chained with ` +
         "unkeyed SHA-256, which anyone with database write access can rewrite undetectably. Set it (identically on " +
-        "every replica) to enable HMAC-SHA256.";
-    if (process.env.NODE_ENV === "production") {
-        ctx.logger?.error?.(message);
-    } else {
-        ctx.logger?.warn?.(message);
-    }
+        "every replica) to enable HMAC-SHA256."
+    );
 }
 
 /** Computes the digest covering one entry's own content plus the previous entry's hash - the link in the
@@ -175,16 +120,16 @@ async function findHead(repo: RepoUtils<EscrowAuditHead>): Promise<EscrowAuditHe
  * collision on `chainId` for two racing creates) makes this re-read the head and retry, and a head already at
  * or past `entry.sequence` (a later concurrent append won) is left alone - the head only ever moves forward.
  *
- * Not transactional with the entry insert (see `recordEscrowAuditEntry()` for why there's no transaction): if
+ * Not transactional with the entry insert (see `EscrowAuditUtils.record()` for why there's no transaction): if
  * this fails after the entry was inserted, the head lags behind. That is logged at `error` level but NOT
- * propagated - the tamper-evident entry itself was persisted, `verifyEscrowAuditChain()` tolerates a lagging
+ * propagated - the tamper-evident entry itself was persisted, `EscrowAuditUtils.verifyChain()` tolerates a lagging
  * head (entries past it still have to verify), and the next successful append heals it.
  */
-async function advanceHead(objectFactory: ObjectFactory, ctx: ResolvedContext, entry: EscrowAuditLogEntry): Promise<void> {
+async function advanceHead(ctx: ChainContext, entry: EscrowAuditLogEntry): Promise<void> {
     let lastError: unknown;
     for (let attempt = 0; attempt < MAX_HEAD_ATTEMPTS; attempt++) {
         try {
-            const headRepo: RepoUtils<EscrowAuditHead> = await getRepo<EscrowAuditHead>(objectFactory, ctx.headClass);
+            const headRepo: RepoUtils<EscrowAuditHead> = await ctx.getHeadRepo!();
             const head: EscrowAuditHead | undefined = await findHead(headRepo);
             if (head && head.sequence >= entry.sequence) {
                 return;
@@ -198,14 +143,14 @@ async function advanceHead(objectFactory: ObjectFactory, ctx: ResolvedContext, e
                 mac: ctx.hmacKey ? computeHeadMac(ESCROW_AUDIT_HEAD_CHAIN_ID, entry.sequence, entry.hash, ctx.hmacKey) : (null as any),
             };
             if (!head) {
-                await headRepo.create(new ctx.headClass(fields), { ignoreACL: true });
+                await headRepo.create(ctx.makeHead(fields), { ignoreACL: true });
             } else {
                 // `asEntity()`: on Mongo `find()` returns a plain document, and `RepoUtils.update()` only
                 // enforces its optimistic `version` lock when `existing` is a real entity instance - without it
                 // two concurrent appenders could both overwrite the head (a lost update that can leave the head
                 // behind a later append, or pointing at the wrong entry), instead of the loser getting a
                 // conflict and re-reading here.
-                await headRepo.update(new ctx.headClass({ ...head, ...fields }), asEntity(headRepo, head), { ignoreACL: true });
+                await headRepo.update(ctx.makeHead({ ...head, ...fields }), asEntity(headRepo, head), { ignoreACL: true });
             }
             return;
         } catch (err) {
@@ -218,35 +163,9 @@ async function advanceHead(objectFactory: ObjectFactory, ctx: ResolvedContext, e
     );
 }
 
-/**
- * Persists one hash-chained escrow-access audit entry. Unlike `recordAuditLog()`, this THROWS/propagates a
- * persistence failure rather than swallowing it - a failed write here means an escrow access happened with
- * no tamper-evident record of it, which undermines the entire feature's compliance value; the caller must
- * let this fail the whole request rather than silently continue.
- *
- * Scheme: HMAC-SHA256 keyed by `mail:escrow:audit_hmac_key` when set, otherwise unkeyed SHA-256 (with a
- * one-time warning - see `warnIfKeyMissing()`). The scheme used is recorded on the entry (`hashAlgorithm`).
- *
- * Concurrency: reads the current highest `sequence`, computes the next entry's hash, and attempts to
- * insert it. `EscrowAuditLogEntrySQL`/`Mongo` carry a unique index on `sequence`, so two concurrent callers
- * racing for the same next sequence number can't fork the chain - the loser's insert fails, and this
- * function retries (re-reading the now-updated latest entry) up to `MAX_APPEND_ATTEMPTS` times before giving
- * up. That unique index (not the head record) is what serializes appends; the head is advanced right after
- * (`advanceHead()`). Claiming the head first instead would make a failure between the two leave the head
- * pointing at an entry that was never written - a permanent verification failure - whereas this order can
- * only leave a self-healing lag. Not wrapped in `@Transactional()`: that decorator resolves the datasource to
- * open a transaction against from a `@Model`-decorated ROUTE class's own `modelClass` getter (see
- * `BaseKeyVaultRoute.ts`'s), which a plain, non-route utility function like this one has no equivalent of.
- */
-export async function recordEscrowAuditEntry(
-    objectFactory: ObjectFactory,
-    escrowAuditLogClass: any,
-    params: RecordEscrowAuditEntryParams,
-    options?: EscrowAuditOptions,
-): Promise<EscrowAuditLogEntry> {
-    const ctx: ResolvedContext = resolveContext(objectFactory, escrowAuditLogClass, options);
-    warnIfKeyMissing(objectFactory, ctx);
-    const repo: RepoUtils<EscrowAuditLogEntry> = await getRepo<EscrowAuditLogEntry>(objectFactory, escrowAuditLogClass);
+/** The body of `EscrowAuditUtils.record()` - see its doc comment. */
+async function appendEntry(ctx: ChainContext, params: RecordEscrowAuditEntryParams): Promise<EscrowAuditLogEntry> {
+    const repo: RepoUtils<EscrowAuditLogEntry> = ctx.entryRepo;
     const hashAlgorithm: EscrowAuditHashAlgorithm = ctx.hmacKey ? EscrowAuditHashAlgorithm.HMAC_SHA256 : EscrowAuditHashAlgorithm.SHA256;
 
     let lastError: unknown;
@@ -260,22 +179,22 @@ export async function recordEscrowAuditEntry(
         let entry: EscrowAuditLogEntry;
         try {
             entry = await repo.create(
-                new escrowAuditLogClass({ ...params, sequence, previousHash, hash, hashAlgorithm, occurredAt }),
+                ctx.makeEntry({ ...params, sequence, previousHash, hash, hashAlgorithm, occurredAt }),
                 { ignoreACL: true },
             );
         } catch (err) {
             lastError = err;
             continue;
         }
-        if (ctx.headClass) {
-            await advanceHead(objectFactory, ctx, entry);
+        if (ctx.getHeadRepo) {
+            await advanceHead(ctx, entry);
         }
         return entry;
     }
     throw lastError;
 }
 
-/** Why `verifyEscrowAuditChain()` reported the chain invalid. */
+/** Why `EscrowAuditUtils.verifyChain()` reported the chain invalid. */
 export type EscrowAuditVerificationFailure =
     /** An entry's `previousHash` doesn't match the preceding entry's `hash` (a deleted, inserted, or reordered entry). */
     | "link_mismatch"
@@ -302,41 +221,10 @@ export interface EscrowAuditVerificationResult {
     reason?: EscrowAuditVerificationFailure;
 }
 
-/**
- * Walks every `EscrowAuditLogEntry` in `sequence` order (paginated, `VERIFY_PAGE_SIZE` at a time - same
- * pattern `MailboxQuotaRecalcJob.findAllPages()` already establishes), and for each one: checks
- * `entry.previousHash` matches the running expected value, then recomputes `hash` from the entry's own
- * stored fields with the entry's own `hashAlgorithm` (absent = legacy SHA-256) and compares. Returns the
- * first (lowest) sequence at which any check fails.
- *
- * Then compares the chain against the separately stored head record (read BEFORE the walk, so a concurrent
- * append can only add entries past it, never make the chain look truncated):
- * - head `sequence` beyond the last entry present -> `truncated` (tail deletion).
- * - the entry at head `sequence` has a different hash -> `head_mismatch`. Entries AFTER the head are
- * tolerated (a head lagging after a failed `advanceHead()`); they still had to pass the per-entry checks.
- * - head MAC present -> must verify with the configured key. With a key configured, a head MAC is required
- * (`head_mac_mismatch` when missing).
- * - no head row at all -> "no head yet" (valid) only while every entry is a pre-upgrade legacy entry (no
- * `hashAlgorithm`), i.e. a deployment that hasn't appended since upgrading - its first append creates the
- * head. Once any entry carries `hashAlgorithm`, a head must exist (`head_missing`).
- *
- * Residual limits (inherent to keeping all state in the same database an attacker is assumed to write to):
- * with the key configured, an attacker without it can't forge entries or a head, but can still (a) restore a
- * previously captured head row after deleting the entries appended since, or (b) rewrite every entry as a
- * pre-upgrade legacy SHA-256 entry (no `hashAlgorithm`) and delete the head. Only an external anchor (e.g.
- * periodically recording the head off-box) closes those.
- */
-export async function verifyEscrowAuditChain(
-    objectFactory: ObjectFactory,
-    escrowAuditLogClass: any,
-    options?: EscrowAuditOptions,
-): Promise<EscrowAuditVerificationResult> {
-    const ctx: ResolvedContext = resolveContext(objectFactory, escrowAuditLogClass, options);
-    warnIfKeyMissing(objectFactory, ctx);
-    const repo: RepoUtils<EscrowAuditLogEntry> = await getRepo<EscrowAuditLogEntry>(objectFactory, escrowAuditLogClass);
-    const head: EscrowAuditHead | undefined = ctx.headClass
-        ? await findHead(await getRepo<EscrowAuditHead>(objectFactory, ctx.headClass))
-        : undefined;
+/** The body of `EscrowAuditUtils.verifyChain()` - see its doc comment. */
+async function verifyChain(ctx: ChainContext): Promise<EscrowAuditVerificationResult> {
+    const repo: RepoUtils<EscrowAuditLogEntry> = ctx.entryRepo;
+    const head: EscrowAuditHead | undefined = ctx.getHeadRepo ? await findHead(await ctx.getHeadRepo()) : undefined;
 
     let expectedPreviousHash: string | undefined;
     let sawHmac = false;
@@ -383,7 +271,7 @@ export async function verifyEscrowAuditChain(
         }
     }
 
-    if (!ctx.headClass) {
+    if (!ctx.getHeadRepo) {
         return { valid: true };
     }
     if (!head) {
@@ -414,4 +302,121 @@ export async function verifyEscrowAuditChain(
         return { valid: false, brokenAtSequence: head.sequence, reason: "head_mismatch" };
     }
     return { valid: true };
+}
+
+/**
+ * Records and verifies the hash-chained escrow-access audit log, built once by the consuming route/job's
+ * `@Init` hook through the `ObjectFactory` with the (already built) repositories -
+ * `await objectFactory.newInstance(EscrowAuditUtils, { name: EscrowAuditLogEntryClass.name, args: [entryRepo, headRepo] })`.
+ * The HMAC key (`mail:escrow:audit_hmac_key`) and the logger are injected; the missing-key warning is logged once per
+ * instance. `headRepo` may be `null`/omitted to disable head maintenance and tail-truncation checking.
+ *
+ * The HMAC key defaults to `""` so a deployment that never sets `mail:escrow:audit_hmac_key` (escrow is optional) still builds the
+ * service and falls back, with a one-time warning, to unkeyed SHA-256.
+ */
+export class EscrowAuditUtils {
+    @Config(ESCROW_AUDIT_HMAC_KEY_CONFIG, "")
+    protected hmacKey: string | number = "";
+
+    /** The deployment environment, read from `NODE_ENV` (config first, then the process environment); `production`
+     * logs the missing-key warning at `error` level. */
+    @Config("NODE_ENV", process.env.NODE_ENV)
+    protected environment?: string;
+
+    @Logger
+    protected logger: any;
+
+    /** Whether the missing-key warning was already logged by this instance. */
+    protected warnedMissingKey: boolean = false;
+
+    constructor(
+        protected readonly entryRepo: RepoUtils<EscrowAuditLogEntry>,
+        protected readonly headRepo?: RepoUtils<EscrowAuditHead> | null,
+    ) {}
+
+    /** `hmacKey` as a string: nconf's `parseValues` turns an all-digit env value into a number, which is accepted rather than
+     * silently falling back to the unkeyed scheme. `""` when unset. */
+    protected get resolvedKey(): string {
+        return typeof this.hmacKey === "string" || typeof this.hmacKey === "number" ? String(this.hmacKey) : "";
+    }
+
+    /** Logs (once per instance) that `mail:escrow:audit_hmac_key` is unset - see `warnIfKeyMissing()`. Never throws. */
+    protected warnIfKeyMissing(): void {
+        if (this.resolvedKey || this.warnedMissingKey) {
+            return;
+        }
+        this.warnedMissingKey = true;
+        const message = missingKeyMessage();
+        if (this.environment === "production") {
+            this.logger?.error?.(message);
+        } else {
+            this.logger?.warn?.(message);
+        }
+    }
+
+    protected chainContext(): ChainContext {
+        const headRepo: RepoUtils<EscrowAuditHead> | undefined = this.headRepo ?? undefined;
+        return {
+            entryRepo: this.entryRepo,
+            getHeadRepo: headRepo ? async () => headRepo : undefined,
+            makeEntry: (data) => asEntity(this.entryRepo, data),
+            makeHead: (data) => asEntity(headRepo!, data),
+            hmacKey: this.resolvedKey,
+            logger: this.logger,
+        };
+    }
+
+    /**
+     * Persists one hash-chained escrow-access audit entry. Unlike `AuditLogUtils.record()`, this THROWS/propagates a
+     * persistence failure rather than swallowing it - a failed write here means an escrow access happened with
+     * no tamper-evident record of it, which undermines the entire feature's compliance value; the caller must
+     * let this fail the whole request rather than silently continue.
+     *
+     * Scheme: HMAC-SHA256 keyed by `mail:escrow:audit_hmac_key` when set, otherwise unkeyed SHA-256 (with a
+     * one-time warning - see `warnIfKeyMissing()`). The scheme used is recorded on the entry (`hashAlgorithm`).
+     *
+     * Concurrency: reads the current highest `sequence`, computes the next entry's hash, and attempts to
+     * insert it. `EscrowAuditLogEntrySQL`/`Mongo` carry a unique index on `sequence`, so two concurrent callers
+     * racing for the same next sequence number can't fork the chain - the loser's insert fails, and this
+     * retries (re-reading the now-updated latest entry) up to `MAX_APPEND_ATTEMPTS` times before giving
+     * up. That unique index (not the head record) is what serializes appends; the head is advanced right after
+     * (`advanceHead()`). Claiming the head first instead would make a failure between the two leave the head
+     * pointing at an entry that was never written - a permanent verification failure - whereas this order can
+     * only leave a self-healing lag. Not wrapped in `@Transactional()`: that decorator resolves the datasource to
+     * open a transaction against from a `@Model`-decorated ROUTE class's own `modelClass` getter (see
+     * `BaseKeyVaultRoute.ts`'s), which a plain, non-route utility service like this one has no equivalent of.
+     */
+    public async record(params: RecordEscrowAuditEntryParams): Promise<EscrowAuditLogEntry> {
+        this.warnIfKeyMissing();
+        return appendEntry(this.chainContext(), params);
+    }
+
+    /**
+     * Walks every `EscrowAuditLogEntry` in `sequence` order (paginated, `VERIFY_PAGE_SIZE` at a time - same
+     * pattern `MailboxQuotaRecalcJob.findAllPages()` already establishes), and for each one: checks
+     * `entry.previousHash` matches the running expected value, then recomputes `hash` from the entry's own
+     * stored fields with the entry's own `hashAlgorithm` (absent = legacy SHA-256) and compares. Returns the
+     * first (lowest) sequence at which any check fails.
+     *
+     * Then compares the chain against the separately stored head record (read BEFORE the walk, so a concurrent
+     * append can only add entries past it, never make the chain look truncated):
+     * - head `sequence` beyond the last entry present -> `truncated` (tail deletion).
+     * - the entry at head `sequence` has a different hash -> `head_mismatch`. Entries AFTER the head are
+     * tolerated (a head lagging after a failed `advanceHead()`); they still had to pass the per-entry checks.
+     * - head MAC present -> must verify with the configured key. With a key configured, a head MAC is required
+     * (`head_mac_mismatch` when missing).
+     * - no head row at all -> "no head yet" (valid) only while every entry is a pre-upgrade legacy entry (no
+     * `hashAlgorithm`), i.e. a deployment that hasn't appended since upgrading - its first append creates the
+     * head. Once any entry carries `hashAlgorithm`, a head must exist (`head_missing`).
+     *
+     * Residual limits (inherent to keeping all state in the same database an attacker is assumed to write to):
+     * with the key configured, an attacker without it can't forge entries or a head, but can still (a) restore a
+     * previously captured head row after deleting the entries appended since, or (b) rewrite every entry as a
+     * pre-upgrade legacy SHA-256 entry (no `hashAlgorithm`) and delete the head. Only an external anchor (e.g.
+     * periodically recording the head off-box) closes those.
+     */
+    public async verifyChain(): Promise<EscrowAuditVerificationResult> {
+        this.warnIfKeyMissing();
+        return verifyChain(this.chainContext());
+    }
 }

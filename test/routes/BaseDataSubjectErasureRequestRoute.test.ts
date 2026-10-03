@@ -37,6 +37,7 @@ describe("BaseDataSubjectErasureRequestRoute Tests (create() TOCTOU mitigation o
         });
         (route as any).mailboxRepo = { find: vi.fn().mockResolvedValue([{ uid: "mailbox-1" }]) };
         (route as any).config = config;
+        (route as any).auditLogUtils = { record: vi.fn().mockResolvedValue(undefined) };
         (route as any).logger = { warn: vi.fn(), error: vi.fn() };
         return route;
     }

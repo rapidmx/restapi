@@ -6,19 +6,20 @@
 // few query shapes used) so the races and failures a real datastore can't be made to produce on demand - a lost version
 // race, a duplicate-key create, a failing read - are covered. The same code against real MongoDB and SQL runs through
 // `test/routes/{mongo,sql}/DirectoryRoute.test.ts` and the ingest, send and calendar route and job tests.
-import { ModelUtils, RepoUtils } from "@rapidrest/service-core";
+import config from "../config.js";
+import { Logger } from "@rapidrest/core";
+import { ModelUtils, ObjectFactory } from "@rapidrest/service-core";
 import {
     CORRESPONDENT_BACKFILL_MAX_ADDRESSES,
     CORRESPONDENT_MAX_ADDRESS_LENGTH,
     CORRESPONDENT_MAX_NAME_LENGTH,
     CORRESPONDENT_MAX_PER_CALL,
     cleanCorrespondentAddress,
-    ensureCorrespondentsBackfilled,
     eventObservations,
     mergeCorrespondentObservations,
     messageObservations,
-    recordCorrespondents,
-    type CorrespondentBackfillContext,
+    CorrespondentBackfillUtils,
+    CorrespondentUtils,
 } from "../../src/util/CorrespondentUtils.js";
 import { FolderType } from "../../src/models/types.js";
 
@@ -50,7 +51,10 @@ class FakeRepo {
     public queries: any[] = [];
     public findOptions: any[] = [];
 
-    constructor(rows: any[] = []) {
+    constructor(
+        rows: any[] = [],
+        public modelClass?: any,
+    ) {
         this.rows = rows;
     }
 
@@ -97,35 +101,20 @@ class FakeRepo {
 
 function fixture() {
     const repos: Record<string, FakeRepo> = {
-        CorrespondentClass: new FakeRepo(),
-        MailboxClass: new FakeRepo(),
+        CorrespondentClass: new FakeRepo([], CorrespondentClass),
+        MailboxClass: new FakeRepo([], MailboxClass),
         MessageClass: new FakeRepo(),
         FolderClass: new FakeRepo(),
         EventClass: new FakeRepo(),
     };
-    const objectFactory: any = {
-        newInstance: vi.fn(async (clazz: any, options: any) => {
-            expect(clazz).toBe(RepoUtils);
-            const repo = repos[options.name];
-            if (!repo) {
-                throw new Error(`no repo ${options.name}`);
-            }
-            return repo;
-        }),
-    };
     const logger = { warn: vi.fn(), debug: vi.fn() };
-    const context: CorrespondentBackfillContext = {
-        objectFactory,
-        correspondentClass: CorrespondentClass,
-        mailboxClass: MailboxClass,
-        messageClass: MessageClass,
-        folderClass: FolderClass,
-        calendarEventClass: EventClass,
-        logger,
-    };
+    const utils: any = new CorrespondentUtils(repos.CorrespondentClass as any, repos.MailboxClass as any);
+    utils.logger = logger;
+    const backfillUtils: any = new CorrespondentBackfillUtils(utils, repos.FolderClass as any, repos.MessageClass as any, repos.EventClass as any);
+    backfillUtils.logger = logger;
     const mailbox = { uid: "mb1", primarySmtpAddress: "Me@Example.com", aliasAddresses: ["alias@example.com"] };
     repos.MailboxClass.rows.push({ ...mailbox, version: 0 });
-    return { repos, context, logger, mailbox, objectFactory };
+    return { repos, utils: utils as CorrespondentUtils, backfillUtils: backfillUtils as CorrespondentBackfillUtils, logger, mailbox };
 }
 
 const at = (iso: string): Date => new Date(iso);
@@ -259,11 +248,10 @@ describe("messageObservations() and eventObservations()", () => {
     });
 });
 
-describe("recordCorrespondents()", () => {
+describe("CorrespondentUtils.recordCorrespondents()", () => {
     it("creates a row per distinct address, lowercased, skipping the mailbox's own addresses", async () => {
-        const { repos, context, mailbox } = fixture();
-        await recordCorrespondents(
-            context,
+        const { repos, mailbox, utils } = fixture();
+        await utils.recordCorrespondents(
             mailbox,
             [{ address: "Bob@Example.com", displayName: "Bob" }, { address: "me@example.com" }, { address: "alias@example.com" }, { address: "bob@example.com" }, { address: "junk" }],
             "received",
@@ -274,49 +262,49 @@ describe("recordCorrespondents()", () => {
     });
 
     it("loads the mailbox when given its uid, and records nothing for one that is gone or for no observations", async () => {
-        const { repos, context, objectFactory } = fixture();
-        await recordCorrespondents(context, "mb1", [{ address: "bob@example.com" }, { address: "me@example.com" }], "sent");
+        const { repos, utils } = fixture();
+        const findOne = vi.spyOn(repos.MailboxClass, "findOne");
+        await utils.recordCorrespondents("mb1", [{ address: "bob@example.com" }, { address: "me@example.com" }], "sent");
         expect(repos.CorrespondentClass.rows.map((row) => row.address)).toEqual(["bob@example.com"]);
 
         repos.CorrespondentClass.rows.length = 0;
-        await recordCorrespondents(context, "gone", [{ address: "bob@example.com" }], "sent");
+        await utils.recordCorrespondents("gone", [{ address: "bob@example.com" }], "sent");
         expect(repos.CorrespondentClass.rows).toEqual([]);
 
-        objectFactory.newInstance.mockClear();
-        await recordCorrespondents(context, "mb1", [], "sent");
-        expect(objectFactory.newInstance).not.toHaveBeenCalled();
+        findOne.mockClear();
+        await utils.recordCorrespondents("mb1", [], "sent");
+        expect(findOne).not.toHaveBeenCalled();
     });
 
     it("adds one to the count of a known address and moves it forward, keeping its name when the new sighting has none", async () => {
-        const { repos, context, mailbox } = fixture();
-        await recordCorrespondents(context, mailbox, [{ address: "bob@example.com", displayName: "Bob", seenAt: at("2026-01-01T00:00:00Z") }], "received");
-        await recordCorrespondents(context, mailbox, [{ address: "bob@example.com", seenAt: at("2026-02-01T00:00:00Z") }], "sent");
+        const { repos, mailbox, utils } = fixture();
+        await utils.recordCorrespondents(mailbox, [{ address: "bob@example.com", displayName: "Bob", seenAt: at("2026-01-01T00:00:00Z") }], "received");
+        await utils.recordCorrespondents(mailbox, [{ address: "bob@example.com", seenAt: at("2026-02-01T00:00:00Z") }], "sent");
         expect(repos.CorrespondentClass.rows).toHaveLength(1);
         expect(repos.CorrespondentClass.rows[0]).toMatchObject({ displayName: "Bob", count: 2, lastSource: "sent", lastSeenAt: at("2026-02-01T00:00:00Z") });
 
-        await recordCorrespondents(context, mailbox, [{ address: "bob@example.com", displayName: "Robert", seenAt: at("2026-03-01T00:00:00Z") }], "event");
+        await utils.recordCorrespondents(mailbox, [{ address: "bob@example.com", displayName: "Robert", seenAt: at("2026-03-01T00:00:00Z") }], "event");
         expect(repos.CorrespondentClass.rows[0]).toMatchObject({ displayName: "Robert", count: 3, lastSource: "event" });
     });
 
     it("counts an older sighting without letting it change who the address is now", async () => {
-        const { repos, context, mailbox } = fixture();
-        await recordCorrespondents(context, mailbox, [{ address: "bob@example.com", displayName: "Robert", seenAt: at("2026-03-01T00:00:00Z") }], "sent");
-        await recordCorrespondents(context, mailbox, [{ address: "bob@example.com", displayName: "Bob", seenAt: at("2026-01-01T00:00:00Z"), count: 4 }], "received");
+        const { repos, mailbox, utils } = fixture();
+        await utils.recordCorrespondents(mailbox, [{ address: "bob@example.com", displayName: "Robert", seenAt: at("2026-03-01T00:00:00Z") }], "sent");
+        await utils.recordCorrespondents(mailbox, [{ address: "bob@example.com", displayName: "Bob", seenAt: at("2026-01-01T00:00:00Z"), count: 4 }], "received");
         expect(repos.CorrespondentClass.rows[0]).toMatchObject({ displayName: "Robert", count: 5, lastSource: "sent", lastSeenAt: at("2026-03-01T00:00:00Z") });
     });
 
     it("copes with a stored row that has no usable count, time or name", async () => {
-        const { repos, context, mailbox } = fixture();
+        const { repos, mailbox, utils } = fixture();
         repos.CorrespondentClass.rows.push({ uid: "old", version: 0, mailboxUid: "mb1", address: "bob@example.com", count: undefined, lastSeenAt: "garbage", displayName: undefined });
-        await recordCorrespondents(context, mailbox, [{ address: "bob@example.com" }], "received");
+        await utils.recordCorrespondents(mailbox, [{ address: "bob@example.com" }], "received");
         expect(repos.CorrespondentClass.rows[0]).toMatchObject({ count: 1, lastSource: "received", displayName: "" });
         expect(repos.CorrespondentClass.rows[0].lastSeenAt).toBeInstanceOf(Date);
     });
 
     it("reads the existing rows once, however many addresses", async () => {
-        const { repos, context, mailbox } = fixture();
-        await recordCorrespondents(
-            context,
+        const { repos, mailbox, utils } = fixture();
+        await utils.recordCorrespondents(
             mailbox,
             Array.from({ length: 25 }, (_, i) => ({ address: `p${i}@example.com` })),
             "received",
@@ -326,7 +314,7 @@ describe("recordCorrespondents()", () => {
     });
 
     it("retries a create that lost a race to another writer, against the row that won", async () => {
-        const { repos, context, mailbox } = fixture();
+        const { repos, mailbox, utils } = fixture();
         let raced = false;
         repos.CorrespondentClass.hooks.create = () => {
             if (!raced) {
@@ -335,14 +323,14 @@ describe("recordCorrespondents()", () => {
                 throw Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
             }
         };
-        await recordCorrespondents(context, mailbox, [{ address: "bob@example.com" }], "sent");
+        await utils.recordCorrespondents(mailbox, [{ address: "bob@example.com" }], "sent");
         expect(repos.CorrespondentClass.rows).toHaveLength(1);
         expect(repos.CorrespondentClass.rows[0]).toMatchObject({ uid: "winner", count: 2, lastSource: "sent" });
     });
 
     it("retries an update that lost a version race", async () => {
-        const { repos, context, mailbox } = fixture();
-        await recordCorrespondents(context, mailbox, [{ address: "bob@example.com" }], "received");
+        const { repos, mailbox, utils } = fixture();
+        await utils.recordCorrespondents(mailbox, [{ address: "bob@example.com" }], "received");
         let raced = false;
         repos.CorrespondentClass.hooks.update = () => {
             if (!raced) {
@@ -350,59 +338,64 @@ describe("recordCorrespondents()", () => {
                 repos.CorrespondentClass.rows[0].version += 1;
             }
         };
-        await recordCorrespondents(context, mailbox, [{ address: "bob@example.com" }], "received");
+        await utils.recordCorrespondents(mailbox, [{ address: "bob@example.com" }], "received");
         expect(repos.CorrespondentClass.rows[0].count).toBe(2);
     });
 
     it("gives up on an address after three lost races, logs it, and still records the others", async () => {
-        const { repos, context, mailbox, logger } = fixture();
+        const { repos, mailbox, logger, utils } = fixture();
         repos.CorrespondentClass.hooks.create = (obj: any) => {
             if (obj.address === "bad@example.com") {
                 throw Object.assign(new Error("duplicate key"), { code: 11000 });
             }
         };
-        await recordCorrespondents(context, mailbox, [{ address: "bad@example.com" }, { address: "good@example.com" }], "received");
+        await utils.recordCorrespondents(mailbox, [{ address: "bad@example.com" }, { address: "good@example.com" }], "received");
         expect(repos.CorrespondentClass.rows.map((row) => row.address)).toEqual(["good@example.com"]);
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("could not record bad@example.com for mailbox mb1"));
     });
 
     it("does not retry an error that is not a lost race", async () => {
-        const { repos, context, mailbox, logger } = fixture();
+        const { repos, mailbox, logger, utils } = fixture();
         const create = vi.fn(() => {
             throw new Error("disk on fire");
         });
         repos.CorrespondentClass.hooks.create = create;
-        await recordCorrespondents(context, mailbox, [{ address: "bad@example.com" }], "received");
+        await utils.recordCorrespondents(mailbox, [{ address: "bad@example.com" }], "received");
         expect(create).toHaveBeenCalledTimes(1);
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("disk on fire"));
     });
 
-    it("never throws: a failing read, an unknown repo and a missing logger are all swallowed", async () => {
-        const { repos, context, mailbox, logger } = fixture();
+    it("never throws: a failing read, a failing mailbox lookup and a missing logger are all swallowed", async () => {
+        const { repos, mailbox, logger, utils } = fixture();
         repos.CorrespondentClass.hooks.find = () => {
             throw new Error("read failed");
         };
-        await expect(recordCorrespondents(context, mailbox, [{ address: "bob@example.com" }], "received")).resolves.toBeUndefined();
+        await expect(utils.recordCorrespondents(mailbox, [{ address: "bob@example.com" }], "received")).resolves.toBeUndefined();
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("read failed"));
 
-        class Unregistered {}
-        await expect(recordCorrespondents({ ...context, correspondentClass: Unregistered }, mailbox, [{ address: "bob@example.com" }], "received")).resolves.toBeUndefined();
-        await expect(recordCorrespondents({ ...context, logger: undefined, correspondentClass: Unregistered }, mailbox, [{ address: "bob@example.com" }], "received")).resolves.toBeUndefined();
+        repos.MailboxClass.hooks.findOne = () => {
+            throw new Error("mailbox unreadable");
+        };
+        await expect(utils.recordCorrespondents("mb1", [{ address: "bob@example.com" }], "received")).resolves.toBeUndefined();
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("mailbox unreadable"));
+        (utils as any).logger = undefined;
+        await expect(utils.recordCorrespondents("mb1", [{ address: "bob@example.com" }], "received")).resolves.toBeUndefined();
+        repos.MailboxClass.hooks.findOne = undefined;
 
         repos.CorrespondentClass.hooks.find = () => {
             throw new Error("still failing");
         };
-        await expect(recordCorrespondents({ ...context, logger: undefined }, mailbox, [{ address: "bob@example.com" }], "received")).resolves.toBeUndefined();
+        await expect(utils.recordCorrespondents(mailbox, [{ address: "bob@example.com" }], "received")).resolves.toBeUndefined();
         // A per-address failure with no logger is swallowed too.
         repos.CorrespondentClass.hooks.find = undefined;
         repos.CorrespondentClass.hooks.create = () => {
             throw new Error("nope");
         };
-        await expect(recordCorrespondents({ ...context, logger: undefined }, mailbox, [{ address: "bob@example.com" }], "received")).resolves.toBeUndefined();
+        await expect(utils.recordCorrespondents(mailbox, [{ address: "bob@example.com" }], "received")).resolves.toBeUndefined();
     });
 });
 
-describe("ensureCorrespondentsBackfilled()", () => {
+describe("CorrespondentBackfillUtils.ensureCorrespondentsBackfilled()", () => {
     const folders = (repos: Record<string, FakeRepo>): void => {
         repos.FolderClass.rows.push(
             { uid: "inbox", mailboxUid: "mb1", type: FolderType.INBOX },
@@ -425,7 +418,7 @@ describe("ensureCorrespondentsBackfilled()", () => {
     });
 
     it("builds the list from received and sent mail and calendar events, leaving out junk, drafts, deleted items and the outbox", async () => {
-        const { repos, context, mailbox } = fixture();
+        const { repos, mailbox, backfillUtils } = fixture();
         folders(repos);
         repos.MessageClass.rows.push(
             message("m1", "inbox", "Carol@Example.com", [["me@example.com", "to"], ["dave@example.com", "cc", "Dave D"], ["hidden@example.com", "bcc"]], "2026-01-01T00:00:00Z"),
@@ -446,7 +439,7 @@ describe("ensureCorrespondentsBackfilled()", () => {
             { uid: "e3", mailboxUid: "mb1", organizer: { address: "late@example.com" }, attendees: [] },
         );
 
-        await ensureCorrespondentsBackfilled(context, mailbox);
+        await backfillUtils.ensureCorrespondentsBackfilled(mailbox);
 
         const byAddress = new Map(repos.CorrespondentClass.rows.map((row) => [row.address, row]));
         expect([...byAddress.keys()].sort()).toEqual(
@@ -480,73 +473,75 @@ describe("ensureCorrespondentsBackfilled()", () => {
         // Marked done, so a second call does nothing.
         expect(repos.MailboxClass.rows[0].correspondentsBackfilledAt).toBeInstanceOf(Date);
         const before = repos.CorrespondentClass.rows.map((row) => ({ ...row }));
-        await ensureCorrespondentsBackfilled(context, { ...mailbox, correspondentsBackfilledAt: new Date() });
-        await ensureCorrespondentsBackfilled(context, mailbox);
+        await backfillUtils.ensureCorrespondentsBackfilled({ ...mailbox, correspondentsBackfilledAt: new Date() });
+        await backfillUtils.ensureCorrespondentsBackfilled(mailbox);
         expect(repos.CorrespondentClass.rows).toEqual(before);
     });
 
     it("adds to correspondents recorded live before it ran", async () => {
-        const { repos, context, mailbox } = fixture();
+        const { repos, mailbox, utils, backfillUtils } = fixture();
         folders(repos);
         repos.MessageClass.rows.push(message("m1", "inbox", "carol@example.com", [], "2026-01-01T00:00:00Z"));
-        await recordCorrespondents(context, mailbox, [{ address: "carol@example.com", displayName: "Live Carol" }], "received");
-        await ensureCorrespondentsBackfilled(context, mailbox);
+        await utils.recordCorrespondents(mailbox, [{ address: "carol@example.com", displayName: "Live Carol" }], "received");
+        await backfillUtils.ensureCorrespondentsBackfilled(mailbox);
         expect(repos.CorrespondentClass.rows).toHaveLength(1);
         // The live sighting is newer than the message the backfill found, so it keeps the name and time.
         expect(repos.CorrespondentClass.rows[0]).toMatchObject({ count: 2, displayName: "Live Carol" });
     });
 
     it("keeps only the most recently seen addresses when there are more than the cap", async () => {
-        const { repos, context, mailbox } = fixture();
+        const { repos, mailbox, backfillUtils } = fixture();
         folders(repos);
         const total = CORRESPONDENT_BACKFILL_MAX_ADDRESSES + 3;
         for (let i = 0; i < total; i++) {
             repos.MessageClass.rows.push(message(`bulk${i}`, "inbox", `p${i}@example.com`, [], new Date(Date.UTC(2026, 0, 1) + i * 60_000).toISOString()));
         }
-        await ensureCorrespondentsBackfilled(context, mailbox);
+        await backfillUtils.ensureCorrespondentsBackfilled(mailbox);
         expect(repos.CorrespondentClass.rows).toHaveLength(CORRESPONDENT_BACKFILL_MAX_ADDRESSES);
         expect(repos.CorrespondentClass.rows.some((row) => row.address === `p${total - 1}@example.com`)).toBe(true);
         expect(repos.CorrespondentClass.rows.some((row) => row.address === "p0@example.com")).toBe(false);
     });
 
     it("does nothing for a mailbox that is gone or was marked done since the caller read it", async () => {
-        const { repos, context, mailbox } = fixture();
-        await ensureCorrespondentsBackfilled(context, { ...mailbox, uid: "gone" });
+        const { repos, mailbox, backfillUtils } = fixture();
+        await backfillUtils.ensureCorrespondentsBackfilled({ ...mailbox, uid: "gone" });
         repos.MailboxClass.rows[0].correspondentsBackfilledAt = new Date();
         const version = repos.MailboxClass.rows[0].version;
-        await ensureCorrespondentsBackfilled(context, mailbox);
+        await backfillUtils.ensureCorrespondentsBackfilled(mailbox);
         expect(repos.MailboxClass.rows[0].version).toBe(version);
         expect(repos.MessageClass.queries).toEqual([]);
     });
 
     it("leaves the work to whoever claimed it first when the claim loses a version race", async () => {
-        const { repos, context, mailbox, logger } = fixture();
+        const { repos, mailbox, logger, backfillUtils } = fixture();
         repos.MailboxClass.hooks.update = () => {
             repos.MailboxClass.rows[0].version += 1;
         };
-        await ensureCorrespondentsBackfilled(context, mailbox);
+        await backfillUtils.ensureCorrespondentsBackfilled(mailbox);
         expect(repos.MessageClass.queries).toEqual([]);
         expect(logger.debug).toHaveBeenCalledWith(expect.stringContaining("claimed elsewhere"));
-        // No logger at all is fine too.
-        await ensureCorrespondentsBackfilled({ ...context, logger: undefined }, mailbox);
-        await ensureCorrespondentsBackfilled({ ...context, logger: { warn: vi.fn() } }, mailbox);
+        // No logger at all is fine too, and so is one without `debug`.
+        (backfillUtils as any).logger = undefined;
+        await backfillUtils.ensureCorrespondentsBackfilled(mailbox);
+        (backfillUtils as any).logger = { warn: vi.fn() };
+        await backfillUtils.ensureCorrespondentsBackfilled(mailbox);
     });
 
     it("clears the marker again when the backfill fails, so the next search retries", async () => {
-        const { repos, context, mailbox, logger } = fixture();
+        const { repos, mailbox, logger, backfillUtils } = fixture();
         repos.MessageClass.hooks.find = () => {
             throw new Error("messages unreadable");
         };
-        await ensureCorrespondentsBackfilled(context, mailbox);
+        await backfillUtils.ensureCorrespondentsBackfilled(mailbox);
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("messages unreadable"));
         expect(repos.MailboxClass.rows[0].correspondentsBackfilledAt).toBeNull();
         repos.MessageClass.hooks.find = undefined;
-        await ensureCorrespondentsBackfilled(context, { ...mailbox, correspondentsBackfilledAt: undefined });
+        await backfillUtils.ensureCorrespondentsBackfilled({ ...mailbox, correspondentsBackfilledAt: undefined });
         expect(repos.MailboxClass.rows[0].correspondentsBackfilledAt).toBeInstanceOf(Date);
     });
 
     it("survives a failure while clearing the marker", async () => {
-        const { repos, context, mailbox } = fixture();
+        const { repos, mailbox, backfillUtils } = fixture();
         repos.MessageClass.hooks.find = () => {
             throw new Error("messages unreadable");
         };
@@ -556,31 +551,72 @@ describe("ensureCorrespondentsBackfilled()", () => {
                 throw new Error("mailbox unreadable");
             }
         };
-        await expect(ensureCorrespondentsBackfilled(context, mailbox)).resolves.toBeUndefined();
+        await expect(backfillUtils.ensureCorrespondentsBackfilled(mailbox)).resolves.toBeUndefined();
         expect(repos.MailboxClass.rows[0].correspondentsBackfilledAt).toBeInstanceOf(Date);
     });
 
     it("survives the mailbox vanishing while the marker is cleared", async () => {
-        const { repos, context, mailbox } = fixture();
+        const { repos, mailbox, backfillUtils } = fixture();
         repos.MessageClass.hooks.find = () => {
             repos.MailboxClass.rows.length = 0;
             throw new Error("messages unreadable");
         };
-        await expect(ensureCorrespondentsBackfilled(context, mailbox)).resolves.toBeUndefined();
+        await expect(backfillUtils.ensureCorrespondentsBackfilled(mailbox)).resolves.toBeUndefined();
     });
 
     it("never throws when the mailbox cannot be read at all", async () => {
-        const { repos, context, mailbox, logger } = fixture();
+        const { repos, mailbox, logger, backfillUtils } = fixture();
         repos.MailboxClass.hooks.findOne = () => {
             throw new Error("mailbox unreadable");
         };
-        await expect(ensureCorrespondentsBackfilled(context, mailbox)).resolves.toBeUndefined();
+        await expect(backfillUtils.ensureCorrespondentsBackfilled(mailbox)).resolves.toBeUndefined();
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("mailbox unreadable"));
-        await expect(ensureCorrespondentsBackfilled({ ...context, logger: undefined }, mailbox)).resolves.toBeUndefined();
+        (backfillUtils as any).logger = undefined;
+        await expect(backfillUtils.ensureCorrespondentsBackfilled(mailbox)).resolves.toBeUndefined();
     });
 
     it("reads the query values the way the datastores do", () => {
         expect(wanted(ModelUtils.literal("a"))).toEqual(["a"]);
         expect(wanted(ModelUtils.literal(["a", "b"], "in"))).toEqual(["a", "b"]);
+    });
+});
+
+describe("With a real ObjectFactory", () => {
+    let objectFactory: ObjectFactory;
+
+    beforeEach(() => {
+        objectFactory = new ObjectFactory(config, Logger());
+    });
+
+    afterEach(async () => {
+        await objectFactory.destroy();
+    });
+
+    it("injects a logger into both services, and builds each with the repositories its consumers pass", async () => {
+        const { repos, mailbox } = fixture();
+        const utils: any = await objectFactory.newInstance(CorrespondentUtils, {
+            name: "CorrespondentMongo",
+            args: [repos.CorrespondentClass, repos.MailboxClass],
+        });
+        const again: any = await objectFactory.newInstance(CorrespondentUtils, {
+            name: "CorrespondentMongo",
+            args: [repos.CorrespondentClass, repos.MailboxClass],
+        });
+        // The backfill is built under the same name (it is a different class, so a different instance) on top of the shared recorder.
+        const backfillUtils: any = await objectFactory.newInstance(CorrespondentBackfillUtils, {
+            name: "CorrespondentMongo",
+            args: [utils, repos.FolderClass, repos.MessageClass, repos.EventClass],
+        });
+
+        expect(again).toBe(utils);
+        expect(backfillUtils).toBeInstanceOf(CorrespondentBackfillUtils);
+        expect(backfillUtils).not.toBe(utils);
+        expect(utils.logger).toBeDefined();
+        expect(backfillUtils.logger).toBeDefined();
+
+        await utils.recordCorrespondents(mailbox, [{ address: "bob@example.com" }], "received");
+        await backfillUtils.ensureCorrespondentsBackfilled(mailbox);
+        expect(repos.CorrespondentClass.rows.map((row) => row.address)).toEqual(["bob@example.com"]);
+        expect(repos.MailboxClass.rows[0].correspondentsBackfilledAt).toBeInstanceOf(Date);
     });
 });

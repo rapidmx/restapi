@@ -17,7 +17,6 @@ import {
 import type { BlobStore } from "../blob/BlobStore.js";
 import { sniffImageType } from "../util/AppearanceUtils.js";
 import { deleteBlobsIfUnreferenced } from "../util/BlobReferenceUtils.js";
-import { getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { Contact } from "../models/types.js";
 const { Inject } = ObjectDecorators;
@@ -131,16 +130,6 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
     @Inject("BlobStore")
     private blobStore?: BlobStore;
 
-    /** The concrete `Folder` entity class, supplied by the Mongo/SQL concrete subclass - used only by
-     * `resolveMailboxUidFor()` below. */
-    protected abstract folderClass: any;
-
-    /** See `BaseScopedChildRoute.resolveMailboxUidFor()`'s own doc comment - `Contact` carries its own
-     * denormalized `mailboxUid` that must never diverge from its actual folder's mailbox. */
-    protected async resolveMailboxUidFor(scopeUid: string, rejectDeleted?: boolean): Promise<string | undefined> {
-        return getMailboxUidForFolder(this._objectFactory!, this.folderClass, scopeUid, rejectDeleted);
-    }
-
     @Post()
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         for (const single of Array.isArray(obj) ? obj : [obj]) {
@@ -175,12 +164,7 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
             return;
         }
         try {
-            await deleteBlobsIfUnreferenced(
-                this._objectFactory!,
-                this.blobStore!,
-                [{ entityClass: this.modelClass, fields: ["photoBlobKey"] }],
-                photoKeys,
-            );
+            await deleteBlobsIfUnreferenced(this.blobStore!, [{ repo: this.repoUtils!, fields: ["photoBlobKey"] }], photoKeys);
             /* v8 ignore start -- only a blob store or database failure */
         } catch (err: any) {
             this.logger?.warn(`BaseContactRoute: failed to delete contact photo blob(s) ${photoKeys.join(", ")}: ${err?.message}`);

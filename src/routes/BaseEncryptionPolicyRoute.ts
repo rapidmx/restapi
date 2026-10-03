@@ -4,9 +4,9 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { AuditAction, EncryptionPolicy, PolicyState } from "../models/types.js";
-const { Config, Init, Logger } = ObjectDecorators;
+const { Init } = ObjectDecorators;
 const { Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorators;
 
 /** The fixed, well-known identifier of the one `EncryptionPolicy` row this route ever reads/writes - same
@@ -56,13 +56,11 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
 
     private encryptionPolicyRepo?: RepoUtils<T>;
 
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`) -
-     * same reasoning as `BaseBrandingRoute.ts`'s identical field. */
-    @Config()
-    private config: any;
+    /** The `AuditLogEntry` repository, built once by `initialize()`. */
+    protected auditLogRepo?: RepoUtils<any>;
 
-    @Logger
-    private logger: any;
+    /** Records the audit entries, built once by `initialize()` from `auditLogRepo`. */
+    protected auditLogUtils?: AuditLogUtils;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -71,6 +69,12 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
         }
         if (!this.encryptionPolicyRepo && this.encryptionPolicyClass) {
             this.encryptionPolicyRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.encryptionPolicyClass.name, args: [this.encryptionPolicyClass] });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
+        }
+        if (!this.auditLogUtils && this.auditLogRepo) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
         }
     }
 
@@ -156,11 +160,9 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
             existing,
             { user, ignoreACL: true },
         );
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, user, logger: this.logger },
+        await this.auditLogUtils!.record(
             { action: AuditAction.ENCRYPTION_POLICY_UPDATE, targetType: "EncryptionPolicy", targetUid: ENCRYPTION_POLICY_UID, details: patch },
+            { user },
         );
         return this.toPublic(updated);
     }

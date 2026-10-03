@@ -442,9 +442,8 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
         const matter = await createMatter({ escrowScopeId, custodianMailboxUids: [mailboxA.uid, mailboxB.uid] });
         const request = await createRequest({ matterId: matter.uid });
 
-        // `recordEscrowAuditEntry()`'s own internal `EscrowAuditLogEntryMongo` `RepoUtils` instance is
-        // constructed and cached (`EscrowAuditUtils.ts`'s own module-level `WeakMap`) independently of
-        // this test file's own `escrowAuditLogRepo` - patched at the shared `RepoUtils.prototype.create`
+        // `EscrowAuditUtils.record()`'s `EscrowAuditLogEntryMongo` `RepoUtils` instance is built by the job's own `@Init` hook,
+        // independently of this test file's own `escrowAuditLogRepo` - patched at the shared `RepoUtils.prototype.create`
         // level instead, filtered to that one target class, so mailboxA's first 5 attempts
         // (MAX_APPEND_ATTEMPTS, see EscrowAuditUtils.ts) genuinely exhaust its retry loop and throw,
         // simulating real concurrent `sequence` contention without needing to actually win that race;

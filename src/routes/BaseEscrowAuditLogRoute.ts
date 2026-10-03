@@ -13,9 +13,9 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import { verifyEscrowAuditChain, type EscrowAuditVerificationResult } from "../util/EscrowAuditUtils.js";
+import { EscrowAuditUtils, type EscrowAuditVerificationResult } from "../util/EscrowAuditUtils.js";
 import { exactInFilter, findHeldScopeIds, isQuerySafeUid } from "../util/EscrowUtils.js";
-import { EscrowAuditLogEntry, Matter } from "../models/types.js";
+import { EscrowAuditLogEntry, EscrowScope, Matter } from "../models/types.js";
 const { Init } = ObjectDecorators;
 const { Before, Delete, Get, Param, Post, Put, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 
@@ -33,7 +33,7 @@ const MATTER_PAGE_SIZE = 500;
  * `create`/`update`/`updateBulk`/`updateProperty`/`delete`/`truncate` are overridden to unconditionally reject *every* caller, trusted
  * included - identical reasoning to `BaseAuditLogRoute`'s own `rejectWrite()`: an audit trail editable by
  * the people it holds accountable isn't trustworthy. The only writer is `util/EscrowAuditUtils.ts`'s
- * `recordEscrowAuditEntry()`, called directly by `BaseEscrowAccessRequestRoute` with `{ ignoreACL: true }`,
+ * `EscrowAuditUtils.record()`, called directly by `BaseEscrowAccessRequestRoute` with `{ ignoreACL: true }`,
  * bypassing this route entirely.
  *
  * @author Jean-Philippe Steinmetz
@@ -53,6 +53,10 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
     protected trustedRoles: string[] = ["admin"];
 
     protected matterRepo?: RepoUtils<Matter>;
+    protected escrowScopeRepo?: RepoUtils<EscrowScope>;
+    protected escrowAuditEntryRepo?: RepoUtils<T>;
+    protected escrowAuditHeadRepo?: RepoUtils<any>;
+    protected escrowAuditUtils?: EscrowAuditUtils;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -65,6 +69,31 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
                 args: [this.matterClass],
             });
         }
+        if (!this.escrowScopeRepo && this.escrowScopeClass) {
+            this.escrowScopeRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.escrowScopeClass.name,
+                args: [this.escrowScopeClass],
+            });
+        }
+        if (!this.escrowAuditEntryRepo && this.modelClass) {
+            this.escrowAuditEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.modelClass.name,
+                args: [this.modelClass],
+            });
+        }
+        const escrowAuditHeadClass: any = this.modelClass?.escrowAuditHeadClass;
+        if (!this.escrowAuditHeadRepo && escrowAuditHeadClass) {
+            this.escrowAuditHeadRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: escrowAuditHeadClass.name,
+                args: [escrowAuditHeadClass],
+            });
+        }
+        if (!this.escrowAuditUtils && this.modelClass) {
+            this.escrowAuditUtils = await this._objectFactory.newInstance(EscrowAuditUtils, {
+                name: this.modelClass.name,
+                args: [this.escrowAuditEntryRepo, this.escrowAuditHeadRepo],
+            });
+        }
     }
 
     /** Resolves the `matterId`s a non-trusted caller may see entries for - every `Matter` under a scope
@@ -75,7 +104,7 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
             return undefined;
         }
         // `exactInFilter()`/`isQuerySafeUid()`: a uid holding `,` would widen the `in(...)` filters below.
-        const heldScopes: string | undefined = exactInFilter(await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user));
+        const heldScopes: string | undefined = exactInFilter(await findHeldScopeIds(this.escrowScopeRepo!, user));
         if (!heldScopes) {
             return [];
         }
@@ -179,7 +208,7 @@ export abstract class BaseEscrowAuditLogRoute<T extends EscrowAuditLogEntry> ext
     @RequiresTrustedRole()
     @Get("/verify")
     public async verify(): Promise<EscrowAuditVerificationResult> {
-        return await verifyEscrowAuditChain(this._objectFactory!, this.modelClass);
+        return await this.escrowAuditUtils!.verifyChain();
     }
 
     /** Runs as `@Before` middleware on every write handler below, strictly before the handler body - see

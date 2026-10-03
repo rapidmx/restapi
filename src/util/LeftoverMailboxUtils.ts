@@ -2,11 +2,11 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, type JWTUser, type ObjectFactory } from "@rapidrest/core";
+import { ApiError, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, type ACLUtils, type HttpRequest, ModelUtils, MongoRepository, type RepoUtils } from "@rapidrest/service-core";
 import { ERASURE_IN_PROGRESS } from "../jobs/ErasureExecutionJob.js";
 import { AuditAction } from "../models/types.js";
-import { recordAuditLog } from "./AuditLogUtils.js";
+import type { AuditLogUtils } from "./AuditLogUtils.js";
 import { assertNotOnLegalHold } from "./LegalHoldUtils.js";
 
 /**
@@ -69,16 +69,16 @@ export interface LeftoverMailboxPage {
 
 /** The repositories and services the leftover helpers work through. */
 export interface LeftoverContext {
-    objectFactory: ObjectFactory;
     mailboxRepo: RepoUtils<any>;
     folderRepo: RepoUtils<any>;
     requestRepo: RepoUtils<any>;
     /** The concrete `DataSubjectErasureRequest` class. */
     requestClass: any;
-    matterClass: any;
-    auditLogClass: any;
+    /** The `Matter` repository the legal-hold check reads. */
+    matterRepo: RepoUtils<any>;
+    /** The built audit service. */
+    auditLogUtils: AuditLogUtils;
     aclUtils?: ACLUtils;
-    config: any;
     logger?: any;
 }
 
@@ -236,13 +236,10 @@ export async function fileLeftoverErasure(
     if (evidence.folderCount === 0 && !evidence.hasAcl) {
         throw new ApiError(ApiErrors.NOT_FOUND, 404, "There is no data left over from a deleted mailbox at this address.");
     }
-    await assertNotOnLegalHold(ctx.objectFactory, ctx.matterClass, mailboxUid);
+    await assertNotOnLegalHold(ctx.matterRepo, mailboxUid);
 
     const audit = async (action: AuditAction, request: any): Promise<void> => {
-        await recordAuditLog(
-            ctx.objectFactory,
-            ctx.auditLogClass,
-            { config: ctx.config, req: caller.req, user: caller.user, logger: ctx.logger },
+        await ctx.auditLogUtils.record(
             {
                 action,
                 targetType: "DataSubjectErasureRequest",
@@ -250,6 +247,7 @@ export async function fileLeftoverErasure(
                 mailboxUid,
                 details: { leftover: true, folderCount: evidence.folderCount },
             },
+            { req: caller.req, user: caller.user },
         );
     };
 

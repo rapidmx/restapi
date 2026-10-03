@@ -5,7 +5,7 @@
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { asEntity } from "../util/EntityUtils.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { publicKeyFromCertificatePem, supersedeKeys } from "../util/CertificateInstallUtils.js";
 import { AuditAction, KeyVault, Mailbox, PublicKey, WrappedPrivateKey } from "../models/types.js";
 import type { HealthUpdate, SigningEnrollmentHealth } from "../pki/SigningEnrollmentHealth.js";
@@ -71,6 +71,8 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
 
     protected mailboxRepo?: RepoUtils<MB>;
     protected keyVaultRepo?: RepoUtils<K>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
 
     @Inject("SigningCertificateEnrollment")
     private signingCertificateEnrollment?: AcmeDrivenEnrollment;
@@ -96,11 +98,6 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
     @Config("mail:jobs:acme_enrollment_driver:failure_audit_after", 3)
     private failureAuditAfter: number = 3;
 
-    // No key = the whole config object, the same decorator `ModelRoute.config`/`DomainVerificationJob.config`
-    // itself use - needed by `recordAuditLog()`, which constructs a real `Event(config, ...)`.
-    @Config()
-    private config: any;
-
     @Logger
     private logger: any;
 
@@ -123,6 +120,18 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
             this.keyVaultRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.keyVaultClass.name,
                 args: [this.keyVaultClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
             });
         }
     }
@@ -215,17 +224,12 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
                 this.logger?.info("AcmeEnrollmentDriverJob: the certificate authority answers again.");
             }
             if (update.auditDue) {
-                await recordAuditLog(
-                    this._objectFactory!,
-                    this.auditLogClass,
-                    { config: this.config, logger: this.logger },
-                    {
-                        action: AuditAction.SIGNING_ENROLLMENT_CA_UNREACHABLE,
-                        targetType: "SigningEnrollment",
-                        targetUid: "ca",
-                        details: { consecutiveFailures: update.consecutiveFailures, firstFailureAt: update.firstFailureAt, error: update.error },
-                    },
-                );
+                await this.auditLogUtils!.record({
+                    action: AuditAction.SIGNING_ENROLLMENT_CA_UNREACHABLE,
+                    targetType: "SigningEnrollment",
+                    targetUid: "ca",
+                    details: { consecutiveFailures: update.consecutiveFailures, firstFailureAt: update.firstFailureAt, error: update.error },
+                });
             }
         } catch (err: any) {
             this.logger?.warn(`AcmeEnrollmentDriverJob: could not record the certificate authority's health: ${err?.message}`);
@@ -350,18 +354,13 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
             );
         }
 
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, logger: this.logger },
-            {
-                action: AuditAction.KEY_VAULT_ENROLL,
-                targetType: "KeyVault",
-                targetUid: keyVaultUid,
-                mailboxUid: found.uid,
-                details: { useType: "sign", fingerprint, automated: true },
-            },
-        );
+        await this.auditLogUtils!.record({
+            action: AuditAction.KEY_VAULT_ENROLL,
+            targetType: "KeyVault",
+            targetUid: keyVaultUid,
+            mailboxUid: found.uid,
+            details: { useType: "sign", fingerprint, automated: true },
+        });
         return { status: "installed" };
     }
 
@@ -399,25 +398,20 @@ export abstract class AcmeEnrollmentDriverJob<MB extends Mailbox, K extends KeyV
                 if (keyVault.expiryAuditedFingerprint === newest.fingerprint) {
                     return;
                 }
-                // Marker first: a failed audit write is only logged (`recordAuditLog()` never throws), which is
+                // Marker first: a failed audit write is only logged (`AuditLogUtils.record()` never throws), which is
                 // preferable to the reverse order, where a failing marker write would re-audit on every run.
                 await this.keyVaultRepo!.update(
                     { uid: keyVault.uid, version: (keyVault as any).version, expiryAuditedFingerprint: newest.fingerprint } as any,
                     asEntity(this.keyVaultRepo!, keyVault),
                     { ignoreACL: true },
                 );
-                await recordAuditLog(
-                    this._objectFactory!,
-                    this.auditLogClass,
-                    { config: this.config, logger: this.logger },
-                    {
-                        action: AuditAction.SIGNING_CERT_EXPIRING,
-                        targetType: "Mailbox",
-                        targetUid: mailbox.uid,
-                        mailboxUid: mailbox.uid,
-                        details: { fingerprint: newest.fingerprint, notAfter: newest.notAfter },
-                    },
-                );
+                await this.auditLogUtils!.record({
+                    action: AuditAction.SIGNING_CERT_EXPIRING,
+                    targetType: "Mailbox",
+                    targetUid: mailbox.uid,
+                    mailboxUid: mailbox.uid,
+                    details: { fingerprint: newest.fingerprint, notAfter: newest.notAfter },
+                });
             } catch (err: any) {
                 this.logger?.error(`AcmeEnrollmentDriverJob: failed to flag expiring signing certificate for mailbox '${mailbox.uid}': ${err.message}`);
             }

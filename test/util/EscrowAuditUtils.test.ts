@@ -2,17 +2,13 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-// Isolated unit tests for recordEscrowAuditEntry()/verifyEscrowAuditChain() - objectFactory/repo are
-// hand-built mocks so this can assert exactly what gets persisted, retried, and verified, without a real
-// DB.
-//
-// Both functions cache one repo per `escrowAuditLogClass` *object identity* in a module-level WeakMap (see
-// EscrowAuditUtils.ts's own doc comment on getEscrowAuditRepo()) - shared across every call in this
-// process, not reset between tests. Each test below therefore declares its own fresh, locally-scoped stub
-// class rather than a single shared one, so no test's cache entry can leak into (and mask a missing
-// `newInstance()` call in) another.
+// Isolated unit tests for `EscrowAuditUtils` - the repositories are hand-built fakes so this can assert exactly what gets
+// persisted, retried, and verified, without a real DB. Real MongoDB/SQL runs through the escrow route tests.
 import * as crypto from "crypto";
-import { recordEscrowAuditEntry, verifyEscrowAuditChain } from "../../src/util/EscrowAuditUtils.js";
+import config from "../config.js";
+import { Logger } from "@rapidrest/core";
+import { ObjectFactory } from "@rapidrest/service-core";
+import { EscrowAuditUtils } from "../../src/util/EscrowAuditUtils.js";
 import { EscrowAuditAction, EscrowAuditHashAlgorithm } from "../../src/models/types.js";
 
 function makeStubClass(): any {
@@ -22,10 +18,6 @@ function makeStubClass(): any {
             Object.assign(this, props);
         }
     };
-}
-
-function makeObjectFactory(repo: any): any {
-    return { newInstance: vi.fn().mockResolvedValue(repo) };
 }
 
 function makeParams(overrides: any = {}) {
@@ -39,12 +31,34 @@ function makeParams(overrides: any = {}) {
     };
 }
 
-describe("recordEscrowAuditEntry() Tests", () => {
+/** An `EscrowAuditUtils` over just an entry repository (no head), with no key and a throwaway logger. */
+function makeUtils(repo: any): EscrowAuditUtils {
+    const utils: any = new EscrowAuditUtils(repo);
+    utils.logger = { warn: vi.fn(), error: vi.fn() };
+    return utils;
+}
+
+/** An in-memory entry repository that also answers the verifier's paged read. */
+function makeEntryRepo(stored: any[] = []) {
+    return {
+        find: vi.fn().mockImplementation(async (query: any) => {
+            if (query.page !== undefined) {
+                return query.page === 0 ? stored : [];
+            }
+            return stored.length ? [stored[stored.length - 1]] : [];
+        }),
+        create: vi.fn().mockImplementation(async (entry) => {
+            stored.push(entry);
+            return entry;
+        }),
+    };
+}
+
+describe("EscrowAuditUtils.record() Tests", () => {
     it("Persists the first entry with sequence 0 and no previousHash.", async () => {
         const repo = { find: vi.fn().mockResolvedValue([]), create: vi.fn().mockImplementation(async (entry) => entry) };
-        const objectFactory = makeObjectFactory(repo);
 
-        const entry = await recordEscrowAuditEntry(objectFactory, makeStubClass(), makeParams());
+        const entry = await makeUtils(repo).record(makeParams());
 
         expect(entry.sequence).toBe(0);
         expect(entry.previousHash).toBeUndefined();
@@ -53,8 +67,6 @@ describe("recordEscrowAuditEntry() Tests", () => {
     });
 
     it("Chains the second entry's previousHash to the first entry's hash, and increments sequence.", async () => {
-        const stubClass = makeStubClass();
-        const objectFactory = makeObjectFactory(null);
         let stored: any;
         const repo = {
             find: vi.fn().mockImplementation(async () => (stored ? [stored] : [])),
@@ -63,10 +75,10 @@ describe("recordEscrowAuditEntry() Tests", () => {
                 return entry;
             }),
         };
-        objectFactory.newInstance.mockResolvedValue(repo);
+        const utils = makeUtils(repo);
 
-        const first = await recordEscrowAuditEntry(objectFactory, stubClass, makeParams());
-        const second = await recordEscrowAuditEntry(objectFactory, stubClass, makeParams({ action: EscrowAuditAction.REQUEST_APPROVED }));
+        const first = await utils.record(makeParams());
+        const second = await utils.record(makeParams({ action: EscrowAuditAction.REQUEST_APPROVED }));
 
         expect(second.sequence).toBe(1);
         expect(second.previousHash).toBe(first.hash);
@@ -75,10 +87,10 @@ describe("recordEscrowAuditEntry() Tests", () => {
 
     it("Produces a different hash when any one field differs.", async () => {
         const repoA = { find: vi.fn().mockResolvedValue([]), create: vi.fn().mockImplementation(async (entry) => entry) };
-        const entryA = await recordEscrowAuditEntry(makeObjectFactory(repoA), makeStubClass(), makeParams());
+        const entryA = await makeUtils(repoA).record(makeParams());
 
         const repoB = { find: vi.fn().mockResolvedValue([]), create: vi.fn().mockImplementation(async (entry) => entry) };
-        const entryB = await recordEscrowAuditEntry(makeObjectFactory(repoB), makeStubClass(), makeParams({ mailboxUid: "mbx-2" }));
+        const entryB = await makeUtils(repoB).record(makeParams({ mailboxUid: "mbx-2" }));
 
         expect(entryA.hash).not.toBe(entryB.hash);
     });
@@ -88,9 +100,8 @@ describe("recordEscrowAuditEntry() Tests", () => {
             find: vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([{ sequence: 0, hash: "existing-hash" }]),
             create: vi.fn().mockRejectedValueOnce(new Error("duplicate key")).mockImplementationOnce(async (entry) => entry),
         };
-        const objectFactory = makeObjectFactory(repo);
 
-        const entry = await recordEscrowAuditEntry(objectFactory, makeStubClass(), makeParams());
+        const entry = await makeUtils(repo).record(makeParams());
 
         expect(repo.create).toHaveBeenCalledTimes(2);
         expect(entry.sequence).toBe(1);
@@ -102,97 +113,54 @@ describe("recordEscrowAuditEntry() Tests", () => {
             find: vi.fn().mockResolvedValue([]),
             create: vi.fn().mockRejectedValue(new Error("duplicate key")),
         };
-        const objectFactory = makeObjectFactory(repo);
 
-        await expect(recordEscrowAuditEntry(objectFactory, makeStubClass(), makeParams())).rejects.toThrow("duplicate key");
+        await expect(makeUtils(repo).record(makeParams())).rejects.toThrow("duplicate key");
         expect(repo.create.mock.calls.length).toBeGreaterThan(1);
     });
 });
 
-describe("verifyEscrowAuditChain() Tests", () => {
-    it("Returns valid: true for an intact chain built via recordEscrowAuditEntry().", async () => {
-        const stubClass = makeStubClass();
-        let stored: any[] = [];
-        const repo = {
-            find: vi.fn().mockImplementation(async (query: any) => {
-                if (query.page !== undefined) {
-                    return query.page === 0 ? stored : [];
-                }
-                return stored.length ? [stored[stored.length - 1]] : [];
-            }),
-            create: vi.fn().mockImplementation(async (entry) => {
-                stored.push(entry);
-                return entry;
-            }),
-        };
-        const objectFactory = makeObjectFactory(repo);
+describe("EscrowAuditUtils.verifyChain() Tests", () => {
+    it("Returns valid: true for an intact chain built via record().", async () => {
+        const utils = makeUtils(makeEntryRepo());
 
-        await recordEscrowAuditEntry(objectFactory, stubClass, makeParams());
-        await recordEscrowAuditEntry(objectFactory, stubClass, makeParams({ action: EscrowAuditAction.REQUEST_APPROVED }));
-        await recordEscrowAuditEntry(objectFactory, stubClass, makeParams({ action: EscrowAuditAction.MATERIAL_READ }));
+        await utils.record(makeParams());
+        await utils.record(makeParams({ action: EscrowAuditAction.REQUEST_APPROVED }));
+        await utils.record(makeParams({ action: EscrowAuditAction.MATERIAL_READ }));
 
-        const result = await verifyEscrowAuditChain(objectFactory, stubClass);
-
-        expect(result).toEqual({ valid: true });
+        expect(await utils.verifyChain()).toEqual({ valid: true });
     });
 
     it("Detects tampering at the first broken entry's sequence.", async () => {
-        const stubClass = makeStubClass();
-        let stored: any[] = [];
-        const repo = {
-            find: vi.fn().mockImplementation(async (query: any) => {
-                if (query.page !== undefined) {
-                    return query.page === 0 ? stored : [];
-                }
-                return stored.length ? [stored[stored.length - 1]] : [];
-            }),
-            create: vi.fn().mockImplementation(async (entry) => {
-                stored.push(entry);
-                return entry;
-            }),
-        };
-        const objectFactory = makeObjectFactory(repo);
+        const stored: any[] = [];
+        const utils = makeUtils(makeEntryRepo(stored));
 
-        await recordEscrowAuditEntry(objectFactory, stubClass, makeParams());
-        await recordEscrowAuditEntry(objectFactory, stubClass, makeParams({ action: EscrowAuditAction.REQUEST_APPROVED }));
+        await utils.record(makeParams());
+        await utils.record(makeParams({ action: EscrowAuditAction.REQUEST_APPROVED }));
 
-        // Tamper with the second entry's details directly, bypassing recordEscrowAuditEntry() entirely -
-        // its stored `hash` no longer matches what recomputation from its (now-mutated) fields produces.
+        // Tamper with the second entry's details directly, bypassing record() entirely - its stored `hash` no
+        // longer matches what recomputation from its (now-mutated) fields produces.
         stored[1].details = { tampered: true };
 
-        const result = await verifyEscrowAuditChain(objectFactory, stubClass);
+        const result = await utils.verifyChain();
 
         expect(result.valid).toBe(false);
         expect(result.brokenAtSequence).toBe(1);
     });
 
     it("Detects a broken previousHash link (a deleted/reordered entry), distinct from a per-entry hash mismatch.", async () => {
-        const stubClass = makeStubClass();
-        let stored: any[] = [];
-        const repo = {
-            find: vi.fn().mockImplementation(async (query: any) => {
-                if (query.page !== undefined) {
-                    return query.page === 0 ? stored : [];
-                }
-                return stored.length ? [stored[stored.length - 1]] : [];
-            }),
-            create: vi.fn().mockImplementation(async (entry) => {
-                stored.push(entry);
-                return entry;
-            }),
-        };
-        const objectFactory = makeObjectFactory(repo);
+        const stored: any[] = [];
+        const utils = makeUtils(makeEntryRepo(stored));
 
-        await recordEscrowAuditEntry(objectFactory, stubClass, makeParams());
-        await recordEscrowAuditEntry(objectFactory, stubClass, makeParams({ action: EscrowAuditAction.REQUEST_APPROVED }));
+        await utils.record(makeParams());
+        await utils.record(makeParams({ action: EscrowAuditAction.REQUEST_APPROVED }));
 
-        // Directly delete the first entry from the backing store, as if it were purged out from under the
-        // chain - the second entry's own `hash` is still internally consistent with its own fields, but its
-        // `previousHash` no longer matches any entry actually present (`expectedPreviousHash` starts
-        // `undefined` for the first entry seen, which is now the second one, whose `previousHash` is set).
+        // Directly delete the first entry from the backing store, as if it were purged out from under the chain - the
+        // second entry's own `hash` is still internally consistent with its own fields, but its `previousHash` no
+        // longer matches any entry actually present (`expectedPreviousHash` starts `undefined` for the first entry
+        // seen, which is now the second one, whose `previousHash` is set).
         stored.shift();
 
-        const result = await verifyEscrowAuditChain(objectFactory, stubClass);
+        const result = await utils.verifyChain();
 
         expect(result.valid).toBe(false);
         expect(result.brokenAtSequence).toBe(1);
@@ -202,16 +170,13 @@ describe("verifyEscrowAuditChain() Tests", () => {
 // --- HMAC keying + head record (tail-truncation detection) -------------------------------------------------
 // A small in-memory fake of both repos: `entries` enforces the unique `sequence` index, `heads` enforces the
 // unique `chainId` and `RepoUtils.update()`'s optimistic `version` lock.
-function makeChainFixture(options: { key?: any; withHead?: boolean } = {}) {
+function makeChainFixture(options: { key?: any; withHead?: boolean; environment?: string } = {}) {
     const entries: any[] = [];
     const heads: any[] = [];
     const EntryClass = makeStubClass();
     const HeadClass = makeStubClass();
-    if (options.withHead !== false) {
-        EntryClass.escrowAuditHeadClass = HeadClass;
-    }
-    let key: any = options.key;
     const entryRepo = {
+        modelClass: EntryClass,
         find: vi.fn(async (query: any) => {
             const sorted = [...entries].sort((a, b) => a.sequence - b.sequence);
             if (query.page !== undefined) {
@@ -228,6 +193,7 @@ function makeChainFixture(options: { key?: any; withHead?: boolean } = {}) {
         }),
     };
     const headRepo = {
+        modelClass: HeadClass,
         find: vi.fn(async () => heads.map((h) => ({ ...h }))),
         create: vi.fn(async (head: any) => {
             if (heads.length) {
@@ -245,11 +211,15 @@ function makeChainFixture(options: { key?: any; withHead?: boolean } = {}) {
         }),
     };
     const logger = { warn: vi.fn(), error: vi.fn() };
-    const objectFactory: any = {
-        newInstance: vi.fn(async (_clazz: any, opts: any) => (opts.args[0] === HeadClass ? headRepo : entryRepo)),
-        logger,
-        config: { get: vi.fn((k: string) => (k === "mail:escrow:audit_hmac_key" ? key : undefined)) },
+    /** A service over the fake repositories; `withHead: false` (or `null`) builds it without head maintenance. */
+    const makeService = (withHead: boolean | null = options.withHead !== false): any => {
+        const utils: any = new EscrowAuditUtils(entryRepo as any, withHead === null ? null : withHead ? (headRepo as any) : undefined);
+        utils.hmacKey = options.key ?? "";
+        utils.environment = options.environment;
+        utils.logger = logger;
+        return utils;
     };
+    const service: any = makeService();
     return {
         entries,
         heads,
@@ -258,10 +228,11 @@ function makeChainFixture(options: { key?: any; withHead?: boolean } = {}) {
         entryRepo,
         headRepo,
         logger,
-        objectFactory,
-        setKey: (k: any) => (key = k),
-        append: (overrides: any = {}) => recordEscrowAuditEntry(objectFactory, EntryClass, makeParams(overrides)),
-        verify: () => verifyEscrowAuditChain(objectFactory, EntryClass),
+        utils: service as EscrowAuditUtils,
+        makeService,
+        setKey: (k: any) => (service.hmacKey = k),
+        append: (overrides: any = {}) => service.record(makeParams(overrides)),
+        verify: () => service.verifyChain(),
     };
 }
 
@@ -295,17 +266,12 @@ function pushLegacyEntry(fixture: ReturnType<typeof makeChainFixture>, overrides
 }
 
 describe("EscrowAuditUtils HMAC keying Tests", () => {
-    afterEach(() => {
-        vi.unstubAllEnvs();
-    });
-
     it("Keys new entries with HMAC-SHA256 from mail:escrow:audit_hmac_key and marks them hmac-sha256.", async () => {
         const fixture = makeChainFixture({ key: "secret-key" });
 
         const first = await fixture.append();
         const second = await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
 
-        expect(fixture.objectFactory.config.get).toHaveBeenCalledWith("mail:escrow:audit_hmac_key");
         expect(first.hashAlgorithm).toBe(EscrowAuditHashAlgorithm.HMAC_SHA256);
         expect(second.hashAlgorithm).toBe(EscrowAuditHashAlgorithm.HMAC_SHA256);
         // Not the unkeyed digest of the same content.
@@ -366,16 +332,6 @@ describe("EscrowAuditUtils HMAC keying Tests", () => {
         expect(await fixture.verify()).toEqual({ valid: true });
     });
 
-    it("Prefers an explicit hmacKey option over config.", async () => {
-        const fixture = makeChainFixture({ key: "config-key" });
-        await recordEscrowAuditEntry(fixture.objectFactory, fixture.EntryClass, makeParams(), { hmacKey: "option-key" });
-
-        expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 0, reason: "hash_mismatch" });
-        expect(await verifyEscrowAuditChain(fixture.objectFactory, fixture.EntryClass, { hmacKey: "option-key" })).toEqual({
-            valid: true,
-        });
-    });
-
     it("Without a key, falls back to SHA-256 (marked sha256) and warns exactly once.", async () => {
         const fixture = makeChainFixture();
 
@@ -391,8 +347,7 @@ describe("EscrowAuditUtils HMAC keying Tests", () => {
     });
 
     it("Without a key in production, logs at error level instead of warn, and still does not throw.", async () => {
-        vi.stubEnv("NODE_ENV", "production");
-        const fixture = makeChainFixture();
+        const fixture = makeChainFixture({ environment: "production" });
 
         await expect(fixture.append()).resolves.toBeDefined();
 
@@ -462,9 +417,7 @@ describe("EscrowAuditUtils head record Tests", () => {
         fixture.entries.pop();
 
         // The remaining chain is internally consistent - only the head reveals the missing tail.
-        expect(await verifyEscrowAuditChain(fixture.objectFactory, fixture.EntryClass, { escrowAuditHeadClass: null })).toEqual({
-            valid: true,
-        });
+        expect(await fixture.makeService(false).verifyChain()).toEqual({ valid: true });
         expect(await fixture.verify()).toEqual({ valid: false, brokenAtSequence: 2, reason: "truncated" });
     });
 
@@ -616,7 +569,6 @@ describe("EscrowAuditUtils head record Tests", () => {
 
     it("Passes the head to update() as a real head-class instance so the optimistic version lock is enforced (Mongo find() returns plain documents).", async () => {
         const fixture = makeChainFixture({ key: "secret-key" });
-        (fixture.headRepo as any).modelClass = fixture.HeadClass;
         await fixture.append();
         await fixture.append({ action: EscrowAuditAction.REQUEST_APPROVED });
 
@@ -656,5 +608,99 @@ describe("EscrowAuditUtils head record Tests", () => {
 
         expect(fixture.headRepo.find).not.toHaveBeenCalled();
         expect(await fixture.verify()).toEqual({ valid: true });
+    });
+});
+
+describe("EscrowAuditUtils service wiring Tests", () => {
+    it("Logs the missing-key warning at warn level outside production, and needs no logger.", async () => {
+        const fixture = makeChainFixture();
+        const quiet: any = fixture.makeService();
+        quiet.logger = undefined;
+        await expect(quiet.record(makeParams())).resolves.toBeDefined();
+
+        const quietProduction: any = makeChainFixture({ environment: "production" }).makeService();
+        quietProduction.logger = undefined;
+        await expect(quietProduction.record(makeParams())).resolves.toBeDefined();
+    });
+
+    it("Works without a head repository (omitted or null), and does not check for tail truncation then.", async () => {
+        for (const withHead of [false, null]) {
+            const fixture = makeChainFixture({ key: "k" });
+            const utils = fixture.makeService(withHead);
+
+            await utils.record(makeParams());
+            await utils.record(makeParams({ requestId: "req-2" }));
+
+            expect(fixture.headRepo.find).not.toHaveBeenCalled();
+            expect(fixture.heads).toHaveLength(0);
+            expect(await utils.verifyChain()).toEqual({ valid: true });
+        }
+    });
+
+    it("Appends entries and the head as the repositories' model classes.", async () => {
+        const fixture = makeChainFixture({ key: "secret" });
+
+        const entry = await fixture.append();
+
+        expect(entry).toBeInstanceOf(fixture.EntryClass);
+        expect(fixture.heads).toHaveLength(1);
+        expect(fixture.headRepo.create.mock.calls[0][0]).toBeInstanceOf(fixture.HeadClass);
+    });
+
+    it("Propagates a persistence failure from record().", async () => {
+        const fixture = makeChainFixture({ key: "k" });
+        fixture.entryRepo.create.mockRejectedValue(new Error("db down"));
+
+        await expect(fixture.append()).rejects.toThrow("db down");
+    });
+
+    describe("With a real ObjectFactory", () => {
+        let objectFactory: ObjectFactory;
+        let previousKey: any;
+
+        beforeEach(() => {
+            previousKey = config.get("mail:escrow:audit_hmac_key");
+            objectFactory = new ObjectFactory(config, Logger());
+        });
+
+        afterEach(async () => {
+            await objectFactory.destroy();
+            config.set("mail:escrow:audit_hmac_key", previousKey);
+        });
+
+        it("Injects the HMAC key and a logger, and returns the same instance for the same name.", async () => {
+            config.set("mail:escrow:audit_hmac_key", "factory-key");
+            const fixture = makeChainFixture();
+            const args = [fixture.entryRepo, fixture.headRepo];
+            const first: any = await objectFactory.newInstance(EscrowAuditUtils, { name: "EscrowAuditLogEntryMongo", args });
+            const second: any = await objectFactory.newInstance(EscrowAuditUtils, { name: "EscrowAuditLogEntryMongo", args });
+
+            expect(first).toBeInstanceOf(EscrowAuditUtils);
+            expect(second).toBe(first);
+            expect(first.hmacKey).toBe("factory-key");
+            expect(first.logger).toBeDefined();
+            const entry = await first.record(makeParams());
+            expect(entry.hashAlgorithm).toBe(EscrowAuditHashAlgorithm.HMAC_SHA256);
+            expect(await first.verifyChain()).toEqual({ valid: true });
+        });
+
+        it("Builds without the HMAC key configured (it defaults to empty) and falls back to unkeyed SHA-256 with a warning.", async () => {
+            config.set("mail:escrow:audit_hmac_key", undefined);
+            const fixture = makeChainFixture();
+            const instance: any = await objectFactory.newInstance(EscrowAuditUtils, {
+                name: "EscrowAuditLogEntryNoKey",
+                args: [fixture.entryRepo, fixture.headRepo],
+            });
+            const warn = vi.fn();
+            instance.logger = { warn, error: vi.fn() };
+            instance.environment = undefined;
+
+            expect(instance.hmacKey).toBe("");
+            const entry = await instance.record(makeParams());
+
+            expect(entry.hashAlgorithm).toBe(EscrowAuditHashAlgorithm.SHA256);
+            expect(warn).toHaveBeenCalledTimes(1);
+            expect(await instance.verifyChain()).toEqual({ valid: true });
+        });
     });
 });

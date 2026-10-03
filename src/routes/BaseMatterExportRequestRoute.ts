@@ -12,11 +12,11 @@
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, HttpResponse, ModelUtils, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
-import { recordEscrowAuditEntry } from "../util/EscrowAuditUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
+import { EscrowAuditUtils } from "../util/EscrowAuditUtils.js";
 import { exactInFilter, findHeldScopeIds, requireEscrowHolder } from "../util/EscrowUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
-import { AuditAction, EscrowAuditAction, Mailbox, Matter, MatterExportRequest } from "../models/types.js";
+import { AuditAction, EscrowAuditAction, EscrowScope, Mailbox, Matter, MatterExportRequest } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Query, RateLimit, Request, Response, User: AuthUser } = RouteDecorators;
 
@@ -55,18 +55,18 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
-    @Config()
-    private config: any;
-
     protected requestRepo?: RepoUtils<T>;
     protected matterRepo?: RepoUtils<M>;
     protected mailboxRepo?: RepoUtils<MB>;
+    protected escrowScopeRepo?: RepoUtils<EscrowScope>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected escrowAuditEntryRepo?: RepoUtils<any>;
+    protected escrowAuditHeadRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
+    protected escrowAuditUtils?: EscrowAuditUtils;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
-
-    @Logger
-    private logger: any;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -91,6 +91,43 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
                 args: [this.mailboxClass],
             });
         }
+        if (!this.escrowScopeRepo && this.escrowScopeClass) {
+            this.escrowScopeRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.escrowScopeClass.name,
+                args: [this.escrowScopeClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
+            });
+        }
+        if (!this.escrowAuditEntryRepo && this.escrowAuditLogClass) {
+            this.escrowAuditEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.escrowAuditLogClass.name,
+                args: [this.escrowAuditLogClass],
+            });
+        }
+        const escrowAuditHeadClass: any = this.escrowAuditLogClass?.escrowAuditHeadClass;
+        if (!this.escrowAuditHeadRepo && escrowAuditHeadClass) {
+            this.escrowAuditHeadRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: escrowAuditHeadClass.name,
+                args: [escrowAuditHeadClass],
+            });
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
+            });
+        }
+        if (!this.escrowAuditUtils && this.escrowAuditLogClass) {
+            this.escrowAuditUtils = await this._objectFactory.newInstance(EscrowAuditUtils, {
+                name: this.escrowAuditLogClass.name,
+                args: [this.escrowAuditEntryRepo, this.escrowAuditHeadRepo],
+            });
+        }
     }
 
     private async requireRequest(id: string): Promise<T> {
@@ -113,7 +150,7 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
     @RateLimit({ perUser: true, maxAttempts: CREATE_MAX_ATTEMPTS, windowSeconds: CREATE_WINDOW_SECONDS })
     public async create(body: { matterId: string }, @AuthUser user?: JWTUser): Promise<T> {
         const matter: M = await this.requireMatter(body?.matterId);
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, matter.escrowScopeId, user);
         // A closed matter is over - same rule as `BaseEscrowAccessRequestRoute.create()`.
         if (matter.closedAt) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This matter is closed.");
@@ -141,7 +178,7 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
             if (!mailbox || mailbox.escrowScopeId !== matter.escrowScopeId) {
                 continue;
             }
-            await recordEscrowAuditEntry(this._objectFactory!, this.escrowAuditLogClass, {
+            await this.escrowAuditUtils!.record({
                 action: EscrowAuditAction.MATTER_EXPORT_REQUESTED,
                 holderUserUid: user!.uid,
                 matterId: matter.uid,
@@ -164,7 +201,7 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
     ): Promise<T[]> {
         const { limit, page } = parseListPaging({ limit: limitParam, page: pageParam });
         // `exactInFilter()`: a uid holding `,` would otherwise widen these `in(...)` filters to other scopes/matters.
-        const heldScopes: string | undefined = exactInFilter(await findHeldScopeIds(this._objectFactory!, this.escrowScopeClass, user));
+        const heldScopes: string | undefined = exactInFilter(await findHeldScopeIds(this.escrowScopeRepo!, user));
         if (!heldScopes) {
             return [];
         }
@@ -198,7 +235,7 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
     public async findById(@Param("id") id: string, @AuthUser user?: JWTUser): Promise<T> {
         const request: T = await this.requireRequest(id);
         const matter: M = await this.requireMatter(request.matterId);
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, matter.escrowScopeId, user);
         return request;
     }
 
@@ -214,7 +251,7 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
         }
         const request: T = await this.requireRequest(id);
         const matter: M = await this.requireMatter(request.matterId);
-        await requireEscrowHolder(this._objectFactory!, this.escrowScopeClass, matter.escrowScopeId, user);
+        await requireEscrowHolder(this.escrowScopeRepo!, matter.escrowScopeId, user);
         // A closed matter is over - its exports stop being downloadable too, same as `create()` refusing new ones and
         // `BaseEscrowAccessRequestRoute.material()` refusing key material.
         if (matter.closedAt) {
@@ -225,13 +262,11 @@ export abstract class BaseMatterExportRequestRoute<T extends MatterExportRequest
         }
 
         const content: Buffer = await this.blobStore.get(request.blobKey);
-        if (this.auditLogClass) {
+        if (this.auditLogUtils) {
             // Whoever takes the export out of the system is on the record: the request's own ledger entries say who asked for it.
-            await recordAuditLog(
-                this._objectFactory!,
-                this.auditLogClass,
-                { config: this.config, req, user, logger: this.logger },
+            await this.auditLogUtils.record(
                 { action: AuditAction.MATTER_EXPORT_DOWNLOAD, targetType: "MatterExportRequest", targetUid: request.uid, details: { matterId: request.matterId } },
+                { req, user },
             );
         }
         res.setHeader("content-type", "application/x-ndjson");

@@ -31,6 +31,8 @@ export * from "./DsnParser.js";
 export * from "./TimeZoneUtils.js";
 export * from "./DomainVerificationUtils.js";
 export * from "./EntityUtils.js";
+export * from "./EscrowAuditUtils.js";
+export * from "./EscrowUtils.js";
 export * from "./EventDescriptionUtils.js";
 export * from "./FocusedInboxUtils.js";
 export * from "./FolderCountUtils.js";
@@ -45,8 +47,8 @@ export * from "./MailSendUtils.js";
 export * from "./MailboxPolicyUtils.js";
 export * from "./MailSignatureUtils.js";
 export * from "./MailboxScopeUtils.js";
-// Keyset paging by `uid` only - the rest of `MailboxContentUtils.ts` stays internal.
-export { findPagesByUid } from "./MailboxContentUtils.js";
+// Keyset paging by `uid` and the collection of a mailbox's content - the rest of `MailboxContentUtils.ts` stays internal.
+export { collectMailboxContentLines, findPagesByUid, type MailboxContentRepos } from "./MailboxContentUtils.js";
 export * from "./MessageListUtils.js";
 export * from "./MessagePurgeUtils.js";
 export * from "./MimeHeaderUtils.js";

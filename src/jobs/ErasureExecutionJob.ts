@@ -9,7 +9,7 @@ import { BlobStore } from "../blob/BlobStore.js";
 import { BlobReferenceSource, deleteBlobsIfUnreferenced, messageBlobReferenceSources } from "../util/BlobReferenceUtils.js";
 import { assertNotOnLegalHold } from "../util/LegalHoldUtils.js";
 import { CONTACT_PHOTO_KEY_PREFIX } from "../routes/BaseContactRoute.js";
-import { recordAuditLog } from "../util/AuditLogUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { retainedBodyBlobKeysOf } from "../util/DraftBodyRetentionUtils.js";
 import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
@@ -150,6 +150,9 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
 
     protected requestRepo?: RepoUtils<T>;
     protected mailboxRepo?: RepoUtils<MB>;
+    protected matterRepo?: RepoUtils<any>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
 
     /** The repo of every entity class the cascade purges, keyed by class: built in `init()` for each class the subclass
      * supplies, and by `getRepo()` on first use for a class only known at run time (a plugin's `@MailboxScopedData()` model). */
@@ -192,10 +195,6 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     @Config("mail:jobs:erasure_execution:batch_size", 1)
     private batchSize: number = 1;
 
-    /** The whole application config, needed only to pass through to `recordAuditLog()` (`caller.config`). */
-    @Config()
-    private config: any;
-
     @Logger
     private logger: any;
 
@@ -218,6 +217,18 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.mailboxClass.name,
                 args: [this.mailboxClass],
+            });
+        }
+        if (!this.matterRepo && this.matterClass) {
+            this.matterRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.matterClass.name,
+                args: [this.matterClass],
+            });
+        }
+        if (!this.auditLogRepo && this.auditLogClass) {
+            this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogClass],
             });
         }
         const entityClasses: any[] = [
@@ -251,6 +262,12 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
                     await this._objectFactory.newInstance(RepoUtils, { name: entityClass.name, args: [entityClass] }),
                 );
             }
+        }
+        if (!this.auditLogUtils && this.auditLogClass) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, {
+                name: this.auditLogClass.name,
+                args: [this.auditLogRepo],
+            });
         }
     }
 
@@ -354,7 +371,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
 
     private async processRequest(request: T): Promise<void> {
         try {
-            await assertNotOnLegalHold(this._objectFactory!, this.matterClass, request.mailboxUid);
+            await assertNotOnLegalHold(this.matterRepo!, request.mailboxUid);
         } catch {
             // Still held - skip, don't error. Retried automatically on a later run once the matter closes. Claiming and handing
             // it straight back (an in-progress one so it reads as waiting, not running; an approved one) bumps its
@@ -389,16 +406,16 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         // soft-deleted included) still references them - see `util/BlobReferenceUtils.ts`. Erasing one recipient
         // must never destroy another recipient's copy, least of all a legal-hold custodian's.
         const blobSources: BlobReferenceSource[] = messageBlobReferenceSources({
-            messageClass: this.messageClass,
-            attachmentClass: this.attachmentClass,
-            quarantineEntryClass: this.quarantineEntryClass,
-            ingestQueueEntryClass: this.ingestQueueEntryClass,
+            messageRepo: this.entityRepos.get(this.messageClass),
+            attachmentRepo: this.entityRepos.get(this.attachmentClass),
+            quarantineEntryRepo: this.entityRepos.get(this.quarantineEntryClass),
+            ingestQueueEntryRepo: this.entityRepos.get(this.ingestQueueEntryClass),
         });
         // Run BEFORE the owning row is deleted (the row being purged is excluded from the reference check): a blob store
         // failure then leaves the row, and so its blob keys, in place for the next run to retry, instead of an orphaned blob
         // (personal data) that nothing points at and no later run can find.
         const deleteSharedBlobs = async (entityClass: any, row: any, ...keys: (string | undefined)[]): Promise<void> => {
-            await deleteBlobsIfUnreferenced(this._objectFactory!, this.blobStore!, blobSources, keys, { entityClass, uid: row.uid });
+            await deleteBlobsIfUnreferenced(this.blobStore!, blobSources, keys, { repo: this.entityRepos.get(entityClass), uid: row.uid });
         };
         purgedCount += await this.purgeEntityType(this.attachmentClass, request.mailboxUid, async (row: any) => {
             await deleteSharedBlobs(this.attachmentClass, row, row.blobKey, row.extractedTextBlobKey);
@@ -503,7 +520,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             // so the retry is a cheap no-op cascade followed by just this one remaining check, the
             // same "skip, don't error, retry automatically" shape the top-of-method check already
             // uses.
-            await assertNotOnLegalHold(this._objectFactory!, this.matterClass, request.mailboxUid);
+            await assertNotOnLegalHold(this.matterRepo!, request.mailboxUid);
         } catch {
             this.logger?.error(
                 `ErasureExecutionJob: a legal hold appeared on mailbox ${request.mailboxUid} while erasure request ${request.uid} was already running - ${purgedCount} rows were purged before it was detected; the mailbox record and its access list were preserved pending the hold's resolution.`,
@@ -575,18 +592,13 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             { ignoreACL: true },
         );
         this.claim = undefined;
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, logger: this.logger },
-            {
-                action: AuditAction.ERASURE_REQUEST_DENIED,
-                targetType: "DataSubjectErasureRequest",
-                targetUid: denied.uid,
-                mailboxUid: denied.mailboxUid,
-                details: { automatic: true, leftover: true },
-            },
-        );
+        await this.auditLogUtils!.record({
+            action: AuditAction.ERASURE_REQUEST_DENIED,
+            targetType: "DataSubjectErasureRequest",
+            targetUid: denied.uid,
+            mailboxUid: denied.mailboxUid,
+            details: { automatic: true, leftover: true },
+        });
     }
 
     /** The plugins declaring `mailboxScopedData` in their stored manifest that aren't loaded in this process, per
@@ -717,17 +729,12 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             asEntity(this.requestRepo!, request),
             { ignoreACL: true },
         );
-        await recordAuditLog(
-            this._objectFactory!,
-            this.auditLogClass,
-            { config: this.config, logger: this.logger },
-            {
-                action: AuditAction.ERASURE_REQUEST_COMPLETED,
-                targetType: "DataSubjectErasureRequest",
-                targetUid: updated.uid,
-                mailboxUid: updated.mailboxUid,
-                details: { purgedCount },
-            },
-        );
+        await this.auditLogUtils!.record({
+            action: AuditAction.ERASURE_REQUEST_COMPLETED,
+            targetType: "DataSubjectErasureRequest",
+            targetUid: updated.uid,
+            mailboxUid: updated.mailboxUid,
+            details: { purgedCount },
+        });
     }
 }

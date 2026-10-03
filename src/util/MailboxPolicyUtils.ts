@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError } from "@rapidrest/core";
-import { ApiErrors, type BaseEntity, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { ApiErrors, type BaseEntity, type RepoUtils } from "@rapidrest/service-core";
 import { MailboxPolicy } from "../models/types.js";
+import { asEntity } from "./EntityUtils.js";
 
 /** The fixed identifier of the one `MailboxPolicy` row - same singleton convention as `RETENTION_POLICY_UID`. */
 export const MAILBOX_POLICY_UID = "mailbox-policy";
@@ -20,18 +21,17 @@ export interface MailboxPolicySeed {
 }
 
 /**
- * Returns the singleton row `uid`, creating it from `seed` if it doesn't exist yet. Two concurrent first callers
- * can both miss and both create; the loser's create throws a duplicate-key error, and since the uid is fixed,
- * re-reading and returning the winner's row is the correct outcome (same reasoning as
- * `BaseRetentionPolicyRoute.findOrCreate()`).
+ * Returns the singleton row `uid`, creating it from `seed` if it doesn't exist yet (instantiated as the repository's own model class). Two
+ * concurrent first callers can both miss and both create; the loser's create throws a duplicate-key error, and since the uid is fixed,
+ * re-reading and returning the winner's row is the correct outcome (same reasoning as `BaseRetentionPolicyRoute.findOrCreate()`).
  */
-export async function findOrCreateSingleton<T extends BaseEntity>(repo: RepoUtils<T>, entityClass: any, uid: string, seed: Record<string, unknown> = {}): Promise<T> {
+export async function findOrCreateSingleton<T extends BaseEntity>(repo: RepoUtils<T>, uid: string, seed: Record<string, unknown> = {}): Promise<T> {
     const existing: T | undefined = await repo.findOne(uid, { ignoreACL: true });
     if (existing) {
         return existing;
     }
     try {
-        return await repo.create(new entityClass({ ...seed, uid }), { ignoreACL: true });
+        return await repo.create(asEntity(repo, { ...seed, uid }) as any, { ignoreACL: true });
     } catch (err) {
         const winner: T | undefined = await repo.findOne(uid, { ignoreACL: true });
         if (winner) {
@@ -53,18 +53,13 @@ export async function findOrCreateSingleton<T extends BaseEntity>(repo: RepoUtil
  * config there could, say, re-enable self-service provisioning an administrator had turned off.
  */
 export async function findOrSeedMailboxPolicy(
-    objectFactory: ObjectFactory,
-    mailboxPolicyClass: any,
+    policyRepo: RepoUtils<MailboxPolicy>,
     seed: MailboxPolicySeed,
     logger?: any,
     failClosed: boolean = false,
 ): Promise<MailboxPolicySeed> {
     try {
-        const repo: RepoUtils<MailboxPolicy> = await objectFactory.newInstance(RepoUtils, {
-            name: mailboxPolicyClass.name,
-            args: [mailboxPolicyClass],
-        });
-        const policy: MailboxPolicy = await findOrCreateSingleton(repo, mailboxPolicyClass, MAILBOX_POLICY_UID, { ...seed });
+        const policy: MailboxPolicy = await findOrCreateSingleton(policyRepo, MAILBOX_POLICY_UID, { ...seed });
         return {
             defaultQuotaBytes: policy.defaultQuotaBytes ?? seed.defaultQuotaBytes,
             autoProvisionEnabled: policy.autoProvisionEnabled ?? seed.autoProvisionEnabled,
