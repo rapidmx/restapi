@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.1] - 2026-10-04
+
+### Changed
+- Publish a prerelease version to npm under the next tag, which npm requires, and a release under latest
+- Treat the rspamd greylist action as clean, and send a message whose spam verdict is only suspect rather than refusing it with a 422 unless the scan engine was unavailable
+
 ## [0.30.0] - 2026-10-03
 
 ### Changed
@@ -1348,7 +1354,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.30.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.30.1...HEAD
+[0.30.1]: https://github.com/rapidmx/restapi/compare/v0.30.0...v0.30.1
 [0.30.0]: https://github.com/rapidmx/restapi/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/rapidmx/restapi/compare/v0.28.1...v0.29.0
 [0.28.1]: https://github.com/rapidmx/restapi/compare/v0.28.0...v0.28.1
