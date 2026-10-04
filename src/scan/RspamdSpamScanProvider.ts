@@ -159,9 +159,12 @@ function mapAction(action: RspamdCheckV2Response["action"]): SpamVerdict {
         case "reject":
         case "soft reject":
             return SpamVerdict.SPAM;
+        // `greylist` is a delay a receiving server asks of an unknown sender; this server never greylists, so it says nothing
+        // against the message.
         case "no action":
+        case "greylist":
             return SpamVerdict.CLEAN;
-        // `add header`, `rewrite subject`, `greylist` - and any action a newer rspamd adds (`quarantine`, `discard`), which is
+        // `add header`, `rewrite subject` - and any action a newer rspamd adds (`quarantine`, `discard`), which is
         // not known to be clean and so is not delivered as if it were.
         default:
             return SpamVerdict.SUSPECT;

@@ -76,7 +76,7 @@ describe("RspamdSpamScanProvider Tests", () => {
         ["soft reject", SpamVerdict.SPAM],
         ["add header", SpamVerdict.SUSPECT],
         ["rewrite subject", SpamVerdict.SUSPECT],
-        ["greylist", SpamVerdict.SUSPECT],
+        ["greylist", SpamVerdict.CLEAN],
         ["no action", SpamVerdict.CLEAN],
     ] as const)("Maps rspamd action '%s' to verdict %s.", async (action, expectedVerdict) => {
         mockFetch.mockResolvedValue(

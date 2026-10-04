@@ -94,6 +94,24 @@ describe("scanAndRelay() Tests", () => {
         ).rejects.toThrow(/failed spam\/malware scanning/);
     });
 
+    it("Sends a message whose spam verdict is only SUSPECT (a middling score).", async () => {
+        scanPipeline.run.mockResolvedValue(makeCleanScanResult({ spam: { score: 6, verdict: SpamVerdict.SUSPECT, symbols: ["FOO"] } }));
+
+        const result = await scanAndRelay(makeRawMessage(), "sender@example.com", ["recipient@example.com"], scanPipeline as any, mailTransport, blobStore);
+
+        expect(result.messageId).toBeDefined();
+    });
+
+    it("Refuses (422) a SUSPECT verdict that is only the scan engine being unavailable.", async () => {
+        scanPipeline.run.mockResolvedValue(
+            makeCleanScanResult({ spam: { score: 0, verdict: SpamVerdict.SUSPECT, symbols: ["SCAN_ENGINE_UNAVAILABLE"] } }),
+        );
+
+        await expect(
+            scanAndRelay(makeRawMessage(), "sender@example.com", ["recipient@example.com"], scanPipeline as any, mailTransport, blobStore),
+        ).rejects.toThrow(/failed spam\/malware scanning/);
+    });
+
     it("Throws a 502 MailRelayError when the mail transport rejects the message outright, saying who and why.", async () => {
         const response = "554 5.7.1 <recipient@example.com>: Recipient address rejected: Access denied";
         vi.spyOn(mailTransport, "send").mockResolvedValue({

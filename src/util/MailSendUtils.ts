@@ -7,7 +7,7 @@ import { ApiError } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
-import type { Mailbox, MessageReceiptEntry, PublicKey } from "../models/types.js";
+import { type Mailbox, type MessageReceiptEntry, type PublicKey, SpamVerdict } from "../models/types.js";
 import { type MailSendContext, publishTransportOutcome } from "../events/MailEventStream.js";
 import { MailRelayError, type MailRelayFailureDetails, relayFailureDetails } from "../transport/TransportResultUtils.js";
 import { normalizeAddress } from "./AddressUtils.js";
@@ -123,7 +123,10 @@ export async function scanAndRelay(
 
     // No preview: no caller of a send uses one (the draft already has its own), and deriving it converts the whole HTML body to text.
     const scanResult = await scanPipeline.run(finalRaw, { from: envelopeFrom, to: envelopeTo }, { skipPreview: true });
-    const verdict = resolveDeliveryVerdict(scanResult);
+    // A message its own user is sending is not junk-foldered: a `SUSPECT` spam verdict (a middling score) doesn't stop it, only a verdict
+    // of spam or malware, or a scan that never ran (`SCAN_ENGINE_UNAVAILABLE`), does.
+    const spamOnlySuspect: boolean = scanResult.spam.verdict === SpamVerdict.SUSPECT && !scanResult.spam.symbols.includes("SCAN_ENGINE_UNAVAILABLE");
+    const verdict = resolveDeliveryVerdict(spamOnlySuspect ? { ...scanResult, spam: { ...scanResult.spam, verdict: SpamVerdict.CLEAN } } : scanResult);
     if (verdict !== "deliver") {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 422, "This message could not be sent because it failed spam/malware scanning.");
     }
