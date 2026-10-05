@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.31.0
+
 ### Added
 
 - **`src/util/MeetingInviteUtils.js` is now part of the package's public `util` barrel export** (`extractIcsFromRaw()`, `parseInviteIcs()`, `describeInvite()`, `meetingMethodOf()`, and the `MessageInvite`/`InviteParticipant`/`InviteScheduleEntry` types) - previously internal-only, even though `Message.meetingMethod`/`meetingResponse` (which these build on) were already public API. Lets a downstream package (the `activesync` plugin, rendering MS-ASEMAIL's `MeetingRequest` element for a Sync'd invite email) reuse the same invite-parsing logic the web client's own Accept/Decline card already depends on, instead of re-implementing ICS parsing.

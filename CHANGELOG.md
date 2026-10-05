@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-10-05
+
+### Changed
+- Export MeetingInviteUtils from the public util barrel so downstream protocol packages can reuse invite parsing
+
 ## [0.30.1] - 2026-10-04
 
 ### Changed
@@ -1354,7 +1359,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.30.1...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/rapidmx/restapi/compare/v0.30.1...v0.31.0
 [0.30.1]: https://github.com/rapidmx/restapi/compare/v0.30.0...v0.30.1
 [0.30.0]: https://github.com/rapidmx/restapi/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/rapidmx/restapi/compare/v0.28.1...v0.29.0
