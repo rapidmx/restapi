@@ -45,6 +45,7 @@ export * from "./MailAccessUtils.js";
 export * from "./MailFilterUtils.js";
 export * from "./MailSendUtils.js";
 export * from "./MailboxPolicyUtils.js";
+export * from "./MeetingInviteUtils.js";
 export * from "./MailSignatureUtils.js";
 export * from "./MailboxScopeUtils.js";
 // Keyset paging by `uid` and the collection of a mailbox's content - the rest of `MailboxContentUtils.ts` stays internal.
