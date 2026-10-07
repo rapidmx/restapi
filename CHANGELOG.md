@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-10-07
+
+### Added
+- Added a Suggested Contacts folder type that is created lazily and never client-created
+- Added Correspondent.suggestedAt marking the people already turned into suggested contacts
+- Added POST /mail/directory/suggested-contacts to fill the Suggested Contacts folder from existing mail history
+
+### Changed
+- Create a Contact per correspondent in the Suggested Contacts folder with SuggestedContactUtils
+
 ## [0.31.0] - 2026-10-05
 
 ### Changed
@@ -1359,7 +1369,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.31.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/rapidmx/restapi/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/rapidmx/restapi/compare/v0.30.1...v0.31.0
 [0.30.1]: https://github.com/rapidmx/restapi/compare/v0.30.0...v0.30.1
 [0.30.0]: https://github.com/rapidmx/restapi/compare/v0.29.0...v0.30.0
