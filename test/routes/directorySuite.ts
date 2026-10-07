@@ -31,6 +31,14 @@ export interface DirectorySuiteContext {
     saveCalendarEvent: (fields: Record<string, any>) => Promise<any>;
     /** Every stored `Correspondent` of `mailboxUid`. */
     findCorrespondents: (mailboxUid: string) => Promise<any[]>;
+    /** Every stored `Contact` of `mailboxUid`, deleted ones included. */
+    findContacts: (mailboxUid: string) => Promise<any[]>;
+    /** Every stored `Folder` of `mailboxUid`. */
+    findFolders: (mailboxUid: string) => Promise<any[]>;
+    /** Deletes the stored `Mailbox` row `uid` (its ACL stays). */
+    removeMailbox: (uid: string) => Promise<void>;
+    /** Deletes the stored `Contact` `uid` outright. */
+    removeContact: (uid: string) => Promise<void>;
     /** The stored `Mailbox` `uid`. */
     findMailbox: (uid: string) => Promise<any>;
 }
@@ -461,6 +469,139 @@ export function directorySuite(ctx: DirectorySuiteContext): void {
             expect((await searchCorrespondents("who", owner, `&mailboxUid=${privateMailbox.uid}`)).body).toEqual([]);
             expect(await ctx.findCorrespondents(privateMailbox.uid)).toEqual([]);
             expect((await ctx.findMailbox(privateMailbox.uid)).correspondentsBackfilledAt ?? null).toBeNull();
+        });
+    });
+    describe("POST /suggested-contacts (correspondents as contacts of a Suggested Contacts folder)", () => {
+        const owner: any = newUser();
+        const day = (n: number): Date => new Date(Date.UTC(2026, 0, n));
+        const post = (path: string, user?: any) => {
+            const req: any = request(ctx.app()).post(`${ctx.baseUrl}${path}`);
+            return user ? req.set("Authorization", "jwt " + tokenFor(user)) : req;
+        };
+        const suggest = (mailboxUid: string, user: any) => post(`/suggested-contacts?mailboxUid=${mailboxUid}`, user);
+        const doneMailbox = async (user: any, fields: Record<string, any> = {}, records: AclRecords = []) =>
+            await mailboxFor(user, { correspondentsBackfilledAt: new Date(), ...fields }, records);
+        const correspondent = async (mailbox: any, address: string, fields: Record<string, any> = {}) =>
+            await ctx.saveCorrespondent({ mailboxUid: mailbox.uid, address, displayName: "", lastSeenAt: day(1), count: 1, lastSource: "received", ...fields });
+        const suggested = async (mailbox: any) => {
+            const folder = (await ctx.findFolders(mailbox.uid)).find((candidate) => candidate.type === FolderType.SUGGESTED_CONTACTS);
+            return { folder, contacts: folder ? (await ctx.findContacts(mailbox.uid)).filter((contact) => contact.folderUid === folder.uid) : [] };
+        };
+
+        it("requires a signed-in caller and a mailboxUid", async () => {
+            expect((await post("/suggested-contacts?mailboxUid=x")).status).toBe(401);
+            expect((await post("/suggested-contacts", owner)).status).toBe(400);
+            expect((await post("/suggested-contacts?mailboxUid=", owner)).status).toBe(400);
+            expect((await post("/suggested-contacts?mailboxUid=a&mailboxUid=b", owner)).status).toBe(400);
+        });
+
+        it("refuses callers who may not create in the mailbox, and unknown mailboxes, creating nothing", async () => {
+            const mailbox = await doneMailbox(owner);
+            await correspondent(mailbox, "refused@x.test");
+            const reader: any = newUser();
+            const readOnly = await doneMailbox(owner, {}, [{ userOrRoleId: reader.uid, actions: [ACLAction.READ, ACLAction.LIST] }]);
+            await correspondent(readOnly, "refused2@x.test");
+            expect((await suggest(mailbox.uid, newUser())).status).toBe(403);
+            expect((await suggest(mailbox.uid, newUser(["admin"]))).status).toBe(403);
+            expect((await suggest(readOnly.uid, reader)).status).toBe(403);
+            expect((await suggest("no-such-mailbox", owner)).status).toBe(403);
+            expect((await suggested(mailbox)).folder).toBeUndefined();
+            expect((await suggested(readOnly)).folder).toBeUndefined();
+            expect((await ctx.findCorrespondents(mailbox.uid)).every((row) => !row.suggestedAt)).toBe(true);
+        });
+
+        it("answers 404 for a mailbox the caller holds an ACL on that has no row", async () => {
+            const ghost = await mailboxFor(owner);
+            await ctx.removeMailbox(ghost.uid);
+            expect((await suggest(ghost.uid, owner)).status).toBe(404);
+        });
+
+        it("lets a delegate with write access fill the mailbox's Suggested Contacts folder", async () => {
+            const delegate: any = newUser();
+            const mailbox = await doneMailbox(owner, {}, [{ userOrRoleId: delegate.uid, actions: [ACLAction.CREATE] }]);
+            await correspondent(mailbox, "delegated@x.test", { displayName: "Del Egated" });
+            const res = await suggest(mailbox.uid, delegate);
+            expect(res.status).toBe(200);
+            expect(res.body).toMatchObject({ created: 1, remaining: 0 });
+            expect((await suggested(mailbox)).contacts.map((contact) => contact.displayName)).toEqual(["Del Egated"]);
+        });
+
+        it("creates the folder and a contact per correspondent that is nobody's contact yet, once", async () => {
+            const mailbox = await doneMailbox(owner);
+            const contacts = await ctx.saveFolder({ mailboxUid: mailbox.uid, name: "Contacts", type: FolderType.CONTACTS });
+            await ctx.saveContact({
+                mailboxUid: mailbox.uid,
+                folderUid: contacts.uid,
+                displayName: "Already Mine",
+                emails: [{ address: "Mine@Contacts.test", type: ContactAddressKind.WORK }],
+            });
+            await correspondent(mailbox, "ann@x.test", { displayName: "Ann Example", lastSeenAt: day(3) });
+            await correspondent(mailbox, "bare@x.test", { lastSeenAt: day(2) });
+            await correspondent(mailbox, "mine@contacts.test", { displayName: "Mine From Mail", lastSeenAt: day(4) });
+            await correspondent(mailbox, "done@x.test", { suggestedAt: day(1) });
+
+            const res = await suggest(mailbox.uid, owner);
+            expect(res.status).toBe(200);
+            const { folder, contacts: made } = await suggested(mailbox);
+            expect(folder).toMatchObject({ name: "Suggested Contacts", type: FolderType.SUGGESTED_CONTACTS });
+            expect(res.body).toEqual({ folderUid: folder.uid, created: 2, remaining: 0 });
+            expect(made.map((contact) => contact.displayName).sort()).toEqual(["Ann Example", "bare@x.test"]);
+            const ann = made.find((contact) => contact.displayName === "Ann Example");
+            expect(ann.mailboxUid).toBe(mailbox.uid);
+            expect(ann.emails).toEqual([{ address: "ann@x.test", type: ContactAddressKind.OTHER }]);
+            // Everything that was considered is marked.
+            const rows = await ctx.findCorrespondents(mailbox.uid);
+            for (const address of ["ann@x.test", "bare@x.test", "mine@contacts.test"]) {
+                expect(rows.find((row) => row.address === address).suggestedAt).toBeTruthy();
+            }
+            expect((await ctx.findContacts(mailbox.uid)).filter((contact) => contact.folderUid === contacts.uid)).toHaveLength(1);
+
+            // Once: nothing more is made, and the folder is the same one.
+            const again = await suggest(mailbox.uid, owner);
+            expect(again.body).toEqual({ folderUid: folder.uid, created: 0, remaining: 0 });
+            expect((await ctx.findFolders(mailbox.uid)).filter((candidate) => candidate.type === FolderType.SUGGESTED_CONTACTS)).toHaveLength(1);
+            expect((await suggested(mailbox)).contacts).toHaveLength(2);
+        });
+
+        it("never brings back a suggested contact the user deleted, and picks up people seen later", async () => {
+            const mailbox = await doneMailbox(owner);
+            await correspondent(mailbox, "gone@x.test", { displayName: "Gone Soon" });
+            const first = await suggest(mailbox.uid, owner);
+            expect(first.body.created).toBe(1);
+            const { contacts } = await suggested(mailbox);
+            await ctx.removeContact(contacts[0].uid);
+            await correspondent(mailbox, "later@x.test", { displayName: "Later Person" });
+            const second = await suggest(mailbox.uid, owner);
+            expect(second.body).toMatchObject({ created: 1, remaining: 0 });
+            expect((await suggested(mailbox)).contacts.map((contact) => contact.displayName)).toEqual(["Later Person"]);
+        });
+
+        it("includes the people from the mailbox's existing mail the first time, and leaves other mailboxes alone", async () => {
+            const mailbox = await mailboxFor(owner, { primarySmtpAddress: "me.sc@owners.test" });
+            const inbox = await ctx.saveFolder({ mailboxUid: mailbox.uid, name: "Inbox", type: FolderType.INBOX });
+            await ctx.saveMessage({
+                mailboxUid: mailbox.uid,
+                folderUid: inbox.uid,
+                messageId: uuid.v4(),
+                from: { address: "hist.sc@sender.test", displayName: "History Hank", type: "to" },
+                recipients: [{ address: "me.sc@owners.test", type: "to", displayName: "" }],
+                receivedDate: day(3),
+            });
+            const other = await doneMailbox(newUser());
+            await correspondent(other, "other.sc@x.test");
+            const res = await suggest(mailbox.uid, owner);
+            expect(res.status).toBe(200);
+            expect(res.body.created).toBe(1);
+            expect((await suggested(mailbox)).contacts.map((contact) => contact.displayName)).toEqual(["History Hank"]);
+            expect((await suggested(other)).folder).toBeUndefined();
+        });
+
+        it("is not part of the contacts directory search, which covers the user's own contacts", async () => {
+            const mailbox = await doneMailbox(owner);
+            await correspondent(mailbox, "hidden.sc@x.test", { displayName: "Hidden Suggest" });
+            await suggest(mailbox.uid, owner);
+            expect((await get("/contacts?q=hidden", owner)).body).toEqual([]);
+            expect(addresses((await get("/correspondents?q=hidden", owner)).body)).toEqual(["hidden.sc@x.test"]);
         });
     });
 }

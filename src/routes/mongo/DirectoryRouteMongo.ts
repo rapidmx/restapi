@@ -24,6 +24,7 @@ export class DirectoryRouteMongo extends BaseDirectoryRoute<MailboxMongo, Folder
     protected messageClass: any = MessageMongo;
     protected calendarEventClass: any = CalendarEventMongo;
     protected correspondentClass: any = CorrespondentMongo;
+    protected contactClass: any = ContactMongo;
 
     @Repository(MailboxMongo)
     private mailboxCollection?: MongoRepository<MailboxMongo>;

@@ -108,6 +108,14 @@ describe("Route:DirectoryMongo Tests", () => {
         saveMessage: async (fields) => await messageRepo.save(new MessageMongo(fields as any)),
         saveCalendarEvent: async (fields) => await eventRepo.save(new CalendarEventMongo(fields as any)),
         findCorrespondents: async (mailboxUid) => await correspondentRepo.find({ mailboxUid }).toArray(),
+        findContacts: async (mailboxUid) => await contactRepo.find({ mailboxUid }).toArray(),
+        findFolders: async (mailboxUid) => await folderRepo.find({ mailboxUid }).toArray(),
+        removeMailbox: async (uid) => {
+            await mailboxRepo.deleteOne({ uid });
+        },
+        removeContact: async (uid) => {
+            await contactRepo.deleteOne({ uid });
+        },
         findMailbox: async (uid) => await mailboxRepo.findOne({ uid }),
     });
 });

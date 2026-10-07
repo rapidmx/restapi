@@ -49,7 +49,7 @@ export class ContactSQL extends RecoverableBaseEntity implements Contact {
     public mailboxUid: string = "";
 
     @Column()
-    @Description("The unique identifier of the `Folder` (of type `CONTACTS`) this contact resides in.")
+    @Description("The unique identifier of the `Folder` (of type `CONTACTS` or `SUGGESTED_CONTACTS`) this contact resides in.")
     public folderUid: string = "";
 
     @Column({ nullable: true })

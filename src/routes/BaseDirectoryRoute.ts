@@ -5,12 +5,13 @@
 // The consuming application must apply `@ApiRoute("mail/directory")` to its own concrete subclass - `@Get()` and
 // `@Get("/contacts")` below then resolve to `GET /mail/directory` and `GET /mail/directory/contacts`.
 import { ApiError, ObjectDecorators, UserUtils, type JWTUser } from "@rapidrest/core";
-import { ACLAction, ACLUtils, ApiErrors, ModelUtils, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
+import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ModelUtils, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { Contact, Correspondent, DataSubjectErasureRequest, DistributionList, Folder, FolderType, Mailbox } from "../models/types.js";
 import { CorrespondentBackfillUtils, CorrespondentUtils } from "../util/CorrespondentUtils.js";
-import { hasMailAccess } from "../util/MailAccessUtils.js";
+import { assertMailAccess, hasMailAccess } from "../util/MailAccessUtils.js";
+import { SuggestedContactUtils, type SuggestedContactsResult } from "../util/SuggestedContactUtils.js";
 const { Config, Init, Inject } = ObjectDecorators;
-const { Auth, Get, Query, RateLimit, User: AuthUser } = RouteDecorators;
+const { Auth, Get, Post, Query, RateLimit, User: AuthUser } = RouteDecorators;
 
 /** What a directory entry names: a person's mailbox, a shared mailbox, a room or equipment resource, a distribution
  * list, (from `GET /contacts`) one of the caller's own contacts, or (from `GET /correspondents`) somebody the caller's
@@ -170,6 +171,8 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
     protected abstract messageClass: any;
     protected abstract calendarEventClass: any;
     protected abstract correspondentClass: any;
+    /** The `Contact` model class: `POST /suggested-contacts` writes the people a mailbox has corresponded with into its Suggested Contacts folder. */
+    protected abstract contactClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -179,12 +182,16 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
     protected messageRepo?: RepoUtils<any>;
     protected calendarEventRepo?: RepoUtils<any>;
     protected correspondentRepo?: RepoUtils<any>;
+    protected contactRepo?: RepoUtils<any>;
 
     /** Records the correspondents, built once by `initialize()` from the repositories above. */
     protected correspondentUtils?: CorrespondentUtils;
 
     /** Backfills a mailbox's correspondents from its existing mail and events, built once by `initialize()` on `correspondentUtils`. */
     protected correspondentBackfillUtils?: CorrespondentBackfillUtils;
+
+    /** Turns a mailbox's correspondents into contacts of its Suggested Contacts folder, built once by `initialize()`. */
+    protected suggestedContactUtils?: SuggestedContactUtils;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
@@ -229,6 +236,15 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
         }
         if (!this.correspondentRepo && this.correspondentClass) {
             this.correspondentRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.correspondentClass.name, args: [this.correspondentClass] });
+        }
+        if (!this.contactRepo && this.contactClass) {
+            this.contactRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.contactClass.name, args: [this.contactClass] });
+        }
+        if (!this.suggestedContactUtils && this.correspondentRepo && this.folderRepo && this.contactRepo) {
+            this.suggestedContactUtils = await this._objectFactory.newInstance(SuggestedContactUtils, {
+                name: this.correspondentClass.name,
+                args: [this.correspondentRepo, this.folderRepo, this.contactRepo, this.folderClass, this.contactClass],
+            });
         }
         if (!this.correspondentUtils && this.correspondentRepo && this.mailboxRepo) {
             this.correspondentUtils = await this._objectFactory.newInstance(CorrespondentUtils, {
@@ -405,5 +421,34 @@ export abstract class BaseDirectoryRoute<M extends Mailbox, F extends Folder> {
             }
         }
         return entries.slice(0, query.limit);
+    }
+    /**
+     * Fills the Suggested Contacts folder of `mailboxUid` - a contacts folder of its own (`FolderType.SUGGESTED_CONTACTS`), kept
+     * apart from the user's normal contacts - with a contact per person the mailbox has exchanged mail or calendar invitations
+     * with. The folder is created the first time. A mailbox's existing history is included (its correspondents are backfilled
+     * first, `CorrespondentBackfillUtils.ensureCorrespondentsBackfilled()`). Addresses that already are a contact of the mailbox
+     * (in any of its contacts folders) are skipped, and every address is considered once ever, so a suggested contact the user
+     * deleted or moved never comes back (`SuggestedContactUtils`).
+     *
+     * Needs the right to create in the mailbox (its owner, or a delegate with write access - 403 otherwise, also for an unknown
+     * mailbox; 400 without `mailboxUid`; 404 if the mailbox has gone). At most `SUGGESTED_CONTACTS_MAX_PER_CALL` contacts are
+     * created per call: while `remaining` is above `0`, call again.
+     *
+     * Responds `{ folderUid, created, remaining }`.
+     */
+    @Auth(["jwt"])
+    @RateLimit({ perUser: true, maxAttempts: DIRECTORY_MAX_ATTEMPTS, windowSeconds: DIRECTORY_WINDOW_SECONDS })
+    @Post("/suggested-contacts")
+    public async createSuggestedContacts(@Query("mailboxUid") mailboxUid: unknown, @AuthUser user?: JWTUser): Promise<SuggestedContactsResult> {
+        if (typeof mailboxUid !== "string" || !mailboxUid) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The 'mailboxUid' query parameter is required.");
+        }
+        await assertMailAccess(this.aclUtils, this.trustedRoles, user, mailboxUid, ACLAction.CREATE);
+        const mailbox: M | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        await this.correspondentBackfillUtils!.ensureCorrespondentsBackfilled(mailbox);
+        return await this.suggestedContactUtils!.ensureSuggestedContacts(mailbox.uid, user);
     }
 }

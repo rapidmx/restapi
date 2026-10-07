@@ -6,7 +6,10 @@ import { BaseEntity, RecoverableBaseEntity } from "@rapidrest/service-core";
 
 /**
  * The kind of well-known folder a `Folder` represents. `USER` is any folder created by the mailbox owner
- * (or a client) rather than one of the special system folders every mailbox is provisioned with.
+ * (or a client) rather than one of the special system folders every mailbox is provisioned with. `SUGGESTED_CONTACTS`
+ * is a system folder too, but the one exception to "every mailbox has it": it is created lazily, the first time the
+ * Contacts app asks for suggestions (`POST /mail/directory/suggested-contacts`), and holds a `Contact` per person the
+ * mailbox has corresponded with that is in no address book yet.
  */
 export enum FolderType {
     INBOX = "inbox",
@@ -20,6 +23,7 @@ export enum FolderType {
     CONTACTS = "contacts",
     TASKS = "tasks",
     NOTES = "notes",
+    SUGGESTED_CONTACTS = "suggested_contacts",
     USER = "user",
 }
 
@@ -1285,6 +1289,12 @@ export interface Correspondent extends BaseEntity {
 
     /** How the address was last encountered. */
     lastSource: CorrespondentSource;
+
+    /** When this address was turned into a contact of the mailbox's `SUGGESTED_CONTACTS` folder (or found to be a contact
+     * already), or `undefined` if it has not been considered yet. Once set the address is never turned into a suggested
+     * contact again, so a contact the user deleted or moved to their own contacts never comes back. Optional rather than
+     * a defaulted required field so that adding this column never requires a backfill in a SQL deployment. */
+    suggestedAt?: Date;
 }
 
 /**
@@ -1403,7 +1413,7 @@ export interface Contact extends RecoverableBaseEntity {
     /** The unique identifier of the `Mailbox` this contact belongs to. */
     mailboxUid: string;
 
-    /** The unique identifier of the `Folder` (of type `CONTACTS`) this contact resides in. */
+    /** The unique identifier of the `Folder` (of type `CONTACTS` or `SUGGESTED_CONTACTS`) this contact resides in. */
     folderUid: string;
 
     /** The unique identifier of the `ContactList` this contact is a member of, if any. */

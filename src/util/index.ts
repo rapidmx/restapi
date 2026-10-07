@@ -21,6 +21,7 @@ export * from "./CalendarEventUtils.js";
 export * from "./ClientIpUtils.js";
 export * from "./ConversationUtils.js";
 export * from "./CorrespondentUtils.js";
+export * from "./SuggestedContactUtils.js";
 export * from "./DateCoercionUtils.js";
 export * from "./DeliveryFailureNoticeUtils.js";
 export * from "./DistributionListUtils.js";

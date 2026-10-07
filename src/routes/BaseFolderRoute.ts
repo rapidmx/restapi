@@ -33,7 +33,7 @@ const SHARE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const SERVER_MANAGED_FOLDER_FIELDS = ["unreadCount", "totalCount", "syncKeyVersion", "mailboxUid"] as const;
 
 /** The types of folder a client may create: the user's own folders and the extra calendars, address books, task lists and note
- * folders it makes. Every other type (the mail folders) is made by the server alone (`ensureWellKnownFolders()`): the message
+ * folders it makes. Every other type (the mail folders and `SUGGESTED_CONTACTS`) is made by the server alone (`ensureWellKnownFolders()`): the message
  * routes' guards (Drafts is writable and sendable, Sent Items can be recalled, a held message's fields are frozen outside
  * Drafts) all key off the folder's `type`, so a client that could pick one could defeat them. */
 const CLIENT_CREATABLE_FOLDER_TYPES: ReadonlySet<string> = new Set<string>([
@@ -108,7 +108,9 @@ function stripUnsafeQueryKeys(query: any): Record<string, any> {
  * counts. The live `{ action: "update", data: { uid, mailboxUid, unreadCount, totalCount } }` event published when a
  * message write changes a folder's counts is described in `util/FolderCountUtils.ts`.
  *
- * **Every mailbox has every well-known folder.** `find` (which always names a `mailboxUid`) and `findById` first make
+ * **Every mailbox has every well-known folder** (all of `WELL_KNOWN_FOLDER_TYPES`; the `SUGGESTED_CONTACTS` folder is the
+ * exception - it is created lazily by `POST /mail/directory/suggested-contacts`, never by a client, and once it exists it
+ * is listed like any other folder). `find` (which always names a `mailboxUid`) and `findById` first make
  * sure the mailbox the caller is allowed to list has all of them (`ensureWellKnownFolders()`, `util/FolderUtils.ts`):
  * one existence query per request, nothing written when the set is complete, best-effort (a failure is logged and the
  * read goes on). This is how a mailbox created before its folders were all provisioned at creation (or one that never

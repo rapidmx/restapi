@@ -51,6 +51,7 @@ const DEFAULT_FOLDER_NAMES: Record<FolderType, string> = {
     [FolderType.CONTACTS]: "Contacts",
     [FolderType.TASKS]: "Tasks",
     [FolderType.NOTES]: "Notes",
+    [FolderType.SUGGESTED_CONTACTS]: "Suggested Contacts",
     [FolderType.USER]: "New Folder",
 };
 
@@ -63,11 +64,12 @@ export function wellKnownFolderUid(mailboxUid: string, type: FolderType): string
     return nameBasedUuid(`folder:${mailboxUid}:${type}`);
 }
 
-/** A folder type every mailbox has exactly one of (every `FolderType` but `USER`). */
+/** A folder type a mailbox has at most one of (every `FolderType` but `USER`). Every one is in `WELL_KNOWN_FOLDER_TYPES`
+ * except `SUGGESTED_CONTACTS`, which is created lazily by `findOrCreateWellKnownFolder()` rather than for every mailbox. */
 export type WellKnownFolderType = Exclude<FolderType, FolderType.USER>;
 
 /**
- * Every well-known folder a mailbox has, in the order `ensureWellKnownFolders()` creates them (so a listing ordered by
+ * Every well-known folder every mailbox has (all but `SUGGESTED_CONTACTS`, which only mailboxes that use suggested contacts have), in the order `ensureWellKnownFolders()` creates them (so a listing ordered by
  * `dateCreated` reads Inbox first): the mail set - Inbox, Drafts, Outbox, Sent Items, Deleted Items, Junk Email, Archive -
  * and the calendar, contacts, tasks and notes folders.
  */

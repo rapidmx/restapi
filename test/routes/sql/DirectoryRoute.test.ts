@@ -93,6 +93,14 @@ describe("Route:DirectorySQL Tests", () => {
         saveMessage: async (fields) => await messageRepo.save(new MessageSQL(fields as any)),
         saveCalendarEvent: async (fields) => await eventRepo.save(new CalendarEventSQL(fields as any)),
         findCorrespondents: async (mailboxUid) => await correspondentRepo.find({ where: { mailboxUid } }),
+        findContacts: async (mailboxUid) => await contactRepo.find({ where: { mailboxUid } }),
+        findFolders: async (mailboxUid) => await folderRepo.find({ where: { mailboxUid } }),
+        removeMailbox: async (uid) => {
+            await mailboxRepo.delete({ uid });
+        },
+        removeContact: async (uid) => {
+            await contactRepo.delete({ uid });
+        },
         findMailbox: async (uid) => await mailboxRepo.findOne({ where: { uid } }),
     });
 });

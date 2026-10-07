@@ -48,6 +48,7 @@ export class DirectoryRouteSQL extends BaseDirectoryRoute<MailboxSQL, FolderSQL>
     protected messageClass: any = MessageSQL;
     protected calendarEventClass: any = CalendarEventSQL;
     protected correspondentClass: any = CorrespondentSQL;
+    protected contactClass: any = ContactSQL;
 
     @Repository(MailboxSQL)
     private mailboxTable?: TypeOrmRepository<MailboxSQL>;

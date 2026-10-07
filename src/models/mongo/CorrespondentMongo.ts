@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
+import { ObjectDecorators } from "@rapidrest/core";
 import { Correspondent, CorrespondentSource } from "../types.js";
 const { Description } = DocDecorators;
+const { Nullable } = ObjectDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity, Index } = PersistenceDecorators;
 
@@ -60,6 +62,11 @@ export class CorrespondentMongo extends BaseMongoEntity implements Correspondent
     @Description("How the address was last encountered: received, sent or event.")
     public lastSource: CorrespondentSource = "received";
 
+    @Column()
+    @Description("When this address was turned into a suggested contact (or found to be a contact already), if it has been.")
+    @Nullable
+    public suggestedAt?: Date;
+
     constructor(other?: Partial<CorrespondentMongo>) {
         super(other);
 
@@ -70,6 +77,7 @@ export class CorrespondentMongo extends BaseMongoEntity implements Correspondent
             this.lastSeenAt = other.lastSeenAt !== undefined ? other.lastSeenAt : this.lastSeenAt;
             this.count = other.count !== undefined ? other.count : this.count;
             this.lastSource = other.lastSource !== undefined ? other.lastSource : this.lastSource;
+            this.suggestedAt = "suggestedAt" in other ? other.suggestedAt : this.suggestedAt;
         }
     }
 }
