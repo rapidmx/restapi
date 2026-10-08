@@ -2253,6 +2253,12 @@ export interface CalendarEvent extends RecoverableBaseEntity {
      * ever sends a given occurrence's reminder. System-managed; `undefined` means no reminder sent yet. */
     reminderSentFor?: Date;
 
+    /** The start of the latest occurrence of this event whose start-time alarm `CalendarReminderJob` has claimed/sent
+     * (every non-cancelled, non-all-day occurrence alarms at its start, reminder or not). Claimed exactly like
+     * `reminderSentFor`, with its own marker so the two alarms of one occurrence are independent. System-managed;
+     * `undefined` means no start alarm sent yet. */
+    startAlarmSentFor?: Date;
+
     /**
      * Provenance for this event's encryption state, per `specs/search.md` §3 "Provenance" (refining
      * `specs/end-to-end_encryption.md`'s "Derived Entities" section, which this field originally implemented

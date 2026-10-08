@@ -11,12 +11,20 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 const MS_PER_MINUTE = 60 * 1000;
 
+/** The two alarms of an occurrence: the lead-time reminder and the alarm at the occurrence start itself. */
+type AlarmKind = "reminder" | "start";
+
 /** How far past a run's fire window `processEvent()` looks for a recurring master's next occurrence, to remember when it is next due. */
 const NEXT_REMINDER_LOOKAHEAD_MS = 400 * 24 * 60 * MS_PER_MINUTE;
 
 /**
- * Dispatches a `"reminder"` push notification (to the event's folder and mailbox channels) when an event
- * occurrence's reminder fire time (`occurrence start - reminderMinutesBeforeStart`) comes due. The payload carries
+ * Dispatches a `"reminder"` push notification (to the event's folder and mailbox channels) when an alarm of an
+ * event occurrence comes due. Every occurrence has up to two alarms, each sent as the same `"reminder"` push:
+ * the REMINDER at `occurrence start - reminderMinutesBeforeStart` (only when that is set and greater than 0) and
+ * the START alarm at the occurrence start itself - so an event alarms at its start even with no reminder at all.
+ * A lead of `0` makes the two coincide: it fires once, as the reminder. Cancelled events never alarm, and the
+ * START alarm is skipped for `allDay` events (their start is midnight; an all-day event's reminder still fires).
+ * The payload carries
  * the event's own `location` verbatim (`{ eventUid, title, startDate, location }`) - plain, undecorated text a
  * client is free to read as a join link when it looks like one (e.g. a video-conferencing URL), same as anywhere
  * else `location` is already shown as-is. Not actually encrypted today regardless of `encryptionOrigin` (see that
@@ -33,18 +41,20 @@ const NEXT_REMINDER_LOOKAHEAD_MS = 400 * 24 * 60 * MS_PER_MINUTE;
  *
  * **Recurring events.** Masters (`recurrenceRule` set) are expanded through `expandOccurrences()` (in the event's
  * own time zone), excluding `RecurrenceRule.exceptions` and the `recurrenceId` of every sibling override row, which
- * fires its own reminder from its own row.
+ * fires its own alarms from its own row.
  *
- * **Candidates.** Non-recurring rows and override rows are read by `startDate` from the watermark up to
+ * **Candidates.** Every event is a candidate whether or not it has a reminder (it alarms at its start regardless).
+ * Non-recurring rows and override rows are read by `startDate` from the watermark up to
  * `now + window_seconds + max_lead_minutes`, keyset-paged on `(startDate, uid)` in `batch_size` pages; recurring
  * masters are read separately (their `startDate` is the series start, not the next occurrence), narrowed to
  * non-cancelled masters starting before that same upper bound, and skipped before expansion when their
  * `recurrenceRule.until` has already passed. There is no page cap: every candidate is read each run. A reminder set further ahead than
- * `max_lead_minutes` (default 14 days) on a non-recurring event is never picked up - raise the setting if such
- * reminders matter.
+ * `max_lead_minutes` (default 14 days) on a non-recurring event is never picked up (its start alarm still is) -
+ * raise the setting if such reminders matter.
  *
- * **Exactly once across replicas.** Before sending, the job claims the occurrence by writing
- * `reminderSentFor = occurrence start` with an optimistic-lock (versioned) update. Only the replica whose update
+ * **Exactly once across replicas.** Before sending, the job claims the occurrence by writing the kind's marker
+ * (`reminderSentFor` for the reminder, `startAlarmSentFor` for the start alarm) `= occurrence start` with an
+ * optimistic-lock (versioned) update. The two kinds are processed sequentially (reminder first), each with its own claim. Only the replica whose update
  * wins sends; a replica that loses re-reads the row and retries once if the conflict came from an unrelated edit
  * rather than another replica's claim. The claim is written before the send, so a notification that then fails to
  * publish is logged and not retried (at-most-once, which suits a reminder).
@@ -89,8 +99,8 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
     /** Upper bound (epoch ms) of the fire window the previous successful run in this process covered. */
     private watermarkMs?: number;
 
-    /** Per recurring master (by uid): the row version it was expanded at, and the earliest time a reminder of it can next be due -
-     * see `processEvent()`. In memory and per process, so a restart simply expands every master once more. */
+    /** Per recurring master and alarm kind (`${uid}:reminder` / `${uid}:start`): the row version it was expanded at, and the earliest time
+     * that alarm of it can next be due - see `processKind()`. In memory and per process, so a restart simply expands every master once more. */
     private nextDue: Map<string, { version: number; notBeforeMs: number }> = new Map();
 
     public get schedule(): string | undefined {
@@ -134,7 +144,7 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         // only the query) - same for `page`.
         const upperStartMs: number = horizonMs + Number(this.maxLeadMinutes) * MS_PER_MINUTE;
         await this.readKeyset(
-            { reminderMinutesBeforeStart: "ne(null)" },
+            {},
             "startDate",
             new Date(lowerMs),
             (rows) => {
@@ -155,7 +165,6 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
             {
                 recurrenceRule: "ne(null)",
                 recurrenceId: null,
-                reminderMinutesBeforeStart: "ne(null)",
                 status: `ne(${CalendarEventStatus.CANCELLED})`,
                 startDate: `lte(${new Date(upperStartMs).toISOString()})`,
             },
@@ -182,9 +191,9 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         }
 
         // A master that is no longer a candidate (ended, cancelled, deleted) needs no remembered time.
-        for (const uid of this.nextDue.keys()) {
-            if (!candidates.has(uid)) {
-                this.nextDue.delete(uid);
+        for (const key of this.nextDue.keys()) {
+            if (!candidates.has(key.slice(0, key.lastIndexOf(":")))) {
+                this.nextDue.delete(key);
             }
         }
 
@@ -249,17 +258,32 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
     }
 
     private async processEvent(event: CE, lowerMs: number, horizonMs: number): Promise<void> {
-        const reminderMinutes = event.reminderMinutesBeforeStart;
-        if (reminderMinutes === undefined || reminderMinutes === null || Number(reminderMinutes) < 0 || event.status === CalendarEventStatus.CANCELLED) {
+        if (event.status === CalendarEventStatus.CANCELLED) {
             return;
         }
-        const leadMs: number = Number(reminderMinutes) * MS_PER_MINUTE;
+        const minutes = event.reminderMinutesBeforeStart;
+        const lead: number = minutes === undefined || minutes === null ? -1 : Number(minutes);
+        // Sequential on purpose: the second claim must see the row version the first claim's update produced.
+        if (lead >= 0) {
+            // A lead of 0 is the reminder at the start itself - the one alarm of that occurrence.
+            await this.processKind(event, "reminder", lead * MS_PER_MINUTE, lowerMs, horizonMs);
+        }
+        // An all-day event's "start" is midnight - not an alarm anyone wants; with a lead of 0 the reminder already is the start alarm.
+        if (lead !== 0 && !event.allDay) {
+            await this.processKind(event, "start", 0, lowerMs, horizonMs);
+        }
+    }
+
+    /** Fires `event`'s due alarm of `kind` (if any) - `leadMs` is how long before the occurrence start it fires. */
+    private async processKind(event: CE, kind: AlarmKind, leadMs: number, lowerMs: number, horizonMs: number): Promise<void> {
+        const marker: string = kind === "reminder" ? "reminderSentFor" : "startAlarmSentFor";
+        const cacheKey = `${event.uid}:${kind}`;
         const isMaster: boolean = !!event.recurrenceRule && !event.recurrenceId;
 
-        // A master whose next reminder was found, on an earlier run, to be further away than this run's window is not expanded
+        // A master whose next alarm was found, on an earlier run, to be further away than this run's window is not expanded
         // again until then (expanding a series is the costly part of every run, done on the event loop) - unless its row has
         // changed since, which makes what was remembered stale.
-        const remembered: { version: number; notBeforeMs: number } | undefined = isMaster ? this.nextDue.get(event.uid) : undefined;
+        const remembered: { version: number; notBeforeMs: number } | undefined = isMaster ? this.nextDue.get(cacheKey) : undefined;
         if (remembered && remembered.version === (event as any).version && horizonMs < remembered.notBeforeMs) {
             return;
         }
@@ -270,7 +294,7 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         }
         // Only occurrence *starts* matter here, so expand as zero-length occurrences: `expandOccurrences()`'s
         // overlap test then reduces to `windowStart < start < windowEnd` (hence the 1ms on the inclusive end), and a
-        // row with a missing/inverted `endDate` can't hide its reminder.
+        // row with a missing/inverted `endDate` can't hide its alarm.
         const windowStart = new Date(lowerMs + leadMs);
         const windowEnd = new Date(horizonMs + leadMs + 1);
         const expand = (): OccurrenceWindow[] =>
@@ -286,7 +310,7 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
                 // look-ahead - when the look-ahead itself runs out.
                 const lookAheadEnd = new Date(windowEnd.getTime() + NEXT_REMINDER_LOOKAHEAD_MS);
                 const [next] = this.expandStarts(event, isMaster, excludeDates, new Date(windowEnd.getTime() - 1), lookAheadEnd);
-                this.nextDue.set(event.uid, {
+                this.nextDue.set(cacheKey, {
                     version: (event as any).version,
                     notBeforeMs: next ? next.start.getTime() - leadMs : lookAheadEnd.getTime() - leadMs,
                 });
@@ -295,7 +319,7 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         }
         if (isMaster) {
             // Only worth the extra query once an occurrence is actually due: a sibling override row represents
-            // that occurrence itself (and fires its own reminder from its own row).
+            // that occurrence itself (and fires its own alarms from its own row).
             const overrides: CE[] = await this.calendarEventRepo!.find(
                 { icalUid: event.icalUid, mailboxUid: event.mailboxUid, recurrenceId: "ne(null)", limit: 1000 } as any,
                 { ignoreACL: true, limit: 1000 },
@@ -308,9 +332,9 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         }
 
         // Only the latest due occurrence gets a notification - after downtime there's no value in a burst of stale
-        // reminders for the same series.
+        // alarms for the same series.
         const occurrence: OccurrenceWindow = due[due.length - 1];
-        if (!(await this.claim(event, occurrence.start, isMaster))) {
+        if (!(await this.claim(event, marker, occurrence.start, isMaster))) {
             return;
         }
         this.notificationUtils?.sendMessage([event.folderUid, event.mailboxUid], "CalendarEvent", "reminder", {
@@ -321,26 +345,27 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         });
     }
 
-    /** `true` if `occurrenceStart` has already had its reminder claimed on `event`. */
-    private alreadySent(event: CE, occurrenceStart: Date, isMaster: boolean): boolean {
-        if (event.reminderSentFor === undefined || event.reminderSentFor === null) {
+    /** `true` if `occurrenceStart` has already had its alarm claimed on `event` (in `marker`). */
+    private alreadySent(event: CE, marker: string, occurrenceStart: Date, isMaster: boolean): boolean {
+        const sent: any = (event as any)[marker];
+        if (sent === undefined || sent === null) {
             return false;
         }
-        const sentMs: number = new Date(event.reminderSentFor).getTime();
+        const sentMs: number = new Date(sent).getTime();
         // A recurring series only ever moves forward. A single event can be rescheduled earlier or later, and
         // either way its new start deserves a reminder.
         return isMaster ? occurrenceStart.getTime() <= sentMs : occurrenceStart.getTime() === sentMs;
     }
 
     /**
-     * Claims `occurrenceStart`'s reminder with a versioned update of `reminderSentFor`. Returns `false` if it was
+     * Claims `occurrenceStart`'s alarm with a versioned update of `marker`. Returns `false` if it was
      * already claimed (possibly by another replica). On a version conflict, re-reads the row once: if the fresh
      * row is already claimed another replica won; otherwise the conflict came from an unrelated edit, so retry.
      */
-    private async claim(event: CE, occurrenceStart: Date, isMaster: boolean): Promise<boolean> {
+    private async claim(event: CE, marker: string, occurrenceStart: Date, isMaster: boolean): Promise<boolean> {
         let current: CE | undefined = event;
         for (let attempt = 0; attempt < 2 && current; attempt++) {
-            if (this.alreadySent(current, occurrenceStart, isMaster)) {
+            if (this.alreadySent(current, marker, occurrenceStart, isMaster)) {
                 return false;
             }
             // `RepoUtils.find()` on the Mongo backend returns raw documents, and `RepoUtils.update()` only enforces
@@ -348,12 +373,16 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
             // `updateOne({ uid })`. Instantiating the model class is what makes the claim a real compare-and-set.
             const existing: CE = current instanceof this.calendarEventClass ? current : new this.calendarEventClass(current);
             try {
-                await this.calendarEventRepo!.update(
-                    { uid: existing.uid, version: (existing as any).version, reminderSentFor: occurrenceStart } as any,
+                const saved: any = await this.calendarEventRepo!.update(
+                    { uid: existing.uid, version: (existing as any).version, [marker]: occurrenceStart } as any,
                     existing,
                     // The marker is job bookkeeping, not a user-visible change - don't broadcast an "update" push.
                     { ignoreACL: true, skipPush: true },
                 );
+                // Carry the claim over to the caller's copy, so the next alarm kind of this same row claims against the
+                // row's new version instead of failing its first attempt on a stale one.
+                (event as any).version = saved.version;
+                (event as any)[marker] = occurrenceStart;
                 return true;
             } catch (err: any) {
                 if (err?.code !== ApiErrors.INVALID_OBJECT_VERSION) {

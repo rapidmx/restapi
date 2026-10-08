@@ -164,6 +164,11 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
     public reminderSentFor?: Date;
 
     @Column()
+    @Description("The start of the latest occurrence whose start-time alarm has been sent (system-managed).")
+    @Nullable
+    public startAlarmSentFor?: Date;
+
+    @Column()
     @Description("Provenance for this event's encryption state - see EncryptionOrigin's own doc comment.")
     public encryptionOrigin: EncryptionOrigin = "none";
 
@@ -248,6 +253,7 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
             this.inviteSequenceSent = "inviteSequenceSent" in other ? other.inviteSequenceSent : this.inviteSequenceSent;
             this.cancelNoticeSentAt = "cancelNoticeSentAt" in other ? other.cancelNoticeSentAt : this.cancelNoticeSentAt;
             this.reminderSentFor = "reminderSentFor" in other ? other.reminderSentFor : this.reminderSentFor;
+            this.startAlarmSentFor = "startAlarmSentFor" in other ? other.startAlarmSentFor : this.startAlarmSentFor;
             this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
             this.videoMeetingUid = "videoMeetingUid" in other ? other.videoMeetingUid : this.videoMeetingUid;
             this.description = "description" in other ? other.description : this.description;

@@ -127,7 +127,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * setting them could suppress invites, cancellation notices or reminders (or trigger them again). Dropped from a
      * non-trusted caller's create/update body by `BaseScopedChildRoute`, so a full-object round trip keeps the stored
      * values. */
-    protected readonly serverManagedFields: readonly string[] = ["inviteSequenceSent", "cancelNoticeSentAt", "reminderSentFor"];
+    protected readonly serverManagedFields: readonly string[] = ["inviteSequenceSent", "cancelNoticeSentAt", "reminderSentFor", "startAlarmSentFor"];
 
     /** The concrete `Folder` entity class, supplied by the Mongo/SQL concrete subclass - used only by
      * `resolveMailboxUidFor()` below. */

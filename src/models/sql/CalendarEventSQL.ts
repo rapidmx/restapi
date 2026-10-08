@@ -169,6 +169,11 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
     @Nullable
     public reminderSentFor?: Date;
 
+    @Column({ nullable: true })
+    @Description("The start of the latest occurrence whose start-time alarm has been sent (system-managed).")
+    @Nullable
+    public startAlarmSentFor?: Date;
+
     // `nullable: true`: added after the table already existed in deployed installations, and this framework's
     // `@Column` decorator has no SQL-level `DEFAULT` option (see `ColumnOptions`) - without `nullable: true`,
     // `synchronize: true`'s `ALTER TABLE ... ADD COLUMN ... NOT NULL` fails outright against a populated table
@@ -265,6 +270,7 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
             this.inviteSequenceSent = "inviteSequenceSent" in other ? other.inviteSequenceSent : this.inviteSequenceSent;
             this.cancelNoticeSentAt = "cancelNoticeSentAt" in other ? other.cancelNoticeSentAt : this.cancelNoticeSentAt;
             this.reminderSentFor = "reminderSentFor" in other ? other.reminderSentFor : this.reminderSentFor;
+            this.startAlarmSentFor = "startAlarmSentFor" in other ? other.startAlarmSentFor : this.startAlarmSentFor;
             this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
             this.videoMeetingUid = "videoMeetingUid" in other ? other.videoMeetingUid : this.videoMeetingUid;
             this.description = "description" in other ? other.description : this.description;

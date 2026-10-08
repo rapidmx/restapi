@@ -195,7 +195,7 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
         }
     });
 
-    it("Skips an event with no reminderMinutesBeforeStart configured.", async () => {
+    it("Does not fire an event with no reminderMinutesBeforeStart configured before its start.", async () => {
         const now = Date.now();
         await createEvent({ startDate: new Date(now + 5 * 60 * 1000), reminderMinutesBeforeStart: undefined });
 
@@ -204,7 +204,7 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
         expect(fakeRedis.published).toHaveLength(0);
     });
 
-    it("Skips an event with a null reminderMinutesBeforeStart.", async () => {
+    it("Does not fire an event with a null reminderMinutesBeforeStart before its start.", async () => {
         const now = Date.now();
         await createEvent({ startDate: new Date(now + 5 * 60 * 1000), reminderMinutesBeforeStart: null as any });
 
@@ -222,14 +222,17 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
         expect(fakeRedis.published).toHaveLength(0);
     });
 
-    it("Skips an event whose reminder fire time has already passed.", async () => {
+    it("Skips the reminder of an event whose reminder fire time has already passed, but still alarms at its start.", async () => {
         const now = Date.now();
-        // startDate=now+1min, reminderMinutesBeforeStart=10 -> fireAt=now-9min, before `now`.
-        await createEvent({ startDate: new Date(now + 60 * 1000), reminderMinutesBeforeStart: 10 });
+        // startDate=now+1min, reminderMinutesBeforeStart=10 -> fireAt=now-9min, before `now`; the start alarm is due.
+        const event = await createEvent({ startDate: new Date(now + 60 * 1000), reminderMinutesBeforeStart: 10 });
 
         await job.run();
 
-        expect(fakeRedis.published).toHaveLength(0);
+        expect(fakeRedis.published).toHaveLength(2);
+        const stored: any = await calendarEventRepo.findOne({ where: { uid: event.uid } });
+        expect(stored.reminderSentFor).toBeFalsy();
+        expect(stored.startAlarmSentFor).toBeTruthy();
     });
 
     it("Skips an event whose reminder fire time is beyond the polling window.", async () => {
@@ -332,15 +335,15 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
 
     it("Catches a fire time that fell between runs after scheduler drift (watermark), but not one older than the initial lookback on a first run.", async () => {
         const now = Date.now();
-        // fireAt = now - 5 min: older than the 120s first-run lookback...
-        await createEvent({ startDate: new Date(now + 60 * 1000), reminderMinutesBeforeStart: 6 });
+        // fireAt = now - 5 min: older than the 120s first-run lookback (the start alarm, at now + 5 min, is not yet due)...
+        await createEvent({ startDate: new Date(now + 5 * 60 * 1000), reminderMinutesBeforeStart: 10 });
 
         await job.run();
         expect(fakeRedis.published).toHaveLength(0);
 
         // ...but inside the window since the previous run when that run was 10 minutes ago.
         await calendarEventRepo.clear();
-        await createEvent({ startDate: new Date(now + 60 * 1000), reminderMinutesBeforeStart: 6 });
+        await createEvent({ startDate: new Date(now + 5 * 60 * 1000), reminderMinutesBeforeStart: 10 });
         (job as any).watermarkMs = now - 10 * 60 * 1000;
         await job.run();
         expect(fakeRedis.published).toHaveLength(2);
@@ -451,7 +454,7 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
             await job.run();
 
             expect(fakeRedis.published).toHaveLength(0);
-            const remembered = (job as any).nextDue.get(event.uid);
+            const remembered = (job as any).nextDue.get(`${event.uid}:reminder`);
             const stored = (await calendarEventRepo.findOne({ where: { uid: event.uid } }))!;
             expect(remembered.notBeforeMs).toBe(nextStartMs - Number(stored.reminderMinutesBeforeStart) * 60 * 1000);
             expect(remembered.version).toBe((await calendarEventRepo.findOne({ where: { uid: event.uid } }))!.version);
@@ -471,23 +474,23 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
             const version = (await calendarEventRepo.findOne({ where: { uid: event.uid } }))!.version;
 
             // Remembered as not due for a day: skipped.
-            (job as any).nextDue.set(event.uid, { version, notBeforeMs: now + 24 * 60 * 60 * 1000 });
+            (job as any).nextDue.set(`${event.uid}:reminder`, { version, notBeforeMs: now + 24 * 60 * 60 * 1000 });
             await job.run();
             expect(fakeRedis.published).toHaveLength(0);
 
             // The row has been edited since (another version): expanded again, and the reminder goes out.
             (job as any).watermarkMs = undefined;
-            (job as any).nextDue.set(event.uid, { version: version - 1, notBeforeMs: now + 24 * 60 * 60 * 1000 });
+            (job as any).nextDue.set(`${event.uid}:reminder`, { version: version - 1, notBeforeMs: now + 24 * 60 * 60 * 1000 });
             await job.run();
             expect(fakeRedis.published).toHaveLength(2);
         });
 
         it("Forgets a master that no longer comes up as a candidate.", async () => {
-            (job as any).nextDue.set("gone", { version: 0, notBeforeMs: Date.now() + 1000 });
+            (job as any).nextDue.set("gone:reminder", { version: 0, notBeforeMs: Date.now() + 1000 });
 
             await job.run();
 
-            expect((job as any).nextDue.has("gone")).toBe(false);
+            expect((job as any).nextDue.has("gone:reminder")).toBe(false);
         });
     });
 
@@ -520,5 +523,236 @@ describe("CalendarReminderJobSQL Tests (real DB + DI)", () => {
         await job.run();
 
         expect(fakeRedis.published).toHaveLength(0);
+    });
+
+    describe("Start-time alarm", () => {
+        const readRow = async (uid: string): Promise<any> => calendarEventRepo.findOne({ where: { uid } });
+        /** The notifications broadcast so far (one publish per channel, so count the folder channel's). */
+        const notifications = (): any[] => fakeRedis.published.filter((p) => p.channel === folderUid).map((p) => JSON.parse(p.message));
+        const daily = { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] };
+        const secondsFromNow = (seconds: number): Date => new Date(Math.floor((Date.now() + seconds * 1000) / 1000) * 1000);
+        const claimedMarkers = (updateSpy: any): string[] =>
+            updateSpy.mock.calls.map((call: any[]) => ("reminderSentFor" in call[0] ? "reminderSentFor" : "startAlarmSentFor"));
+
+        it("Fires at the start of an event that has no reminder, with the unchanged push shape.", async () => {
+            const event = await createEvent({ startDate: secondsFromNow(30), location: "Room 1" });
+
+            await job.run();
+
+            expect(fakeRedis.published).toHaveLength(2);
+            expect(notifications()).toEqual([
+                {
+                    type: "CalendarEvent",
+                    action: "reminder",
+                    data: { eventUid: event.uid, title: event.title, startDate: event.startDate.toISOString(), location: "Room 1" },
+                },
+            ]);
+            const stored = await readRow(event.uid);
+            expect(new Date(stored.startAlarmSentFor).getTime()).toBe(new Date(event.startDate).getTime());
+            expect(stored.reminderSentFor).toBeFalsy();
+        });
+
+        it("Fires at the start of an event with a null or negative reminder.", async () => {
+            await createEvent({ startDate: secondsFromNow(30), reminderMinutesBeforeStart: null as any });
+            await createEvent({ startDate: secondsFromNow(30), reminderMinutesBeforeStart: -5 });
+
+            await job.run();
+
+            expect(notifications()).toHaveLength(2);
+        });
+
+        it("Fires both the reminder and the start alarm of one event, separately, each once and in order.", async () => {
+            const event = await createEvent({ startDate: secondsFromNow(30), reminderMinutesBeforeStart: 1 });
+            // The previous run (conceptually) was long enough ago that the reminder's fire time is inside this run's window too.
+            (job as any).watermarkMs = Date.now() - 10 * 60 * 1000;
+            const updateSpy = vi.spyOn((job as any).calendarEventRepo, "update");
+            try {
+                await job.run();
+                (job as any).watermarkMs = Date.now() - 10 * 60 * 1000;
+                await job.run();
+
+                expect(claimedMarkers(updateSpy)).toEqual(["reminderSentFor", "startAlarmSentFor"]);
+            } finally {
+                updateSpy.mockRestore();
+            }
+
+            expect(notifications()).toHaveLength(2);
+            const stored = await readRow(event.uid);
+            expect(new Date(stored.reminderSentFor).getTime()).toBe(new Date(event.startDate).getTime());
+            expect(new Date(stored.startAlarmSentFor).getTime()).toBe(new Date(event.startDate).getTime());
+        });
+
+        it("Fires once, as the reminder, when the lead is 0.", async () => {
+            const event = await createEvent({ startDate: secondsFromNow(30), reminderMinutesBeforeStart: 0 });
+
+            await job.run();
+
+            expect(notifications()).toHaveLength(1);
+            const stored = await readRow(event.uid);
+            expect(new Date(stored.reminderSentFor).getTime()).toBe(new Date(event.startDate).getTime());
+            expect(stored.startAlarmSentFor).toBeFalsy();
+        });
+
+        it("Fires nothing for an all-day event with no reminder.", async () => {
+            await createEvent({ startDate: secondsFromNow(30), allDay: true });
+
+            await job.run();
+
+            expect(fakeRedis.published).toHaveLength(0);
+        });
+
+        it("Fires only the reminder for an all-day event with a reminder (and nothing for a lead of 0 on a different day).", async () => {
+            const event = await createEvent({ startDate: secondsFromNow(30), allDay: true, reminderMinutesBeforeStart: 1 });
+            (job as any).watermarkMs = Date.now() - 10 * 60 * 1000;
+
+            await job.run();
+
+            expect(notifications()).toHaveLength(1);
+            const stored = await readRow(event.uid);
+            expect(stored.reminderSentFor).toBeTruthy();
+            expect(stored.startAlarmSentFor).toBeFalsy();
+        });
+
+        it("Fires nothing for a cancelled event, reminder or not.", async () => {
+            await createEvent({ startDate: secondsFromNow(30), status: CalendarEventStatus.CANCELLED });
+            await createEvent({ startDate: secondsFromNow(30), status: CalendarEventStatus.CANCELLED, reminderMinutesBeforeStart: 0 });
+
+            await job.run();
+
+            expect(fakeRedis.published).toHaveLength(0);
+        });
+
+        it("Never sends the same occurrence's start alarm twice across runs.", async () => {
+            await createEvent({ startDate: secondsFromNow(30) });
+
+            await job.run();
+            (job as any).watermarkMs = undefined;
+            await job.run();
+
+            expect(notifications()).toHaveLength(1);
+        });
+
+        it("Sends exactly one start alarm when two replicas run at the same moment.", async () => {
+            await createEvent({ startDate: secondsFromNow(30) });
+            const replica = await objectFactory.newInstance(JobClass, { name: "replica-start" });
+            const replicaRepo: any = (replica as any).calendarEventRepo;
+            const realFind = replicaRepo.find.bind(replicaRepo);
+            let raced = false;
+            const findSpy = vi.spyOn(replicaRepo, "find").mockImplementation(async (...args: any[]) => {
+                const rows = await realFind(...args);
+                if (!raced) {
+                    raced = true;
+                    await job.run();
+                }
+                return rows;
+            });
+
+            try {
+                await replica.run();
+            } finally {
+                findSpy.mockRestore();
+            }
+
+            expect(notifications()).toHaveLength(1);
+        });
+
+        it("Fires a recurring master with no reminder at its occurrence start, once.", async () => {
+            const occurrenceStart = secondsFromNow(30);
+            const seriesStart = new Date(occurrenceStart.getTime() - 10 * 24 * 60 * 60 * 1000);
+            const event = await createEvent({
+                startDate: seriesStart,
+                endDate: new Date(seriesStart.getTime() + 30 * 60 * 1000),
+                recurrenceRule: daily,
+            });
+
+            await job.run();
+            (job as any).watermarkMs = undefined;
+            await job.run();
+
+            expect(notifications().map((n) => [n.data.eventUid, n.data.title, n.data.startDate])).toEqual([
+                [event.uid, event.title, occurrenceStart.toISOString()],
+            ]);
+            const stored = await readRow(event.uid);
+            expect(new Date(stored.startAlarmSentFor).getTime()).toBe(occurrenceStart.getTime());
+        });
+
+        it("Fires a one-off override row with no reminder at its own start, in place of the master's replaced occurrence.", async () => {
+            const occurrenceStart = secondsFromNow(30);
+            const seriesStart = new Date(occurrenceStart.getTime() - 10 * 24 * 60 * 60 * 1000);
+            const icalUid = uuid.v4();
+            await createEvent({
+                icalUid,
+                startDate: seriesStart,
+                endDate: new Date(seriesStart.getTime() + 30 * 60 * 1000),
+                recurrenceRule: daily,
+            });
+            const movedStart = secondsFromNow(40);
+            const override = await createEvent({
+                icalUid,
+                recurrenceId: occurrenceStart,
+                startDate: movedStart,
+                endDate: new Date(movedStart.getTime() + 30 * 60 * 1000),
+            });
+
+            await job.run();
+
+            expect(notifications().map((n) => [n.data.eventUid, n.data.startDate])).toEqual([[override.uid, movedStart.toISOString()]]);
+        });
+
+        it("Remembers the next due time of a master separately for its reminder and its start alarm.", async () => {
+            const now = Date.now();
+            // Weekly, last occurred about an hour ago: the next one is a week less an hour from now.
+            const seriesStart = new Date(Math.floor((now - 60 * 60 * 1000) / 1000) * 1000 - 14 * 24 * 60 * 60 * 1000);
+            const weekly = (extra: any = {}) => ({
+                startDate: seriesStart,
+                endDate: new Date(seriesStart.getTime() + 30 * 60 * 1000),
+                recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+                ...extra,
+            });
+            const withReminder = await createEvent(weekly({ reminderMinutesBeforeStart: 4.5 }));
+            const noReminder = await createEvent(weekly());
+            const nextStartMs = seriesStart.getTime() + 21 * 24 * 60 * 60 * 1000;
+
+            await job.run();
+
+            expect(fakeRedis.published).toHaveLength(0);
+            const nextDue: Map<string, any> = (job as any).nextDue;
+            expect(nextDue.get(`${withReminder.uid}:reminder`).notBeforeMs).toBe(nextStartMs - Number((await readRow(withReminder.uid)).reminderMinutesBeforeStart) * 60 * 1000);
+            expect(nextDue.get(`${withReminder.uid}:start`).notBeforeMs).toBe(nextStartMs);
+            expect(nextDue.get(`${noReminder.uid}:start`).notBeforeMs).toBe(nextStartMs);
+            expect(nextDue.has(`${noReminder.uid}:reminder`)).toBe(false);
+            expect(nextDue.has(withReminder.uid)).toBe(false);
+
+            // Not expanded again while either alarm is more than a window away.
+            const expandSpy = vi.spyOn(job as any, "expandStarts");
+            await job.run();
+            expect(expandSpy).not.toHaveBeenCalled();
+            expandSpy.mockRestore();
+        });
+
+        it("Skips a master only for the alarm kind that was remembered, and forgets entries of masters that are no longer candidates.", async () => {
+            const occurrenceStart = secondsFromNow(30);
+            const seriesStart = new Date(occurrenceStart.getTime() - 14 * 24 * 60 * 60 * 1000);
+            const event = await createEvent({
+                startDate: seriesStart,
+                endDate: new Date(seriesStart.getTime() + 30 * 60 * 1000),
+                recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, exceptions: [] },
+            });
+            const version = (await readRow(event.uid)).version;
+            const nextDue: Map<string, any> = (job as any).nextDue;
+            nextDue.set(`${event.uid}:start`, { version, notBeforeMs: Date.now() + 24 * 60 * 60 * 1000 });
+            nextDue.set("gone:reminder", { version: 0, notBeforeMs: Date.now() + 1000 });
+
+            await job.run();
+            expect(fakeRedis.published).toHaveLength(0);
+            expect(nextDue.has("gone:reminder")).toBe(false);
+            expect(nextDue.has(`${event.uid}:start`)).toBe(true);
+
+            // A stale version no longer skips it: the start alarm goes out.
+            (job as any).watermarkMs = undefined;
+            nextDue.set(`${event.uid}:start`, { version: version - 1, notBeforeMs: Date.now() + 24 * 60 * 60 * 1000 });
+            await job.run();
+            expect(notifications()).toHaveLength(1);
+        });
     });
 });

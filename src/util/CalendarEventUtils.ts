@@ -80,6 +80,7 @@ export function redactEventForReader<E extends Partial<CalendarEvent>>(event: E)
         "inviteSequenceSent",
         "cancelNoticeSentAt",
         "reminderSentFor",
+        "startAlarmSentFor",
         ...GUEST_PERMISSION_FIELDS,
     ]) {
         delete copy[field];
