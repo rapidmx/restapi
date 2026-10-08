@@ -14,6 +14,7 @@ import {
 } from "../models/types.js";
 import { guestPermissionsOf } from "./CalendarEventUtils.js";
 import { sanitizeInboundDescription } from "./EventDescriptionUtils.js";
+import { ianaZoneForWindowsZone } from "./WindowsZones.js";
 
 /**
  * Hand-rolled RFC 5545/5546 iCalendar generation and parsing for this library's meeting-invite feature
@@ -40,8 +41,8 @@ import { sanitizeInboundDescription } from "./EventDescriptionUtils.js";
  * is already short is emitted byte for byte as before.
  * - A `DTSTART`/`DTEND`/`RECURRENCE-ID`/`EXDATE`/`UNTIL` value with a `TZID` parameter is converted to UTC
  * via `Intl`'s built-in timezone database (no new dependency). `TZID` may be quoted (`TZID="America/New_York"`)
- * and may be a common Windows zone name (`"Pacific Standard Time"`, as classic Outlook emits) - see
- * `resolveTimeZone()`'s `WINDOWS_TO_IANA` table. A `TZID` that is neither a real IANA name nor in that table
+ * and may be any Windows zone id (`"Pacific Standard Time"`, as classic Outlook emits) - see `resolveTimeZone()`,
+ * which uses CLDR's full Windows mapping (`WindowsZones.ts`). A `TZID` that is neither a real IANA name nor a Windows id
  * (e.g. Outlook's display-style `"(UTC-08:00) Pacific Time (US & Canada)"`, or a custom `VTIMEZONE` name) still
  * falls back to treating the value as UTC - `VTIMEZONE` blocks themselves are never parsed.
  * - Recurrence expansion (`expandOccurrences()`) supports `FREQ`/`INTERVAL`/`COUNT`/`UNTIL`/`BYDAY` (including
@@ -301,66 +302,10 @@ function zoneOffsetMs(instantMs: number, formatter: Intl.DateTimeFormat): number
     return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - wholeSecond;
 }
 
-/** Windows time zone names (as classic Outlook/Exchange emit in `TZID`) mapped to their CLDR "001" IANA
- * equivalents. Deliberately a small table of the most common zones, not the full CLDR `windowsZones.xml`. Keys
- * are lowercase. */
-const WINDOWS_TO_IANA: Record<string, string> = {
-    "dateline standard time": "Etc/GMT+12",
-    "hawaiian standard time": "Pacific/Honolulu",
-    "alaskan standard time": "America/Anchorage",
-    "pacific standard time": "America/Los_Angeles",
-    "us mountain standard time": "America/Phoenix",
-    "mountain standard time": "America/Denver",
-    "central standard time": "America/Chicago",
-    "canada central standard time": "America/Regina",
-    "central america standard time": "America/Guatemala",
-    "eastern standard time": "America/New_York",
-    "sa pacific standard time": "America/Bogota",
-    "atlantic standard time": "America/Halifax",
-    "newfoundland standard time": "America/St_Johns",
-    "e. south america standard time": "America/Sao_Paulo",
-    "argentina standard time": "America/Buenos_Aires",
-    utc: "UTC",
-    "coordinated universal time": "UTC",
-    "gmt standard time": "Europe/London",
-    "greenwich standard time": "Atlantic/Reykjavik",
-    "w. europe standard time": "Europe/Berlin",
-    "central europe standard time": "Europe/Budapest",
-    "central european standard time": "Europe/Warsaw",
-    "romance standard time": "Europe/Paris",
-    "w. central africa standard time": "Africa/Lagos",
-    "e. europe standard time": "Europe/Chisinau",
-    "gtb standard time": "Europe/Bucharest",
-    "fle standard time": "Europe/Helsinki",
-    "israel standard time": "Asia/Jerusalem",
-    "south africa standard time": "Africa/Johannesburg",
-    "egypt standard time": "Africa/Cairo",
-    "turkey standard time": "Europe/Istanbul",
-    "russian standard time": "Europe/Moscow",
-    "arab standard time": "Asia/Riyadh",
-    "arabian standard time": "Asia/Dubai",
-    "iran standard time": "Asia/Tehran",
-    "pakistan standard time": "Asia/Karachi",
-    "india standard time": "Asia/Kolkata",
-    "bangladesh standard time": "Asia/Dhaka",
-    "se asia standard time": "Asia/Bangkok",
-    "singapore standard time": "Asia/Singapore",
-    "china standard time": "Asia/Shanghai",
-    "taipei standard time": "Asia/Taipei",
-    "w. australia standard time": "Australia/Perth",
-    "tokyo standard time": "Asia/Tokyo",
-    "korea standard time": "Asia/Seoul",
-    "cen. australia standard time": "Australia/Adelaide",
-    "aus central standard time": "Australia/Darwin",
-    "e. australia standard time": "Australia/Brisbane",
-    "aus eastern standard time": "Australia/Sydney",
-    "new zealand standard time": "Pacific/Auckland",
-};
-
 /**
  * Resolves an iCalendar `TZID` (or a stored `CalendarEvent.timezone`) to an IANA zone name `Intl` recognizes:
- * strips surrounding double quotes, maps common Windows zone names via `WINDOWS_TO_IANA`, and returns
- * `undefined` for anything `Intl` still doesn't know.
+ * strips surrounding double quotes, keeps a name `Intl` already knows as-is, maps any Windows zone id via CLDR
+ * (`ianaZoneForWindowsZone()`), and returns `undefined` for anything else.
  */
 export function resolveTimeZone(tzid: string | undefined | null): string | undefined {
     if (typeof tzid !== "string") {
@@ -373,8 +318,11 @@ export function resolveTimeZone(tzid: string | undefined | null): string | undef
     if (!name) {
         return undefined;
     }
-    const candidate: string = WINDOWS_TO_IANA[name.toLowerCase()] ?? name;
-    return getZoneFormatter(candidate) ? candidate : undefined;
+    if (getZoneFormatter(name)) {
+        return name;
+    }
+    const mapped: string | undefined = ianaZoneForWindowsZone(name);
+    return mapped && getZoneFormatter(mapped) ? mapped : undefined;
 }
 
 /** Parses a single RFC 5545 `DATE-TIME`/`DATE` value (`20260615T120000Z`, `20260615T120000`, or the

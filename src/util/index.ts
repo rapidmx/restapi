@@ -62,3 +62,4 @@ export * from "./SearchIndexUtils.js";
 export * from "./SenderListUtils.js";
 export * from "./TransportRuleUtils.js";
 export * from "./UserUidUtils.js";
+export * from "./WindowsZones.js";
