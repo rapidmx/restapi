@@ -916,6 +916,14 @@ export interface MessageFlags {
     flagged: boolean;
     answered: boolean;
     forwarded: boolean;
+    /** When `answered`/`forwarded` was last set `true` - MS-ASEMAIL2's `LastVerbExecuted`/`LastVerbExecutionTime`
+     * needs a timestamp alongside the verb itself, which plain booleans can't supply. Server-managed only in
+     * the sense that nothing in restapi itself sets `answered`/`forwarded` (every write comes from a caller -
+     * the webmail REST API or, for EAS, `activesync`'s own `ComposeMailCommand`/`SmartReplyCommand`/
+     * `SmartForwardCommand`) - whichever caller flips one of those booleans `true` is expected to stamp this
+     * alongside it. Not reset when a flag is cleared, so a client that re-reads an old "last replied" moment
+     * after `answered` was manually unset sees the time of the last real reply, not nothing. */
+    lastVerbExecutedAt?: Date;
 }
 
 export enum MessageImportance {
@@ -1059,6 +1067,13 @@ export interface Message extends RecoverableBaseEntity {
 
     /** The RFC 5322 `In-Reply-To` header value, if this message is a reply. */
     inReplyTo?: string;
+
+    /** The RFC 5322 `Reply-To` header's address, if the message carries one - the address a reply should
+     * actually go to instead of `from`, e.g. for a mailing list or a no-reply sender. Extracted at ingestion
+     * (`ScanPipelineResult.replyToAddress`) but previously never copied onto the stored `Message`, which meant
+     * a client composing a reply itself (most EAS devices, which build a `SmartReply` MIME locally and never
+     * ask the server) had no way to learn it existed and would reply to `from` instead. */
+    replyTo?: string;
 
     /** The RFC 5322 `References` header value(s), for building conversation threads. */
     references: string[];
@@ -1379,6 +1394,10 @@ export enum ContactAddressKind {
     HOME = "home",
     WORK = "work",
     OTHER = "other",
+    /** A phone number only - MS-ASCONTACTS has its own `MobilePhoneNumber` tag distinct from Home/Business,
+     * which `ContactPhone.type` needs a value for; not meaningful for `ContactEmail`/`ContactPostalAddress`,
+     * which don't distinguish a mobile kind of their own. */
+    MOBILE = "mobile",
 }
 
 export interface ContactEmail {

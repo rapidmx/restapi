@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- **`ContactAddressKind.MOBILE`** - `ContactPhone.type` had no way to represent a mobile number distinct from Home/Business/Other, even though it's the most common phone type on a mobile deployment. Lets a downstream package (the `activesync` plugin) map MS-ASCONTACTS' own `MobilePhoneNumber` tag.
+- **`Message.replyTo`** - the RFC 5322 `Reply-To` header's address was already extracted at ingestion (`ScanPipelineResult.replyToAddress`) but never copied onto the stored message, so nothing downstream could ever see it. Lets a downstream package (the `activesync` plugin) emit MS-ASEMAIL's `ReplyTo`, so a device composing its own reply addresses it correctly instead of always replying to `from`.
+- **`MessageFlags.lastVerbExecutedAt`** - `answered`/`forwarded` had no timestamp, so nothing could say *when* a message was last replied to or forwarded. Lets a downstream package (the `activesync` plugin) emit MS-ASEMAIL2's `LastVerbExecuted`/`LastVerbExecutionTime`. Purely additive; restapi itself never sets `answered`/`forwarded` (every write comes from a caller), so there is no new internal write path to add alongside it - a caller that sets one of those flags true is expected to stamp this too.
+
 ## v0.32.0
 
 ## v0.31.0

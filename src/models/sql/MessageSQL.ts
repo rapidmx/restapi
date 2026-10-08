@@ -178,6 +178,12 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
     @Nullable
     public inReplyTo?: string;
 
+    // `text` for the same reason as `inReplyTo` above.
+    @Column({ type: "text", nullable: true })
+    @Description("The RFC 5322 `Reply-To` header's address, if the message carries one.")
+    @Nullable
+    public replyTo?: string;
+
     @Column({ type: "simple-json" })
     @Description("The RFC 5322 `References` header value(s), for building conversation threads.")
     public references: string[] = [];
@@ -400,6 +406,7 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
             this.flags = other.flags !== undefined ? other.flags : this.flags;
             this.importance = other.importance !== undefined ? other.importance : this.importance;
             this.inReplyTo = "inReplyTo" in other ? other.inReplyTo : this.inReplyTo;
+            this.replyTo = "replyTo" in other ? other.replyTo : this.replyTo;
             this.references = other.references !== undefined ? other.references : this.references;
             this.hasAttachments = other.hasAttachments !== undefined ? other.hasAttachments : this.hasAttachments;
             this.labelUids = other.labelUids !== undefined ? other.labelUids : this.labelUids;
