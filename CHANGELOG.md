@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-10-09
+
+### Added
+- Added startAlarmSentFor claim marker to CalendarEvent models and treat it as server-managed
+- Added start-alarm tests for the Mongo and SQL reminder jobs
+- Added ContactAddressKind.MOBILE, Message.replyTo, and MessageFlags.lastVerbExecutedAt, closing data-model gaps a downstream package (the activesync plugin) needs to map EAS fields this server had no way to represent at all
+- Added a CLDR-generated Windows time zone id to IANA zone mapping with ianaZoneForWindowsZone, windowsZoneForIanaZone, and currentIanaZone
+- Added the CLDR source data and the generator script for the Windows zone mapping
+
+### Changed
+- Fire a calendar event's alarm at its start time even when it has no reminder
+- Claim each alarm kind separately in CalendarReminderJob and key the next-due cache per master and kind
+- Skip the start-time alarm for all-day events
+- Message.replyTo is wired at ingestion (ScanQueueJob.deliverMessage, both the primary and copy-rule paths) from ScanPipelineResult.replyToAddress, which was already extracted but never stored. lastVerbExecutedAt is purely additive - restapi itself never sets answered/forwarded, so there is no internal write path to add alongside it
+- Resolve every Windows zone id in resolveTimeZone instead of a 10-entry table
+
 ## [0.32.0] - 2026-10-07
 
 ### Added
@@ -1369,7 +1385,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.32.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.33.0...HEAD
+[0.33.0]: https://github.com/rapidmx/restapi/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/rapidmx/restapi/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/rapidmx/restapi/compare/v0.30.1...v0.31.0
 [0.30.1]: https://github.com/rapidmx/restapi/compare/v0.30.0...v0.30.1

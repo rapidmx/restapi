@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.33.0
+
 ### Added
 
 - **`ContactAddressKind.MOBILE`** - `ContactPhone.type` had no way to represent a mobile number distinct from Home/Business/Other, even though it's the most common phone type on a mobile deployment. Lets a downstream package (the `activesync` plugin) map MS-ASCONTACTS' own `MobilePhoneNumber` tag.
