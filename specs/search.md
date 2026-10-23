@@ -630,7 +630,9 @@ export interface SearchQuery {
 - **Version 1 (current): an entries bundle.** The sealed file is gzipped JSON, `{ "v": 1, "documents": ZeroAccessIndexDocument[] }`: the same documents the week's entries carry, merged, one per message. A client imports it through the same insert path as individual entries, so every backend (web wa-sqlite over the page-encrypting VFS, tauri's native SQLCipher) can import it with no new storage primitive.
   - Why not a SQLite file yet: web's local index encrypts every page under its own key (`localIndexVFS.ts`), so a downloaded SQLite file can't be `ATTACH`ed without a second, plain VFS, and wa-sqlite exposes no `sqlite3_deserialize` wrapper.
   - The cost is FTS tokenisation on import instead of a page copy. That is acceptable at a week's volume.
-- **Version 2 (planned): a SQLite FTS5 database file** as the rest of this section describes, once clients can open one directly. The server stores segments as opaque bytes with their `schemaVersion`, so the change needs no server work, and a client declines a version it can't open.
+- **Version 2 (unscheduled): a SQLite FTS5 database file** as the rest of this section describes, once clients can open one directly. The server stores segments as opaque bytes with their `schemaVersion`, so the change needs no server work, and a client declines a version it can't open.
+  - It is deliberately left unscheduled until §19.5 measures whether version 1's import cost matters in practice.
+  - Its gain is replacing re-tokenisation on import with a page copy. That only matters for a cold start over many weeks of segments, or on low-end devices.
 
 ### Rationale
 
@@ -855,6 +857,10 @@ Two measurements, serving different decisions.
 
 Determine the grace period after a week closes before it is compacted (default 24 hours). Too short and delayed mail forces frequent re-compaction into new generations; too long and clients carry a closed week as individual entries for longer than necessary.
 
+### 19.5 Measure segment import cost (gates segment format version 2)
+
+Measure how long a device takes to import version 1 segments (§16) on a cold start - a newly unlocked device over a large, long-lived mailbox - on web (wa-sqlite over the encrypting VFS) and tauri, on a typical laptop and a low-end phone. Version 2 (SQLite files imported by page copy) is scheduled only if that time is unacceptable: searchable recent mail is the bar, since segments import newest first.
+
 ## Resolved
 
 | Question | Decision |
@@ -902,6 +908,6 @@ Determine the grace period after a week closes before it is compacted (default 2
 
 ## Status
 
-The architecture is settled. Four tasks in §19 remain: two pre-existing `ModelUtils` operator divergences that must be resolved before the query grammar is exposed, and two measurements — segment size and delivery-path build cost — that gate configuration values rather than the design.
+The architecture is settled. Five tasks in §19 remain: two pre-existing `ModelUtils` operator divergences that must be resolved before the query grammar is exposed, two measurements — segment size and delivery-path build cost — that gate configuration values rather than the design, and the segment import measurement (§19.5) that decides whether segment format version 2 is built.
 
 **The delivery-path build cost measurement (§19.3) is the one that could force a change.** If indexing plus in-budget attachment extraction cannot fit inside the delivery transaction at realistic concurrency, the extraction budget shrinks and more work defers to clients. The zero-access property itself is not negotiable against that measurement.

@@ -4349,3 +4349,4 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
   - 2026 has an ISO week 53 (it starts on a Thursday); 2025 doesn't.
   - The `request` test helper decodes binary bodies as UTF-8, so assert on the stored blob or the ETag instead.
 - **Open:** pending entries and segments of a purged message or mailbox aren't deleted yet. That belongs with erasure and the backfill job in Phase 6.
+- **Segment format version 2 (SQLite FTS5 files) is unscheduled** (JP, 2026-10-23, option 2). It waits for `specs/search.md` §19.5, which measures v1's cold-start import time on web and tauri. Build it only if that time is unacceptable.
