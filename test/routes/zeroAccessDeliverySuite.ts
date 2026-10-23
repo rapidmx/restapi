@@ -1,0 +1,401 @@
+///////////////////////////////////////////////////////////////////////////////
+// Copyright (C) 2026 Jean-Philippe Steinmetz
+// SPDX-License-Identifier: MPL-2.0
+///////////////////////////////////////////////////////////////////////////////
+// Zero-access delivery (`specs/search.md` §3) end to end through `POST /internal/mta/deliver`, identical on both backends:
+// `test/routes/{mongo,sql}/ZeroAccessDelivery.test.ts` supply a server with the ingest route mounted, the shared test doubles
+// registered, and accessors for the rows it writes.
+import "reflect-metadata";
+import { createHash, webcrypto } from "node:crypto";
+import { gunzipSync } from "node:zlib";
+import * as asn1js from "asn1js";
+import * as pkijs from "pkijs";
+import * as x509 from "@peculiar/x509";
+import { ACLAction } from "@rapidrest/service-core";
+import { request } from "@rapidrest/service-core/test";
+import { IngestStatus, TransportRuleActionType, type ZeroAccessKey } from "../../src/models/types.js";
+import type { InMemoryBlobStore } from "../testDoubles.js";
+
+x509.cryptoProvider.set(webcrypto as unknown as Crypto);
+const ENGINE = new pkijs.CryptoEngine({ name: "test", crypto: webcrypto as unknown as Crypto }) as unknown as pkijs.ICryptoEngine;
+
+export interface ZeroAccessDeliverySuiteContext {
+    app: () => any;
+    baseUrl: string;
+    secret: string;
+    blobStore: () => InMemoryBlobStore;
+    createMailbox: (data?: any) => Promise<any>;
+    updateMailbox: (uid: string, fields: any) => Promise<void>;
+    /** Saves the singleton `EncryptionPolicy` with `allowZeroAccess` (`undefined` leaves the row out entirely). */
+    setAllowZeroAccess: (allow: boolean | undefined) => Promise<void>;
+    /** Writes the mailbox's access list. */
+    setAcl: (mailboxUid: string, records: { userOrRoleId: string; actions: string[] }[]) => Promise<void>;
+    createTransportRule: (data: any) => Promise<any>;
+    entries: () => Promise<any[]>;
+    messages: () => Promise<any[]>;
+    indexEntries: () => Promise<any[]>;
+    quarantineEntries: () => Promise<any[]>;
+    attachments: () => Promise<any[]>;
+    calendarEvents: () => Promise<any[]>;
+    /** Saves a `CalendarEvent` row with these fields over the backend's defaults. */
+    createCalendarEvent: (data: any) => Promise<any>;
+}
+
+interface Recipient {
+    certificate: pkijs.Certificate;
+    privateKey: CryptoKey;
+    key: ZeroAccessKey;
+}
+
+/** A zero-access keypair for a mailbox: the `ZeroAccessKey` its row holds, and the private half to check what was sealed to it. */
+async function makeKey(): Promise<Recipient> {
+    const keys = await webcrypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    const cert = await x509.X509CertificateGenerator.createSelfSigned({
+        name: "CN=za@example.com",
+        notBefore: new Date(Date.now() - 1000),
+        notAfter: new Date(Date.now() + 86_400_000),
+        keys: keys as CryptoKeyPair,
+        signingAlgorithm: { name: "ECDSA", hash: "SHA-256" },
+    });
+    const der = Buffer.from(cert.rawData);
+    const pkcs8 = await webcrypto.subtle.exportKey("pkcs8", keys.privateKey);
+    const privateKey = (await webcrypto.subtle.importKey("pkcs8", pkcs8, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"])) as CryptoKey;
+    return {
+        certificate: new pkijs.Certificate({ schema: asn1js.fromBER(cert.rawData).result }),
+        privateKey,
+        key: {
+            publicKey: der.toString("base64"),
+            type: "x509",
+            useType: "zero-access",
+            fingerprint: createHash("sha256").update(der).digest("hex"),
+            notBefore: Date.now() - 1000,
+            notAfter: Date.now() + 86_400_000,
+        },
+    };
+}
+
+async function open(der: Buffer, recipient: Recipient): Promise<Buffer> {
+    const contentInfo = new pkijs.ContentInfo({ schema: asn1js.fromBER(der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength)).result });
+    const envelopedData = new pkijs.EnvelopedData({ schema: contentInfo.content });
+    return Buffer.from(await envelopedData.decrypt(0, { recipientCertificate: recipient.certificate, recipientPrivateKey: recipient.privateKey }, ENGINE));
+}
+
+/** The sealed MIME blob's encrypted content, decrypted. */
+async function openSealedMessage(blob: Buffer, recipient: Recipient): Promise<Buffer> {
+    const body: string = blob.toString("latin1").split("\r\n\r\n")[1];
+    return open(Buffer.from(body.replace(/\r\n/g, ""), "base64"), recipient);
+}
+
+const CANARY_SUBJECT = "Merger codename Bluebird";
+const CANARY_BODY = "the acquisition closes on Friday";
+const CANARY_ATTACHMENT = "board minutes attached";
+
+function rawMessage(to: string): Buffer {
+    return Buffer.from(
+        [
+            "From: Bob <bob@example.org>",
+            `To: ${to}`,
+            `Subject: ${CANARY_SUBJECT}`,
+            "Date: Thu, 22 Oct 2026 10:00:00 +0000",
+            "Message-ID: <za-1@example.org>",
+            "MIME-Version: 1.0",
+            'Content-Type: multipart/mixed; boundary="b1"',
+            "",
+            "--b1",
+            "Content-Type: text/plain; charset=utf-8",
+            "",
+            `Hi, ${CANARY_BODY}.`,
+            "--b1",
+            'Content-Type: text/plain; name="minutes.txt"',
+            'Content-Disposition: attachment; filename="minutes.txt"',
+            "",
+            CANARY_ATTACHMENT,
+            "--b1--",
+            "",
+        ].join("\r\n"),
+    );
+}
+
+/** A DKIM-verified (as this deployment's MTA would stamp it) message from bob@example.org carrying an iTIP `method` with `vevent` lines. */
+function itipMessage(to: string, method: string, vevent: string[]): Buffer {
+    const ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//test//EN", `METHOD:${method}`, "BEGIN:VEVENT", ...vevent, "END:VEVENT", "END:VCALENDAR"].join("\r\n");
+    return Buffer.from(
+        [
+            "From: bob@example.org",
+            `To: ${to}`,
+            "Authentication-Results: mx.example.com; dkim=pass header.d=example.org",
+            "Subject: Invitation",
+            "MIME-Version: 1.0",
+            'Content-Type: multipart/mixed; boundary="b2"',
+            "",
+            "--b2",
+            "Content-Type: text/plain; charset=utf-8",
+            "",
+            "You are invited.",
+            "--b2",
+            `Content-Type: text/calendar; method=${method}; name="invite.ics"`,
+            'Content-Disposition: attachment; filename="invite.ics"',
+            "",
+            ics,
+            "--b2--",
+            "",
+        ].join("\r\n"),
+    );
+}
+
+export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): void {
+    const deliver = (to: string[], raw: Buffer) =>
+        request(ctx.app())
+            .post(`${ctx.baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${ctx.secret}`)
+            .set("X-Envelope-From", "bob@example.org")
+            .set("X-Envelope-To", to.join(","))
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+    /** Every stored blob's key and content. */
+    const blobs = (): [string, Buffer][] => [...((ctx.blobStore() as any).store as Map<string, Buffer>).entries()];
+
+    const zeroAccessMailbox = async (recipient: Recipient, data: any = {}) => ctx.createMailbox({ zeroAccessKeys: [recipient.key], ...data });
+
+    describe("zero-access delivery", () => {
+        it("seals the message, its summary and its index entry to the mailbox's key, and stores no plaintext anywhere", async () => {
+            const recipient = await makeKey();
+            const mailbox = await zeroAccessMailbox(recipient);
+            const raw = rawMessage(mailbox.primarySmtpAddress);
+
+            const result = await deliver([mailbox.primarySmtpAddress], raw);
+
+            expect(result.status).toBe(202);
+            const [entry] = await ctx.entries();
+            expect(entry).toMatchObject({ mailboxUid: mailbox.uid, rawBlobKey: "", zeroAccessKeyFingerprint: recipient.key.fingerprint, status: IngestStatus.DELIVERED });
+
+            const [message] = await ctx.messages();
+            expect(message.subject).toBe("[...]");
+            expect(message.bodyPreview).toBe("");
+            expect(message.hasAttachments).toBe(true);
+            expect(message.sanitizedHtmlBlobKey ?? undefined).toBeUndefined();
+            expect(message.bodyBlobKey).toBe(`za/${mailbox.uid}/${message.uid}`);
+            expect(message.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+            expect(await ctx.attachments()).toEqual([]);
+
+            // The stored message is the original MIME, byte for byte, once decrypted.
+            const sealed: Buffer = await ctx.blobStore().get(message.bodyBlobKey);
+            expect((await openSealedMessage(sealed, recipient)).equals(raw)).toBe(true);
+            const summary = JSON.parse((await open(Buffer.from(message.zeroAccess.sealedSummary, "base64"), recipient)).toString("utf-8"));
+            expect(summary.subject).toBe(CANARY_SUBJECT);
+            expect(summary.preview).toContain(CANARY_BODY);
+
+            const [indexEntry] = await ctx.indexEntries();
+            expect(indexEntry).toMatchObject({ mailboxUid: mailbox.uid, messageUid: message.uid, keyFingerprint: recipient.key.fingerprint });
+            expect(indexEntry.weekId).toMatch(/^\d{4}-W\d{2}$/);
+            const document = JSON.parse(gunzipSync(await open(Buffer.from(indexEntry.sealed, "base64"), recipient)).toString("utf-8"));
+            expect(document).toMatchObject({ v: 1, messageUid: message.uid, subject: CANARY_SUBJECT, from: "bob@example.org", attachmentNames: ["minutes.txt"] });
+            expect(document.body).toContain(CANARY_BODY);
+            expect(document.attachmentText.join(" ")).toContain(CANARY_ATTACHMENT);
+
+            // No ingest spool, sanitized copy, attachment blob or extracted text - nothing readable is left in storage.
+            for (const [key, content] of blobs()) {
+                expect(key.startsWith("ingest/")).toBe(false);
+                const text: string = content.toString("latin1");
+                for (const canary of [CANARY_SUBJECT, CANARY_BODY, CANARY_ATTACHMENT]) {
+                    expect(text.includes(canary), `${key} holds "${canary}"`).toBe(false);
+                }
+            }
+        });
+
+        it("seals only the zero-access recipient's copy of a message also addressed to a mailbox without it", async () => {
+            const recipient = await makeKey();
+            const sealedMailbox = await zeroAccessMailbox(recipient);
+            const plainMailbox = await ctx.createMailbox();
+
+            const result = await deliver([sealedMailbox.primarySmtpAddress, plainMailbox.primarySmtpAddress], rawMessage(sealedMailbox.primarySmtpAddress));
+
+            expect(result.status).toBe(202);
+            const entries = await ctx.entries();
+            const sealedEntry = entries.find((e) => e.mailboxUid === sealedMailbox.uid);
+            const plainEntry = entries.find((e) => e.mailboxUid === plainMailbox.uid);
+            expect(sealedEntry.status).toBe(IngestStatus.DELIVERED);
+            // The plaintext recipient is queued as before, from the raw blob written for it alone.
+            expect(plainEntry).toMatchObject({ status: IngestStatus.PENDING });
+            expect(plainEntry.zeroAccessKeyFingerprint ?? undefined).toBeUndefined();
+            expect(plainEntry.rawBlobKey.startsWith("ingest/")).toBe(true);
+            expect(await ctx.messages()).toHaveLength(1);
+        });
+
+        it.each([
+            ["the administrator disallowed it", async (mailbox: any) => ctx.setAllowZeroAccess(false)],
+            ["the owner turned it off", async (mailbox: any) => ctx.updateMailbox(mailbox.uid, { zeroAccessEnabled: false })],
+            [
+                "the mailbox has a delegate",
+                async (mailbox: any) =>
+                    ctx.setAcl(mailbox.uid, [
+                        { userOrRoleId: mailbox.ownerUserUid, actions: [ACLAction.FULL] },
+                        { userOrRoleId: "delegate-uid", actions: [ACLAction.READ] },
+                    ]),
+            ],
+            ["the mailbox has no owner", async (mailbox: any) => ctx.updateMailbox(mailbox.uid, { ownerUserUid: null })],
+        ])("stores the message as it arrives when %s", async (_why, arrange) => {
+            const recipient = await makeKey();
+            const mailbox = await zeroAccessMailbox(recipient);
+            await arrange(mailbox);
+
+            const result = await deliver([mailbox.primarySmtpAddress], rawMessage(mailbox.primarySmtpAddress));
+
+            expect(result.status).toBe(202);
+            const [entry] = await ctx.entries();
+            expect(entry.status).toBe(IngestStatus.PENDING);
+            expect(entry.zeroAccessKeyFingerprint ?? undefined).toBeUndefined();
+            expect(entry.rawBlobKey.startsWith("ingest/")).toBe(true);
+        });
+
+        it("seals a message for a mailbox that has a key and nothing set, the server allowing it by default", async () => {
+            const recipient = await makeKey();
+            const mailbox = await zeroAccessMailbox(recipient);
+            await ctx.setAllowZeroAccess(undefined);
+            await ctx.setAcl(mailbox.uid, [
+                { userOrRoleId: mailbox.ownerUserUid, actions: [ACLAction.FULL] },
+                { userOrRoleId: "admin", actions: [ACLAction.READ] },
+            ]);
+
+            await deliver([mailbox.primarySmtpAddress], rawMessage(mailbox.primarySmtpAddress));
+
+            expect((await ctx.entries())[0].status).toBe(IngestStatus.DELIVERED);
+        });
+
+        it("seals a quarantined message too, keeping no plaintext for review", async () => {
+            const recipient = await makeKey();
+            const mailbox = await zeroAccessMailbox(recipient);
+            await ctx.createTransportRule({ actions: [{ type: TransportRuleActionType.QUARANTINE }] });
+            const raw = rawMessage(mailbox.primarySmtpAddress);
+
+            const result = await deliver([mailbox.primarySmtpAddress], raw);
+
+            expect(result.status).toBe(202);
+            const [held] = await ctx.quarantineEntries();
+            expect(held.rawBlobKey.startsWith(`za/${mailbox.uid}/`)).toBe(true);
+            expect((await openSealedMessage(await ctx.blobStore().get(held.rawBlobKey), recipient)).equals(raw)).toBe(true);
+            expect(await ctx.messages()).toEqual([]);
+            expect(blobs().some(([key]) => key.startsWith("ingest/"))).toBe(false);
+        });
+
+        it("answers 503 when a zero-access recipient can't be delivered, and files it exactly once when the MTA retries", async () => {
+            const recipient = await makeKey();
+            const broken: ZeroAccessKey = { ...recipient.key, publicKey: Buffer.from("not a certificate").toString("base64") };
+            const mailbox = await ctx.createMailbox({ zeroAccessKeys: [broken] });
+            const raw = rawMessage(mailbox.primarySmtpAddress);
+
+            const failed = await deliver([mailbox.primarySmtpAddress], raw);
+
+            expect(failed.status).toBe(503);
+            const [entry] = await ctx.entries();
+            expect(entry.status).toBe(IngestStatus.FAILED);
+            expect(await ctx.messages()).toEqual([]);
+
+            // The key is repaired; the MTA resends the same transaction.
+            await ctx.updateMailbox(mailbox.uid, { zeroAccessKeys: [recipient.key] });
+            const retried = await deliver([mailbox.primarySmtpAddress], raw);
+            const again = await deliver([mailbox.primarySmtpAddress], raw);
+
+            expect(retried.status).toBe(202);
+            expect(again.status).toBe(202);
+            expect(await ctx.entries()).toHaveLength(1);
+            expect((await ctx.entries())[0].status).toBe(IngestStatus.DELIVERED);
+            expect(await ctx.messages()).toHaveLength(1);
+            expect(await ctx.indexEntries()).toHaveLength(1);
+        });
+
+        it("seals an invitation's title, location and description on the event it creates and on its later updates", async () => {
+            const recipient = await makeKey();
+            const mailbox = await zeroAccessMailbox(recipient);
+            const vevent = (sequence: number, summary: string) => [
+                "UID:za-event-1",
+                "DTSTAMP:20261022T100000Z",
+                "DTSTART:20261101T100000Z",
+                "DTEND:20261101T110000Z",
+                `SUMMARY:${summary}`,
+                "LOCATION:Room 42",
+                "DESCRIPTION:Discuss Bluebird",
+                "ORGANIZER;CN=Bob:mailto:bob@example.org",
+                `ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:${mailbox.primarySmtpAddress}`,
+                `SEQUENCE:${sequence}`,
+            ];
+
+            expect((await deliver([mailbox.primarySmtpAddress], itipMessage(mailbox.primarySmtpAddress, "REQUEST", vevent(0, "Secret board meeting")))).status).toBe(202);
+
+            const [event] = await ctx.calendarEvents();
+            expect(event.title).toBe("[...]");
+            expect(event.location ?? undefined).toBeUndefined();
+            expect(event.description ?? undefined).toBeUndefined();
+            expect(event.encryptionOrigin).toBe("derived");
+            // Time and attendees stay plaintext, for free/busy and scheduling.
+            expect(new Date(event.startDate).toISOString()).toBe("2026-11-01T10:00:00.000Z");
+            expect(event.attendees.map((a: any) => a.address)).toEqual([mailbox.primarySmtpAddress]);
+            expect(event.sealedContent.keyFingerprint).toBe(recipient.key.fingerprint);
+            expect(JSON.parse((await open(Buffer.from(event.sealedContent.sealed, "base64"), recipient)).toString("utf-8"))).toEqual({
+                title: "Secret board meeting",
+                location: "Room 42",
+                description: "Discuss Bluebird",
+            });
+
+            expect((await deliver([mailbox.primarySmtpAddress], itipMessage(mailbox.primarySmtpAddress, "REQUEST", vevent(1, "Renamed meeting")))).status).toBe(202);
+
+            const [updated] = await ctx.calendarEvents();
+            expect(updated.title).toBe("[...]");
+            expect(JSON.parse((await open(Buffer.from(updated.sealedContent.sealed, "base64"), recipient)).toString("utf-8")).title).toBe("Renamed meeting");
+        });
+
+        it("applies only the time of a guest's change request to a zero-access organizer's event, never its content", async () => {
+            const recipient = await makeKey();
+            const mailbox = await zeroAccessMailbox(recipient);
+            await ctx.createCalendarEvent({
+                mailboxUid: mailbox.uid,
+                folderUid: "calendar",
+                title: "[...]",
+                startDate: new Date("2026-11-01T10:00:00Z"),
+                endDate: new Date("2026-11-01T11:00:00Z"),
+                organizer: { address: mailbox.primarySmtpAddress, type: "to" },
+                attendees: [{ address: "bob@example.org", role: "required", responseStatus: "accepted", isOrganizer: false }],
+                icalUid: "za-event-2",
+                sequence: 0,
+                guestsCanModify: true,
+            });
+
+            const counter = itipMessage(mailbox.primarySmtpAddress, "COUNTER", [
+                "UID:za-event-2",
+                "DTSTAMP:20261022T100000Z",
+                "DTSTART:20261101T120000Z",
+                "DTEND:20261101T130000Z",
+                "SUMMARY:Leaked title",
+                "LOCATION:Leaked room",
+                "DESCRIPTION:Leaked notes",
+                `ORGANIZER:mailto:${mailbox.primarySmtpAddress}`,
+                "ATTENDEE;PARTSTAT=ACCEPTED:mailto:bob@example.org",
+                "X-RAPIDMX-CHANGE-REQUEST:TRUE",
+                "SEQUENCE:0",
+            ]);
+            expect((await deliver([mailbox.primarySmtpAddress], counter)).status).toBe(202);
+
+            const [event] = await ctx.calendarEvents();
+            expect(event.title).toBe("[...]");
+            expect(event.location ?? undefined).toBeUndefined();
+            expect(event.description ?? undefined).toBeUndefined();
+            expect(new Date(event.startDate).toISOString()).toBe("2026-11-01T12:00:00.000Z");
+        });
+
+        it("keeps sealing a retried transaction even after zero-access was turned off in between", async () => {
+            const recipient = await makeKey();
+            const broken: ZeroAccessKey = { ...recipient.key, publicKey: Buffer.from("not a certificate").toString("base64") };
+            const mailbox = await ctx.createMailbox({ zeroAccessKeys: [broken] });
+            const raw = rawMessage(mailbox.primarySmtpAddress);
+            expect((await deliver([mailbox.primarySmtpAddress], raw)).status).toBe(503);
+
+            await ctx.updateMailbox(mailbox.uid, { zeroAccessKeys: [recipient.key], zeroAccessEnabled: false });
+            expect((await deliver([mailbox.primarySmtpAddress], raw)).status).toBe(202);
+
+            const [message] = await ctx.messages();
+            expect(message.subject).toBe("[...]");
+            expect(blobs().some(([key]) => key.startsWith("ingest/"))).toBe(false);
+        });
+    });
+}

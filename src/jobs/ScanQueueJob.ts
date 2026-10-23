@@ -41,6 +41,11 @@ import { buildDeliveredRecipients } from "../util/RecipientUtils.js";
 import { CorrespondentUtils, eventObservations, messageObservations } from "../util/CorrespondentUtils.js";
 import { nameBasedUuid } from "../util/UuidUtils.js";
 import { sendOrThrow } from "../transport/TransportResultUtils.js";
+import { ExtractorRegistry } from "../search/extraction/ExtractorRegistry.js";
+import { ZeroAccessFiling } from "../zeroaccess/ZeroAccessFiling.js";
+import { buildIndexDocument } from "../zeroaccess/ZeroAccessIndexing.js";
+import { zeroAccessTargetFor, type ZeroAccessTarget } from "../zeroaccess/ZeroAccessResolver.js";
+import { PROTECTED_SUBJECT } from "../zeroaccess/ZeroAccessSealer.js";
 import {
     Attachment,
     Attendee,
@@ -62,6 +67,7 @@ import {
     Mailbox,
     MailFilterRule,
     Message,
+    MessageZeroAccess,
     MessageClassification,
     MessageFlags,
     MessageImportance,
@@ -71,6 +77,7 @@ import {
     QuarantineEntry,
     QuarantineReason,
     Recipient,
+    ZeroAccessIndexDocument,
     RecipientType,
     ScanResult,
     ScanTargetType,
@@ -145,6 +152,14 @@ interface EntryClaim<Q> {
     leaseGrantedAt: number;
 }
 
+/** What a zero-access filing puts on its `Message` rows (and indexes for each) instead of the plaintext - see `sealForFiling()`. */
+interface SealedFields {
+    filing: ZeroAccessFiling;
+    bodyBlobKey: string;
+    state: MessageZeroAccess;
+    document: Omit<ZeroAccessIndexDocument, "messageUid">;
+}
+
 /** An attachment already persisted to the `BlobStore`, ready to be attached to one or more `Message` rows. */
 interface StoredAttachment {
     filename: string;
@@ -209,6 +224,9 @@ export abstract class ScanQueueJob<
     protected abstract correspondentClass: any;
     protected abstract domainClass: any;
     protected abstract keyVaultClass: any;
+    /** The `ZeroAccessIndexEntry` model class for this backend, supplied by the Mongo/SQL subclasses. Left unset, a zero-access
+     * entry fails (its MTA retries) rather than being filed without its index entry. */
+    protected zeroAccessIndexEntryClass?: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -221,6 +239,7 @@ export abstract class ScanQueueJob<
     protected scanResultRepo?: RepoUtils<SR>;
     protected mailboxRepo?: RepoUtils<X>;
     protected keyVaultRepo?: RepoUtils<any>;
+    protected zeroAccessIndexEntryRepo?: RepoUtils<any>;
     protected mailFilterRuleRepo?: RepoUtils<MFR>;
     protected calendarEventRepo?: RecoverableRepoUtils<CE>;
     protected oofReplySuppressionRepo?: RepoUtils<OS>;
@@ -238,6 +257,18 @@ export abstract class ScanQueueJob<
     protected dataSubjectErasureRequestClass?: any;
 
     /** Optional - when search isn't configured, index removal is a no-op (see `removeFromSearchIndex()`). */
+    /** Extracts attachment text for a zero-access message's index entry, inside the delivery (`specs/search.md` §9). */
+    @Inject(ExtractorRegistry)
+    protected extractorRegistry?: ExtractorRegistry;
+
+    /** How long a zero-access delivery may spend extracting its attachments' text, in total, before the rest is left to the client. */
+    @Config("mail:zero_access:extraction_budget_ms", 5000)
+    protected zeroAccessExtractionBudgetMs: number = 5000;
+
+    /** An attachment larger than this is never extracted during a zero-access delivery - the client extracts it. */
+    @Config("mail:zero_access:extraction_max_bytes", 10 * 1024 * 1024)
+    protected zeroAccessExtractionMaxBytes: number = 10 * 1024 * 1024;
+
     @Inject("SearchProvider")
     private searchProvider?: SearchProvider;
 
@@ -436,6 +467,12 @@ export abstract class ScanQueueJob<
                 args: [this.keyVaultClass],
             });
         }
+        if (!this.zeroAccessIndexEntryRepo && this.zeroAccessIndexEntryClass) {
+            this.zeroAccessIndexEntryRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.zeroAccessIndexEntryClass.name,
+                args: [this.zeroAccessIndexEntryClass],
+            });
+        }
         if (!this.correspondentRepo && this.correspondentClass) {
             this.correspondentRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.correspondentClass.name,
@@ -495,6 +532,98 @@ export abstract class ScanQueueJob<
      * a message that kills its worker outright (and so never reaches `recordFailure()`) still exhausts
      * `max_attempts` through repeated lease takeovers instead of crash-looping forever.
      */
+    /**
+     * Processes one zero-access entry (`IngestQueueEntry.zeroAccessKeyFingerprint`) inside its ingest request, from `raw` in memory -
+     * the only way such an entry is ever processed, since no plaintext spool of it exists (`specs/search.md` §3). Claims it like `run()`
+     * does (a concurrent attempt at the same entry - an overlapping MTA retry - loses the version check and throws), and records a
+     * failure on it before rethrowing, so `BaseMailIngestRoute` answers the MTA with a temporary failure and its retry processes the
+     * same entry again; the filing is idempotent across attempts, as for any entry. An entry already delivered is left alone.
+     */
+    public async processInline(entryUid: string, raw: Buffer): Promise<void> {
+        const entry: Q | undefined = await this.ingestQueueRepo!.findOne(entryUid, { ignoreACL: true, skipCache: true });
+        if (!entry) {
+            throw new Error(`Ingest entry ${entryUid} not found.`);
+        }
+        if (entry.status === IngestStatus.DELIVERED) {
+            return;
+        }
+        const grantedAt: number = Date.now();
+        await this.ingestQueueRepo!.update(
+            {
+                uid: entry.uid,
+                version: (entry as any).version,
+                status: IngestStatus.SCANNING,
+                attempts: (entry.attempts ?? 0) + 1,
+                scanLeaseExpiresAt: new Date(grantedAt + this.leaseSeconds * 1000),
+            } as any,
+            asEntity(this.ingestQueueRepo!, entry),
+            { ignoreACL: true },
+        );
+        const claim: EntryClaim<Q> = { row: (await this.ingestQueueRepo!.findOne(entry.uid, { ignoreACL: true }))!, leaseGrantedAt: grantedAt };
+        try {
+            await this.processEntry(claim, raw);
+        } catch (err: any) {
+            await this.recordFailure(claim, err);
+            throw err;
+        }
+    }
+
+    /** The zero-access filing for `entry`, or `undefined` for an entry stored as it arrived. A zero-access entry is sealed to the key
+     * its ingest request chose, even if the mailbox has rotated it since (the old key's private half is retained). */
+    private async zeroAccessFilingFor(entry: Q): Promise<ZeroAccessFiling | undefined> {
+        if (!entry.zeroAccessKeyFingerprint) {
+            return undefined;
+        }
+        if (!this.zeroAccessIndexEntryRepo) {
+            throw new Error("Zero-access delivery needs the ZeroAccessIndexEntry model.");
+        }
+        const mailbox: X | undefined = await this.mailboxRepo!.findOne(entry.mailboxUid, { ignoreACL: true });
+        const target: ZeroAccessTarget | undefined = mailbox && zeroAccessTargetFor(mailbox, entry.zeroAccessKeyFingerprint);
+        if (!target) {
+            throw new Error(`Mailbox ${entry.mailboxUid} no longer has the zero-access key ${entry.zeroAccessKeyFingerprint}.`);
+        }
+        return new ZeroAccessFiling(target, this.blobStore!, entry.mailboxUid);
+    }
+
+    /**
+     * Seals a zero-access message for filing as `targetUid`: its MIME into its own blob, its subject and preview into the sealed summary,
+     * and builds the index document every filed copy is indexed with - extracting attachment text within
+     * `mail:zero_access:extraction_budget_ms`/`extraction_max_bytes`, the rest left to the client.
+     */
+    private async sealForFiling(
+        filing: ZeroAccessFiling,
+        raw: Buffer,
+        targetUid: string,
+        entry: Q,
+        result: ScanPipelineResult,
+        recipients: Recipient[],
+    ): Promise<SealedFields> {
+        const bodyBlobKey: string = await filing.storeMessage(raw, targetUid);
+        const state: MessageZeroAccess = await filing.messageState({ subject: result.subject ?? "", preview: result.bodyPreview ?? "" });
+        const { messageUid: _unused, ...document } = await buildIndexDocument(
+            {
+                messageUid: targetUid,
+                subject: result.subject ?? "",
+                bodyText: result.bodyText ?? "",
+                fromAddress: result.fromAddress || entry.envelopeFrom,
+                fromDisplayName: result.fromDisplayName,
+                recipients,
+                attachments: result.attachments,
+                dateForSort: new Date(),
+            },
+            (mimeType, content) => this.extractorRegistry?.extract(mimeType, content) ?? Promise.resolve(undefined),
+            { budgetMs: this.zeroAccessExtractionBudgetMs, maxAttachmentBytes: this.zeroAccessExtractionMaxBytes },
+        );
+        return { filing, bodyBlobKey, state, document };
+    }
+
+    /** Writes the index entry of one filed zero-access message (`messageUid`), once. Nothing for a message filed as it arrived. */
+    private async indexZeroAccess(sealed: SealedFields | undefined, messageUid: string, receivedAt: Date): Promise<void> {
+        if (sealed) {
+            await sealed.filing.index(this.zeroAccessIndexEntryRepo!, this.zeroAccessIndexEntryClass, messageUid, new Date(receivedAt), sealed.document);
+        }
+    }
+
     public async run(): Promise<void> {
         const candidates: Q[] = await this.findDueEntries(new Date());
 
@@ -523,15 +652,18 @@ export abstract class ScanQueueJob<
      * *and* in the query object itself (all `ModelUtils.buildSearchQuerySQL` reads). */
     private async findDueEntries(now: Date): Promise<Q[]> {
         const leaseMs: number = this.leaseSeconds * 1000;
+        // A zero-access entry has no raw blob to process - only its ingest request (or the MTA's retry of it) can: never picked up here.
+        const notZeroAccess = { zeroAccessKeyFingerprint: "exists(false)" };
         const queries: Record<string, any>[] = [
-            { status: IngestStatus.PENDING },
-            { status: IngestStatus.FAILED, nextAttemptAt: `lte(${now.toISOString()})` },
-            { status: IngestStatus.SCANNING, scanLeaseExpiresAt: `lt(${now.toISOString()})` },
+            { status: IngestStatus.PENDING, ...notZeroAccess },
+            { status: IngestStatus.FAILED, nextAttemptAt: `lte(${now.toISOString()})`, ...notZeroAccess },
+            { status: IngestStatus.SCANNING, scanLeaseExpiresAt: `lt(${now.toISOString()})`, ...notZeroAccess },
             // Claimed before leases existed (or by a worker that crashed before writing one).
             {
                 status: IngestStatus.SCANNING,
                 scanLeaseExpiresAt: "exists(false)",
                 dateModified: `lt(${new Date(now.getTime() - leaseMs).toISOString()})`,
+                ...notZeroAccess,
             },
         ];
         const seen: Set<string> = new Set();
@@ -781,7 +913,7 @@ export abstract class ScanQueueJob<
      * after its purge pass already ran keeps its row and raw blob - a residual this job doesn't delete itself, since the
      * raw blob may be shared with other recipients' entries.
      */
-    private async processEntry(claim: EntryClaim<Q>): Promise<void> {
+    private async processEntry(claim: EntryClaim<Q>, rawInMemory?: Buffer): Promise<void> {
         const entry: Q = claim.row;
 
         // Checked before scanning, so an entry deferred for a pending erasure isn't re-scanned on every deferral, and again
@@ -789,11 +921,16 @@ export abstract class ScanQueueJob<
         if (await this.stopForErasure(claim)) {
             return;
         }
-        const raw: Buffer = await this.blobStore!.get(entry.rawBlobKey);
-        const result: ScanPipelineResult = await this.scanPipeline!.run(raw, {
-            from: entry.envelopeFrom,
-            to: entry.envelopeTo,
-        });
+        if (entry.zeroAccessKeyFingerprint && !rawInMemory) {
+            throw new Error(`Zero-access ingest entry ${entry.uid} is only processed inside its ingest request; the MTA retries it.`);
+        }
+        const raw: Buffer = rawInMemory ?? (await this.blobStore!.get(entry.rawBlobKey));
+        const zeroAccess: ZeroAccessFiling | undefined = await this.zeroAccessFilingFor(entry);
+        const result: ScanPipelineResult = await this.scanPipeline!.run(
+            raw,
+            { from: entry.envelopeFrom, to: entry.envelopeTo },
+            zeroAccess ? { includeBodyText: true } : {},
+        );
         // Scanning is the slow part - make sure this worker still owns the entry before writing anything.
         await this.renewLeaseIfDue(claim);
         if (await this.stopForErasure(claim)) {
@@ -860,7 +997,8 @@ export abstract class ScanQueueJob<
                                 ? QuarantineReason.INFECTED
                                 : (entry.quarantineReason ?? QuarantineReason.OTHER),
                         scanResultUid: scanResult.uid,
-                        rawBlobKey: entry.rawBlobKey,
+                        // A zero-access recipient's held message is sealed like a filed one: no plaintext is kept for review.
+                        rawBlobKey: zeroAccess ? await zeroAccess.storeMessage(raw, targetUid) : entry.rawBlobKey,
                     }),
                     { ignoreACL: true },
                 );
@@ -886,7 +1024,7 @@ export abstract class ScanQueueJob<
             const charge = { bytes: 0 };
             let delivered: boolean;
             try {
-                delivered = await this.deliverMessage(claim, raw, targetUid, scanResult, result, verdict === "junk", charge);
+                delivered = await this.deliverMessage(claim, raw, targetUid, scanResult, result, verdict === "junk", charge, zeroAccess);
             } catch (err) {
                 // The retry of this entry charges the message again (nothing is filed yet), so an attempt that failed
                 // after its charge hands the charge back.
@@ -901,11 +1039,11 @@ export abstract class ScanQueueJob<
             // before replying still replies. iTIP processing is idempotent (sequence/state checks), so a retry re-applies
             // it safely.
             if (delivered) {
-                await this.publishDelivered(entry, raw, targetUid, result, verdict === "junk");
+                await this.publishDelivered(entry, raw, targetUid, result, verdict === "junk", !!zeroAccess);
             }
             if (verdict === "deliver" && delivered) {
                 await this.maybeSendAutoReplyOnce(entry, raw, result);
-                await this.maybeProcessItipMessage(entry, raw, result);
+                await this.maybeProcessItipMessage(entry, raw, result, zeroAccess);
                 // Recipient suggestions: only mail that reached the Inbox counts - junk is not somebody the user knows.
                 await this.recordInboundCorrespondents(entry, result);
             }
@@ -919,7 +1057,14 @@ export abstract class ScanQueueJob<
      * when it is one. A retried entry that already filed its message publishes again - the stream is at-least-once, and its
      * consumers dedupe by `messageUid`. Never throws: `publish()` swallows a Redis failure.
      */
-    private async publishDelivered(entry: Q, raw: Buffer, messageUid: string, result: ScanPipelineResult, junk: boolean): Promise<void> {
+    private async publishDelivered(
+        entry: Q,
+        raw: Buffer,
+        messageUid: string,
+        result: ScanPipelineResult,
+        junk: boolean,
+        zeroAccess: boolean,
+    ): Promise<void> {
         const isReport: boolean = !!(result.deliveryStatusReport || result.feedbackReport);
         await this.mailEventStream?.publish({
             type: "message.delivered",
@@ -929,7 +1074,8 @@ export abstract class ScanQueueJob<
             envelopeFrom: entry.envelopeFrom,
             envelopeTo: [...entry.envelopeTo],
             fromAddress: result.fromAddress,
-            subject: result.subject,
+            // A zero-access message's subject is sealed: the stream (and every plugin reading it) gets none.
+            subject: zeroAccess ? undefined : result.subject,
             messageId: result.messageIdHeader,
             inReplyTo: result.inReplyTo,
             references: result.references,
@@ -1083,6 +1229,7 @@ export abstract class ScanQueueJob<
         result: ScanPipelineResult,
         isJunk: boolean,
         charge: { bytes: number },
+        zeroAccess?: ZeroAccessFiling,
     ): Promise<boolean> {
         const entry: Q = claim.row;
         // Who this message was actually addressed to, and who sent it, as its own headers say - shared by the
@@ -1106,7 +1253,8 @@ export abstract class ScanQueueJob<
         const alreadyFiled: boolean = !!(await this.messageRepo!.findOne(targetUid, { ignoreACL: true }));
 
         let sanitizedHtmlBlobKey: string | undefined;
-        if (result.sanitizedHtml !== undefined) {
+        // A zero-access message keeps no sanitized copy: the client renders it from the decrypted MIME.
+        if (result.sanitizedHtml !== undefined && !zeroAccess) {
             sanitizedHtmlBlobKey = `sanitized/${targetUid}`;
             await this.blobStore!.put(sanitizedHtmlBlobKey, Buffer.from(result.sanitizedHtml, "utf-8"), {
                 contentType: "text/html",
@@ -1191,7 +1339,7 @@ export abstract class ScanQueueJob<
                             mailboxUid: entry.mailboxUid,
                             reason: QuarantineReason.QUOTA_EXCEEDED,
                             scanResultUid: scanResult.uid,
-                            rawBlobKey: entry.rawBlobKey,
+                            rawBlobKey: zeroAccess ? await zeroAccess.storeMessage(raw, targetUid) : entry.rawBlobKey,
                         }),
                         { ignoreACL: true },
                     );
@@ -1201,8 +1349,19 @@ export abstract class ScanQueueJob<
             }
         }
 
-        const storedAttachments: StoredAttachment[] = await this.storeAttachmentBlobs(result.attachments, targetUid);
+        // A zero-access message's attachments stay inside its sealed MIME - no plaintext attachment blob, no attachment row: the client
+        // lists and opens them from the decrypted message, as it does for an end-to-end encrypted one.
+        const storedAttachments: StoredAttachment[] = zeroAccess ? [] : await this.storeAttachmentBlobs(result.attachments, targetUid);
         const flags: MessageFlags = { read: filterResult.markRead, flagged: false, answered: false, forwarded: false };
+        const sealed: SealedFields | undefined = zeroAccess ? await this.sealForFiling(zeroAccess, raw, targetUid, entry, result, recipients) : undefined;
+        const contentFields = {
+            subject: sealed ? PROTECTED_SUBJECT : (result.subject ?? ""),
+            bodyBlobKey: sealed ? sealed.bodyBlobKey : entry.rawBlobKey,
+            sanitizedHtmlBlobKey,
+            bodyPreview: sealed ? "" : (result.bodyPreview ?? ""),
+            hasAttachments: sealed ? result.attachments.length > 0 : storedAttachments.length > 0,
+            ...(sealed ? { zeroAccess: sealed.state } : {}),
+        };
 
         if (!filterResult.deleted && alreadyFiled) {
             const existing: M = (await this.messageRepo!.findOne(targetUid, { ignoreACL: true }))!;
@@ -1210,6 +1369,7 @@ export abstract class ScanQueueJob<
             if (existingFolder) {
                 await this.attachRows(storedAttachments, existing, existingFolder, entry.mailboxUid);
             }
+            await this.indexZeroAccess(sealed, existing.uid, existing.receivedDate);
             // The earlier attempt may have failed after filing but before its receipt was sent/recorded.
             await this.completeDeliveryReceipt(entry, raw, result, existing);
         } else if (!filterResult.deleted) {
@@ -1235,14 +1395,11 @@ export abstract class ScanQueueJob<
                     folderUid: folder.uid,
                     mailboxUid: entry.mailboxUid,
                     messageId,
-                    subject: result.subject ?? "",
+                    ...contentFields,
                     from: { ...sender },
                     recipients: recipients.map((recipient) => ({ ...recipient })),
                     sentDate: new Date(),
                     receivedDate: new Date(),
-                    bodyBlobKey: entry.rawBlobKey,
-                    sanitizedHtmlBlobKey,
-                    bodyPreview: result.bodyPreview ?? "",
                     flags,
                     importance: MessageImportance.NORMAL,
                     inReplyTo: result.inReplyTo,
@@ -1250,7 +1407,6 @@ export abstract class ScanQueueJob<
                     references: result.references,
                     conversationId,
                     inferenceClassification,
-                    hasAttachments: storedAttachments.length > 0,
                     meetingMethod: meetingMethodOf(result.icsPart),
                     labelUids: filterResult.labelUidsToApply,
                     encrypted: result.encrypted,
@@ -1260,6 +1416,7 @@ export abstract class ScanQueueJob<
                 }),
                 { ignoreACL: true },
             );
+            await this.indexZeroAccess(sealed, message.uid, message.receivedDate);
             this.notificationUtils?.sendMessage(folder.uid, this.messageClass.name, "create", message);
             await this.attachRows(storedAttachments, message, folder, entry.mailboxUid);
             await refreshFolderCounts(this.folderCountsContext(), [folder.uid], { bumpSyncKey: true });
@@ -1276,6 +1433,7 @@ export abstract class ScanQueueJob<
             const copyUid: string = nameBasedUuid(`${targetUid}:copy:${copyFolder.uid}`);
             const existingCopy: M | undefined = await this.messageRepo!.findOne(copyUid, { ignoreACL: true });
             if (existingCopy) {
+                await this.indexZeroAccess(sealed, existingCopy.uid, existingCopy.receivedDate);
                 await this.attachRows(storedAttachments, existingCopy, copyFolder, entry.mailboxUid);
                 continue;
             }
@@ -1301,14 +1459,11 @@ export abstract class ScanQueueJob<
                     folderUid: copyFolder.uid,
                     mailboxUid: entry.mailboxUid,
                     messageId: copyMessageId,
-                    subject: result.subject ?? "",
+                    ...contentFields,
                     from: { ...sender },
                     recipients: recipients.map((recipient) => ({ ...recipient })),
                     sentDate: new Date(),
                     receivedDate: new Date(),
-                    bodyBlobKey: entry.rawBlobKey,
-                    sanitizedHtmlBlobKey,
-                    bodyPreview: result.bodyPreview ?? "",
                     flags,
                     importance: MessageImportance.NORMAL,
                     inReplyTo: result.inReplyTo,
@@ -1316,7 +1471,6 @@ export abstract class ScanQueueJob<
                     references: result.references,
                     conversationId: copyConversationId,
                     inferenceClassification: copyClassification,
-                    hasAttachments: storedAttachments.length > 0,
                     meetingMethod: meetingMethodOf(result.icsPart),
                     labelUids: filterResult.labelUidsToApply,
                     encrypted: result.encrypted,
@@ -1324,6 +1478,7 @@ export abstract class ScanQueueJob<
                 }),
                 { ignoreACL: true },
             );
+            await this.indexZeroAccess(sealed, copyMessage.uid, copyMessage.receivedDate);
             this.notificationUtils?.sendMessage(copyFolder.uid, this.messageClass.name, "create", copyMessage);
             await this.attachRows(storedAttachments, copyMessage, copyFolder, entry.mailboxUid);
             await refreshFolderCounts(this.folderCountsContext(), [copyFolder.uid], { bumpSyncKey: true });
@@ -2373,7 +2528,7 @@ export abstract class ScanQueueJob<
      * means it's about the master/whole-series row - see `IcsUtils.ts`'s own doc comment on the master/
      * override `CalendarEvent` row model this relies on.
      */
-    private async maybeProcessItipMessage(entry: Q, raw: Buffer, result: ScanPipelineResult): Promise<void> {
+    private async maybeProcessItipMessage(entry: Q, raw: Buffer, result: ScanPipelineResult, zeroAccess?: ZeroAccessFiling): Promise<void> {
         if (!result.icsPart) {
             return;
         }
@@ -2395,7 +2550,7 @@ export abstract class ScanQueueJob<
         try {
             switch (parsed.method) {
                 case "REQUEST":
-                    await this.processItipRequest(entry.mailboxUid, parsed, result.encrypted, sender);
+                    await this.processItipRequest(entry.mailboxUid, parsed, result.encrypted, sender, zeroAccess);
                     break;
                 case "REPLY":
                     await this.processItipReply(entry.mailboxUid, parsed, sender);
@@ -2406,7 +2561,7 @@ export abstract class ScanQueueJob<
                 case "COUNTER":
                     // Only a guest's change request (`X-RAPIDMX-CHANGE-REQUEST`) is ever acted on; any other COUNTER is a proposal
                     // the organizer answers with `POST .../accept-proposal`, exactly as before.
-                    if (parsed.changeRequest && (await this.processItipChangeRequest(entry.mailboxUid, parsed, sender))) {
+                    if (parsed.changeRequest && (await this.processItipChangeRequest(entry.mailboxUid, parsed, sender, !!zeroAccess))) {
                         await this.markChangeRequestApplied(nameBasedUuid(`ingest:${entry.uid}:target`));
                     }
                     break;
@@ -2498,7 +2653,13 @@ export abstract class ScanQueueJob<
      * (`CalendarEvent.encryptionOrigin`'s own doc comment). This inbound iTIP pipeline only ever produces
      * `"derived"` or `"none"` - `"originated"` is set by a client explicitly creating/marking its own
      * outbound invite as encrypted, a different code path entirely (see `MeetingSchedulingJob`). */
-    private async processItipRequest(mailboxUid: string, parsed: ParsedIcsEvent, encrypted: boolean, sender: string): Promise<void> {
+    private async processItipRequest(
+        mailboxUid: string,
+        parsed: ParsedIcsEvent,
+        encrypted: boolean,
+        sender: string,
+        zeroAccess?: ZeroAccessFiling,
+    ): Promise<void> {
         const seriesRows: CE[] = await this.findCalendarEventRows(mailboxUid, parsed.uid);
         const existing: CE | undefined = seriesRows.find((row) => recurrenceIdsMatch(row.recurrenceId, parsed.recurrenceId));
         // Only the organizer may create or update a meeting: the sender must be the organizer the REQUEST names,
@@ -2546,6 +2707,23 @@ export abstract class ScanQueueJob<
             attendees = self.length > 0 ? self : attendees;
         }
 
+        // A zero-access mailbox's copy keeps the invitation's title, location and description only sealed (`specs/search.md` §4): the
+        // row holds a placeholder title, the client shows the real one after decrypting `sealedContent`.
+        const content = zeroAccess
+            ? {
+                  title: PROTECTED_SUBJECT,
+                  location: null,
+                  description: null,
+                  descriptionHtml: null,
+                  sealedContent: await zeroAccess.eventContent({
+                      title: parsed.summary ?? "",
+                      location: parsed.location,
+                      description: parsed.description,
+                      descriptionHtml: parsed.descriptionHtml,
+                  }),
+              }
+            : undefined;
+
         let row: CE;
         if (!existing) {
             const folder: F = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, mailboxUid, FolderType.CALENDAR);
@@ -2584,7 +2762,8 @@ export abstract class ScanQueueJob<
                     busyStatus: BusyStatus.BUSY,
                     icalUid: parsed.uid,
                     sequence: parsed.sequence,
-                    encryptionOrigin: (encrypted ? "derived" : "none") as EncryptionOrigin,
+                    encryptionOrigin: (encrypted || content ? "derived" : "none") as EncryptionOrigin,
+                    ...(content ? { ...content, location: undefined, description: undefined, descriptionHtml: undefined } : {}),
                     // This is an attendee's copy of someone else's invitation - marked as already sent so
                     // `MeetingSchedulingJob` never re-sends it as if this mailbox were the organizer.
                     inviteSequenceSent: parsed.sequence,
@@ -2616,6 +2795,7 @@ export abstract class ScanQueueJob<
                     recurrenceRule: parsed.recurrenceRule ?? current.recurrenceRule,
                     sequence: parsed.sequence,
                     inviteSequenceSent: parsed.sequence,
+                    ...(content ?? {}),
                 };
             });
             if (!updated) {
@@ -2939,7 +3119,7 @@ export abstract class ScanQueueJob<
      * back to needs-action, except the guest who asked, who is accepted (as `POST .../accept-proposal` does for the proposer). Version-checked
      * with a retry like every other iTIP update here.
      */
-    private async processItipChangeRequest(mailboxUid: string, parsed: ParsedIcsEvent, sender: string): Promise<boolean> {
+    private async processItipChangeRequest(mailboxUid: string, parsed: ParsedIcsEvent, sender: string, contentSealed: boolean = false): Promise<boolean> {
         const existing: CE | undefined = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
         if (!existing || !parsed.attendees.some((attendee) => normalizeAddress(attendee.address) === sender)) {
             return false;
@@ -2957,15 +3137,20 @@ export abstract class ScanQueueJob<
                 return undefined;
             }
             const patch: Record<string, any> = {};
-            const title: string | undefined = parsed.summary?.trim().slice(0, 1000);
+            // A zero-access organizer's event content is sealed and can't be merged here: only a time change applies.
+            if (contentSealed && (parsed.summary !== undefined || parsed.location !== undefined || parsed.description !== undefined)) {
+                this.logger?.info(`ScanQueueJob: not applying a guest's title, location or description change to zero-access event ${current.uid}.`);
+            }
+            const title: string | undefined = contentSealed ? undefined : parsed.summary?.trim().slice(0, 1000);
             if (title && title !== current.title) {
                 patch.title = title;
             }
-            const location: string | undefined = parsed.location?.trim().slice(0, 1000);
+            const location: string | undefined = contentSealed ? undefined : parsed.location?.trim().slice(0, 1000);
             if (location && location !== current.location) {
                 patch.location = location;
             }
             if (
+                !contentSealed &&
                 (parsed.description !== undefined || parsed.descriptionHtml !== undefined) &&
                 ((parsed.description ?? null) !== (current.description ?? null) || (parsed.descriptionHtml ?? null) !== (current.descriptionHtml ?? null))
             ) {

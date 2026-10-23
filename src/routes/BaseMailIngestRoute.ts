@@ -6,6 +6,7 @@ import * as crypto from "crypto";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import {
+    ACLUtils,
     ApiErrorMessages,
     ApiErrors,
     DocDecorators,
@@ -34,6 +35,7 @@ import { asEntity } from "../util/EntityUtils.js";
 import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import { nameBasedUuid } from "../util/UuidUtils.js";
 import { buildTransportRuleContext, evaluateTransportRules } from "../util/TransportRuleUtils.js";
+import { ZeroAccessResolver, type ZeroAccessTarget } from "../zeroaccess/ZeroAccessResolver.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Description, Summary } = DocDecorators;
 const { Get, Post, Query, Request, Response } = RouteDecorators;
@@ -83,9 +85,26 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
     protected abstract distributionListClass: any;
     protected abstract transportRuleClass: any;
     protected abstract domainClass: any;
+    /** The `EncryptionPolicy` model class, supplied by the Mongo/SQL subclasses - read for "Allow zero-access encryption". Left unset,
+     * no recipient is treated as zero-access. */
+    protected encryptionPolicyClass?: any;
+    /** The backend's `ScanQueueJob` class, which processes a zero-access recipient's entry inside this request (`processInline()`). */
+    protected scanQueueJobClass?: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
+
+    /** Decides which recipients' mail is sealed on arrival - built by `initialize()` when `encryptionPolicyClass` is set. */
+    protected zeroAccessResolver?: ZeroAccessResolver;
+
+    @Inject(ACLUtils)
+    private aclUtils?: ACLUtils;
+
+    @Config("trusted_roles", ["admin"])
+    private trustedRoles: string[] = ["admin"];
+
+    @Config("mail:zero_access:allowed", true)
+    private zeroAccessAllowedDefault: boolean = true;
 
     protected mailboxRepo?: RepoUtils<M>;
     protected ingestQueueRepo?: RepoUtils<Q>;
@@ -175,6 +194,46 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 args: [this.domainRepo],
             });
         }
+        if (!this.zeroAccessResolver && this.encryptionPolicyClass) {
+            const policyRepo: RepoUtils<any> = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.encryptionPolicyClass.name,
+                args: [this.encryptionPolicyClass],
+            });
+            this.zeroAccessResolver = new ZeroAccessResolver(policyRepo, this.aclUtils, this.zeroAccessAllowedDefault, this.trustedRoles);
+        }
+    }
+
+    /** The key `mailbox`'s mail must be sealed to on arrival, or `undefined` to store it as it arrives - see `ZeroAccessResolver`. */
+    private async zeroAccessTargetFor(mailbox: M): Promise<ZeroAccessTarget | undefined> {
+        return this.zeroAccessResolver ? await this.zeroAccessResolver.target(mailbox) : undefined;
+    }
+
+    /**
+     * Processes each zero-access recipient's entry now, from the raw message in memory (`ScanQueueJob.processInline()`): such an entry
+     * has no plaintext spool for the scan queue to process later. Returns how many failed - each logged, its entry left for the MTA's
+     * retry of the whole transaction, which `deliver()` asks for with a temporary failure.
+     */
+    private async processZeroAccessInline(entries: { uid: string; raw: Buffer }[]): Promise<number> {
+        if (entries.length === 0) {
+            return 0;
+        }
+        const job: any =
+            this.scanQueueJobClass &&
+            (this._objectFactory!.getInstance(this.scanQueueJobClass) ??
+                (await this._objectFactory!.newInstance(this.scanQueueJobClass, { name: this.scanQueueJobClass.name })));
+        let failures: number = 0;
+        for (const { uid, raw } of entries) {
+            try {
+                if (!job) {
+                    throw new Error("no ScanQueueJob is configured");
+                }
+                await job.processInline(uid, raw);
+            } catch (err: any) {
+                failures++;
+                this.logger?.error(`MailIngestRoute: zero-access delivery of ingest entry ${uid} failed, asking the MTA to retry: ${err?.message}`);
+            }
+        }
+        return failures;
     }
 
     /**
@@ -715,6 +774,8 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         // blob (a full copy of `raw`) per direct recipient - e.g. a 20MB attachment CC'd to 50 internal
         // mailboxes wrote ~1GB for one logical message instead of one 20MB blob.
         let directRawBlobKey: string | undefined;
+        // Zero-access recipients' entries, processed before answering - see `processZeroAccessInline()`.
+        const inline: { uid: string; raw: Buffer }[] = [];
         // What identifies this transaction when the MTA retries it after a failure part-way: the message, the sender and the recipients - so
         // each recipient's queue entry (and the blob they share) is made once, however many times the same transaction arrives.
         const transactionKey: string = crypto
@@ -741,18 +802,17 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             }
 
             if (mailbox) {
-                if (!directRawBlobKey) {
-                    directRawBlobKey = `ingest/${nameBasedUuid(`raw:${transactionKey}`)}`;
-                    await this.blobStore.put(directRawBlobKey, raw, { contentType: "message/rfc822" });
-                }
-                await this.queueIngestEntry(transactionKey, {
-                    mailboxUid: mailbox.uid,
-                    envelopeFrom,
-                    envelopeTo: [address],
-                    rawBlobKey: directRawBlobKey,
-                    status: IngestStatus.PENDING,
-                    quarantineReason,
-                });
+                // Written only when some recipient stores the message as it arrived: a zero-access recipient's copy never touches storage
+                // unencrypted. Bound per call (not inside the arrow), since `raw` is reassigned above.
+                const directRaw: Buffer = raw;
+                const ensureDirectBlob = async (): Promise<string> => {
+                    if (!directRawBlobKey) {
+                        directRawBlobKey = `ingest/${nameBasedUuid(`raw:${transactionKey}`)}`;
+                        await this.blobStore!.put(directRawBlobKey, directRaw, { contentType: "message/rfc822" });
+                    }
+                    return directRawBlobKey;
+                };
+                await this.queueRecipient(transactionKey, mailbox, { envelopeFrom, envelopeTo: [address], quarantineReason }, raw, ensureDirectBlob, inline);
                 results.push({ rcpt: address, queued: true });
                 continue;
             }
@@ -805,18 +865,17 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             // shared by every internal member's `IngestQueueEntry` and every external relay - not rebuilt or
             // re-stored per recipient.
             const listRaw: Buffer = rewriteHeadersForList(raw, list);
-            const rawBlobKey: string = `ingest/${nameBasedUuid(`list-raw:${transactionKey}:${list.uid}`)}`;
-            await this.blobStore.put(rawBlobKey, listRaw, { contentType: "message/rfc822" });
+            let listRawBlobKey: string | undefined;
+            const ensureListBlob = async (): Promise<string> => {
+                if (!listRawBlobKey) {
+                    listRawBlobKey = `ingest/${nameBasedUuid(`list-raw:${transactionKey}:${list.uid}`)}`;
+                    await this.blobStore!.put(listRawBlobKey, listRaw, { contentType: "message/rfc822" });
+                }
+                return listRawBlobKey;
+            };
 
             for (const member of mailboxes) {
-                await this.queueIngestEntry(transactionKey, {
-                    mailboxUid: member.uid,
-                    envelopeFrom,
-                    envelopeTo: [address],
-                    rawBlobKey,
-                    status: IngestStatus.PENDING,
-                    quarantineReason,
-                });
+                await this.queueRecipient(transactionKey, member, { envelopeFrom, envelopeTo: [address], quarantineReason }, listRaw, ensureListBlob, inline);
             }
 
             // External members get a copy the MTA signs as this server's domain, so it must not launder a spoofed message
@@ -858,6 +917,14 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             results.push({ rcpt: address, queued: mailboxes.length > 0 || (!!externalRaw && externalAddresses.length > 0) });
         }
 
+        // A zero-access recipient that couldn't be delivered here has nothing queued to fall back on: the MTA must retry the transaction,
+        // which redoes only what isn't done yet (entries and filing are idempotent) - though an external list member already relayed to is
+        // relayed to again, the lesser harm next to losing the message.
+        const inlineFailures: number = await this.processZeroAccessInline(inline);
+        if (inlineFailures > 0) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 503, `Could not deliver to ${inlineFailures} recipient(s). Try again.`);
+        }
+
         // A relay that failed is not a delivered message: answering 202 would have the MTA drop it. Everything else of the transaction is queued by
         // now, and queues the same entries - not new ones - when the MTA retries it. Not when other external members were already relayed:
         // the retry would send the list's message to each of them again, so the members that failed are given up on (logged) instead.
@@ -871,20 +938,51 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
 
     /**
      * Stages one `IngestQueueEntry`, once: its uid is derived from the transaction (`transactionKey`), the mailbox and the recipient address, so a
-     * retry of a transaction that failed part-way finds the entries it already made instead of making them again.
+     * retry of a transaction that failed part-way finds the entries it already made instead of making them again. `fields` is only
+     * built when the entry is new, so a retry never redoes (or contradicts) what the first attempt decided - like writing a raw blob
+     * for a recipient whose first attempt sealed its copy.
      */
-    private async queueIngestEntry(transactionKey: string, fields: Record<string, unknown> & { mailboxUid: string; envelopeTo: string[] }): Promise<void> {
-        const uid: string = nameBasedUuid(`ingest-entry:${transactionKey}:${fields.mailboxUid}:${fields.envelopeTo[0]}`);
-        if (await this.ingestQueueRepo!.findOne(uid, { ignoreACL: true, includeDeleted: true })) {
-            return;
+    private async queueIngestEntry(transactionKey: string, mailboxUid: string, address: string, fields: () => Promise<Record<string, unknown>>): Promise<Q> {
+        const uid: string = nameBasedUuid(`ingest-entry:${transactionKey}:${mailboxUid}:${address}`);
+        const existing: Q | undefined = await this.ingestQueueRepo!.findOne(uid, { ignoreACL: true, includeDeleted: true });
+        if (existing) {
+            return existing;
         }
         try {
-            await this.ingestQueueRepo!.create(new this.ingestQueueClass({ uid, ...fields }), { ignoreACL: true });
+            return await this.ingestQueueRepo!.create(new this.ingestQueueClass({ uid, mailboxUid, ...(await fields()) }), { ignoreACL: true });
         } catch (err: any) {
             // A concurrent retry made it between the lookup and here.
             if (!isDuplicateKeyError(err)) {
                 throw err;
             }
+            return (await this.ingestQueueRepo!.findOne(uid, { ignoreACL: true, includeDeleted: true }))!;
+        }
+    }
+
+    /**
+     * Stages one mailbox recipient's entry. A zero-access recipient (`zeroAccessTargetFor()`) gets an entry with no raw blob, naming the
+     * key, and is added to `inline` with the message in memory; anybody else gets one sharing the transaction's raw blob
+     * (`ensureBlob()`), drained later by `ScanQueueJob`. A retried transaction keeps whatever its first attempt decided for the
+     * recipient: an existing zero-access entry is processed inline again, an existing plaintext one already has its blob.
+     */
+    private async queueRecipient(
+        transactionKey: string,
+        mailbox: M,
+        fields: { envelopeFrom: string; envelopeTo: string[]; quarantineReason?: QuarantineReason },
+        raw: Buffer,
+        ensureBlob: () => Promise<string>,
+        inline: { uid: string; raw: Buffer }[],
+    ): Promise<void> {
+        const entry: Q = await this.queueIngestEntry(transactionKey, mailbox.uid, fields.envelopeTo[0], async () => {
+            const target: ZeroAccessTarget | undefined = await this.zeroAccessTargetFor(mailbox);
+            return {
+                ...fields,
+                status: IngestStatus.PENDING,
+                ...(target ? { rawBlobKey: "", zeroAccessKeyFingerprint: target.key.fingerprint } : { rawBlobKey: await ensureBlob() }),
+            };
+        });
+        if (entry.zeroAccessKeyFingerprint) {
+            inline.push({ uid: entry.uid, raw });
         }
     }
 }

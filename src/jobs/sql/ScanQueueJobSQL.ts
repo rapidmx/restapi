@@ -21,6 +21,7 @@ import {
     OofReplySuppressionSQL,
     QuarantineEntrySQL,
     ScanResultSQL,
+    ZeroAccessIndexEntrySQL,
 } from "../../sql.js";
 
 export class ScanQueueJobSQL extends ScanQueueJob<
@@ -53,6 +54,7 @@ export class ScanQueueJobSQL extends ScanQueueJob<
     protected domainClass: any = DomainSQL;
     protected keyVaultClass: any = KeyVaultSQL;
     protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestSQL;
+    protected zeroAccessIndexEntryClass: any = ZeroAccessIndexEntrySQL;
 
     /** `MailboxSQL.aliasAddresses` is a serialized `simple-json` column - see `MailIngestRouteSQL.aliasQueryValue()`, whose
      * anchored, `ESCAPE`d LIKE this repeats. */

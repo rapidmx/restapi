@@ -88,6 +88,11 @@ export class IngestQueueEntrySQL extends BaseEntity implements IngestQueueEntry 
     @Nullable
     public scanLeaseExpiresAt?: Date;
 
+    @Column({ nullable: true })
+    @Description("Set for a zero-access recipient: the key the message is sealed to. Such an entry has no raw blob and is processed inside the ingest request.")
+    @Nullable
+    public zeroAccessKeyFingerprint?: string;
+
     constructor(other?: Partial<IngestQueueEntrySQL>) {
         super(other);
 
@@ -99,6 +104,7 @@ export class IngestQueueEntrySQL extends BaseEntity implements IngestQueueEntry 
             this.status = other.status !== undefined ? other.status : this.status;
             this.errorMessage = "errorMessage" in other ? other.errorMessage : this.errorMessage;
             this.quarantineReason = "quarantineReason" in other ? other.quarantineReason : this.quarantineReason;
+            this.zeroAccessKeyFingerprint = "zeroAccessKeyFingerprint" in other ? other.zeroAccessKeyFingerprint : this.zeroAccessKeyFingerprint;
             this.attempts = "attempts" in other ? other.attempts : this.attempts;
             this.nextAttemptAt = "nextAttemptAt" in other ? other.nextAttemptAt : this.nextAttemptAt;
             this.scanLeaseExpiresAt = "scanLeaseExpiresAt" in other ? other.scanLeaseExpiresAt : this.scanLeaseExpiresAt;

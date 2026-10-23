@@ -20,6 +20,7 @@ import {
     OofReplySuppressionMongo,
     QuarantineEntryMongo,
     ScanResultMongo,
+    ZeroAccessIndexEntryMongo,
 } from "../../mongo.js";
 
 export class ScanQueueJobMongo extends ScanQueueJob<
@@ -52,4 +53,5 @@ export class ScanQueueJobMongo extends ScanQueueJob<
     protected domainClass: any = DomainMongo;
     protected keyVaultClass: any = KeyVaultMongo;
     protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestMongo;
+    protected zeroAccessIndexEntryClass: any = ZeroAccessIndexEntryMongo;
 }

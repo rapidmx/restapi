@@ -16,6 +16,7 @@ import {
     CalendarEvent,
     CalendarEventStatus,
     EncryptionOrigin,
+    SealedEventContent,
     EventVisibility,
     Recipient,
     RecipientType,
@@ -172,6 +173,11 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
     @Description("Provenance for this event's encryption state - see EncryptionOrigin's own doc comment.")
     public encryptionOrigin: EncryptionOrigin = "none";
 
+    @Column()
+    @Description("Set for an event created from a zero-access message: its title, location and description, sealed to the mailbox's zero-access key.")
+    @Nullable
+    public sealedContent?: SealedEventContent = undefined;
+
     // Not indexed: nothing ever queries by this field - `MeetingSchedulingJob` only reads it off rows it has
     // already loaded, to decide whether that one event's invites need per-attendee personalization.
     @Column()
@@ -255,6 +261,7 @@ export class CalendarEventMongo extends RecoverableBaseMongoEntity implements Ca
             this.reminderSentFor = "reminderSentFor" in other ? other.reminderSentFor : this.reminderSentFor;
             this.startAlarmSentFor = "startAlarmSentFor" in other ? other.startAlarmSentFor : this.startAlarmSentFor;
             this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
+            this.sealedContent = "sealedContent" in other ? other.sealedContent : this.sealedContent;
             this.videoMeetingUid = "videoMeetingUid" in other ? other.videoMeetingUid : this.videoMeetingUid;
             this.description = "description" in other ? other.description : this.description;
             this.descriptionHtml = "descriptionHtml" in other ? other.descriptionHtml : this.descriptionHtml;

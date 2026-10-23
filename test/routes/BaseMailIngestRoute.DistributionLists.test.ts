@@ -70,7 +70,8 @@ async function makeRoute(overrides: {
     const objectFactory: ObjectFactory = new ObjectFactory(config, Logger());
     const route = objectFactory.newInstance<TestMailIngestRoute>(TestMailIngestRoute, { initialize: false });
     const logger = { warn: vi.fn() };
-    const ingestQueueRepo = { create: vi.fn(), findOne: vi.fn().mockResolvedValue(undefined) };
+    // `create()` returns the row it made, as a real repo does.
+    const ingestQueueRepo = { create: vi.fn(async (entry: any) => entry), findOne: vi.fn().mockResolvedValue(undefined) };
     const mailTransport = { send: vi.fn().mockResolvedValue({ accepted: ["x"], rejected: [] }) };
 
     (route as any).ingestSecret = "s3cr3t";
@@ -249,6 +250,8 @@ describe("BaseMailIngestRoute Tests (distribution list expansion/relay/unsubscri
         const raw = "From: sender@example.com\r\n\r\nHi\r\n";
         const duplicate = await makeRoute({ lists: { "target@example.com": target }, mailboxes: { "real@example.com": real } });
         duplicate.ingestQueueRepo.create.mockRejectedValueOnce(Object.assign(new Error("E11000 duplicate key"), { code: 11000 }));
+        // Not there when first looked up; there (made by the concurrent retry) when looked up again after the duplicate-key error.
+        duplicate.ingestQueueRepo.findOne.mockResolvedValueOnce(undefined).mockResolvedValueOnce({ uid: "made-by-retry", rawBlobKey: "ingest/x" });
         const res = makeRes();
 
         await duplicate.route.deliver(makeReq("sender@example.com", "target@example.com", raw), res);

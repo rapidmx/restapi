@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { DistributionListSQL, DomainSQL, IngestQueueEntrySQL, MailboxSQL, TransportRuleSQL } from "../../sql.js";
+import { DistributionListSQL, DomainSQL, EncryptionPolicySQL, IngestQueueEntrySQL, MailboxSQL, TransportRuleSQL } from "../../sql.js";
+import { ScanQueueJobSQL } from "../../jobs/sql/ScanQueueJobSQL.js";
 import { BaseMailIngestRoute } from "../BaseMailIngestRoute.js";
 import { escapeLike, rawLike } from "./LikeUtils.js";
 
@@ -12,6 +13,8 @@ export class MailIngestRouteSQL extends BaseMailIngestRoute<MailboxSQL, IngestQu
     protected distributionListClass: any = DistributionListSQL;
     protected transportRuleClass: any = TransportRuleSQL;
     protected domainClass: any = DomainSQL;
+    protected encryptionPolicyClass: any = EncryptionPolicySQL;
+    protected scanQueueJobClass: any = ScanQueueJobSQL;
 
     /**
      * `MailboxSQL.aliasAddresses`/`DistributionListSQL.aliasAddresses` are both `simple-json` columns, stored

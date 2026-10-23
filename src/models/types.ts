@@ -2389,6 +2389,11 @@ export interface CalendarEvent extends RecoverableBaseEntity {
      */
     encryptionOrigin: EncryptionOrigin;
 
+    /** Set when this event was created from a zero-access message (`specs/search.md` §4): its title, location and description are
+     * sealed here to the mailbox's zero-access key, and the row's own `title` is a placeholder with no location or description.
+     * Temporal fields, the organizer and the attendees stay plaintext, so free/busy and scheduling still work. */
+    sealedContent?: SealedEventContent;
+
     /**
      * The identifier of the video meeting a compose client linked to this event, if any - e.g. a
      * `@rapidmx/meet-plugin` `VideoMeeting.uid`, named here generically and by name only: this library
@@ -2478,6 +2483,22 @@ export type EventVisibility = "default" | "public" | "private" | "confidential";
  * control (ciphertext is self-evident to the server either way), but the UI needs it to explain *why* an item
  * is encrypted. See `specs/search.md` §3 "Provenance".
  */
+/** An event's sealed content - see `CalendarEvent.sealedContent`. */
+export interface SealedEventContent {
+    /** Fingerprint of the zero-access key `sealed` is encrypted to. */
+    keyFingerprint: string;
+    /** Base64 DER CMS `EnvelopedData` of the JSON `SealedEventFields`. */
+    sealed: string;
+}
+
+/** What `SealedEventContent.sealed` decrypts to. */
+export interface SealedEventFields {
+    title: string;
+    location?: string;
+    description?: string;
+    descriptionHtml?: string;
+}
+
 export type EncryptionOrigin =
     /** Not encrypted. */
     | "none"
@@ -2795,6 +2816,12 @@ export interface IngestQueueEntry extends BaseEntity {
     /** Set when a worker claims the entry for scanning. Once it has passed, a `SCANNING` entry is treated as abandoned
      * (its worker died) and can be claimed again. */
     scanLeaseExpiresAt?: Date;
+
+    /** Set when this recipient's mailbox stores mail zero-access encrypted (`specs/search.md` §3): the fingerprint of the key the
+     * message is sealed to. Such an entry has no raw blob - `rawBlobKey` is empty - because it is processed inside the ingest request
+     * from the raw message in memory, never from a plaintext spool; `ScanQueueJob` never picks it up on its own, and a failure is
+     * retried by the MTA resending the transaction. */
+    zeroAccessKeyFingerprint?: string;
 }
 
 /**

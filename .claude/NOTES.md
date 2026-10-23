@@ -4221,3 +4221,43 @@ Tests (targeted, `--coverage.enabled=false`):
 - **Cross-repo fixture.** web-client's `test/lib/crypto/fixtures/zeroAccessSealed.json` was generated with this sealer, and `zeroAccessSealedFixture.test.ts` there proves the client's existing `decryptEnvelopedDataWithKeys()` and `parseEncryptedMessageWithKeys()` open it.
   - If the sealed format changes, regenerate it with a throwaway vitest file calling `sealMessage`, `sealSummary` and `sealIndexDocument`, and write it to that path.
 - **Open, needs a real device.** Do Outlook and iOS Mail accept AES-GCM inside `EnvelopedData`? RFC 5083 puts GCM in `AuthEnvelopedData`. This matters for the S/MIME passthrough (Phase 4). If they don't, switch to `AuthEnvelopedData` and teach web-client to read it.
+
+## 2026-10-22 - Zero-access encryption, Phase 3 (delivery path)
+
+The delivery path is now done for zero-access recipients. No plaintext spool exists for them.
+
+- **Ingest (`BaseMailIngestRoute.deliver()`).** Each mailbox recipient is staged through `queueRecipient()`.
+  - `ZeroAccessResolver.target()` (via `encryptionPolicyClass`, set in the Mongo/SQL concrete routes) decides each recipient.
+  - A zero-access recipient's `IngestQueueEntry` gets `rawBlobKey: ""` and a `zeroAccessKeyFingerprint`, and is processed **inside the request** before the 202, by `ScanQueueJob.processInline(uid, raw)` with the raw message in memory. The job comes from `scanQueueJobClass` through `objectFactory.getInstance()` or `newInstance({ name })`.
+  - The transaction's raw blob (direct, or `list-raw` for a distribution list) is written lazily, only when some recipient needs plaintext.
+  - Any inline failure answers **503**; postfix-bridge maps a non-202 to SMTP 450, so the sending MTA retries.
+- **Retries keep the first decision.** `queueIngestEntry(transactionKey, mailboxUid, address, fields)` now takes a lazy `fields` builder and returns the row, so a retry follows whatever the first attempt decided.
+  - An existing zero-access entry is processed inline again, even if zero-access was turned off in between (it is sealed to the key chosen then).
+  - An existing plaintext entry already has its blob.
+  - **Bug caught by a test:** the first version built the fields, and so wrote the raw blob, before looking the entry up.
+- **`ScanQueueJob`.**
+  - `findDueEntries` adds `zeroAccessKeyFingerprint: "exists(false)"` to every query, so the background job never picks a zero-access entry up.
+  - `processEntry(claim, rawInMemory?)` throws for a zero-access entry without an in-memory raw message.
+  - `zeroAccessFilingFor()` resolves the key by fingerprint (`zeroAccessTargetFor`, revoked included).
+  - `ScanPipeline.run(..., { includeBodyText: true })` is used for zero-access.
+- **Filing (`ZeroAccessFiling`, per delivery).**
+  - **Stored message.** The sealed MIME goes to `za/<mailboxUid>/<targetUid>`, written once and reused by rule copies and retries.
+  - **Message row.** `subject: "[...]"`, `bodyPreview: ""`, and `zeroAccess: { keyFingerprint, sealedSummary }`. There is no sanitized-HTML blob, no attachment blobs or rows, and `hasAttachments` comes from the parsed attachments.
+  - **Index entry.** One `ZeroAccessIndexEntry` per filed message (primary and every rule copy, and again on retry), with uid `nameBasedUuid("za-index:" + messageUid)`. The document is built once per delivery by `buildIndexDocument`, with extraction under `mail:zero_access:extraction_budget_ms` (5000) and `extraction_max_bytes` (10 MB).
+  - **Quarantine.** Both the transport-rule/AV path and the over-quota path store the sealed blob as `QuarantineEntry.rawBlobKey`. Release only stamps `releasedAt` and never re-reads the message, so nothing else is needed.
+  - **Mail event stream.** `message.delivered` carries no subject for zero-access mail.
+  - **Push.** The pushed `Message` already carries the placeholder subject.
+- **iTIP.**
+  - `processItipRequest` creates and updates the event with `title: "[...]"`, location, description and descriptionHtml null, `sealedContent: { keyFingerprint, sealed }` (`sealEventFields`), and `encryptionOrigin: "derived"`. Time, organizer and attendees stay plaintext.
+  - `processItipChangeRequest(..., contentSealed)` applies only time changes to a zero-access organizer's event, because the server can't merge into sealed content; it logs at info.
+  - The client-side decryption of `sealedContent` is Phase 6. Until then, such events show "[...]".
+- **Source A works unchanged.** `SearchIndexJob.buildDocument` parses the sealed blob, `isEncryptedBody()` is true, so the document is metadata-only with subject "[...]".
+- **Tests.** `test/routes/zeroAccessDeliverySuite.ts`, run on both backends by `{mongo,sql}/ZeroAccessDelivery.test.ts` (12 each), covers:
+  - The canary check: no blob anywhere contains the subject, body or attachment text.
+  - Each of the four reasons that makes delivery plaintext.
+  - Mixed recipients.
+  - Quarantine.
+  - 503, then retry, filed exactly once.
+  - A retry after zero-access was turned off.
+  - Invite creation and update.
+  - The change request.

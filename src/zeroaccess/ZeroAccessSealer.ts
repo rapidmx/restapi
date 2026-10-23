@@ -14,7 +14,7 @@ import { promisify } from "node:util";
 import { gzip as gzipCallback } from "node:zlib";
 import * as asn1js from "asn1js";
 import * as pkijs from "pkijs";
-import type { ZeroAccessIndexDocument, ZeroAccessSummary } from "../models/types.js";
+import type { SealedEventFields, ZeroAccessIndexDocument, ZeroAccessSummary } from "../models/types.js";
 
 const gzip = promisify(gzipCallback);
 
@@ -60,6 +60,17 @@ export async function sealToCertificate(content: Uint8Array, certDer: Uint8Array
 /** The sealed summary of a message (`MessageZeroAccess.sealedSummary`), base64. */
 export async function sealSummary(summary: ZeroAccessSummary, certDer: Uint8Array): Promise<string> {
     const json: string = JSON.stringify({ subject: summary.subject, preview: summary.preview });
+    return (await sealToCertificate(Buffer.from(json, "utf-8"), certDer)).toString("base64");
+}
+
+/** A calendar event's sealed content (`SealedEventContent.sealed`), base64 JSON of only the `SealedEventFields` that are set. */
+export async function sealEventFields(fields: SealedEventFields, certDer: Uint8Array): Promise<string> {
+    const json: string = JSON.stringify({
+        title: fields.title,
+        ...(fields.location !== undefined ? { location: fields.location } : {}),
+        ...(fields.description !== undefined ? { description: fields.description } : {}),
+        ...(fields.descriptionHtml !== undefined ? { descriptionHtml: fields.descriptionHtml } : {}),
+    });
     return (await sealToCertificate(Buffer.from(json, "utf-8"), certDer)).toString("base64");
 }
 
