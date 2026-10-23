@@ -11,18 +11,18 @@ import type { Mailbox, ZeroAccessKey } from "../models/types.js";
  * - `active`: mail is encrypted at rest on arrival.
  * - `disabled_by_admin`: the server's "Allow zero-access encryption" is off (`EncryptionPolicy.allowZeroAccess`).
  * - `disabled_by_owner`: the mailbox's own "Enable zero-access encryption" is off (`Mailbox.zeroAccessEnabled`).
- * - `shared_mailbox`: the mailbox has no owner or has delegates - excluded until member key wraps exist, so a delegate
- * never silently loses access to new mail.
- * - `no_key`: no zero-access key is enrolled yet; it is provisioned the next time the owner unlocks their keys.
+ * - `no_key`: no zero-access key is enrolled yet. The owner's client provisions one the next time they unlock; for a mailbox without an
+ * owner, the client of a member with full access does, wrapping it to every member (`KeyVault.memberKeyWraps`).
+ *
+ * A shared mailbox - one with delegates, or with no owner - is no exception: its members read it through member key wraps
+ * (`specs/search.md` §3 *Shared Mailboxes*).
  */
-export type ZeroAccessStatus = "active" | "disabled_by_admin" | "disabled_by_owner" | "shared_mailbox" | "no_key";
+export type ZeroAccessStatus = "active" | "disabled_by_admin" | "disabled_by_owner" | "no_key";
 
 /** What `zeroAccessStatus()` needs beyond the mailbox itself. */
 export interface ZeroAccessContext {
     /** The effective `EncryptionPolicy.allowZeroAccess` (the stored value, or `mail:zero_access:allowed`). */
     allowZeroAccess: boolean;
-    /** Whether any user other than the owner holds a grant on the mailbox. */
-    hasDelegates: boolean;
 }
 
 /**
@@ -41,7 +41,7 @@ export function activeZeroAccessKey(mailbox: Pick<Mailbox, "zeroAccessKeys">): Z
 }
 
 /** Whether zero-access encryption is in effect for `mailbox` and, if not, why - see `ZeroAccessStatus`. The checks run in the
- * order a user can act on them: the administrator's switch first, then the owner's, then the mailbox's shape, then its key. */
+ * order a user can act on them: the administrator's switch first, then the owner's, then its key. */
 export function zeroAccessStatus(
     mailbox: Pick<Mailbox, "ownerUserUid" | "zeroAccessEnabled" | "zeroAccessKeys">,
     context: ZeroAccessContext,
@@ -52,9 +52,6 @@ export function zeroAccessStatus(
     // Unset (or a SQL `null` from before the column existed) means on.
     if (mailbox.zeroAccessEnabled === false) {
         return "disabled_by_owner";
-    }
-    if (!mailbox.ownerUserUid || context.hasDelegates) {
-        return "shared_mailbox";
     }
     return activeZeroAccessKey(mailbox) ? "active" : "no_key";
 }

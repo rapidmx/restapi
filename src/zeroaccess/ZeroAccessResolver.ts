@@ -20,7 +20,8 @@ export interface ZeroAccessTarget {
 /** The mailbox fields zero-access decisions read. */
 export type ZeroAccessMailbox = Pick<Mailbox, "uid" | "ownerUserUid" | "zeroAccessEnabled" | "zeroAccessKeys">;
 
-function canonicalUserUid(uid: string | undefined): string | undefined {
+/** A user uid as member comparisons use it: normalized when it is a UUID, else trimmed and lowercased. */
+export function canonicalUserUid(uid: string | undefined): string | undefined {
     const trimmed: string | undefined = uid?.trim();
     return trimmed === undefined ? undefined : (normalizeUserUid(trimmed) ?? trimmed.toLowerCase());
 }
@@ -48,29 +49,19 @@ export class ZeroAccessResolver {
         return typeof policy?.allowZeroAccess === "boolean" ? policy.allowZeroAccess : this.allowedDefault !== false;
     }
 
-    /** Whether anybody besides the owner (and administrative roles) holds read access on `mailbox` - a delegate who would lose
-     * access to new mail if it were encrypted to the owner's key alone. */
-    public async hasDelegates(mailbox: ZeroAccessMailbox): Promise<boolean> {
-        const acl = await this.aclUtils?.findACL(mailbox.uid);
-        const owner: string | undefined = canonicalUserUid(mailbox.ownerUserUid);
-        return (acl?.records ?? []).some(
-            (record) =>
-                canonicalUserUid(record.userOrRoleId) !== owner &&
-                !this.trustedRoles.includes(record.userOrRoleId) &&
-                record.actions.some((action) => action === ACLAction.READ || action === ACLAction.FULL),
-        );
+    /** The members of `mailbox` besides its owner: every user its access list grants read or full access, other than the owner (however
+     * their uid is spelled), administrative roles and the catch-all records. They read its zero-access mail through member key wraps. */
+    public async members(mailbox: ZeroAccessMailbox): Promise<{ userUid: string; full: boolean }[]> {
+        return zeroAccessMembers(await this.aclUtils?.findACL(mailbox.uid), mailbox, this.trustedRoles);
     }
 
-    /** `zeroAccessStatus()` for `mailbox`, reading the policy and the access list only when an earlier check hasn't decided it. */
+    /** `zeroAccessStatus()` for `mailbox`, reading the policy only when the mailbox's own state hasn't decided it. */
     public async status(mailbox: ZeroAccessMailbox): Promise<ZeroAccessStatus> {
         if (!(await this.allowed())) {
             return "disabled_by_admin";
         }
         if (mailbox.zeroAccessEnabled === false) {
             return "disabled_by_owner";
-        }
-        if (!mailbox.ownerUserUid || (await this.hasDelegates(mailbox))) {
-            return "shared_mailbox";
         }
         return activeZeroAccessKey(mailbox) ? "active" : "no_key";
     }
@@ -83,6 +74,30 @@ export class ZeroAccessResolver {
         }
         return toTarget(activeZeroAccessKey(mailbox)!);
     }
+}
+
+/** Records that are never a member: the anonymous and catch-all records. */
+const NON_MEMBER_RECORDS: ReadonlySet<string> = new Set(["anonymous", ".*"]);
+
+/** `ZeroAccessResolver.members()` over an already-read access list. */
+export function zeroAccessMembers(
+    acl: { records?: { userOrRoleId: string; actions: string[] }[] } | undefined | null,
+    mailbox: Pick<Mailbox, "ownerUserUid">,
+    trustedRoles: readonly string[],
+): { userUid: string; full: boolean }[] {
+    const owner: string | undefined = canonicalUserUid(mailbox.ownerUserUid);
+    const members: Map<string, boolean> = new Map();
+    for (const record of acl?.records ?? []) {
+        const uid: string | undefined = canonicalUserUid(record.userOrRoleId);
+        if (!uid || uid === owner || NON_MEMBER_RECORDS.has(record.userOrRoleId) || trustedRoles.includes(record.userOrRoleId)) {
+            continue;
+        }
+        const full: boolean = record.actions.includes(ACLAction.FULL);
+        if (full || record.actions.includes(ACLAction.READ)) {
+            members.set(uid, (members.get(uid) ?? false) || full);
+        }
+    }
+    return [...members.entries()].map(([userUid, full]) => ({ userUid, full }));
 }
 
 function toTarget(key: ZeroAccessKey): ZeroAccessTarget {

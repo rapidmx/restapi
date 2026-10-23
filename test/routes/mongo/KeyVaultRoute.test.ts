@@ -5,7 +5,7 @@
 import "reflect-metadata";
 import config from "../../config.js";
 import { request } from "@rapidrest/service-core/test";
-import { ACLRecord, MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager, ACLAction, RepoUtils } from "@rapidrest/service-core";
+import { ACLRecord, ACLUtils, MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager, ACLAction, RepoUtils } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as x509 from "@peculiar/x509";
 import * as uuid from "uuid";
@@ -16,6 +16,7 @@ import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { FakeEncryptionCertificateAuthority, generateTestCsr, registerTestDoubles } from "../../testDoubles.js";
+import { sharedZeroAccessKeySuite } from "../sharedZeroAccessKeySuite.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -1148,5 +1149,31 @@ describe("Route:KeyVaultMongo Tests", () => {
 
             expect(result.status).toBe(403);
         });
+    });
+
+    sharedZeroAccessKeySuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        tokenFor: (uid) => JWTUtils.createTokenSync(config.get("auth"), { uid, roles: [], elevated: Date.now() } as any),
+        createMailbox: async (data?: any) =>
+            mailboxRepo.save(
+                new MailboxMongo({
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Shared",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                    ...data,
+                }),
+            ),
+        setAcl: async (mailboxUid, records) => {
+            await aclRepo.deleteMany({ uid: mailboxUid } as any);
+            await aclRepo.save({ uid: mailboxUid, dateCreated: new Date(), dateModified: new Date(), version: 0, records, parentUid: "Mailbox" });
+            // As the access route does after writing an access list.
+            await objectFactory.getInstance(ACLUtils)?.invalidateACLs([mailboxUid]);
+        },
+        findMailbox: (uid) => mailboxRepo.findOne({ uid } as any),
+        findKeyVault: (mailboxUid) => keyVaultRepo.findOne({ mailboxUid } as any),
     });
 });

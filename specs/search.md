@@ -138,6 +138,15 @@ Instead, the mailbox's zero-access **private key** — never its MK, signing key
 - **Provisioning.** The owner's client provisions an owned mailbox. For an ownerless mailbox, a member with full access provisions its keypair, and the member wraps (plus an escrow wrap, if the mailbox has an escrow scope) are its only copies.
 - **Grants.** Adding a member — including by an administrator, who holds no key — creates a pending grant. Any unlocked member who holds the key fulfils it in the background. A member without a zero-access key of their own stays pending until they first sign in.
 - **Revocation.** Removing a member triggers a key rotation on the next unlocked member's client: a new keypair is enrolled for new mail, and the retained old keys are re-wrapped for the remaining members only. Until that runs, new mail is still encrypted to the old key; the client shows the rotation as pending.
+- **Interface.** All of this is under `/mail/mailboxes/:id/keyvault`.
+  - `GET members` reports the members, their certificates and wraps, and who is pending or departed, with the caller's `role`.
+  - `GET member-wraps` returns the caller's own wraps.
+  - `PUT member-wraps` fulfils grants; it is for the owner and members with full access.
+  - `DELETE member-wraps/:user` removes a departed user's wraps.
+  - `POST shared-zero-access-key` serves a mailbox without an owner: its key and the members' wraps are written together.
+  - A member's "own certificate" is the active zero-access key of a mailbox they own.
+  - Membership is read from the access list uncached.
+  - Retained keys need no re-wrapping on rotation: the remaining members already hold them. Only the departed user's wraps are removed.
 
 ## 4. Encryption Scope
 

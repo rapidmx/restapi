@@ -37,7 +37,10 @@ import {
     verifiedIssuerCertificate,
 } from "../util/CertificateInstallUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
-import { AuditAction, EscrowScope, KeyUseType, KeyVault, Mailbox, MasterKeyWrap, PublicKey, WrappedPrivateKey, ZeroAccessKey } from "../models/types.js";
+import { AuditAction, EscrowScope, KeyUseType, KeyVault, Mailbox, MasterKeyWrap, MemberKeyWrap, PublicKey, WrappedPrivateKey, ZeroAccessKey } from "../models/types.js";
+import { activeZeroAccessKey } from "../util/ZeroAccessUtils.js";
+import { canonicalUserUid, zeroAccessMembers } from "../zeroaccess/ZeroAccessResolver.js";
+import { isSealedToCertificate } from "../zeroaccess/ZeroAccessSealer.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
 const { Delete, Get, Param, Post, Put, Query, Response, User: AuthUser } = RouteDecorators;
@@ -54,6 +57,43 @@ export type PublicKeyVault = Pick<KeyVault, "wrappedKeys" | "masterKeyWraps"> & 
      * because unlocking needs them (CMS addresses its recipient by certificate) and they are never published. */
     zeroAccessKeys: ZeroAccessKey[];
 };
+
+
+/** The most member key wraps one vault holds (members times retained keys). */
+const MAX_MEMBER_KEY_WRAPS = 2000;
+
+/** A member key wrap as a client sends it (`createdAt` is the server's). */
+export type MemberKeyWrapInput = Omit<MemberKeyWrap, "createdAt">;
+
+/** One member of a shared mailbox in `SharedKeyStatus`. */
+export interface SharedKeyMember {
+    userUid: string;
+    /** Full access: may provision, rotate and fulfil wraps. */
+    full: boolean;
+    /** The member's own zero-access certificate - what their wraps are addressed to. Absent until they first sign in and get one. */
+    certificate?: ZeroAccessKey;
+    /** The fingerprints of this mailbox's zero-access keys the member holds a wrap of. */
+    wrapped: string[];
+}
+
+/** `GET /mailbox/:id/keyvault/members` - see `BaseKeyVaultRoute.memberKeyStatus()`. */
+export interface SharedKeyStatus {
+    ownerless: boolean;
+    /** The caller: the mailbox's owner, one of its members (who reads it through member key wraps), or neither (an administrator acting
+     * through a role record) - so a client knows whether to unlock it with its own password or its wraps. */
+    role: "owner" | "member" | "other";
+    activeKeyFingerprint?: string;
+    zeroAccessKeys: ZeroAccessKey[];
+    members: SharedKeyMember[];
+    /** Members with a certificate but no wrap of the active key: a client holding the key wraps it for them. */
+    pending: string[];
+    /** Users holding wraps who are no longer members: their wraps are removed after a rotation. */
+    departed: string[];
+    /** A departed user holds the active key: a new key must be provisioned for the remaining members. */
+    rotationPending: boolean;
+    /** The caller may change the wraps (the owner, or a member with full access). */
+    manager: boolean;
+}
 
 const EMPTY_KEY_VAULT: PublicKeyVault = { wrappedKeys: [], masterKeyWraps: [], masterKeyGeneration: 0, zeroAccessKeys: [] };
 
@@ -330,6 +370,10 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
+
+    /** `trusted_roles`: a record for one of these on a mailbox's access list is administration, not membership. */
+    @Config("trusted_roles", ["admin"])
+    private trustedRoles: string[] = ["admin"];
 
     @Inject("EncryptionCertificateAuthority")
     private encryptionCa?: EncryptionCertificateAuthority;
@@ -668,6 +712,282 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         );
 
         return { mailbox: updatedMailbox, keyVault: updatedKeyVault };
+    }
+
+    /**
+     * `GET /mailbox/:id/keyvault/members` - where a shared mailbox's zero-access key stands with its members (`specs/search.md` §3 *Shared
+     * Mailboxes*): who the members are, each one's own zero-access certificate (on a mailbox they own, `undefined` until they first sign in
+     * and get one) and which of the mailbox's zero-access keys they hold a wrap of; who is still waiting for a wrap of the active key; who
+     * holds wraps but is no longer a member; and whether the key must be rotated because of them. A client that holds the key fulfils
+     * the pending grants and runs the rotation (`putMemberKeyWraps()`, `enrollSharedZeroAccessKey()`, `removeMemberKeyWraps()`).
+     *
+     * For the owner and every member (read or full access); `manager` says whether the caller may change the wraps.
+     */
+    @Get("/:id/keyvault/members")
+    public async memberKeyStatus(@Param("id") mailboxId: string, @AuthUser user?: JWTUser): Promise<SharedKeyStatus> {
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
+        return await this.sharedKeyStatus(mailbox, user);
+    }
+
+    /** `GET /mailbox/:id/keyvault/member-wraps` - the caller's own wraps of this mailbox's zero-access keys (`[]` for the owner, who opens
+     * them with the master key, and for a member still waiting). Only for a current member: a removed member reads nothing more. */
+    @Get("/:id/keyvault/member-wraps")
+    public async myMemberKeyWraps(@Param("id") mailboxId: string, @AuthUser user?: JWTUser): Promise<MemberKeyWrap[]> {
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        await this.requireMailboxAccess(mailbox, user, ACLAction.READ);
+        const me: string | undefined = canonicalUserUid(user!.uid);
+        if (!(await this.members(mailbox)).some((member) => member.userUid === me)) {
+            return [];
+        }
+        const keyVault: K | undefined = await this.findKeyVault(mailbox.uid);
+        return (keyVault?.memberKeyWraps ?? []).filter((wrap) => wrap.memberUserUid === me);
+    }
+
+    /**
+     * `PUT /mailbox/:id/keyvault/member-wraps` - adds (or replaces, per member and key) wraps of this mailbox's zero-access keys for its
+     * members: how an unlocked client holding the key fulfils pending grants. For the owner and members with full access. Each wrap must
+     * name a current member, the member's own zero-access certificate (by fingerprint) and one of this mailbox's zero-access keys, and must
+     * be CMS addressed to that certificate (`isSealedToCertificate()`) - the server can't read what is inside.
+     */
+    @Put("/:id/keyvault/member-wraps")
+    public async putMemberKeyWraps(@Param("id") mailboxId: string, body: { wraps?: MemberKeyWrapInput[] }, @AuthUser user?: JWTUser): Promise<SharedKeyStatus> {
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        await this.requireMailboxManager(mailbox, user);
+        const wraps: MemberKeyWrapInput[] = Array.isArray(body?.wraps) ? body.wraps : [];
+        if (wraps.length === 0 || wraps.length > MAX_MEMBER_KEY_WRAPS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `wraps must list between 1 and ${MAX_MEMBER_KEY_WRAPS} wraps.`);
+        }
+        const accepted: MemberKeyWrap[] = await this.validateMemberWraps(mailbox, wraps, false);
+        const keyVault: K = await this.findOrCreateKeyVault(mailbox.uid);
+        const replaced = (existing: MemberKeyWrap) =>
+            accepted.some((wrap) => wrap.memberUserUid === existing.memberUserUid && wrap.zeroAccessKeyFingerprint === existing.zeroAccessKeyFingerprint);
+        const memberKeyWraps: MemberKeyWrap[] = [...(keyVault.memberKeyWraps ?? []).filter((existing) => !replaced(existing)), ...accepted];
+        if (memberKeyWraps.length > MAX_MEMBER_KEY_WRAPS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox cannot hold more than ${MAX_MEMBER_KEY_WRAPS} member key wraps.`);
+        }
+        await this.keyVaultRepo!.update({ uid: keyVault.uid, version: (keyVault as any).version, memberKeyWraps } as any, keyVault, { ignoreACL: true });
+        await this.auditLogUtils!.record(
+            {
+                action: AuditAction.KEY_VAULT_MEMBER_WRAPS,
+                targetType: "KeyVault",
+                targetUid: keyVault.uid,
+                mailboxUid: mailbox.uid,
+                details: { added: accepted.map(({ memberUserUid, zeroAccessKeyFingerprint }) => ({ memberUserUid, zeroAccessKeyFingerprint })) },
+            },
+            { user },
+        );
+        return await this.sharedKeyStatus(await this.requireMailbox(mailbox.uid), user);
+    }
+
+    /** `DELETE /mailbox/:id/keyvault/member-wraps/:memberUserUid` - removes every wrap of someone who is no longer a member (`409` for a
+     * current member: their access is removed on the access list, and the key rotated, not by taking their wraps). For the owner and
+     * members with full access - the last step of a rotation (`enrollSharedZeroAccessKey()`). */
+    @Delete("/:id/keyvault/member-wraps/:memberUserUid")
+    public async removeMemberKeyWraps(
+        @Param("id") mailboxId: string,
+        @Param("memberUserUid") memberUserUid: string,
+        @AuthUser user?: JWTUser,
+    ): Promise<SharedKeyStatus> {
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        await this.requireMailboxManager(mailbox, user);
+        const departed: string = canonicalUserUid(memberUserUid) ?? "";
+        if ((await this.members(mailbox)).some((member) => member.userUid === departed)) {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This user is still a member of the mailbox.");
+        }
+        const keyVault: K | undefined = await this.findKeyVault(mailbox.uid);
+        const remaining: MemberKeyWrap[] = (keyVault?.memberKeyWraps ?? []).filter((wrap) => wrap.memberUserUid !== departed);
+        if (keyVault && remaining.length !== (keyVault.memberKeyWraps ?? []).length) {
+            await this.keyVaultRepo!.update({ uid: keyVault.uid, version: (keyVault as any).version, memberKeyWraps: remaining } as any, keyVault, {
+                ignoreACL: true,
+            });
+            await this.auditLogUtils!.record(
+                { action: AuditAction.KEY_VAULT_MEMBER_WRAPS, targetType: "KeyVault", targetUid: keyVault.uid, mailboxUid: mailbox.uid, details: { removed: departed } },
+                { user },
+            );
+        }
+        return await this.sharedKeyStatus(mailbox, user);
+    }
+
+    /**
+     * `POST /mailbox/:id/keyvault/shared-zero-access-key` - provisions (or, on a rotation, replaces) the zero-access key of a mailbox with
+     * no owner, which has no master key to seal it under: the certificate is issued for `csr` and becomes the mailbox's active zero-access
+     * key in the same write as `wraps`, the member wraps of its private key - at least the caller's own. Mail is therefore never sealed to a
+     * key nobody holds. For members with full access; an owned mailbox's owner enrolls through `enrollKey()` and adds wraps with
+     * `putMemberKeyWraps()`.
+     */
+    @Post("/:id/keyvault/shared-zero-access-key")
+    public async enrollSharedZeroAccessKey(
+        @Param("id") mailboxId: string,
+        body: { csr?: string; wraps?: Omit<MemberKeyWrapInput, "zeroAccessKeyFingerprint">[] },
+        @AuthUser user?: JWTUser,
+    ): Promise<SharedKeyStatus> {
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        if (mailbox.ownerUserUid) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A mailbox with an owner gets its zero-access key from its owner.");
+        }
+        await this.requireMailboxManager(mailbox, user);
+        const wraps = Array.isArray(body?.wraps) ? body.wraps : [];
+        if (!body?.csr || wraps.length === 0 || wraps.length > MAX_MEMBER_KEY_WRAPS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `csr and between 1 and ${MAX_MEMBER_KEY_WRAPS} wraps are required.`);
+        }
+        const me: string = canonicalUserUid(user!.uid) ?? "";
+        if (!wraps.some((wrap) => wrap?.memberUserUid === me)) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "wraps must include your own.");
+        }
+        if ((mailbox.zeroAccessKeys ?? []).length >= MAX_ENROLLED_KEYS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox cannot enroll more than ${MAX_ENROLLED_KEYS} keys.`);
+        }
+        const issued = await this.encryptionCa!.issue(mailbox.primarySmtpAddress, body.csr);
+        const cert = new crypto.X509Certificate(issued.certificate);
+        const publicKey: ZeroAccessKey = {
+            publicKey: cert.raw.toString("base64"),
+            type: "x509",
+            useType: "zero-access",
+            fingerprint: issued.fingerprint,
+            notBefore: issued.notBefore.getTime(),
+            notAfter: issued.notAfter.getTime(),
+        };
+        const accepted: MemberKeyWrap[] = await this.validateMemberWraps(
+            mailbox,
+            wraps.map((wrap) => ({ ...wrap, zeroAccessKeyFingerprint: publicKey.fingerprint })),
+            true,
+        );
+        const keyVault: K = await this.persistSharedEnrollment(mailbox, publicKey, accepted);
+        await this.auditLogUtils!.record(
+            {
+                action: AuditAction.KEY_VAULT_ENROLL,
+                targetType: "KeyVault",
+                targetUid: keyVault.uid,
+                mailboxUid: mailbox.uid,
+                details: { useType: "zero-access", fingerprint: publicKey.fingerprint, shared: true, members: accepted.map((wrap) => wrap.memberUserUid) },
+            },
+            { user },
+        );
+        return await this.sharedKeyStatus(await this.requireMailbox(mailbox.uid), user);
+    }
+
+    /** The new key on the mailbox and its member wraps in the vault, in one transaction. */
+    @Transactional()
+    protected async persistSharedEnrollment(mailbox: M, publicKey: ZeroAccessKey, wraps: MemberKeyWrap[]): Promise<K> {
+        const keyVault: K = await this.findOrCreateKeyVault(mailbox.uid);
+        await this.mailboxRepo!.update(
+            { uid: mailbox.uid, version: (mailbox as any).version, zeroAccessKeys: supersedeKeys(mailbox.zeroAccessKeys, publicKey, Date.now()) } as any,
+            mailbox,
+            { ignoreACL: true },
+        );
+        return await this.keyVaultRepo!.update(
+            { uid: keyVault.uid, version: (keyVault as any).version, memberKeyWraps: [...(keyVault.memberKeyWraps ?? []), ...wraps] } as any,
+            keyVault,
+            { ignoreACL: true },
+        );
+    }
+
+    /** The mailbox's members (`ZeroAccessResolver.members()`), from its access list as stored now: who may hold the key is never decided
+     * from a cached list, so a removed member stops getting wraps the moment they are removed. */
+    private async members(mailbox: M): Promise<{ userUid: string; full: boolean }[]> {
+        return zeroAccessMembers(await this.aclUtils!.findACL(mailbox.uid, undefined, { skipCache: true }), mailbox, this.trustedRoles);
+    }
+
+    /** Who may change a shared mailbox's member wraps: its owner, and members with full access (`403` for anyone else). */
+    private async requireMailboxManager(mailbox: M, user: JWTUser | undefined): Promise<void> {
+        if (user && mailbox.ownerUserUid && mailbox.ownerUserUid === user.uid) {
+            return;
+        }
+        const me: string | undefined = user ? (canonicalUserUid(user.uid)) : undefined;
+        if (!me || !(await this.members(mailbox)).some((member) => member.userUid === me && member.full)) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+    }
+
+    /** A user's own zero-access certificate: the active zero-access key of a mailbox they own (the first by uid, when they own several). */
+    private async memberCertificate(userUid: string): Promise<ZeroAccessKey | undefined> {
+        const owned: M[] = await this.mailboxRepo!.find({ ownerUserUid: userUid, sort: { uid: "ASC" }, limit: 50 } as any, { ignoreACL: true, limit: 50 });
+        for (const mailbox of owned) {
+            const key: ZeroAccessKey | undefined = activeZeroAccessKey(mailbox);
+            if (key) {
+                return key;
+            }
+        }
+        return undefined;
+    }
+
+    /** `wraps` checked and completed (`createdAt`), or a `400` naming what is wrong. `newKey` skips the check that the wrapped key is
+     * already one of the mailbox's (it is being enrolled with them). */
+    private async validateMemberWraps(mailbox: M, wraps: MemberKeyWrapInput[], newKey: boolean): Promise<MemberKeyWrap[]> {
+        const members: Set<string> = new Set((await this.members(mailbox)).map((member) => member.userUid));
+        const zeroAccessFingerprints: Set<string> = new Set((mailbox.zeroAccessKeys ?? []).map((key) => key.fingerprint));
+        const certificates: Map<string, ZeroAccessKey | undefined> = new Map();
+        const accepted: MemberKeyWrap[] = [];
+        const seen: Set<string> = new Set();
+        for (const wrap of wraps) {
+            const memberUserUid: string | undefined = typeof wrap?.memberUserUid === "string" ? (canonicalUserUid(wrap.memberUserUid)) : undefined;
+            if (
+                !memberUserUid ||
+                !members.has(memberUserUid) ||
+                typeof wrap.recipientFingerprint !== "string" ||
+                typeof wrap.zeroAccessKeyFingerprint !== "string" ||
+                typeof wrap.cms !== "string" ||
+                wrap.cms.length > MAX_WRAP_FIELD_LENGTH * 4 ||
+                (!newKey && !zeroAccessFingerprints.has(wrap.zeroAccessKeyFingerprint))
+            ) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Each wrap must name a member and one of this mailbox's zero-access keys.");
+            }
+            const key = `${memberUserUid}:${wrap.zeroAccessKeyFingerprint}`;
+            if (seen.has(key)) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A member can have only one wrap of each key.");
+            }
+            seen.add(key);
+            if (!certificates.has(memberUserUid)) {
+                certificates.set(memberUserUid, await this.memberCertificate(memberUserUid));
+            }
+            const certificate: ZeroAccessKey | undefined = certificates.get(memberUserUid);
+            if (!certificate || certificate.fingerprint !== wrap.recipientFingerprint || !isSealedToCertificate(Buffer.from(wrap.cms, "base64"), Buffer.from(certificate.publicKey, "base64"))) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Each wrap must be encrypted to its member's own zero-access certificate.");
+            }
+            accepted.push({
+                memberUserUid,
+                recipientFingerprint: wrap.recipientFingerprint,
+                zeroAccessKeyFingerprint: wrap.zeroAccessKeyFingerprint,
+                cms: wrap.cms,
+                createdAt: Date.now(),
+            });
+        }
+        return accepted;
+    }
+
+    private async sharedKeyStatus(mailbox: M, user: JWTUser | undefined): Promise<SharedKeyStatus> {
+        const members = await this.members(mailbox);
+        const memberUids: Set<string> = new Set(members.map((member) => member.userUid));
+        const keyVault: K | undefined = await this.findKeyVault(mailbox.uid);
+        const wraps: MemberKeyWrap[] = keyVault?.memberKeyWraps ?? [];
+        const active: ZeroAccessKey | undefined = activeZeroAccessKey(mailbox);
+        const memberStatus: SharedKeyMember[] = [];
+        for (const member of members) {
+            const certificate: ZeroAccessKey | undefined = await this.memberCertificate(member.userUid);
+            memberStatus.push({
+                userUid: member.userUid,
+                full: member.full,
+                ...(certificate ? { certificate } : {}),
+                wrapped: wraps.filter((wrap) => wrap.memberUserUid === member.userUid).map((wrap) => wrap.zeroAccessKeyFingerprint),
+            });
+        }
+        const departed: string[] = [...new Set(wraps.map((wrap) => wrap.memberUserUid).filter((uid) => !memberUids.has(uid)))];
+        const me: string | undefined = user ? canonicalUserUid(user.uid) : undefined;
+        const owner: boolean = !!user && !!mailbox.ownerUserUid && mailbox.ownerUserUid === user.uid;
+        return {
+            ownerless: !mailbox.ownerUserUid,
+            role: owner ? "owner" : memberUids.has(me ?? "") ? "member" : "other",
+            ...(active ? { activeKeyFingerprint: active.fingerprint } : {}),
+            zeroAccessKeys: mailbox.zeroAccessKeys ?? [],
+            members: memberStatus,
+            pending: active
+                ? memberStatus.filter((member) => member.certificate && !member.wrapped.includes(active.fingerprint)).map((member) => member.userUid)
+                : [],
+            departed,
+            rotationPending: !!active && wraps.some((wrap) => !memberUids.has(wrap.memberUserUid) && wrap.zeroAccessKeyFingerprint === active.fingerprint),
+            manager: (!!user && mailbox.ownerUserUid === user.uid) || members.some((member) => member.userUid === me && member.full),
+        };
     }
 
     /**

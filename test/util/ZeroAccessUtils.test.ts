@@ -23,7 +23,7 @@ const mailbox = (fields: Partial<ZeroAccessMailbox> = {}): ZeroAccessMailbox => 
     ...fields,
 });
 
-const allowed = { allowZeroAccess: true, hasDelegates: false };
+const allowed = { allowZeroAccess: true };
 
 describe("ZeroAccessUtils", () => {
     describe("activeZeroAccessKey()", () => {
@@ -65,9 +65,9 @@ describe("ZeroAccessUtils", () => {
             expect(zeroAccessStatus(mailbox({ zeroAccessEnabled: false }), allowed)).toBe("disabled_by_owner");
         });
 
-        it("is shared_mailbox for an ownerless mailbox or one with delegates", () => {
-            expect(zeroAccessStatus(mailbox({ ownerUserUid: undefined }), allowed)).toBe("shared_mailbox");
-            expect(zeroAccessStatus(mailbox(), { ...allowed, hasDelegates: true })).toBe("shared_mailbox");
+        it("treats a mailbox without an owner like any other: active with a key (its members read it through member key wraps)", () => {
+            expect(zeroAccessStatus(mailbox({ ownerUserUid: undefined }), allowed)).toBe("active");
+            expect(zeroAccessStatus(mailbox({ ownerUserUid: undefined, zeroAccessKeys: [] }), allowed)).toBe("no_key");
         });
 
         it("is no_key when no unrevoked key is enrolled", () => {

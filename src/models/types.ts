@@ -163,6 +163,10 @@ export interface KeyVault extends BaseEntity {
 
     masterKeyWraps: MasterKeyWrap[];
 
+    /** Shared mailboxes (`specs/search.md` §3 *Shared Mailboxes*): the mailbox's zero-access private keys, each wrapped to a member's own
+     * zero-access certificate. Never the master key, signing key or encryption keys. Each member reads only their own. */
+    memberKeyWraps?: MemberKeyWrap[];
+
     /** Server-managed: fingerprint of the signing certificate `AcmeEnrollmentDriverJob` last recorded a
      * `SIGNING_CERT_EXPIRING` audit entry for - so that entry is written once per certificate, not every run. */
     expiryAuditedFingerprint?: string;
@@ -172,6 +176,19 @@ export interface KeyVault extends BaseEntity {
      * `AcmeEnrollmentDriverJob` refuses to install that key once it no longer matches - the key is sealed under a
      * master key the vault no longer has. */
     masterKeyGeneration?: number;
+}
+
+/** One member's copy of a shared mailbox's zero-access private key - see `KeyVault.memberKeyWraps`. */
+export interface MemberKeyWrap {
+    /** The member it is for (a user with read or full access to the mailbox). */
+    memberUserUid: string;
+    /** Fingerprint of the member's own zero-access certificate (on a mailbox they own) that `cms` is addressed to. */
+    recipientFingerprint: string;
+    /** Fingerprint of the shared mailbox's zero-access key whose private key `cms` holds. */
+    zeroAccessKeyFingerprint: string;
+    /** Base64 DER CMS `EnvelopedData` of that private key's PKCS#8, to the member's certificate. */
+    cms: string;
+    createdAt: number;
 }
 
 /** A scope's own public key, used only so a client can wrap a mailbox's master key against it - the server
@@ -1992,6 +2009,9 @@ export enum AuditAction {
      * Outlook/phone"). `details.keys` lists each exported key's `kind` and `fingerprint`; the file never reaches the server. See
      * `BaseKeyVaultRoute.recordExport()`. */
     KEY_VAULT_EXPORT = "key_vault.export",
+    /** A shared mailbox's member key wraps changed (`BaseKeyVaultRoute.putMemberKeyWraps()`/`removeMemberKeyWraps()`). `details.added`
+     * lists `{ memberUserUid, zeroAccessKeyFingerprint }`; `details.removed` names a departed user. Never the wraps themselves. */
+    KEY_VAULT_MEMBER_WRAPS = "key_vault.member_wraps",
     /** `POST /mailbox/:id/keys/trust` pinned a signer certificate on a contact by hand ("Trust this signer"). `details`
      * carries the `address` and the certificate `fingerprint`. See `BaseKeyLookupRoute.trust()`. */
     CONTACT_KEY_TRUSTED = "contact.key_trusted",

@@ -4369,3 +4369,23 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
   - It returns 409 when the mailbox no longer has that key.
   - A client-sent `sealedContent` is stripped on create and update.
 - **Still open from Phase 6:** Source C (client segments for end-to-end mail). Pending entries of individually purged messages aren't removed; they are harmless (intersected with Source A), and a later compaction can drop them.
+
+## 2026-10-23 - Zero-access encryption, Phase 7 (shared mailboxes)
+
+- **Shared mailboxes are sealed like any other.** `zeroAccessStatus()` and `ZeroAccessResolver.status()` lost `shared_mailbox` and `hasDelegates`.
+  - `ZeroAccessResolver.members()` / `zeroAccessMembers()` lists users with READ or FULL, excluding the owner (canonical uid), trusted roles, `.*` and `anonymous`.
+  - `canonicalUserUid()` is exported.
+- **`KeyVault.memberKeyWraps`** (`MemberKeyWrap`: `memberUserUid`, `recipientFingerprint`, `zeroAccessKeyFingerprint`, `cms`, `createdAt`) holds the mailbox's zero-access private key wrapped to each member's own zero-access certificate. That certificate is the active zero-access key of a mailbox the member owns, the first by uid.
+- **Routes on `BaseKeyVaultRoute`:**
+  - `GET /:id/keyvault/members` (`SharedKeyStatus`, for the owner or a READ member): `role`, members with their certificate and wrapped fingerprints, `pending`, `departed`, `rotationPending`, `manager`.
+  - `GET /:id/keyvault/member-wraps`: the caller's own wraps, only while they are a current member.
+  - `PUT /:id/keyvault/member-wraps`:
+    - It is for the owner or a FULL member, upserting per member and key, with a cap of 2000.
+    - Each wrap must name a current member, that member's own certificate and one of the mailbox's keys, and must pass `isSealedToCertificate`.
+  - `DELETE /:id/keyvault/member-wraps/:user`: 409 for a current member.
+  - `POST /:id/keyvault/shared-zero-access-key`:
+    - It is for ownerless mailboxes only, called by a FULL member, and the caller's own wrap is required.
+    - The CA issues the certificate, which is written with the wraps in one transaction (`persistSharedEnrollment`). Mail is therefore never sealed to a key nobody holds.
+  - Membership decisions read the ACL with `skipCache: true`. Audit: `key_vault.member_wraps`, and `key_vault.enroll` with `shared: true`.
+- **Rotation is client-driven.** `rotationPending` means a departed user holds the active key. The owner re-enrolls with `enrollKey`; for an ownerless mailbox the client calls `shared-zero-access-key`. The client then wraps the new key for the members and deletes the departed user's wraps.
+- **Not done:** an escrow wrap for an ownerless mailbox's zero-access key. An owned mailbox is covered by the MK escrow plus the `/material` key release.

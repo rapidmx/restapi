@@ -39,29 +39,41 @@ describe("ZeroAccessResolver", () => {
         });
     });
 
-    describe("hasDelegates()", () => {
-        it("ignores the owner (however their uid is spelled), administrative roles and grants that don't read", async () => {
+    describe("members()", () => {
+        it("ignores the owner (however their uid is spelled), administrative roles, catch-all records and grants that don't read", async () => {
             const { resolver: r } = resolver({
                 records: [
                     { userOrRoleId: OWNER.toUpperCase(), actions: [ACLAction.FULL] },
                     { userOrRoleId: "admin", actions: [ACLAction.READ] },
-                    { userOrRoleId: ".*", actions: [] },
+                    { userOrRoleId: ".*", actions: [ACLAction.READ] },
+                    { userOrRoleId: "anonymous", actions: [ACLAction.READ] },
                     { userOrRoleId: "someone", actions: [ACLAction.CREATE] },
+                    { userOrRoleId: "  ", actions: [ACLAction.READ] },
                 ],
             });
-            expect(await r.hasDelegates(mailbox())).toBe(false);
+            expect(await r.members(mailbox())).toEqual([]);
         });
 
-        it("counts another user with read or full access", async () => {
-            expect(await resolver({ records: [{ userOrRoleId: "delegate", actions: [ACLAction.READ] }] }).resolver.hasDelegates(mailbox())).toBe(true);
-            expect(await resolver({ records: [{ userOrRoleId: "manager", actions: [ACLAction.FULL] }] }).resolver.hasDelegates(mailbox())).toBe(true);
+        it("lists every other user with read or full access once, full when any record of theirs grants it", async () => {
+            const { resolver: r } = resolver({
+                records: [
+                    { userOrRoleId: "Delegate", actions: [ACLAction.READ] },
+                    { userOrRoleId: "manager", actions: [ACLAction.READ] },
+                    { userOrRoleId: "manager", actions: [ACLAction.FULL] },
+                ],
+            });
+            expect(await r.members(mailbox())).toEqual([
+                { userUid: "delegate", full: false },
+                { userUid: "manager", full: true },
+            ]);
+            expect(await r.members(mailbox({ ownerUserUid: undefined }))).toHaveLength(2);
         });
 
         it("treats a mailbox with no access list, or no ACL utility, as having none", async () => {
             const { resolver: r, aclUtils } = resolver();
             aclUtils.findACL.mockResolvedValue(undefined);
-            expect(await r.hasDelegates(mailbox())).toBe(false);
-            expect(await new ZeroAccessResolver(undefined, undefined, true, []).hasDelegates(mailbox())).toBe(false);
+            expect(await r.members(mailbox())).toEqual([]);
+            expect(await new ZeroAccessResolver(undefined, undefined, true, []).members(mailbox())).toEqual([]);
         });
     });
 
@@ -81,15 +93,13 @@ describe("ZeroAccessResolver", () => {
             expect(aclUtils.findACL).not.toHaveBeenCalled();
         });
 
-        it("then the owner's switch, then the mailbox's shape, then its key", async () => {
-            const { resolver: r, aclUtils } = resolver();
+        it("then the owner's switch, then its key - a shared mailbox included, whose members read it through member key wraps", async () => {
+            const { resolver: r, aclUtils } = resolver({ records: [{ userOrRoleId: "delegate", actions: [ACLAction.READ] }] });
             expect(await r.status(mailbox({ zeroAccessEnabled: false }))).toBe("disabled_by_owner");
-            expect(await r.status(mailbox({ ownerUserUid: undefined }))).toBe("shared_mailbox");
-            expect(aclUtils.findACL).not.toHaveBeenCalled();
+            expect(await r.status(mailbox({ ownerUserUid: undefined }))).toBe("active");
+            expect(await r.status(mailbox())).toBe("active");
             expect(await r.status(mailbox({ zeroAccessKeys: [] }))).toBe("no_key");
-
-            aclUtils.findACL.mockResolvedValue({ records: [{ userOrRoleId: "delegate", actions: [ACLAction.READ] }] });
-            expect(await r.status(mailbox())).toBe("shared_mailbox");
+            expect(aclUtils.findACL).not.toHaveBeenCalled();
         });
     });
 

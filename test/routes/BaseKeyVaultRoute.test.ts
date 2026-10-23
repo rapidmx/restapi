@@ -238,3 +238,35 @@ describe("BaseKeyVaultRoute Tests (findOrCreateKeyVault() TOCTOU race and MAX_*_
         expect(persistEnrollment).toHaveBeenCalledTimes(1);
     });
 });
+
+describe("BaseKeyVaultRoute shared mailbox caps", () => {
+    const objectFactory = new ObjectFactory(config, Logger());
+    const owner = { uid: "owner-uid" } as any;
+
+    function route(mailbox: any, keyVault: any) {
+        const instance = objectFactory.newInstance<TestKeyVaultRoute>(TestKeyVaultRoute, { initialize: false }) as any;
+        instance.mailboxRepo = { findOne: vi.fn().mockResolvedValue(mailbox) };
+        instance.keyVaultRepo = { find: vi.fn().mockResolvedValue([keyVault]), update: vi.fn() };
+        instance.aclUtils = { findACL: vi.fn().mockResolvedValue({ records: [] }) };
+        return instance;
+    }
+
+    it("refuses wraps that would take a vault past its limit", async () => {
+        const full = Array.from({ length: 2000 }, (_, i) => ({ memberUserUid: `m${i}`, zeroAccessKeyFingerprint: "fp" }));
+        const instance = route({ uid: "mb", ownerUserUid: "owner-uid" }, { uid: "kv", mailboxUid: "mb", wrappedKeys: [], masterKeyWraps: [], memberKeyWraps: full });
+        instance.validateMemberWraps = vi.fn().mockResolvedValue([{ memberUserUid: "new", zeroAccessKeyFingerprint: "fp" }]);
+
+        await expect(instance.putMemberKeyWraps("mb", { wraps: [{}] }, owner)).rejects.toMatchObject({ status: 400 });
+        expect(instance.keyVaultRepo.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses to provision a shared key for a mailbox already at its key limit", async () => {
+        const keys = Array.from({ length: 50 }, (_, i) => ({ fingerprint: `k${i}` }));
+        const instance = route({ uid: "mb", zeroAccessKeys: keys }, undefined);
+        instance.aclUtils.findACL.mockResolvedValue({ records: [{ userOrRoleId: "manager", actions: ["*"] }] });
+
+        await expect(
+            instance.enrollSharedZeroAccessKey("mb", { csr: "csr", wraps: [{ memberUserUid: "manager" }] }, { uid: "manager" }),
+        ).rejects.toMatchObject({ status: 400 });
+    });
+});

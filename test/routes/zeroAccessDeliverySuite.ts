@@ -241,15 +241,6 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
         it.each([
             ["the administrator disallowed it", async (mailbox: any) => ctx.setAllowZeroAccess(false)],
             ["the owner turned it off", async (mailbox: any) => ctx.updateMailbox(mailbox.uid, { zeroAccessEnabled: false })],
-            [
-                "the mailbox has a delegate",
-                async (mailbox: any) =>
-                    ctx.setAcl(mailbox.uid, [
-                        { userOrRoleId: mailbox.ownerUserUid, actions: [ACLAction.FULL] },
-                        { userOrRoleId: "delegate-uid", actions: [ACLAction.READ] },
-                    ]),
-            ],
-            ["the mailbox has no owner", async (mailbox: any) => ctx.updateMailbox(mailbox.uid, { ownerUserUid: null })],
         ])("stores the message as it arrives when %s", async (_why, arrange) => {
             const recipient = await makeKey();
             const mailbox = await zeroAccessMailbox(recipient);
@@ -262,6 +253,29 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
             expect(entry.status).toBe(IngestStatus.PENDING);
             expect(entry.zeroAccessKeyFingerprint ?? undefined).toBeUndefined();
             expect(entry.rawBlobKey.startsWith("ingest/")).toBe(true);
+        });
+
+        it.each([
+            [
+                "has a delegate",
+                async (mailbox: any) =>
+                    ctx.setAcl(mailbox.uid, [
+                        { userOrRoleId: mailbox.ownerUserUid, actions: [ACLAction.FULL] },
+                        { userOrRoleId: "delegate-uid", actions: [ACLAction.READ] },
+                    ]),
+            ],
+            ["has no owner", async (mailbox: any) => ctx.updateMailbox(mailbox.uid, { ownerUserUid: null })],
+        ])("seals the message for a shared mailbox that %s - its members read it through member key wraps", async (_why, arrange) => {
+            const recipient = await makeKey();
+            const mailbox = await zeroAccessMailbox(recipient);
+            await arrange(mailbox);
+
+            const result = await deliver([mailbox.primarySmtpAddress], rawMessage(mailbox.primarySmtpAddress));
+
+            expect(result.status).toBe(202);
+            const [entry] = await ctx.entries();
+            expect(entry.status).toBe(IngestStatus.DELIVERED);
+            expect(entry.zeroAccessKeyFingerprint).toBe(recipient.key.fingerprint);
         });
 
         it("seals a message for a mailbox that has a key and nothing set, the server allowing it by default", async () => {
