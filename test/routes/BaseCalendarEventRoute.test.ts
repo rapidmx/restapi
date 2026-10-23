@@ -49,8 +49,8 @@ describe("BaseCalendarEventRoute Tests (dependency guard clause only)", () => {
 
         await expect(route.getInvite("message-1", user)).rejects.toThrow(/internal error/i);
         await expect(route.respondToInvite("message-1", { responseStatus: "accepted" }, user)).rejects.toThrow(/internal error/i);
-        await expect(route.removeInvite("message-1", user)).rejects.toThrow(/internal error/i);
+        await expect(route.removeInvite("message-1", undefined, user)).rejects.toThrow(/internal error/i);
         await expect(route.proposeNewTime("message-1", {}, user)).rejects.toThrow(/internal error/i);
-        await expect(route.acceptProposal("message-1", user)).rejects.toThrow(/internal error/i);
+        await expect(route.acceptProposal("message-1", undefined, user)).rejects.toThrow(/internal error/i);
     });
 });

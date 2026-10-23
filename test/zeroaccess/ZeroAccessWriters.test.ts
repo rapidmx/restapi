@@ -229,6 +229,55 @@ describe("Message route readers (zero-access, isolated)", () => {
         await expect(instance.content("m1", {} as any, { uid: "u" } as any)).rejects.toMatchObject({ status: 409 });
     });
 
+    it("refuses a report's rawMessage that isn't base64 text", async () => {
+        const instance = route();
+        instance.repoUtils = { findOne: vi.fn() };
+        for (const rawMessage of [5, "not base64!"]) {
+            await expect(instance.report("m1", { kind: "junk", rawMessage }, {} as any, { uid: "u" } as any)).rejects.toMatchObject({ status: 400 });
+        }
+        expect(instance.repoUtils.findOne).not.toHaveBeenCalled();
+    });
+
+    it("accepts a report's decrypted copy only for a zero-access message, and only when it is that message", () => {
+        const instance = route();
+        const raw = Buffer.from("Message-ID: <Abc@Example.com>\r\nSubject: hi\r\n\r\nbody");
+        const sealed = { uid: "m1", messageId: "abc@example.com", zeroAccess: { keyFingerprint: "fp" } };
+
+        expect(instance.reportedZeroAccessSource(sealed, raw.toString("base64"))).toEqual(raw);
+        expect(instance.reportedZeroAccessSource({ ...sealed, messageId: undefined }, raw.toString("base64"))).toEqual(raw);
+        expect(() => instance.reportedZeroAccessSource({ ...sealed, messageId: "other@example.com" }, raw.toString("base64"))).toThrow(
+            expect.objectContaining({ status: 400 }),
+        );
+        expect(() => instance.reportedZeroAccessSource({ uid: "m1", messageId: "abc@example.com" }, raw.toString("base64"))).toThrow(
+            expect.objectContaining({ status: 400 }),
+        );
+    });
+
+    it("teaches the spam filter a zero-access message only from the client's copy, never handing the source on", async () => {
+        const instance = route();
+        const learn = vi.fn().mockResolvedValue(undefined);
+        Object.assign(instance, { spamScanProvider: { learn }, spamLearnEnabled: true, logger: { warn: vi.fn() } });
+        const sealed = { uid: "m1", zeroAccess: { keyFingerprint: "fp" } };
+        const mailbox = { primarySmtpAddress: "alice@example.com" };
+
+        expect(await instance.teachSpamFilter(sealed, "junk", mailbox, true)).toEqual({ learned: false, learnSkipped: "zero_access" });
+
+        const copy = Buffer.from("Subject: hi\r\n\r\nbody");
+        expect(await instance.teachSpamFilter(sealed, "not_junk", mailbox, true, copy)).toEqual({ learned: true });
+        expect(learn).toHaveBeenCalledWith(copy, "ham", { recipient: "alice@example.com" });
+
+        expect(await instance.teachSpamFilter(sealed, "junk", mailbox, false, Buffer.alloc(5 * 1024 * 1024 + 1))).toEqual({
+            learned: false,
+            learnSkipped: "too_large",
+        });
+
+        learn.mockRejectedValueOnce(new Error("rspamd down"));
+        expect(await instance.teachSpamFilter(sealed, "junk", mailbox, false, copy)).toEqual({ learned: false, learnSkipped: "failed" });
+
+        instance.spamLearnEnabled = false;
+        expect(await instance.teachSpamFilter(sealed, "junk", mailbox, false, copy)).toEqual({ learned: false, learnSkipped: "disabled" });
+    });
+
     it("gives a conversation row its latest message's sealed summary", async () => {
         const instance = route();
         const sealed = { keyFingerprint: "fp", sealedSummary: "s" };

@@ -4310,3 +4310,17 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
     - This follows the precedent that the MTA queue holds plaintext anyway, and Proton does the same for scheduled sends to non-PGP recipients.
     - The Sent Items copy is then sealed and the plaintext removed.
   - **Not covered yet:** files uploaded to a zero-access draft (`attachments/` blobs and rows) stay plaintext until the message is sent. Sealing them needs the attachment upload and the draft reopen path to change together.
+
+## 2026-10-23 - Zero-access encryption, Phase 4 (report, invitations)
+
+- **`POST /messages/:id/report`** takes `rawMessage` (base64), the client's decrypted source of a zero-access message. It is used only to teach the spam filter and is never stored.
+  - It is a 400 for any other message (the server reads that one itself), for text that isn't base64, and for a copy whose `Message-ID` differs from the message's own (when the message has one).
+  - Without it, a zero-access report skips learning with the new `learnSkipped: "zero_access"`.
+  - A trusted sender (`alwaysTrustSender`) still comes from the stored message's outer `From`, never from the client's copy.
+- **The sealed form keeps `Authentication-Results`** among its outer headers (`ZeroAccessSealer`'s `OUTER_HEADERS`, in their original order). `verifiedFromAddress()` therefore works on a sealed message: a DKIM-verified organizer can still be told from a forged one. This is envelope metadata the server already had.
+- **Invitations in zero-access messages:**
+  - Every invitation endpoint takes `ics` in its body: the calendar file from the client's decrypted copy, at most 1 MiB.
+  - `POST /invite/:messageUid/view` is the `GET`'s counterpart.
+  - For a sealed message, `ics` is required (404 without it, as for "no invitation"); for any other message it is a 400.
+  - The client's file is trusted only as far as the user's own calendar: acting on it changes only their calendar and answers as themselves. The organizer checks still use the stored `Authentication-Results`.
+- **Signature change:** `removeInvite(messageUid, body, user)` and `acceptProposal(messageUid, body, user)` now take a body before the user.

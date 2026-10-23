@@ -119,6 +119,84 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
     const requestFor = (me: string, extra: Partial<IcsOptions> = {}): string =>
         ics({ method: "REQUEST", uid: eventUid, start, end, organizer: "boss@boss.example.com", attendees: [{ address: me, partstat: "NEEDS-ACTION" }], ...extra });
 
+    describe("zero-access messages (the client sends the calendar file)", () => {
+        /** A zero-access message as stored: the sealed form's outer headers - its MTA's `Authentication-Results` among them - over an
+         * opaque body the server can't read a calendar file from. */
+        const receiveSealed = async (mailboxUid: string, folderUid: string, verified: boolean = true) => {
+            const raw: Buffer = Buffer.from(
+                [
+                    ...(verified ? ["Authentication-Results: mx.example.com; dkim=pass header.d=boss.example.com"] : []),
+                    "From: boss@boss.example.com",
+                    "To: me@example.com",
+                    "Subject: [...]",
+                    "MIME-Version: 1.0",
+                    'Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"',
+                    "Content-Transfer-Encoding: base64",
+                    "",
+                    Buffer.from("not a calendar").toString("base64"),
+                    "",
+                ].join("\r\n"),
+            );
+            const bodyBlobKey = `za/${mailboxUid}/${uuid.v4()}`;
+            await ctx.blobStore().put(bodyBlobKey, raw);
+            return await ctx.createMessage(mailboxUid, folderUid, {
+                bodyBlobKey,
+                subject: "[...]",
+                from: { address: "boss@boss.example.com", type: RecipientType.TO },
+                hasAttachments: true,
+                zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" },
+            });
+        };
+
+        it("Describes the invitation from the calendar file the client decrypted, and has none to read without it.", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const message = await receiveSealed(mailbox.uid, inbox.uid);
+
+            const result = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/view"))).send({ ics: requestFor(me) });
+
+            expect(result.status).toBe(200);
+            expect(result.body).toMatchObject({ method: "REQUEST", uid: eventUid, summary: "Video Test", canRespond: true });
+            expect((await owner(request(ctx.app()).get(inviteUrl(message.uid)))).status).toBe(404);
+        });
+
+        it("Answers it from the client's calendar file: the meeting goes on the calendar and the organizer gets the reply.", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const message = await receiveSealed(mailbox.uid, inbox.uid);
+
+            const result = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({ responseStatus: "accepted", ics: requestFor(me) });
+
+            expect(result.status).toBe(200);
+            expect(result.body.onCalendar).toBe(true);
+            expect((await ctx.findEvents(mailbox.uid)).map((event: any) => event.icalUid)).toEqual([eventUid]);
+            expect(ctx.transport().sent.length).toBeGreaterThan(0);
+        });
+
+        it("Still tells a verified organizer's change of a meeting on the calendar from a forged one, by the stored Authentication-Results.", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const first = await receiveSealed(mailbox.uid, inbox.uid);
+            await owner(request(ctx.app()).post(inviteUrl(first.uid, "/respond"))).send({ responseStatus: "accepted", ics: requestFor(me) });
+            const forged = await receiveSealed(mailbox.uid, inbox.uid, false);
+            const verified = await receiveSealed(mailbox.uid, inbox.uid);
+            const update = requestFor(me, { sequence: 1 });
+
+            const refused = await owner(request(ctx.app()).post(inviteUrl(forged.uid, "/respond"))).send({ responseStatus: "accepted", ics: update });
+            const accepted = await owner(request(ctx.app()).post(inviteUrl(verified.uid, "/respond"))).send({ responseStatus: "accepted", ics: update });
+
+            expect(refused.status).toBe(403);
+            expect(accepted.status).toBe(200);
+        });
+
+        it("Refuses a calendar file for a message the server reads itself, and one that isn't text.", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const plain = await receive(mailbox.uid, inbox.uid, requestFor(me));
+            const sealed = await receiveSealed(mailbox.uid, inbox.uid);
+
+            expect((await owner(request(ctx.app()).post(inviteUrl(plain.uid, "/view"))).send({ ics: requestFor(me) })).status).toBe(400);
+            expect((await owner(request(ctx.app()).post(inviteUrl(sealed.uid, "/view"))).send({ ics: 42 })).status).toBe(400);
+            expect((await owner(request(ctx.app()).post(inviteUrl(sealed.uid, "/remove"))).send({})).status).toBe(404);
+        });
+    });
+
     describe("GET /invite/:messageUid", () => {
         it("Describes the invitation a message carries and what the reader can do with it.", async () => {
             const { mailbox, inbox, me } = await setup();

@@ -26,9 +26,22 @@ const ENGINE = new pkijs.CryptoEngine({ name: "rapidmx-zero-access", crypto: web
 const CONTENT_ENCRYPTION_ALGORITHM: AesKeyGenParams = { name: "AES-GCM", length: 256 };
 
 /** Outer headers a zero-access message keeps in the clear: what the server stores in plaintext on the message row anyway
- * (`from`, `recipients`, threading, dates), so a mail client lists and threads it before decrypting. The subject is not
- * among them - it is replaced by `[...]`, RFC 9788's placeholder for a protected subject. */
-const OUTER_HEADERS: ReadonlySet<string> = new Set(["from", "sender", "to", "cc", "reply-to", "date", "message-id", "in-reply-to", "references"]);
+ * (`from`, `recipients`, threading, dates), so a mail client lists and threads it before decrypting, and the
+ * `Authentication-Results` this server's MTA stamped on delivery (kept in order), so a DKIM-verified sender can still be told from
+ * a forged one (`verifiedFromAddress()`, e.g. for a calendar invitation). The subject is not among them - it is replaced by
+ * `[...]`, RFC 9788's placeholder for a protected subject. */
+const OUTER_HEADERS: ReadonlySet<string> = new Set([
+    "from",
+    "sender",
+    "to",
+    "cc",
+    "reply-to",
+    "date",
+    "message-id",
+    "in-reply-to",
+    "references",
+    "authentication-results",
+]);
 
 /** The subject an encrypted message shows outside its encryption (RFC 9788 §3.2). */
 export const PROTECTED_SUBJECT = "[...]";

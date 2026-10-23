@@ -219,7 +219,17 @@ const REPORT_HEADER_BYTES: number = 64 * 1024;
 const REPORT_KINDS: readonly MessageReportKind[] = ["junk", "phishing", "not_junk"];
 
 /** Why `report()` did not teach the spam filter (`MessageReportResult.learnSkipped`). */
-export type MessageLearnSkipped = "encrypted" | "unsupported" | "disabled" | "failed" | "too_large";
+/** Base64 (standard alphabet, padded or not), for `POST /:id/report`'s `rawMessage`. */
+const BASE64_PATTERN: RegExp = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/** A `Message-ID` without its angle brackets or surrounding space, lowercased - `undefined` when there is none. */
+function normalizeMessageId(value: string | undefined | null): string | undefined {
+    const id: string = (value ?? "").trim().replace(/^<|>$/g, "").trim().toLowerCase();
+    return id || undefined;
+}
+
+/** `zero_access`: a zero-access message reported without the client's decrypted copy (`rawMessage`) - the server holds only ciphertext. */
+export type MessageLearnSkipped = "encrypted" | "zero_access" | "unsupported" | "disabled" | "failed" | "too_large";
 
 /** The answer to `POST /:id/report`. */
 export interface MessageReportResult {
@@ -1962,7 +1972,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     @Post("/:id/report")
     public async report(
         @Param("id") id: string,
-        body: { kind?: unknown; alwaysTrustSender?: unknown } | undefined,
+        body: { kind?: unknown; alwaysTrustSender?: unknown; rawMessage?: unknown } | undefined,
         @Request req: HttpRequest,
         @AuthUser user?: JWTUser,
     ): Promise<MessageReportResult> {
@@ -1980,6 +1990,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         }
         if (alwaysTrustSender === true && reportKind !== "not_junk") {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "alwaysTrustSender only applies to a not_junk report.");
+        }
+        const rawMessage: unknown = body?.rawMessage;
+        if (rawMessage !== undefined && (typeof rawMessage !== "string" || !BASE64_PATTERN.test(rawMessage))) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "rawMessage must be the message source, base64-encoded.");
         }
 
         const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
@@ -2001,6 +2015,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (sourceFolder?.type === FolderType.DRAFTS || sourceFolder?.type === FolderType.OUTBOX) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A message in Drafts or Outbox cannot be reported.");
         }
+        const clientRaw: Buffer | undefined = typeof rawMessage === "string" ? this.reportedZeroAccessSource(message, rawMessage) : undefined;
 
         const target: any = await findOrCreateWellKnownFolder(
             folderRepo,
@@ -2020,6 +2035,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             reportKind,
             mailbox,
             alwaysTrustSender === true,
+            clientRaw,
         );
         let safeSender: string | undefined;
         if (alwaysTrustSender === true) {
@@ -2114,6 +2130,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         kind: MessageReportKind,
         mailbox: Mailbox | undefined,
         needRaw: boolean,
+        clientRaw?: Buffer,
     ): Promise<{ learned: boolean; learnSkipped?: MessageLearnSkipped; raw?: Buffer }> {
         const provider: SpamScanProvider | undefined = this.spamScanProvider;
         let skipped: MessageLearnSkipped | undefined;
@@ -2123,6 +2140,16 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             skipped = "disabled";
         } else if (!provider || typeof provider.learn !== "function") {
             skipped = "unsupported";
+        } else if ((message as any).zeroAccess && !clientRaw) {
+            skipped = "zero_access";
+        }
+        // A zero-access message is learned only from the client's decrypted copy, which is never kept or handed on: no `raw` is returned,
+        // so a trusted sender comes from the sealed message's own outer headers.
+        if ((message as any).zeroAccess) {
+            if (skipped) {
+                return { learned: false, learnSkipped: skipped };
+            }
+            return await this.learnSource(provider!, message, kind, mailbox, clientRaw!);
         }
         if (skipped && !needRaw) {
             return { learned: false, learnSkipped: skipped };
@@ -2145,13 +2172,44 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if (!raw) {
             return { learned: false, learnSkipped: "failed" };
         }
+        return { ...(await this.learnSource(provider!, message, kind, mailbox, raw)), raw };
+    }
+
+    /** Teaches `provider` the source `raw` of `message` as `kind`. */
+    private async learnSource(
+        provider: SpamScanProvider,
+        message: T,
+        kind: MessageReportKind,
+        mailbox: Mailbox | undefined,
+        raw: Buffer,
+    ): Promise<{ learned: boolean; learnSkipped?: MessageLearnSkipped }> {
+        if (raw.length > MAX_REPORT_LEARN_BYTES) {
+            return { learned: false, learnSkipped: "too_large" };
+        }
         try {
-            await provider!.learn!(raw, kind === "not_junk" ? "ham" : "spam", { recipient: mailbox?.primarySmtpAddress });
-            return { learned: true, raw };
+            await provider.learn!(raw, kind === "not_junk" ? "ham" : "spam", { recipient: mailbox?.primarySmtpAddress });
+            return { learned: true };
         } catch (err: any) {
             this.logger?.warn(`Message report: the spam filter did not learn message ${message.uid} as ${kind}: ${err?.message}`);
-            return { learned: false, learnSkipped: "failed", raw };
+            return { learned: false, learnSkipped: "failed" };
         }
+    }
+
+    /**
+     * The client's decrypted copy of a zero-access `message` (`POST /:id/report`'s `rawMessage`), decoded - refused (400) for any other
+     * message, whose source the server reads itself, and for a copy whose `Message-ID` isn't the message's own. Used only to teach the
+     * spam filter, never stored.
+     */
+    private reportedZeroAccessSource(message: T, rawMessage: string): Buffer {
+        if (!(message as any).zeroAccess) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "rawMessage applies only to a zero-access message.");
+        }
+        const raw: Buffer = Buffer.from(rawMessage, "base64");
+        const expected: string | undefined = normalizeMessageId(message.messageId);
+        if (expected && normalizeMessageId(extractHeader(raw, "message-id")) !== expected) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "rawMessage is not the source of this message.");
+        }
+        return raw;
     }
 
     /**

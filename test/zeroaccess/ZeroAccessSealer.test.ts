@@ -119,6 +119,31 @@ describe("ZeroAccessSealer", () => {
         expect((await sealMessage(headerOnly, recipient.certDer)).toString("latin1")).toMatch(/^From: bob@example.org\r\nSubject: \[\.\.\.\]/);
     });
 
+    it("keeps the delivery's Authentication-Results outside, in their order, so a verified sender can still be told apart", async () => {
+        const recipient = await makeRecipient();
+        const raw = Buffer.from(
+            [
+                "Authentication-Results: mx.example.com; dkim=pass header.d=example.org",
+                "Received: from relay",
+                "Authentication-Results: upstream.example; dkim=fail",
+                "From: bob@example.org",
+                "Subject: secret",
+                "",
+                "body",
+            ].join("\r\n"),
+        );
+
+        const header: string = (await sealMessage(raw, recipient.certDer)).toString("latin1").split("\r\n\r\n")[0];
+
+        expect(
+            header.startsWith(
+                "Authentication-Results: mx.example.com; dkim=pass header.d=example.org\r\nAuthentication-Results: upstream.example; dkim=fail\r\nFrom: bob@example.org\r\n",
+            ),
+        ).toBe(true);
+        expect(header).not.toContain("Received");
+        expect(header).not.toContain("secret");
+    });
+
     it("ignores a leading continuation line with no field to belong to", async () => {
         const recipient = await makeRecipient();
         const odd = Buffer.from(" stray\r\nFrom: bob@example.org\r\n\r\nbody");

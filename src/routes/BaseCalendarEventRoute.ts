@@ -88,6 +88,14 @@ function respondStatusOf(answer: unknown): AttendeeResponseStatus | undefined {
     return typeof answer === "string" && Object.prototype.hasOwnProperty.call(RESPOND_STATUS_MAP, answer) ? RESPOND_STATUS_MAP[answer] : undefined;
 }
 
+/** The calendar file a client sends for an invitation in a zero-access message (see `BaseCalendarEventRoute.loadInvite()`). */
+export interface InviteSource {
+    ics?: string;
+}
+
+/** The longest calendar file a client may send for a zero-access invitation. */
+const MAX_CLIENT_ICS_LENGTH: number = 1024 * 1024;
+
 /**
  * Extends `BaseScopedChildRoute` (scoped by `folderUid`, same as `Message`) with the two pieces of
  * scheduling-relevant behavior a `CalendarEvent` needs beyond ordinary CRUD:
@@ -727,6 +735,19 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     }
 
     /**
+     * `getInvite()` for a zero-access message, whose stored source is sealed: the client sends the calendar file from its decrypted copy
+     * (`ics`), which every other invitation endpoint takes in its body too. See `loadInvite()`.
+     */
+    @Summary("Read the meeting invitation in a zero-access message")
+    @Description("Reports the calendar invitation of a zero-access message from the calendar file the client decrypted, as GET /invite/:messageUid does.")
+    @Returns([Object])
+    @Post("/invite/:messageUid/view")
+    public async viewInvite(@Param("messageUid") messageUid: string, body: InviteSource | undefined, @AuthUser user?: JWTUser): Promise<MessageInvite> {
+        const context = await this.loadInvite(messageUid, user, ACLAction.READ, body?.ics);
+        return await this.describe(context);
+    }
+
+    /**
      * Answers the invitation in a message as the mailbox that received it, as a mail client's Accept / Tentative / Decline does:
      *
      * **Accepted / tentative**: the meeting is put on the calendar (from the message's own calendar file, at the deterministic uid
@@ -748,10 +769,10 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     @Post("/invite/:messageUid/respond")
     public async respondToInvite(
         @Param("messageUid") messageUid: string,
-        body: { responseStatus?: InviteResponse } | undefined,
+        body: ({ responseStatus?: InviteResponse } & InviteSource) | undefined,
         @AuthUser user?: JWTUser,
     ): Promise<MessageInvite> {
-        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE);
+        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE, body?.ics);
         const answer: InviteResponse | undefined = body?.responseStatus;
         const status: AttendeeResponseStatus | undefined = answer ? respondStatusOf(answer) : undefined;
         if (!answer || !status) {
@@ -806,8 +827,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     @Description("Deletes the caller's calendar copy of the meeting a cancellation message names.")
     @Returns([Object])
     @Post("/invite/:messageUid/remove")
-    public async removeInvite(@Param("messageUid") messageUid: string, @AuthUser user?: JWTUser): Promise<MessageInvite> {
-        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE);
+    public async removeInvite(@Param("messageUid") messageUid: string, body: InviteSource | undefined, @AuthUser user?: JWTUser): Promise<MessageInvite> {
+        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE, body?.ics);
         await this.assertFromOrganizer(context);
         const view: MessageInvite = await this.describe(context);
         if (!view.canRemove || !context.existing) {
@@ -829,10 +850,10 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     @Post("/invite/:messageUid/propose")
     public async proposeNewTime(
         @Param("messageUid") messageUid: string,
-        body: { startDate?: string; endDate?: string; comment?: string } | undefined,
+        body: ({ startDate?: string; endDate?: string; comment?: string } & InviteSource) | undefined,
         @AuthUser user?: JWTUser,
     ): Promise<MessageInvite> {
-        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE);
+        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE, body?.ics);
         const view: MessageInvite = await this.describe(context);
         if (!view.canPropose) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This message isn't an invitation you can propose another time for.");
@@ -874,8 +895,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     @Description("Moves the meeting to the time an attendee proposed (an iTIP COUNTER) and re-invites the attendees.")
     @Returns([Object])
     @Post("/invite/:messageUid/accept-proposal")
-    public async acceptProposal(@Param("messageUid") messageUid: string, @AuthUser user?: JWTUser): Promise<MessageInvite> {
-        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE);
+    public async acceptProposal(@Param("messageUid") messageUid: string, body: InviteSource | undefined, @AuthUser user?: JWTUser): Promise<MessageInvite> {
+        const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE, body?.ics);
         const view: MessageInvite = await this.describe(context);
         const existing: CalendarEvent | undefined = context.existing;
         // "You organize it" is what the calendar copy says, not the file the sender wrote: a guest's counter-proposal naming the reader as `ORGANIZER`
@@ -978,8 +999,16 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         }
     }
 
-    /** What the invitation endpoints work from: the message, its mailbox, the calendar file's event and the calendar row that already stands for it. */
-    private async loadInvite(messageUid: string, user: JWTUser | undefined, action: string): Promise<InviteContext> {
+    /**
+     * What the invitation endpoints work from: the message, its mailbox, the calendar file's event and the calendar row that already stands for it.
+     *
+     * A zero-access message's stored source is sealed, so its calendar file comes from the client (`clientIcs`, out of its decrypted copy) and
+     * is required (`404` without it, as for a message with no invitation); a `clientIcs` for any other message is a `400`, the server reading
+     * that file itself. The sender's DKIM verification still comes from the stored message - the sealed copy keeps its `Authentication-Results`
+     * in the clear - never from the client. The client's file is trusted as far as its sender's own calendar is: a mailbox's user acting on it
+     * changes only their calendar and answers as themselves, which they can do directly.
+     */
+    private async loadInvite(messageUid: string, user: JWTUser | undefined, action: string, clientIcs?: unknown): Promise<InviteContext> {
         if (!this.repoUtils || !this.blobStore) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
@@ -997,13 +1026,24 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (!messageMayCarryInvite(message) || !message.bodyBlobKey) {
             throw noInvite();
         }
+        const sealed: boolean = !!message.zeroAccess;
+        if (clientIcs !== undefined && (!sealed || typeof clientIcs !== "string" || clientIcs.length > MAX_CLIENT_ICS_LENGTH)) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                sealed ? `'ics' must be the calendar file, at most ${MAX_CLIENT_ICS_LENGTH} characters.` : "'ics' applies only to a zero-access message.",
+            );
+        }
+        if (sealed && clientIcs === undefined) {
+            throw noInvite();
+        }
         let raw: Buffer;
         try {
             raw = await this.blobStore.get(message.bodyBlobKey);
         } catch {
             throw noInvite();
         }
-        const ics: string | undefined = await extractIcsFromRaw(raw);
+        const ics: string | undefined = sealed ? (clientIcs) : await extractIcsFromRaw(raw);
         const parsed: ParsedIcsEvent | undefined = ics ? parseInviteIcs(ics) : undefined;
         if (!parsed) {
             throw noInvite();
