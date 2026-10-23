@@ -6,7 +6,7 @@ import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { AuditAction, EncryptionPolicy, PolicyState } from "../models/types.js";
-const { Init } = ObjectDecorators;
+const { Config, Init } = ObjectDecorators;
 const { Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorators;
 
 /** The fixed, well-known identifier of the one `EncryptionPolicy` row this route ever reads/writes - same
@@ -16,14 +16,20 @@ const ENCRYPTION_POLICY_UID = "encryption-policy";
 /** The wire shape of `EncryptionPolicy` - identical to the entity today, but kept as its own type (mirroring
  * `BaseBrandingRoute.ts`'s `PublicBranding`) so a future field this route shouldn't expose (e.g. internal
  * bookkeeping) doesn't leak by accident. */
-export type PublicEncryptionPolicy = Pick<EncryptionPolicy, "encryptSameOrg" | "encryptFederated" | "encryptExternal">;
+export type PublicEncryptionPolicy = Pick<EncryptionPolicy, "encryptSameOrg" | "encryptFederated" | "encryptExternal"> & {
+    /** Always present on the wire: the stored value, or `mail:zero_access:allowed` when none has been saved. */
+    allowZeroAccess: boolean;
+};
+
+/** The config key seeding `EncryptionPolicy.allowZeroAccess` until an administrator saves a value. */
+export const ZERO_ACCESS_ALLOWED_CONFIG = "mail:zero_access:allowed";
 
 /** All-`"optional"` defaults `GET /encryption-policy` returns when nothing has been configured yet - never a
  * `404`, so a client's compose-time policy check never has to special-case "not configured". `"optional"`
  * (not `"prohibited"`) matches the spec's explicit same-organisation default, extended to all three tiers
  * since encryption is a *protective* capability with no reason to default more restrictively for a
  * federated/external tier than for same-organisation. */
-const DEFAULT_ENCRYPTION_POLICY: PublicEncryptionPolicy = {
+const DEFAULT_ENCRYPTION_POLICY: Omit<PublicEncryptionPolicy, "allowZeroAccess"> = {
     encryptSameOrg: "optional",
     encryptFederated: "optional",
     encryptExternal: "optional",
@@ -61,6 +67,10 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
 
     /** Records the audit entries, built once by `initialize()` from `auditLogRepo`. */
     protected auditLogUtils?: AuditLogUtils;
+
+    /** Seeds `EncryptionPolicy.allowZeroAccess` (`specs/search.md` §3: on by default) until an administrator saves a value. */
+    @Config(ZERO_ACCESS_ALLOWED_CONFIG, true)
+    protected zeroAccessAllowedDefault: boolean = true;
 
     @Init
     protected async initialize(): Promise<void> {
@@ -102,11 +112,13 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
         }
     }
 
-    private toPublic(policy: T): PublicEncryptionPolicy {
+    private toPublic(policy: Omit<PublicEncryptionPolicy, "allowZeroAccess"> & { allowZeroAccess?: boolean | null }): PublicEncryptionPolicy {
         return {
             encryptSameOrg: policy.encryptSameOrg,
             encryptFederated: policy.encryptFederated,
             encryptExternal: policy.encryptExternal,
+            // `null` is a SQL row from before the column existed: unset, like `undefined`.
+            allowZeroAccess: typeof policy.allowZeroAccess === "boolean" ? policy.allowZeroAccess : this.zeroAccessAllowedDefault !== false,
         };
     }
 
@@ -119,6 +131,9 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
             if (value !== undefined) {
                 patch[field] = value;
             }
+        }
+        if (obj?.allowZeroAccess !== undefined) {
+            patch.allowZeroAccess = obj.allowZeroAccess;
         }
         return patch;
     }
@@ -137,6 +152,9 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
                 );
             }
         }
+        if (obj?.allowZeroAccess !== undefined && typeof obj.allowZeroAccess !== "boolean") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'allowZeroAccess' must be a boolean.");
+        }
     }
 
     @Get()
@@ -145,7 +163,7 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
         const existing: T | undefined = await this.encryptionPolicyRepo!.findOne(ENCRYPTION_POLICY_UID, { ignoreACL: true });
-        return existing ? this.toPublic(existing) : DEFAULT_ENCRYPTION_POLICY;
+        return this.toPublic(existing ?? DEFAULT_ENCRYPTION_POLICY);
     }
 
     @RequiresTrustedRole()

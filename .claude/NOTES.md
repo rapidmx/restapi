@@ -4162,3 +4162,32 @@ Not committed. BREAKING for every downstream package (server, activesync, mapi, 
 - **Plain functions now repo-taking** (same names as before, new first argument): `requireEscrowHolder(repo, scopeId, user)`, `findHeldScopeIds(repo, user)`, `getMailboxUidForFolder(folderRepo, folderUid, { rejectDeleted })`, `loadLegalHoldIndex(matterRepo)`, `findActiveHoldsFor(matterRepo, mailboxUid, date?)`, `assertNotOnLegalHold(matterRepo, mailboxUid, date?)`, `findOrCreateSingleton(repo, uid, seed)`, `findOrSeedMailboxPolicy(policyRepo, seed, logger?, failClosed?)`, `collectMailboxContentLines(repos, ...)`, `softDeletedContentLines(repos, ...)`, `collectMessagePurge`/`finishMessagePurge({ blobStore, repos, logger })`, `messageBlobReferenceSources(repos)`, `isBlobKeyReferenced(sources, key, exclude?)`, `deleteBlobsIfUnreferenced(blobStore, sources, keys, exclude?)`. Blob sources and exclusions are now `{ repo, entityType?, fields, extraCriteria? }` / `{ repo? | entityType?, uid }`.
 - **`prepareOutboundMime({ raw, message, mailbox, domainUtils, dnsResolver })`** and `LeftoverContext` (`matterRepo`, `auditLogUtils` required) lost their legacy `objectFactory`/`*Class`/`config` fields.
 - **Tests**: the old-API tests were ported to the new API in place (`test/util/<Module>.test.ts`; the `.service`/`.repo`/`.stage1`/`.ctx` stage files were merged into them, `test/jobs/SoftDeletedContent.test.ts` is new); `EscrowAuditUtils.test.ts` also covers building through a real `ObjectFactory` without the key configured.
+
+## 2026-10-22 - Zero-access encryption, Phase 1 (keys and settings)
+
+The plan's Phase 1, from the standing "Zero-access encryption" decision. Nothing encrypts mail yet: this lands the key, the two settings and the effective-state rule.
+
+- **Key storage.** The `zero-access` keys live on `Mailbox.zeroAccessKeys` (`ZeroAccessKey`, the `PublicKey` shape minus `issuerCertificate`), never on `Mailbox.keys`. `PublicKey` is shared with contact keyrings, and discovery serves `mailbox.keys` verbatim, so a separate field makes "never published" true by construction instead of depending on filters.
+  - `WrappedPrivateKey.useType` widened to `KeyUseType`.
+  - Contact-facing `useType`s stay `"sign" | "encrypt"`, and `KeyDiscoveryClient` already rejects anything else from a peer.
+- **Enrollment.** `enrollKey` gained `useType: "zero-access"`: the CSR goes to `EncryptionCertificateAuthority.issue()`, like `encrypt`.
+  - `persistEnrollment` writes `zeroAccessKeys` via `supersedeKeys`, which is now generic over the key type.
+  - `MAX_ENROLLED_KEYS` counts both lists.
+  - `rekey` leaves `zeroAccessKeys` alone, but carries their wrapped keys like any other.
+- **Vault response.** Every vault response now includes `zeroAccessKeys` (the mailbox's, `[]` if none). Unlocking needs the certificates because CMS matches its recipient by certificate, and the vault reader is the only one who may see them.
+- **Admin setting.** `EncryptionPolicy.allowZeroAccess`: a nullable column, with an unset value falling back to `@Config("mail:zero_access:allowed", true)`. GET always returns the effective boolean.
+- **Mailbox setting.** `Mailbox.zeroAccessEnabled` is a nullable column, where unset means on.
+  - Only the owner's value is kept: `dropKeyFieldsOfNonOwner` drops it for delegates and admins (whose writes `restrictToAdminFields` also strips, since it isn't in `ADMIN_MANAGED_FIELDS`).
+  - A non-empty `zeroAccessKeys` is refused with 400, like `keys`. An empty or null one is dropped.
+- **Effective state.** `util/ZeroAccessUtils.ts` provides `zeroAccessStatus()`, `isZeroAccessActive()` and `activeZeroAccessKey()`.
+  - Statuses are checked in this order: `disabled_by_admin` → `disabled_by_owner` → `shared_mailbox` (ownerless or `hasDelegates`, until Phase 7) → `no_key` → `active`.
+  - The active key ignores `notAfter` on purpose. Only this server encrypts to it, so an expired certificate must not drop a mailbox back to plaintext.
+  - These are pure functions. The repo-backed resolver (reading the policy plus delegate ACLs) comes with the delivery path in Phase 3.
+- **Plugin settings.** `mail:zero_access` was added to `PluginUtils`'s protected namespaces, kept equal to server's `PROTECTED_PLUGIN_SETTING_KEYS`.
+- **Dropped from the plan.** The plan's `zeroAccessActivatedAt` was not added: the backfill (Phase 6) finds plaintext messages of active mailboxes directly.
+
+Tests (targeted, `--coverage.enabled=false`):
+- `ZeroAccessUtils` unit.
+- `CertificateInstallUtils`.
+- EncryptionPolicy, KeyVault and Mailbox route suites, mongo and sql: 314 tests passing.
+- `yarn build` (lint) is clean.

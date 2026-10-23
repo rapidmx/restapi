@@ -92,10 +92,25 @@ export interface WrappedPrivateKey {
     nonce: string;
     /** AEAD algorithm identifier (e.g. `AES-256-GCM`). */
     algorithm: string;
-    /** Fingerprint of the corresponding `PublicKey`. */
+    /** Fingerprint of the corresponding `PublicKey` (or `ZeroAccessKey`). */
     fingerprint: string;
     /** The purpose this key is used for. */
-    useType: "sign" | "encrypt";
+    useType: KeyUseType;
+}
+
+/** What a mailbox's own key is used for: `sign`/`encrypt` keys are published (`Mailbox.keys`), `zero-access` keys never are
+ * (`Mailbox.zeroAccessKeys`). */
+export type KeyUseType = "sign" | "encrypt" | "zero-access";
+
+/**
+ * A mailbox's zero-access encryption key (`specs/search.md` §3): the public half of the keypair this server encrypts mail
+ * at rest to on arrival, its index entries and its sealed summaries. Same shape as `PublicKey` (an X.509 certificate from
+ * the internal CA, so CMS can address it), but kept apart from it - stored on `Mailbox.zeroAccessKeys`, never `Mailbox.keys` -
+ * so it can never reach the discovery endpoint, the `RapidMX-Key` header or a contact's keyring: only this server ever
+ * encrypts to it. Its private key is wrapped under the mailbox master key in the `KeyVault`, like the others.
+ */
+export interface ZeroAccessKey extends Omit<PublicKey, "useType" | "issuerCertificate"> {
+    useType: "zero-access";
 }
 
 /**
@@ -452,6 +467,10 @@ export interface EncryptionPolicy extends BaseEntity {
     encryptSameOrg: PolicyState;
     encryptFederated: PolicyState;
     encryptExternal: PolicyState;
+    /** "Allow zero-access encryption" (`specs/search.md` §3): whether mailboxes on this server may store mail encrypted at rest.
+     * Unset falls back to `mail:zero_access:allowed` (default `true`). Off, every mailbox stores new mail in plaintext
+     * regardless of its own `Mailbox.zeroAccessEnabled`; mail already encrypted stays encrypted. */
+    allowZeroAccess?: boolean;
 }
 
 /** The minimum enforceable `RetentionPolicy.auditLogRetentionDays` - approximates HIPAA's typical
@@ -768,6 +787,16 @@ export interface Mailbox extends BaseEntity {
      * private-material-carrying `KeyVault` returned only from the authenticated `GET /mailbox/:id/keyvault`.
      * Defaults to `[]` for a mailbox that has never enrolled a key. */
     keys: PublicKey[];
+
+    /** This mailbox's zero-access encryption keys (`ZeroAccessKey`), newest last; at most one is unrevoked. Never published -
+     * see `ZeroAccessKey`. Managed by the server (`BaseKeyVaultRoute.enrollKey()`), never written by a client directly.
+     * Unset for a mailbox that has never enrolled one. */
+    zeroAccessKeys?: ZeroAccessKey[];
+
+    /** "Enable zero-access encryption" (`specs/search.md` §3): whether this mailbox stores mail encrypted at rest when the
+     * server allows it (`EncryptionPolicy.allowZeroAccess`) and a zero-access key is enrolled. Unset means on. Only the
+     * mailbox's owner may change it - never an administrator or a delegate. */
+    zeroAccessEnabled?: boolean;
 
     /** Precomputed `zbase32(sha256(lowercase(localPart)))` of `primarySmtpAddress` (see
      * `util/KeyDiscoveryClient.ts`'s `computeKeyDiscoveryHash()`), maintained alongside `primarySmtpAddress`

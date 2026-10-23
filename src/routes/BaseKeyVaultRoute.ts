@@ -37,7 +37,7 @@ import {
     verifiedIssuerCertificate,
 } from "../util/CertificateInstallUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
-import { AuditAction, EscrowScope, KeyVault, Mailbox, MasterKeyWrap, PublicKey, WrappedPrivateKey } from "../models/types.js";
+import { AuditAction, EscrowScope, KeyUseType, KeyVault, Mailbox, MasterKeyWrap, PublicKey, WrappedPrivateKey, ZeroAccessKey } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
 const { Delete, Get, Param, Post, Put, Query, Response, User: AuthUser } = RouteDecorators;
@@ -50,9 +50,12 @@ export type PublicKeyVault = Pick<KeyVault, "wrappedKeys" | "masterKeyWraps"> & 
      * back as `expectedMasterKeyGeneration` on the writes that put material sealed under its master key into the vault
      * (see `ExpectedMasterKeyGeneration`). */
     masterKeyGeneration: number;
+    /** The mailbox's zero-access certificates (`Mailbox.zeroAccessKeys`, `[]` for none). Returned here, to the vault's reader only,
+     * because unlocking needs them (CMS addresses its recipient by certificate) and they are never published. */
+    zeroAccessKeys: ZeroAccessKey[];
 };
 
-const EMPTY_KEY_VAULT: PublicKeyVault = { wrappedKeys: [], masterKeyWraps: [], masterKeyGeneration: 0 };
+const EMPTY_KEY_VAULT: PublicKeyVault = { wrappedKeys: [], masterKeyWraps: [], masterKeyGeneration: 0, zeroAccessKeys: [] };
 
 /**
  * Optional on `enrollKey()`, `startSignEnrollment()`, `addMasterKeyWrap()` and `rekey()`: the `masterKeyGeneration` the
@@ -94,8 +97,13 @@ function assertMasterKeyGeneration(keyVault: KeyVault | undefined, expected: num
 }
 
 /** The response shape of every key-vault endpoint. */
-function toPublicKeyVault(keyVault: KeyVault): PublicKeyVault {
-    return { wrappedKeys: keyVault.wrappedKeys, masterKeyWraps: keyVault.masterKeyWraps, masterKeyGeneration: generationOf(keyVault) };
+function toPublicKeyVault(keyVault: KeyVault, mailbox: Pick<Mailbox, "zeroAccessKeys">): PublicKeyVault {
+    return {
+        wrappedKeys: keyVault.wrappedKeys,
+        masterKeyWraps: keyVault.masterKeyWraps,
+        masterKeyGeneration: generationOf(keyVault),
+        zeroAccessKeys: mailbox.zeroAccessKeys ?? [],
+    };
 }
 
 /** Request body for `enrollKey()`. `wrappedKey`'s `fingerprint`/`useType` are deliberately omitted - the
@@ -106,9 +114,9 @@ function toPublicKeyVault(keyVault: KeyVault): PublicKeyVault {
  * with a different master key). Enrolling an additional key omits it; adding a master-key wrap independent of key
  * enrollment is `addMasterKeyWrap()`'s (D3's) job. */
 export interface EnrollKeyRequest extends ExpectedMasterKeyGeneration {
-    useType: "sign" | "encrypt";
-    /** A PEM-encoded PKCS#10 CSR - required, and only meaningful, when `useType` is `"encrypt"`: the server
-     * calls the injected `EncryptionCertificateAuthority` itself to mint the certificate. */
+    useType: KeyUseType;
+    /** A PEM-encoded PKCS#10 CSR - required, and only meaningful, when `useType` is `"encrypt"` or `"zero-access"`: the
+     * server calls the injected `EncryptionCertificateAuthority` itself to mint the certificate. */
     csr?: string;
     /** An already-issued PEM certificate - required, and only meaningful, when `useType` is `"sign"`: signing
      * certificates are enrolled asynchronously against a public CA via the separate
@@ -482,7 +490,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { action: AuditAction.KEY_VAULT_READ, targetType: "KeyVault", targetUid: existing?.uid ?? mailbox.uid, mailboxUid: mailbox.uid },
             { user },
         );
-        return existing ? toPublicKeyVault(existing) : { ...EMPTY_KEY_VAULT };
+        return existing ? toPublicKeyVault(existing, mailbox) : { ...EMPTY_KEY_VAULT, zeroAccessKeys: mailbox.zeroAccessKeys ?? [] };
     }
 
     /**
@@ -524,11 +532,11 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         for (const wrap of requestedMasterKeyWraps) {
             validateMasterKeyWrap(wrap, { allowEscrow: await this.resolveAllowEscrow(mailbox, wrap) });
         }
-        if ((mailbox.keys ?? []).length >= MAX_ENROLLED_KEYS) {
+        if ((mailbox.keys ?? []).length + (mailbox.zeroAccessKeys ?? []).length >= MAX_ENROLLED_KEYS) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox cannot enroll more than ${MAX_ENROLLED_KEYS} keys.`);
         }
 
-        let publicKey: PublicKey;
+        let publicKey: PublicKey | ZeroAccessKey;
         let fingerprint: string;
         if (body.useType === "encrypt") {
             if (!body.csr) {
@@ -537,7 +545,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             const issued = await this.encryptionCa!.issue(mailbox.primarySmtpAddress, body.csr);
             const cert = new crypto.X509Certificate(issued.certificate);
             fingerprint = issued.fingerprint;
-            publicKey = {
+            const encryptKey: PublicKey = {
                 publicKey: cert.raw.toString("base64"),
                 type: "x509",
                 useType: "encrypt",
@@ -548,8 +556,26 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             // Published only when it provably issued the certificate (dropped otherwise, never refused).
             const issuerCertificate: string | undefined = verifiedIssuerCertificate(cert, issued.issuerCertificate);
             if (issuerCertificate) {
-                publicKey.issuerCertificate = issuerCertificate;
+                encryptKey.issuerCertificate = issuerCertificate;
             }
+            publicKey = encryptKey;
+        } else if (body.useType === "zero-access") {
+            // Issued by the internal CA like an encryption key (CMS addresses its recipient by certificate), but never
+            // published: it lands on `Mailbox.zeroAccessKeys`, which nothing serves outside this mailbox's own reads.
+            if (!body.csr) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "csr is required for useType 'zero-access'.");
+            }
+            const issued = await this.encryptionCa!.issue(mailbox.primarySmtpAddress, body.csr);
+            const cert = new crypto.X509Certificate(issued.certificate);
+            fingerprint = issued.fingerprint;
+            publicKey = {
+                publicKey: cert.raw.toString("base64"),
+                type: "x509",
+                useType: "zero-access",
+                fingerprint,
+                notBefore: issued.notBefore.getTime(),
+                notAfter: issued.notAfter.getTime(),
+            };
         } else if (body.useType === "sign") {
             if (!body.certificate) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "certificate is required for useType 'sign'.");
@@ -559,10 +585,12 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             publicKey = result.publicKey;
             fingerprint = result.fingerprint;
         } else {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "useType must be 'sign' or 'encrypt'.");
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "useType must be 'sign', 'encrypt' or 'zero-access'.");
         }
 
-        const collision: PublicKey | undefined = (mailbox.keys ?? []).find((k) => k.fingerprint === fingerprint);
+        const collision: PublicKey | ZeroAccessKey | undefined = [...(mailbox.keys ?? []), ...(mailbox.zeroAccessKeys ?? [])].find(
+            (k) => k.fingerprint === fingerprint,
+        );
         if (collision && !collision.revokedAt && collision.notAfter > Date.now()) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A non-expired, non-revoked key with this fingerprint is already enrolled.");
         }
@@ -587,7 +615,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { user },
         );
 
-        return toPublicKeyVault(persisted.keyVault);
+        return toPublicKeyVault(persisted.keyVault, persisted.mailbox);
     }
 
     /** `expectedGeneration`, when given, must still be the vault's master key generation (409 otherwise) - see
@@ -595,7 +623,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     @Transactional()
     protected async persistEnrollment(
         mailbox: M,
-        publicKey: PublicKey,
+        publicKey: PublicKey | ZeroAccessKey,
         wrappedKey: WrappedPrivateKey,
         initialMasterKeyWraps: MasterKeyWrap[] | undefined,
         expectedGeneration?: number,
@@ -606,8 +634,13 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         assertMasterKeyWrapsAccepted(keyVault, initialMasterKeyWraps);
         assertMasterKeyGeneration(keyVault, expectedGeneration);
 
+        // A zero-access key supersedes only the mailbox's earlier zero-access keys, on their own (never published) list.
+        const keyField: Partial<Mailbox> =
+            publicKey.useType === "zero-access"
+                ? { zeroAccessKeys: supersedeKeys(mailbox.zeroAccessKeys, publicKey, Date.now()) }
+                : { keys: supersedeKeys(mailbox.keys, publicKey, Date.now()) };
         const updatedMailbox: M = await this.mailboxRepo!.update(
-            { uid: mailbox.uid, version: (mailbox as any).version, keys: supersedeKeys(mailbox.keys, publicKey, Date.now()) } as any,
+            { uid: mailbox.uid, version: (mailbox as any).version, ...keyField } as any,
             mailbox,
             { ignoreACL: true },
         );
@@ -933,7 +966,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { user },
         );
 
-        return toPublicKeyVault(updated);
+        return toPublicKeyVault(updated, mailbox);
     }
 
     /**
@@ -1007,7 +1040,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { user },
         );
 
-        return toPublicKeyVault(updated);
+        return toPublicKeyVault(updated, mailbox);
     }
 
     /**
@@ -1129,7 +1162,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { user },
         );
 
-        return toPublicKeyVault(updated);
+        return toPublicKeyVault(updated, mailbox);
     }
 
     /**

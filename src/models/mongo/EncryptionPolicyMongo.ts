@@ -2,8 +2,10 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { ObjectDecorators } from "@rapidrest/core";
 import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
 import { EncryptionPolicy, PolicyState } from "../types.js";
+const { Nullable } = ObjectDecorators;
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity } = PersistenceDecorators;
@@ -40,6 +42,12 @@ export class EncryptionPolicyMongo extends BaseMongoEntity implements Encryption
     @Description("Encryption policy for external recipients.")
     public encryptExternal: PolicyState = "optional";
 
+    // `nullable: true` so `synchronize` can add the column to an existing row; unset falls back to `mail:zero_access:allowed`.
+    @Column()
+    @Description("Whether mailboxes on this server may store mail encrypted at rest (zero-access). Unset uses the server default.")
+    @Nullable
+    public allowZeroAccess?: boolean = undefined;
+
     constructor(other?: Partial<EncryptionPolicyMongo>) {
         super(other);
 
@@ -47,6 +55,7 @@ export class EncryptionPolicyMongo extends BaseMongoEntity implements Encryption
             this.encryptSameOrg = other.encryptSameOrg !== undefined ? other.encryptSameOrg : this.encryptSameOrg;
             this.encryptFederated = other.encryptFederated !== undefined ? other.encryptFederated : this.encryptFederated;
             this.encryptExternal = other.encryptExternal !== undefined ? other.encryptExternal : this.encryptExternal;
+            this.allowZeroAccess = "allowZeroAccess" in other ? other.allowZeroAccess : this.allowZeroAccess;
         }
     }
 }

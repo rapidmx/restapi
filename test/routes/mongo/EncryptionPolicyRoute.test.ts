@@ -63,7 +63,7 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
                 .set("Authorization", "jwt " + userToken);
 
             expect(result.status).toBe(200);
-            expect(result.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional" });
+            expect(result.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: true });
         });
 
         it("Answers 200 with the defaults for any signed-in user - a token with no roles and no elevation, an ordinary one, an administrator - and creates no row for any of them.", async () => {
@@ -75,7 +75,7 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
                     .set("Authorization", "jwt " + token);
 
                 expect(result.status).toBe(200);
-                expect(result.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional" });
+                expect(result.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: true });
             }
             expect(await policyRepo.find({}).toArray()).toEqual([]);
         });
@@ -122,7 +122,7 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
                 .send({ encryptSameOrg: "automatic" });
 
             expect(result.status).toBe(200);
-            expect(result.body).toEqual({ encryptSameOrg: "automatic", encryptFederated: "optional", encryptExternal: "optional" });
+            expect(result.body).toEqual({ encryptSameOrg: "automatic", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: true });
 
             const rows = await policyRepo.find().toArray();
             expect(rows).toHaveLength(1);
@@ -141,7 +141,7 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
                 .send({ encryptExternal: "prohibited" });
 
             expect(result.status).toBe(200);
-            expect(result.body).toEqual({ encryptSameOrg: "automatic", encryptFederated: "prohibited", encryptExternal: "prohibited" });
+            expect(result.body).toEqual({ encryptSameOrg: "automatic", encryptFederated: "prohibited", encryptExternal: "prohibited", allowZeroAccess: true });
         });
 
         it("Rejects an invalid policy state value (400).", async () => {
@@ -163,6 +163,66 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
 
             const entries = await auditLogRepo.find({ action: AuditAction.ENCRYPTION_POLICY_UPDATE }).toArray();
             expect(entries).toHaveLength(1);
+        });
+    });
+
+    describe("allowZeroAccess", () => {
+        it("Defaults to true (mail:zero_access:allowed) before anything is saved.", async () => {
+            const result = await request(server.getApplication())
+                .get(baseUrl)
+                .set("Authorization", "jwt " + userToken);
+
+            expect(result.status).toBe(200);
+            expect(result.body.allowZeroAccess).toBe(true);
+        });
+
+        it("A trusted caller turns it off, any signed-in user reads it back, and the other fields are untouched.", async () => {
+            const put = await request(server.getApplication())
+                .put(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ allowZeroAccess: false });
+
+            expect(put.status).toBe(200);
+            expect(put.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: false });
+
+            const result = await request(server.getApplication())
+                .get(baseUrl)
+                .set("Authorization", "jwt " + userToken);
+            expect(result.body.allowZeroAccess).toBe(false);
+            expect((await policyRepo.find().toArray())[0].allowZeroAccess).toBe(false);
+        });
+
+        it("Keeps a saved value across a PUT of the other fields.", async () => {
+            await request(server.getApplication())
+                .put(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ allowZeroAccess: false });
+
+            const result = await request(server.getApplication())
+                .put(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ encryptSameOrg: "automatic" });
+
+            expect(result.body.allowZeroAccess).toBe(false);
+        });
+
+        it("Rejects a non-boolean value (400) without creating the row.", async () => {
+            const result = await request(server.getApplication())
+                .put(baseUrl)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ allowZeroAccess: "no" });
+
+            expect(result.status).toBe(400);
+            expect(await policyRepo.find().toArray()).toHaveLength(0);
+        });
+
+        it("Rejects a non-trusted caller (403).", async () => {
+            const result = await request(server.getApplication())
+                .put(baseUrl)
+                .set("Authorization", "jwt " + userToken)
+                .send({ allowZeroAccess: false });
+
+            expect(result.status).toBe(403);
         });
     });
 });

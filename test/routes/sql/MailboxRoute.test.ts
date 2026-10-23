@@ -388,6 +388,87 @@ describe("Route:MailboxSQL Tests", () => {
         expect(result.status).toBe(400);
     });
 
+    it("Lets the owner turn zeroAccessEnabled off and on again.", async () => {
+        const obj = await createMailboxSQL();
+
+        const off = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, zeroAccessEnabled: false });
+        expect(off.status).toBe(200);
+        expect(off.body.zeroAccessEnabled).toBe(false);
+
+        const on = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: off.body.version, zeroAccessEnabled: true });
+        expect(on.status).toBe(200);
+        expect(((await repo.findOne({ where: { uid: obj.uid } })) as any)?.zeroAccessEnabled).toBe(true);
+    });
+
+    it("Rejects a non-boolean zeroAccessEnabled (400).", async () => {
+        const obj = await createMailboxSQL();
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, zeroAccessEnabled: "off" });
+
+        expect(result.status).toBe(400);
+    });
+
+    it("Drops zeroAccessEnabled written by an administrator with no grant - only the owner may change it.", async () => {
+        const obj = await createMailboxSQL();
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + adminToken)
+            .send({ uid: obj.uid, version: obj.version, zeroAccessEnabled: false, displayName: "Renamed by admin" });
+
+        expect(result.status).toBe(200);
+        const stored: any = await repo.findOne({ where: { uid: obj.uid } });
+        expect(stored?.displayName).toBe("Renamed by admin");
+        expect(stored?.zeroAccessEnabled ?? undefined).toBeUndefined();
+    });
+
+    it("Drops zeroAccessEnabled written by a delegate holding UPDATE - only the owner may change it.", async () => {
+        const shared = await createMailboxSQL({ displayName: "Delegated" }, otherUser.uid);
+        const acl: any = await aclRepo.findOne({ where: { uid: shared.uid } });
+        acl.records = [...acl.records, { userOrRoleId: owner.uid, actions: [ACLAction.READ, ACLAction.UPDATE] }];
+        await aclRepo.save(acl);
+
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${shared.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: shared.uid, version: shared.version, zeroAccessEnabled: false, displayName: "Renamed by delegate" });
+
+        expect(result.status).toBe(200);
+        const stored: any = await repo.findOne({ where: { uid: shared.uid } });
+        expect(stored?.displayName).toBe("Renamed by delegate");
+        expect(stored?.zeroAccessEnabled ?? undefined).toBeUndefined();
+    });
+
+    it("Rejects a client attempting to directly set 'zeroAccessKeys' via PUT (400), and ignores an empty one.", async () => {
+        const obj = await createMailboxSQL();
+
+        const forged = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({
+                uid: obj.uid,
+                version: obj.version,
+                zeroAccessKeys: [{ publicKey: "forged-b64", type: "x509", useType: "zero-access", fingerprint: "forged-fp", notBefore: 0, notAfter: Date.now() + 1_000_000 }],
+            });
+        expect(forged.status).toBe(400);
+
+        const empty = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, zeroAccessKeys: [], displayName: "Still Fine" });
+        expect(empty.status).toBe(200);
+        expect(empty.body.displayName).toBe("Still Fine");
+    });
+
     it("Rejects a client attempting to directly set 'keyDiscoveryHash' via PUT (400) - collision with another address's hash would impersonate it at the discovery endpoint.", async () => {
         const obj = await createMailboxSQL();
 

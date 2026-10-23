@@ -111,8 +111,16 @@ export function publicKeyFromCertificate(cert: crypto.X509Certificate, useType: 
 /** A `PublicKey.revocationReason` value. */
 export const REVOCATION_REASONS = ["superseded", "compromised"] as const;
 
+/** The fields of a mailbox key (`PublicKey` or `ZeroAccessKey`) that superseding reads and writes. */
+interface SupersedableKey {
+    useType: string;
+    fingerprint: string;
+    revokedAt?: number;
+    revocationReason?: PublicKey["revocationReason"];
+}
+
 /** `key` revoked at `at` because a newer key of its `useType` replaced it. */
-function superseded(key: PublicKey, at: number): PublicKey {
+function superseded<K extends SupersedableKey>(key: K, at: number): K {
     return { ...key, revokedAt: at, revocationReason: "superseded" };
 }
 
@@ -126,8 +134,8 @@ function superseded(key: PublicKey, at: number): PublicKey {
  *
  * The caller must write the result in the same update that publishes `installed`, so a failed install revokes nothing.
  */
-export function supersedeKeys(keys: PublicKey[] | null | undefined, installed: PublicKey, installedAt: number): PublicKey[] {
-    const kept: PublicKey[] = (keys ?? [])
+export function supersedeKeys<K extends SupersedableKey>(keys: K[] | null | undefined, installed: K, installedAt: number): K[] {
+    const kept: K[] = (keys ?? [])
         .filter((key) => key.fingerprint !== installed.fingerprint)
         .map((key) => (key.useType === installed.useType && !key.revokedAt ? superseded(key, installedAt) : key));
     return [...kept, installed];

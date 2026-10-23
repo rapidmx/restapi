@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { EncryptionPreference, FreeBusyVisibility, Mailbox, PublicKey } from "../types.js";
+import { EncryptionPreference, FreeBusyVisibility, Mailbox, PublicKey, ZeroAccessKey } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity, Index } = PersistenceDecorators;
@@ -169,6 +169,16 @@ export class MailboxMongo extends BaseMongoEntity implements Mailbox {
     public keys: PublicKey[] = [];
 
     @Column()
+    @Description("This mailbox's zero-access encryption keys. Never published; managed by the server.")
+    @Nullable
+    public zeroAccessKeys?: ZeroAccessKey[] = undefined;
+
+    @Column()
+    @Description("Whether this mailbox stores mail encrypted at rest (zero-access) when the server allows it. Unset means on. Owner only.")
+    @Nullable
+    public zeroAccessEnabled?: boolean = undefined;
+
+    @Column()
     @Description("Precomputed zbase32(sha256(localPart)) of primarySmtpAddress, for the discovery endpoint's indexed lookup.")
     @Nullable
     public keyDiscoveryHash?: string = undefined;
@@ -252,6 +262,8 @@ export class MailboxMongo extends BaseMongoEntity implements Mailbox {
                 other.autoSendReceiptsExternal !== undefined ? other.autoSendReceiptsExternal : this.autoSendReceiptsExternal;
             this.encryptPreference = other.encryptPreference !== undefined ? other.encryptPreference : this.encryptPreference;
             this.keys = other.keys !== undefined ? other.keys : this.keys;
+            this.zeroAccessKeys = "zeroAccessKeys" in other ? other.zeroAccessKeys : this.zeroAccessKeys;
+            this.zeroAccessEnabled = "zeroAccessEnabled" in other ? other.zeroAccessEnabled : this.zeroAccessEnabled;
             this.keyDiscoveryHash = "keyDiscoveryHash" in other ? other.keyDiscoveryHash : this.keyDiscoveryHash;
             this.escrowScopeId = "escrowScopeId" in other ? other.escrowScopeId : this.escrowScopeId;
             this.correspondentsBackfilledAt =

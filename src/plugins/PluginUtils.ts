@@ -348,6 +348,7 @@ export const CORE_CONFIG_NAMESPACES: readonly string[] = [
     "mail:search",
     "mail:preferences",
     "mail:branding",
+    "mail:zero_access",
     "mail:default_quota_bytes",
     "metrics",
     "diagnostics",

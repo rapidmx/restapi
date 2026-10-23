@@ -122,6 +122,16 @@ function rejectServerManagedFields(obj: Record<string, unknown>): void {
     if (Array.isArray(obj.keys) && obj.keys.length > 0) {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'keys' is managed by the server and cannot be set directly.");
     }
+    if (Array.isArray(obj.zeroAccessKeys) && obj.zeroAccessKeys.length > 0) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'zeroAccessKeys' is managed by the server and cannot be set directly.");
+    }
+    // An empty list or a null round-tripped back is dropped rather than stored over the server's own value.
+    if ("zeroAccessKeys" in obj) {
+        delete obj.zeroAccessKeys;
+    }
+    if (obj.zeroAccessEnabled !== undefined && obj.zeroAccessEnabled !== null && typeof obj.zeroAccessEnabled !== "boolean") {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'zeroAccessEnabled' must be a boolean.");
+    }
     if (typeof obj.keyDiscoveryHash === "string" && obj.keyDiscoveryHash.length > 0) {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'keyDiscoveryHash' is managed by the server and cannot be set directly.");
     }
@@ -1276,7 +1286,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * with update access would otherwise wipe the owner's published certificates (`keys: []`) from key discovery. */
     private async dropKeyFieldsOfNonOwner(id: string, obj: Record<string, any>, user: JWTUser | undefined): Promise<void> {
         // By presence, not value: a property write with no body carries the key with the value `undefined`, which a document store saves as null.
-        if (!("keys" in obj) && !("keyDiscoveryHash" in obj)) {
+        if (!("keys" in obj) && !("keyDiscoveryHash" in obj) && !("zeroAccessEnabled" in obj)) {
             return;
         }
         const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
@@ -1284,6 +1294,10 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         if (!user || !ownerUid || !sameUserUid(ownerUid, user.uid)) {
             delete obj.keys;
             delete obj.keyDiscoveryHash;
+            // Zero-access is the owner's own protection against everybody else, delegates and administrators included
+            // (`specs/search.md` §3), so only the owner turns it off or on; anybody else's value is dropped silently, the same
+            // way a full-object round trip of the other key fields is.
+            delete obj.zeroAccessEnabled;
         }
     }
 

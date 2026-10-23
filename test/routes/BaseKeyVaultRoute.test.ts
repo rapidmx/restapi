@@ -223,7 +223,7 @@ describe("BaseKeyVaultRoute Tests (findOrCreateKeyVault() TOCTOU race and MAX_*_
         (route as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue(mailbox) };
         (route as any).keyVaultRepo = { find };
         (route as any).escrowScopeRepo = {};
-        const persistEnrollment = vi.fn().mockResolvedValue({ keyVault: { uid: "kv-1", wrappedKeys: [], masterKeyWraps: [] } });
+        const persistEnrollment = vi.fn().mockResolvedValue({ keyVault: { uid: "kv-1", wrappedKeys: [], masterKeyWraps: [] }, mailbox });
         (route as any).persistEnrollment = persistEnrollment;
         (route as any).auditLogUtils = { record: vi.fn().mockResolvedValue(undefined) };
         const body: any = { useType: "sign", certificate, wrappedKey: { ciphertext: "c", nonce: "n", algorithm: "aes-gcm" }, masterKeyWraps: [passwordWrap] };

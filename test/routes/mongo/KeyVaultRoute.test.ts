@@ -158,7 +158,7 @@ describe("Route:KeyVaultMongo Tests", () => {
                 .set("Authorization", "jwt " + ownerToken);
 
             expect(result.status).toBe(200);
-            expect(result.body).toEqual({ wrappedKeys: [], masterKeyWraps: [], masterKeyGeneration: 0 });
+            expect(result.body).toEqual({ wrappedKeys: [], masterKeyWraps: [], masterKeyGeneration: 0, zeroAccessKeys: [] });
         });
 
         it("A caller with a delegate READ grant (not owner) cannot read the vault (403) - its wraps would open to an offline guess at the owner's password.", async () => {
@@ -402,6 +402,71 @@ describe("Route:KeyVaultMongo Tests", () => {
                 .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
                 .set("Authorization", "jwt " + ownerToken)
                 .send({ useType: "encrypt", wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } });
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Enrolls a zero-access key via a CSR - issues the cert through EncryptionCertificateAuthority but stores it on Mailbox.zeroAccessKeys, never the published Mailbox.keys.", async () => {
+            const mailbox = await createMailbox();
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    useType: "zero-access",
+                    csr: await generateTestCsr(mailbox.primarySmtpAddress),
+                    wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" },
+                    masterKeyWraps: [
+                        { method: "password", ciphertext: "mkct", nonce: "mkn", salt: "salt", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() },
+                    ],
+                });
+
+            expect(result.status).toBe(200);
+            expect(result.body.wrappedKeys).toHaveLength(1);
+            expect(result.body.wrappedKeys[0].useType).toBe("zero-access");
+            expect(result.body.zeroAccessKeys).toHaveLength(1);
+            expect(result.body.zeroAccessKeys[0].fingerprint).toBe(result.body.wrappedKeys[0].fingerprint);
+
+            const updatedMailbox: any = await mailboxRepo.findOne({ uid: mailbox.uid } as any);
+            expect(updatedMailbox?.keys ?? []).toHaveLength(0);
+            expect(updatedMailbox?.zeroAccessKeys).toHaveLength(1);
+            expect(updatedMailbox?.zeroAccessKeys[0].useType).toBe("zero-access");
+            expect(updatedMailbox?.zeroAccessKeys[0].fingerprint).toBe(result.body.wrappedKeys[0].fingerprint);
+        });
+
+        it("A second zero-access key supersedes the first on zeroAccessKeys only, leaving the published encryption key active.", async () => {
+            const mailbox = await createMailbox();
+            const enroll = (useType: string, masterKeyWraps?: any[]) =>
+                generateTestCsr(mailbox.primarySmtpAddress).then((csr) =>
+                    request(server.getApplication())
+                        .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
+                        .set("Authorization", "jwt " + ownerToken)
+                        .send({ useType, csr, wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" }, ...(masterKeyWraps ? { masterKeyWraps } : {}) }),
+                );
+            expect(
+                (await enroll("encrypt", [{ method: "password", ciphertext: "mkct", nonce: "mkn", salt: "salt", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() }]))
+                    .status,
+            ).toBe(200);
+            expect((await enroll("zero-access")).status).toBe(200);
+            const second = await enroll("zero-access");
+            expect(second.status).toBe(200);
+            expect(second.body.wrappedKeys).toHaveLength(3);
+
+            const updatedMailbox: any = await mailboxRepo.findOne({ uid: mailbox.uid } as any);
+            expect(updatedMailbox?.keys).toHaveLength(1);
+            expect(updatedMailbox?.keys[0].revokedAt).toBeUndefined();
+            expect(updatedMailbox?.zeroAccessKeys).toHaveLength(2);
+            expect(updatedMailbox?.zeroAccessKeys[0].revokedAt).toBeGreaterThan(0);
+            expect(updatedMailbox?.zeroAccessKeys[0].revocationReason).toBe("superseded");
+            expect(updatedMailbox?.zeroAccessKeys[1].revokedAt ?? undefined).toBeUndefined();
+        });
+
+        it("Rejects useType 'zero-access' with no csr (400).", async () => {
+            const mailbox = await createMailbox();
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ useType: "zero-access", wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" } });
 
             expect(result.status).toBe(400);
         });
