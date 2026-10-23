@@ -298,18 +298,20 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
     }
 
     private async buildDocument(message: M, indexedAttachmentUids?: Set<string>): Promise<SearchDocument> {
-        const raw: Buffer = await this.blobStore!.get(message.bodyBlobKey);
+        // A zero-access message is stored sealed: there is nothing here to read, so its metadata is indexed without fetching the blob.
+        // Its content is searched on the owner's devices, from its sealed index entry (`specs/search.md` §7).
+        const sealed: boolean = !!(message as any).zeroAccess;
         // `skipImageLinks`: otherwise a related image is inlined into the HTML as a `data:` URI - base64 of the whole image, which
         // is what would be indexed (and held in memory) for an HTML-only message.
-        const parsed: ParsedMail = await simpleParser(raw, { skipImageLinks: true });
+        const parsed: ParsedMail | undefined = sealed ? undefined : await simpleParser(await this.blobStore!.get(message.bodyBlobKey), { skipImageLinks: true });
         // An S/MIME-encrypted body is ciphertext to this server - indexing it (or any attachment text
         // extracted from inside it) would only ever put garbage into the index, not a privacy leak by itself,
         // but garbage nonetheless. `Message.subject`/`participants`/`dateForSort` below are unaffected: they
         // come from the outer RFC 5322 headers, which S/MIME's `EnvelopedData` never encrypts (a sender using
         // RFC 9788 header protection on top already replaces a real Subject with a non-revealing placeholder
         // in that same outer header, so no extra detection is needed here for that case either).
-        const encrypted: boolean = isEncryptedBody(parsed);
-        const body: string = encrypted ? "" : typeof parsed.text === "string" ? parsed.text : (parsed.html || "").toString();
+        const encrypted: boolean = !parsed || isEncryptedBody(parsed);
+        const body: string = !parsed || encrypted ? "" : typeof parsed.text === "string" ? parsed.text : (parsed.html || "").toString();
 
         const attachmentText: string[] = [];
         if (!encrypted && message.hasAttachments) {

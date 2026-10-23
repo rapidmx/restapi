@@ -52,6 +52,11 @@ interface ExportLease<DER> {
  * The `"json"` bundle also carries the rows the user deleted (flagged `deleted`, still held and restorable), tagged `deleted: true`
  * (`SoftDeletedContent.ts`) - they are personal data the deployment still holds. `"mbox"` is live mail only.
  *
+ * A zero-access message (`Message.zeroAccess`) is exported as stored: its mbox entry is the sealed S/MIME `enveloped-data` copy
+ * (`Subject: [...]`), and its JSON row carries the `[...]` subject and the sealed summary. This server can't decrypt either. A mail
+ * client holding the owner's exported keys ("Export keys for Outlook or a phone") opens the mbox entries; an export of readable
+ * mail has to be made on the owner's device.
+ *
  * The aggregation step (`util/MailboxContentUtils.ts`'s `collectMailboxContentLines()`) is deliberately
  * not hard-wired to "one mailbox" - `MatterExportJob` reuses it per custodian mailbox for a Matter-scoped
  * eDiscovery export.

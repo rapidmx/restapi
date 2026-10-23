@@ -4324,3 +4324,5 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
   - For a sealed message, `ics` is required (404 without it, as for "no invitation"); for any other message it is a 400.
   - The client's file is trusted only as far as the user's own calendar: acting on it changes only their calendar and answers as themselves. The organizer checks still use the stored `Authentication-Results`.
 - **Signature change:** `removeInvite(messageUid, body, user)` and `acceptProposal(messageUid, body, user)` now take a body before the user.
+- **`SearchIndexJob`** indexes a zero-access message's metadata only, without fetching its sealed blob. That was already the outcome via `isEncryptedBody()`; this skips the download and the parse.
+- **`DataExportJob`** exports a zero-access message as stored: the sealed S/MIME copy in mbox, and the `[...]` subject plus sealed summary in JSON. This is documented on the class. A readable export has to be made on the owner's device, which is a later item.

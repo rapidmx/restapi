@@ -286,6 +286,19 @@ describe("SearchIndexJobMongo Tests (real DB + DI)", () => {
         expect(doc!.metadataOnly).toBe(true);
     });
 
+    it("Indexes a zero-access message's metadata only, without reading its sealed blob.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const get = vi.spyOn(blobStore, "get");
+        const message = await createMessage({ bodyBlobKey: `za/mb/${uuid.v4()}`, subject: "[...]", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" } });
+
+        await job.run();
+
+        const doc = objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!.indexed.get(`message:${message.uid}`);
+        expect(doc).toMatchObject({ body: "", attachmentText: [], metadataOnly: true });
+        expect(get).not.toHaveBeenCalledWith(message.bodyBlobKey);
+        get.mockRestore();
+    });
+
     it("Includes extracted attachment text for a message that has attachments, skipping ones with no extracted text yet.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const bodyBlobKey = `body/${uuid.v4()}`;
