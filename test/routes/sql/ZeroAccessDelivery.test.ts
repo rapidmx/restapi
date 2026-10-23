@@ -21,6 +21,7 @@ import { ZeroAccessIndexEntrySQL } from "../../../src/models/sql/ZeroAccessIndex
 import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 import { zeroAccessDeliverySuite } from "../zeroAccessDeliverySuite.js";
 import { zeroAccessIndexSuite } from "../zeroAccessIndexSuite.js";
+import { ZeroAccessBackfillJobSQL } from "../../../src/jobs/sql/ZeroAccessBackfillJobSQL.js";
 import { ZeroAccessIndexSegmentSQL } from "../../../src/models/sql/ZeroAccessIndexSegmentSQL.js";
 
 describe("Zero-access delivery (SQL)", () => {
@@ -112,6 +113,7 @@ describe("Zero-access delivery (SQL)", () => {
         calendarEvents: () => repo(CalendarEventSQL).find(),
         createCalendarEvent: async (data) => repo(CalendarEventSQL).save(new CalendarEventSQL(data)),
         messagesUrl: "/sql/messages",
+        calendarEventsUrl: "/sql/calendar-events",
         tokenFor: (uid) => JWTUtils.createTokenSync(config.get("auth"), { uid, roles: [] } as any),
         createFolder: async (mailboxUid, type) => {
             const folder = await repo(FolderSQL).save(new FolderSQL({ mailboxUid, name: type, type: type as any, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }));
@@ -134,6 +136,10 @@ describe("Zero-access delivery (SQL)", () => {
         findMessage: (uid) => repo(MessageSQL).findOne({ where: { uid } }),
         updateMessage: async (uid, fields) => {
             await repo(MessageSQL).update({ uid }, fields);
+        },
+        runBackfill: async () => {
+            const job = await objectFactory.newInstance<ZeroAccessBackfillJobSQL>(ZeroAccessBackfillJobSQL, { name: `za-backfill-${uuid.v4()}` });
+            await job.run();
         },
     });
 

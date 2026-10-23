@@ -15,6 +15,7 @@ import { ACLAction } from "@rapidrest/service-core";
 import { request } from "@rapidrest/service-core/test";
 import { IngestStatus, TransportRuleActionType, type ZeroAccessKey } from "../../src/models/types.js";
 import type { InMemoryBlobStore } from "../testDoubles.js";
+import { isoWeekId } from "../../src/zeroaccess/ZeroAccessSealer.js";
 
 x509.cryptoProvider.set(webcrypto as unknown as Crypto);
 const ENGINE = new pkijs.CryptoEngine({ name: "test", crypto: webcrypto as unknown as Crypto }) as unknown as pkijs.ICryptoEngine;
@@ -48,6 +49,10 @@ export interface ZeroAccessDeliverySuiteContext {
     createMessage: (data: any) => Promise<any>;
     createAttachment: (data: any) => Promise<any>;
     findMessage: (uid: string) => Promise<any>;
+    /** The calendar event route, e.g. `/mongo/calendar-events`. */
+    calendarEventsUrl: string;
+    /** Runs one pass of `ZeroAccessBackfillJob`. */
+    runBackfill: () => Promise<void>;
     updateMessage: (uid: string, fields: object) => Promise<void>;
 }
 
@@ -355,6 +360,50 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
             expect(JSON.parse((await open(Buffer.from(updated.sealedContent.sealed, "base64"), recipient)).toString("utf-8")).title).toBe("Renamed meeting");
         });
 
+        it("seals the reader's own edit of a sealed event again, storing none of it readable, and ignores a sealedContent sent with it", async () => {
+            const recipient = await makeKey();
+            const mailbox = await zeroAccessMailbox(recipient);
+            const vevent = ["UID:meet-edit@example.org", "SEQUENCE:0", "DTSTART:20261101T150000Z", "DTEND:20261101T160000Z", "SUMMARY:Board meeting", "ORGANIZER:mailto:bob@example.org", `ATTENDEE:mailto:${mailbox.primarySmtpAddress}`];
+            await deliver([mailbox.primarySmtpAddress], itipMessage(mailbox.primarySmtpAddress, "REQUEST", vevent));
+            await vi.waitFor(async () => expect((await ctx.calendarEvents()).filter((e) => e.mailboxUid === mailbox.uid)).toHaveLength(1), { timeout: 5000, interval: 20 });
+            const [event] = (await ctx.calendarEvents()).filter((e) => e.mailboxUid === mailbox.uid);
+            await ctx.setAcl(mailbox.uid, [{ userOrRoleId: mailbox.ownerUserUid, actions: [ACLAction.FULL] }]);
+
+            const result = await request(ctx.app())
+                .put(`${ctx.calendarEventsUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                .send({ ...event, title: "Board meeting (moved)", location: "Room 9", description: "Bring the numbers", sealedContent: { keyFingerprint: "forged", sealed: "x" } });
+
+            expect(result.status).toBeLessThan(300);
+            const [stored] = (await ctx.calendarEvents()).filter((e) => e.mailboxUid === mailbox.uid);
+            expect(stored).toMatchObject({ title: "[...]" });
+            expect(stored.location ?? null).toBeNull();
+            expect(stored.description ?? null).toBeNull();
+            expect(stored.sealedContent.keyFingerprint).toBe(recipient.key.fingerprint);
+            expect(JSON.parse((await open(Buffer.from(stored.sealedContent.sealed, "base64"), recipient)).toString("utf-8"))).toEqual({
+                title: "Board meeting (moved)",
+                location: "Room 9",
+                description: "Bring the numbers",
+            });
+
+            // A move touches no content: the sealed content stays as it is.
+            const moved = await request(ctx.app())
+                .put(`${ctx.calendarEventsUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                .send({ uid: event.uid, version: stored.version, startDate: "2026-11-02T15:00:00.000Z", endDate: "2026-11-02T16:00:00.000Z" });
+            expect(moved.status).toBeLessThan(300);
+            const [afterMove] = (await ctx.calendarEvents()).filter((e) => e.mailboxUid === mailbox.uid);
+            expect(afterMove.sealedContent).toEqual(stored.sealedContent);
+
+            // With the key it was sealed to gone, its content can't be changed (it would have to be stored readable).
+            await ctx.updateMailbox(mailbox.uid, { zeroAccessKeys: [] });
+            const refused = await request(ctx.app())
+                .put(`${ctx.calendarEventsUrl}/${event.uid}`)
+                .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                .send({ uid: event.uid, version: afterMove.version, title: "Readable now?" });
+            expect(refused.status).toBe(409);
+        });
+
         it("applies only the time of a guest's change request to a zero-access organizer's event, never its content", async () => {
             const recipient = await makeKey();
             const mailbox = await zeroAccessMailbox(recipient);
@@ -391,6 +440,102 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
             expect(event.location ?? undefined).toBeUndefined();
             expect(event.description ?? undefined).toBeUndefined();
             expect(new Date(event.startDate).toISOString()).toBe("2026-11-01T12:00:00.000Z");
+        });
+
+        describe("backfill of existing mail", () => {
+            const WEEK_OF = (date: Date) => isoWeekId(date);
+            /** A readable message as stored before zero-access: its raw blob, a sanitized copy and an attachment row and blob. */
+            const stored = async (mailbox: any, folder: any, fields: any = {}) => {
+                const bodyBlobKey = `ingest/${Math.random().toString(16).slice(2)}`;
+                await ctx.blobStore().put(bodyBlobKey, rawMessage(mailbox.primarySmtpAddress));
+                const sanitizedHtmlBlobKey = `sanitized/${Math.random().toString(16).slice(2)}`;
+                await ctx.blobStore().put(sanitizedHtmlBlobKey, Buffer.from(`<p>${CANARY_BODY}</p>`));
+                const message = await ctx.createMessage({
+                    mailboxUid: mailbox.uid,
+                    folderUid: folder.uid,
+                    subject: CANARY_SUBJECT,
+                    bodyPreview: CANARY_BODY,
+                    from: { address: "bob@example.org", type: "to" },
+                    recipients: [{ address: mailbox.primarySmtpAddress, type: "to" }],
+                    bodyBlobKey,
+                    sanitizedHtmlBlobKey,
+                    hasAttachments: true,
+                    receivedDate: new Date("2026-03-04T10:00:00Z"),
+                    searchIndexedAt: new Date(),
+                    ...fields,
+                });
+                const attachmentBlobKey = `attachments/${Math.random().toString(16).slice(2)}`;
+                await ctx.blobStore().put(attachmentBlobKey, Buffer.from(CANARY_ATTACHMENT));
+                await ctx.createAttachment({ messageUid: message.uid, folderUid: folder.uid, mailboxUid: mailbox.uid, filename: "minutes.txt", mimeType: "text/plain", sizeBytes: 22, blobKey: attachmentBlobKey });
+                return { message, bodyBlobKey, sanitizedHtmlBlobKey, attachmentBlobKey };
+            };
+
+            it("seals a mailbox's readable mail into its own week and removes every readable copy", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const inbox = await ctx.createFolder(mailbox.uid, "inbox");
+                const { message, bodyBlobKey, sanitizedHtmlBlobKey, attachmentBlobKey } = await stored(mailbox, inbox);
+
+                await ctx.runBackfill();
+
+                const sealed = await ctx.findMessage(message.uid);
+                expect(sealed).toMatchObject({ subject: "[...]", bodyPreview: "", bodyBlobKey: `za/${mailbox.uid}/${message.uid}` });
+                expect(sealed.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                expect(sealed.sanitizedHtmlBlobKey ?? undefined).toBeUndefined();
+                expect(sealed.searchIndexedAt ?? undefined).toBeUndefined();
+                expect((await openSealedMessage(await ctx.blobStore().get(sealed.bodyBlobKey), recipient)).toString("latin1")).toContain(CANARY_BODY);
+                for (const key of [bodyBlobKey, sanitizedHtmlBlobKey, attachmentBlobKey]) {
+                    expect(await ctx.blobStore().exists(key)).toBe(false);
+                }
+                expect(await ctx.attachments()).toEqual([]);
+                expect((await ctx.indexEntries()).map((entry) => [entry.messageUid, entry.weekId])).toEqual([[message.uid, WEEK_OF(new Date("2026-03-04T10:00:00Z"))]]);
+                for (const [key, content] of blobs()) {
+                    expect(content.toString("latin1"), key).not.toContain(CANARY_BODY);
+                }
+
+                // Nothing left to do: a second run changes nothing.
+                await ctx.runBackfill();
+                expect((await ctx.findMessage(message.uid)).version).toBe(sealed.version);
+            });
+
+            it("seals drafts and restorable deleted mail, but leaves Outbox, end-to-end mail and a mailbox without zero-access alone", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const drafts = await ctx.createFolder(mailbox.uid, "drafts");
+                const outbox = await ctx.createFolder(mailbox.uid, "outbox");
+                const inbox = await ctx.createFolder(mailbox.uid, "inbox");
+                const draft = (await stored(mailbox, drafts)).message;
+                const deleted = (await stored(mailbox, inbox, { deleted: true })).message;
+                const sending = (await stored(mailbox, outbox)).message;
+                const e2e = (await stored(mailbox, inbox, { encrypted: true })).message;
+                const plain = await ctx.createMailbox();
+                const plainInbox = await ctx.createFolder(plain.uid, "inbox");
+                const untouched = (await stored(plain, plainInbox)).message;
+
+                await ctx.runBackfill();
+
+                expect((await ctx.findMessage(draft.uid)).bodyBlobKey).toMatch(new RegExp(`^za/${mailbox.uid}/drafts/`));
+                expect((await ctx.findMessage(deleted.uid)).zeroAccess).toBeTruthy();
+                for (const uid of [sending.uid, e2e.uid, untouched.uid]) {
+                    expect((await ctx.findMessage(uid)).zeroAccess ?? undefined).toBeUndefined();
+                }
+            });
+
+            it("marks a message it can't read and never selects it again", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const inbox = await ctx.createFolder(mailbox.uid, "inbox");
+                const { message, bodyBlobKey } = await stored(mailbox, inbox);
+                await ctx.blobStore().delete(bodyBlobKey);
+
+                await ctx.runBackfill();
+                const marked = await ctx.findMessage(message.uid);
+                await ctx.runBackfill();
+
+                expect(marked.zeroAccessBackfillError).toContain("couldn't be read");
+                expect(marked.zeroAccess ?? undefined).toBeUndefined();
+                expect((await ctx.findMessage(message.uid)).version).toBe(marked.version);
+            });
         });
 
         describe("Sent Items copies", () => {

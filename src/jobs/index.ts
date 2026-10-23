@@ -15,3 +15,4 @@ export * from "./RetentionEnforcementJob.js";
 export * from "./ScanQueueJob.js";
 export * from "./ScheduledSendJob.js";
 export * from "./SearchIndexJob.js";
+export * from "./ZeroAccessBackfillJob.js";

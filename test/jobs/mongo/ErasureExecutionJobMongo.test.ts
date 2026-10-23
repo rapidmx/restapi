@@ -16,6 +16,8 @@ import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
 import { CalendarShareLinkMongo } from "../../../src/models/mongo/CalendarShareLinkMongo.js";
 import { KeyVaultMongo } from "../../../src/models/mongo/KeyVaultMongo.js";
+import { ZeroAccessIndexEntryMongo } from "../../../src/models/mongo/ZeroAccessIndexEntryMongo.js";
+import { ZeroAccessIndexSegmentMongo } from "../../../src/models/mongo/ZeroAccessIndexSegmentMongo.js";
 import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
 import { ContactListMongo } from "../../../src/models/mongo/ContactListMongo.js";
 import { DataExportRequestMongo } from "../../../src/models/mongo/DataExportRequestMongo.js";
@@ -76,6 +78,8 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
     let mailboxImportRequestRepo: MongoRepository<MailboxImportRequestMongo>;
     let matterRepo: MongoRepository<MatterMongo>;
     let keyVaultRepo: MongoRepository<KeyVaultMongo>;
+    let zaEntryRepo: MongoRepository<ZeroAccessIndexEntryMongo>;
+    let zaSegmentRepo: MongoRepository<ZeroAccessIndexSegmentMongo>;
     let calendarShareLinkRepo: MongoRepository<CalendarShareLinkMongo>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
 
@@ -132,6 +136,8 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         models.set("MatterMongo", MatterMongo);
         models.set("AuditLogEntryMongo", AuditLogEntryMongo);
         models.set("KeyVaultMongo", KeyVaultMongo);
+        models.set("ZeroAccessIndexEntryMongo", ZeroAccessIndexEntryMongo);
+        models.set("ZeroAccessIndexSegmentMongo", ZeroAccessIndexSegmentMongo);
         models.set("CalendarShareLinkMongo", CalendarShareLinkMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
@@ -165,6 +171,8 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         matterRepo = conn.getMongoRepository("MatterMongo");
         auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
         keyVaultRepo = conn.getMongoRepository("KeyVaultMongo");
+        zaEntryRepo = conn.getMongoRepository("ZeroAccessIndexEntryMongo");
+        zaSegmentRepo = conn.getMongoRepository("ZeroAccessIndexSegmentMongo");
         calendarShareLinkRepo = conn.getMongoRepository("CalendarShareLinkMongo");
 
         job = await objectFactory.newInstance(ErasureExecutionJobMongo, { name: "default" });
@@ -525,6 +533,32 @@ describe("ErasureExecutionJobMongo Tests (real DB + DI)", () => {
         } finally {
             PluginRegistry.setLoaded([]);
         }
+    });
+
+    it("Purges the mailbox's zero-access search index - its sealed entries, and its segments with their files - but not another mailbox's.", async () => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const mailbox = await createMailbox();
+        const otherMailbox = await createMailbox();
+        const entry = (mailboxUid: string) => new ZeroAccessIndexEntryMongo({ mailboxUid, messageUid: uuid.v4(), weekId: "2026-W40", receivedAt: new Date(), keyFingerprint: "fp", sealed: "c2VhbGVk" });
+        await zaEntryRepo.save(entry(mailbox.uid));
+        await zaEntryRepo.save(entry(otherMailbox.uid));
+        const segmentKey = `za-index/${mailbox.uid}/2026-W40/1-n`;
+        const otherSegmentKey = `za-index/${otherMailbox.uid}/2026-W40/1-n`;
+        await blobStore.put(segmentKey, Buffer.from("sealed segment"));
+        await blobStore.put(otherSegmentKey, Buffer.from("sealed segment"));
+        await zaSegmentRepo.save(new ZeroAccessIndexSegmentMongo({ mailboxUid: mailbox.uid, weekId: "2026-W40", blobKey: segmentKey }));
+        await zaSegmentRepo.save(new ZeroAccessIndexSegmentMongo({ mailboxUid: otherMailbox.uid, weekId: "2026-W40", blobKey: otherSegmentKey }));
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+
+        await job.run();
+
+        expect((await requestRepo.findOne({ uid: request.uid } as any))!.status).toBe("completed");
+        expect(await zaEntryRepo.count({ mailboxUid: mailbox.uid })).toBe(0);
+        expect(await zaSegmentRepo.count({ mailboxUid: mailbox.uid })).toBe(0);
+        expect(await blobStore.exists(segmentKey)).toBe(false);
+        expect(await zaEntryRepo.count({ mailboxUid: otherMailbox.uid })).toBe(1);
+        expect(await zaSegmentRepo.count({ mailboxUid: otherMailbox.uid })).toBe(1);
+        expect(await blobStore.exists(otherSegmentKey)).toBe(true);
     });
 
     it("Purges the mailbox's KeyVault and the CalendarShareLinks on its folders, but not another mailbox's.", async () => {

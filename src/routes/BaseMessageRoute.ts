@@ -177,6 +177,10 @@ const SERVER_MANAGED_MESSAGE_FIELDS = [
     "deliveryReceiptSentAt",
     "deliveryReceiptPending",
     "deliveryReceiptDeclined",
+    // Zero-access storage: written only by the server's sealing paths (a client marking a readable message sealed would hide it from
+    // server search and refuse to send it).
+    "zeroAccess",
+    "zeroAccessBackfillError",
     // `SearchIndexJob`'s retry state.
     "searchIndexAttempts",
     "searchIndexNextAttemptAt",

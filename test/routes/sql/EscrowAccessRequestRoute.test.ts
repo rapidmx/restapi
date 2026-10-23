@@ -259,9 +259,19 @@ describe("Route:EscrowAccessRequestSQL Tests", () => {
 
         it("requiredHolders:1 - creation alone reaches status 'approved' and material() is immediately readable.", async () => {
             const scope = await createEscrowScope({ requiredHolders: 1, holderUserUids: [holderA.uid] });
-            const mailbox = await createMailbox({ escrowScopeId: scope.uid });
+            const key = (useType: string, fingerprint: string) => ({ publicKey: "cert", type: "x509", useType, fingerprint, notBefore: 0, notAfter: 1 });
+            const mailbox = await createMailbox({
+                escrowScopeId: scope.uid,
+                keys: [key("encrypt", "fp-enc"), key("sign", "fp-sign")],
+                zeroAccessKeys: [key("zero-access", "fp-za")],
+            });
+            const wrapped = (useType: string, fingerprint: string) => ({ ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM", fingerprint, useType });
             await keyVaultRepo.save(
-                new KeyVaultSQL({ mailboxUid: mailbox.uid, wrappedKeys: [], masterKeyWraps: [escrowWrap(scope.uid), passwordWrap()] }),
+                new KeyVaultSQL({
+                    mailboxUid: mailbox.uid,
+                    wrappedKeys: [wrapped("encrypt", "fp-enc"), wrapped("sign", "fp-sign"), wrapped("zero-access", "fp-za")] as any,
+                    masterKeyWraps: [escrowWrap(scope.uid), passwordWrap()],
+                }),
             );
             const matter = await createMatter(scope.uid, [mailbox.uid]);
 
@@ -287,6 +297,9 @@ describe("Route:EscrowAccessRequestSQL Tests", () => {
             expect(materialResult.body.masterKeyWraps).toHaveLength(1);
             expect(materialResult.body.masterKeyWraps[0].method).toBe("escrow");
             expect(materialResult.body.masterKeyWraps[0].escrowScopeId).toBe(scope.uid);
+            // What the master key opens to read mail: the zero-access and encryption private keys with their certificates, never signing.
+            expect(materialResult.body.wrappedKeys.map((k: any) => k.useType).sort()).toEqual(["encrypt", "zero-access"]);
+            expect(materialResult.body.certificates.map((k: any) => k.fingerprint).sort()).toEqual(["fp-enc", "fp-za"]);
 
             const afterMaterialEntries = await escrowAuditRepo.find({ order: { sequence: "ASC" } });
             expect(afterMaterialEntries).toHaveLength(2);

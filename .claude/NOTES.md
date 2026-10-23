@@ -4350,3 +4350,22 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
   - The `request` test helper decodes binary bodies as UTF-8, so assert on the stored blob or the ETag instead.
 - **Open:** pending entries and segments of a purged message or mailbox aren't deleted yet. That belongs with erasure and the backfill job in Phase 6.
 - **Segment format version 2 (SQLite FTS5 files) is unscheduled** (JP, 2026-10-23, option 2). It waits for `specs/search.md` §19.5, which measures v1's cold-start import time on web and tauri. Build it only if that time is unacceptable.
+
+## 2026-10-23 - Zero-access encryption, Phase 6 (backfill, erasure, escrow, sealed event edits)
+
+- **`ZeroAccessBackfillJob`** (`mail:jobs:zero_access_backfill:schedule`, every minute; `batch_size` 100 per run across all mailboxes) seals mail stored before zero-access became active.
+  - Order: newest first per mailbox. Live rows come first, then soft-deleted ones (`find()` returns those only for an explicit `deleted: true`).
+  - It skips Outbox and `encrypted` messages. Drafts are sealed through `sealDraft`, everything else through `sealRaw`, which indexes into the week of `receivedDate` (else `sentDate`).
+  - It removes the readable copies with `discardPlaintext`, using all four blob reference sources (so a body shared by another mailbox survives). It also clears `sanitizedHtmlBlobKey` and resets `searchIndexedAt`, so `SearchIndexJob` re-indexes the message as metadata only.
+  - An unreadable message gets `Message.zeroAccessBackfillError` (new column) and is never selected again.
+  - A version conflict leaves the message for the next run (a draft's fresh `za/.../drafts/` blob is deleted).
+  - If zero-access stops being active mid-run, the rest of that mailbox waits.
+  - It never decrypts: turning zero-access off affects new mail only.
+- **`zeroAccess` and `zeroAccessBackfillError` are now in `SERVER_MANAGED_MESSAGE_FIELDS`.** Before this, a client update could have marked a readable message as sealed.
+- **`ErasureExecutionJob`** purges the mailbox's `ZeroAccessIndexEntry` rows and its `ZeroAccessIndexSegment` rows with their blobs (optional classes, set in the concretes).
+- **Escrow `/material`** (JP's decision, 2026-10-23) also returns `wrappedKeys` (useType `zero-access` and `encrypt`, never `sign`) and their `certificates` (from `Mailbox.keys` and `zeroAccessKeys`). Before this, a holder got only the master-key wrap and could decrypt nothing with it. This is in `specs/end-to-end_encryption.md`, *What a release carries*.
+- **Sealed calendar events:** `BaseCalendarEventRoute.prepareUpdate()` (`keepSealed`) re-seals a content edit (title, location, description, HTML) of an event with `sealedContent` to the same key. The row keeps `[...]` and nulls.
+  - Fields the edit leaves out are dropped, since the server can't read the old ones.
+  - It returns 409 when the mailbox no longer has that key.
+  - A client-sent `sealedContent` is stripped on create and update.
+- **Still open from Phase 6:** Source C (client segments for end-to-end mail). Pending entries of individually purged messages aren't removed; they are harmless (intersected with Source A), and a later compaction can drop them.

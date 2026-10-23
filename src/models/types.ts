@@ -1253,6 +1253,10 @@ export interface Message extends RecoverableBaseEntity {
      * `encrypted`, which means the *sender* encrypted it end to end. */
     zeroAccess?: MessageZeroAccess;
 
+    /** Why `ZeroAccessBackfillJob` couldn't seal this message, which it then leaves as it is (a message it can't read, e.g. its body
+     * blob is missing). Never set on a sealed message. */
+    zeroAccessBackfillError?: string;
+
     /** The unique identifier of this message's `ScanResult`, once scanning has completed. */
     scanResultUid?: string;
 

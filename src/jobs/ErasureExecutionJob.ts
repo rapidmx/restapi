@@ -131,6 +131,9 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     protected abstract dataExportRequestClass: any;
     protected abstract mailboxImportRequestClass: any;
     protected abstract keyVaultClass: any;
+    /** The mailbox's zero-access search index (`ZeroAccessIndexEntry`, and `ZeroAccessIndexSegment` with its stored file), erased with it. */
+    protected zeroAccessIndexEntryClass?: any;
+    protected zeroAccessIndexSegmentClass?: any;
     protected abstract calendarShareLinkClass: any;
 
     /** Supplied by the Mongo/SQL concrete subclasses so this job can tell which installed plugins aren't loaded in
@@ -249,6 +252,8 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             this.oofReplySuppressionClass,
             this.correspondentClass,
             this.keyVaultClass,
+            this.zeroAccessIndexEntryClass,
+            this.zeroAccessIndexSegmentClass,
             this.quarantineEntryClass,
             this.ingestQueueEntryClass,
             this.dataExportRequestClass,
@@ -468,6 +473,16 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
         purgedCount += await this.purgeEntityType(this.correspondentClass, request.mailboxUid);
         // The mailbox's end-to-end encryption key material (wrapped private keys and master-key wraps).
         purgedCount += await this.purgeEntityType(this.keyVaultClass, request.mailboxUid);
+        // The mailbox's zero-access search index - encrypted to the mailbox's own key, but its mail's content all the same: the sealed
+        // entries, and the segments with their files.
+        if (this.zeroAccessIndexEntryClass) {
+            purgedCount += await this.purgeEntityType(this.zeroAccessIndexEntryClass, request.mailboxUid);
+        }
+        if (this.zeroAccessIndexSegmentClass) {
+            purgedCount += await this.purgeEntityType(this.zeroAccessIndexSegmentClass, request.mailboxUid, async (row: any) => {
+                await this.blobStore!.delete(row.blobKey);
+            });
+        }
         // Plugin models marked `@MailboxScopedData()` (e.g. ActiveSync device state, or the booking plugin's booking types and bookings) hold this mailbox's data too.
         for (const entityClass of this.pluginMailboxScopedClasses()) {
             purgedCount += await this.purgeEntityType(entityClass, request.mailboxUid);

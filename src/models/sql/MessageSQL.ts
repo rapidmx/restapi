@@ -216,6 +216,11 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
     @Nullable
     public zeroAccess?: MessageZeroAccess = undefined;
 
+    @Column({ type: "text", nullable: true })
+    @Description("Why the zero-access backfill couldn't seal this message, if it couldn't.")
+    @Nullable
+    public zeroAccessBackfillError?: string;
+
     @Column({ nullable: true })
     @Description("The unique identifier of this message's `ScanResult`, once scanning has completed.")
     @Nullable
@@ -418,6 +423,7 @@ export class MessageSQL extends RecoverableBaseEntity implements Message {
             this.labelUids = other.labelUids !== undefined ? other.labelUids : this.labelUids;
             this.encrypted = other.encrypted !== undefined ? other.encrypted : this.encrypted;
             this.zeroAccess = "zeroAccess" in other ? other.zeroAccess : this.zeroAccess;
+            this.zeroAccessBackfillError = "zeroAccessBackfillError" in other ? other.zeroAccessBackfillError : this.zeroAccessBackfillError;
             this.scanResultUid = "scanResultUid" in other ? other.scanResultUid : this.scanResultUid;
             this.searchIndexedAt = "searchIndexedAt" in other ? other.searchIndexedAt : this.searchIndexedAt;
             this.searchIndexAttempts = "searchIndexAttempts" in other ? other.searchIndexAttempts : this.searchIndexAttempts;

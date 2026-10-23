@@ -15,3 +15,4 @@ export * from "./RetentionEnforcementJobSQL.js";
 export * from "./ScanQueueJobSQL.js";
 export * from "./ScheduledSendJobSQL.js";
 export * from "./SearchIndexJobSQL.js";
+export * from "./ZeroAccessBackfillJobSQL.js";

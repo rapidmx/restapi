@@ -162,6 +162,8 @@ A scope MAY be configured with no escrow at all, accepting that mail in that sco
 
 **Matter scoping.** Escrow access SHOULD be exercised against a defined matter — a named investigation or legal hold with an explicit custodian list and date range — rather than as blanket decryption authority. Access outside a matter's custodians or date range MUST be a separate, separately authorised act.
 
+**What a release carries.** An approved access request releases the mailbox's escrow wrap of MK, the mailbox's wrapped private keys that read mail (its zero-access keys and its encryption keys, current and retained), and their certificates. It never releases the signing key: escrow reads mail and does not act as the user. The private keys are sealed under MK, so they are as unusable without the escrow private key as the wrap itself. The holder's offline tooling unwraps MK with the escrow private key, opens the private keys with MK, and decrypts the matter export's sealed and end-to-end encrypted messages and its sealed search index.
+
 **Audit.** Every escrow use MUST be recorded in a tamper-evident log capturing the holder, the matter, the mailboxes and date range accessed, and the time. The log MUST NOT be suppressible or editable by escrow holders or by server administrators.
 
 **Subject notification** MUST be configurable per scope. Notifying the mailbox owner is often legally prohibited during an investigation or litigation hold, so it cannot be mandatory — but the audit record persists regardless of whether notification occurs.

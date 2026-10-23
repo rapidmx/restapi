@@ -16,6 +16,8 @@ import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
 import { CalendarShareLinkSQL } from "../../../src/models/sql/CalendarShareLinkSQL.js";
 import { KeyVaultSQL } from "../../../src/models/sql/KeyVaultSQL.js";
+import { ZeroAccessIndexEntrySQL } from "../../../src/models/sql/ZeroAccessIndexEntrySQL.js";
+import { ZeroAccessIndexSegmentSQL } from "../../../src/models/sql/ZeroAccessIndexSegmentSQL.js";
 import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
 import { ContactListSQL } from "../../../src/models/sql/ContactListSQL.js";
 import { DataExportRequestSQL } from "../../../src/models/sql/DataExportRequestSQL.js";
@@ -72,6 +74,8 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
     let mailboxImportRequestRepo: Repository<MailboxImportRequestSQL>;
     let matterRepo: Repository<MatterSQL>;
     let keyVaultRepo: Repository<KeyVaultSQL>;
+    let zaEntryRepo: Repository<ZeroAccessIndexEntrySQL>;
+    let zaSegmentRepo: Repository<ZeroAccessIndexSegmentSQL>;
     let calendarShareLinkRepo: Repository<CalendarShareLinkSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
 
@@ -128,6 +132,8 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         models.set("MatterSQL", MatterSQL);
         models.set("AuditLogEntrySQL", AuditLogEntrySQL);
         models.set("KeyVaultSQL", KeyVaultSQL);
+        models.set("ZeroAccessIndexEntrySQL", ZeroAccessIndexEntrySQL);
+        models.set("ZeroAccessIndexSegmentSQL", ZeroAccessIndexSegmentSQL);
         models.set("CalendarShareLinkSQL", CalendarShareLinkSQL);
         await connectionManager.connect(config.get("datastores"), models);
 
@@ -161,6 +167,8 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         matterRepo = conn.getRepository(MatterSQL);
         auditLogRepo = conn.getRepository(AuditLogEntrySQL);
         keyVaultRepo = conn.getRepository(KeyVaultSQL);
+        zaEntryRepo = conn.getRepository(ZeroAccessIndexEntrySQL);
+        zaSegmentRepo = conn.getRepository(ZeroAccessIndexSegmentSQL);
         calendarShareLinkRepo = conn.getRepository(CalendarShareLinkSQL);
 
         job = await objectFactory.newInstance(ErasureExecutionJobSQL, { name: "default" });
@@ -520,6 +528,32 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         } finally {
             PluginRegistry.setLoaded([]);
         }
+    });
+
+    it("Purges the mailbox's zero-access search index - its sealed entries, and its segments with their files - but not another mailbox's.", async () => {
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const mailbox = await createMailbox();
+        const otherMailbox = await createMailbox();
+        const entry = (mailboxUid: string) => new ZeroAccessIndexEntrySQL({ mailboxUid, messageUid: uuid.v4(), weekId: "2026-W40", receivedAt: new Date(), keyFingerprint: "fp", sealed: "c2VhbGVk" });
+        await zaEntryRepo.save(entry(mailbox.uid));
+        await zaEntryRepo.save(entry(otherMailbox.uid));
+        const segmentKey = `za-index/${mailbox.uid}/2026-W40/1-n`;
+        const otherSegmentKey = `za-index/${otherMailbox.uid}/2026-W40/1-n`;
+        await blobStore.put(segmentKey, Buffer.from("sealed segment"));
+        await blobStore.put(otherSegmentKey, Buffer.from("sealed segment"));
+        await zaSegmentRepo.save(new ZeroAccessIndexSegmentSQL({ mailboxUid: mailbox.uid, weekId: "2026-W40", blobKey: segmentKey }));
+        await zaSegmentRepo.save(new ZeroAccessIndexSegmentSQL({ mailboxUid: otherMailbox.uid, weekId: "2026-W40", blobKey: otherSegmentKey }));
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+
+        await job.run();
+
+        expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("completed");
+        expect(await zaEntryRepo.count({ where: { mailboxUid: mailbox.uid } })).toBe(0);
+        expect(await zaSegmentRepo.count({ where: { mailboxUid: mailbox.uid } })).toBe(0);
+        expect(await blobStore.exists(segmentKey)).toBe(false);
+        expect(await zaEntryRepo.count({ where: { mailboxUid: otherMailbox.uid } })).toBe(1);
+        expect(await zaSegmentRepo.count({ where: { mailboxUid: otherMailbox.uid } })).toBe(1);
+        expect(await blobStore.exists(otherSegmentKey)).toBe(true);
     });
 
     it("Purges the mailbox's KeyVault and the CalendarShareLinks on its folders, but not another mailbox's.", async () => {

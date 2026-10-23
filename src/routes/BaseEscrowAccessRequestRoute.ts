@@ -34,6 +34,9 @@ import {
     Mailbox,
     Matter,
     MasterKeyWrap,
+    PublicKey,
+    WrappedPrivateKey,
+    ZeroAccessKey,
 } from "../models/types.js";
 const { Config, Init, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
@@ -46,11 +49,22 @@ const MAX_PERSIST_ATTEMPTS = 3;
 const MATTER_PAGE_SIZE = 500;
 
 
-/** The wire shape `GET /:id/material` returns - only ever the escrow-method wraps, scoped to the
- * matter's own escrow scope, never `wrappedKeys` or any other unlock method. */
+/**
+ * The wire shape `GET /:id/material` returns: the escrow-method master key wraps, scoped to the matter's own escrow scope, never any
+ * other unlock method; and what that master key opens to read the mailbox's mail - its wrapped zero-access and end-to-end encryption
+ * private keys (never the signing key: escrow reads mail, it doesn't sign as the user) with their certificates. The private keys are
+ * sealed under the master key, so they are as useless without the escrow private key as the wraps are.
+ */
 export interface EscrowAccessMaterial {
     masterKeyWraps: MasterKeyWrap[];
+    /** The wrapped private keys of `useType` `zero-access` and `encrypt`, current and retained. */
+    wrappedKeys: WrappedPrivateKey[];
+    /** The certificate of each of `wrappedKeys` (matched by `fingerprint`), which decrypting CMS addressed to it needs. */
+    certificates: (PublicKey | ZeroAccessKey)[];
 }
+
+/** The key uses whose private keys an escrow release carries - what reads mail, never what signs. */
+const ESCROW_RELEASED_KEY_USES: readonly string[] = ["zero-access", "encrypt"];
 
 /**
  * Implements `specs/end-to-end_encryption.md`'s M-of-N dual control - a bespoke class (own `@Init`-built
@@ -415,8 +429,12 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
             this.persistMaterialRead(attempt === 0 ? request : await this.requireRequest(id, true), user!.uid, matter.escrowScopeId),
         );
 
+        const wrappedKeys: WrappedPrivateKey[] = (keyVault?.wrappedKeys ?? []).filter((k) => ESCROW_RELEASED_KEY_USES.includes(k.useType));
+        const released: Set<string> = new Set(wrappedKeys.map((k) => k.fingerprint));
         return {
             masterKeyWraps: masterKeyWraps.filter((w) => w.method === "escrow" && w.escrowScopeId === matter.escrowScopeId),
+            wrappedKeys,
+            certificates: [...((mailbox as any).keys ?? []), ...((mailbox as any).zeroAccessKeys ?? [])].filter((k: PublicKey) => released.has(k.fingerprint)),
         };
     }
 

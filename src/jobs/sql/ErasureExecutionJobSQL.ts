@@ -6,8 +6,8 @@ import { ErasureExecutionJob } from "../ErasureExecutionJob.js";
 import {
     AttachmentSQL,
     AuditLogEntrySQL,
-    CalendarShareLinkSQL,
     CalendarEventSQL,
+    CalendarShareLinkSQL,
     ContactListSQL,
     ContactSQL,
     CorrespondentSQL,
@@ -18,10 +18,10 @@ import {
     IngestQueueEntrySQL,
     KeyVaultSQL,
     LabelSQL,
-    MailboxImportRequestSQL,
-    MailboxSQL,
     MailFilterRuleSQL,
     MailSignatureSQL,
+    MailboxImportRequestSQL,
+    MailboxSQL,
     MatterSQL,
     MessageSQL,
     NoteSQL,
@@ -30,6 +30,8 @@ import {
     QuarantineEntrySQL,
     TaskListSQL,
     TaskSQL,
+    ZeroAccessIndexEntrySQL,
+    ZeroAccessIndexSegmentSQL,
 } from "../../sql.js";
 
 export class ErasureExecutionJobSQL extends ErasureExecutionJob<DataSubjectErasureRequestSQL, MailboxSQL> {
@@ -55,6 +57,8 @@ export class ErasureExecutionJobSQL extends ErasureExecutionJob<DataSubjectErasu
     protected dataExportRequestClass: any = DataExportRequestSQL;
     protected mailboxImportRequestClass: any = MailboxImportRequestSQL;
     protected keyVaultClass: any = KeyVaultSQL;
+    protected zeroAccessIndexEntryClass: any = ZeroAccessIndexEntrySQL;
+    protected zeroAccessIndexSegmentClass: any = ZeroAccessIndexSegmentSQL;
     protected calendarShareLinkClass: any = CalendarShareLinkSQL;
     protected pluginClass: any = PluginSQL;
     protected matterClass: any = MatterSQL;

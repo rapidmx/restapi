@@ -17,6 +17,7 @@ import { TransportRuleMongo } from "../../../src/models/mongo/TransportRuleMongo
 import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 import { zeroAccessDeliverySuite } from "../zeroAccessDeliverySuite.js";
 import { zeroAccessIndexSuite } from "../zeroAccessIndexSuite.js";
+import { ZeroAccessBackfillJobMongo } from "../../../src/jobs/mongo/ZeroAccessBackfillJobMongo.js";
 import { ZeroAccessIndexEntryMongo } from "../../../src/models/mongo/ZeroAccessIndexEntryMongo.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({ instance: { port: 9999, dbName: "rrst-test" } });
@@ -117,6 +118,7 @@ describe("Zero-access delivery (Mongo)", () => {
         calendarEvents: () => repos.CalendarEventMongo.find({}).toArray(),
         createCalendarEvent: async (data) => repos.CalendarEventMongo.save(new CalendarEventMongo(data)),
         messagesUrl: "/mongo/messages",
+        calendarEventsUrl: "/mongo/calendar-events",
         tokenFor: (uid) => JWTUtils.createTokenSync(config.get("auth"), { uid, roles: [] } as any),
         createFolder: async (mailboxUid, type) => {
             const folder = await repos.FolderMongo.save(new FolderMongo({ mailboxUid, name: type, type: type as any, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }));
@@ -139,6 +141,10 @@ describe("Zero-access delivery (Mongo)", () => {
         findMessage: (uid) => repos.MessageMongo.findOne({ uid } as any),
         updateMessage: async (uid, fields) => {
             await repos.MessageMongo.updateOne({ uid } as any, { $set: fields });
+        },
+        runBackfill: async () => {
+            const job = await objectFactory.newInstance<ZeroAccessBackfillJobMongo>(ZeroAccessBackfillJobMongo, { name: `za-backfill-${uuid.v4()}` });
+            await job.run();
         },
     });
 

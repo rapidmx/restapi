@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
+import { PROTECTED_SUBJECT, sealEventFields } from "../zeroaccess/ZeroAccessSealer.js";
+import { zeroAccessTargetFor, type ZeroAccessTarget } from "../zeroaccess/ZeroAccessResolver.js";
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import {
     ACLAction,
@@ -67,6 +69,7 @@ import {
     CalendarEventStatus,
     FolderType,
     Mailbox,
+    SealedEventContent,
     RecipientType,
 } from "../models/types.js";
 const { Config, Init, Inject } = ObjectDecorators;
@@ -95,6 +98,9 @@ export interface InviteSource {
 
 /** The longest calendar file a client may send for a zero-access invitation. */
 const MAX_CLIENT_ICS_LENGTH: number = 1024 * 1024;
+
+/** The content fields an event made from a zero-access mailbox's invitation keeps only sealed. */
+const SEALED_EVENT_FIELDS: readonly string[] = ["title", "location", "description", "descriptionHtml"];
 
 /**
  * Extends `BaseScopedChildRoute` (scoped by `folderUid`, same as `Message`) with the two pieces of
@@ -171,6 +177,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
         await super.prepareUpdate(obj, existing, user);
         BaseCalendarEventRoute.assertParticipants(obj, existing);
+        await this.keepSealed(obj, existing);
         if (typeof obj.icalUid === "string") {
             obj.icalUid = boundIndexedValue(obj.icalUid);
         }
@@ -188,9 +195,49 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         }
     }
 
+    /**
+     * An event made from an invitation that reached a zero-access mailbox keeps its title, location and description only sealed
+     * (`CalendarEvent.sealedContent`, `specs/search.md` §4). An edit of them - the reader's own, decrypted client-side and sent back in the
+     * request - is sealed again to the same zero-access key, and the row keeps the placeholders: the plaintext is never stored. An edit
+     * sends the fields it keeps along with the one it changes (the event dialog sends them all); one it leaves out is dropped, since the
+     * server can't read the sealed value to keep it. A `sealedContent` from the client is ignored: only the server writes it.
+     */
+    private async keepSealed(obj: any, existing: T): Promise<void> {
+        delete obj.sealedContent;
+        const sealed: SealedEventContent | undefined = (existing as any).sealedContent ?? undefined;
+        if (!sealed || !SEALED_EVENT_FIELDS.some((field) => obj[field] !== undefined)) {
+            return;
+        }
+        const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(existing.mailboxUid, { ignoreACL: true });
+        const target: ZeroAccessTarget | undefined = mailbox ? zeroAccessTargetFor(mailbox, sealed.keyFingerprint) : undefined;
+        if (!target) {
+            // The key is gone (the mailbox's keys were replaced wholesale): nothing can be sealed to it, and storing plaintext isn't an option.
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 409, "This event's details are sealed to a key this mailbox no longer has, so they can't be changed.");
+        }
+        const text = (value: unknown): string | undefined => (typeof value === "string" && value.length > 0 ? value : undefined);
+        obj.sealedContent = {
+            keyFingerprint: target.key.fingerprint,
+            sealed: await sealEventFields(
+                {
+                    title: typeof obj.title === "string" && obj.title !== PROTECTED_SUBJECT ? obj.title : "",
+                    location: text(obj.location),
+                    description: text(obj.description),
+                    descriptionHtml: text(obj.descriptionHtml),
+                },
+                target.certDer,
+            ),
+        };
+        obj.title = PROTECTED_SUBJECT;
+        obj.location = null;
+        obj.description = null;
+        obj.descriptionHtml = null;
+    }
+
     /** Refuses (400) an event whose organizer or attendees can't be mailed safely - see `assertParticipants()` - and a bad description, visibility or guest permission. */
     protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
         await super.prepareCreate(obj, user);
+        // Only the server seals an event's content (from an invitation that reached a zero-access mailbox).
+        delete obj.sealedContent;
         BaseCalendarEventRoute.assertParticipants(obj);
         BaseCalendarEventRoute.normalizeDescriptionAndPolicy(obj, false);
     }

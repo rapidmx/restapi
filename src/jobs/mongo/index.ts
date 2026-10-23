@@ -15,3 +15,4 @@ export * from "./RetentionEnforcementJobMongo.js";
 export * from "./ScanQueueJobMongo.js";
 export * from "./ScheduledSendJobMongo.js";
 export * from "./SearchIndexJobMongo.js";
+export * from "./ZeroAccessBackfillJobMongo.js";

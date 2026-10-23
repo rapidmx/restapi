@@ -6,8 +6,8 @@ import { ErasureExecutionJob } from "../ErasureExecutionJob.js";
 import {
     AttachmentMongo,
     AuditLogEntryMongo,
-    CalendarShareLinkMongo,
     CalendarEventMongo,
+    CalendarShareLinkMongo,
     ContactListMongo,
     ContactMongo,
     CorrespondentMongo,
@@ -18,10 +18,10 @@ import {
     IngestQueueEntryMongo,
     KeyVaultMongo,
     LabelMongo,
-    MailboxImportRequestMongo,
-    MailboxMongo,
     MailFilterRuleMongo,
     MailSignatureMongo,
+    MailboxImportRequestMongo,
+    MailboxMongo,
     MatterMongo,
     MessageMongo,
     NoteMongo,
@@ -30,6 +30,8 @@ import {
     QuarantineEntryMongo,
     TaskListMongo,
     TaskMongo,
+    ZeroAccessIndexEntryMongo,
+    ZeroAccessIndexSegmentMongo,
 } from "../../mongo.js";
 
 export class ErasureExecutionJobMongo extends ErasureExecutionJob<DataSubjectErasureRequestMongo, MailboxMongo> {
@@ -55,6 +57,8 @@ export class ErasureExecutionJobMongo extends ErasureExecutionJob<DataSubjectEra
     protected dataExportRequestClass: any = DataExportRequestMongo;
     protected mailboxImportRequestClass: any = MailboxImportRequestMongo;
     protected keyVaultClass: any = KeyVaultMongo;
+    protected zeroAccessIndexEntryClass: any = ZeroAccessIndexEntryMongo;
+    protected zeroAccessIndexSegmentClass: any = ZeroAccessIndexSegmentMongo;
     protected calendarShareLinkClass: any = CalendarShareLinkMongo;
     protected pluginClass: any = PluginMongo;
     protected matterClass: any = MatterMongo;

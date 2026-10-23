@@ -495,6 +495,8 @@ describe("Background job init() hook Tests", () => {
             "oofReplySuppressionClass",
             "correspondentClass",
             "keyVaultClass",
+            "zeroAccessIndexEntryClass",
+            "zeroAccessIndexSegmentClass",
             "quarantineEntryClass",
             "ingestQueueEntryClass",
             "dataExportRequestClass",
