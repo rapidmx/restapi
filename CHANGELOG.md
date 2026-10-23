@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-10-23
+
+### Added
+- Added zero-access keys as useType zero-access, issued by the internal CA and stored on Mailbox.zeroAccessKeys so they are never published through discovery, the RapidMX-Key header or contact keyrings
+- Added EncryptionPolicy.allowZeroAccess, defaulting to mail:zero_access:allowed (on), to allow or disable zero-access encryption server-wide
+- Added Mailbox.zeroAccessEnabled, unset meaning on, kept only when the mailbox's owner writes it
+- Added ZeroAccessUtils with zeroAccessStatus, isZeroAccessActive and activeZeroAccessKey for the effective zero-access state of a mailbox
+- Added ZeroAccessSealer to encrypt to a mailbox's zero-access certificate as CMS EnvelopedData (ECDH P-256, AES-256-GCM) with pkijs, matching the client's S/MIME construction
+- Added sealMessage to store a message as S/MIME enveloped-data of its full original MIME, keeping only routing headers outside and Subject [...]
+- Added sealSummary and sealIndexDocument for a message's sealed subject and preview and its gzipped search index document
+- Added isoWeekId for the ISO week (UTC) a message's index entry belongs to
+- Added buildIndexDocument to extract attachment text within a time budget and size cap, deferring the rest to the client
+- Added ZeroAccessResolver and zeroAccessTargetFor to decide from the stored policy and the mailbox's access list whether and to which key a mailbox's mail is sealed
+- Added the ZeroAccessIndexEntry entity and Message.zeroAccess with the key fingerprint and sealed summary
+- Added ScanPipeline's includeBodyText option for a message's whole body as text
+- Added pkijs and asn1js dependencies, deduplicated to one asn1js
+- Added ScanQueueJob.processInline and seal zero-access messages on filing: the S/MIME message in its own za/ blob, a placeholder subject and preview with the real ones in Message.zeroAccess, no sanitized HTML or attachment blobs, and one sealed index entry per filed copy
+- Added ZeroAccessFiling and sealEventFields
+- Added ZeroAccessWriter, the shared sealer for every writer of message content other than inbound delivery
+- Added latestZeroAccess to conversation rows
+- Added POST /mailbox/:id/keyvault/exports, recording the owner's export of their zero-access, encryption and signing keys as key_vault.export in the audit log
+- Added ZeroAccessWriter.sealDraft, sealing each saved draft of a zero-access mailbox to a fresh za/<mailbox>/drafts/ blob and replacing its index entry
+- Added ZeroAccessSealOptions to seal and sealRaw for the blob key and index entry replacement
+- Added ZeroAccessIndexSegment and BaseZeroAccessIndexRoute: the zero-access search index manifest, pending sealed entries, segment download and compaction upload with a compare-and-swap on the generation and the folded entry uids
+- Added mail:zero_access:compaction_grace_hours and max_segment_bytes
+- Added ZeroAccessBackfillJob, sealing the mail a mailbox already had when zero-access encryption became active, newest first, and removing its readable copies
+- Added Message.zeroAccessBackfillError for a message the backfill can't seal
+- Added KeyVault.memberKeyWraps, each wrapping a shared mailbox's zero-access private key to a member's own zero-access certificate
+- Added the member key routes: the members' key status, the caller's own wraps, fulfilling and removing wraps, and provisioning a mailbox-without-an-owner's key together with its wraps
+- Added PUT /:id/keyvault/escrow-wraps for full-access members to add the escrow copies a scope is missing, and report them as escrowPending in the members status
+
+### Changed
+- Adopt zero-access encryption in the search and E2E specs with a dedicated never-published zero-access keypair wrapped under MK
+- Replace the three-state zero-access policy with a server-wide allow setting and an owner-only per-mailbox enable setting, both on by default
+- Replace the server hot segment with sealed per-message index entries that clients compact into weekly FTS5 segments
+- Encrypt index entries and segments to the zero-access public key and drop the symmetric wrappedIndexKey
+- Specify inline delivery for zero-access recipients with no plaintext spool, sealing on every content write path including drafts and Sent copies
+- Specify member key wraps for shared mailboxes and backfill of existing mail on enablement
+- Record the zero-access standing decisions in NOTES.md
+- Return the mailbox's zeroAccessKeys with every key vault response so an unlocking client can decrypt zero-access mail
+- Refuse a client-set zeroAccessKeys like keys
+- Make supersedeKeys generic over the key type
+- Protect mail:zero_access from plugin settings
+- Process a zero-access recipient's message inside the ingest request from the raw message in memory, with no plaintext ingest blob, answering 503 so the MTA retries on failure
+- Record the zero-access key on the IngestQueueEntry and keep the scan queue from ever picking such an entry up
+- Keep a retried transaction's first decision per recipient, building a new entry's fields only when it is created
+- Seal zero-access quarantined messages, including over-quota ones
+- Leave the subject out of message.delivered events for zero-access mail
+- Seal an invitation's title, location and description into CalendarEvent.sealedContent for zero-access mailboxes, and apply only time changes from a guest's change request to such an event
+- Seal the Sent Items copy of a message sent now or in the background for a zero-access mailbox, removing the draft's plaintext body and attachments
+- Seal messages imported by MailboxImportJob into a zero-access mailbox, rolling back the sealed blob and index entry when filing fails
+- Answer GET /messages/:id/content with 409 for a zero-access message
+- Read the encryption policy uncached when deciding zero-access
+- Register the zero-access models in the SQL import and scheduled send job tests
+- Refuse to send a draft stored zero-access sealed, with 409 from POST /messages/:id/send and a refusal from ScheduledSendJob
+- Teach the spam filter a reported zero-access message from the client's decrypted copy (rawMessage), checked against its Message-ID and never stored, else skip learning as zero_access
+- Keep Authentication-Results among a zero-access message's outer headers so its sender's DKIM verification still applies
+- Accept the calendar file a client decrypted (ics) for the invitation of a zero-access message on every invitation endpoint, adding POST /invite/:messageUid/view
+- Index a zero-access message's metadata without fetching its sealed blob
+- Document that data exports carry zero-access messages as their sealed copies
+- Refuse to store a search index segment not encrypted to one of the mailbox's zero-access keys, checked with isSealedToCertificate
+- Count a mailbox's pending index entries per week with one grouped query
+- Define search index segment format version 1 as a sealed, gzipped JSON bundle of index documents, and compaction by folded entry uids, in the search spec
+- Leave search index segment format version 2 unscheduled until segment import cost is measured, adding that measurement to the search spec
+- Make Message.zeroAccess and zeroAccessBackfillError server-managed
+- Purge a mailbox's zero-access search index entries and segments when it is erased
+- Release a mailbox's wrapped zero-access and encryption private keys and their certificates with its escrow material, never its signing key
+- Seal an edit of a calendar event made from a zero-access mailbox's invitation again, refusing it when the key is gone, and ignore a client's sealedContent
+- Seal mail for shared mailboxes too, now that their members read it through member key wraps
+- Read a mailbox's members from its access list uncached when deciding who holds its key
+- Escrow a mailbox-without-an-owner's zero-access keys straight to its escrow scope's certificate, in KeyVault.zeroAccessEscrowWraps
+- Require an escrow wrap when provisioning the key of a mailbox without an owner that is assigned to an escrow scope, written in the same transaction
+- Release the matter scope's zero-access key escrow wraps of a mailbox without an owner from an escrow access request's material
+- Record in NOTES that Source C client segments are built and imported by web-client, needing no restapi change
+- Describe zero-access encryption in the release notes
+
 ## [0.33.0] - 2026-10-09
 
 ### Added
@@ -1385,7 +1461,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.33.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.34.0...HEAD
+[0.34.0]: https://github.com/rapidmx/restapi/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/rapidmx/restapi/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/rapidmx/restapi/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/rapidmx/restapi/compare/v0.30.1...v0.31.0

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.34.0
+
 ### Added
 
 - **Zero-access encryption** (`specs/search.md` §3/§7-8/§16, `specs/end-to-end_encryption.md`) - mail at rest is encrypted to a dedicated per-mailbox key whose private half only the mailbox's users hold, so administrators, storage and backup copies, and impersonation can no longer read it. The server still sees each message while it delivers it (scanning, filter rules, iTIP), then seals it and keeps no readable copy.
