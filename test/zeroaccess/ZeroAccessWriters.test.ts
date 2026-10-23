@@ -115,6 +115,32 @@ describe("ZeroAccessWriter", () => {
         expect(index.create).toHaveBeenCalledTimes(1);
     });
 
+    it("seals each draft save to a fresh blob and replaces the draft's index entry", async () => {
+        const mailbox = { uid: "mbx", ownerUserUid: "u", zeroAccessKeys: [await zeroAccessKey()] };
+        const blobs = new Map<string, Buffer>();
+        const blobStore = { exists: async (k: string) => blobs.has(k), put: async (k: string, v: Buffer) => void blobs.set(k, v) };
+        const entries = new Map<string, any>();
+        const index = {
+            findOne: vi.fn(async (uid: string) => entries.get(uid)),
+            create: vi.fn(async (e: any) => void entries.set(e.uid, e)),
+            delete: vi.fn(async (uid: string) => void entries.delete(uid)),
+        };
+        const w = writer({ blobStore }, { index });
+        const raw = (body: string) => Buffer.from(`From: alice@example.com\r\nSubject: plan\r\n\r\n${body}`);
+
+        const first = await w.sealDraft(mailbox, raw("first"), "d1", new Date());
+        const firstEntry = [...entries.values()][0];
+        const second = await w.sealDraft(mailbox, raw("second"), "d1", new Date());
+
+        expect(first!.bodyBlobKey).toMatch(/^za\/mbx\/drafts\//);
+        expect(second!.bodyBlobKey).toMatch(/^za\/mbx\/drafts\//);
+        expect(second!.bodyBlobKey).not.toBe(first!.bodyBlobKey);
+        expect(blobs.size).toBe(2);
+        expect(index.delete).toHaveBeenCalledWith(second!.indexEntryUid, expect.objectContaining({ purge: true }));
+        expect(entries.size).toBe(1);
+        expect([...entries.values()][0].sealed).not.toBe(firstEntry.sealed);
+    });
+
     it("discards plaintext blobs without an attachment repo too", async () => {
         const blobStore = { delete: vi.fn() };
         const w = writer({ blobStore });

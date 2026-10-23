@@ -15,6 +15,12 @@ export function zeroAccessBlobKey(mailboxUid: string, messageUid: string): strin
     return `za/${mailboxUid}/${messageUid}`;
 }
 
+/** The prefix of every saved draft body sealed for `mailboxUid`: a fresh key per save (`ZeroAccessWriter.sealDraft()`), like a
+ * plaintext draft's `bodies/` keys, so a save never rewrites a body something may still be reading. */
+export function zeroAccessDraftBlobPrefix(mailboxUid: string): string {
+    return `za/${mailboxUid}/drafts/`;
+}
+
 /** The uid of a message's index entry - derived from the message, so a retried filing finds the one it already wrote. */
 export function zeroAccessIndexEntryUid(messageUid: string): string {
     return nameBasedUuid(`za-index:${messageUid}`);
@@ -40,10 +46,11 @@ export class ZeroAccessFiling {
         return this.target.key.fingerprint;
     }
 
-    /** Stores `raw` sealed (`sealMessage()`) under `zeroAccessBlobKey(mailboxUid, messageUid)` - once - and returns that key. */
-    public async storeMessage(raw: Buffer, messageUid: string): Promise<string> {
+    /** Stores `raw` sealed (`sealMessage()`) under `blobKey` - by default `zeroAccessBlobKey(mailboxUid, messageUid)` - once, and returns
+     * that key. */
+    public async storeMessage(raw: Buffer, messageUid: string, blobKey?: string): Promise<string> {
         if (!this.sealedBlobKey) {
-            const key: string = zeroAccessBlobKey(this.mailboxUid, messageUid);
+            const key: string = blobKey ?? zeroAccessBlobKey(this.mailboxUid, messageUid);
             if (!(await this.blobStore.exists(key))) {
                 await this.blobStore.put(key, await sealMessage(raw, this.target.certDer), { contentType: "message/rfc822" });
             }
@@ -63,17 +70,22 @@ export class ZeroAccessFiling {
         return { keyFingerprint: this.keyFingerprint, sealed: await sealEventFields(fields, this.target.certDer) };
     }
 
-    /** Writes `messageUid`'s index entry from `document` unless it already exists. */
+    /** Writes `messageUid`'s index entry from `document` unless it already exists - or, with `replace` (a draft saved again), in
+     * place of the existing one. */
     public async index(
         repo: RepoUtils<any>,
         entryClass: new (fields: Partial<ZeroAccessIndexEntry>) => ZeroAccessIndexEntry,
         messageUid: string,
         receivedAt: Date,
         document: Omit<ZeroAccessIndexDocument, "messageUid">,
+        replace: boolean = false,
     ): Promise<void> {
         const uid: string = zeroAccessIndexEntryUid(messageUid);
         if (await repo.findOne(uid, { ignoreACL: true })) {
-            return;
+            if (!replace) {
+                return;
+            }
+            await repo.delete(uid, { ignoreACL: true, purge: true });
         }
         const sealed: string = await sealIndexDocument({ ...document, messageUid }, this.target.certDer);
         await repo.create(

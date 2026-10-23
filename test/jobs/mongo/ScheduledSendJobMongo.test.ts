@@ -5,6 +5,7 @@
 // Real-DB + real-DI integration test for ScheduledSendJobMongo - see ScanQueueJobMongo.test.ts's file header for
 // the full rationale behind bypassing `Server`/`ClassLoader` and doubling only the real external boundaries
 // (BlobStore/scan providers/MailTransport), keeping everything else (repos, ScanPipeline) real.
+import { ZERO_ACCESS_DRAFT_MESSAGE } from "../../../src/zeroaccess/ZeroAccessWriter.js";
 import { simpleParser } from "mailparser";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { ACLUtils, NotificationUtils, ConnectionManager, MongoConnection, MongoRepository, ObjectFactory } from "@rapidrest/service-core";
@@ -731,6 +732,18 @@ describe("ScheduledSendJobMongo Tests (real DB + DI)", () => {
             const updated = await runWithBody("From: owner@example.com, ceo@example.com\r\nTo: recipient@example.com\r\n\r\nHi\r\n");
             expect(transport().sent.length).toBe(0);
             expect(updated.scheduledSendError).toContain("From header");
+        });
+
+        it("Refuses a queued draft saved again since, so stored zero-access sealed: there is nothing readable to relay.", async () => {
+            const message = await createMessage({
+                bodyBlobKey: await putBody("From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: [...]\r\n\r\nsealed\r\n"),
+                scheduledSendTime: new Date(Date.now() - 60 * 1000),
+                zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" },
+            });
+            await job.run();
+            const updated = await findMessage(message.uid);
+            expect(transport().sent.length).toBe(0);
+            expect(updated.scheduledSendError).toBe(ZERO_ACCESS_DRAFT_MESSAGE);
         });
 
         it("Refuses a message with two From headers.", async () => {

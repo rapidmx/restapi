@@ -129,5 +129,8 @@ describe("Zero-access delivery (SQL)", () => {
             ),
         createAttachment: async (data) => repo(AttachmentSQL).save(new AttachmentSQL(data)),
         findMessage: (uid) => repo(MessageSQL).findOne({ where: { uid } }),
+        updateMessage: async (uid, fields) => {
+            await repo(MessageSQL).update({ uid }, fields);
+        },
     });
 });

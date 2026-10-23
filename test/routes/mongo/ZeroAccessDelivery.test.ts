@@ -134,5 +134,8 @@ describe("Zero-access delivery (Mongo)", () => {
             ),
         createAttachment: async (data) => repos.AttachmentMongo.save(new AttachmentMongo(data)),
         findMessage: (uid) => repos.MessageMongo.findOne({ uid } as any),
+        updateMessage: async (uid, fields) => {
+            await repos.MessageMongo.updateOne({ uid } as any, { $set: fields });
+        },
     });
 });

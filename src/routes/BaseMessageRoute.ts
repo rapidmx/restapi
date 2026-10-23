@@ -72,7 +72,7 @@ import {
     Recipient,
     RecipientType,
 } from "../models/types.js";
-import { newZeroAccessWriter, ZeroAccessWriter, type ZeroAccessSealedFields } from "../zeroaccess/ZeroAccessWriter.js";
+import { newZeroAccessWriter, ZERO_ACCESS_DRAFT_MESSAGE, ZeroAccessWriter, type ZeroAccessSealedFields } from "../zeroaccess/ZeroAccessWriter.js";
 const { Config, Init, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Delete, Get, Param, Post, Put, Query, RateLimit, Request, Response, User: AuthUser } = RouteDecorators;
@@ -1255,6 +1255,11 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // where it is (and a scheduled send is never queued only to fail in `ScheduledSendJob`).
         if (!hasRecipients(message)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A message needs at least one To, Cc or Bcc recipient to be sent.");
+        }
+        // A draft saved in a zero-access mailbox is stored sealed, which this server can't relay. The client assembles it again for
+        // sending (`intent: "send"`), which stores it readable until it is relayed.
+        if ((message as any).zeroAccess) {
+            throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, ZERO_ACCESS_DRAFT_MESSAGE);
         }
 
         const sendingMailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(message.mailboxUid, {

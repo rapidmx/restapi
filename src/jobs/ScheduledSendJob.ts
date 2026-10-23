@@ -28,7 +28,7 @@ import { deriveMessageListFields } from "../util/MessageListUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { FolderType, Mailbox, Message, RecipientType } from "../models/types.js";
-import { newZeroAccessWriter, ZeroAccessWriter, type ZeroAccessSealedFields } from "../zeroaccess/ZeroAccessWriter.js";
+import { newZeroAccessWriter, ZERO_ACCESS_DRAFT_MESSAGE, ZeroAccessWriter, type ZeroAccessSealedFields } from "../zeroaccess/ZeroAccessWriter.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** Maximum length of a persisted `scheduledSendError`. */
@@ -463,6 +463,11 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 });
                 if (headerRefusal) {
                     await this.refuse(claimed, headerRefusal);
+                    return;
+                }
+                // Saved again after it was queued, and so stored sealed (zero-access): nothing readable to relay.
+                if ((claimed as any).zeroAccess) {
+                    await this.refuse(claimed, ZERO_ACCESS_DRAFT_MESSAGE);
                     return;
                 }
                 const envelopeTo: string[] = claimed.recipients.map((r) => r.address);

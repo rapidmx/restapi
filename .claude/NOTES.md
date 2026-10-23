@@ -4295,3 +4295,18 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
   - Each key must be on `Mailbox.keys` or `Mailbox.zeroAccessKeys` under that kind, so the audit log never records a fingerprint the mailbox doesn't own.
   - Only `kind` and `fingerprint` are stored in `details`.
 - The client won't hand over the file unless this call succeeds.
+
+## 2026-10-22 - Zero-access encryption, Phase 4 (drafts)
+
+- **`ZeroAccessWriter.sealDraft(mailbox, raw, uid, savedAt)`.** Each save is sealed to a fresh `za/<mailbox>/drafts/<uuid>` blob (`zeroAccessDraftBlobPrefix()`), and the draft's index entry is replaced.
+  - `seal()`/`sealRaw()` take `ZeroAccessSealOptions` (`blobKey`, `replaceIndexEntry`). Their defaults keep the write-once behaviour every other writer relies on.
+  - `ZeroAccessFiling.storeMessage(raw, uid, blobKey?)` and `index(..., replace)` back this.
+  - Why a fresh key per save: the fixed `za/<mailbox>/<uid>` key is write-once (skipped if it exists). If a draft used it, its last sealed save would block the Sent Items copy from being sealed later.
+- **The server's compose route** (`server/src/routes/BaseMailComposeRoute.ts`) calls `sealDraft` for every save, meaning `intent` other than `"send"`.
+  - An assemble with `intent: "send"` stores the draft readable, sets `zeroAccess: null`, and removes the draft's index entry. The Sent Items sealing (`sealSentCopy`) then starts from nothing.
+- **Sending a sealed draft is refused** with `ZERO_ACCESS_DRAFT_MESSAGE`: `POST /messages/:id/send` answers 409, and `ScheduledSendJob` refuses a queued draft that was saved again (and so sealed) after it was queued.
+- **Decisions for JP to review:**
+  - An outgoing message stays readable on the server from its "send" assemble until it is relayed. For a scheduled send, that is until its time.
+    - This follows the precedent that the MTA queue holds plaintext anyway, and Proton does the same for scheduled sends to non-PGP recipients.
+    - The Sent Items copy is then sealed and the plaintext removed.
+  - **Not covered yet:** files uploaded to a zero-access draft (`attachments/` blobs and rows) stay plaintext until the message is sent. Sealing them needs the attachment upload and the draft reopen path to change together.

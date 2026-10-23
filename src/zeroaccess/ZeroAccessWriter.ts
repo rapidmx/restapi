@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { randomUUID } from "node:crypto";
 import { ObjectDecorators } from "@rapidrest/core";
 import { ACLUtils, type ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { simpleParser, type ParsedMail } from "mailparser";
@@ -12,11 +13,24 @@ import { ExtractorRegistry } from "../search/extraction/ExtractorRegistry.js";
 import { deleteBlobsIfUnreferenced, messageBlobReferenceSources, type MessageBlobRepos } from "../util/BlobReferenceUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { parseHeaderRecipients } from "../util/RecipientUtils.js";
-import { ZeroAccessFiling, zeroAccessIndexEntryUid } from "./ZeroAccessFiling.js";
+import { ZeroAccessFiling, zeroAccessDraftBlobPrefix, zeroAccessIndexEntryUid } from "./ZeroAccessFiling.js";
 import { buildIndexDocument, type IndexableAttachment } from "./ZeroAccessIndexing.js";
 import { ZeroAccessResolver, type ZeroAccessMailbox, type ZeroAccessTarget } from "./ZeroAccessResolver.js";
 import { PROTECTED_SUBJECT } from "./ZeroAccessSealer.js";
 const { Config, Inject } = ObjectDecorators;
+
+/** Why a draft stored sealed can't be relayed as it is: `POST /messages/:id/send` answers 409 with it, and `ScheduledSendJob` refuses a
+ * queued draft with it. The client assembles the draft again for sending (`intent: "send"`), which stores it readable until relayed. */
+export const ZERO_ACCESS_DRAFT_MESSAGE =
+    "This draft is stored with zero-access encryption, which the server can't send. Open it and send it again.";
+
+/** Where `seal()` stores the sealed message and how it treats an existing index entry - the defaults are a message filed once. */
+export interface ZeroAccessSealOptions {
+    /** The blob key to store the sealed message under, instead of `zeroAccessBlobKey(mailboxUid, messageUid)`. */
+    blobKey?: string;
+    /** Replace the message's index entry when it has one, instead of keeping it. */
+    replaceIndexEntry?: boolean;
+}
 
 /** How much of a body becomes a sealed message's preview - the same length delivery's `bodyPreview` has. */
 const PREVIEW_MAX_LENGTH = 500;
@@ -92,7 +106,11 @@ export class ZeroAccessWriter {
      * Seals `input.raw` for `mailbox` when zero-access is active for it: stores the S/MIME message, writes its index entry, and returns
      * the fields its `Message` row takes instead of the plaintext ones. `undefined` - store the message as before - when it isn't.
      */
-    public async seal(mailbox: Pick<Mailbox, "uid"> & ZeroAccessMailbox, input: ZeroAccessSealInput): Promise<ZeroAccessSealedFields | undefined> {
+    public async seal(
+        mailbox: Pick<Mailbox, "uid"> & ZeroAccessMailbox,
+        input: ZeroAccessSealInput,
+        options: ZeroAccessSealOptions = {},
+    ): Promise<ZeroAccessSealedFields | undefined> {
         const target: ZeroAccessTarget | undefined = await this.target(mailbox);
         if (!target) {
             return undefined;
@@ -101,7 +119,7 @@ export class ZeroAccessWriter {
             throw new Error("Zero-access filing needs a BlobStore and the ZeroAccessIndexEntry model.");
         }
         const filing = new ZeroAccessFiling(target, this.blobStore, mailbox.uid);
-        const bodyBlobKey: string = await filing.storeMessage(input.raw, input.messageUid);
+        const bodyBlobKey: string = await filing.storeMessage(input.raw, input.messageUid, options.blobKey);
         const zeroAccess: MessageZeroAccess = await filing.messageState({ subject: input.subject, preview: input.preview });
         const { messageUid: _unused, ...document } = await buildIndexDocument(
             {
@@ -117,7 +135,7 @@ export class ZeroAccessWriter {
             async (mimeType, content) => this.extractorRegistry?.extract(mimeType, content),
             { budgetMs: this.extractionBudgetMs, maxAttachmentBytes: this.extractionMaxBytes },
         );
-        await filing.index(this.indexEntryRepo, this.indexEntryClass, input.messageUid, input.receivedAt, document);
+        await filing.index(this.indexEntryRepo, this.indexEntryClass, input.messageUid, input.receivedAt, document, options.replaceIndexEntry);
         return { subject: PROTECTED_SUBJECT, bodyPreview: "", bodyBlobKey, zeroAccess, indexEntryUid: zeroAccessIndexEntryUid(input.messageUid) };
     }
 
@@ -150,6 +168,7 @@ export class ZeroAccessWriter {
         raw: Buffer,
         messageUid: string,
         receivedAt: Date,
+        options: ZeroAccessSealOptions = {},
     ): Promise<ZeroAccessSealedFields | undefined> {
         if (!(await this.target(mailbox))) {
             return undefined;
@@ -167,6 +186,23 @@ export class ZeroAccessWriter {
             fromDisplayName: parsed.from?.value?.[0]?.name || undefined,
             recipients: parseHeaderRecipients(parsed),
             attachments: (parsed.attachments ?? []).map((a) => ({ filename: a.filename, contentType: a.contentType, content: a.content })),
+        }, options);
+    }
+
+    /**
+     * Seals a saved draft's composed MIME for `mailbox` when zero-access is active for it (`undefined` when it isn't): to a fresh blob
+     * under `zeroAccessDraftBlobPrefix()` each save, with the draft's index entry replaced. The caller points the draft at the returned
+     * `bodyBlobKey` and removes the body it replaces, as it does for a plaintext save.
+     */
+    public async sealDraft(
+        mailbox: Pick<Mailbox, "uid"> & ZeroAccessMailbox,
+        raw: Buffer,
+        messageUid: string,
+        savedAt: Date,
+    ): Promise<ZeroAccessSealedFields | undefined> {
+        return this.sealRaw(mailbox, raw, messageUid, savedAt, {
+            blobKey: `${zeroAccessDraftBlobPrefix(mailbox.uid)}${randomUUID()}`,
+            replaceIndexEntry: true,
         });
     }
 }

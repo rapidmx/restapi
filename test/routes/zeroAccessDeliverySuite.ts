@@ -48,6 +48,7 @@ export interface ZeroAccessDeliverySuiteContext {
     createMessage: (data: any) => Promise<any>;
     createAttachment: (data: any) => Promise<any>;
     findMessage: (uid: string) => Promise<any>;
+    updateMessage: (uid: string, fields: object) => Promise<void>;
 }
 
 interface Recipient {
@@ -462,6 +463,21 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 // The job files the sealed copy before it removes the draft's plaintext, so wait for both.
                 await vi.waitFor(() => expectSealedSentCopy(message.uid, recipient, [bodyBlobKey, attachmentBlobKey]), { timeout: 10_000, interval: 50 });
             }, 20_000);
+
+            it("refuses to send a draft still stored sealed, which it can't relay", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const { message } = await draft(mailbox);
+                await ctx.updateMessage(message.uid, { zeroAccess: { keyFingerprint: recipient.key.fingerprint, sealedSummary: "s" } });
+
+                const result = await request(ctx.app())
+                    .post(`${ctx.messagesUrl}/${message.uid}/send`)
+                    .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                    .send({});
+
+                expect(result.status).toBe(409);
+                expect(result.body.message).toContain("zero-access");
+            });
 
             it("files the Sent Items copy of a mailbox without zero-access as before", async () => {
                 const mailbox = await ctx.createMailbox();

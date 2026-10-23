@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Real-DB + real-DI integration test for ScheduledSendJobSQL - see ScanQueueJobSQL.test.ts's/
 // ScheduledSendJobSQL.test.ts's file headers for the full rationale.
+import { ZERO_ACCESS_DRAFT_MESSAGE } from "../../../src/zeroaccess/ZeroAccessWriter.js";
 import { ACLUtils, NotificationUtils, AccessControlListSQL, ConnectionManager, ObjectFactory, isSqlDataSource } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { simpleParser } from "mailparser";
@@ -688,6 +689,18 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
             const updated = await runWithBody("From: owner@example.com, ceo@example.com\r\nTo: recipient@example.com\r\n\r\nHi\r\n");
             expect(transport().sent.length).toBe(0);
             expect(updated.scheduledSendError).toContain("From header");
+        });
+
+        it("Refuses a queued draft saved again since, so stored zero-access sealed: there is nothing readable to relay.", async () => {
+            const message = await createMessage({
+                bodyBlobKey: await putBody("From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: [...]\r\n\r\nsealed\r\n"),
+                scheduledSendTime: new Date(Date.now() - 60 * 1000),
+                zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" },
+            });
+            await job.run();
+            const updated = await findMessage(message.uid);
+            expect(transport().sent.length).toBe(0);
+            expect(updated.scheduledSendError).toBe(ZERO_ACCESS_DRAFT_MESSAGE);
         });
 
         it("Refuses a message with two From headers.", async () => {
