@@ -1,4 +1,4 @@
-# RapidMX: End-to-End Encryption
+# RapidMX REST API: New Features
 
 The purpose of this document is to lay out a technical plan for implementing the following two major new features to RapidMX.
 
@@ -26,7 +26,7 @@ All key material described in this document is therefore X.509.
 **Certificate issuance is two-tier:**
 
 - **Encryption certificates** are issued by the RapidMX server's internal CA. Trust between RapidMX servers is anchored in the domain (DNSSEC and TLS on the discovery endpoint), not in a public root, so a public CA adds nothing.
-- **Signing certificates** MUST be enrolled against a publicly trusted CA by default. A signature from an internal CA displays to external recipients as _unverified_ rather than _verified_, which is worse than not signing at all. Administrators MAY disable public enrolment for closed deployments.
+- **Signing certificates** MUST be enrolled against a publicly trusted CA by default. A signature from an internal CA displays to external recipients as *unverified* rather than *verified*, which is worse than not signing at all. Administrators MAY disable public enrolment for closed deployments.
 
 Public enrolment MUST be automated. RFC 8823 defines an ACME `email-reply-00` challenge for S/MIME issuance, and the CA/Browser Forum S/MIME Baseline Requirements permit it as a mailbox-control validation method. Certificate lifetimes are capped at 825 days under those requirements and are shortening, so unattended reissue is a launch requirement, not a later feature.
 
@@ -39,10 +39,10 @@ RapidMX features fall into two categories, and they MUST NOT share a scope.
 - **Protective capabilities** reduce what third parties can learn. They disclose nothing and impose nothing on the recipient. These MUST be scoped as widely as possible — to any capable peer.
 - **Disclosing capabilities** reveal something about a user to another party. These MUST be scoped to the administrative boundary, because users outside that boundary never agreed to the originating organisation's norms.
 
-| Capability                                               | Category   | Scope             |
-| -------------------------------------------------------- | ---------- | ----------------- |
-| Signing, encryption, key discovery                       | Protective | Federated peer    |
-| Delivery / read receipt requests                         | Disclosing | Same-organisation |
+| Capability | Category | Scope |
+| --- | --- | --- |
+| Signing, encryption, key discovery | Protective | Federated peer |
+| Delivery / read receipt requests | Disclosing | Same-organisation |
 | Free/busy, presence, directory search, typing indicators | Disclosing | Same-organisation |
 
 New features MUST be classified under this principle before a default scope is chosen.
@@ -63,11 +63,11 @@ The features of `Digital Signatures` (DS) and `End-to-End Encryption` (E2E) are 
 
 Encryption policy MUST be expressed as **three** states, configurable independently per recipient tier (§Scoping Principle):
 
-| State        | Meaning                                                                         |
-| ------------ | ------------------------------------------------------------------------------- |
-| `automatic`  | Encrypt by default where both parties advertise `mutual`.                       |
-| `optional`   | Not applied automatically. A user MAY encrypt a specific message or invitation. |
-| `prohibited` | Users cannot encrypt. Attempts are blocked with an explanation.                 |
+| State | Meaning |
+| --- | --- |
+| `automatic` | Encrypt by default where both parties advertise `mutual`. |
+| `optional` | Not applied automatically. A user MAY encrypt a specific message or invitation. |
+| `prohibited` | Users cannot encrypt. Attempts are blocked with an explanation. |
 
 **Two states are not sufficient**, and conflating `optional` with `prohibited` fails in both directions.
 
@@ -81,16 +81,18 @@ When policy is `prohibited` for a tier, the client MUST explain why encryption i
 
 When the user first signs in to their RapidMX mailbox, the client MUST create two new X.509 keypairs automatically. The first keypair MUST be used for digitally signing outgoing messages. The second keypair MUST be used for encrypting message contents. The public keys MUST be stored on the server for discovery by other parties. The private keys MUST be encrypted on the client device and then uploaded to the RapidMX server.
 
+Where zero-access encryption is allowed, the client MUST also create a third keypair, the **zero-access keypair**, which the server uses to encrypt mail at rest on arrival. It is handled exactly like the other two — private key wrapped under MK, certificate issued by the internal CA — but its public key is **never published** for discovery or in the `RapidMX-Key` header. See the companion search design document, §3.
+
 Keypairs MUST default to ECC (P-256), not RSA. A P-256 certificate is approximately 510 bytes DER against 907 bytes for RSA-2048, which roughly halves the size of the Autocrypt-style header carried on every outgoing message.
 
 The two keypairs MUST have different lifecycles:
 
-|             | Signing key                               | Encryption key                                      |
-| ----------- | ----------------------------------------- | --------------------------------------------------- |
-| Escrow      | MUST NOT be escrowed                      | MUST be escrowed                                    |
-| Rotation    | Rotates on schedule                       | Long-lived                                          |
-| On rotation | Old private key destroyed                 | Old private key retained indefinitely               |
-| Rationale   | A copy elsewhere destroys non-repudiation | Discarding it makes old mail permanently unreadable |
+| | Signing key | Encryption key |
+| --- | --- | --- |
+| Escrow | MUST NOT be escrowed | MUST be escrowed |
+| Rotation | Rotates on schedule | Long-lived |
+| On rotation | Old private key destroyed | Old private key retained indefinitely |
+| Rationale | A copy elsewhere destroys non-repudiation | Discarding it makes old mail permanently unreadable |
 
 When a user logs in to their account, the private keys MUST be downloaded from the server, decrypted, and stored locally on the device in a secure location. When the user explicitly logs out on the device, the private keys MUST be destroyed until the next log in attempt.
 
@@ -110,6 +112,7 @@ MK = random 32 bytes                       <- never leaves the client unwrapped
      |
      +-- AEAD encrypts --> signing private key      -+
      +-- AEAD encrypts --> encryption private key   -+--> stored on server
+     +-- AEAD encrypts --> zero-access private key  -+
 
 MK is wrapped once per unlock method:
      wrap_password  = AEAD(HKDF(Argon2id(password, salt), "wrap"), MK)
@@ -119,6 +122,10 @@ MK is wrapped once per unlock method:
 ```
 
 The server stores the wrapped blobs, salts and KDF parameters. Every one of them is opaque to the server.
+
+**The zero-access private key is a third protected secret**, alongside the signing and encryption private keys. The server encrypts zero-access mail, its search index entries and index segments to the corresponding public key (companion search design document, §3 and §7). It is kept separate from the E2E encryption key so that rotating either never forces re-encryption of the other's ciphertext, and so that a shared mailbox's delegates can be given it without gaining access to end-to-end mail. On rotation the old zero-access private key is retained, so neither messages nor the index are re-encrypted.
+
+A symmetric search index key wrapped under MK is **not** used: the server must write the index at delivery, and cannot hold a key that decrypts.
 
 **Permitted unlock methods:**
 
@@ -130,7 +137,7 @@ The server stores the wrapped blobs, salts and KDF parameters. Every one of them
 
 **Escrow** MUST be optional and disabled by default. When enabled, a holder can unwrap MK and therefore decrypt the user's mail. Administrators enabling it MUST be shown this consequence explicitly, and the client MUST display escrow status to the user in account settings. A server with escrow enabled does not provide end-to-end encryption against the escrow holder, and the product MUST NOT claim otherwise.
 
-Escrow MUST NOT be a single organisation-wide key held by whoever administers the server. See _Escrow Scoping_ below.
+Escrow MUST NOT be a single organisation-wide key held by whoever administers the server. See *Escrow Scoping* below.
 
 #### Escrow Scoping
 
@@ -176,24 +183,20 @@ A scope MAY be configured with no escrow at all, accepting that mail in that sco
  * This type MUST NOT ever carry private key material.
  */
 export interface PublicKey {
-    /** The base64 encoded public key (DER-encoded X.509 certificate). */
-    publicKey: string;
-    /** The key's type and format (e.g. `x509`). */
-    type: string;
-    /** The purpose type that this key will be used for. */
-    useType: "sign" | "encrypt";
-    /** SHA-256 fingerprint of the certificate, hex encoded. Used for TOFU pinning and out-of-band verification. */
-    fingerprint: string;
-    /** UTC timestamp at which this key becomes valid. */
-    notBefore: number;
-    /** UTC timestamp at which this key expires. */
-    notAfter: number;
-    /** UTC timestamp at which this key was revoked, if applicable. */
-    revokedAt?: number;
-    /** Why the key was revoked: `superseded` by a newer key of the same use type (routine rotation), or `compromised`. Absent on a revoked key means `compromised`. */
-    revocationReason?: "superseded" | "compromised";
-    /** The base64 encoded DER X.509 certificate that directly issued `publicKey`, when known. At most 16 KB of base64. */
-    issuerCertificate?: string;
+  /** The base64 encoded public key (DER-encoded X.509 certificate). */
+  publicKey: string;
+  /** The key's type and format (e.g. `x509`). */
+  type: string;
+  /** The purpose type that this key will be used for. `zero-access` keys are never published. */
+  useType: "sign" | "encrypt" | "zero-access";
+  /** SHA-256 fingerprint of the certificate, hex encoded. Used for TOFU pinning and out-of-band verification. */
+  fingerprint: string;
+  /** UTC timestamp at which this key becomes valid. */
+  notBefore: number;
+  /** UTC timestamp at which this key expires. */
+  notAfter: number;
+  /** UTC timestamp at which this key was revoked, if applicable. */
+  revokedAt?: number;
 }
 
 /**
@@ -201,57 +204,57 @@ export interface PublicKey {
  * Only ever returned from authenticated endpoints.
  */
 export interface WrappedPrivateKey {
-    /** AEAD ciphertext of the private key, base64 encoded. */
-    ciphertext: string;
-    /** Base64 encoded AEAD nonce. */
-    nonce: string;
-    /** AEAD algorithm identifier (e.g. `AES-256-GCM`). */
-    algorithm: string;
-    /** Fingerprint of the corresponding PublicKey. */
-    fingerprint: string;
-    /** The purpose type that this key will be used for. */
-    useType: "sign" | "encrypt";
+  /** AEAD ciphertext of the private key, base64 encoded. */
+  ciphertext: string;
+  /** Base64 encoded AEAD nonce. */
+  nonce: string;
+  /** AEAD algorithm identifier (e.g. `AES-256-GCM`). */
+  algorithm: string;
+  /** Fingerprint of the corresponding PublicKey. */
+  fingerprint: string;
+  /** The purpose type that this key will be used for. */
+  useType: "sign" | "encrypt" | "zero-access";
 }
 
 /**
  * One wrapped copy of the mailbox master key, per unlock method.
  */
 export interface MasterKeyWrap {
-    /** Unlock method used to derive the wrapping key. */
-    method: "password" | "passkey" | "recovery" | "escrow";
-    /** Opaque identifier for the method instance (e.g. WebAuthn credential ID). */
-    methodId?: string;
-    /** For method `escrow`: the escrow scope this wrap belongs to. Re-wrapped on scope change or key rotation. */
-    escrowScopeId?: string;
-    /** AEAD ciphertext of the master key, base64 encoded. */
-    ciphertext: string;
-    /** Base64 encoded AEAD nonce. */
-    nonce: string;
-    /** Base64 encoded KDF salt. */
-    salt: string;
-    /** KDF identifier and parameters (e.g. `argon2id:m=65536,t=3,p=4`). */
-    kdf: string;
-    /** Wrapping scheme version, so parameters can be upgraded over time. */
-    schemeVersion: number;
-    /** UTC timestamp of creation. */
-    createdAt: number;
+  /** Unlock method used to derive the wrapping key. */
+  method: "password" | "passkey" | "recovery" | "escrow";
+  /** Opaque identifier for the method instance (e.g. WebAuthn credential ID). */
+  methodId?: string;
+  /** For method `escrow`: the escrow scope this wrap belongs to. Re-wrapped on scope change or key rotation. */
+  escrowScopeId?: string;
+  /** AEAD ciphertext of the master key, base64 encoded. */
+  ciphertext: string;
+  /** Base64 encoded AEAD nonce. */
+  nonce: string;
+  /** Base64 encoded KDF salt. */
+  salt: string;
+  /** KDF identifier and parameters (e.g. `argon2id:m=65536,t=3,p=4`). */
+  kdf: string;
+  /** Wrapping scheme version, so parameters can be upgraded over time. */
+  schemeVersion: number;
+  /** UTC timestamp of creation. */
+  createdAt: number;
 }
 
 /**
  * Describes the encryption preferences of the user or Contact.
  */
 export interface EncryptionPreference {
-    /** The UTC timestamp of the most recent effective date that the last encryption preference was provided. */
-    lastSeen?: number;
-    /** The encryption preference of the user or contact to apply to outgoing messages. */
-    preferEncrypt: "mutual" | "nopreference";
+  /** The UTC timestamp of the most recent effective date that the last encryption preference was provided. */
+  lastSeen?: number;
+  /** The encryption preference of the user or contact to apply to outgoing messages. */
+  preferEncrypt: "mutual" | "nopreference";
 }
 
 export interface Mailbox extends BaseEntity {
-    /** The encryption preference of the mailbox. */
-    encryptPreference: EncryptionPreference;
-    /** Public keys associated with this mailbox. Safe to expose publicly. */
-    keys: PublicKey[];
+  /** The encryption preference of the mailbox. */
+  encryptPreference: EncryptionPreference;
+  /** Public keys associated with this mailbox. Safe to expose publicly. */
+  keys: PublicKey[];
 }
 
 /**
@@ -260,8 +263,24 @@ export interface Mailbox extends BaseEntity {
  * cannot be leaked by serialising a Mailbox.
  */
 export interface KeyVault {
-    wrappedKeys: WrappedPrivateKey[];
-    masterKeyWraps: MasterKeyWrap[];
+  wrappedKeys: WrappedPrivateKey[];
+  masterKeyWraps: MasterKeyWrap[];
+  /**
+   * Shared mailboxes only: the mailbox's zero-access private key, wrapped (CMS EnvelopedData)
+   * to each member's own zero-access certificate. Never the MK, signing key or E2E keys.
+   */
+  memberKeyWraps?: MemberKeyWrap[];
+}
+
+export interface MemberKeyWrap {
+  memberUserUid: string;
+  /** Fingerprint of the member's own zero-access certificate this wrap is addressed to. */
+  recipientFingerprint: string;
+  /** Fingerprint of the mailbox zero-access key being wrapped. */
+  zeroAccessKeyFingerprint: string;
+  /** Base64 DER CMS EnvelopedData of the PKCS#8 private key. */
+  cms: string;
+  createdAt: number;
 }
 ```
 
@@ -273,34 +292,20 @@ The following new properties MUST be added to the `Contact` data model.
 
 ```ts
 export interface Contact extends RecoverableBaseEntity {
-    /** The known encryption preferences of the contact. */
-    encryptPreference?: EncryptionPreference;
-    /** The list of public keys that this contact has published. */
-    keys?: PublicKey[];
-    /** UTC timestamp at which the contact's keys were first observed (TOFU anchor). */
-    keysFirstSeen?: number;
-    /** UTC timestamp of the most recent message observed from this contact, with or without a key header. */
-    lastMessageSeen?: number;
-    /** Observed keys that conflict with the pinned key of their useType. Blocks silent acceptance. At most one per useType. */
-    keyConflicts?: KeyConflict[];
-    /** Formerly pinned keys, newest first, at most 5 per useType. Kept so older signed mail still verifies. */
-    previousKeys?: PreviousKey[];
-    /** Observed keys the user rejected, newest first, at most 10. Not recorded as conflicts again. */
-    rejectedKeys?: { useType: "sign" | "encrypt"; fingerprint: string; rejectedAt: number }[];
-}
-
-export interface KeyConflict {
-    useType: "sign" | "encrypt";
-    /** The observed key in full, so the user can accept it. */
-    observedKey: PublicKey;
+  /** The known encryption preferences of the contact. */
+  encryptPreference?: EncryptionPreference;
+  /** The list of public keys that this contact has published. */
+  keys?: PublicKey[];
+  /** UTC timestamp at which the contact's keys were first observed (TOFU anchor). */
+  keysFirstSeen?: number;
+  /** UTC timestamp of the most recent message observed from this contact, with or without a key header. */
+  lastMessageSeen?: number;
+  /** Set when an observed key conflicts with the stored key. Blocks silent acceptance. */
+  keyConflict?: {
+    observedFingerprint: string;
     observedAt: number;
     source: "header" | "discovery";
-}
-
-export interface PreviousKey extends PublicKey {
-    /** UTC timestamp at which it stopped being the pinned key. */
-    replacedAt: number;
-    replacement: "automatic" | "user";
+  };
 }
 ```
 
@@ -315,35 +320,13 @@ The client MUST surface certificate fingerprints in the contact UI so users can 
 When an observed key for a contact differs from the stored key, the client MUST NOT silently accept the new key and MUST NOT silently reject the message. It MUST:
 
 1. Retain the previously stored key.
-2. Record the conflict in `Contact.keyConflicts`, with the full observed key. There is one entry per `useType`, and a later observation replaces an earlier one. A key whose fingerprint the user rejected for that `useType` (`Contact.rejectedKeys`) is not recorded again.
+2. Record the conflict in `Contact.keyConflict`.
 3. Present the change to the user with both fingerprints and the date each was first seen.
 4. Require explicit user action to replace the pinned key.
 
 Key changes are routine (rotation, reinstall, new device) and are also exactly what an attack looks like. The distinction cannot be made automatically.
 
 A key MUST be replaced without prompting only when the new certificate is signed by the same issuing CA as the pinned certificate **and** the pinned certificate is expired or revoked.
-
-To make this provable, a server MUST publish each key's issuing CA certificate as `PublicKey.issuerCertificate`. It stores one only after checking that the leaf's issuer name equals the CA certificate's subject and that the leaf's signature verifies against the CA's public key. A peer MUST NOT trust a peer-asserted issuer name alone. A receiving server replaces an observed key N for the pinned key P of the same `useType` without prompting only when all of these hold:
-
-- (a) N carries `issuerCertificate` I. I parses and may act as a CA: a basicConstraints extension, when present, has `cA` true (a keyUsage extension, when present, must allow certificate signing). N's issuer name equals I's subject, and N's signature verifies with I's public key.
-- (b) P's certificate also verifies with I's public key, and P's issuer name equals I's subject. Both come from the same issuing CA key.
-- (c) P is expired at the time of the observation, or P is revoked. P is revoked when the pinned record has `revokedAt`, or when the same authenticated response lists P's fingerprint with `revokedAt`. Either `revocationReason` counts.
-- (d) N is currently valid, names the contact's address (subjectAltName `rfc822Name`, or the subject `emailAddress` when there is none), and its usage fits the `useType`. For `sign`, a keyUsage extension (when present) must include `digitalSignature`. For `encrypt`, it must include `keyAgreement` or `keyEncipherment`, the bits the reference encryption CA issues (ECDH and RSA keys respectively). For both, an extKeyUsage extension (when present) must include `emailProtection`.
-
-When all hold, N is pinned, P moves to `Contact.previousKeys` with `replacement: "automatic"`, and the conflict for that `useType` is cleared. Otherwise the conflict is recorded as above.
-
-Revocations in an authenticated response are applied to keys already on file. A listed key with `revokedAt` is never pinned, not even on first use, and never recorded as a conflict. When it matches a pinned or previous key, that key takes the listed `revokedAt`/`revocationReason` if the revocation is stronger: any revocation beats none, and `"compromised"` (or no reason) beats `"superseded"`. A stored revocation is never weakened. A key already in `previousKeys` is not recorded as a conflict again.
-
-The `RapidMX-Key` header never carries `issuerCertificate`, so a key change seen there can only be recorded as a conflict. The receiving server then refreshes Discovery for the sender (as for a Rotation Notification), so the automatic rule can apply. The refresh is bounded by the federation and key caches, and it never affects delivery. It is a narrow exception to lazy, compose-time Discovery: it runs only for a sender whose DKIM-verified header just announced a different key, and it happens at delivery, so it reveals when the message was delivered, not when it was read.
-
-The user resolves a conflict with `POST /mail/mailboxes/:id/keys/resolve`, body `{ address, useType, action: "accept" | "reject", expectedPinnedFingerprint, certificate? }`:
-
-- `accept` pins `certificate` when given, otherwise the recorded conflict's key. The key is validated at that moment as in (d). The old key moves to `previousKeys` with `replacement: "user"`, the conflict is cleared, and the fingerprint is removed from `rejectedKeys`.
-- `reject` clears the conflict and adds its fingerprint to `rejectedKeys`.
-- The request fails with 409 when the pinned key is no longer `expectedPinnedFingerprint`, so the user replaces only the key they saw. It fails with 404 when there is no contact, no pinned key of that `useType` (accept), or no conflict (reject, or accept without a certificate), and with 400 for a malformed body or an invalid certificate. An accept of the key already pinned succeeds without change.
-- Both actions are audited (`contact.key_replaced`, `contact.key_conflict_rejected`).
-
-Replaced keys are kept in `previousKeys` (at most 5 per `useType`) so a message signed before a rotation still verifies. A client SHOULD treat a previous signing key as trusted for that purpose unless it is revoked as compromised (`revokedAt` with `revocationReason` `"compromised"` or no reason).
 
 #### Anti-Downgrade
 
@@ -400,15 +383,13 @@ In the event that the mailbox queried does not exist on the server, the server M
 
 ```json
 {
-    "encryptPreference": {
-        "preferEncrypt": "nopreference"
-    },
-    "keys": [],
-    "escrow": false
+  "encryptPreference": {
+    "preferEncrypt": "nopreference"
+  },
+  "keys": [],
+  "escrow": false
 }
 ```
-
-Each `PublicKey` in the response carries `issuerCertificate` when the server knows it, and a superseded key carries `revokedAt` and `revocationReason: "superseded"` (see _Rotation Notification_). `issuerCertificate` MUST NOT be added to the `RapidMX-Key` header, which stays small.
 
 The response for a non-existent mailbox MUST be indistinguishable in status code, body shape and response time from a mailbox that exists but has no keys published. This endpoint is otherwise a directory-harvesting oracle.
 
@@ -427,11 +408,11 @@ TYPE    HOST                    VALUE
 TXT     _rapidmx.domain.com     v=RMXv1; id=1; host=mail.domain.com;
 ```
 
-| Attribute | Meaning                                                       |
-| --------- | ------------------------------------------------------------- |
-| `v`       | Policy version. `RMXv1`.                                      |
-| `id`      | Opaque policy version token. Changes when the policy changes. |
-| `host`    | Hostname of the RapidMX server serving the key endpoint.      |
+| Attribute | Meaning |
+| --- | --- |
+| `v` | Policy version. `RMXv1`. |
+| `id` | Opaque policy version token. Changes when the policy changes. |
+| `host` | Hostname of the RapidMX server serving the key endpoint. |
 
 2. Query the key endpoint at that host:
 
@@ -481,8 +462,6 @@ The reason is trust asymmetry: MDN extension fields are hop-authenticated at bes
 
 Push is an optimisation over `ETag` polling, not a replacement. Peers MUST continue to honour `Cache-Control` expiry independently.
 
-**Superseded keys.** When a new key of a use type becomes a mailbox's active key, the server MUST set `revokedAt` (the install time) and `revocationReason: "superseded"` on every older unrevoked key of that use type, in the same write that publishes the new key. Discovery then shows the old key as retired, which, with a shared issuing CA, lets peers replace the pin without prompting. Only the public record changes: private keys follow the rotation table in _Keypair Generation & Storage_. A superseded key was not compromised. Signatures made and mail encrypted before its `revokedAt` MUST stay trusted, both in the owner's mailbox and at peers. A `compromised` revocation, or one with no reason, withdraws trust entirely. A revocation, once published, MUST NOT be withdrawn, and `superseded` MAY only be escalated to `compromised`.
-
 ### Digital Signatures
 
 The client SHOULD digitally sign all mail composed from the user's device with the user's signing key. The client MUST provide a setting to the user allowing them to toggle message signing, which can be overridden by the system-wide policy.
@@ -505,7 +484,7 @@ Without this, a signed message still has a forgeable subject line and a forgeabl
 
 RFC 9788 updates RFC 8551 specifically because the original §3.1 `message/rfc822` wrapping caused rendering and security problems in legacy clients. Implementations MUST follow RFC 9788's outer-header handling rules rather than the naive wrapping, so that clients unaware of header protection still render the message correctly.
 
-When header protection is in use, the client MUST render the _protected_ header values, and MUST visually distinguish a message whose outer and protected headers disagree.
+When header protection is in use, the client MUST render the *protected* header values, and MUST visually distinguish a message whose outer and protected headers disagree.
 
 ### Encryption
 
@@ -533,11 +512,11 @@ Receipt **requests** are a disclosing capability and are scoped to **same-organi
 
 #### Default Scope
 
-| Recipient tier    | Automatic request attached |
-| ----------------- | -------------------------- |
-| Same-organisation | Yes                        |
-| Federated peer    | No                         |
-| External          | No                         |
+| Recipient tier | Automatic request attached |
+| --- | --- |
+| Same-organisation | Yes |
+| Federated peer | No |
+| External | No |
 
 Federated peers are deliberately excluded. A peer is a different organisation whose users have not agreed to this organisation's norms around read tracking, and the mutual-consent assumption that makes the messaging-app experience acceptable does not hold across an administrative boundary.
 
@@ -578,10 +557,10 @@ MDN support in the wider mail ecosystem is inconsistent — consumer Gmail ignor
 
 The client MUST distinguish three states and MUST NOT render the third as an unfilled "unread" checkmark:
 
-| State                     | Meaning                                                             |
-| ------------------------- | ------------------------------------------------------------------- |
-| Delivered / Read          | A receipt was received.                                             |
-| Awaiting                  | A receipt was requested and may still arrive.                       |
+| State | Meaning |
+| --- | --- |
+| Delivered / Read | A receipt was received. |
+| Awaiting | A receipt was requested and may still arrive. |
 | No confirmation available | The recipient's system does not support or did not honour receipts. |
 
 ### Derived Entities
@@ -590,7 +569,7 @@ An entity materialised from an encrypted message — most importantly a calendar
 
 - Entities materialised from a message encrypted by a **federated peer or external sender** MUST be encrypted under the same mailbox master key as the message they derive from, and MUST carry a provenance flag.
 - **Origination.** A user MUST be able to send an encrypted calendar invitation. When an invitation is sent encrypted, the organiser's own copy of the event MUST also be encrypted — encrypt-to-self applied to calendar. An explicit user choice to encrypt MUST be honoured regardless of tier, including same-organisation invitations; a deliberate decision outranks the default scoping below.
-- Entities derived from **same-organisation** messages are not _automatically_ protected. The administrator can already read the mailbox, so no new exposure is created. **However, inheritance follows the message's actual encryption state, not its tier**: if a message arrived encrypted for any reason — including a same-organisation sender who chose to encrypt — its derived entities MUST be encrypted. Tier scoping governs whether protection is applied automatically, never whether existing protection is inherited.
+- Entities derived from **same-organisation** messages are not *automatically* protected. The administrator can already read the mailbox, so no new exposure is created. **However, inheritance follows the message's actual encryption state, not its tier**: if a message arrived encrypted for any reason — including a same-organisation sender who chose to encrypt — its derived entities MUST be encrypted. Tier scoping governs whether protection is applied automatically, never whether existing protection is inherited.
 - **Encrypted events are partially encrypted.** Title, notes, location and attachments are encrypted. Start, end, duration, busy status, recurrence pattern, organiser, attendee list and RSVP status remain plaintext. Free/busy MUST report busy time without title or location. Attendees stay plaintext because a meeting invitation travels as a message whose `To`/`Cc` headers already name them and RFC 9788 retains outer headers by default; encrypting the list would protect data the server already holds while breaking RSVP tracking and delegate access. This rule MUST be revisited if HP-Obscured outer-header handling is ever adopted.
 - **Encryption state is sticky.** Updates, cancellations and every instance of a recurring series MUST share the original's encryption state. Adding an attendee who cannot receive encrypted mail follows the multi-recipient rule above: present the choice, never split into encrypted and plaintext copies.
 - **Contacts are never encrypted.** A contact is a record the user authored, not content the correspondent sent. `prefer-encrypt` is a statement about messages in transit and MUST NOT be interpreted as changing how an existing contact is stored. Contacts MUST NOT be auto-enriched from decrypted message content; envelope-derived address and display name only.
@@ -605,13 +584,13 @@ The search consequences of this rule are specified in the companion encrypted se
 
 Encrypting message bodies removes the server's ability to read them. The following features are affected and each server operator MUST be able to see which are degraded when E2E is enabled:
 
-| Feature                           | Impact                                                                     |
-| --------------------------------- | -------------------------------------------------------------------------- |
-| Server-side full-text search      | Encrypted bodies are not indexable. See **Search** below.                  |
-| Content-based spam filtering      | Operates on envelope and headers only for encrypted mail.                  |
-| Rules matching on body text       | Cannot be evaluated server-side. Header and envelope rules are unaffected. |
-| Archiving / compliance retention  | Archives ciphertext. Full-text search over the archive is not possible.    |
-| Antivirus scanning of attachments | Cannot inspect encrypted attachments.                                      |
+| Feature | Impact |
+| --- | --- |
+| Server-side full-text search | Encrypted bodies are not indexable. See **Search** below. |
+| Content-based spam filtering | Operates on envelope and headers only for encrypted mail. |
+| Rules matching on body text | Cannot be evaluated server-side. Header and envelope rules are unaffected. |
+| Archiving / compliance retention | Archives ciphertext. Full-text search over the archive is not possible. |
+| Antivirus scanning of attachments | Cannot inspect encrypted attachments. |
 
 The product documentation MUST state plainly which of these are traded away. Capturing plaintext at delivery to preserve them means the server can read user mail, and any deployment doing so MUST NOT be described as end-to-end encrypted.
 
@@ -653,15 +632,18 @@ Loss of every unlock method means the user's encrypted mail is permanently unrea
 
 The client MUST display the security status of every message. Encryption and signing are **separate guarantees** and MUST NOT be collapsed into a single indicator — a message can be encrypted but unsigned, or signed but plaintext.
 
-| State                | Meaning                                                                    |
-| -------------------- | -------------------------------------------------------------------------- |
-| Encrypted            | Body was encrypted to the recipient's key. Says nothing about who sent it. |
-| Signed & verified    | Signature validates against the pinned key for this contact.               |
-| Encrypted & verified | Both of the above.                                                         |
-| Signature failed     | A signature was present and did not validate.                              |
-| Unprotected          | Neither.                                                                   |
+| State | Meaning |
+| --- | --- |
+| Encrypted | Body was encrypted end-to-end to the recipient's key. The server never held plaintext. |
+| Signed & verified | Signature validates against the pinned key for this contact. |
+| Encrypted & verified | Both of the above. |
+| Signature failed | A signature was present and did not validate. |
+| Protected at rest | Zero-access: the server encrypted the message on arrival and discarded the plaintext. |
+| Unprotected | None of the above. |
 
 **Signature failure MUST be visually distinct from unprotected**, not a muted variant of verified. A failed signature is a stronger negative signal than no signature at all, and rendering it as a lesser shade of success inverts its meaning.
+
+**Protected at rest MUST be visually distinct from Encrypted**, and MUST NOT be presented as a weaker shade of it. The two differ in kind, not degree: under zero-access the server held the plaintext for the duration of the delivery transaction and is trusted to have discarded it, whereas an end-to-end encrypted message never passed through the server in the clear. Interface copy MUST NOT describe a zero-access message as end-to-end encrypted.
 
 An unprotected message MUST NOT be styled as an error state. Most legitimate mail will be unprotected for the foreseeable future, and alarming users about ordinary correspondence trains them to ignore the indicator entirely.
 
@@ -669,17 +651,28 @@ These indicators also serve the enablement migration: a user who enables E2E aft
 
 ## Resolved Decisions
 
-| #   | Question                                      | Decision                                                                                                                               |
-| --- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Public CA enrolment for signing keys          | Yes, by default, automated via RFC 8823. Encryption keys stay on the internal CA.                                                      |
-| 2   | RFC 9788 header protection                    | Yes. `Subject` and `From` covered by the signature.                                                                                    |
-| 3   | Hash the local part on the discovery endpoint | Yes, SHA-256 + z-base32, following WKD.                                                                                                |
-| 4   | Migration for users enabling E2E later        | Handled by per-message security indicators rather than a migration process.                                                            |
-| 5   | Receipt transport between peers               | Standard RFC 8098 MDN with extension fields. No separate channel.                                                                      |
-| 6   | Encrypted search                              | Hybrid, server-side plus client-side index. Deterministic keyword hashing rejected. Separate design document required.                 |
-| 7   | Escrow disclosure to correspondents           | Yes, as a MUST on the discovery endpoint, documented as an honesty signal rather than a guarantee.                                     |
-| 8   | Key rotation push to federated peers          | Yes, via MDN extension fields, as a cache invalidation hint only. Never installs keys directly.                                        |
-| 9   | Escrow warning severity                       | Soft passive indicator by default; user-configurable escalation to a confirmation prompt.                                              |
-| 10  | Encryption policy granularity                 | Three states per tier — `automatic`, `optional`, `prohibited`. Two states conflate "not by default" with "not allowed".                |
-| 11  | Escrow boundary                               | eDiscovery/compliance role, not server administration. Multiple scopes, each with its own key and holders; a scope may have no escrow. |
-| 12  | Derived-entity inheritance vs. tier           | Inheritance follows the message's actual encryption state. Tier scoping governs automatic application only.                            |
+| # | Question | Decision |
+| --- | --- | --- |
+| 1 | Public CA enrolment for signing keys | Yes, by default, automated via RFC 8823. Encryption keys stay on the internal CA. |
+| 2 | RFC 9788 header protection | Yes. `Subject` and `From` covered by the signature. |
+| 3 | Hash the local part on the discovery endpoint | Yes, SHA-256 + z-base32, following WKD. |
+| 4 | Migration for users enabling E2E later | Handled by per-message security indicators rather than a migration process. |
+| 5 | Receipt transport between peers | Standard RFC 8098 MDN with extension fields. No separate channel. |
+| 6 | Encrypted search | Hybrid, server-side plus client-side index. Deterministic keyword hashing rejected. Separate design document required. |
+| 7 | Escrow disclosure to correspondents | Yes, as a MUST on the discovery endpoint, documented as an honesty signal rather than a guarantee. |
+| 8 | Key rotation push to federated peers | Yes, via MDN extension fields, as a cache invalidation hint only. Never installs keys directly. |
+| 9 | Escrow warning severity | Soft passive indicator by default; user-configurable escalation to a confirmation prompt. |
+| 10 | Encryption policy granularity | Three states per tier — `automatic`, `optional`, `prohibited`. Two states conflate "not by default" with "not allowed". |
+| 11 | Escrow boundary | eDiscovery/compliance role, not server administration. Multiple scopes, each with its own key and holders; a scope may have no escrow. |
+| 12 | Derived-entity inheritance vs. tier | Inheritance follows the message's actual encryption state. Tier scoping governs automatic application only. |
+| 13 | Zero-access encryption at rest | Adopted. A server-wide "Allow zero-access encryption" setting (administrator, default on) and a per-mailbox "Enable zero-access encryption" setting (owner only, default on). Covers the mail that can never be end-to-end encrypted. Specified in the search design document, which owns the delivery-path ordering. |
+| 14 | Zero-access vs. E2EE in the UI | Separate indicator states. A zero-access message MUST NOT be described as end-to-end encrypted. |
+| 15 | Search index key | None. The index is encrypted to a dedicated zero-access public key — a third keypair whose private key is wrapped under MK — because the server must write the index at delivery and cannot use a symmetric key. Old zero-access keys are retained on rotation, so nothing is re-encrypted. |
+
+## Deferred
+
+**Encrypted search design.** Owned by the companion search design document, which specifies zero-access encryption in the delivery path, the server-built encrypted index entries and client-compacted segments, and the client-side query model. Segment sizing and delivery-path build cost remain open measurements there; neither blocks this document.
+
+## Status
+
+All design questions raised against this document are resolved. The specification is ready for implementation review.

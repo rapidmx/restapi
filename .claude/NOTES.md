@@ -55,6 +55,28 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
+- **Zero-access encryption (ZAE), adopted 2026-10-22.** The authoritative design is `restapi/specs/search.md` §3 and §7, plus `specs/end-to-end_encryption.md`. Settled decisions; do not re-litigate:
+  - **Dedicated key.** Each mailbox gets its own keypair, `useType: "zero-access"`.
+    - Its private key is wrapped under MK, and its certificate comes from the internal CA.
+    - It is **never published**: neither the discovery endpoint nor the `RapidMX-Key` header includes it.
+    - On rotation the old private keys are retained.
+  - **Active only when all three hold:**
+    - `EncryptionPolicy.allowZeroAccess !== false` (admin, default on)
+    - `Mailbox.zeroAccessEnabled !== false` (**owner-only**, never admin-writable)
+    - a non-revoked zero-access key exists
+
+    If any one fails, behaviour is exactly as before ZAE. Shared mailboxes stay excluded until member key wraps land.
+  - **No plaintext at rest for an active mailbox, on any write path.** That covers delivery, rule copies, quarantine, Sent copies, drafts, import, EAS/MAPI and plugins.
+    - The server may see plaintext *inside a request*, but never persists it.
+    - Delivery for ZAE recipients runs inline before the 202. There is no `ingest/` spool; a failure returns 451.
+  - **Stored form.** Standard S/MIME (CMS EnvelopedData, ECDH P-256, AES-256-GCM via pkijs, the same construction as web-client `lib/crypto/smime.ts`) of the full original MIME.
+    - The subject and preview are replaced by `"[...]"` / `""` and carried in a sealed summary.
+    - `Message.encrypted` stays reserved for true E2E.
+  - **Index.** The server writes one sealed index entry per message, keyed by ISO week (UTC) of receipt time.
+    - Clients compact closed weeks into sealed SQLite FTS5 segments, with compare-and-swap on generation.
+    - The server never holds a readable index (it has no hot segment), and there is no symmetric index key.
+  - **Escrow** covers ZAE through the existing MK escrow wrap. Turning ZAE off never decrypts anything.
+
 ## Session Log
 
 ### 2026-09-06 — Repo split: `@rapidrest/mail` → four RapidMX packages
