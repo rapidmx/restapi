@@ -4368,7 +4368,7 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
   - Fields the edit leaves out are dropped, since the server can't read the old ones.
   - It returns 409 when the mailbox no longer has that key.
   - A client-sent `sealedContent` is stripped on create and update.
-- **Still open from Phase 6:** Source C (client segments for end-to-end mail). Pending entries of individually purged messages aren't removed; they are harmless (intersected with Source A), and a later compaction can drop them.
+- **Source C** is done client-side (web-client, 2026-10-23): the local index builder uploads `origin: "client"` segments of the end-to-end mail it decrypted, and every device imports them. No restapi change was needed. Pending entries of individually purged messages aren't removed; they are harmless (intersected with Source A), and a later compaction can drop them.
 
 ## 2026-10-23 - Zero-access encryption, Phase 7 (shared mailboxes)
 
