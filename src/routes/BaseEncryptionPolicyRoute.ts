@@ -11,7 +11,7 @@ const { Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorat
 
 /** The fixed, well-known identifier of the one `EncryptionPolicy` row this route ever reads/writes - same
  * singleton-row convention as `BaseBrandingRoute.ts`'s `BRANDING_UID`. */
-const ENCRYPTION_POLICY_UID = "encryption-policy";
+import { ENCRYPTION_POLICY_UID } from "../zeroaccess/ZeroAccessResolver.js";
 
 /** The wire shape of `EncryptionPolicy` - identical to the entity today, but kept as its own type (mirroring
  * `BaseBrandingRoute.ts`'s `PublicBranding`) so a future field this route shouldn't expose (e.g. internal

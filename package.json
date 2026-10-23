@@ -54,10 +54,12 @@
     "dependencies": {
         "@peculiar/x509": "^2.1.0",
         "acme-client": "^5.4.0",
+        "asn1js": "^3.0.10",
         "html-to-text": "^10.0.1",
         "htmlparser2": "^10.1.0",
         "mailparser": "^3.9.23",
         "nodemailer": "^10.0.13",
+        "pkijs": "^3.4.0",
         "pst-extractor": "^1.12.0",
         "sanitize-html": "^2.17.7",
         "semver": "^7.8.5"

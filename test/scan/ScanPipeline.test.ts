@@ -495,6 +495,31 @@ describe("ScanPipeline Tests", () => {
         });
     });
 
+    describe("run() - includeBodyText", () => {
+        beforeEach(() => {
+            (pipeline as any).spamScanProvider = spamScanProvider;
+            (pipeline as any).avScanProvider = avScanProvider;
+        });
+
+        it("Leaves bodyText out unless asked.", async () => {
+            expect((await pipeline.run(makePlainRawMessage(), makeEnvelope())).bodyText).toBeUndefined();
+        });
+
+        it("Is the whole text body, or the HTML body as text, but never an encrypted body.", async () => {
+            expect((await pipeline.run(makePlainRawMessage(), makeEnvelope(), { includeBodyText: true })).bodyText?.trim()).toBe("Just plain text, no HTML, no attachments.");
+            const html = await pipeline.run(makeStyledRawMessage(), makeEnvelope(), { includeBodyText: true });
+            expect(html.bodyText).toContain("Everything must go.");
+            expect(html.bodyText).not.toContain("<td");
+            expect((await pipeline.run(makeEncryptedRawMessage(), makeEnvelope(), { includeBodyText: true })).bodyText).toBeUndefined();
+        });
+
+        it("Converts the HTML part itself when the message has no text part, and is empty with neither.", async () => {
+            const parse = (pipeline as any).deriveBodyText.bind(pipeline);
+            expect(parse({ html: "<p>Only <b>HTML</b></p>" })).toContain("Only HTML");
+            expect(parse({ html: false })).toBe("");
+        });
+    });
+
     describe("run() - encrypted body detection", () => {
         beforeEach(() => {
             (pipeline as any).spamScanProvider = spamScanProvider;

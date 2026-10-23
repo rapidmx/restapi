@@ -15,3 +15,4 @@ export * from "./events/index.js";
 export * from "./shared.js";
 export * from "./util/index.js";
 export * from "./plugins/index.js";
+export * from "./zeroaccess/index.js";

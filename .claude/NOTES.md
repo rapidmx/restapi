@@ -4191,3 +4191,33 @@ Tests (targeted, `--coverage.enabled=false`):
 - `CertificateInstallUtils`.
 - EncryptionPolicy, KeyVault and Mailbox route suites, mongo and sql: 314 tests passing.
 - `yarn build` (lint) is clean.
+
+## 2026-10-22 - Zero-access encryption, Phase 2 (sealing primitive)
+
+- **New `src/zeroaccess/` module**, exported from the package index:
+  - **`ZeroAccessSealer`.** `sealToCertificate()` produces a CMS `EnvelopedData` with ECDH P-256 and AES-256-GCM, built with pkijs exactly as web-client's `smime.ts` `encryptForRecipients()` does.
+  - **`sealMessage()`.** Produces S/MIME `enveloped-data` whose encrypted content is the whole original MIME, byte for byte.
+    - The outer headers keep only From/Sender/To/Cc/Reply-To/Date/Message-ID/In-Reply-To/References, verbatim and with folding, plus `Subject: [...]` (RFC 9788's placeholder).
+    - Base64 is wrapped at 76 characters.
+  - **`sealSummary()` and `sealIndexDocument()`.** Both return base64; the index document is gzipped before it is encrypted.
+  - **`isoWeekId()`.** Returns the ISO 8601 week in UTC.
+- **`ZeroAccessIndexing.buildIndexDocument()`.** Extracts attachment text within a total time budget and a per-attachment size cap. Anything over either limit is listed in `deferredAttachments` for the client, never spooled. An attachment with no extractor is indexed by name only, as today.
+- **`ZeroAccessResolver`** is the repo-backed `zeroAccessStatus()`:
+  - `allowed()` reads the saved policy, else `mail:zero_access:allowed`.
+  - `hasDelegates()` is true when any ACL record that isn't the owner (uid compared canonically) or a `trusted_roles` role grants READ or FULL.
+  - `status()` and `target()` check in the pure function's order, querying the policy and ACL only when needed.
+  - `zeroAccessTargetFor(mailbox, fingerprint)` finds a key even once it's revoked, because mail already decided for a key is sealed to it.
+  - `ENCRYPTION_POLICY_UID` now lives here, and the policy route imports it.
+- **pkijs runs on an explicit engine.** It uses `new pkijs.CryptoEngine({ crypto: node:crypto webcrypto })`, passed to every call; pkijs's global engine is never set.
+- **Gotcha: there must be only ONE `asn1js` instance.**
+  - `yarn add pkijs` installed pkijs 3.4.3 with its own nested `asn1js` 3.1.0, alongside the top-level 3.0.10.
+  - Anything parsed with the top-level `asn1js.fromBER` (the certificate, the `ContentInfo`) then failed pkijs's `instanceof` checks inside `EnvelopedData`, and decryption threw `OperationError: The provided data is too small` (AES-GCM fed empty content).
+  - Fixed with `yarn dedupe asn1js`. Re-check after any pkijs or asn1js bump, here and in any consumer (server has pkijs 3.4.0 and asn1js 3.0.10 hoisted, from web-client).
+- **New entity `ZeroAccessIndexEntry`** (SQL and Mongo), indexed on (mailboxUid, weekId) and messageUid.
+  - Fields: `mailboxUid`, `messageUid`, `weekId`, `receivedAt`, `keyFingerprint`, `sealed`.
+  - `sealed` is stored inline (SQL `text`) rather than as a blob, because clients fetch entries in pages.
+- **`Message.zeroAccess?: { keyFingerprint, sealedSummary }`** (SQL simple-json, nullable). `encrypted` stays reserved for sender E2E.
+- **`ScanPipeline.run(..., { includeBodyText })`.** Adds `ScanPipelineResult.bodyText`: the whole body as text, capped at 1M characters. It is only computed when asked for.
+- **Cross-repo fixture.** web-client's `test/lib/crypto/fixtures/zeroAccessSealed.json` was generated with this sealer, and `zeroAccessSealedFixture.test.ts` there proves the client's existing `decryptEnvelopedDataWithKeys()` and `parseEncryptedMessageWithKeys()` open it.
+  - If the sealed format changes, regenerate it with a throwaway vitest file calling `sealMessage`, `sealSummary` and `sealIndexDocument`, and write it to that path.
+- **Open, needs a real device.** Do Outlook and iOS Mail accept AES-GCM inside `EnvelopedData`? RFC 5083 puts GCM in `AuthEnvelopedData`. This matters for the S/MIME passthrough (Phase 4). If they don't, switch to `AuthEnvelopedData` and teach web-client to read it.

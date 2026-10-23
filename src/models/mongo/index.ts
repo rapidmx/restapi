@@ -41,3 +41,4 @@ export * from "./SearchIndexStateMongo.js";
 export * from "./TaskListMongo.js";
 export * from "./TaskMongo.js";
 export * from "./TransportRuleMongo.js";
+export * from "./ZeroAccessIndexEntryMongo.js";

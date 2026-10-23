@@ -17,6 +17,9 @@ const { Config, Inject, Logger } = ObjectDecorators;
 /** The maximum length, in characters, of the plain-text body preview `ScanPipeline.run()` derives. */
 const BODY_PREVIEW_MAX_LENGTH = 500;
 
+/** How much of a body `includeBodyText` keeps - the same ceiling `SearchProvider` applies to an indexed document's text. */
+export const BODY_TEXT_MAX_LENGTH = 1_000_000;
+
 /** The per-attachment AV outcome, keyed by the attachment's position in the parsed message. */
 export interface ScanPipelineAttachmentResult {
     filename?: string;
@@ -52,6 +55,9 @@ export interface ScanPipelineResult {
      * `Message.bodyPreview` and to evaluate `MailFilterRule` body conditions. Never derived for an encrypted
      * body - see `encrypted`. */
     bodyPreview?: string;
+    /** The whole body as plain text, at most `BODY_TEXT_MAX_LENGTH` characters - only when `run()` was asked for it
+     * (`includeBodyText`), and never for an encrypted body. */
+    bodyText?: string;
     /** The message's parsed `From` address (e.g. `"Jane Doe <jane@x.com>"`), used to evaluate `MailFilterRule`
      * from conditions - the envelope-from (`ScanEnvelope.from`) is the SMTP `MAIL FROM`, which can legitimately
      * differ from this header. */
@@ -201,9 +207,14 @@ export class ScanPipeline {
     /**
      * Scans and parses `raw`. `options.skipPreview` leaves `bodyPreview` out: deriving it converts the whole HTML body to text
      * (about as costly as sanitizing it - some 40 ms per 200 KB on the main thread), which a caller that does not use it, like a
-     * send whose draft already has its own preview, should not pay for.
+     * send whose draft already has its own preview, should not pay for. `options.includeBodyText` adds `bodyText`, the whole
+     * body as plain text, for a zero-access delivery's index entry - the one caller that needs it.
      */
-    public async run(raw: Buffer, envelope: ScanEnvelope, options: { skipPreview?: boolean } = {}): Promise<ScanPipelineResult> {
+    public async run(
+        raw: Buffer,
+        envelope: ScanEnvelope,
+        options: { skipPreview?: boolean; includeBodyText?: boolean } = {},
+    ): Promise<ScanPipelineResult> {
         if (!this.spamScanProvider || !this.avScanProvider) {
             throw new Error(
                 "ScanPipeline requires both a SpamScanProvider and an AvScanProvider to be registered. " +
@@ -245,6 +256,7 @@ export class ScanPipeline {
         const deliveryStatusReport: DeliveryStatusReport | undefined = encrypted ? undefined : parseDeliveryStatusReport(parsed);
         const feedbackReport: FeedbackReport | undefined = encrypted ? undefined : parseFeedbackReport(parsed);
         const bodyPreview: string | undefined = encrypted || options.skipPreview ? undefined : this.derivePreview(parsed, deliveryStatusReport);
+        const bodyText: string | undefined = encrypted || !options.includeBodyText ? undefined : this.deriveBodyText(parsed);
         const parsedFrom: string | undefined = parsed.from?.text;
         const fromDisplayName: string | undefined = parseSenderDisplayName(parsed.from);
         const fromAddress: string | undefined = parsed.from?.value?.[0]?.address;
@@ -277,6 +289,7 @@ export class ScanPipeline {
             sanitizedHtml,
             subject: parsed.subject,
             bodyPreview,
+            bodyText,
             parsedFrom,
             fromDisplayName,
             headerRecipients,
@@ -307,6 +320,12 @@ export class ScanPipeline {
      * report says instead (`formatDeliveryStatusPreview()`, `util/DsnParser.ts`): its notification text opens with a page of boilerplate ("This is
      * the mail system at host ...") that would fill the preview before the reason for the failure is reached.
      */
+    /** The whole body as plain text (the text part, else the HTML part converted), at most `BODY_TEXT_MAX_LENGTH` characters. */
+    private deriveBodyText(parsed: ParsedMail): string {
+        const text: string = parsed.text || (typeof parsed.html === "string" ? htmlPreview(parsed.html, BODY_TEXT_MAX_LENGTH) : "");
+        return text.slice(0, BODY_TEXT_MAX_LENGTH);
+    }
+
     private derivePreview(parsed: ParsedMail, deliveryStatusReport: DeliveryStatusReport | undefined): string | undefined {
         if (deliveryStatusReport) {
             return formatDeliveryStatusPreview(deliveryStatusReport).slice(0, BODY_PREVIEW_MAX_LENGTH);

@@ -17,6 +17,7 @@ import {
     MessageImportance,
     MessageReceiptEntry,
     MessageReportKind,
+    MessageZeroAccess,
     Recipient,
     RecipientType,
 } from "../types.js";
@@ -188,6 +189,11 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     @Column()
     @Description("`true` if this message's body is S/MIME (CMS) encrypted.")
     public encrypted: boolean = false;
+
+    @Column()
+    @Description("Set when this message is stored zero-access encrypted: the key it is encrypted to and its sealed subject and preview.")
+    @Nullable
+    public zeroAccess?: MessageZeroAccess = undefined;
 
     @Column()
     @Description("The unique identifier of this message's `ScanResult`, once scanning has completed.")
@@ -386,6 +392,7 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.hasAttachments = other.hasAttachments !== undefined ? other.hasAttachments : this.hasAttachments;
             this.labelUids = other.labelUids !== undefined ? other.labelUids : this.labelUids;
             this.encrypted = other.encrypted !== undefined ? other.encrypted : this.encrypted;
+            this.zeroAccess = "zeroAccess" in other ? other.zeroAccess : this.zeroAccess;
             this.scanResultUid = "scanResultUid" in other ? other.scanResultUid : this.scanResultUid;
             this.searchIndexedAt = "searchIndexedAt" in other ? other.searchIndexedAt : this.searchIndexedAt;
             this.searchIndexAttempts = "searchIndexAttempts" in other ? other.searchIndexAttempts : this.searchIndexAttempts;

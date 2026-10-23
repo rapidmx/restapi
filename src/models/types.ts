@@ -1004,6 +1004,61 @@ export interface MessageReceiptEntry {
  *
  * @author Jean-Philippe Steinmetz
  */
+/** The zero-access state of a stored message - see `Message.zeroAccess`. */
+export interface MessageZeroAccess {
+    /** Fingerprint of the mailbox zero-access key the message, its sealed summary and its index entry are encrypted to. */
+    keyFingerprint: string;
+    /** Base64 DER CMS `EnvelopedData` of the JSON `ZeroAccessSummary`, to the same key. */
+    sealedSummary: string;
+}
+
+/** What `MessageZeroAccess.sealedSummary` decrypts to: what a message list shows, which the row itself holds only as
+ * placeholders. */
+export interface ZeroAccessSummary {
+    subject: string;
+    preview: string;
+}
+
+/**
+ * One zero-access message's search index entry (`specs/search.md` §7, Source B): the text the server extracted from the
+ * message while it held the plaintext, encrypted to the mailbox's zero-access key. Clients fetch a week's entries, decrypt
+ * them and index them locally; once a week has closed, a client compacts them into a segment and they are deleted.
+ */
+export interface ZeroAccessIndexEntry extends BaseEntity {
+    mailboxUid: string;
+    /** The `Message` the entry indexes. */
+    messageUid: string;
+    /** ISO week (UTC) of `receivedAt`, e.g. `2026-W43` - the segment the entry is compacted into. */
+    weekId: string;
+    /** When the message was received (or, for backfilled and imported mail, its original date). */
+    receivedAt: Date;
+    /** Fingerprint of the zero-access key `sealed` is encrypted to. */
+    keyFingerprint: string;
+    /** Base64 DER CMS `EnvelopedData` of the gzipped JSON `ZeroAccessIndexDocument`. */
+    sealed: string;
+}
+
+/** What `ZeroAccessIndexEntry.sealed` decrypts (and gunzips) to - the same fields a client's local index stores per message. */
+export interface ZeroAccessIndexDocument {
+    /** Format version, so a client can decline an entry it doesn't understand. */
+    v: 1;
+    messageUid: string;
+    subject: string;
+    body: string;
+    /** Text extracted from each attachment the server could read within its budget. */
+    attachmentText: string[];
+    attachmentNames: string[];
+    /** Names of attachments not extracted on the server (over the size or time budget, or no extractor): a client extracts these. */
+    deferredAttachments: string[];
+    from: string;
+    to: string[];
+    cc: string[];
+    /** Every sender and recipient address and display name, for free-text matching. */
+    participants: string[];
+    /** Epoch ms used to order results. */
+    dateForSort: number;
+}
+
 export interface Message extends RecoverableBaseEntity {
     /** The unique identifier of the `Folder` this message currently resides in. */
     folderUid: string;
@@ -1121,6 +1176,12 @@ export interface Message extends RecoverableBaseEntity {
      * derived-entity creation from an encrypted calendar invite) key off of this rather than re-deriving it
      * themselves, since by the time they run the original `ScanPipelineResult` is long gone. */
     encrypted: boolean;
+
+    /** Set when this message is stored zero-access encrypted (`specs/search.md` §3): its `bodyBlobKey` holds an S/MIME
+     * `EnvelopedData` of the original MIME addressed to the mailbox's zero-access key, `subject` and `bodyPreview` are
+     * placeholders, and the real ones are in `sealedSummary`. Unset for a message stored as it arrived. Distinct from
+     * `encrypted`, which means the *sender* encrypted it end to end. */
+    zeroAccess?: MessageZeroAccess;
 
     /** The unique identifier of this message's `ScanResult`, once scanning has completed. */
     scanResultUid?: string;
