@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Added
+
+- **Zero-access encryption** (`specs/search.md` §3/§7-8/§16, `specs/end-to-end_encryption.md`) - mail at rest is encrypted to a dedicated per-mailbox key whose private half only the mailbox's users hold, so administrators, storage and backup copies, and impersonation can no longer read it. The server still sees each message while it delivers it (scanning, filter rules, iTIP), then seals it and keeps no readable copy.
+  - **Keys.** A never-published `useType: "zero-access"` key, issued by the internal CA and stored on `Mailbox.zeroAccessKeys`; its private key sits in the `KeyVault` under the master key like the others. `ZeroAccessUtils.isActive()` decides per mailbox: the global `EncryptionPolicy.allowZeroAccess` (default on, `mail:zero_access:allowed`), the owner-only `Mailbox.zeroAccessEnabled` (default on), and a zero-access key. A mailbox without a key is stored as before.
+  - **Sealing.** `ZeroAccessSealer` writes standard CMS `EnvelopedData` (ECDH P-256, AES-256-GCM) of the full original MIME to a per-mailbox `za/<mailbox>/<uid>` blob, with subject and preview in `Message.zeroAccess.sealedSummary` (the stored subject is `[...]`). A zero-access recipient is processed inside the ingest request from the raw message in memory, with no plaintext spool; a sealing failure answers `451`. `ZeroAccessWriter` seals every other writer: Sent copies, imports, scheduled sends, and drafts (`sealDraft`).
+  - **Readers.** `GET /content` answers `409 zero_access` (clients read `/raw` and decrypt); Source A indexes metadata only; `/report` learns from the client's decrypted copy; push payloads and the mail event stream carry envelope fields only; calendar events derived from sealed mail seal their title, location and description.
+  - **Search index.** One sealed index entry per message; `BaseZeroAccessIndexRoute` (`/mail/mailboxes/:id/search-index`) serves the manifest, pending entries and per-week segments, and takes client-compacted segments with a generation check. Segment format v1 is a sealed, gzipped JSON bundle; client-built (`origin: "client"`) segments carry end-to-end mail.
+  - **Existing mail.** `ZeroAccessBackfillJob` seals what a mailbox already had, newest first.
+  - **Escrow.** An escrow release (`/material`) now also returns the wrapped zero-access and encryption private keys with their certificates (never the signing key), and for a mailbox without an owner its zero-access keys wrapped straight to the scope (`KeyVault.zeroAccessEscrowWraps`, `PUT /:id/keyvault/escrow-wraps`).
+  - **Shared mailboxes.** `KeyVault.memberKeyWraps` wraps a shared mailbox's zero-access private key to each member's own zero-access certificate, with routes for the members' status, their own wraps, fulfilling and removing wraps, and provisioning a mailbox-without-an-owner's key (`/:id/keyvault/members`, `member-wraps`, `shared-zero-access-key`).
+  - **Key export.** `POST /:id/keyvault/exports` audits an "Export keys for Outlook/phone" file (key kinds and fingerprints only).
+
+### Changed
+
+- **Features that need the server to read mail no longer apply to a zero-access mailbox** once it has a key: filter rules after delivery, server-side content search, server assemble/quote of a draft, admin quarantine preview and retrospective AV. Turning the global switch off makes new mail readable again; already-sealed mail stays sealed, since the server can't decrypt it.
+
 ## v0.33.0
 
 ### Added
