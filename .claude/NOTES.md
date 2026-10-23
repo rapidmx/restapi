@@ -4286,3 +4286,12 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
 - **Still open in Phase 4:** drafts (seal on save, plus client-side assembly and `send-raw`), the calendar invite endpoints that re-read raw ICS, `/report` (spam learn), data-export notes, and the activesync/mapi/booking-plugin writers (these need this restapi published first).
 - **SQL job tests register their own datasource models.** `MailboxImportJobSQL.test.ts` and `ScheduledSendJobSQL.test.ts` now register `EncryptionPolicySQL` and `ZeroAccessIndexEntrySQL` (and `AttachmentSQL` for the send job). Without them, every import fails with `No metadata for "EncryptionPolicySQL"`. Any new SQL job test whose job builds a `ZeroAccessWriter` needs them too.
 - The background-send test waits for the whole sealed-copy check, because the job files the sealed copy before it removes the draft's plaintext.
+
+## 2026-10-22 - Zero-access encryption, Phase 4 (key export audit)
+
+- **`POST /mailbox/:id/keyvault/exports`** (`BaseKeyVaultRoute.recordExport()`) records `AuditAction.KEY_VAULT_EXPORT` (`key_vault.export`) for web-client's "Export keys for Outlook/phone". The PKCS#12 is built entirely in the client, so this is the server's only part.
+  - It is owner-only (`requireMailboxOwner()`), like every vault operation.
+  - The body is `{ keys: [{ kind: "zero-access" | "encrypt" | "sign", fingerprint }] }`, with 1 to 43 entries (`MAX_EXPORTED_KEYS`).
+  - Each key must be on `Mailbox.keys` or `Mailbox.zeroAccessKeys` under that kind, so the audit log never records a fingerprint the mailbox doesn't own.
+  - Only `kind` and `fingerprint` are stored in `details`.
+- The client won't hand over the file unless this call succeeds.

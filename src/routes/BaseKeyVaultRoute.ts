@@ -158,6 +158,15 @@ const MAX_WRAP_FIELD_LENGTH = 8192;
 const MAX_ENROLLED_KEYS = 50;
 const MAX_MASTER_KEY_WRAPS = 20;
 
+/** The most keys one `recordExport()` call may list: the client's cap of 21 zero-access and 21 encryption keys, plus a signing key. */
+const MAX_EXPORTED_KEYS = 43;
+const EXPORTED_KEY_KINDS: readonly string[] = ["zero-access", "encrypt", "sign"];
+
+/** `POST /mailbox/:id/keyvault/exports`: the keys an "Export keys for Outlook/phone" file held (see `recordExport()`). */
+export interface KeyExportRecord {
+    keys: { kind: "zero-access" | "encrypt" | "sign"; fingerprint: string }[];
+}
+
 /**
  * Validates a client-supplied `MasterKeyWrap` shape before it's persisted - `addMasterKeyWrap()`/`rekey()`
  * previously accepted the request body completely unvalidated (no `method` check, no field presence/type/size
@@ -1041,6 +1050,41 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         );
 
         return toPublicKeyVault(updated, mailbox);
+    }
+
+    /**
+     * `POST /mailbox/:id/keyvault/exports` - records that the owner exported private keys from their vault ("Export keys for
+     * Outlook/phone", `specs/search.md` §3). The export itself happens entirely in the client from a fresh master-password
+     * unlock; this only writes the `KEY_VAULT_EXPORT` audit entry, with the kind and fingerprint of each exported key and
+     * nothing else. Owner-only like every vault operation, and only for keys this mailbox actually has, so the audit log never
+     * records a fingerprint the mailbox doesn't own. The client won't hand over the file until this succeeds.
+     */
+    @Post("/:id/keyvault/exports")
+    public async recordExport(@Param("id") mailboxId: string, body: KeyExportRecord, @AuthUser user?: JWTUser): Promise<void> {
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        this.requireMailboxOwner(mailbox, user);
+
+        const keys: KeyExportRecord["keys"] = Array.isArray(body?.keys) ? body.keys : [];
+        if (keys.length === 0 || keys.length > MAX_EXPORTED_KEYS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `keys must list between 1 and ${MAX_EXPORTED_KEYS} exported keys.`);
+        }
+        const known: Set<string> = new Set([...(mailbox.keys ?? []), ...(mailbox.zeroAccessKeys ?? [])].map((k) => `${k.useType}:${k.fingerprint}`));
+        for (const key of keys) {
+            if (!EXPORTED_KEY_KINDS.includes(key?.kind) || typeof key.fingerprint !== "string" || !known.has(`${key.kind}:${key.fingerprint}`)) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "keys must name this mailbox's own zero-access, encryption or signing keys.");
+            }
+        }
+
+        await this.auditLogUtils!.record(
+            {
+                action: AuditAction.KEY_VAULT_EXPORT,
+                targetType: "KeyVault",
+                targetUid: mailbox.uid,
+                mailboxUid: mailbox.uid,
+                details: { keys: keys.map(({ kind, fingerprint }) => ({ kind, fingerprint })) },
+            },
+            { user },
+        );
     }
 
     /**

@@ -604,6 +604,78 @@ describe("Route:KeyVaultSQL Tests", () => {
         });
     });
 
+    describe("POST /:id/keyvault/exports", () => {
+        const key = (useType: string, fingerprint: string) => ({ publicKey: "cert", type: "x509", useType, fingerprint, notBefore: 0, notAfter: 1 });
+        const withKeys = async () => {
+            const mailbox: any = await createMailbox();
+            mailbox.keys = [key("encrypt", "fp-enc"), key("sign", "fp-sign")];
+            mailbox.zeroAccessKeys = [key("zero-access", "fp-za")];
+            return await mailboxRepo.save(mailbox);
+        };
+
+        it("Records the owner's export of their own keys in the audit log, with only each key's kind and fingerprint.", async () => {
+            const mailbox = await withKeys();
+            const keys = [
+                { kind: "zero-access", fingerprint: "fp-za" },
+                { kind: "encrypt", fingerprint: "fp-enc" },
+                { kind: "sign", fingerprint: "fp-sign" },
+            ];
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/exports`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ keys: keys.map((k) => ({ ...k, extra: "dropped" })) });
+
+            expect(result.status).toBeLessThan(300);
+            const entries: any[] = await auditLogRepo.find({ where: { action: AuditAction.KEY_VAULT_EXPORT } });
+            expect(entries).toHaveLength(1);
+            expect(entries[0].details).toEqual({ keys });
+            expect(entries[0].mailboxUid).toBe(mailbox.uid);
+        });
+
+        it("Refuses a delegate, another user and an administrator (403).", async () => {
+            const mailbox = await withKeys();
+            for (const token of [delegateToken, otherUserToken, adminToken]) {
+                const result = await request(server.getApplication())
+                    .post(`${baseUrl}/${mailbox.uid}/keyvault/exports`)
+                    .set("Authorization", "jwt " + token)
+                    .send({ keys: [{ kind: "zero-access", fingerprint: "fp-za" }] });
+                expect(result.status).toBe(403);
+            }
+            expect(await auditLogRepo.find({ where: { action: AuditAction.KEY_VAULT_EXPORT } })).toHaveLength(0);
+        });
+
+        it("Refuses (400) an empty list, a key the mailbox doesn't have, and a fingerprint under the wrong kind.", async () => {
+            const mailbox = await withKeys();
+            for (const body of [
+                {},
+                { keys: [] },
+                { keys: [{ kind: "zero-access", fingerprint: "unknown" }] },
+                { keys: [{ kind: "encrypt", fingerprint: "fp-za" }] },
+                { keys: [{ kind: "master", fingerprint: "fp-za" }] },
+                { keys: [{ kind: "zero-access", fingerprint: 7 }] },
+                { keys: [null] },
+                { keys: Array.from({ length: 44 }, () => ({ kind: "zero-access", fingerprint: "fp-za" })) },
+            ]) {
+                const result = await request(server.getApplication())
+                    .post(`${baseUrl}/${mailbox.uid}/keyvault/exports`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .send(body);
+                expect(result.status).toBe(400);
+            }
+            expect(await auditLogRepo.find({ where: { action: AuditAction.KEY_VAULT_EXPORT } })).toHaveLength(0);
+        });
+
+        it("Refuses a mailbox with no keys at all (400).", async () => {
+            const mailbox = await createMailbox();
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}/${mailbox.uid}/keyvault/exports`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ keys: [{ kind: "zero-access", fingerprint: "fp-za" }] });
+            expect(result.status).toBe(400);
+        });
+    });
+
     describe("POST /:id/keyvault/wraps and DELETE /:id/keyvault/wraps/:method", () => {
         const enrollFirstKey = async function (mailbox: MailboxSQL): Promise<void> {
             await request(server.getApplication())

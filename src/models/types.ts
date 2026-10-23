@@ -1914,6 +1914,10 @@ export enum AuditAction {
     /** `GET /mailbox/:id/keyvault` - the one key-vault operation that reads wrapped key material (including,
      * via `masterKeyWraps`, an escrow wrap) rather than writing it. See `BaseKeyVaultRoute.get()`. */
     KEY_VAULT_READ = "key_vault.read",
+    /** `POST /mailbox/:id/keyvault/exports` - the owner exported private keys to a PKCS#12 file in their client ("Export keys for
+     * Outlook/phone"). `details.keys` lists each exported key's `kind` and `fingerprint`; the file never reaches the server. See
+     * `BaseKeyVaultRoute.recordExport()`. */
+    KEY_VAULT_EXPORT = "key_vault.export",
     /** `POST /mailbox/:id/keys/trust` pinned a signer certificate on a contact by hand ("Trust this signer"). `details`
      * carries the `address` and the certificate `fingerprint`. See `BaseKeyLookupRoute.trust()`. */
     CONTACT_KEY_TRUSTED = "contact.key_trusted",
