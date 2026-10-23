@@ -4,10 +4,13 @@
 ///////////////////////////////////////////////////////////////////////////////
 import config from "../../config.js";
 import { ConnectionManager, MongoConnection, MongoRepository, ObjectFactory, Server } from "@rapidrest/service-core";
-import { Logger } from "@rapidrest/core";
+import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { MongoMemoryServer } from "mongodb-memory-server";
+import { AttachmentMongo } from "../../../src/models/mongo/AttachmentMongo.js";
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
+import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
+import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
 import { EncryptionPolicyMongo } from "../../../src/models/mongo/EncryptionPolicyMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { TransportRuleMongo } from "../../../src/models/mongo/TransportRuleMongo.js";
@@ -110,5 +113,26 @@ describe("Zero-access delivery (Mongo)", () => {
         attachments: () => repos.AttachmentMongo.find({}).toArray(),
         calendarEvents: () => repos.CalendarEventMongo.find({}).toArray(),
         createCalendarEvent: async (data) => repos.CalendarEventMongo.save(new CalendarEventMongo(data)),
+        messagesUrl: "/mongo/messages",
+        tokenFor: (uid) => JWTUtils.createTokenSync(config.get("auth"), { uid, roles: [] } as any),
+        createFolder: async (mailboxUid, type) => {
+            const folder = await repos.FolderMongo.save(new FolderMongo({ mailboxUid, name: type, type: type as any, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }));
+            await repos.AccessControlListMongo.save({ uid: folder.uid, dateCreated: new Date(), dateModified: new Date(), version: 0, records: [], parentUid: mailboxUid });
+            return folder;
+        },
+        createMessage: async (data) =>
+            repos.MessageMongo.save(
+                new MessageMongo({
+                    messageId: `${uuid.v4()}@example.com`,
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    flags: { read: false, flagged: false, answered: false, forwarded: false },
+                    importance: "normal" as any,
+                    references: [],
+                    ...data,
+                }),
+            ),
+        createAttachment: async (data) => repos.AttachmentMongo.save(new AttachmentMongo(data)),
+        findMessage: (uid) => repos.MessageMongo.findOne({ uid } as any),
     });
 });

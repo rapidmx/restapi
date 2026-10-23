@@ -18,6 +18,9 @@ import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
+import { AttachmentSQL } from "../../../src/models/sql/AttachmentSQL.js";
+import { EncryptionPolicySQL } from "../../../src/models/sql/EncryptionPolicySQL.js";
+import { ZeroAccessIndexEntrySQL } from "../../../src/models/sql/ZeroAccessIndexEntrySQL.js";
 import { FolderType, MessageImportance, RecipientType } from "../../../src/models/types.js";
 import { boundIndexedValue } from "../../../src/util/ConversationUtils.js";
 
@@ -91,6 +94,9 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         models.set("MailboxSQL", MailboxSQL);
         models.set("MessageSQL", MessageSQL);
         models.set("CorrespondentSQL", CorrespondentSQL);
+        models.set("AttachmentSQL", AttachmentSQL);
+        models.set("EncryptionPolicySQL", EncryptionPolicySQL);
+        models.set("ZeroAccessIndexEntrySQL", ZeroAccessIndexEntrySQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");

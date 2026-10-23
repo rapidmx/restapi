@@ -31,7 +31,7 @@ describe("ZeroAccessResolver", () => {
         it("reads the saved policy row, falling back to the server default when the row or the field is missing", async () => {
             const saved = resolver({ policy: { allowZeroAccess: false } });
             expect(await saved.resolver.allowed()).toBe(false);
-            expect(saved.policyRepo.findOne).toHaveBeenCalledWith(ENCRYPTION_POLICY_UID, { ignoreACL: true });
+            expect(saved.policyRepo.findOne).toHaveBeenCalledWith(ENCRYPTION_POLICY_UID, { ignoreACL: true, skipCache: true });
 
             expect(await resolver({ policy: { allowZeroAccess: null } }).resolver.allowed()).toBe(true);
             expect(await resolver({ allowedDefault: false }).resolver.allowed()).toBe(false);

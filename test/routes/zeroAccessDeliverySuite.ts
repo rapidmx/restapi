@@ -39,6 +39,15 @@ export interface ZeroAccessDeliverySuiteContext {
     calendarEvents: () => Promise<any[]>;
     /** Saves a `CalendarEvent` row with these fields over the backend's defaults. */
     createCalendarEvent: (data: any) => Promise<any>;
+    /** The messages route, e.g. `/mongo/messages`. */
+    messagesUrl: string;
+    /** A token for `uid`. */
+    tokenFor: (uid: string) => string;
+    /** A folder of `mailboxUid`, with the access list the message route expects. */
+    createFolder: (mailboxUid: string, type: string) => Promise<any>;
+    createMessage: (data: any) => Promise<any>;
+    createAttachment: (data: any) => Promise<any>;
+    findMessage: (uid: string) => Promise<any>;
 }
 
 interface Recipient {
@@ -381,6 +390,93 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
             expect(event.location ?? undefined).toBeUndefined();
             expect(event.description ?? undefined).toBeUndefined();
             expect(new Date(event.startDate).toISOString()).toBe("2026-11-01T12:00:00.000Z");
+        });
+
+        describe("Sent Items copies", () => {
+            /** A draft from `mailbox` with a body blob and one attachment blob holding the canaries. */
+            const draft = async (mailbox: any) => {
+                // The owner's own record, as a created mailbox has: what the message route checks a send against.
+                await ctx.setAcl(mailbox.uid, [{ userOrRoleId: mailbox.ownerUserUid, actions: [ACLAction.FULL] }]);
+                const drafts = await ctx.createFolder(mailbox.uid, "drafts");
+                const bodyBlobKey = `bodies/${Math.random().toString(16).slice(2)}`;
+                await ctx.blobStore().put(
+                    bodyBlobKey,
+                    Buffer.from(`From: ${mailbox.primarySmtpAddress}\r\nTo: carol@example.org\r\nSubject: ${CANARY_SUBJECT}\r\n\r\n${CANARY_BODY}\r\n`),
+                );
+                const message = await ctx.createMessage({
+                    mailboxUid: mailbox.uid,
+                    folderUid: drafts.uid,
+                    subject: CANARY_SUBJECT,
+                    bodyPreview: CANARY_BODY,
+                    from: { address: mailbox.primarySmtpAddress, type: "to" },
+                    recipients: [{ address: "carol@example.org", type: "to" }],
+                    bodyBlobKey,
+                    hasAttachments: true,
+                });
+                const attachmentBlobKey = `attachments/${Math.random().toString(16).slice(2)}`;
+                await ctx.blobStore().put(attachmentBlobKey, Buffer.from(CANARY_ATTACHMENT));
+                await ctx.createAttachment({ messageUid: message.uid, folderUid: drafts.uid, mailboxUid: mailbox.uid, filename: "minutes.txt", mimeType: "text/plain", sizeBytes: 22, blobKey: attachmentBlobKey });
+                return { message, bodyBlobKey, attachmentBlobKey };
+            };
+
+            const expectSealedSentCopy = async (uid: string, recipient: Recipient, plaintextKeys: string[]) => {
+                const filed = await ctx.findMessage(uid);
+                expect(filed.subject).toBe("[...]");
+                expect(filed.bodyPreview).toBe("");
+                expect(filed.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                expect(filed.bodyBlobKey).toBe(`za/${filed.mailboxUid}/${uid}`);
+                const original = (await openSealedMessage(await ctx.blobStore().get(filed.bodyBlobKey), recipient)).toString("latin1");
+                expect(original).toContain(CANARY_BODY);
+                expect(await ctx.attachments()).toEqual([]);
+                for (const key of plaintextKeys) {
+                    expect(await ctx.blobStore().exists(key)).toBe(false);
+                }
+                expect((await ctx.indexEntries()).map((entry) => entry.messageUid)).toEqual([uid]);
+            };
+
+            it("seals the Sent Items copy of a message sent now, and removes the draft's plaintext body and attachments", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const { message, bodyBlobKey, attachmentBlobKey } = await draft(mailbox);
+
+                const result = await request(ctx.app())
+                    .post(`${ctx.messagesUrl}/${message.uid}/send`)
+                    .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                    .send({});
+
+                expect(result.status).toBeLessThan(300);
+                await expectSealedSentCopy(message.uid, recipient, [bodyBlobKey, attachmentBlobKey]);
+            });
+
+            it("seals the Sent Items copy of a message sent in the background", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const { message, bodyBlobKey, attachmentBlobKey } = await draft(mailbox);
+
+                const result = await request(ctx.app())
+                    .post(`${ctx.messagesUrl}/${message.uid}/send`)
+                    .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                    .send({ background: true });
+
+                expect(result.status).toBeLessThan(300);
+                // The job files the sealed copy before it removes the draft's plaintext, so wait for both.
+                await vi.waitFor(() => expectSealedSentCopy(message.uid, recipient, [bodyBlobKey, attachmentBlobKey]), { timeout: 10_000, interval: 50 });
+            }, 20_000);
+
+            it("files the Sent Items copy of a mailbox without zero-access as before", async () => {
+                const mailbox = await ctx.createMailbox();
+                const { message, bodyBlobKey } = await draft(mailbox);
+
+                await request(ctx.app())
+                    .post(`${ctx.messagesUrl}/${message.uid}/send`)
+                    .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                    .send({});
+
+                const filed = await ctx.findMessage(message.uid);
+                expect(filed.zeroAccess ?? undefined).toBeUndefined();
+                expect(filed.bodyBlobKey).toBe(bodyBlobKey);
+                expect(await ctx.attachments()).toHaveLength(1);
+            });
         });
 
         it("keeps sealing a retried transaction even after zero-access was turned off in between", async () => {

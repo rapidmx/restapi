@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import config from "../../config.sql.js";
 import { AccessControlListSQL, ConnectionManager, isSqlDataSource, ObjectFactory, Server } from "@rapidrest/service-core";
-import { Logger } from "@rapidrest/core";
+import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import { AttachmentSQL } from "../../../src/models/sql/AttachmentSQL.js";
@@ -108,5 +108,26 @@ describe("Zero-access delivery (SQL)", () => {
         attachments: () => repo(AttachmentSQL).find(),
         calendarEvents: () => repo(CalendarEventSQL).find(),
         createCalendarEvent: async (data) => repo(CalendarEventSQL).save(new CalendarEventSQL(data)),
+        messagesUrl: "/sql/messages",
+        tokenFor: (uid) => JWTUtils.createTokenSync(config.get("auth"), { uid, roles: [] } as any),
+        createFolder: async (mailboxUid, type) => {
+            const folder = await repo(FolderSQL).save(new FolderSQL({ mailboxUid, name: type, type: type as any, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }));
+            await aclRepo.save({ uid: folder.uid, dateCreated: new Date(), dateModified: new Date(), version: 0, records: [], parentUid: mailboxUid } as any);
+            return folder;
+        },
+        createMessage: async (data) =>
+            repo(MessageSQL).save(
+                new MessageSQL({
+                    messageId: `${uuid.v4()}@example.com`,
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    flags: { read: false, flagged: false, answered: false, forwarded: false },
+                    importance: "normal" as any,
+                    references: [],
+                    ...data,
+                }),
+            ),
+        createAttachment: async (data) => repo(AttachmentSQL).save(new AttachmentSQL(data)),
+        findMessage: (uid) => repo(MessageSQL).findOne({ where: { uid } }),
     });
 });

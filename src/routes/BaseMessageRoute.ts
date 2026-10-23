@@ -66,11 +66,13 @@ import {
     MessageClassification,
     MessageFlags,
     MessageReceiptEntry,
+    MessageZeroAccess,
     MessageReportKind,
     Matter,
     Recipient,
     RecipientType,
 } from "../models/types.js";
+import { newZeroAccessWriter, ZeroAccessWriter, type ZeroAccessSealedFields } from "../zeroaccess/ZeroAccessWriter.js";
 const { Config, Init, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Delete, Get, Param, Post, Put, Query, RateLimit, Request, Response, User: AuthUser } = RouteDecorators;
@@ -139,6 +141,9 @@ export interface ConversationSummary {
     latestFrom: Recipient;
     /** The most recent message's `bodyPreview` - the snippet a collapsed conversation row shows. */
     latestPreview: string;
+    /** The most recent message's `zeroAccess` when it is sealed at rest: its subject and preview are only in `sealedSummary`, which a client
+     * opens with the mailbox's zero-access key (`subject` and `latestPreview` are then placeholders). */
+    latestZeroAccess?: MessageZeroAccess;
     /** The most recent message's `folderUid`, so a collapsed row can show where the conversation last moved. */
     latestFolderUid: string;
     /** The most recent message's `meetingMethod` (the iTIP `METHOD` of the calendar file it carries), so a collapsed conversation row can show
@@ -310,6 +315,7 @@ function summarizeConversation(conversationId: string, messages: Message[]): Con
         latestMessageUid: latest.uid,
         latestFrom: latest.from,
         latestPreview: latest.bodyPreview,
+        ...(latest.zeroAccess ? { latestZeroAccess: latest.zeroAccess } : {}),
         latestFolderUid: latest.folderUid,
         latestMeetingMethod: latest.meetingMethod,
         latestMeetingResponse: latest.meetingResponse,
@@ -438,6 +444,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     /** Supplied by the Mongo/SQL concrete subclasses so `setVerificationSeal()` can read the mailbox's `KeyVault`
      * master key generation without depending on either backend directly. */
     protected abstract keyVaultClass: any;
+
+    /** The `EncryptionPolicy` and `ZeroAccessIndexEntry` model classes, supplied by the Mongo/SQL subclasses: a sent message's Sent
+     * Items copy is sealed when the sending mailbox has zero-access encryption on. Left unset, it is filed as before. */
+    protected encryptionPolicyClass?: any;
+    protected zeroAccessIndexEntryClass?: any;
+    protected zeroAccessWriter?: ZeroAccessWriter;
 
     /** Supplied by the Mongo/SQL concrete subclasses: the `ScheduledSendJob` that relays a message queued by a background send
      * (`POST /:id/send` with `{ background: true }`). Left unset (a downstream subclass that predates it), a background send
@@ -569,6 +581,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 args: [this.attachmentClass],
             });
         }
+        this.zeroAccessWriter ??= await newZeroAccessWriter(this._objectFactory, this.encryptionPolicyClass, this.zeroAccessIndexEntryClass);
         if (!this.auditLogRepo && this.auditLogClass) {
             this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.auditLogClass.name,
@@ -1489,6 +1502,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // recipient appearing twice (e.g. a case-variant duplicate across To/Cc) doesn't seed two rows that
         // `processReceipt()`'s `findIndex()` could only ever update the first of.
         const receiptStatus: MessageReceiptEntry[] | undefined = attachesReceiptRequest ? seedReceiptStatus(envelopeTo) : undefined;
+        // The Sent Items copy of a zero-access mailbox is sealed like delivered mail (restapi `specs/search.md` §3) - not one the sender
+        // already encrypted end to end, which is ciphertext already (encrypted to the sender too).
+        const sealed: ZeroAccessSealedFields | undefined = encrypted ? undefined : await this.sealSentCopy(current, relayedRaw);
+        const sealedFields = sealed
+            ? { subject: sealed.subject, bodyPreview: sealed.bodyPreview, bodyBlobKey: sealed.bodyBlobKey, zeroAccess: sealed.zeroAccess, sanitizedHtmlBlobKey: null }
+            : {};
 
         // `messageId`/`conversationId` come from the relayed MIME and are written as a patch (no model constructor), so
         // they are bounded here - see `boundIndexedValue()`. The same patch rewrites `flags`, so the denormalized list
@@ -1499,7 +1518,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 version: (current as any).version,
                 folderUid: sentFolder.uid,
                 flags,
-                ...deriveMessageListFields({ ...current, flags }),
+                ...deriveMessageListFields({ ...current, flags, ...(sealed ? { subject: sealed.subject, bodyPreview: sealed.bodyPreview } : {}) }),
                 sanitizedHtmlBlobKey,
                 messageId: boundIndexedValue(messageId),
                 conversationId: boundIndexedValue(conversationId),
@@ -1515,12 +1534,39 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 scheduledSendRelayedAt: null,
                 // The server relayed this message: the one thing that makes it recallable (see `recall()`).
                 sentByServerAt: new Date(),
+                ...sealedFields,
             } as any,
             current,
             { user, ignoreACL: true },
         );
+        if (sealed) {
+            await this.discardSentPlaintext(current, scannedHtmlBlobKey);
+        }
         await this.notifyFolders([current.folderUid, sentFolder.uid]);
         return filed;
+    }
+
+    /** `message`'s relayed MIME sealed for its mailbox's Sent Items, or `undefined` when zero-access isn't active there. */
+    private async sealSentCopy(message: T, relayedRaw: Buffer): Promise<ZeroAccessSealedFields | undefined> {
+        const mailbox: Mailbox | undefined = this.zeroAccessWriter && (await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true }));
+        return mailbox ? await this.zeroAccessWriter!.sealRaw(mailbox, relayedRaw, message.uid, new Date()) : undefined;
+    }
+
+    /**
+     * Removes what a sealed Sent Items copy no longer needs in plaintext: the draft's body and sanitized HTML, and its attachment rows and
+     * blobs (the attachments are inside the sealed message, where the client reads them). A blob something else still names is kept. Best
+     * effort: a failure is logged, never undoes the send. Superseded draft bodies held for a legal hold (`retainedBodyBlobKeys`) stay.
+     */
+    private async discardSentPlaintext(previous: T, scannedHtmlBlobKey: string | undefined): Promise<void> {
+        try {
+            await this.zeroAccessWriter!.discardPlaintext(
+                { messageRepo: this.repoUtils, attachmentRepo: this.attachmentRepo, quarantineEntryRepo: this.quarantineEntryRepo, ingestQueueEntryRepo: this.ingestQueueEntryRepo },
+                previous.uid,
+                [previous.bodyBlobKey, (previous as any).sanitizedHtmlBlobKey, scannedHtmlBlobKey],
+            );
+        } catch (err: any) {
+            this.logger?.warn(`BaseMessageRoute: could not remove the plaintext of sealed Sent Items message ${previous.uid}: ${err?.message}`);
+        }
     }
 
     /**
@@ -2740,6 +2786,11 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const message: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
         if (!message || !(await this.hasMailAccess(user, message.folderUid, ACLAction.READ))) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        // Sealed at rest (`specs/search.md` §3): this server has no readable body to serve - the client opens `/raw` with the mailbox's
+        // zero-access key. Answered before the audit below, since nothing is disclosed.
+        if (message.zeroAccess) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 409, "This message is sealed with zero-access encryption: open its raw source with the mailbox's keys.");
         }
 
         // A missing `mailbox` (a dangling `message.mailboxUid` - e.g. the mailbox was deleted, which has no

@@ -21,6 +21,8 @@ import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { MailboxImportRequestSQL } from "../../../src/models/sql/MailboxImportRequestSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
+import { EncryptionPolicySQL } from "../../../src/models/sql/EncryptionPolicySQL.js";
+import { ZeroAccessIndexEntrySQL } from "../../../src/models/sql/ZeroAccessIndexEntrySQL.js";
 import { AuditAction, RecipientType } from "../../../src/models/types.js";
 import { buildMboxEntry } from "../../../src/util/MboxUtils.js";
 import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
@@ -111,6 +113,8 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
         models.set("MessageSQL", MessageSQL);
         models.set("AttachmentSQL", AttachmentSQL);
         models.set("AuditLogEntrySQL", AuditLogEntrySQL);
+        models.set("EncryptionPolicySQL", EncryptionPolicySQL);
+        models.set("ZeroAccessIndexEntrySQL", ZeroAccessIndexEntrySQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");

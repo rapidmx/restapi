@@ -28,6 +28,7 @@ import { deriveMessageListFields } from "../util/MessageListUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { FolderType, Mailbox, Message, RecipientType } from "../models/types.js";
+import { newZeroAccessWriter, ZeroAccessWriter, type ZeroAccessSealedFields } from "../zeroaccess/ZeroAccessWriter.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** Maximum length of a persisted `scheduledSendError`. */
@@ -123,6 +124,14 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
 
     /** The `Domain` class, for classifying recipients when a receipt is requested. Without it no receipt is requested. */
     protected domainClass?: any;
+
+    /** The `Attachment`, `EncryptionPolicy` and `ZeroAccessIndexEntry` model classes: a relayed message's Sent Items copy is sealed when
+     * its mailbox has zero-access encryption on, and its plaintext attachments removed. Left unset, it is filed as before. */
+    protected attachmentClass?: any;
+    protected encryptionPolicyClass?: any;
+    protected zeroAccessIndexEntryClass?: any;
+    protected attachmentRepo?: RepoUtils<any>;
+    protected zeroAccessWriter?: ZeroAccessWriter;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -232,6 +241,10 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 args: [this.domainClass],
             });
         }
+        if (!this.attachmentRepo && this.attachmentClass) {
+            this.attachmentRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.attachmentClass.name, args: [this.attachmentClass] });
+        }
+        this.zeroAccessWriter ??= await newZeroAccessWriter(this._objectFactory, this.encryptionPolicyClass, this.zeroAccessIndexEntryClass);
         if (!this.correspondentUtils && this.correspondentClass) {
             this.correspondentUtils = await this._objectFactory.newInstance(CorrespondentUtils, {
                 name: this.correspondentClass.name,
@@ -550,6 +563,12 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 FolderType.SENT_ITEMS,
             );
             const flags = { ...refetched.flags, read: true };
+            // The Sent Items copy of a zero-access mailbox is sealed (`BaseMessageRoute.sealSentCopy()`'s counterpart) - unless the sender
+            // encrypted it end to end, or a previous run already sealed it.
+            const sealed: ZeroAccessSealedFields | undefined =
+                (relayInfo?.encrypted ?? refetched.encrypted) || (refetched as any).zeroAccess
+                    ? undefined
+                    : await this.sealSentCopy(refetched, relayedRaw ?? (await this.blobStore!.get(claimed.bodyBlobKey)));
 
             const updated: M = await this.messageRepo!.update(
                 {
@@ -559,8 +578,9 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     flags,
                     // An update is a patch, not a constructed entity, so `flags`' denormalized list mirrors have
                     // to be re-derived alongside it - see `util/MessageListUtils.ts`.
-                    ...deriveMessageListFields({ ...refetched, flags }),
-                    sanitizedHtmlBlobKey: sanitizedHtmlBlobKey ?? null,
+                    ...deriveMessageListFields({ ...refetched, flags, ...(sealed ? { subject: sealed.subject, bodyPreview: sealed.bodyPreview } : {}) }),
+                    sanitizedHtmlBlobKey: sealed ? null : (sanitizedHtmlBlobKey ?? null),
+                    ...(sealed ? { subject: sealed.subject, bodyPreview: sealed.bodyPreview, bodyBlobKey: sealed.bodyBlobKey, zeroAccess: sealed.zeroAccess } : {}),
                     ...(messageId ? { messageId: boundIndexedValue(messageId) } : {}),
                     conversationId: boundIndexedValue(conversationId) ?? null,
                     // What the relayed bytes say (only known to the run that relayed them): the threading headers recipients
@@ -585,6 +605,9 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 asEntity(this.messageRepo!, refetched),
                 { ignoreACL: true },
             );
+            if (sealed) {
+                await this.discardSentPlaintext(refetched, sanitizedHtmlBlobKey);
+            }
             this.notificationUtils?.sendMessage(sentFolder.uid, this.messageClass.name, "update", updated);
             this.publishSendEvent("send-succeeded", refetched, [refetched.folderUid, sentFolder.uid], { attempt: attemptNumber });
             // Outbox -> Sent Items: both folders' counts changed.
@@ -599,6 +622,25 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 sanitizedHtmlBlobKey: sanitizedHtmlBlobKey ?? null,
             });
             throw err;
+        }
+    }
+
+    /** `message`'s relayed MIME sealed for its mailbox's Sent Items, or `undefined` when zero-access isn't active there. */
+    private async sealSentCopy(message: M, raw: Buffer): Promise<ZeroAccessSealedFields | undefined> {
+        const mailbox: Mailbox | undefined = this.zeroAccessWriter && (await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true }));
+        return mailbox ? await this.zeroAccessWriter!.sealRaw(mailbox, raw, message.uid, new Date()) : undefined;
+    }
+
+    /** Removes a sealed Sent Items copy's plaintext body, sanitized HTML and attachments - best effort, never failing the send. */
+    private async discardSentPlaintext(previous: M, sanitizedHtmlBlobKey: string | undefined): Promise<void> {
+        try {
+            await this.zeroAccessWriter!.discardPlaintext({ messageRepo: this.messageRepo, attachmentRepo: this.attachmentRepo }, previous.uid, [
+                previous.bodyBlobKey,
+                (previous as any).sanitizedHtmlBlobKey,
+                sanitizedHtmlBlobKey,
+            ]);
+        } catch (err: any) {
+            this.logger?.warn(`ScheduledSendJob: could not remove the plaintext of sealed Sent Items message ${previous.uid}: ${err?.message}`);
         }
     }
 

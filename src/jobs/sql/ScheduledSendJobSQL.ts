@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { ScheduledSendJob } from "../ScheduledSendJob.js";
-import { CorrespondentSQL, DomainSQL, FolderSQL, MailboxSQL, MessageSQL } from "../../sql.js";
+import { AttachmentSQL, CorrespondentSQL, DomainSQL, EncryptionPolicySQL, FolderSQL, MailboxSQL, MessageSQL, ZeroAccessIndexEntrySQL } from "../../sql.js";
 
 const { Config } = ObjectDecorators;
 
@@ -20,6 +20,9 @@ export class ScheduledSendJobSQL extends ScheduledSendJob<MessageSQL> {
     protected mailboxClass: any = MailboxSQL;
     protected correspondentClass: any = CorrespondentSQL;
     protected domainClass: any = DomainSQL;
+    protected attachmentClass: any = AttachmentSQL;
+    protected encryptionPolicyClass: any = EncryptionPolicySQL;
+    protected zeroAccessIndexEntryClass: any = ZeroAccessIndexEntrySQL;
 
     /** One relay at a time on a single-connection driver (SQLite): concurrent relays would fail each other's transactions. */
     protected maxParallel(): number {

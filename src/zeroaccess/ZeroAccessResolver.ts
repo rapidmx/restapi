@@ -43,7 +43,8 @@ export class ZeroAccessResolver {
 
     /** The effective "Allow zero-access encryption": the saved `EncryptionPolicy.allowZeroAccess`, else the server default. */
     public async allowed(): Promise<boolean> {
-        const policy: EncryptionPolicy | undefined = await this.policyRepo?.findOne(ENCRYPTION_POLICY_UID, { ignoreACL: true });
+        // Read fresh: one small row, and a stale "allowed" would seal (or not seal) mail against the administrator's current choice.
+        const policy: EncryptionPolicy | undefined = await this.policyRepo?.findOne(ENCRYPTION_POLICY_UID, { ignoreACL: true, skipCache: true });
         return typeof policy?.allowZeroAccess === "boolean" ? policy.allowZeroAccess : this.allowedDefault !== false;
     }
 

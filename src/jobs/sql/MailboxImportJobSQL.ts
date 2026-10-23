@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { MailboxImportJob } from "../MailboxImportJob.js";
-import { AttachmentSQL, AuditLogEntrySQL, FolderSQL, MailboxImportRequestSQL, MailboxSQL, MessageSQL } from "../../sql.js";
+import { AttachmentSQL, AuditLogEntrySQL, EncryptionPolicySQL, FolderSQL, MailboxImportRequestSQL, MailboxSQL, MessageSQL, ZeroAccessIndexEntrySQL } from "../../sql.js";
 
 export class MailboxImportJobSQL extends MailboxImportJob<MailboxImportRequestSQL, MailboxSQL, FolderSQL, MessageSQL> {
     protected mailboxImportRequestClass: any = MailboxImportRequestSQL;
@@ -12,4 +12,6 @@ export class MailboxImportJobSQL extends MailboxImportJob<MailboxImportRequestSQ
     protected messageClass: any = MessageSQL;
     protected attachmentClass: any = AttachmentSQL;
     protected auditLogClass: any = AuditLogEntrySQL;
+    protected encryptionPolicyClass: any = EncryptionPolicySQL;
+    protected zeroAccessIndexEntryClass: any = ZeroAccessIndexEntrySQL;
 }

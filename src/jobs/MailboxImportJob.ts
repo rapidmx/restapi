@@ -36,6 +36,8 @@ import {
     MessageImportance,
     RecipientType,
 } from "../models/types.js";
+import { ZeroAccessWriter, newZeroAccessWriter, type ZeroAccessSealedFields } from "../zeroaccess/ZeroAccessWriter.js";
+import { zeroAccessBlobKey } from "../zeroaccess/ZeroAccessFiling.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** Thrown by `persistImportedMessage()` when importing one more message would exceed the target mailbox's
@@ -55,6 +57,18 @@ interface ImportQuota {
 interface ImportLease<MIR> {
     held: MIR;
     renewedAt: number;
+}
+
+/**
+ * When an imported message was sent: its own `Date:` header, else now. `ScanPipelineResult` doesn't expose the header (live delivery
+ * stamps `new Date()`, seconds from the send), but an imported message can be years old, and `sentDate` is what legal holds and
+ * eDiscovery date ranges narrow by - stamping today on a 2019 message would let it slip past a 2019 hold. Read with the header-only
+ * scan (`util/MimeHeaderUtils.ts`), not a second full parse.
+ */
+function importedDate(raw: Buffer): Date {
+    const dateHeader: string | undefined = extractHeader(raw, "Date");
+    const parsedDate: Date | undefined = dateHeader ? new Date(dateHeader) : undefined;
+    return parsedDate && !Number.isNaN(parsedDate.getTime()) ? parsedDate : new Date();
 }
 
 /**
@@ -123,6 +137,10 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     protected abstract messageClass: any;
     protected abstract attachmentClass: any;
     protected abstract auditLogClass: any;
+    /** The `EncryptionPolicy` and `ZeroAccessIndexEntry` model classes, supplied by the Mongo/SQL subclasses: an import into a mailbox
+     * with zero-access encryption on is sealed like delivered mail. Left unset, imports are stored as they come. */
+    protected encryptionPolicyClass?: any;
+    protected zeroAccessIndexEntryClass?: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -134,6 +152,7 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     protected attachmentRepo?: RepoUtils<Attachment>;
     protected auditLogRepo?: RepoUtils<any>;
     protected auditLogUtils?: AuditLogUtils;
+    protected zeroAccessWriter?: ZeroAccessWriter;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -216,6 +235,7 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                 args: [this.auditLogRepo],
             });
         }
+        this.zeroAccessWriter ??= await newZeroAccessWriter(this._objectFactory, this.encryptionPolicyClass, this.zeroAccessIndexEntryClass);
     }
 
     public async start(): Promise<void> {
@@ -585,7 +605,7 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     /** Stores one imported message and its attachments. A failure part-way undoes what was written (`rollbackImportedMessage()`):
      * the caller refunds the quota it charged, so nothing may stay behind that this message's bytes still account for. */
     private async storeImportedMessage(raw: Buffer, result: ScanPipelineResult, mailbox: MB, folder: F): Promise<boolean> {
-        const written: { blobKeys: string[]; attachmentUids: string[]; messageUid?: string } = { blobKeys: [], attachmentUids: [] };
+        const written: { blobKeys: string[]; attachmentUids: string[]; messageUid?: string; indexEntryUid?: string } = { blobKeys: [], attachmentUids: [] };
         try {
             return await this.writeImportedMessage(raw, result, mailbox, folder, written);
         } catch (err) {
@@ -597,7 +617,7 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
     /** Best-effort removal of what a failed `writeImportedMessage()` already wrote - attachment rows, the message row, then every
      * blob it put (a key is recorded before its put, so one that failed part-way is cleaned up too). Never throws: the store failure
      * is what the caller reports. */
-    private async rollbackImportedMessage(written: { blobKeys: string[]; attachmentUids: string[]; messageUid?: string }): Promise<void> {
+    private async rollbackImportedMessage(written: { blobKeys: string[]; attachmentUids: string[]; messageUid?: string; indexEntryUid?: string }): Promise<void> {
         const quietly = async (what: string, action: () => Promise<unknown>): Promise<void> => {
             try {
                 await action();
@@ -614,6 +634,9 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
         for (const key of written.blobKeys) {
             await quietly(`blob ${key}`, () => this.blobStore!.delete(key));
         }
+        if (written.indexEntryUid) {
+            await quietly(`index entry ${written.indexEntryUid}`, () => this.zeroAccessWriter!.removeIndexEntry(written.indexEntryUid!));
+        }
     }
 
     private async writeImportedMessage(
@@ -621,14 +644,22 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
         result: ScanPipelineResult,
         mailbox: MB,
         folder: F,
-        written: { blobKeys: string[]; attachmentUids: string[]; messageUid?: string },
+        written: { blobKeys: string[]; attachmentUids: string[]; messageUid?: string; indexEntryUid?: string },
     ): Promise<boolean> {
-        const bodyBlobKey = `imported/${crypto.randomUUID()}`;
-        written.blobKeys.push(bodyBlobKey);
-        await this.blobStore!.put(bodyBlobKey, raw, { contentType: "message/rfc822" });
+        const messageUid: string = crypto.randomUUID();
+        const sentDate: Date = importedDate(raw);
+        // A zero-access mailbox gets its imported mail sealed like delivered mail - no plaintext body, sanitized copy or attachment.
+        written.blobKeys.push(zeroAccessBlobKey(mailbox.uid, messageUid));
+        const sealed: ZeroAccessSealedFields | undefined = await this.zeroAccessWriter?.sealRaw(mailbox, raw, messageUid, sentDate);
+        written.indexEntryUid = sealed?.indexEntryUid;
+        const bodyBlobKey = sealed ? sealed.bodyBlobKey : `imported/${crypto.randomUUID()}`;
+        if (!sealed) {
+            written.blobKeys.push(bodyBlobKey);
+            await this.blobStore!.put(bodyBlobKey, raw, { contentType: "message/rfc822" });
+        }
 
         let sanitizedHtmlBlobKey: string | undefined;
-        if (result.sanitizedHtml !== undefined) {
+        if (result.sanitizedHtml !== undefined && !sealed) {
             sanitizedHtmlBlobKey = `sanitized/${crypto.randomUUID()}`;
             written.blobKeys.push(sanitizedHtmlBlobKey);
             await this.blobStore!.put(sanitizedHtmlBlobKey, Buffer.from(result.sanitizedHtml, "utf-8"), { contentType: "text/html" });
@@ -638,26 +669,13 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
         // `alreadyImported()`'s bounded lookup.
         const messageId: string = boundIndexedValue(result.messageIdHeader ?? crypto.randomUUID());
         const conversationId: string = deriveConversationId(result.references, result.inReplyTo, messageId);
-        // `ScanPipelineResult` doesn't parse/expose the message's own `Date:` header (nothing about live
-        // inbound delivery ever needed it - `ScanQueueJob.deliverMessage()` also just stamps `new Date()`,
-        // fine there since delivery time and send time are seconds apart). For an IMPORTED historical
-        // message that gap can be years, and `sentDate` is exactly the field `LegalHoldUtils.
-        // assertNotOnLegalHold()`/`MatterExportJob`'s date-range narrowing check - silently stamping
-        // "today" on a 2019 message would let it slip past a 2019-dated legal hold or eDiscovery date
-        // range entirely. Extracted directly via the lightweight header-only scan (`util/
-        // MimeHeaderUtils.ts`) rather than a second full MIME parse; falls back to "now" only when the
-        // header is genuinely absent or unparseable, same tolerance `BaseSearchRoute.parseDateParam()`
-        // already applies to a caller-supplied date string.
-        const dateHeader: string | undefined = extractHeader(raw, "Date");
-        const parsedDate: Date | undefined = dateHeader ? new Date(dateHeader) : undefined;
-        const sentDate: Date = parsedDate && !Number.isNaN(parsedDate.getTime()) ? parsedDate : new Date();
-
         const message: M = await this.messageRepo!.create(
             new this.messageClass({
+                uid: messageUid,
                 folderUid: folder.uid,
                 mailboxUid: mailbox.uid,
                 messageId,
-                subject: result.subject ?? "",
+                subject: sealed ? sealed.subject : (result.subject ?? ""),
                 from: { address: result.fromAddress ?? "", displayName: result.fromDisplayName, type: RecipientType.TO },
                 // The imported message's own `To`/`Cc` (and, on an archived Sent Items copy, `Bcc`) headers -
                 // an import has no SMTP envelope of its own to fall back on. Left empty until now, which made
@@ -667,7 +685,8 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
                 receivedDate: sentDate,
                 bodyBlobKey,
                 sanitizedHtmlBlobKey,
-                bodyPreview: result.bodyPreview ?? "",
+                bodyPreview: sealed ? sealed.bodyPreview : (result.bodyPreview ?? ""),
+                ...(sealed ? { zeroAccess: sealed.zeroAccess } : {}),
                 // Historical mail already read/handled wherever it originally lived - imported as read,
                 // matching this plan's "not inbound mail in the ordinary sense" scope note (no unread-count
                 // bump, no notification).
@@ -683,7 +702,8 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
         );
 
         written.messageUid = message.uid;
-        for (const attachment of result.attachments) {
+        // A sealed message's attachments stay inside it - the client lists them from the decrypted MIME.
+        for (const attachment of sealed ? [] : result.attachments) {
             const blobKey = `attachments/${crypto.randomUUID()}`;
             written.blobKeys.push(blobKey);
             await this.blobStore!.put(blobKey, attachment.content, { contentType: attachment.contentType });

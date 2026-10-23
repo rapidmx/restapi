@@ -3,7 +3,22 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
-import { AttachmentSQL, AuditLogEntrySQL, CorrespondentSQL, DomainSQL, FocusedInboxOverrideSQL, FolderSQL, IngestQueueEntrySQL, KeyVaultSQL, MailboxSQL, MatterSQL, MessageSQL, QuarantineEntrySQL } from "../../sql.js";
+import {
+    AttachmentSQL,
+    AuditLogEntrySQL,
+    CorrespondentSQL,
+    DomainSQL,
+    EncryptionPolicySQL,
+    FocusedInboxOverrideSQL,
+    FolderSQL,
+    IngestQueueEntrySQL,
+    KeyVaultSQL,
+    MailboxSQL,
+    MatterSQL,
+    MessageSQL,
+    QuarantineEntrySQL,
+    ZeroAccessIndexEntrySQL,
+} from "../../sql.js";
 import { BaseMessageRoute } from "../BaseMessageRoute.js";
 import { ScheduledSendJobSQL } from "../../jobs/sql/ScheduledSendJobSQL.js";
 import { RecoverableRepoUtils } from "../../util/RecoverableRepoUtils.js";
@@ -22,6 +37,8 @@ export class MessageRouteSQL extends BaseMessageRoute<MessageSQL> {
     protected domainClass: any = DomainSQL;
     protected matterClass: any = MatterSQL;
     protected keyVaultClass: any = KeyVaultSQL;
+    protected encryptionPolicyClass: any = EncryptionPolicySQL;
+    protected zeroAccessIndexEntryClass: any = ZeroAccessIndexEntrySQL;
     protected quarantineEntryClass: any = QuarantineEntrySQL;
     protected ingestQueueEntryClass: any = IngestQueueEntrySQL;
     protected sendJobClass: any = ScheduledSendJobSQL;

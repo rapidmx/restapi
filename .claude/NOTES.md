@@ -4261,3 +4261,28 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
   - A retry after zero-access was turned off.
   - Invite creation and update.
   - The change request.
+
+## 2026-10-22 - Zero-access encryption, Phase 4 (other writers and readers, part 1)
+
+- **`ZeroAccessWriter`** (`src/zeroaccess/ZeroAccessWriter.ts`) is the shared sealer for every writer other than inbound delivery.
+  - It is built per backend with `newZeroAccessWriter(objectFactory, encryptionPolicyClass, zeroAccessIndexEntryClass)`, or is `undefined` when either class is missing. BlobStore, ACLUtils, ExtractorRegistry, `trusted_roles` and `mail:zero_access:*` are injected.
+  - `seal(mailbox, input)` and `sealRaw(mailbox, raw, uid, receivedAt)` return the `Message` fields to store (`[...]`, empty preview, a `za/` blob, `zeroAccess`, `indexEntryUid`), or `undefined` for plaintext. `sealRaw` parses the MIME itself, but only once `target()` says zero-access is active.
+  - `discardPlaintext(repos, uid, blobKeys)` removes the former blobs and the attachment rows and their blobs, keeping any blob something still references.
+  - `removeIndexEntry(uid)` lets a caller roll back.
+- **Writers wired so far:**
+  - **Sent Items copy, immediate send** (`BaseMessageRoute.fileSentMessage`): `sealSentCopy`, then `discardSentPlaintext`.
+  - **Scheduled/background send** (`ScheduledSendJob`): the same; the job now also takes optional `attachmentClass`, `encryptionPolicyClass` and `zeroAccessIndexEntryClass`.
+  - **`MailboxImportJob`:** seals via `sealRaw`. The message uid is now minted up front, and a rollback removes the `za/` blob and the index entry.
+  - Messages the sender already end-to-end encrypted (`encrypted`) are never sealed again, and a re-run skips a row that already has `zeroAccess`.
+  - **Not covered:** superseded draft bodies kept for a legal hold (`retainedBodyBlobKeys`) stay plaintext.
+- **Readers:**
+  - `GET /:id/content` answers **409** for a `zeroAccess` message (before the audit, since nothing is disclosed); the client uses `/raw`.
+  - `conversations()` rows carry `latestZeroAccess` (the latest message's `{ keyFingerprint, sealedSummary }`).
+- **The policy read skips the cache.** `ZeroAccessResolver.allowed()` now reads with `skipCache: true`. With the cache, a test that wrote the policy row directly kept being served the stale row across tests. In production it's one small row per seal, and a stale "allowed" would contradict the admin's current choice.
+- **Test gotchas:**
+  - A null SQL column satisfies `toBeDefined()`. Wait on `toBeTruthy()`.
+  - Mongo test repos want `findOne({ uid })`, not `findOne({ where: { uid } })`.
+  - A send from a test mailbox needs the owner's own ACL record on the mailbox.
+- **Still open in Phase 4:** drafts (seal on save, plus client-side assembly and `send-raw`), the calendar invite endpoints that re-read raw ICS, `/report` (spam learn), data-export notes, and the activesync/mapi/booking-plugin writers (these need this restapi published first).
+- **SQL job tests register their own datasource models.** `MailboxImportJobSQL.test.ts` and `ScheduledSendJobSQL.test.ts` now register `EncryptionPolicySQL` and `ZeroAccessIndexEntrySQL` (and `AttachmentSQL` for the send job). Without them, every import fails with `No metadata for "EncryptionPolicySQL"`. Any new SQL job test whose job builds a `ZeroAccessWriter` needs them too.
+- The background-send test waits for the whole sealed-copy check, because the job files the sealed copy before it removes the draft's plaintext.
