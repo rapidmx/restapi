@@ -1175,5 +1175,20 @@ describe("Route:KeyVaultMongo Tests", () => {
         },
         findMailbox: (uid) => mailboxRepo.findOne({ uid } as any),
         findKeyVault: (mailboxUid) => keyVaultRepo.findOne({ mailboxUid } as any),
+        updateMailbox: async (uid: string, data: any) => {
+            await mailboxRepo.updateOne({ uid } as any, { $set: data });
+        },
+        setEscrowWraps: async (mailboxUid: string, wraps: any[]) => {
+            await keyVaultRepo.updateOne({ mailboxUid } as any, { $set: { zeroAccessEscrowWraps: wraps } });
+        },
+        createEscrowScope: (certificate: string, fingerprint: string) =>
+            escrowScopeRepo.save(
+                new EscrowScopeMongo({
+                    name: "legal",
+                    publicKey: { publicKey: certificate, type: "x509", fingerprint, notBefore: 0, notAfter: Date.now() + 86_400_000 },
+                    holderUserUids: [uuid.v4()],
+                    requiredHolders: 1,
+                }),
+            ),
     });
 });

@@ -167,6 +167,10 @@ export interface KeyVault extends BaseEntity {
      * zero-access certificate. Never the master key, signing key or encryption keys. Each member reads only their own. */
     memberKeyWraps?: MemberKeyWrap[];
 
+    /** A mailbox without an owner (which has no master key to escrow): its zero-access private keys, each wrapped to the certificate of
+     * the escrow scope the mailbox is assigned to - what an escrow release (`BaseEscrowAccessRequestRoute.material()`) carries for it. */
+    zeroAccessEscrowWraps?: ZeroAccessEscrowWrap[];
+
     /** Server-managed: fingerprint of the signing certificate `AcmeEnrollmentDriverJob` last recorded a
      * `SIGNING_CERT_EXPIRING` audit entry for - so that entry is written once per certificate, not every run. */
     expiryAuditedFingerprint?: string;
@@ -187,6 +191,19 @@ export interface MemberKeyWrap {
     /** Fingerprint of the shared mailbox's zero-access key whose private key `cms` holds. */
     zeroAccessKeyFingerprint: string;
     /** Base64 DER CMS `EnvelopedData` of that private key's PKCS#8, to the member's certificate. */
+    cms: string;
+    createdAt: number;
+}
+
+/** An escrow copy of a mailbox-without-an-owner's zero-access private key - see `KeyVault.zeroAccessEscrowWraps`. */
+export interface ZeroAccessEscrowWrap {
+    /** The escrow scope whose certificate `cms` is addressed to. */
+    escrowScopeId: string;
+    /** Fingerprint of that scope's key when the wrap was made. */
+    escrowKeyFingerprint: string;
+    /** Fingerprint of the mailbox's zero-access key whose private key `cms` holds. */
+    zeroAccessKeyFingerprint: string;
+    /** Base64 DER CMS `EnvelopedData` of that private key's PKCS#8, to the scope's certificate. */
     cms: string;
     createdAt: number;
 }
@@ -2012,6 +2029,9 @@ export enum AuditAction {
     /** A shared mailbox's member key wraps changed (`BaseKeyVaultRoute.putMemberKeyWraps()`/`removeMemberKeyWraps()`). `details.added`
      * lists `{ memberUserUid, zeroAccessKeyFingerprint }`; `details.removed` names a departed user. Never the wraps themselves. */
     KEY_VAULT_MEMBER_WRAPS = "key_vault.member_wraps",
+    /** A mailbox-without-an-owner's escrow copies of its zero-access keys changed (`BaseKeyVaultRoute.putZeroAccessEscrowWraps()`, or
+     * provisioning its key). `details` names the `escrowScopeId` and the `zeroAccessKeyFingerprints`. Never the wraps themselves. */
+    KEY_VAULT_ESCROW_WRAPS = "key_vault.escrow_wraps",
     /** `POST /mailbox/:id/keys/trust` pinned a signer certificate on a contact by hand ("Trust this signer"). `details`
      * carries the `address` and the certificate `fingerprint`. See `BaseKeyLookupRoute.trust()`. */
     CONTACT_KEY_TRUSTED = "contact.key_trusted",

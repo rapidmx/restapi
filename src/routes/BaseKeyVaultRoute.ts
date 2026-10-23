@@ -37,7 +37,7 @@ import {
     verifiedIssuerCertificate,
 } from "../util/CertificateInstallUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
-import { AuditAction, EscrowScope, KeyUseType, KeyVault, Mailbox, MasterKeyWrap, MemberKeyWrap, PublicKey, WrappedPrivateKey, ZeroAccessKey } from "../models/types.js";
+import { AuditAction, EscrowScope, KeyUseType, KeyVault, Mailbox, MasterKeyWrap, MemberKeyWrap, PublicKey, WrappedPrivateKey, ZeroAccessEscrowWrap, ZeroAccessKey } from "../models/types.js";
 import { activeZeroAccessKey } from "../util/ZeroAccessUtils.js";
 import { canonicalUserUid, zeroAccessMembers } from "../zeroaccess/ZeroAccessResolver.js";
 import { isSealedToCertificate } from "../zeroaccess/ZeroAccessSealer.js";
@@ -61,6 +61,12 @@ export type PublicKeyVault = Pick<KeyVault, "wrappedKeys" | "masterKeyWraps"> & 
 
 /** The most member key wraps one vault holds (members times retained keys). */
 const MAX_MEMBER_KEY_WRAPS = 2000;
+
+/** The most escrow copies of zero-access keys one vault holds (keys times the scopes a mailbox was assigned to over time). */
+const MAX_ESCROW_ZERO_ACCESS_WRAPS = 200;
+
+/** An escrow copy of a zero-access key as a client sends it (`escrowKeyFingerprint` and `createdAt` are the server's). */
+export type ZeroAccessEscrowWrapInput = Pick<ZeroAccessEscrowWrap, "escrowScopeId" | "zeroAccessKeyFingerprint" | "cms">;
 
 /** A member key wrap as a client sends it (`createdAt` is the server's). */
 export type MemberKeyWrapInput = Omit<MemberKeyWrap, "createdAt">;
@@ -93,6 +99,12 @@ export interface SharedKeyStatus {
     rotationPending: boolean;
     /** The caller may change the wraps (the owner, or a member with full access). */
     manager: boolean;
+    /** A mailbox without an owner assigned to an escrow scope: that scope. Its certificate comes from the mailbox's escrow info. */
+    escrowScopeId?: string;
+    /** The fingerprints of this mailbox's zero-access keys with no escrow copy for `escrowScopeId` yet: a client holding the keys wraps
+     * them to the scope's certificate (`putZeroAccessEscrowWraps()`). Always empty for a mailbox with an owner, whose escrowed master
+     * key already opens them. */
+    escrowPending: string[];
 }
 
 const EMPTY_KEY_VAULT: PublicKeyVault = { wrappedKeys: [], masterKeyWraps: [], masterKeyGeneration: 0, zeroAccessKeys: [] };
@@ -815,11 +827,14 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
      * key in the same write as `wraps`, the member wraps of its private key - at least the caller's own. Mail is therefore never sealed to a
      * key nobody holds. For members with full access; an owned mailbox's owner enrolls through `enrollKey()` and adds wraps with
      * `putMemberKeyWraps()`.
+     *
+     * A mailbox assigned to an escrow scope also needs `escrowWrap`, the private key wrapped to the scope's certificate, written in the
+     * same transaction: with no master key, it is the only way escrow can ever read the mailbox's mail.
      */
     @Post("/:id/keyvault/shared-zero-access-key")
     public async enrollSharedZeroAccessKey(
         @Param("id") mailboxId: string,
-        body: { csr?: string; wraps?: Omit<MemberKeyWrapInput, "zeroAccessKeyFingerprint">[] },
+        body: { csr?: string; wraps?: Omit<MemberKeyWrapInput, "zeroAccessKeyFingerprint">[]; escrowWrap?: Omit<ZeroAccessEscrowWrapInput, "zeroAccessKeyFingerprint"> },
         @AuthUser user?: JWTUser,
     ): Promise<SharedKeyStatus> {
         const mailbox: M = await this.requireMailbox(mailboxId);
@@ -838,6 +853,10 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         if ((mailbox.zeroAccessKeys ?? []).length >= MAX_ENROLLED_KEYS) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox cannot enroll more than ${MAX_ENROLLED_KEYS} keys.`);
         }
+        const scope: EscrowScope | undefined = await this.assignedEscrowScope(mailbox);
+        if (scope && !body.escrowWrap) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This mailbox is assigned to an escrow scope: escrowWrap is required.");
+        }
         const issued = await this.encryptionCa!.issue(mailbox.primarySmtpAddress, body.csr);
         const cert = new crypto.X509Certificate(issued.certificate);
         const publicKey: ZeroAccessKey = {
@@ -853,23 +872,32 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             wraps.map((wrap) => ({ ...wrap, zeroAccessKeyFingerprint: publicKey.fingerprint })),
             true,
         );
-        const keyVault: K = await this.persistSharedEnrollment(mailbox, publicKey, accepted);
+        const escrowWraps: ZeroAccessEscrowWrap[] = scope
+            ? this.validateEscrowWraps(mailbox, scope, [{ ...body.escrowWrap!, zeroAccessKeyFingerprint: publicKey.fingerprint }], publicKey.fingerprint)
+            : [];
+        const keyVault: K = await this.persistSharedEnrollment(mailbox, publicKey, accepted, escrowWraps);
         await this.auditLogUtils!.record(
             {
                 action: AuditAction.KEY_VAULT_ENROLL,
                 targetType: "KeyVault",
                 targetUid: keyVault.uid,
                 mailboxUid: mailbox.uid,
-                details: { useType: "zero-access", fingerprint: publicKey.fingerprint, shared: true, members: accepted.map((wrap) => wrap.memberUserUid) },
+                details: {
+                    useType: "zero-access",
+                    fingerprint: publicKey.fingerprint,
+                    shared: true,
+                    members: accepted.map((wrap) => wrap.memberUserUid),
+                    ...(scope ? { escrowScopeId: scope.uid } : {}),
+                },
             },
             { user },
         );
         return await this.sharedKeyStatus(await this.requireMailbox(mailbox.uid), user);
     }
 
-    /** The new key on the mailbox and its member wraps in the vault, in one transaction. */
+    /** The new key on the mailbox and its member and escrow wraps in the vault, in one transaction. */
     @Transactional()
-    protected async persistSharedEnrollment(mailbox: M, publicKey: ZeroAccessKey, wraps: MemberKeyWrap[]): Promise<K> {
+    protected async persistSharedEnrollment(mailbox: M, publicKey: ZeroAccessKey, wraps: MemberKeyWrap[], escrowWraps: ZeroAccessEscrowWrap[]): Promise<K> {
         const keyVault: K = await this.findOrCreateKeyVault(mailbox.uid);
         await this.mailboxRepo!.update(
             { uid: mailbox.uid, version: (mailbox as any).version, zeroAccessKeys: supersedeKeys(mailbox.zeroAccessKeys, publicKey, Date.now()) } as any,
@@ -877,10 +905,103 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { ignoreACL: true },
         );
         return await this.keyVaultRepo!.update(
-            { uid: keyVault.uid, version: (keyVault as any).version, memberKeyWraps: [...(keyVault.memberKeyWraps ?? []), ...wraps] } as any,
+            {
+                uid: keyVault.uid,
+                version: (keyVault as any).version,
+                memberKeyWraps: [...(keyVault.memberKeyWraps ?? []), ...wraps],
+                ...(escrowWraps.length ? { zeroAccessEscrowWraps: [...(keyVault.zeroAccessEscrowWraps ?? []), ...escrowWraps] } : {}),
+            } as any,
             keyVault,
             { ignoreACL: true },
         );
+    }
+
+    /**
+     * `PUT /mailbox/:id/keyvault/escrow-wraps` - adds (or replaces, per scope and key) escrow copies of a mailbox-without-an-owner's
+     * zero-access keys: how a key provisioned before the mailbox was assigned to its escrow scope (or under an earlier scope) is brought
+     * under the current one. For members with full access. Each wrap must name the mailbox's current escrow scope and one of its
+     * zero-access keys, and be CMS addressed to the scope's certificate (`isSealedToCertificate()`). A mailbox with an owner is refused
+     * (`400`): its escrowed master key already opens its keys.
+     */
+    @Put("/:id/keyvault/escrow-wraps")
+    public async putZeroAccessEscrowWraps(
+        @Param("id") mailboxId: string,
+        body: { wraps?: ZeroAccessEscrowWrapInput[] },
+        @AuthUser user?: JWTUser,
+    ): Promise<SharedKeyStatus> {
+        const mailbox: M = await this.requireMailbox(mailboxId);
+        if (mailbox.ownerUserUid) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A mailbox with an owner is escrowed through its master key.");
+        }
+        await this.requireMailboxManager(mailbox, user);
+        const scope: EscrowScope | undefined = await this.assignedEscrowScope(mailbox);
+        if (!scope) {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This mailbox is not assigned to an escrow scope.");
+        }
+        const wraps: ZeroAccessEscrowWrapInput[] = Array.isArray(body?.wraps) ? body.wraps : [];
+        if (wraps.length === 0 || wraps.length > MAX_ENROLLED_KEYS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `wraps must list between 1 and ${MAX_ENROLLED_KEYS} wraps.`);
+        }
+        const accepted: ZeroAccessEscrowWrap[] = this.validateEscrowWraps(mailbox, scope, wraps);
+        const keyVault: K = await this.findOrCreateKeyVault(mailbox.uid);
+        const replaced = (existing: ZeroAccessEscrowWrap) =>
+            accepted.some((wrap) => wrap.escrowScopeId === existing.escrowScopeId && wrap.zeroAccessKeyFingerprint === existing.zeroAccessKeyFingerprint);
+        const zeroAccessEscrowWraps: ZeroAccessEscrowWrap[] = [...(keyVault.zeroAccessEscrowWraps ?? []).filter((existing) => !replaced(existing)), ...accepted];
+        if (zeroAccessEscrowWraps.length > MAX_ESCROW_ZERO_ACCESS_WRAPS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox cannot hold more than ${MAX_ESCROW_ZERO_ACCESS_WRAPS} escrow key wraps.`);
+        }
+        await this.keyVaultRepo!.update({ uid: keyVault.uid, version: (keyVault as any).version, zeroAccessEscrowWraps } as any, keyVault, {
+            ignoreACL: true,
+        });
+        await this.auditLogUtils!.record(
+            {
+                action: AuditAction.KEY_VAULT_ESCROW_WRAPS,
+                targetType: "KeyVault",
+                targetUid: keyVault.uid,
+                mailboxUid: mailbox.uid,
+                details: { escrowScopeId: scope.uid, zeroAccessKeyFingerprints: accepted.map((wrap) => wrap.zeroAccessKeyFingerprint) },
+            },
+            { user },
+        );
+        return await this.sharedKeyStatus(mailbox, user);
+    }
+
+    /** The escrow scope a mailbox is assigned to, when it still exists. */
+    private async assignedEscrowScope(mailbox: M): Promise<EscrowScope | undefined> {
+        return mailbox.escrowScopeId ? await this.escrowScopeRepo!.findOne(mailbox.escrowScopeId, { ignoreACL: true }) : undefined;
+    }
+
+    /** `wraps` checked and completed, or a `400` naming what is wrong. `newKey` is the fingerprint of a key being enrolled with them, not
+     * yet on the mailbox. */
+    private validateEscrowWraps(mailbox: M, scope: EscrowScope, wraps: ZeroAccessEscrowWrapInput[], newKey?: string): ZeroAccessEscrowWrap[] {
+        const zeroAccessFingerprints: Set<string> = new Set([...(mailbox.zeroAccessKeys ?? []).map((key) => key.fingerprint), ...(newKey ? [newKey] : [])]);
+        const certificate: Buffer = Buffer.from(scope.publicKey.publicKey, "base64");
+        const seen: Set<string> = new Set();
+        return wraps.map((wrap) => {
+            if (
+                wrap?.escrowScopeId !== scope.uid ||
+                typeof wrap.zeroAccessKeyFingerprint !== "string" ||
+                !zeroAccessFingerprints.has(wrap.zeroAccessKeyFingerprint) ||
+                typeof wrap.cms !== "string" ||
+                wrap.cms.length > MAX_WRAP_FIELD_LENGTH * 4
+            ) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Each escrow wrap must name the mailbox's escrow scope and one of its zero-access keys.");
+            }
+            if (seen.has(wrap.zeroAccessKeyFingerprint)) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A key can have only one escrow wrap.");
+            }
+            seen.add(wrap.zeroAccessKeyFingerprint);
+            if (!isSealedToCertificate(Buffer.from(wrap.cms, "base64"), certificate)) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Each escrow wrap must be encrypted to the escrow scope's certificate.");
+            }
+            return {
+                escrowScopeId: scope.uid,
+                escrowKeyFingerprint: scope.publicKey.fingerprint,
+                zeroAccessKeyFingerprint: wrap.zeroAccessKeyFingerprint,
+                cms: wrap.cms,
+                createdAt: Date.now(),
+            };
+        });
     }
 
     /** The mailbox's members (`ZeroAccessResolver.members()`), from its access list as stored now: who may hold the key is never decided
@@ -975,6 +1096,10 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         const departed: string[] = [...new Set(wraps.map((wrap) => wrap.memberUserUid).filter((uid) => !memberUids.has(uid)))];
         const me: string | undefined = user ? canonicalUserUid(user.uid) : undefined;
         const owner: boolean = !!user && !!mailbox.ownerUserUid && mailbox.ownerUserUid === user.uid;
+        const scope: EscrowScope | undefined = mailbox.ownerUserUid ? undefined : await this.assignedEscrowScope(mailbox);
+        const escrowed: Set<string> = new Set(
+            (keyVault?.zeroAccessEscrowWraps ?? []).filter((wrap) => wrap.escrowScopeId === scope?.uid).map((wrap) => wrap.zeroAccessKeyFingerprint),
+        );
         return {
             ownerless: !mailbox.ownerUserUid,
             role: owner ? "owner" : memberUids.has(me ?? "") ? "member" : "other",
@@ -987,6 +1112,8 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             departed,
             rotationPending: !!active && wraps.some((wrap) => !memberUids.has(wrap.memberUserUid) && wrap.zeroAccessKeyFingerprint === active.fingerprint),
             manager: (!!user && mailbox.ownerUserUid === user.uid) || members.some((member) => member.userUid === me && member.full),
+            ...(scope ? { escrowScopeId: scope.uid } : {}),
+            escrowPending: scope ? (mailbox.zeroAccessKeys ?? []).map((key) => key.fingerprint).filter((fingerprint) => !escrowed.has(fingerprint)) : [],
         };
     }
 

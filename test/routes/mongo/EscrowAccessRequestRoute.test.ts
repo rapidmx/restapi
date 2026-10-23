@@ -274,7 +274,7 @@ describe("Route:EscrowAccessRequestMongo Tests", () => {
             const mailbox = await createMailbox({
                 escrowScopeId: scope.uid,
                 keys: [key("encrypt", "fp-enc"), key("sign", "fp-sign")],
-                zeroAccessKeys: [key("zero-access", "fp-za")],
+                zeroAccessKeys: [key("zero-access", "fp-za"), key("zero-access", "fp-za-shared"), key("zero-access", "fp-za-other")],
             });
             const wrapped = (useType: string, fingerprint: string) => ({ ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM", fingerprint, useType });
             await keyVaultRepo.save(
@@ -282,6 +282,10 @@ describe("Route:EscrowAccessRequestMongo Tests", () => {
                     mailboxUid: mailbox.uid,
                     wrappedKeys: [wrapped("encrypt", "fp-enc"), wrapped("sign", "fp-sign"), wrapped("zero-access", "fp-za")] as any,
                     masterKeyWraps: [escrowWrap(scope.uid), passwordWrap()],
+                    zeroAccessEscrowWraps: [
+                        { escrowScopeId: scope.uid, escrowKeyFingerprint: "fp1", zeroAccessKeyFingerprint: "fp-za-shared", cms: "cms", createdAt: 1 },
+                        { escrowScopeId: "another-scope", escrowKeyFingerprint: "fp2", zeroAccessKeyFingerprint: "fp-za-other", cms: "cms", createdAt: 1 },
+                    ],
                 }),
             );
             const matter = await createMatter(scope.uid, [mailbox.uid]);
@@ -310,7 +314,9 @@ describe("Route:EscrowAccessRequestMongo Tests", () => {
             expect(materialResult.body.masterKeyWraps[0].escrowScopeId).toBe(scope.uid);
             // What the master key opens to read mail: the zero-access and encryption private keys with their certificates, never signing.
             expect(materialResult.body.wrappedKeys.map((k: any) => k.useType).sort()).toEqual(["encrypt", "zero-access"]);
-            expect(materialResult.body.certificates.map((k: any) => k.fingerprint).sort()).toEqual(["fp-enc", "fp-za"]);
+            // A mailbox without an owner: its zero-access keys wrapped straight to this scope, never another's.
+            expect(materialResult.body.zeroAccessEscrowWraps.map((w: any) => w.zeroAccessKeyFingerprint)).toEqual(["fp-za-shared"]);
+            expect(materialResult.body.certificates.map((k: any) => k.fingerprint).sort()).toEqual(["fp-enc", "fp-za", "fp-za-shared"]);
 
             const afterMaterialEntries = await escrowAuditRepo.find({}).toArray();
             expect(afterMaterialEntries).toHaveLength(2);
@@ -318,6 +324,14 @@ describe("Route:EscrowAccessRequestMongo Tests", () => {
             const fulfilled = await requestRepo.findOne({ uid: createResult.body.uid } as any);
             expect(fulfilled?.status).toBe("fulfilled");
             expect(fulfilled?.fulfilledAt).toBeTruthy();
+
+            // Once the mailbox has an owner, its escrowed master key opens its keys; its key escrow wraps are not released.
+            await mailboxRepo.updateOne({ uid: mailbox.uid } as any, { $set: { ownerUserUid: uuid.v4() } });
+            const owned = await request(server.getApplication())
+                .get(`${baseUrl}/${createResult.body.uid}/material`)
+                .set("Authorization", "jwt " + holderAToken);
+            expect(owned.body.zeroAccessEscrowWraps).toEqual([]);
+            expect(owned.body.certificates.map((k: any) => k.fingerprint).sort()).toEqual(["fp-enc", "fp-za"]);
         });
     });
 

@@ -23,6 +23,10 @@ export interface SharedZeroAccessKeySuiteContext {
     setAcl: (mailboxUid: string, records: { userOrRoleId: string; actions: string[] }[]) => Promise<void>;
     findMailbox: (uid: string) => Promise<any>;
     findKeyVault: (mailboxUid: string) => Promise<any>;
+    updateMailbox: (uid: string, data: any) => Promise<void>;
+    setEscrowWraps: (mailboxUid: string, wraps: any[]) => Promise<void>;
+    /** An escrow scope whose key is the certificate `certificate` (base64 DER). */
+    createEscrowScope: (certificate: string, fingerprint: string) => Promise<any>;
 }
 
 async function zeroAccessKey() {
@@ -202,6 +206,100 @@ export function sharedZeroAccessKeySuite(ctx: SharedZeroAccessKeySuiteContext): 
             expect((await ctx.findKeyVault(mailbox.uid)).memberKeyWraps).toEqual([]);
             // Nothing left to clear is not an error.
             expect((await request(ctx.app()).delete(`${ctx.baseUrl}/${mailbox.uid}/keyvault/member-wraps/${delegate.uid}`).set("Authorization", as(owner.uid))).status).toBe(200);
+        });
+
+        it("escrows an ownerless mailbox's key to its escrow scope: required when provisioning, reported while missing, and added later", async () => {
+            const manager = await user();
+            const reader = await user();
+            const escrow = await zeroAccessKey();
+            const scope = await ctx.createEscrowScope(escrow.der.toString("base64"), escrow.key.fingerprint);
+            const otherScope = await ctx.createEscrowScope(escrow.der.toString("base64"), escrow.key.fingerprint);
+            const shared = await ctx.createMailbox({ ownerUserUid: null, escrowScopeId: scope.uid });
+            await ctx.setAcl(shared.uid, [
+                { userOrRoleId: manager.uid, actions: [ACLAction.FULL] },
+                { userOrRoleId: reader.uid, actions: [ACLAction.READ] },
+            ]);
+            const escrowCms = async () => (await sealToCertificate(Buffer.from("pkcs8"), escrow.der)).toString("base64");
+            const provision = async (body: any) =>
+                await request(ctx.app())
+                    .post(`${ctx.baseUrl}/${shared.uid}/keyvault/shared-zero-access-key`)
+                    .set("Authorization", as(manager.uid))
+                    .send({ csr: await generateTestCsr(shared.primarySmtpAddress), wraps: [await wrapFor(manager)], ...body });
+
+            // Without an escrow wrap, or with one sealed elsewhere or naming another scope, nothing is provisioned.
+            expect((await provision({})).status).toBe(400);
+            expect((await provision({ escrowWrap: { escrowScopeId: scope.uid, cms: (await wrapFor(manager)).cms } })).status).toBe(400);
+            expect((await provision({ escrowWrap: { escrowScopeId: otherScope.uid, cms: await escrowCms() } })).status).toBe(400);
+            expect((await ctx.findMailbox(shared.uid)).zeroAccessKeys ?? []).toHaveLength(0);
+
+            const first = await provision({ escrowWrap: { escrowScopeId: scope.uid, cms: await escrowCms() } });
+            expect(first.status).toBe(200);
+            expect(first.body).toMatchObject({ escrowScopeId: scope.uid, escrowPending: [] });
+            const firstKey: string = first.body.activeKeyFingerprint;
+            const vault = await ctx.findKeyVault(shared.uid);
+            expect(vault.zeroAccessEscrowWraps).toEqual([
+                expect.objectContaining({ escrowScopeId: scope.uid, escrowKeyFingerprint: escrow.key.fingerprint, zeroAccessKeyFingerprint: firstKey }),
+            ]);
+
+            // Moved to another scope: the key has no copy for the new one yet.
+            await ctx.updateMailbox(shared.uid, { escrowScopeId: otherScope.uid });
+            const status = await request(ctx.app()).get(`${ctx.baseUrl}/${shared.uid}/keyvault/members`).set("Authorization", as(reader.uid));
+            expect(status.body).toMatchObject({ escrowScopeId: otherScope.uid, escrowPending: [firstKey] });
+
+            const put = async (uid: string, wraps: any) =>
+                await request(ctx.app()).put(`${ctx.baseUrl}/${shared.uid}/keyvault/escrow-wraps`).set("Authorization", as(uid)).send({ wraps });
+            expect((await put(reader.uid, [{ escrowScopeId: otherScope.uid, zeroAccessKeyFingerprint: firstKey, cms: await escrowCms() }])).status).toBe(403);
+            for (const bad of [
+                [],
+                [{ escrowScopeId: scope.uid, zeroAccessKeyFingerprint: firstKey, cms: await escrowCms() }],
+                [{ escrowScopeId: otherScope.uid, zeroAccessKeyFingerprint: "not-a-key", cms: await escrowCms() }],
+                [{ escrowScopeId: otherScope.uid, zeroAccessKeyFingerprint: firstKey, cms: (await wrapFor(manager)).cms }],
+                [
+                    { escrowScopeId: otherScope.uid, zeroAccessKeyFingerprint: firstKey, cms: await escrowCms() },
+                    { escrowScopeId: otherScope.uid, zeroAccessKeyFingerprint: firstKey, cms: await escrowCms() },
+                ],
+            ]) {
+                expect((await put(manager.uid, bad)).status).toBe(400);
+            }
+            const added = await put(manager.uid, [{ escrowScopeId: otherScope.uid, zeroAccessKeyFingerprint: firstKey, cms: await escrowCms() }]);
+            expect(added.status).toBe(200);
+            expect(added.body.escrowPending).toEqual([]);
+            // Replaced per scope and key, never duplicated; the earlier scope's copy stays.
+            await put(manager.uid, [{ escrowScopeId: otherScope.uid, zeroAccessKeyFingerprint: firstKey, cms: await escrowCms() }]);
+            const kept = (await ctx.findKeyVault(shared.uid)).zeroAccessEscrowWraps;
+            expect(kept.map((w: any) => w.escrowScopeId)).toEqual([scope.uid, otherScope.uid]);
+
+            // A vault already holding the most escrow wraps takes no more.
+            const full = Array.from({ length: 200 }, (_, i) => ({ ...kept[0], escrowScopeId: `old-${i}` }));
+            await ctx.setEscrowWraps(shared.uid, full);
+            const refused = await put(manager.uid, [{ escrowScopeId: otherScope.uid, zeroAccessKeyFingerprint: firstKey, cms: await escrowCms() }]);
+            expect(refused.status).toBe(400);
+        });
+
+        it("refuses escrow wraps for a mailbox with an owner or without an escrow scope, and leaves provisioning without one alone", async () => {
+            const manager = await user();
+            const escrow = await zeroAccessKey();
+            const owned = await user();
+            const ownedMailbox = await ctx.createMailbox({ ownerUserUid: owned.uid });
+            const wraps = [{ escrowScopeId: "x", zeroAccessKeyFingerprint: "y", cms: (await sealToCertificate(Buffer.from("k"), escrow.der)).toString("base64") }];
+            expect(
+                (await request(ctx.app()).put(`${ctx.baseUrl}/${ownedMailbox.uid}/keyvault/escrow-wraps`).set("Authorization", as(owned.uid)).send({ wraps })).status,
+            ).toBe(400);
+
+            const shared = await ctx.createMailbox({ ownerUserUid: null });
+            await ctx.setAcl(shared.uid, [{ userOrRoleId: manager.uid, actions: [ACLAction.FULL] }]);
+            expect(
+                (await request(ctx.app()).put(`${ctx.baseUrl}/${shared.uid}/keyvault/escrow-wraps`).set("Authorization", as(manager.uid)).send({ wraps })).status,
+            ).toBe(409);
+            // An escrow wrap sent for a mailbox without a scope is ignored.
+            const enrolled = await request(ctx.app())
+                .post(`${ctx.baseUrl}/${shared.uid}/keyvault/shared-zero-access-key`)
+                .set("Authorization", as(manager.uid))
+                .send({ csr: await generateTestCsr(shared.primarySmtpAddress), wraps: [await wrapFor(manager)], escrowWrap: wraps[0] });
+            expect(enrolled.status).toBe(200);
+            expect(enrolled.body.escrowPending).toEqual([]);
+            expect(enrolled.body.escrowScopeId).toBeUndefined();
+            expect((await ctx.findKeyVault(shared.uid)).zeroAccessEscrowWraps ?? []).toEqual([]);
         });
     });
 }

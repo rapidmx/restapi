@@ -36,6 +36,7 @@ import {
     MasterKeyWrap,
     PublicKey,
     WrappedPrivateKey,
+    ZeroAccessEscrowWrap,
     ZeroAccessKey,
 } from "../models/types.js";
 const { Config, Init, Logger } = ObjectDecorators;
@@ -59,7 +60,10 @@ export interface EscrowAccessMaterial {
     masterKeyWraps: MasterKeyWrap[];
     /** The wrapped private keys of `useType` `zero-access` and `encrypt`, current and retained. */
     wrappedKeys: WrappedPrivateKey[];
-    /** The certificate of each of `wrappedKeys` (matched by `fingerprint`), which decrypting CMS addressed to it needs. */
+    /** A mailbox without an owner, which has no master key: its zero-access private keys wrapped straight to this matter's escrow scope
+     * certificate (`KeyVault.zeroAccessEscrowWraps`). Empty for a mailbox with an owner. */
+    zeroAccessEscrowWraps: ZeroAccessEscrowWrap[];
+    /** The certificate of each of `wrappedKeys` and `zeroAccessEscrowWraps` (matched by fingerprint), which decrypting CMS addressed to it needs. */
     certificates: (PublicKey | ZeroAccessKey)[];
 }
 
@@ -430,10 +434,14 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         );
 
         const wrappedKeys: WrappedPrivateKey[] = (keyVault?.wrappedKeys ?? []).filter((k) => ESCROW_RELEASED_KEY_USES.includes(k.useType));
-        const released: Set<string> = new Set(wrappedKeys.map((k) => k.fingerprint));
+        const zeroAccessEscrowWraps: ZeroAccessEscrowWrap[] = (mailbox as any).ownerUserUid
+            ? []
+            : (keyVault?.zeroAccessEscrowWraps ?? []).filter((w) => w.escrowScopeId === matter.escrowScopeId);
+        const released: Set<string> = new Set([...wrappedKeys.map((k) => k.fingerprint), ...zeroAccessEscrowWraps.map((w) => w.zeroAccessKeyFingerprint)]);
         return {
             masterKeyWraps: masterKeyWraps.filter((w) => w.method === "escrow" && w.escrowScopeId === matter.escrowScopeId),
             wrappedKeys,
+            zeroAccessEscrowWraps,
             certificates: [...((mailbox as any).keys ?? []), ...((mailbox as any).zeroAccessKeys ?? [])].filter((k: PublicKey) => released.has(k.fingerprint)),
         };
     }

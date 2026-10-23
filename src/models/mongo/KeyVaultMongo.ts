@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { KeyVault, MasterKeyWrap, MemberKeyWrap, WrappedPrivateKey } from "../types.js";
+import { KeyVault, MasterKeyWrap, MemberKeyWrap, WrappedPrivateKey, ZeroAccessEscrowWrap } from "../types.js";
 const { Nullable } = ObjectDecorators;
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
@@ -52,6 +52,11 @@ export class KeyVaultMongo extends BaseMongoEntity implements KeyVault {
     public memberKeyWraps?: MemberKeyWrap[];
 
     @Column()
+    @Description("A mailbox without an owner: its zero-access private keys, each wrapped to its escrow scope's certificate.")
+    @Nullable
+    public zeroAccessEscrowWraps?: ZeroAccessEscrowWrap[];
+
+    @Column()
     @Description("Fingerprint of the signing certificate an expiry warning was last audited for (server-managed).")
     @Nullable
     public expiryAuditedFingerprint?: string;
@@ -69,6 +74,7 @@ export class KeyVaultMongo extends BaseMongoEntity implements KeyVault {
             this.wrappedKeys = other.wrappedKeys !== undefined ? other.wrappedKeys : this.wrappedKeys;
             this.masterKeyWraps = other.masterKeyWraps !== undefined ? other.masterKeyWraps : this.masterKeyWraps;
             this.memberKeyWraps = other.memberKeyWraps !== undefined ? other.memberKeyWraps : this.memberKeyWraps;
+            this.zeroAccessEscrowWraps = other.zeroAccessEscrowWraps !== undefined ? other.zeroAccessEscrowWraps : this.zeroAccessEscrowWraps;
             this.expiryAuditedFingerprint = "expiryAuditedFingerprint" in other ? other.expiryAuditedFingerprint : this.expiryAuditedFingerprint;
             this.masterKeyGeneration = "masterKeyGeneration" in other ? other.masterKeyGeneration : this.masterKeyGeneration;
         }

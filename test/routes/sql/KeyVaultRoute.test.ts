@@ -1154,5 +1154,20 @@ describe("Route:KeyVaultSQL Tests", () => {
         },
         findMailbox: (uid) => mailboxRepo.findOne({ where: { uid } }),
         findKeyVault: (mailboxUid) => keyVaultRepo.findOne({ where: { mailboxUid } }),
+        updateMailbox: async (uid: string, data: any) => {
+            await mailboxRepo.update({ uid }, data);
+        },
+        setEscrowWraps: async (mailboxUid: string, wraps: any[]) => {
+            await keyVaultRepo.update({ mailboxUid }, { zeroAccessEscrowWraps: wraps });
+        },
+        createEscrowScope: (certificate: string, fingerprint: string) =>
+            escrowScopeRepo.save(
+                new EscrowScopeSQL({
+                    name: "legal",
+                    publicKey: { publicKey: certificate, type: "x509", fingerprint, notBefore: 0, notAfter: Date.now() + 86_400_000 },
+                    holderUserUids: [uuid.v4()],
+                    requiredHolders: 1,
+                }),
+            ),
     });
 });

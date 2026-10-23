@@ -147,6 +147,10 @@ Instead, the mailbox's zero-access **private key** — never its MK, signing key
   - A member's "own certificate" is the active zero-access key of a mailbox they own.
   - Membership is read from the access list uncached.
   - Retained keys need no re-wrapping on rotation: the remaining members already hold them. Only the departed user's wraps are removed.
+- **Escrow.** An owned mailbox's keys are opened by its escrowed MK. A mailbox without an owner has no MK, so each of its zero-access private keys is wrapped straight to its escrow scope's certificate (`KeyVault.zeroAccessEscrowWraps`).
+  - `POST shared-zero-access-key` requires `escrowWrap` while the mailbox is assigned to a scope, written in the same transaction as the key.
+  - `PUT escrow-wraps` (full-access members) adds the copies a scope is missing: keys provisioned before the mailbox was assigned, or under an earlier scope. `GET members` reports them as `escrowPending`, and an unlocked member's client fills them in the background.
+  - Each wrap must be CMS addressed to the scope's certificate. An escrow release (`/material`) carries the wraps for the matter's scope.
 
 ## 4. Encryption Scope
 

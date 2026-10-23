@@ -4388,4 +4388,10 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
     - The CA issues the certificate, which is written with the wraps in one transaction (`persistSharedEnrollment`). Mail is therefore never sealed to a key nobody holds.
   - Membership decisions read the ACL with `skipCache: true`. Audit: `key_vault.member_wraps`, and `key_vault.enroll` with `shared: true`.
 - **Rotation is client-driven.** `rotationPending` means a departed user holds the active key. The owner re-enrolls with `enrollKey`; for an ownerless mailbox the client calls `shared-zero-access-key`. The client then wraps the new key for the members and deletes the departed user's wraps.
-- **Not done:** an escrow wrap for an ownerless mailbox's zero-access key. An owned mailbox is covered by the MK escrow plus the `/material` key release.
+- **Escrow for ownerless mailboxes (2026-10-23).** `KeyVault.zeroAccessEscrowWraps` (`ZeroAccessEscrowWrap`: `escrowScopeId`, `escrowKeyFingerprint`, `zeroAccessKeyFingerprint`, `cms`, `createdAt`) wraps each zero-access key straight to the mailbox's escrow scope certificate. An owned mailbox stays covered by the MK escrow plus the `/material` key release.
+  - `shared-zero-access-key` takes `escrowWrap` (`escrowScopeId`, `cms`); it is required (400) while the mailbox is assigned to an existing scope and ignored otherwise.
+  - `PUT /:id/keyvault/escrow-wraps` (FULL members, ownerless only - 400 for an owned mailbox, 409 without a scope) upserts per scope and key, cap 200. Wraps for an earlier scope are kept.
+  - Validation: the current scope, one of the mailbox's keys, no duplicate key, `isSealedToCertificate` to `scope.publicKey.publicKey`.
+  - `SharedKeyStatus` gained `escrowScopeId` and `escrowPending` (the keys with no copy for that scope; always `[]` for an owned mailbox).
+  - `EscrowAccessMaterial.zeroAccessEscrowWraps` releases the matter scope's wraps for an ownerless mailbox (`[]` once it has an owner), and `certificates` includes their keys.
+  - Audit: `key_vault.escrow_wraps`; `key_vault.enroll` carries `escrowScopeId`.
