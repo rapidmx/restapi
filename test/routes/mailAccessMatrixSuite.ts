@@ -521,6 +521,16 @@ export const MATRIX_CASES: MatrixCase[] = [
         success: (res) => ok(res),
     },
     {
+        route: "ZeroAccessIndexRoute",
+        name: "Zero-access search index: read the manifest",
+        access: "read",
+        // The sealed index opens only with the owner's own zero-access key, which delegates don't hold (member wraps are Phase 7 of the
+        // zero-access work): the owner alone reads it.
+        only: ["owner", "impersonated"],
+        request: (s) => ({ method: "get", path: `/mailboxes/${s.mailbox.uid}/search-index/manifest` }),
+        success: (res) => ok(res),
+    },
+    {
         route: "KeyLookupRoute",
         name: "KeyLookup: lookup an address",
         access: "write",

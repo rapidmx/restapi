@@ -48,6 +48,7 @@ export const ROUTE_TABLE: Record<string, RouteRow> = {
     MailboxAccessRoute: { kind: "mailbox", base: "BaseMailboxAccessRoute", gate: "owner/manager; administrator (trusted+elevated) lists/revokes any, grants on ownerless only, audited" },
     SearchRoute: { kind: "mailbox", base: "BaseSearchRoute", gate: "hasMailAccess READ on the searched mailbox (default: the caller's own)" },
     KeyVaultRoute: { kind: "mailbox", base: "BaseKeyVaultRoute", gate: "owner or explicit ACL record only (getRecord, no trusted bypass); writes owner-only" },
+    ZeroAccessIndexRoute: { kind: "mailbox", base: "BaseZeroAccessIndexRoute", gate: "the mailbox's ownerUserUid only (no ACL, no trusted bypass); serves and stores ciphertext" },
     KeyLookupRoute: { kind: "mailbox", base: "BaseKeyLookupRoute", gate: "hasMailAccess UPDATE on the mailbox" },
     DirectoryRoute: { kind: "mailbox", base: "BaseDirectoryRoute", gate: "org address book: any mailbox owner or trusted; contact suggestions: own + hasMailAccess READ mailboxes" },
     MailboxImportRequestRoute: { kind: "mailbox", base: "BaseMailboxImportRoute", gate: "own mailbox, or hasMailAccess CREATE on ?mailboxUid; requests visible to requester/owner/trusted (metadata)" },

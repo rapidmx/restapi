@@ -371,7 +371,7 @@ This unification is what retires the previous design's server-assisted candidate
 
 **Weeks are ISO weeks in UTC**, keyed on the server's receipt time, never the message's `Date:` header — that header is sender-controlled and would let a sender place mail into an already-compacted week. Backfilled and imported mail is keyed on its original receipt or sort date and can therefore arrive in a closed week.
 
-A closed week becomes eligible for compaction a configurable grace period (default 24 hours) after it ends, to absorb delayed delivery. Entries that arrive in a week after it has been compacted wait for the next compaction, which produces a new **generation** of that week's segment. Compaction is a compare-and-swap on the generation and on the highest entry folded in, so two devices racing to compact the same week cannot lose entries: the loser re-reads the manifest. After a successful upload the server deletes the folded entries and the previous generation.
+A closed week becomes eligible for compaction a configurable grace period (default 24 hours) after it ends, to absorb delayed delivery. Entries that arrive in a week after it has been compacted wait for the next compaction, which produces a new **generation** of that week's segment. Compaction is a compare-and-swap on the generation, and the upload names the entries it folded in. Two devices racing to compact the same week therefore cannot lose entries: the loser re-reads the manifest, and an entry that arrived while a compaction was being built is not in its list, so it stays pending for the next generation. After a successful upload the server deletes exactly the folded entries and the previous generation. The server refuses a segment that is not CMS `EnvelopedData` addressed to one of the mailbox's zero-access certificates, so it never stores what could be a readable index.
 
 A week that no client has compacted yet is still fully searchable from its entries; compaction is an optimisation and MUST NOT be required for correctness.
 
@@ -562,8 +562,10 @@ export interface IndexSegment {
     weekId: string;
     /** Increments each time the week is re-compacted with later entries. */
     generation: number;
-    /** Highest entry sequence folded into this generation. */
-    entryHighWater: number;
+    /** How many entries this generation and the ones before it folded in. */
+    entryCount: number;
+    /** Fingerprint of the zero-access key the segment is encrypted to. */
+    keyFingerprint: string;
     /** Who built it. Zero-access segments are compacted from server entries; client segments cover E2EE content. */
     origin: "zero-access" | "client";
     bytes: number;
@@ -576,8 +578,8 @@ export interface IndexSegment {
 export interface IndexWeekEntries {
     weekId: string;
     pendingEntries: number;
-    /** Highest entry sequence in the week. */
-    latestSequence: number;
+    /** When the newest pending entry was written (ISO 8601). */
+    latestEntryAt: string;
     /** True once the week has closed and its grace period has elapsed, so a client may compact it. */
     compactable: boolean;
 }
@@ -590,9 +592,13 @@ export interface SegmentManifest {
 
 /** One sealed index entry, as served to the client. `sealed` is CMS EnvelopedData to the zero-access key. */
 export interface SealedIndexEntry {
-    sequence: number;
+    uid: string;
     weekId: string;
-    entityUid: string;
+    messageUid: string;
+    /** When the entry was written (ISO 8601). The live tail asks for entries written since shortly before its last poll and drops the
+     * ones it already has, so an entry committed late is never skipped; pages within that set are ordered by `uid`. */
+    createdAt: string;
+    keyFingerprint: string;
     sealed: string;
 }
 
@@ -618,6 +624,13 @@ export interface SearchQuery {
 ## 16. Segment Implementation
 
 **SQLite with FTS5**, compacted on a client from server-extracted entries and consumed on every client platform. Native SQLite on desktop and mobile; SQLite compiled to WebAssembly over OPFS on web.
+
+### Segment format versions
+
+- **Version 1 (current): an entries bundle.** The sealed file is gzipped JSON, `{ "v": 1, "documents": ZeroAccessIndexDocument[] }`: the same documents the week's entries carry, merged, one per message. A client imports it through the same insert path as individual entries, so every backend (web wa-sqlite over the page-encrypting VFS, tauri's native SQLCipher) can import it with no new storage primitive.
+  - Why not a SQLite file yet: web's local index encrypts every page under its own key (`localIndexVFS.ts`), so a downloaded SQLite file can't be `ATTACH`ed without a second, plain VFS, and wa-sqlite exposes no `sqlite3_deserialize` wrapper.
+  - The cost is FTS tokenisation on import instead of a page copy. That is acceptable at a week's volume.
+- **Version 2 (planned): a SQLite FTS5 database file** as the rest of this section describes, once clients can open one directly. The server stores segments as opaque bytes with their `schemaVersion`, so the change needs no server work, and a client declines a version it can't open.
 
 ### Rationale
 

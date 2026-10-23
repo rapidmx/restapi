@@ -70,6 +70,36 @@ export async function sealToCertificate(content: Uint8Array, certDer: Uint8Array
     return Buffer.from(contentInfo.toSchema().toBER());
 }
 
+/**
+ * Whether `der` is a CMS `EnvelopedData` with a recipient that is `certDer`'s certificate (matched by issuer and serial number, as
+ * `sealToCertificate()` and web-client's `encryptForRecipients()` address it). Never decrypts - it reads only the recipient list - so it
+ * is how the server checks that a file a client uploads for a mailbox (a search index segment) is encrypted to the mailbox's
+ * zero-access key and is no plaintext index. `false` for anything that doesn't parse.
+ */
+export function isSealedToCertificate(der: Uint8Array, certDer: Uint8Array): boolean {
+    try {
+        const contentInfo = pkijs.ContentInfo.fromBER(toArrayBuffer(der));
+        if (contentInfo.contentType !== pkijs.ContentInfo.ENVELOPED_DATA) {
+            return false;
+        }
+        const envelopedData = new pkijs.EnvelopedData({ schema: contentInfo.content });
+        const cert: pkijs.Certificate = parseCertificate(certDer);
+        const matches = (issuerAndSerial: any): boolean =>
+            issuerAndSerial instanceof pkijs.IssuerAndSerialNumber &&
+            issuerAndSerial.serialNumber.isEqual(cert.serialNumber) &&
+            issuerAndSerial.issuer.isEqual(cert.issuer);
+        return envelopedData.recipientInfos.some((info) => {
+            const value: any = info.value;
+            if (value instanceof pkijs.KeyAgreeRecipientInfo) {
+                return value.recipientEncryptedKeys.encryptedKeys.some((key) => key.rid.variant === 1 && matches(key.rid.value));
+            }
+            return value instanceof pkijs.KeyTransRecipientInfo && matches(value.rid);
+        });
+    } catch {
+        return false;
+    }
+}
+
 /** The sealed summary of a message (`MessageZeroAccess.sealedSummary`), base64. */
 export async function sealSummary(summary: ZeroAccessSummary, certDer: Uint8Array): Promise<string> {
     const json: string = JSON.stringify({ subject: summary.subject, preview: summary.preview });

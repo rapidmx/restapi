@@ -1059,6 +1059,76 @@ export interface ZeroAccessIndexDocument {
     dateForSort: number;
 }
 
+/** Who built a search index segment (`specs/search.md` §7): a client compacting the server's zero-access entries, or a client indexing
+ * end-to-end encrypted mail it decrypted itself (Source C). */
+export type ZeroAccessSegmentOrigin = "zero-access" | "client";
+
+/**
+ * One week's compacted search index for a mailbox (`specs/search.md` §7, *Segment Model*): a SQLite FTS5 database file a client built
+ * from that week's `ZeroAccessIndexEntry` rows, encrypted to the mailbox's zero-access key, stored at `blobKey`. The server can't read
+ * it. One row per mailbox and week (`zeroAccessSegmentUid()`), replaced by each new generation.
+ */
+export interface ZeroAccessIndexSegment extends BaseEntity {
+    mailboxUid: string;
+    /** ISO week in UTC, e.g. `2026-W43`. */
+    weekId: string;
+    /** 1 for the week's first compaction, incremented each time later entries are folded in. */
+    generation: number;
+    /** Where the sealed segment file is stored. */
+    blobKey: string;
+    bytes: number;
+    /** SHA-256 (hex) of the stored file - its ETag. */
+    etag: string;
+    /** Segment format version, so a client can decline a segment it can't open. */
+    schemaVersion: number;
+    origin: ZeroAccessSegmentOrigin;
+    /** Fingerprint of the zero-access key the file is encrypted to. */
+    keyFingerprint: string;
+    /** How many entries this generation and the ones before it folded in. */
+    entryCount: number;
+}
+
+/** A segment as the manifest lists it (`specs/search.md` §15 `IndexSegment`). */
+export interface IndexSegment {
+    weekId: string;
+    generation: number;
+    origin: ZeroAccessSegmentOrigin;
+    bytes: number;
+    etag: string;
+    schemaVersion: number;
+    keyFingerprint: string;
+    entryCount: number;
+}
+
+/** A week's entries not yet compacted (`specs/search.md` §15 `IndexWeekEntries`). */
+export interface IndexWeekEntries {
+    weekId: string;
+    pendingEntries: number;
+    /** When the newest pending entry was written (ISO 8601) - a client compares it with what it has fetched. */
+    latestEntryAt: string;
+    /** The week has closed and its grace period has passed, so a client may compact it. */
+    compactable: boolean;
+}
+
+/** `GET /mail/mailboxes/:id/search-index/manifest`. */
+export interface SegmentManifest {
+    mailboxUid: string;
+    segments: IndexSegment[];
+    weeks: IndexWeekEntries[];
+}
+
+/** One pending entry as served to a client (`GET .../search-index/entries`). */
+export interface SealedIndexEntry {
+    uid: string;
+    weekId: string;
+    messageUid: string;
+    /** When the entry was written (ISO 8601): the order entries are served in, and the cursor a client resumes from. */
+    createdAt: string;
+    keyFingerprint: string;
+    /** Base64 DER CMS `EnvelopedData` of the gzipped JSON `ZeroAccessIndexDocument`. */
+    sealed: string;
+}
+
 export interface Message extends RecoverableBaseEntity {
     /** The unique identifier of the `Folder` this message currently resides in. */
     folderUid: string;

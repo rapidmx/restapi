@@ -11,6 +11,7 @@ import * as x509 from "@peculiar/x509";
 import type { ZeroAccessIndexDocument } from "../../src/models/types.js";
 import {
     isoWeekId,
+    isSealedToCertificate,
     PROTECTED_SUBJECT,
     sealIndexDocument,
     sealMessage,
@@ -204,5 +205,48 @@ describe("ZeroAccessSealer", () => {
             // 23:30 on Sunday in UTC-5 is already Monday in UTC.
             expect(isoWeekId(new Date("2026-10-25T23:30:00-05:00"))).toBe("2026-W44");
         });
+    });
+});
+
+describe("isSealedToCertificate", () => {
+    it("recognizes what was sealed to a certificate, and nothing sealed to another", async () => {
+        const recipient = await makeRecipient();
+        const other = await makeRecipient();
+        const sealed = await sealToCertificate(Buffer.from("segment"), recipient.certDer);
+
+        expect(isSealedToCertificate(sealed, recipient.certDer)).toBe(true);
+        expect(isSealedToCertificate(sealed, other.certDer)).toBe(false);
+    });
+
+    it("is false for plaintext, for garbage and for a CMS structure that isn't enveloped data", async () => {
+        const recipient = await makeRecipient();
+        const data = new pkijs.ContentInfo({ contentType: pkijs.ContentInfo.DATA, content: new asn1js.OctetString({ valueHex: new Uint8Array([1, 2]).buffer }) });
+
+        expect(isSealedToCertificate(Buffer.from("SQLite format 3\0"), recipient.certDer)).toBe(false);
+        expect(isSealedToCertificate(new Uint8Array(0), recipient.certDer)).toBe(false);
+        expect(isSealedToCertificate(new Uint8Array(data.toSchema().toBER()), recipient.certDer)).toBe(false);
+    });
+
+    it("matches an RSA (key transport) recipient by issuer and serial number too", async () => {
+        const keys = await webcrypto.subtle.generateKey(
+            { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+            true,
+            ["sign", "verify"],
+        );
+        const cert = await x509.X509CertificateGenerator.createSelfSigned({
+            name: "CN=rsa@example.com",
+            notBefore: new Date(),
+            notAfter: new Date(Date.now() + 86_400_000),
+            keys: keys as CryptoKeyPair,
+            signingAlgorithm: { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+        });
+        const certDer = new Uint8Array(cert.rawData);
+        const envelopedData = new pkijs.EnvelopedData();
+        envelopedData.addRecipientByCertificate(new pkijs.Certificate({ schema: asn1js.fromBER(cert.rawData).result }), { oaepHashAlgorithm: "SHA-256" }, 1, ENGINE);
+        await envelopedData.encrypt({ name: "AES-GCM", length: 256 }, new Uint8Array([1, 2, 3]).buffer, ENGINE);
+        const der = new Uint8Array(new pkijs.ContentInfo({ contentType: pkijs.ContentInfo.ENVELOPED_DATA, content: envelopedData.toSchema() }).toSchema().toBER());
+
+        expect(isSealedToCertificate(der, certDer)).toBe(true);
+        expect(isSealedToCertificate(der, (await makeRecipient()).certDer)).toBe(false);
     });
 });

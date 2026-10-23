@@ -21,6 +21,7 @@ export * from "./IngestQueueRouteSQL.js";
 export * from "./KeyDiscoveryRouteSQL.js";
 export * from "./KeyLookupRouteSQL.js";
 export * from "./KeyVaultRouteSQL.js";
+export * from "./ZeroAccessIndexRouteSQL.js";
 export * from "./LabelRouteSQL.js";
 export * from "./MailboxAccessRouteSQL.js";
 export * from "./MailboxImportRequestRouteSQL.js";

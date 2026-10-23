@@ -4326,3 +4326,26 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
 - **Signature change:** `removeInvite(messageUid, body, user)` and `acceptProposal(messageUid, body, user)` now take a body before the user.
 - **`SearchIndexJob`** indexes a zero-access message's metadata only, without fetching its sealed blob. That was already the outcome via `isEncryptedBody()`; this skips the download and the parse.
 - **`DataExportJob`** exports a zero-access message as stored: the sealed S/MIME copy in mbox, and the `[...]` subject plus sealed summary in JSON. This is documented on the class. A readable export has to be made on the owner's device, which is a later item.
+
+## 2026-10-23 - Zero-access encryption, Phase 5 (segment store)
+
+- **Model `ZeroAccessIndexSegment`** (Mongo and SQL): one row per mailbox, week and origin (`zeroAccessSegmentUid()`), replaced by each generation.
+  - Fields: `generation`, `blobKey` (`za-index/<mailbox>/<week>/<generation>-<nonce>`), `bytes`, `etag` (SHA-256 hex), `schemaVersion`, `origin`, `keyFingerprint`, `entryCount`.
+  - The SQL `origin` column needs `{ type: "varchar" }`, because a string-union type reflects as `Object`.
+- **`BaseZeroAccessIndexRoute`** (concrete `ZeroAccessIndexRoute{Mongo,SQL}`, mounted under the mailbox prefix) is owner-only (`ownerUserUid`; no ACL, no admin bypass). It is in the `mailAccessRouteTable` and the matrix.
+  - `GET /:id/search-index/manifest`: segments, plus the pending entries per week (`pendingEntriesByWeek()`, a `$group`/`GROUP BY` that never loads entries) and `compactable` (week end + `mail:zero_access:compaction_grace_hours`, default 24).
+  - `GET /:id/search-index/entries?week=&since=&after=&limit=`: paged by uid. `since` filters on `dateCreated` for the live tail; clients ask from a little before their last pass and de-duplicate.
+  - `GET /:id/search-index/segments/:weekId?generation=&origin=`: serves the current generation with an ETag, immutable caching and 304 support; 404 for a replaced generation.
+  - `PUT /:id/search-index/segments/:weekId` (`SegmentUpload`), the compaction:
+    - It is a compare-and-swap on `expectedGeneration`. A lost write (version conflict, or a duplicate first row) is a 409, and its blob is deleted.
+    - It deletes exactly the `foldedEntryUids` that belong to that mailbox and week, by paging the week's entries rather than looking each uid up. The previous blob is deleted on a best-effort basis.
+    - `zero-access` segments require a compactable week. `client` segments (Source C) may target any week and fold nothing.
+    - The file must pass `isSealedToCertificate()` (new in `ZeroAccessSealer`: CMS EnvelopedData whose recipient's issuer and serial match one of the mailbox's zero-access certificates; key-agreement and key-transport recipients). The server never stores a readable index.
+    - At most `mail:zero_access:max_segment_bytes` (default 64 MiB) and 100k folded uids.
+- **Segment format version 1** is gzipped JSON `{ v: 1, documents: ZeroAccessIndexDocument[] }`, not an FTS5 file. `specs/search.md` §16 says why: web's index VFS encrypts pages, and wa-sqlite has no deserialize. A SQLite file can come later as `schemaVersion` 2 with no server change.
+- The spec now describes compare-and-swap by folded uids rather than a high-water mark, and the actual `IndexSegment`, `IndexWeekEntries` and `SealedIndexEntry` shapes (`entryCount`, `keyFingerprint`, `latestEntryAt`, `createdAt`).
+- **Gotchas:**
+  - `MongoRepository` must come from `@rapidrest/service-core`, not `typeorm`, or `instanceof` fails.
+  - 2026 has an ISO week 53 (it starts on a Thursday); 2025 doesn't.
+  - The `request` test helper decodes binary bodies as UTF-8, so assert on the stored blob or the ETag instead.
+- **Open:** pending entries and segments of a purged message or mailbox aren't deleted yet. That belongs with erasure and the backfill job in Phase 6.

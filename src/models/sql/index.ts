@@ -43,3 +43,4 @@ export * from "./TaskSQL.js";
 export * from "./TransportRuleSQL.js";
 export * from "./SqlDriverColumnTypes.js";
 export * from "./ZeroAccessIndexEntrySQL.js";
+export * from "./ZeroAccessIndexSegmentSQL.js";

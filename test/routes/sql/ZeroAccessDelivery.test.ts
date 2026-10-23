@@ -20,6 +20,8 @@ import { TransportRuleSQL } from "../../../src/models/sql/TransportRuleSQL.js";
 import { ZeroAccessIndexEntrySQL } from "../../../src/models/sql/ZeroAccessIndexEntrySQL.js";
 import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 import { zeroAccessDeliverySuite } from "../zeroAccessDeliverySuite.js";
+import { zeroAccessIndexSuite } from "../zeroAccessIndexSuite.js";
+import { ZeroAccessIndexSegmentSQL } from "../../../src/models/sql/ZeroAccessIndexSegmentSQL.js";
 
 describe("Zero-access delivery (SQL)", () => {
     const logger = Logger();
@@ -30,6 +32,7 @@ describe("Zero-access delivery (SQL)", () => {
         IngestQueueEntrySQL,
         MessageSQL,
         ZeroAccessIndexEntrySQL,
+        ZeroAccessIndexSegmentSQL,
         QuarantineEntrySQL,
         AttachmentSQL,
         EncryptionPolicySQL,
@@ -132,5 +135,27 @@ describe("Zero-access delivery (SQL)", () => {
         updateMessage: async (uid, fields) => {
             await repo(MessageSQL).update({ uid }, fields);
         },
+    });
+
+    zeroAccessIndexSuite({
+        app: () => server.getApplication(),
+        mailboxesUrl: "/sql/mailboxes",
+        tokenFor: (uid) => JWTUtils.createTokenSync(config.get("auth"), { uid, roles: [] } as any),
+        blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        createMailbox: async (data?: any) =>
+            repo(MailboxSQL).save(
+                new MailboxSQL({
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Index Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                    ...data,
+                }),
+            ),
+        createIndexEntry: async (data) => repo(ZeroAccessIndexEntrySQL).save(new ZeroAccessIndexEntrySQL(data)),
+        indexEntries: () => repo(ZeroAccessIndexEntrySQL).find(),
+        findSegment: (uid) => repo(ZeroAccessIndexSegmentSQL).findOne({ where: { uid } }),
     });
 });

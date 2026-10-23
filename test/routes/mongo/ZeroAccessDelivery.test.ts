@@ -16,6 +16,8 @@ import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { TransportRuleMongo } from "../../../src/models/mongo/TransportRuleMongo.js";
 import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 import { zeroAccessDeliverySuite } from "../zeroAccessDeliverySuite.js";
+import { zeroAccessIndexSuite } from "../zeroAccessIndexSuite.js";
+import { ZeroAccessIndexEntryMongo } from "../../../src/models/mongo/ZeroAccessIndexEntryMongo.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({ instance: { port: 9999, dbName: "rrst-test" } });
 
@@ -29,6 +31,7 @@ describe("Zero-access delivery (Mongo)", () => {
         "IngestQueueEntryMongo",
         "MessageMongo",
         "ZeroAccessIndexEntryMongo",
+        "ZeroAccessIndexSegmentMongo",
         "QuarantineEntryMongo",
         "AttachmentMongo",
         "EncryptionPolicyMongo",
@@ -137,5 +140,27 @@ describe("Zero-access delivery (Mongo)", () => {
         updateMessage: async (uid, fields) => {
             await repos.MessageMongo.updateOne({ uid } as any, { $set: fields });
         },
+    });
+
+    zeroAccessIndexSuite({
+        app: () => server.getApplication(),
+        mailboxesUrl: "/mongo/mailboxes",
+        tokenFor: (uid) => JWTUtils.createTokenSync(config.get("auth"), { uid, roles: [] } as any),
+        blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        createMailbox: async (data?: any) =>
+            repos.MailboxMongo.save(
+                new MailboxMongo({
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Index Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                    ...data,
+                }),
+            ),
+        createIndexEntry: async (data) => repos.ZeroAccessIndexEntryMongo.save(new ZeroAccessIndexEntryMongo(data)),
+        indexEntries: () => repos.ZeroAccessIndexEntryMongo.find({}).toArray(),
+        findSegment: (uid) => repos.ZeroAccessIndexSegmentMongo.findOne({ uid } as any),
     });
 });
