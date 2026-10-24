@@ -263,3 +263,23 @@ export async function canReplaceOpenPgpKeyAutomatically(pinned: PublicKey, obser
         return false;
     }
 }
+
+/**
+ * The OpenPGP certificate in `binary` (one or more concatenated transferable public keys, as a Web Key Directory answers) that
+ * is `address`'s at `now` (`parseOpenPgpContactKey()`), the newest when several are; `undefined` when none is.
+ */
+export async function selectOpenPgpKeyFor(binary: Uint8Array, address: string, now: number = Date.now()): Promise<PublicKey | undefined> {
+    if (binary.length === 0 || binary.length > MAX_OPENPGP_KEY_BYTES * 4) {
+        return undefined;
+    }
+    const pgp: OpenPgp = await openpgp();
+    const certs = await orElse(pgp.readKeys({ binaryKeys: binary }), []);
+    let newest: PublicKey | undefined;
+    for (const cert of certs.slice(0, 8)) {
+        const key: PublicKey | undefined = await orElse(parseOpenPgpContactKey(Buffer.from(cert.write()).toString("base64"), address, now), undefined);
+        if (key && (!newest || key.notBefore > newest.notBefore)) {
+            newest = key;
+        }
+    }
+    return newest;
+}

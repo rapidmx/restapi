@@ -16,6 +16,7 @@ import { registerTestDoubles } from "../../testDoubles.js";
 
 import { ENCRYPTION_POLICY_UID } from "../../../src/zeroaccess/ZeroAccessResolver.js";
 import { EncryptionPolicySQL } from "../../../src/models/sql/EncryptionPolicySQL.js";
+import { wkdRouteSuite } from "../wkdRouteSuite.js";
 describe("Route:KeyDiscoverySQL Tests", () => {
     const logger = Logger();
     const objectFactory: ObjectFactory = new ObjectFactory(config, logger);
@@ -294,5 +295,21 @@ describe("Route:KeyDiscoverySQL Tests", () => {
         } finally {
             rateLimiter.config = original;
         }
+    });
+
+    wkdRouteSuite({
+        app: () => server.getApplication(),
+        baseUrl: "/sql/.well-known/openpgpkey",
+        createMailbox: (data: any) => createMailbox(data),
+        saveVerifiedDomain: async (name: string) => {
+            await domainRepo.save(new DomainSQL({ uid: name, name, enabled: true, verified: true }));
+        },
+        setOpenPgpAllowed: async (allowed) => {
+            const policies = (objectFactory.getInstance(ConnectionManager)!.connections.get("sql") as any).getRepository(EncryptionPolicySQL);
+            await policies.clear();
+            if (allowed !== undefined) {
+                await policies.save(new EncryptionPolicySQL({ uid: ENCRYPTION_POLICY_UID, allowOpenPgp: allowed }));
+            }
+        },
     });
 });

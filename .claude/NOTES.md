@@ -4445,3 +4445,34 @@ Phase 1 (restapi): the key model.
   - `Message.encrypted` now means "end-to-end encrypted, in either format".
   - There is no separate format field; the client tells the format from the MIME.
 - **Escrow.** The OpenPGP secret key has `useType: "encrypt"`, so `/material` already releases it along with its certificate.
+
+## 2026-10-24 - OpenPGP interoperability, Phase 2 (publication and discovery beyond RapidMX)
+
+- **`BaseWkdRoute`** (`WkdRouteMongo`/`WkdRouteSQL`) is the OpenPGP Web Key Directory. The server mounts it at `/.well-known/openpgpkey`.
+  - Direct method: `GET /hu/:hash?l=` on the mail domain itself; the `Host` header gives the domain.
+  - Advanced method: `GET /:domain/hu/:hash?l=` on `openpgpkey.<domain>`.
+  - `GET /policy` and `GET /:domain/policy` serve an empty policy file.
+  - The address comes from `l`, and the hash must equal `computeWkdHash(l)` (`util/WkdUtils.ts`: z-base-32 of SHA-1 of the ASCII-lowercased local part, checked against the draft's vector). With no `l` the request can't be answered, because the hash can't be reversed.
+  - Lookup is `discoverLocalKeys()`, which resolves aliases, plus-tags and alias domains. It answers with the newest active OpenPGP key as binary `application/octet-stream`, with `access-control-allow-origin: *`.
+  - Everything else is a 404: an unknown address, no OpenPGP key, or "Allow OpenPGP" off.
+- **`util/WkdClient.ts` `fetchWkdKey()`** looks up keys over WKD: advanced method first, then direct.
+  - It reuses the discovery client's SSRF guards, now exported from `KeyDiscoveryClient.ts`: `isSafeDiscoveryHost`, `resolvesToPublicAddresses`, and the new `readBoundedBytes` (128 KB cap).
+  - Redirects are refused (`redirect: "error"`).
+  - `OpenPgpKeyUtils.selectOpenPgpKeyFor()` picks the newest certificate that names the address out of concatenated keys.
+  - Results are cached in memory: 1 h for a hit, 10 min for a miss.
+- **`discoverAndMergeKeys`** tries WKD for a domain with no `_rapidmx` record, which is how a Proton user's key is found. The WKD result carries no preference (`nopreference`, which never overrides one on file).
+  - Tests that expected "no fetch for a non-federated domain" now assert only WKD URLs were fetched.
+- **Autocrypt** (`util/AutocryptHeaderUtils.ts`):
+  - Outbound: `prepareOutboundMime` adds `Autocrypt: addr=…; [prefer-encrypt=mutual;] keydata= <base64 in space-separated runs of 76>` carrying the newest active OpenPGP key.
+    - The runs are spaces, not folds, because `prependHeaders` writes headers on one line.
+    - A v6 key keeps the line well under 998 characters.
+  - Inbound: `ScanQueueJob.processInboundRapidMxKeyHeader` also reads `Autocrypt`, under the same gates as `RapidMX-Key`: aligned, passing DKIM that **oversigns** `Autocrypt`.
+    - The Autocrypt key joins the `RapidMX-Key` one, each in its own slot.
+    - Its preference counts only when there is no `RapidMX-Key` header.
+    - `parseAutocryptHeader` rules: exactly one header; `addr` equals From; `keydata` is base64 (whitespace stripped); an unknown attribute without a `_` prefix invalidates the header.
+  - **Deployment TODO:** the MTA's DKIM signing must oversign `Autocrypt`, exactly as it must `RapidMX-Key`. That config lives outside these repos (postfix-bridge/rspamd). Without it, receivers that apply the oversign rule ignore our `Autocrypt` header.
+- **DNS setup:** a new `openpgpkey_cname` check (`openpgpkey.<domain>` CNAME to `mail:dns:mx_hostname`) is always included. The deployment's TLS certificate must also cover that name; the Helm chart handles its own domain.
+- **Known gaps:**
+  - A plus-tag or alias address gets the primary address's key, whose UID doesn't name it, so strict WKD clients (e.g. GnuPG) may reject it.
+  - GnuPG can't read v6 keys anyway.
+  - `Autocrypt` keeps going out while "Allow OpenPGP" is off for a key enrolled earlier. Discovery and WKD stop serving it.

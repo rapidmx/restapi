@@ -29,6 +29,7 @@ import { ERASURE_IN_PROGRESS } from "./ErasureExecutionJob.js";
 import { writeContactKeys } from "../util/ContactKeyUtils.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
 import { isOpenPgpKey } from "../util/OpenPgpKeyUtils.js";
+import { AUTOCRYPT_HEADER, parseAutocryptHeader } from "../util/AutocryptHeaderUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
 import { evaluateSenderLists, type SenderListVerdict } from "../util/SenderListUtils.js";
 import { MAX_EVENT_ATTENDEES, MAX_REQUESTED_GUESTS, guestPermissionsOf } from "../util/CalendarEventUtils.js";
@@ -1794,6 +1795,11 @@ export abstract class ScanQueueJob<
 
         let discovered: KeyDiscoveryResponse | undefined;
         const keyHeaders: string[] = extractHeaders(raw, RAPIDMX_KEY_HEADER);
+        const autocryptHeaders: string[] = extractHeaders(raw, AUTOCRYPT_HEADER);
+        // The message's effective date (see the Anti-Downgrade note below).
+        const dateHeader: string | undefined = extractHeader(raw, "Date");
+        const effectiveDate: number = dateHeader ? Date.parse(dateHeader) : NaN;
+        const lastSeen: number = Number.isNaN(effectiveDate) ? Date.now() : effectiveDate;
         // Aligned, passing DKIM alone isn't enough: the header must also be *oversigned* by that aligned signature,
         // or anyone holding one genuinely signed message from this domain could append their own key header to it
         // and replay it (`util/DkimOversignUtils.ts`).
@@ -1809,16 +1815,29 @@ export abstract class ScanQueueJob<
                 // comparison vacuously true for a replayed/out-of-order message, defeating the whole point of
                 // the check. `Date` header parses to `NaN` for a missing/malformed header; fall back to now
                 // only in that case (a message with no usable date can't be replay-dated anyway).
-                const dateHeader: string | undefined = extractHeader(raw, "Date");
-                const effectiveDate: number = dateHeader ? Date.parse(dateHeader) : NaN;
                 discovered = {
                     keys: [parsed.publicKey],
                     encryptPreference: {
                         preferEncrypt: parsed.preferEncrypt,
-                        lastSeen: Number.isNaN(effectiveDate) ? Date.now() : effectiveDate,
+                        lastSeen,
                     },
                     escrow: false,
                 };
+            }
+        }
+        // An OpenPGP client's `Autocrypt` header (`specs/end-to-end_encryption.md` *OpenPGP Interoperability*), under the same
+        // gates: aligned, passing DKIM that oversigns it. Its certificate joins the `RapidMX-Key` one (each is pinned in its own
+        // slot); its preference counts only when there is no `RapidMX-Key` header.
+        if (
+            autocryptHeaders.length > 0 &&
+            hasAlignedPassingDkim(this.authenticationResults(raw), fromDomain, this.trustedAuthservId) &&
+            isHeaderOversignedByAlignedDkim(raw, AUTOCRYPT_HEADER, fromDomain, this.authenticationResults(raw), this.trustedAuthservId)
+        ) {
+            const autocrypt = parseAutocryptHeader(autocryptHeaders, fromAddress);
+            if (autocrypt) {
+                discovered = discovered
+                    ? { ...discovered, keys: [...discovered.keys, autocrypt.publicKey] }
+                    : { keys: [autocrypt.publicKey], encryptPreference: { preferEncrypt: autocrypt.preferEncrypt, lastSeen }, escrow: false };
             }
         }
 

@@ -18,6 +18,7 @@ export * from "./BaseEncryptionPolicyRoute.js";
 export * from "./BaseFocusedInboxOverrideRoute.js";
 export * from "./BaseFolderRoute.js";
 export * from "./BaseKeyDiscoveryRoute.js";
+export * from "./BaseWkdRoute.js";
 export * from "./BaseKeyLookupRoute.js";
 export * from "./BaseKeyVaultRoute.js";
 export * from "./BaseZeroAccessIndexRoute.js";

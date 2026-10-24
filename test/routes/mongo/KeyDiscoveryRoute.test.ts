@@ -20,6 +20,7 @@ const mongod: MongoMemoryServer = new MongoMemoryServer({
 
 import { ENCRYPTION_POLICY_UID } from "../../../src/zeroaccess/ZeroAccessResolver.js";
 import { EncryptionPolicyMongo } from "../../../src/models/mongo/EncryptionPolicyMongo.js";
+import { wkdRouteSuite } from "../wkdRouteSuite.js";
 describe("Route:KeyDiscoveryMongo Tests", () => {
     const logger = Logger();
     const objectFactory: ObjectFactory = new ObjectFactory(config, logger);
@@ -298,5 +299,21 @@ describe("Route:KeyDiscoveryMongo Tests", () => {
         } finally {
             rateLimiter.config = original;
         }
+    });
+
+    wkdRouteSuite({
+        app: () => server.getApplication(),
+        baseUrl: "/mongo/.well-known/openpgpkey",
+        createMailbox: (data: any) => createMailbox(data),
+        saveVerifiedDomain: async (name: string) => {
+            await domainRepo.save(new DomainMongo({ uid: name, name, enabled: true, verified: true }));
+        },
+        setOpenPgpAllowed: async (allowed) => {
+            const policies = (objectFactory.getInstance(ConnectionManager)!.connections.get("mongo") as any).getMongoRepository("EncryptionPolicyMongo");
+            await policies.deleteMany({});
+            if (allowed !== undefined) {
+                await policies.save(new EncryptionPolicyMongo({ uid: ENCRYPTION_POLICY_UID, allowOpenPgp: allowed }));
+            }
+        },
     });
 });

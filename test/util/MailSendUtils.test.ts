@@ -453,10 +453,22 @@ describe("prepareOutboundMime() and seedReceiptStatus() Tests", () => {
 
         expect(await send([key()], { preferEncrypt: "mutual" })).toMatch(/^RapidMX-Key: addr=sender@example.com; prefer-encrypt=mutual; type=x509; keydata=S0VZ\r\n/);
         expect(await send([key()])).toContain("prefer-encrypt=nopreference");
-        expect(await send([key({ revokedAt: Date.now() - 1 }), key({ notAfter: Date.now() - 1 }), key({ useType: "sign" }), key({ type: "openpgp", publicKey: "UEdQ", notBefore: Date.now() })])).toBe(raw.toString());
+        expect(await send([key({ revokedAt: Date.now() - 1 }), key({ notAfter: Date.now() - 1 }), key({ useType: "sign" })])).toBe(raw.toString());
         // An OpenPGP certificate never rides in the header, even when it is newer than the S/MIME one.
         expect(await send([key(), key({ type: "openpgp", publicKey: "UEdQ", notBefore: Date.now() + 1 })])).toContain("type=x509; keydata=S0VZ");
         expect((await prepareOutboundMime({ raw, message, mailbox: { ...mailbox(), keys: null }, domainUtils: domainUtilsOf(), dnsResolver: dns })).raw).toBe(raw);
+    });
+
+    it("announces the newest active OpenPGP certificate in an Autocrypt header, keydata in runs", async () => {
+        const pgp = (publicKey: string, fields: any = {}) => ({ useType: "encrypt", type: "openpgp", publicKey, notBefore: 1, notAfter: Date.now() + 60_000, ...fields });
+        const send = async (keys: any[], encryptPreference?: any) =>
+            (await prepareOutboundMime({ raw, message, mailbox: mailbox({ keys, encryptPreference }), domainUtils: domainUtilsOf(), dnsResolver: new StaticDnsResolver() })).raw.toString();
+        const long = "A".repeat(100);
+
+        const sent = await send([pgp("T0xE"), pgp(long, { notBefore: 2 }), pgp("UkVW", { notBefore: 3, revokedAt: 1 })], { preferEncrypt: "mutual" });
+        expect(sent).toMatch(/^Autocrypt: addr=sender@example.com; prefer-encrypt=mutual; keydata= A{76} A{24}\r\n/);
+        expect(sent).not.toContain("RapidMX-Key");
+        expect(await send([pgp("T0xE")])).toContain("Autocrypt: addr=sender@example.com; keydata= T0xE\r\n");
     });
 
     it("announces the newest of several active encryption keys (latest notBefore), whatever their order", async () => {

@@ -282,7 +282,7 @@ export function setDiscoveryAddressLookup(lookup?: DiscoveryAddressLookup): void
  * not in time) passes: the request will not connect to it either. A host that changes its answer between this lookup and the
  * request's own (DNS rebinding) is not caught - that takes a connection-level hook, which `fetch()` does not give.
  */
-async function resolvesToPublicAddresses(hostname: string): Promise<boolean> {
+export async function resolvesToPublicAddresses(hostname: string): Promise<boolean> {
     let timer: NodeJS.Timeout | undefined;
     try {
         const addresses: string[] | undefined = await Promise.race([
@@ -352,7 +352,7 @@ const ALLOWED_DISCOVERY_PORTS: ReadonlySet<string> = new Set(["443", "8443"]);
  * `net.isIP()` against its `.hostname` catches every encoding the platform itself would normalize, regardless
  * of base.
  */
-function isSafeDiscoveryHost(host: string): boolean {
+export function isSafeDiscoveryHost(host: string): boolean {
     const parts: string[] = host.split(":");
     if (parts.length > 2) {
         // More than one `:` - an IPv6 literal or garbage, never a `hostname[:port]`.
@@ -415,6 +415,37 @@ export function parseKeyDiscoveryAddress(address: string): KeyDiscoveryAddressPa
  * unbounded stream - `Response.json()`/`.text()` have no built-in size cap, so a malicious/misbehaving peer
  * could otherwise stream gigabytes into this process's heap in response to a single discovery lookup.
  */
+/** `response`'s body, aborting (throwing) once more than `maxBytes` have been read - see `readBoundedJson()`. */
+export async function readBoundedBytes(response: Response, maxBytes: number): Promise<Buffer> {
+    const reader = response.body?.getReader();
+    if (!reader) {
+        // A test double without a stream.
+        const whole: Buffer = Buffer.from(await response.arrayBuffer());
+        if (whole.length > maxBytes) {
+            throw new Error("Response body exceeded the maximum allowed size.");
+        }
+        return whole;
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            total += value.byteLength;
+            if (total > maxBytes) {
+                throw new Error("Response body exceeded the maximum allowed size.");
+            }
+            chunks.push(value);
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+}
+
 async function readBoundedJson(response: Response, maxBytes: number): Promise<unknown> {
     const reader = response.body?.getReader();
     if (!reader) {

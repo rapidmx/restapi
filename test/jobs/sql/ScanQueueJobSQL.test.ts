@@ -7,6 +7,7 @@
 // header for the full rationale (also applies here verbatim). Uses `config.sql.ts`, whose `acl` datastore is
 // ALSO SQL-backed (`AccessControlListSQL`, auto-selected by `ACLUtils` from the connection's runtime type) -
 // so this file has no MongoDB dependency at all, unlike the Mongo-ACL-dependent form this file used earlier.
+import { openPgpKey } from "../../openPgpTestKeys.js";
 import "reflect-metadata";
 import * as nodeCrypto from "crypto";
 import * as x509 from "@peculiar/x509";
@@ -651,6 +652,44 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             expect(contacts[0].keys![0].fingerprint).toMatch(/^[0-9a-f]+$/);
             expect(contacts[0].encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: expect.any(Number) });
             expect(contacts[0].lastMessageSeen).toEqual(expect.any(Number));
+        });
+
+        it("Pins an OpenPGP key from an aligned, oversigned Autocrypt header, next to the RapidMX-Key certificate, and ignores one not oversigned.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const pgp = await openPgpKey("sender@example.com");
+            const autocrypt = `Autocrypt: addr=sender@example.com; prefer-encrypt=mutual; keydata=${pgp.base64}`;
+            const auth = "Authentication-Results: mx.example.com; dkim=pass header.d=example.com";
+            const deliver = async (headers: string): Promise<void> => {
+                const rawBlobKey = `raw/${uuid.v4()}`;
+                await blobStore.put(rawBlobKey, makePlainRawMessage(headers));
+                await createIngestEntry({ rawBlobKey });
+                await job.run();
+            };
+            const contacts = async () => (await contactRepo.find({ where: { mailboxUid } })).filter((c: any) => c.emails?.some((e: any) => e.address === "sender@example.com"));
+
+            // Signed, but the Autocrypt header isn't covered by the signature: ignored.
+            await deliver(`${autocrypt}
+${auth}
+${oversigningDkimSignature("example.com")}`);
+            expect(await contacts()).toHaveLength(0);
+
+            await deliver(`${autocrypt}
+${auth}
+${oversigningDkimSignature("example.com", "Autocrypt")}`);
+            let [contact] = await contacts();
+            expect(contact.keys).toEqual([pgp.key]);
+            expect(contact.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: expect.any(Number) });
+
+            // With a RapidMX-Key header too, its certificate is pinned beside the OpenPGP key.
+            const keydata = await makeCertBase64("sender@example.com");
+            await deliver(
+                `RapidMX-Key: addr=sender@example.com; type=x509; keydata=${keydata}
+${autocrypt}
+${auth}
+${oversigningDkimSignature("example.com", "RapidMX-Key", "Autocrypt")}`,
+            );
+            [contact] = await contacts();
+            expect(contact.keys!.map((k: any) => k.type)).toEqual(["openpgp", "x509"]);
         });
 
         it("Creates no further Contact from a key header once the mailbox holds max_header_key_contacts of them, but still updates one it already has.", async () => {
@@ -1663,7 +1702,8 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
 
             await deliverKeyHeader(address, keydata);
 
-            expect(mockFetch).not.toHaveBeenCalled();
+            // A domain that isn't a RapidMX peer is looked up in its Web Key Directory only - never the RapidMX discovery endpoint.
+            expect(mockFetch.mock.calls.every(([url]: any[]) => String(url).includes("/.well-known/openpgpkey/"))).toBe(true);
             const [contact] = await contactRepo.find({ where: { mailboxUid, displayName: address } });
             expect(contact.keys.map((key: any) => key.fingerprint)).toEqual([pinned.fingerprint]);
             expect(contact.keyConflicts).toEqual([
@@ -3636,7 +3676,8 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
 
             await job.run();
 
-            expect(mockFetch).not.toHaveBeenCalled();
+            // A domain that isn't a RapidMX peer is looked up in its Web Key Directory only - never the RapidMX discovery endpoint.
+            expect(mockFetch.mock.calls.every(([url]: any[]) => String(url).includes("/.well-known/openpgpkey/"))).toBe(true);
             const contacts = await contactRepo.find({ where: { mailboxUid } });
             expect(contacts[0].keys![0].fingerprint).toBe("pinned-fp");
         });

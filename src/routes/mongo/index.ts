@@ -19,6 +19,7 @@ export * from "./FocusedInboxOverrideRouteMongo.js";
 export * from "./FolderRouteMongo.js";
 export * from "./IngestQueueRouteMongo.js";
 export * from "./KeyDiscoveryRouteMongo.js";
+export * from "./WkdRouteMongo.js";
 export * from "./KeyLookupRouteMongo.js";
 export * from "./KeyVaultRouteMongo.js";
 export * from "./ZeroAccessIndexRouteMongo.js";

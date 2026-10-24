@@ -31,12 +31,12 @@ function findCheck(checks: Awaited<ReturnType<typeof checkDnsSetup>>, type: stri
 }
 
 describe("checkDnsSetup() Tests", () => {
-    it("Returns the 5 base record types when no autodiscover hostname is given (plugin not active).", async () => {
+    it("Returns the 6 base record types when no autodiscover hostname is given (plugin not active).", async () => {
         const resolver = makeResolver();
 
         const checks = await checkDnsSetup(resolver, makeDomain(), "");
 
-        expect(checks.map((c) => c.type).sort()).toEqual(["dkim", "dmarc", "mx", "ownership", "spf"].sort());
+        expect(checks.map((c) => c.type).sort()).toEqual(["dkim", "dmarc", "mx", "openpgpkey_cname", "ownership", "spf"].sort());
     });
 
     it("Also returns the 2 autodiscover record types once an autodiscover hostname (even empty) is given.", async () => {
@@ -45,7 +45,7 @@ describe("checkDnsSetup() Tests", () => {
         const checks = await checkDnsSetup(resolver, makeDomain(), "", "");
 
         expect(checks.map((c) => c.type).sort()).toEqual(
-            ["autodiscover_cname", "autodiscover_srv", "dkim", "dmarc", "mx", "ownership", "spf"].sort(),
+            ["autodiscover_cname", "autodiscover_srv", "dkim", "dmarc", "mx", "openpgpkey_cname", "ownership", "spf"].sort(),
         );
     });
 
@@ -254,6 +254,19 @@ describe("checkDnsSetup() Tests", () => {
             const dmarc = findCheck(checks, "dmarc");
             expect(dmarc.found).toBe(false);
             expect(dmarc.matches).toBe(false);
+        });
+    });
+
+    describe("openpgpkey_cname", () => {
+        it("Recommends the deployment's own host for openpgpkey.<domain>, and checks the live CNAME against it.", async () => {
+            const resolver = makeResolver({ resolveCname: vi.fn().mockResolvedValue(["Mail.Example.com."]) });
+            const cname = findCheck(await checkDnsSetup(resolver, makeDomain(), "mail.example.com"), "openpgpkey_cname");
+            expect(cname).toMatchObject({ configured: true, recommendedValue: "mail.example.com", found: true, matches: true, actualValue: "Mail.Example.com." });
+            expect(resolver.resolveCname).toHaveBeenCalledWith(`openpgpkey.${makeDomain().name}`);
+
+            const missing = findCheck(await checkDnsSetup(makeResolver(), makeDomain(), "mail.example.com"), "openpgpkey_cname");
+            expect(missing).toMatchObject({ configured: true, found: false, matches: false });
+            expect(findCheck(await checkDnsSetup(makeResolver(), makeDomain(), ""), "openpgpkey_cname").configured).toBe(false);
         });
     });
 

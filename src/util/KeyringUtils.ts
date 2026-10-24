@@ -13,6 +13,7 @@ import { fetchRemoteKeys, MAX_DISCOVERED_KEYS, parseKeyDiscoveryAddress, parseKe
 import { discoverLocalKeys, type LocalKeyDiscovery } from "./LocalKeyDiscoveryUtils.js";
 import { canReplaceOpenPgpKeyAutomatically, isOpenPgpKey, keySlot, parseOpenPgpContactKey, sanitizeOpenPgpKey } from "./OpenPgpKeyUtils.js";
 import { parseContactKey } from "./SignerCertificateUtils.js";
+import { fetchWkdKey } from "./WkdClient.js";
 import { Contact, EncryptionPreference, KeyConflict, KeyDiscoveryResponse, PreviousKey, PublicKey, RejectedKey } from "../models/types.js";
 
 /** The subset of `Contact` this module reads/writes - callers pass exactly this shape whether the caller has
@@ -375,9 +376,13 @@ export async function applyDiscoveredKeys(
  * `address`'s domain federation policy (`util/FederationUtils.ts`) and fetches that peer's discovery endpoint
  * (`util/KeyDiscoveryClient.ts`).
  *
+ * An address whose domain isn't a RapidMX peer (no `_rapidmx` record) is looked up in its domain's OpenPGP Web Key Directory
+ * instead (`WkdClient.fetchWkdKey()`, `specs/end-to-end_encryption.md` *OpenPGP Interoperability*) - how a Proton Mail user's key
+ * is found. A key found there carries no encryption preference.
+ *
  * Returns `undefined` - not a "no-op" `KeyringUpdate` - when there is nothing to merge: the domain isn't a federated peer
- * at all (no `_rapidmx` record), the fetch failed with nothing cached, or the address is of this deployment's own domain
- * but no mailbox has it. A caller can thereby distinguish "nothing to update" from "this address isn't running
+ * and publishes no OpenPGP key over WKD, the fetch failed with nothing cached, or the address is of this deployment's own
+ * domain but no mailbox has it. A caller can thereby distinguish "nothing to update" from "this address isn't running
  * RapidMX", which `GET /keys/lookup` (Group E2) surfaces differently (e.g. a `404`) than "found the peer, no conflict".
  *
  * @param source `"discovery"` for `GET /keys/lookup` (Group E2); `"header"` callers (Group E3) call
@@ -407,7 +412,10 @@ export async function discoverAndMergeKeys(
     }
     const policy = await resolveFederationPolicy(dnsResolver, parsed.domain);
     if (!policy) {
-        return undefined;
+        const wkdKey: PublicKey | undefined = await fetchWkdKey(address);
+        return wkdKey
+            ? await applyDiscoveredKeys(existing, { encryptPreference: { preferEncrypt: "nopreference" }, keys: [wkdKey], escrow: false }, observedAt, "discovery", address)
+            : undefined;
     }
     const discovered = await fetchRemoteKeys(policy.host, address);
     if (!discovered) {

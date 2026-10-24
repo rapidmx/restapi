@@ -9,6 +9,7 @@ import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { type Mailbox, type MessageReceiptEntry, type PublicKey, SpamVerdict } from "../models/types.js";
 import { isOpenPgpKey } from "./OpenPgpKeyUtils.js";
+import { AUTOCRYPT_HEADER, buildAutocryptHeader } from "./AutocryptHeaderUtils.js";
 import { type MailSendContext, publishTransportOutcome } from "../events/MailEventStream.js";
 import { MailRelayError, type MailRelayFailureDetails, relayFailureDetails } from "../transport/TransportResultUtils.js";
 import { normalizeAddress } from "./AddressUtils.js";
@@ -297,17 +298,17 @@ export async function prepareOutboundMime(args: {
     const activeEncryptKey: PublicKey | undefined = (mailbox?.keys ?? [])
         .filter((k) => k.useType === "encrypt" && !isOpenPgpKey(k) && !k.revokedAt && k.notAfter > Date.now())
         .reduce<PublicKey | undefined>((newest, k) => (newest === undefined || k.notBefore > newest.notBefore ? k : newest), undefined);
+    const preferEncrypt = (mailbox?.encryptPreference ?? { preferEncrypt: "nopreference" as const }).preferEncrypt;
     if (activeEncryptKey) {
-        raw = prependHeaders(raw, [
-            {
-                name: "RapidMX-Key",
-                value: buildRapidMxKeyHeader(
-                    message.from.address,
-                    (mailbox!.encryptPreference ?? { preferEncrypt: "nopreference" }).preferEncrypt,
-                    activeEncryptKey,
-                ),
-            },
-        ]);
+        raw = prependHeaders(raw, [{ name: "RapidMX-Key", value: buildRapidMxKeyHeader(message.from.address, preferEncrypt, activeEncryptKey) }]);
+    }
+    // The OpenPGP certificate rides in a standard `Autocrypt` header, for every OpenPGP mail client (the RapidMX discovery
+    // endpoint and WKD publish it too). The newest active one.
+    const activeOpenPgpKey: PublicKey | undefined = (mailbox?.keys ?? [])
+        .filter((k) => isOpenPgpKey(k) && !k.revokedAt && k.notAfter > Date.now())
+        .reduce<PublicKey | undefined>((newest, k) => (newest === undefined || k.notBefore > newest.notBefore ? k : newest), undefined);
+    if (activeOpenPgpKey) {
+        raw = prependHeaders(raw, [{ name: AUTOCRYPT_HEADER, value: buildAutocryptHeader(message.from.address, preferEncrypt, activeOpenPgpKey) }]);
     }
     return { raw, attachesReceiptRequest };
 }

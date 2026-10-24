@@ -9,7 +9,7 @@ import { buildVerificationTxtValue, checkDomainVerification } from "./DomainVeri
 /** One of the mail-related DNS record types a domain's setup is checked against. The two `autodiscover_*`
  * types are only ever included in `checkDnsSetup()`'s result while `@rapidmx/autodiscover-plugin` is
  * active for this deployment - see that function's own doc comment. */
-export type DnsRecordType = "ownership" | "mx" | "spf" | "dkim" | "dmarc" | "autodiscover_cname" | "autodiscover_srv";
+export type DnsRecordType = "ownership" | "mx" | "spf" | "dkim" | "dmarc" | "openpgpkey_cname" | "autodiscover_cname" | "autodiscover_srv";
 
 /** The live-checked status of one DNS record this server recommends for a `Domain` - see
  * `checkDnsSetup()`. Always computed fresh, never persisted (unlike `Domain.verified`). */
@@ -162,6 +162,30 @@ const AUTODISCOVER_SRV_PORT = 443;
  * `autodiscover.<domain>` hostname to also be covered by this deployment's TLS certificate (a SAN, or its
  * own certificate) - an operational note, not something this check can verify.
  */
+/**
+ * Checks the `openpgpkey.<domain>` CNAME that lets OpenPGP clients (Proton Mail, GnuPG, Thunderbird) find this domain's keys in
+ * its Web Key Directory with the advanced method (`BaseWkdRoute`), pointing at this deployment's own host (`mail:dns:mx_hostname`).
+ * The deployment's TLS certificate must also cover `openpgpkey.<domain>` (the Helm chart's does for its own domain). Without
+ * it, clients fall back to the direct method on the bare domain, which only works when that domain is served here too.
+ */
+async function checkOpenPgpKeyCname(dnsResolver: DnsResolver, domain: Domain, hostname: string): Promise<DnsRecordCheck> {
+    const recordName = `openpgpkey.${domain.name}`;
+    const base: DnsRecordCheck = { type: "openpgpkey_cname", recordKind: "CNAME", recordName, configured: !!hostname, found: false, matches: false };
+    if (!hostname) {
+        return base;
+    }
+    base.recommendedValue = hostname;
+    try {
+        const records: string[] = await dnsResolver.resolveCname(recordName);
+        base.found = records.length > 0;
+        base.matches = records.some((r) => normalizeHost(r) === normalizeHost(hostname));
+        base.actualValue = records.join(", ");
+    } catch {
+        // Not set up yet.
+    }
+    return base;
+}
+
 async function checkAutodiscoverCname(dnsResolver: DnsResolver, domain: Domain, publicHostname: string): Promise<DnsRecordCheck> {
     const recordName = `autodiscover.${domain.name}`;
     const base: DnsRecordCheck = {
@@ -244,6 +268,7 @@ export async function checkDnsSetup(
         checkSpf(dnsResolver, domain),
         checkDkim(dnsResolver, domain),
         checkDmarc(dnsResolver, domain),
+        checkOpenPgpKeyCname(dnsResolver, domain, mxHostname),
     ];
     if (autodiscoverHostname !== undefined) {
         checks.push(checkAutodiscoverCname(dnsResolver, domain, autodiscoverHostname), checkAutodiscoverSrv(dnsResolver, domain, autodiscoverHostname));
