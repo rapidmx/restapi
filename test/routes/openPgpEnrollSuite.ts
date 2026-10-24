@@ -32,7 +32,7 @@ export function openPgpEnrollSuite(ctx: OpenPgpEnrollSuiteContext): void {
             await ctx.setOpenPgpAllowed(undefined);
         });
 
-        it("enrolls a self-certified key next to the S/MIME one, superseding only an earlier OpenPGP key", async () => {
+        it("enrolls a self-certified v4 or v6 key next to the S/MIME one, superseding only an earlier OpenPGP key", async () => {
             const owner = uuid.v4();
             const mailbox = await ctx.createMailbox({ ownerUserUid: owner });
             const smime = await enroll(mailbox, owner, { useType: "encrypt", csr: await generateTestCsr(mailbox.primarySmtpAddress), wrappedKey });
@@ -41,7 +41,7 @@ export function openPgpEnrollSuite(ctx: OpenPgpEnrollSuiteContext): void {
             const first = await openPgpKey(mailbox.primarySmtpAddress);
             const res = await enroll(mailbox, owner, { useType: "encrypt", type: "openpgp", publicKey: first.armored, wrappedKey });
             expect(res.status).toBe(200);
-            const second = await openPgpKey(mailbox.primarySmtpAddress);
+            const second = await openPgpKey(mailbox.primarySmtpAddress, { version: 6 });
             expect((await enroll(mailbox, owner, { useType: "encrypt", type: "openpgp", publicKey: second.base64, wrappedKey })).status).toBe(200);
 
             const stored = await ctx.findMailbox(mailbox.uid);

@@ -19,7 +19,7 @@ export interface TestOpenPgpKey {
 }
 
 export interface TestOpenPgpKeyOptions {
-    /** 6 (default) or 4. */
+    /** 4 (default, what the web client generates) or 6. */
     version?: 4 | 6;
     /** Extra user ID emails, after the first. */
     aliases?: string[];
@@ -35,7 +35,7 @@ export interface TestOpenPgpKeyOptions {
 export async function openPgpKey(email: string, options: TestOpenPgpKeyOptions = {}): Promise<TestOpenPgpKey> {
     const userIDs = [{ name: "Test", email }, ...(options.aliases ?? []).map((alias) => ({ email: alias }))];
     const generated =
-        options.version === 4
+        options.version !== 6
             ? await openpgp.generateKey({
                   type: "ecc",
                   curve: "curve25519Legacy",

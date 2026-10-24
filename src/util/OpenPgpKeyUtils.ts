@@ -25,7 +25,7 @@ export const OPENPGP_KEY_TYPE = "openpgp";
 /** `PublicKey.notAfter` of an OpenPGP certificate that never expires: the largest valid JavaScript date. */
 export const OPENPGP_NO_EXPIRY = 8_640_000_000_000_000;
 
-/** The largest OpenPGP certificate accepted, in bytes (a v6 Ed25519/X25519 key is well under 1 KB; a key with many
+/** The largest OpenPGP certificate accepted, in bytes (an Ed25519/X25519 key, v4 or v6, is well under 1 KB; a key with many
  * signatures or a photo user ID is refused rather than stored). */
 export const MAX_OPENPGP_KEY_BYTES = 32 * 1024;
 

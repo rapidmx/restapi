@@ -32,7 +32,7 @@ describe("OpenPgpKeyUtils", () => {
     });
 
     it("parses a v6 certificate, armored or base64 binary, with every field from the certificate", async () => {
-        const key = await openPgpKey(ADDRESS, { aliases: ["ALIAS@example.com"] });
+        const key = await openPgpKey(ADDRESS, { version: 6, aliases: ["ALIAS@example.com"] });
         for (const text of [key.armored, key.base64]) {
             const parsed = await parseOpenPgpCertificate(text);
             expect(parsed).toMatchObject({ emails: [ADDRESS, "alias@example.com"], canEncrypt: true, version: 6 });
@@ -40,7 +40,7 @@ describe("OpenPgpKeyUtils", () => {
             expect(parsed!.key.fingerprint).toHaveLength(64);
             expect(parsed!.revokedAt).toBeUndefined();
         }
-        const v4 = await parseOpenPgpCertificate((await openPgpKey(ADDRESS, { version: 4 })).armored);
+        const v4 = await parseOpenPgpCertificate((await openPgpKey(ADDRESS)).armored);
         expect(v4).toMatchObject({ version: 4, canEncrypt: true });
         expect(v4!.key.fingerprint).toHaveLength(40);
     });

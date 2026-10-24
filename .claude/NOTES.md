@@ -4402,9 +4402,8 @@ JP's decisions. The plan is at `C:\Users\caska\.claude\plans\openpgp-interop.md`
 - **OpenPGP is a second format, for interoperability only:** Proton Mail, Thunderbird, GnuPG and similar.
   - **S/MIME stays RapidMX's own format, and MUST be preferred** whenever a recipient has an S/MIME certificate.
   - Spec: `end-to-end_encryption.md` *Message Format*, *OpenPGP Interoperability*, and Resolved Decision 16.
-- **Full two-way.** Every mailbox gets a client-generated, self-certified **v6** (RFC 9580) Ed25519/X25519 key.
-  - v4 keys from others are still read.
-  - GnuPG can't import v6 keys; JP accepted this.
+- **Full two-way.** Every mailbox gets a client-generated, self-certified Ed25519/Curve25519 key.
+  - (Changed 2026-10-24, JP) The client generates **v4** (RFC 4880) keys by default, not v6, so GnuPG can import them. v6 (RFC 9580) keys stay fully supported: enrollment, discovery, Autocrypt, WKD and contact pins accept both, and existing v6 keys keep working.
 - **Mixed recipients:** one encrypted copy per format, never a plaintext copy.
 - **Discovery.**
   - The RapidMX discovery endpoint publishes the OpenPGP certificate alongside the S/MIME ones. JP's reasoning: our protocol is richer than Autocrypt, because it works before first contact and carries the preference and the escrow flag.
@@ -4465,7 +4464,7 @@ Phase 1 (restapi): the key model.
 - **Autocrypt** (`util/AutocryptHeaderUtils.ts`):
   - Outbound: `prepareOutboundMime` adds `Autocrypt: addr=…; [prefer-encrypt=mutual;] keydata= <base64 in space-separated runs of 76>` carrying the newest active OpenPGP key.
     - The runs are spaces, not folds, because `prependHeaders` writes headers on one line.
-    - A v6 key keeps the line well under 998 characters.
+    - An Ed25519 key (v4 or v6) keeps the line well under 998 characters.
   - Inbound: `ScanQueueJob.processInboundRapidMxKeyHeader` also reads `Autocrypt`, under the same gates as `RapidMX-Key`: aligned, passing DKIM that **oversigns** `Autocrypt`.
     - The Autocrypt key joins the `RapidMX-Key` one, each in its own slot.
     - Its preference counts only when there is no `RapidMX-Key` header.
@@ -4474,7 +4473,7 @@ Phase 1 (restapi): the key model.
 - **DNS setup:** a new `openpgpkey_cname` check (`openpgpkey.<domain>` CNAME to `mail:dns:mx_hostname`) is always included. The deployment's TLS certificate must also cover that name; the Helm chart handles its own domain.
 - **Known gaps:**
   - A plus-tag or alias address gets the primary address's key, whose UID doesn't name it, so strict WKD clients (e.g. GnuPG) may reject it.
-  - GnuPG can't read v6 keys anyway.
+  - GnuPG can't read v6 keys; RapidMX generates v4 by default for that reason.
   - `Autocrypt` keeps going out while "Allow OpenPGP" is off for a key enrolled earlier. Discovery and WKD stop serving it.
 
 ### 2026-10-24: `Message.envelopeRecipients` (OpenPGP Phase 4, mixed-format sends)

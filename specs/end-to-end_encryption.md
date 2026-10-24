@@ -39,7 +39,8 @@ Public enrolment MUST be automated. RFC 8823 defines an ACME `email-reply-00` ch
 Each RapidMX mailbox also has an **OpenPGP certificate**, so OpenPGP users can encrypt to it and verify its signatures. Server administrators MAY turn this off ("Allow OpenPGP", `EncryptionPolicy.allowOpenPgp`, default on); S/MIME is unaffected.
 
 **Keys.**
-- The client generates a **v6 (RFC 9580)** key: an Ed25519 primary key (certification and signing) with an X25519 encryption subkey, and one user ID, the mailbox's primary address. v4 keys from correspondents MUST still be read, encrypted to and verified.
+- The client generates a **v4 (RFC 4880)** key by default: an Ed25519 primary key (certification and signing) with a Curve25519 (X25519) encryption subkey, and one user ID, the mailbox's primary address. v4 is what every OpenPGP implementation in use reads, GnuPG included.
+- **v6 (RFC 9580)** keys are equally supported: the server accepts either version at enrollment, in discovery, in key headers and from contacts, and the client reads, encrypts to and verifies both.
 - Its secret key is sealed under MK like every other private key (AAD purpose `openpgp-private-key`, `WrappedPrivateKey.type: "openpgp"`), escrowed exactly like the encryption key, and released by escrow with it.
 - There is no CA: the key is self-certified and enrolled with `POST /:id/keyvault/keys` (`type: "openpgp"`). The server checks it (it parses, is valid now, its self-signatures verify, a user ID names the address, it can encrypt) and never issues anything.
 - An OpenPGP certificate both encrypts and signs, so it is one `PublicKey` (`type: "openpgp"`, `useType: "encrypt"`) whose pin covers signature verification too. Its fingerprint is the primary key's (64 hex characters for v6, 40 for v4).
@@ -695,7 +696,7 @@ These indicators also serve the enablement migration: a user who enables E2E aft
 | 13 | Zero-access encryption at rest | Adopted. A server-wide "Allow zero-access encryption" setting (administrator, default on) and a per-mailbox "Enable zero-access encryption" setting (owner only, default on). Covers the mail that can never be end-to-end encrypted. Specified in the search design document, which owns the delivery-path ordering. |
 | 14 | Zero-access vs. E2EE in the UI | Separate indicator states. A zero-access message MUST NOT be described as end-to-end encrypted. |
 | 15 | Search index key | None. The index is encrypted to a dedicated zero-access public key — a third keypair whose private key is wrapped under MK — because the server must write the index at delivery and cannot use a symmetric key. Old zero-access keys are retained on rotation, so nothing is re-encrypted. |
-| 16 | OpenPGP | Supported as a second format, for interoperability with OpenPGP users (Proton Mail and others) only. S/MIME stays RapidMX's own format and is preferred for any recipient that can receive it. Every mailbox gets a self-certified v6 OpenPGP key, published on the RapidMX discovery endpoint, over WKD and in an `Autocrypt` header. Recipients that need both formats get one encrypted copy each; never a plaintext copy. No public keyservers. |
+| 16 | OpenPGP | Supported as a second format, for interoperability with OpenPGP users (Proton Mail and others) only. S/MIME stays RapidMX's own format and is preferred for any recipient that can receive it. Every mailbox gets a self-certified OpenPGP key (v4 by default; v6 also supported), published on the RapidMX discovery endpoint, over WKD and in an `Autocrypt` header. Recipients that need both formats get one encrypted copy each; never a plaintext copy. No public keyservers. |
 
 ## Deferred
 
