@@ -2,20 +2,29 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import * as crypto from "crypto";
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { BlobStore } from "../blob/BlobStore.js";
-import { FolderType, type Folder, type Mailbox, type Message } from "../models/types.js";
+import { FolderType, type Folder, type Mailbox, type Message, type ZeroAccessDataType } from "../models/types.js";
+import { CONTACT_PHOTO_KEY_PREFIX } from "../routes/BaseContactRoute.js";
 import { settleZeroAccessTypes } from "../util/ZeroAccessUtils.js";
-import type { MessageBlobRepos } from "../util/BlobReferenceUtils.js";
+import { deleteBlobsIfUnreferenced, type MessageBlobRepos } from "../util/BlobReferenceUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { newZeroAccessWriter, type ZeroAccessSealedFields, type ZeroAccessWriter } from "../zeroaccess/ZeroAccessWriter.js";
+import { sealFieldsOnWrite } from "../zeroaccess/ZeroAccessFieldSealer.js";
+import { newZeroAccessRecordSealer, PROTECTED_FIELDS, type ZeroAccessRecordSealer } from "../zeroaccess/ZeroAccessRecordSealer.js";
+import type { ZeroAccessTarget } from "../zeroaccess/ZeroAccessResolver.js";
+import { sealToCertificate } from "../zeroaccess/ZeroAccessSealer.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** The longest error message kept on `Message.zeroAccessBackfillError`. */
 const MAX_ERROR_LENGTH = 1000;
+
+/** The record types sealed field by field, in the order a run works through them after mail. */
+const RECORD_TYPES: readonly ZeroAccessDataType[] = ["calendar", "contacts", "tasks"];
 
 /**
  * Seals the mail a mailbox already had when zero-access encryption became active for it (`specs/search.md` §3, *Existing mail*):
@@ -31,6 +40,12 @@ const MAX_ERROR_LENGTH = 1000;
  *
  * Messages in Outbox are left alone - they are being sent, and `ScheduledSendJob` seals the Sent Items copy - and so is mail the
  * sender encrypted end to end. Turning zero-access off never decrypts anything (the server can't): this job only ever seals.
+ *
+ * Calendar events, contacts and tasks are sealed the same way, per data type, once that type is protected for the mailbox (`specs/search.md`
+ * §3 *What It Covers*), within the same budget and after its mail: each record that has no `sealedFields` yet gets its protected fields
+ * sealed exactly as a write would (`sealFieldsOnWrite()`), and a contact's photo is stored again sealed. A record with nothing to seal
+ * gets an empty `sealedFields`, so it isn't selected again; an event made from a zero-access invitation (`sealedContent`) is already
+ * sealed. A record edited while its type was off after it had been sealed keeps the fields edited then readable until it is next edited.
  */
 export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox, F extends Folder> extends BackgroundService {
     protected abstract messageClass: any;
@@ -41,6 +56,10 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
     protected abstract ingestQueueEntryClass: any;
     protected abstract encryptionPolicyClass: any;
     protected abstract zeroAccessIndexEntryClass: any;
+    /** The record models sealed per data type. Optional: a type whose model is unset isn't backfilled. */
+    protected calendarEventClass?: any;
+    protected contactClass?: any;
+    protected taskClass?: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -50,6 +69,8 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
     protected folderRepo?: RepoUtils<F>;
     protected blobRepos: MessageBlobRepos = {};
     protected zeroAccessWriter?: ZeroAccessWriter;
+    protected recordSealer?: ZeroAccessRecordSealer;
+    protected recordRepos: Partial<Record<ZeroAccessDataType, RecoverableRepoUtils<any>>> = {};
 
     @Inject("BlobStore")
     protected blobStore?: BlobStore;
@@ -83,6 +104,17 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
             ingestQueueEntryRepo: await repo(this.ingestQueueEntryClass),
         };
         this.zeroAccessWriter ??= await newZeroAccessWriter(this._objectFactory, this.encryptionPolicyClass, this.zeroAccessIndexEntryClass);
+        this.recordSealer ??= await newZeroAccessRecordSealer(this._objectFactory, this.encryptionPolicyClass);
+        const records: [ZeroAccessDataType, any][] = [
+            ["calendar", this.calendarEventClass],
+            ["contacts", this.contactClass],
+            ["tasks", this.taskClass],
+        ];
+        for (const [type, cls] of records) {
+            if (cls && !this.recordRepos[type]) {
+                this.recordRepos[type] = await repo(cls, RecoverableRepoUtils);
+            }
+        }
     }
 
     public async start(): Promise<void> {
@@ -107,10 +139,15 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                     continue;
                 }
                 await this.settleTypes(mailbox);
-                if (!(await this.zeroAccessWriter.target(mailbox))) {
-                    continue;
+                if (await this.zeroAccessWriter.target(mailbox)) {
+                    budget -= await this.backfillMailbox(mailbox, budget);
                 }
-                budget -= await this.backfillMailbox(mailbox, budget);
+                for (const type of RECORD_TYPES) {
+                    if (budget <= 0) {
+                        return;
+                    }
+                    budget -= await this.backfillRecords(mailbox, type, budget);
+                }
             }
         }
     }
@@ -127,6 +164,72 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                 mailbox,
                 await this.mailboxRepo!.update({ uid: mailbox.uid, version: (mailbox as any).version, zeroAccessTypes: settled } as any, mailbox, { ignoreACL: true }),
             );
+        }
+    }
+
+    /** Seals up to `limit` of `mailbox`'s `type` records not sealed yet - the deleted-but-restorable ones too - when `type` is protected
+     * for it, and returns how many it attempted. */
+    private async backfillRecords(mailbox: X, type: ZeroAccessDataType, limit: number): Promise<number> {
+        const repo: RecoverableRepoUtils<any> | undefined = this.recordRepos[type];
+        const target: ZeroAccessTarget | undefined = repo && this.recordSealer ? await this.recordSealer.target(type, mailbox) : undefined;
+        if (!repo || !target) {
+            return 0;
+        }
+        const query = (deleted?: true) =>
+            repo.find(
+                {
+                    mailboxUid: mailbox.uid,
+                    sealedFields: null,
+                    ...(type === "calendar" ? { sealedContent: null } : {}),
+                    ...(deleted ? { deleted: true } : {}),
+                    sort: { uid: "ASC" },
+                    limit,
+                } as any,
+                { ignoreACL: true, limit },
+            );
+        const live: any[] = await query();
+        const candidates: any[] = live.length < limit ? [...live, ...(await query(true))] : live;
+        let attempted: number = 0;
+        for (const record of candidates.slice(0, limit)) {
+            attempted++;
+            await this.sealRecord(repo, type, record, target);
+        }
+        return attempted;
+    }
+
+    /** Seals one record's protected fields (and a contact's photo) to `target`. A record changed meanwhile is left for the next run. */
+    private async sealRecord(repo: RecoverableRepoUtils<any>, type: ZeroAccessDataType, record: any, target: ZeroAccessTarget): Promise<void> {
+        const fields = PROTECTED_FIELDS[type] ?? [];
+        const patch: Record<string, any> = { uid: record.uid, version: record.version };
+        for (const field of fields) {
+            patch[field.name] = record[field.name];
+        }
+        let previousPhoto: string | undefined;
+        try {
+            await sealFieldsOnWrite(patch, record, fields, target);
+            // Nothing to seal: marked as done, so it isn't selected again.
+            patch.sealedFields ??= {};
+            if (type === "contacts" && !record.photoSealed && typeof record.photoBlobKey === "string" && record.photoBlobKey.startsWith(CONTACT_PHOTO_KEY_PREFIX)) {
+                const photo: Buffer = await this.blobStore!.get(record.photoBlobKey);
+                patch.photoBlobKey = `${CONTACT_PHOTO_KEY_PREFIX}${record.uid}/${crypto.randomUUID()}`;
+                await this.blobStore!.put(patch.photoBlobKey, await sealToCertificate(photo, target.certDer));
+                patch.photoSealed = true;
+                previousPhoto = record.photoBlobKey;
+            }
+            await repo.update(patch, asEntity(repo, record), { ignoreACL: true, includeDeleted: true } as any);
+        } catch (err: any) {
+            if (patch.photoSealed) {
+                await this.blobStore!.delete(patch.photoBlobKey).catch(() => undefined);
+            }
+            this.logger?.debug?.(`ZeroAccessBackfillJob: ${type} ${record.uid} wasn't sealed this run: ${err?.message ?? err}`);
+            return;
+        }
+        if (previousPhoto) {
+            try {
+                await deleteBlobsIfUnreferenced(this.blobStore!, [{ repo, fields: ["photoBlobKey"] }], [previousPhoto]);
+            } catch (err: any) {
+                this.logger?.warn(`ZeroAccessBackfillJob: contact ${record.uid}'s readable photo couldn't be removed: ${err?.message ?? err}`);
+            }
         }
     }
 

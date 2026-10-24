@@ -8,6 +8,7 @@ import { Logger } from "@rapidrest/core";
 import { ObjectFactory } from "@rapidrest/service-core";
 import config from "../config.js";
 import { ZeroAccessBackfillJobMongo } from "../../src/jobs/mongo/ZeroAccessBackfillJobMongo.js";
+import { openSealedField, testZeroAccessKey, type TestZeroAccessKey } from "../zeroAccessTestKeys.js";
 
 const objectFactory = new ObjectFactory(config, Logger());
 const sealed = { subject: "[...]", bodyPreview: "", bodyBlobKey: "za/mb/m", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" }, indexEntryUid: "ix" };
@@ -135,5 +136,99 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
         instance.messageRepo.find = vi.fn(async (query: any) => (query.deleted ? [message("m2", { folderUid: "outbox" })] : [message("m1", { encrypted: true })]));
         await instance.run();
         expect(instance.zeroAccessWriter.sealRaw).not.toHaveBeenCalled();
+    });
+
+    describe("calendar events, contacts and tasks", () => {
+        /** A job whose mail is done, with `rows` per record type for the live query and `deleted` for the deleted one. */
+        async function recordJob(rows: Record<string, any[]>, options: { protectedTypes?: string[]; deleted?: Record<string, any[]>; update?: any } = {}) {
+            const za: TestZeroAccessKey = await testZeroAccessKey();
+            const { instance, logger } = job({ messages: [] });
+            const target = { key: za.key, certDer: Buffer.from(za.key.publicKey, "base64") };
+            const protectedTypes = options.protectedTypes ?? ["calendar", "contacts", "tasks"];
+            instance.recordSealer = { target: vi.fn(async (type: string) => (protectedTypes.includes(type) ? target : undefined)) };
+            instance.blobStore.put = vi.fn().mockResolvedValue(undefined);
+            instance.blobStore.get = vi.fn().mockResolvedValue(Buffer.from("PHOTO"));
+            const repos: Record<string, any> = {};
+            for (const type of ["calendar", "contacts", "tasks"]) {
+                repos[type] = {
+                    find: vi.fn(async (query: any) => (query.deleted ? (options.deleted?.[type] ?? []) : (rows[type] ?? []))),
+                    update: options.update ?? vi.fn(async (patch: any) => patch),
+                    // `deleteBlobsIfUnreferenced()`: nothing else names the old photo.
+                    findOne: vi.fn().mockResolvedValue(undefined),
+                    count: vi.fn().mockResolvedValue(0),
+                };
+            }
+            instance.recordRepos = repos;
+            return { instance, logger, za, repos };
+        }
+
+        it("seals each protected type's records not sealed yet - restorable ones too - and marks a record with nothing to seal", async () => {
+            const { instance, za, repos } = await recordJob(
+                {
+                    calendar: [{ uid: "e1", version: 1, mailboxUid: "mb", title: "CANARY board", location: "Room 4", description: null }],
+                    tasks: [{ uid: "t1", version: 2, mailboxUid: "mb", title: "", body: null }],
+                },
+                { deleted: { tasks: [{ uid: "t2", version: 0, mailboxUid: "mb", title: "CANARY deleted task" }] } },
+            );
+
+            await instance.run();
+
+            const [event, , options] = repos.calendar.update.mock.calls[0];
+            expect(event).toMatchObject({ uid: "e1", version: 1, title: "Protected event", location: null });
+            expect(JSON.stringify(event)).not.toContain("CANARY");
+            expect(await openSealedField(event.sealedFields.title, za)).toBe("CANARY board");
+            expect(options).toMatchObject({ includeDeleted: true });
+            expect(repos.calendar.find.mock.calls[0][0]).toMatchObject({ mailboxUid: "mb", sealedFields: null, sealedContent: null });
+            expect(repos.tasks.update.mock.calls.map(([patch]: any[]) => [patch.uid, patch.sealedFields])).toEqual([
+                ["t1", {}],
+                ["t2", { title: expect.any(String) }],
+            ]);
+            expect(repos.contacts.update).not.toHaveBeenCalled();
+        });
+
+        it("stores a contact's photo again sealed and removes the readable one, and leaves an outside photo key alone", async () => {
+            const { instance, za, repos } = await recordJob({
+                contacts: [
+                    { uid: "c1", version: 0, mailboxUid: "mb", displayName: "Jane", emails: [{ address: "jane@example.com" }], photoBlobKey: "contact-photos/c1/old" },
+                    { uid: "c2", version: 0, mailboxUid: "mb", displayName: "Joe", emails: [], photoBlobKey: "elsewhere/x" },
+                ],
+            });
+
+            await instance.run();
+
+            const [patch] = repos.contacts.update.mock.calls[0];
+            expect(patch).toMatchObject({ displayName: "jane@example.com", photoSealed: true, photoBlobKey: expect.stringMatching(/^contact-photos\/c1\//) });
+            expect(await openSealedField(patch.sealedFields.displayName, za)).toBe("Jane");
+            const [key, bytes] = instance.blobStore.put.mock.calls[0];
+            expect(key).toBe(patch.photoBlobKey);
+            expect(bytes.toString()).not.toContain("PHOTO");
+            expect(instance.blobStore.delete).toHaveBeenCalledWith("contact-photos/c1/old");
+            expect(repos.contacts.update.mock.calls[1][0].photoBlobKey).toBeUndefined();
+        });
+
+        it("leaves a type that isn't protected alone, stops at the budget, and retries a record that changed meanwhile next run", async () => {
+            const update = vi.fn().mockRejectedValue(new Error("version"));
+            const { instance, logger, repos } = await recordJob(
+                { contacts: [{ uid: "c1", version: 0, mailboxUid: "mb", displayName: "Jane", emails: [], photoBlobKey: "contact-photos/c1/old" }], tasks: [{ uid: "t1", title: "x" }] },
+                { protectedTypes: ["contacts", "tasks"], update },
+            );
+            instance.batchSize = 1;
+
+            await instance.run();
+
+            expect(repos.calendar.find).not.toHaveBeenCalled();
+            expect(repos.tasks.find).not.toHaveBeenCalled();
+            // The sealed copy of the photo it couldn't attach goes; the readable one stays.
+            expect(instance.blobStore.delete).toHaveBeenCalledWith(instance.blobStore.put.mock.calls[0][0]);
+            expect(instance.blobStore.delete).not.toHaveBeenCalledWith("contact-photos/c1/old");
+            expect(logger.debug).toHaveBeenCalledWith(expect.stringContaining("version"));
+        });
+
+        it("keeps a contact sealed, logging it, when its readable photo can't be removed", async () => {
+            const { instance, logger } = await recordJob({ contacts: [{ uid: "c1", version: 0, mailboxUid: "mb", displayName: "Jane", emails: [], photoBlobKey: "contact-photos/c1/old" }] });
+            instance.blobStore.delete.mockRejectedValue(new Error("store down"));
+            await instance.run();
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("store down"));
+        });
     });
 });

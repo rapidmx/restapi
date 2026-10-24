@@ -484,6 +484,24 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 return { message, bodyBlobKey, sanitizedHtmlBlobKey, attachmentBlobKey };
             };
 
+            it("seals the calendar events of a mailbox whose calendar it protects, skipping those already done, and leaves its mail alone", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient, { zeroAccessTypes: { mail: false, calendar: true } });
+                const calendar = await ctx.createFolder(mailbox.uid, "calendar");
+                const fields = { mailboxUid: mailbox.uid, folderUid: calendar.uid, location: "CANARY room 4" };
+                const readable = await ctx.createCalendarEvent({ ...fields, title: "CANARY board meeting" });
+                const done = await ctx.createCalendarEvent({ ...fields, title: "Marked done", sealedFields: {} });
+
+                await ctx.runBackfill();
+
+                const events = await ctx.calendarEvents();
+                const sealed = events.find((event) => event.uid === readable.uid);
+                expect(sealed).toMatchObject({ title: "Protected event" });
+                expect(JSON.stringify(sealed)).not.toContain("CANARY");
+                expect(Object.keys(sealed.sealedFields).sort()).toEqual(["location", "title"]);
+                expect(events.find((event) => event.uid === done.uid)).toMatchObject({ title: "Marked done", location: "CANARY room 4" });
+            });
+
             it("seals a mailbox's readable mail into its own week and removes every readable copy", async () => {
                 const recipient = await makeKey();
                 const mailbox = await zeroAccessMailbox(recipient);

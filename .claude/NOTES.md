@@ -4557,3 +4557,13 @@ Phase 1 (restapi): the key model.
 - The guard + claim + send live in `MeetingInviteSender.sendProtectedInvitations(event, content, eventRepo, source)` (+ `protectedInvitationsPending`), exported from the package root with `InvitationContent`: the route, activesync (a device Add) and anything else that saves a protected event with plaintext in hand call it.
 - `CalendarReminderJob` adds `protected: true` to a sealed event's reminder payload; web-client then reads the event by uid to show its real title.
 - Siblings: activesync invites a device's Add (not a Change - it carries placeholders); mapi seals `saveAppointment` (Outlook's own invites for protected events are not sent - documented); booking-plugin seals its event and composes the booker's ICS from the booking (`bookingEventContent`). All take `encryptionPolicyClass` + `newZeroAccessRecordSealer`.
+
+### 2026-10-24: Zero-access for calendar, contacts and tasks - Phase 6 (backfill, escrow)
+- `ZeroAccessBackfillJob` also seals calendar events, contacts and tasks per type once that type is protected (`recordSealer.target(type)`), after the mailbox's mail and within the same `batch_size`. It runs even when mail isn't protected.
+  - It selects rows with `sealedFields: null` (events also `sealedContent: null`), the live ones first and then the soft-deleted ones. It seals them with `sealFieldsOnWrite` and writes with `includeDeleted`.
+  - A row with nothing to seal gets `sealedFields: {}`, so it is never selected again.
+  - A contact photo under `contact-photos/` is stored again sealed under a new key (`photoSealed`), and the old blob is removed via `deleteBlobsIfUnreferenced`.
+  - A conflicting write leaves the row for the next run; the new sealed photo blob is dropped.
+  - Known gap (stated in the doc comment): a row edited while its type was off after it had been sealed keeps those fields readable until its next edit.
+- The models are optional subclass fields (`calendarEventClass`/`contactClass`/`taskClass`).
+- Escrow: the escrow console never decrypts by design, so there is no console change. Matter exports carry `sealedFields` as part of each row; `end-to-end_encryption.md`'s release paragraph says the offline tooling opens them.
