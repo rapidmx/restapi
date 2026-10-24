@@ -1216,6 +1216,12 @@ export interface Message extends RecoverableBaseEntity {
 
     recipients: Recipient[];
 
+    /** The addresses this message is actually delivered to, when not all of `recipients`: one copy of a message whose recipients
+     * need different end-to-end formats (`specs/end-to-end_encryption.md` *OpenPGP Interoperability* - an S/MIME copy and an
+     * OpenPGP copy, each listing every recipient in its headers) goes only to the recipients of its own format. Only ever
+     * narrows delivery: an address not in `recipients` is ignored (`MailSendUtils.envelopeRecipientsOf()`). */
+    envelopeRecipients?: string[];
+
     sentDate: Date;
 
     receivedDate: Date;

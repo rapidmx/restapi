@@ -233,9 +233,23 @@ export function applyThreadHeaders(raw: Buffer, thread: { inReplyTo?: string; re
 }
 
 /** What `prepareOutboundMime()` needs to know about the message being sent. */
+/**
+ * The addresses a message is relayed to: its `envelopeRecipients` when it has any - kept only where they are among its
+ * `recipients` (case-insensitively), so the field can narrow delivery but never add an address - else every recipient.
+ */
+export function envelopeRecipientsOf(message: { recipients: { address: string }[]; envelopeRecipients?: string[] | null }): string[] {
+    const all: string[] = message.recipients.map((recipient) => recipient.address);
+    if (!message.envelopeRecipients?.length) {
+        return all;
+    }
+    const wanted = new Set(message.envelopeRecipients.map((address) => address.toLowerCase()));
+    return all.filter((address) => wanted.has(address.toLowerCase()));
+}
+
 export interface OutboundMessageInfo {
     from: { address: string };
     recipients: { address: string }[];
+    envelopeRecipients?: string[] | null;
     /** An explicit per-draft receipt request, overriding all three of the mailbox's `alwaysRequestReceipt*` defaults. */
     requestReceipt?: boolean | null;
 }
@@ -264,7 +278,7 @@ export async function prepareOutboundMime(args: {
 }): Promise<{ raw: Buffer; attachesReceiptRequest: boolean }> {
     const { message, mailbox, domainUtils } = args;
     let raw: Buffer = args.raw;
-    const envelopeTo: string[] = message.recipients.map((recipient) => recipient.address);
+    const envelopeTo: string[] = envelopeRecipientsOf(message);
 
     let attachesReceiptRequest = false;
     if (mailbox && domainUtils && args.dnsResolver) {

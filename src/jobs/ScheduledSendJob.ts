@@ -23,7 +23,7 @@ import { normalizeAddress } from "../util/AddressUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { CorrespondentUtils, messageObservations } from "../util/CorrespondentUtils.js";
 import { DomainUtils } from "../util/DomainUtils.js";
-import { prepareOutboundMime, scanAndRelay, seedReceiptStatus } from "../util/MailSendUtils.js";
+import { envelopeRecipientsOf, prepareOutboundMime, scanAndRelay, seedReceiptStatus } from "../util/MailSendUtils.js";
 import { deriveMessageListFields } from "../util/MessageListUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
@@ -470,7 +470,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     await this.refuse(claimed, ZERO_ACCESS_DRAFT_MESSAGE);
                     return;
                 }
-                const envelopeTo: string[] = claimed.recipients.map((r) => r.address);
+                const envelopeTo: string[] = envelopeRecipientsOf(claimed);
                 // The receipt request and encryption-key announcement an immediate send adds (`prepareOutboundMime()`).
                 const prepared = await prepareOutboundMime({
                     raw,
@@ -597,7 +597,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                               references: relayInfo.references.length > 0 ? relayInfo.references : ((refetched as any).references ?? []),
                           }
                         : {}),
-                    ...(attachesReceiptRequest ? { receiptStatus: seedReceiptStatus(claimed.recipients.map((r) => r.address)) } : {}),
+                    ...(attachesReceiptRequest ? { receiptStatus: seedReceiptStatus(envelopeRecipientsOf(claimed)) } : {}),
                     // Releases the claim's lease.
                     scheduledSendTime: null,
                     scheduledSendLeaseExpiresAt: null,

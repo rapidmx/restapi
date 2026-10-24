@@ -30,7 +30,7 @@ import { createFederatedPeerCheck, DomainUtils } from "../util/DomainUtils.js";
 import { coalesceFolderCounts, notifyFolderCounts, type FolderCountsContext } from "../util/FolderCountUtils.js";
 import { findOrCreateWellKnownFolder, getMailboxUidForFolder } from "../util/FolderUtils.js";
 import { findActiveHoldsFor } from "../util/LegalHoldUtils.js";
-import { applyThreadHeaders, prepareOutboundMime, scanAndRelay, seedReceiptStatus } from "../util/MailSendUtils.js";
+import { applyThreadHeaders, envelopeRecipientsOf, prepareOutboundMime, scanAndRelay, seedReceiptStatus } from "../util/MailSendUtils.js";
 import { sendOrThrow, type MailRelayFailureDetails } from "../transport/TransportResultUtils.js";
 import type { ScheduledSendJob } from "../jobs/ScheduledSendJob.js";
 import { deliveryFailureKey, describeOriginal, tryFileDeliveryFailureNotice } from "../util/DeliveryFailureNoticeUtils.js";
@@ -1341,7 +1341,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             return background ? { status: "queued", message: queued } : queued;
         }
 
-        const envelopeTo: string[] = message.recipients.map((r) => r.address);
+        const envelopeTo: string[] = envelopeRecipientsOf(message);
 
         // The receipt request and the encryption-key announcement (`util/MailSendUtils.ts`'s `prepareOutboundMime()`, which
         // `ScheduledSendJob` applies to what it relays too) - the same for a message sent now and one sent in the background.
@@ -1778,7 +1778,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // The recall notice goes out with `from.address` as its sender - same rule as `send()`.
         await this.assertSenderAllowed(await this.mailboxRepo!.findOne(message.mailboxUid, { ignoreACL: true }), message);
 
-        const envelopeTo: string[] = message.recipients.map((r) => r.address);
+        // A copy delivered to only some recipients (`Message.envelopeRecipients`) is recalled from those.
+        const envelopeTo: string[] = envelopeRecipientsOf(message);
         // `from.displayName` is ordinary client-writable data - an address-like one is left out (`safeDisplayName()`).
         const fromName: string | undefined = safeDisplayName(message.from.displayName);
         const composed: Buffer = await new MailComposer({

@@ -109,6 +109,11 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
     public recipients: Recipient[] = [];
 
     @Column()
+    @Description("The addresses this message is delivered to when not all of its recipients (one copy of a message sent in two end-to-end formats).")
+    @Nullable
+    public envelopeRecipients?: string[] = undefined;
+
+    @Column()
     @Description("The date and time the message was sent.")
     public sentDate: Date = new Date();
 
@@ -384,6 +389,7 @@ export class MessageMongo extends RecoverableBaseMongoEntity implements Message 
             this.subject = other.subject !== undefined ? other.subject : this.subject;
             this.from = other.from !== undefined ? other.from : this.from;
             this.recipients = other.recipients !== undefined ? other.recipients : this.recipients;
+            this.envelopeRecipients = "envelopeRecipients" in other ? other.envelopeRecipients : this.envelopeRecipients;
             this.sentDate = other.sentDate !== undefined ? other.sentDate : this.sentDate;
             this.receivedDate = other.receivedDate !== undefined ? other.receivedDate : this.receivedDate;
             this.bodyBlobKey = other.bodyBlobKey !== undefined ? other.bodyBlobKey : this.bodyBlobKey;

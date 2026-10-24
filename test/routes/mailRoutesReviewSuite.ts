@@ -962,6 +962,30 @@ export function mailRoutesReviewSuite(ctx: MailRoutesReviewSuiteContext): void {
             expect((await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/recall`)), owner)).status).toBe(200);
         });
 
+        it("a copy limited to some recipients (envelopeRecipients) is relayed and recalled only to those, never to an address not on it", async () => {
+            const mine = await createMailbox(owner.uid);
+            const drafts = await createFolder(mine.uid, FolderType.DRAFTS);
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await ctx.blobStore().put(bodyBlobKey, Buffer.from(`From: ${mine.primarySmtpAddress}
+To: smime@example.net
+Cc: pgp@example.net
+Subject: hi
+
+hello`));
+            const draft = await createMessage(mine, drafts.uid, {
+                bodyBlobKey,
+                recipients: [
+                    { address: "smime@example.net", type: RecipientType.TO },
+                    { address: "pgp@example.net", type: RecipientType.CC },
+                ],
+                envelopeRecipients: ["PGP@example.net", "stranger@example.net"],
+            });
+            expect((await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/send`)), owner)).status).toBe(200);
+            expect(ctx.transport().sent.map((m: any) => m.envelopeTo)).toEqual([["pgp@example.net"]]);
+            expect((await auth(request(ctx.app()).post(url(`/messages/${draft.uid}/recall`)), owner)).status).toBe(200);
+            expect(ctx.transport().sent[1].envelopeTo).toEqual(["pgp@example.net"]);
+        });
+
         it("a recall the transport turns away isn't recorded, and can be tried again (R1-05)", async () => {
             const mine = await createMailbox(owner.uid);
             const sent = await createFolder(mine.uid, FolderType.SENT_ITEMS);

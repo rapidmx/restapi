@@ -4476,3 +4476,9 @@ Phase 1 (restapi): the key model.
   - A plus-tag or alias address gets the primary address's key, whose UID doesn't name it, so strict WKD clients (e.g. GnuPG) may reject it.
   - GnuPG can't read v6 keys anyway.
   - `Autocrypt` keeps going out while "Allow OpenPGP" is off for a key enrolled earlier. Discovery and WKD stop serving it.
+
+### 2026-10-24: `Message.envelopeRecipients` (OpenPGP Phase 4, mixed-format sends)
+- An encrypted message whose recipients need both S/MIME and OpenPGP goes out as two stored messages, one per format. Each lists every recipient in its headers but is relayed only to its own format's recipients.
+- `Message.envelopeRecipients?: string[]` (Mongo and SQL columns, nullable) restricts relay delivery. `MailSendUtils.envelopeRecipientsOf()` keeps only addresses that are also in `recipients` (case-insensitive), so the field can narrow delivery but never add an address. Empty or absent means every recipient.
+- Used by `BaseMessageRoute` send and recall, and by `ScheduledSendJob` (relay plus receipt seeding).
+- The server's `assemble-raw` sets it from the client's `deliverTo`.

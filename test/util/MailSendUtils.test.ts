@@ -7,6 +7,7 @@
 // doubles from testDoubles.ts so this can assert what actually got relayed/stored.
 import {
     applyThreadHeaders,
+    envelopeRecipientsOf,
     MAX_RELAYED_REFERENCES,
     MAX_RELAYED_REFERENCES_LENGTH,
     prepareOutboundMime,
@@ -478,6 +479,14 @@ describe("prepareOutboundMime() and seedReceiptStatus() Tests", () => {
 
         expect(await send([key("T0xE", 100), key("TkVX", 200)])).toContain("keydata=TkVX");
         expect(await send([key("TkVX", 200), key("T0xE", 100)])).toContain("keydata=TkVX");
+    });
+
+    it("relays to every recipient, or only to the envelope recipients among them", () => {
+        const recipients = [{ address: "a@example.com" }, { address: "B@example.com" }];
+        expect(envelopeRecipientsOf({ recipients })).toEqual(["a@example.com", "B@example.com"]);
+        expect(envelopeRecipientsOf({ recipients, envelopeRecipients: [] })).toEqual(["a@example.com", "B@example.com"]);
+        expect(envelopeRecipientsOf({ recipients, envelopeRecipients: ["b@example.com", "x@example.com"] })).toEqual(["B@example.com"]);
+        expect(envelopeRecipientsOf({ recipients, envelopeRecipients: null })).toHaveLength(2);
     });
 
     it("seeds one tracking row per distinct recipient, case variants collapsed", () => {
