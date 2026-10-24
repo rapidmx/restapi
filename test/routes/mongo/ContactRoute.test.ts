@@ -414,6 +414,25 @@ describe("Route:ContactMongo Tests", () => {
         expect(result.body.displayName).toBe("Renamed");
     });
 
+    it("Lets the user choose a contact's preferred end-to-end format, or clear it, and refuses anything else (400).", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const folder = await createFolder(mailbox.uid);
+        const contact = await createContact(mailbox.uid, folder.uid);
+        const put = (version: number, preferredFormat: unknown) =>
+            request(server.getApplication())
+                .put(`${baseUrl}/${contact.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: contact.uid, version, preferredFormat });
+
+        const chosen = await put(contact.version, "openpgp");
+        expect(chosen.status).toBe(200);
+        expect(chosen.body.preferredFormat).toBe("openpgp");
+        expect((await put(chosen.body.version, "pgp")).status).toBe(400);
+        const cleared = await put(chosen.body.version, null);
+        expect(cleared.status).toBe(200);
+        expect(((await contactRepo.findOne({ uid: contact.uid } as any)) as any)?.preferredFormat ?? undefined).toBeUndefined();
+    });
+
     it("Rejects updating a contact that attempts to set a key-discovery-managed field directly (400), leaving it unchanged.", async () => {
         const mailbox = await createMailbox(owner.uid);
         const folder = await createFolder(mailbox.uid);
@@ -429,7 +448,7 @@ describe("Route:ContactMongo Tests", () => {
             });
 
         expect(result.status).toBe(400);
-        for (const field of ["keyConflict", "previousKeys", "rejectedKeys"]) {
+        for (const field of ["keyConflict", "previousKeys", "rejectedKeys", "observedFormat"]) {
             const refused = await request(server.getApplication())
                 .put(`${baseUrl}/${contact.uid}`)
                 .set("Authorization", "jwt " + ownerToken)

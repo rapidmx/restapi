@@ -702,6 +702,48 @@ ${oversigningDkimSignature("example.com", "RapidMX-Key", "Autocrypt")}`,
             expect(contact.keys!.map((k: any) => k.type)).toEqual(["openpgp", "x509"]);
         });
 
+        it("Records the format an authenticated sender was last seen using, never from a RapidMX sender's Autocrypt, an unauthenticated or an older message.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const pgp = await openPgpKey("sender@example.com");
+            const keydata = await makeCertBase64("sender@example.com");
+            const autocrypt = `Autocrypt: addr=sender@example.com; keydata=${pgp.base64}`;
+            const auth = "Authentication-Results: mx.example.com; dkim=pass header.d=example.com";
+            const smimeSigned = 'Content-Type: multipart/signed; protocol="application/pkcs7-signature"; micalg=sha-256; boundary="b"';
+            const pgpEncrypted = 'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="b"';
+            const deliver = async (...headers: string[]): Promise<void> => {
+                const rawBlobKey = `raw/${uuid.v4()}`;
+                await blobStore.put(rawBlobKey, makePlainRawMessage(headers.join("\r\n")));
+                await createIngestEntry({ rawBlobKey });
+                await job.run();
+            };
+            const observed = async () => (await contacts())[0]?.observedFormat ?? undefined;
+            const contacts = async () => await contactRepo.find({ mailboxUid, "emails.address": "sender@example.com" }).toArray();
+
+            // A RapidMX sender sends Autocrypt beside RapidMX-Key on every message: that says nothing about OpenPGP.
+            await deliver(
+                "Date: Mon, 5 Oct 2026 10:00:00 +0000",
+                `RapidMX-Key: addr=sender@example.com; type=x509; keydata=${keydata}`,
+                autocrypt,
+                auth,
+                oversigningDkimSignature("example.com", "RapidMX-Key", "Autocrypt"),
+            );
+            expect(await contacts()).toHaveLength(1);
+            expect(await observed()).toBeUndefined();
+
+            // Another OpenPGP client's Autocrypt header does.
+            await deliver("Date: Tue, 6 Oct 2026 10:00:00 +0000", autocrypt, auth, oversigningDkimSignature("example.com", "Autocrypt"));
+            expect(await observed()).toEqual({ format: "openpgp", at: Date.UTC(2026, 9, 6, 10) });
+
+            // A newer S/MIME-signed message moves it; an older PGP/MIME one, or one without aligned DKIM, doesn't.
+            await deliver("Date: Wed, 7 Oct 2026 10:00:00 +0000", smimeSigned, auth, oversigningDkimSignature("example.com"));
+            expect(await observed()).toEqual({ format: "smime", at: Date.UTC(2026, 9, 7, 10) });
+            await deliver("Date: Thu, 1 Oct 2026 10:00:00 +0000", pgpEncrypted, auth, oversigningDkimSignature("example.com"));
+            await deliver("Date: Fri, 9 Oct 2026 10:00:00 +0000", pgpEncrypted);
+            expect(await observed()).toEqual({ format: "smime", at: Date.UTC(2026, 9, 7, 10) });
+            await deliver("Date: Sat, 10 Oct 2026 10:00:00 +0000", pgpEncrypted, auth, oversigningDkimSignature("example.com"));
+            expect(await observed()).toEqual({ format: "openpgp", at: Date.UTC(2026, 9, 10, 10) });
+        });
+
         it("Creates no further Contact from a key header once the mailbox holds max_header_key_contacts of them, but still updates one it already has.", async () => {
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
             const deliver = async (address: string): Promise<void> => {

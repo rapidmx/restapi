@@ -19,6 +19,7 @@ import { sniffImageType } from "../util/AppearanceUtils.js";
 import { deleteBlobsIfUnreferenced } from "../util/BlobReferenceUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { Contact } from "../models/types.js";
+import { isEndToEndFormat } from "../util/PreferredFormatUtils.js";
 const { Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Delete, Get, Param, Post, Put, Query, RateLimit, Request, Response, User: AuthUser } = RouteDecorators;
@@ -73,9 +74,15 @@ const DISCOVERY_MANAGED_FIELDS = [
     "keyConflicts",
     "previousKeys",
     "rejectedKeys",
+    "observedFormat",
 ] as const;
 
 function rejectDiscoveryManagedFields(obj: Partial<Contact>): void {
+    // The user's own format choice for the contact: one of the two formats, or null/absent for automatic.
+    const preferredFormat: unknown = (obj as Record<string, unknown>).preferredFormat;
+    if (preferredFormat !== undefined && preferredFormat !== null && !isEndToEndFormat(preferredFormat)) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'preferredFormat' must be \"smime\" or \"openpgp\".");
+    }
     for (const field of DISCOVERY_MANAGED_FIELDS) {
         if (field in obj) {
             throw new ApiError(

@@ -18,7 +18,8 @@ import {
     RouteDecorators,
 } from "@rapidrest/service-core";
 import type { DnsResolver } from "../dns/DnsResolver.js";
-import { AuditAction, Contact, EncryptionPreference, Folder, KeyConflict, Mailbox, PreviousKey, PublicKey } from "../models/types.js";
+import { AuditAction, Contact, EncryptionPreference, EndToEndFormat, Folder, KeyConflict, Mailbox, PreviousKey, PublicKey } from "../models/types.js";
+import { type PreferredFormatSource, resolvePreferredFormat } from "../util/PreferredFormatUtils.js";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { ContactKeyMerge, ContactKeyWriteResult, ContactKeyWriteTarget, writeContactKeys } from "../util/ContactKeyUtils.js";
 import { DomainUtils } from "../util/DomainUtils.js";
@@ -44,6 +45,11 @@ const { Get, Param, Post, Query, RateLimit, Request, User: AuthUser } = RouteDec
 export interface PublicKeyLookupResult {
     keys: PublicKey[];
     encryptPreference?: EncryptionPreference;
+    /** The format to use when both are possible (`util/PreferredFormatUtils.ts`'s `resolvePreferredFormat()`): the user's choice for
+     * the contact, else what the address advertises, else what it was last seen using. Absent when nothing says. */
+    preferredFormat?: EndToEndFormat;
+    /** Where `preferredFormat` came from. */
+    preferredFormatSource?: PreferredFormatSource;
     keyConflicts?: KeyConflict[];
     previousKeys?: PreviousKey[];
 }
@@ -256,9 +262,11 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
 
     private toPublic(contact: C): PublicKeyLookupResult {
         const keyConflicts: KeyConflict[] = normalizeKeyConflicts(contact.keyConflicts);
+        const preferred = resolvePreferredFormat(contact);
         return {
             keys: contact.keys ?? [],
             encryptPreference: contact.encryptPreference,
+            ...(preferred ? { preferredFormat: preferred.format, preferredFormatSource: preferred.source } : {}),
             keyConflicts: keyConflicts.length > 0 ? keyConflicts : undefined,
             previousKeys: contact.previousKeys?.length ? contact.previousKeys : undefined,
         };

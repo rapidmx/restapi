@@ -7,6 +7,7 @@ import * as dns from "dns";
 import * as net from "net";
 import { MemoryStore, SimpleStore } from "@rapidrest/core";
 import { EncryptionPreference, KeyDiscoveryResponse, PublicKey } from "../models/types.js";
+import { isEndToEndFormat } from "./PreferredFormatUtils.js";
 
 /** TLDs whose names resolve only inside a private network (or to the host itself): a discovery host under one is an attempt to
  * reach an internal service (`*.svc.cluster.local`, `metadata.google.internal`, `app.localhost`). The documentation TLDs
@@ -161,6 +162,10 @@ export function parseKeyDiscoveryResponse(raw: unknown): KeyDiscoveryResponse | 
     const encryptPreference: EncryptionPreference = { preferEncrypt };
     if (isFiniteNumber(lastSeen)) {
         encryptPreference.lastSeen = lastSeen;
+    }
+    // An unknown format is a newer peer's: ignored, never a reason to refuse the response.
+    if (isEndToEndFormat(raw.encryptPreference.preferFormat)) {
+        encryptPreference.preferFormat = raw.encryptPreference.preferFormat;
     }
     const keys: PublicKey[] = [];
     for (const rawKey of raw.keys) {

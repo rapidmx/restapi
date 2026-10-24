@@ -51,9 +51,10 @@ describe("OpenPgpKeyUtils", () => {
             expect(await parseOpenPgpCertificate(bad)).toBeUndefined();
         }
         expect(await parseOpenPgpCertificate(Buffer.alloc(MAX_OPENPGP_KEY_BYTES + 1, 1).toString("base64").slice(0, 60_000))).toBeUndefined();
-        // An armored key whose binary form is over the cap.
-        const many = await openPgpKey(ADDRESS, { aliases: Array.from({ length: 260 }, (_, i) => `alias${i}@example.com`) });
+        // An armored key within the text cap whose binary form is over the byte cap.
+        const many = await openPgpKey(ADDRESS, { aliases: Array.from({ length: 200 }, (_, i) => `alias${i}@example.com`) });
         expect(many.publicKey.write().length).toBeGreaterThan(MAX_OPENPGP_KEY_BYTES);
+        expect(many.armored.length).toBeLessThan(64 * 1024);
         expect(await parseOpenPgpCertificate(many.armored)).toBeUndefined();
     }, 60_000);
 

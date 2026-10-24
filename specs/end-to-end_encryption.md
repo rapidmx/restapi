@@ -54,7 +54,13 @@ Each RapidMX mailbox also has an **OpenPGP certificate**, so OpenPGP users can e
 - An `Autocrypt` header carries it on outgoing mail, next to `RapidMX-Key`, and MUST be DKIM-oversigned the same way.
 - For a recipient outside RapidMX, the server looks it up with WKD and from DKIM-aligned `Autocrypt` headers of mail it received. A key attached to a signed message is pinned only when the user confirms it. Public keyservers are not consulted (they reveal who users write to).
 
-**Format choice.** For each recipient, the client uses S/MIME when the recipient has a usable S/MIME encryption certificate, and OpenPGP only when they have an OpenPGP certificate and no S/MIME one. A message whose recipients need both formats is sent as **one encrypted copy per format**, each encrypting to every recipient of that format (and to the sender). A plaintext copy is never made.
+**Choosing the format.** A recipient the sender can reach in only one format gets that format. For a recipient with both a usable S/MIME certificate and an OpenPGP certificate, the client uses the recipient's **preferred format**. Key lookup (`GET /mailbox/:id/keys/lookup`) returns it as `preferredFormat`, with `preferredFormatSource` saying which of these it came from; the first one that says anything wins:
+
+1. **The user's choice** for the contact (`Contact.preferredFormat`, "Preferred format" on the contact: Automatic, S/MIME or OpenPGP).
+2. **What the address advertises** (`EncryptionPreference.preferFormat`). A RapidMX mailbox owner sets it on their own mailbox. It is published by the discovery endpoint and by the `RapidMX-Key` header's `_prefer-format` attribute, and is stored on the contact under the same anti-downgrade rule as `prefer-encrypt`. A preference for OpenPGP is published only while the mailbox has an active OpenPGP key that is being published.
+3. **What the address was last seen using** (`Contact.observedFormat`, written only by the server). It comes from inbound mail with aligned, passing DKIM: the message's own format when it is S/MIME or PGP/MIME signed or encrypted, else OpenPGP when it carries an `Autocrypt` header without a `RapidMX-Key` header. A RapidMX sender sends both headers on every message, so its `Autocrypt` header says nothing about which format it would rather receive. Only a newer message (by its `Date`) replaces an observation. Inline PGP is not counted.
+
+With no preference, or a preferred format the sender can't use for that recipient (no usable key in it, or OpenPGP disallowed), the client uses S/MIME. A wrong preference can only pick another format the recipient has a key in; it never sends anything unencrypted. A message whose recipients need both formats is sent as **one encrypted copy per format**, each encrypting to every recipient of that format (and to the sender). A plaintext copy is never made.
 
 **Message format.** PGP/MIME (RFC 3156) with protected headers: the encrypted part carries the real `Subject`, the outer one is `[...]`, as for S/MIME. Inline OpenPGP and cleartext signatures are read, never sent. The server treats PGP/MIME and inline OpenPGP mail as encrypted (no preview, no content indexing, no body rules), and seals it at rest like any other mail when zero-access encryption is on.
 
@@ -276,6 +282,9 @@ export interface EncryptionPreference {
   lastSeen?: number;
   /** The encryption preference of the user or contact to apply to outgoing messages. */
   preferEncrypt: "mutual" | "nopreference";
+  /** Which end-to-end format the address would rather receive when a sender can use either (*Choosing the format*). Absent: no
+   * preference. A receiver ignores a value it doesn't know. */
+  preferFormat?: "smime" | "openpgp";
 }
 
 export interface Mailbox extends BaseEntity {
@@ -465,8 +474,10 @@ In addition to the discovery endpoint, every outgoing message MUST carry the sen
 
 ```
 RapidMX-Key: addr=alice@example.com; prefer-encrypt=mutual;
- type=x509; keydata=MIIB9jCCAZ2gAwIBAgIU...
+ _prefer-format=openpgp; type=x509; keydata=MIIB9jCCAZ2gAwIBAgIU...
 ```
+
+`_prefer-format` (optional, `smime` or `openpgp`) is the sender's preferred format (*Choosing the format*). It is prefixed with `_` so that receivers that predate it ignore it rather than discarding the header.
 
 The **signing** certificate is not carried in this header. It is already present in the `certificates` field of the CMS `SignedData` structure on every signed message.
 

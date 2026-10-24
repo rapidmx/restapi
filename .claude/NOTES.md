@@ -4487,3 +4487,19 @@ Phase 1 (restapi): the key model.
   - `pendingBytes` is the summed length of the pending entries' base64 `sealed`: `$strLenBytes` on Mongo, `SUM(LENGTH())` on SQL. It comes from the same grouped query, so no entry is loaded.
 - Clients stagger from `compactableAt`: desktop at once, web after 6 h, mobile after 24 h. Mobile also declines above 5 MB (pending plus current segment) and on cellular or data saver. Spec: `specs/search.md` §8 *Who compacts*.
 - The server enforces nothing new: the generation compare-and-swap already settles overlap, and the stagger is a client courtesy.
+
+### 2026-10-24: Choosing the format (JP: a stale S/MIME certificate must not beat an OpenPGP user's preference)
+- JP chose **hint + inference + override**. Spec: `end-to-end_encryption.md` *Choosing the format*.
+- **Resolution order** is in `util/PreferredFormatUtils.ts`'s `resolvePreferredFormat`: `Contact.preferredFormat` (the user's choice), then `encryptPreference.preferFormat` (advertised), then `Contact.observedFormat` (seen).
+  - Key lookup returns the result as `preferredFormat` and `preferredFormatSource`.
+  - The client falls back to S/MIME-first when nothing says, or when the preferred format isn't usable.
+- **Advertised:**
+  - The mailbox owner sets `encryptPreference.preferFormat` (validated in `rejectServerManagedFields`).
+  - It is published by discovery (`buildKeyDiscoveryResponse` drops an `openpgp` preference without an active, published OpenPGP key) and by `RapidMX-Key`'s **`_prefer-format`**.
+  - The underscore is deliberate: older parsers reject the whole header for any unknown attribute without one.
+  - `parseKeyDiscoveryResponse` ignores an unknown format rather than refusing the response.
+- **Observed** (`ScanQueueJob.processInboundRapidMxKeyHeader`): only with aligned DKIM.
+  - The message's own S/MIME or PGP/MIME `Content-Type` (`messageEndToEndFormat`) counts, else OpenPGP for an `Autocrypt` header that came **without** `RapidMX-Key`. RapidMX senders send both on every message.
+  - Only a newer `Date` replaces an observation (`newerObservation`).
+  - It is written only onto a contact the message touches anyway, never a new contact. `observedFormat` is discovery-managed, so the contact routes refuse it (400).
+- `Contact.preferredFormat` is user-writable (`smime`/`openpgp`/null, otherwise 400). The SQL column needs `type: "varchar"`, as every string-union column does; otherwise TypeORM sees `Object`.

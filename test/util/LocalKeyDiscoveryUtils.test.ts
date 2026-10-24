@@ -80,6 +80,20 @@ describe("LocalKeyDiscoveryUtils", () => {
             expect((await buildKeyDiscoveryResponse(fakeRepo([]) as any, mailbox() as any)).escrow).toBe(false);
         });
 
+        it("publishes a preference for OpenPGP only with an active OpenPGP key to use, and one for S/MIME always", async () => {
+            const pgpKey = { publicKey: "c", type: "openpgp", useType: "encrypt", fingerprint: "pgp", notBefore: 0, notAfter: 5_000 };
+            const box = (keys: any[], preferFormat: string) => mailbox({ keys, encryptPreference: { preferEncrypt: "mutual", preferFormat } });
+            const response = (keys: any[], preferFormat: string, includeOpenPgp = true) =>
+                buildKeyDiscoveryResponse(fakeRepo([]) as any, box(keys, preferFormat) as any, includeOpenPgp, 1_000);
+
+            expect((await response([...mailbox().keys, pgpKey], "openpgp")).encryptPreference).toEqual({ preferEncrypt: "mutual", preferFormat: "openpgp" });
+            expect((await response(mailbox().keys, "openpgp")).encryptPreference).toEqual({ preferEncrypt: "mutual" });
+            expect((await response([...mailbox().keys, { ...pgpKey, revokedAt: 1 }], "openpgp")).encryptPreference).toEqual({ preferEncrypt: "mutual" });
+            // "Allow OpenPGP" off: the key isn't published, so neither is the preference for it.
+            expect((await response([...mailbox().keys, pgpKey], "openpgp", false)).encryptPreference).toEqual({ preferEncrypt: "mutual" });
+            expect((await response(mailbox().keys, "smime")).encryptPreference).toEqual({ preferEncrypt: "mutual", preferFormat: "smime" });
+        });
+
         it("falls back to the default preference and no keys for a mailbox row that has neither", async () => {
             const response = await buildKeyDiscoveryResponse(fakeRepo([]) as any, mailbox({ keys: undefined, encryptPreference: undefined }) as any);
 

@@ -18,7 +18,7 @@ import { Contact, EncryptionPreference, KeyConflict, KeyDiscoveryResponse, Previ
 
 /** The subset of `Contact` this module reads/writes - callers pass exactly this shape whether the caller has
  * a real `Contact` in hand or is synthesizing one for an address never seen before. */
-export type ContactKeyState = Pick<Contact, "keys" | "encryptPreference" | "keysFirstSeen" | "keyConflicts" | "previousKeys" | "rejectedKeys">;
+export type ContactKeyState = Pick<Contact, "keys" | "encryptPreference" | "keysFirstSeen" | "keyConflicts" | "previousKeys" | "rejectedKeys" | "observedFormat">;
 
 /** The fields `applyDiscoveredKeys()`/`discoverAndMergeKeys()` compute - a caller persists these onto the
  * `Contact` it's tracking (creating one first if this is the first time the address has ever been seen). */

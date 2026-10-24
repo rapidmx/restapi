@@ -30,6 +30,7 @@ import { writeContactKeys } from "../util/ContactKeyUtils.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
 import { isOpenPgpKey } from "../util/OpenPgpKeyUtils.js";
 import { AUTOCRYPT_HEADER, parseAutocryptHeader } from "../util/AutocryptHeaderUtils.js";
+import { messageEndToEndFormat, newerObservation } from "../util/PreferredFormatUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
 import { evaluateSenderLists, type SenderListVerdict } from "../util/SenderListUtils.js";
 import { MAX_EVENT_ATTENDEES, MAX_REQUESTED_GUESTS, guestPermissionsOf } from "../util/CalendarEventUtils.js";
@@ -1800,12 +1801,14 @@ export abstract class ScanQueueJob<
         const dateHeader: string | undefined = extractHeader(raw, "Date");
         const effectiveDate: number = dateHeader ? Date.parse(dateHeader) : NaN;
         const lastSeen: number = Number.isNaN(effectiveDate) ? Date.now() : effectiveDate;
+        const alignedDkim: boolean = hasAlignedPassingDkim(this.authenticationResults(raw), fromDomain, this.trustedAuthservId);
+        let autocryptFromNonRapidMx = false;
         // Aligned, passing DKIM alone isn't enough: the header must also be *oversigned* by that aligned signature,
         // or anyone holding one genuinely signed message from this domain could append their own key header to it
         // and replay it (`util/DkimOversignUtils.ts`).
         if (
             keyHeaders.length > 0 &&
-            hasAlignedPassingDkim(this.authenticationResults(raw), fromDomain, this.trustedAuthservId) &&
+            alignedDkim &&
             isHeaderOversignedByAlignedDkim(raw, RAPIDMX_KEY_HEADER, fromDomain, this.authenticationResults(raw), this.trustedAuthservId)
         ) {
             const parsed = parseRapidMxKeyHeader(keyHeaders, fromAddress);
@@ -1819,6 +1822,7 @@ export abstract class ScanQueueJob<
                     keys: [parsed.publicKey],
                     encryptPreference: {
                         preferEncrypt: parsed.preferEncrypt,
+                        ...(parsed.preferFormat ? { preferFormat: parsed.preferFormat } : {}),
                         lastSeen,
                     },
                     escrow: false,
@@ -1830,16 +1834,24 @@ export abstract class ScanQueueJob<
         // slot); its preference counts only when there is no `RapidMX-Key` header.
         if (
             autocryptHeaders.length > 0 &&
-            hasAlignedPassingDkim(this.authenticationResults(raw), fromDomain, this.trustedAuthservId) &&
+            alignedDkim &&
             isHeaderOversignedByAlignedDkim(raw, AUTOCRYPT_HEADER, fromDomain, this.authenticationResults(raw), this.trustedAuthservId)
         ) {
             const autocrypt = parseAutocryptHeader(autocryptHeaders, fromAddress);
             if (autocrypt) {
+                // A RapidMX sender sends `Autocrypt` alongside `RapidMX-Key` on every message: only another OpenPGP client's says it uses OpenPGP.
+                autocryptFromNonRapidMx = !discovered;
                 discovered = discovered
                     ? { ...discovered, keys: [...discovered.keys, autocrypt.publicKey] }
                     : { keys: [autocrypt.publicKey], encryptPreference: { preferEncrypt: autocrypt.preferEncrypt, lastSeen }, escrow: false };
             }
         }
+
+        // What format the sender was seen using (`specs/end-to-end_encryption.md` *Choosing the format*): the message's own, when it
+        // is signed or encrypted, else OpenPGP for an OpenPGP client's `Autocrypt` header - only from authenticated (aligned DKIM)
+        // mail, and only recorded on a contact this message has reason to touch anyway.
+        const seenFormat = alignedDkim ? (messageEndToEndFormat(extractHeader(raw, "Content-Type")) ?? (autocryptFromNonRapidMx ? "openpgp" : undefined)) : undefined;
+        const observed = seenFormat ? { format: seenFormat, at: lastSeen } : undefined;
 
         const now: number = Date.now();
         let headerConflict = false;
@@ -1860,7 +1872,8 @@ export abstract class ScanQueueJob<
             }
             const update: ContactKeyState = await applyDiscoveredKeys(existingContact, discovered, now, "header", fromAddress);
             headerConflict = !!update.keyConflicts?.some((conflict) => conflict.source === "header" && conflict.observedAt === now);
-            return update;
+            const newer = newerObservation(existingContact?.observedFormat, observed);
+            return newer ? { ...update, observedFormat: newer } : update;
         });
 
         // A `RapidMX-Key` header carries no issuer certificate, so a rotated key seen there can only be recorded as a

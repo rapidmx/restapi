@@ -52,7 +52,12 @@ export async function buildKeyDiscoveryResponse(
     const published: PublicKey[] = (mailbox.keys ?? []).filter((key) => includeOpenPgp || !isOpenPgpKey(key));
     const active = (key: PublicKey): boolean => key.revokedAt === undefined && key.notAfter > now;
     const keys: PublicKey[] = [...published.filter(active), ...published.filter((key) => !active(key))];
-    return { encryptPreference: mailbox.encryptPreference ?? NOT_PUBLISHED_RESPONSE.encryptPreference, keys, escrow };
+    const preference: EncryptionPreference = mailbox.encryptPreference ?? NOT_PUBLISHED_RESPONSE.encryptPreference;
+    // A preference for OpenPGP is only worth publishing with an OpenPGP key to use.
+    const { preferFormat, ...rest } = preference;
+    const encryptPreference: EncryptionPreference =
+        preferFormat === "smime" || (preferFormat === "openpgp" && keys.some((key) => isOpenPgpKey(key) && active(key))) ? preference : rest;
+    return { encryptPreference, keys, escrow };
 }
 
 /** What `discoverLocalKeys()` needs from its caller - the concrete (Mongo/SQL) repos and query shapes. */

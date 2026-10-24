@@ -472,6 +472,26 @@ describe("prepareOutboundMime() and seedReceiptStatus() Tests", () => {
         expect(await send([pgp("T0xE")])).toContain("Autocrypt: addr=sender@example.com; keydata= T0xE\r\n");
     });
 
+    it("advertises the owner's preferred format in the RapidMX-Key header - OpenPGP only with an OpenPGP key to use", async () => {
+        const key = { useType: "encrypt", type: "x509", publicKey: "S0VZ", notBefore: 1, notAfter: Date.now() + 60_000 };
+        const pgp = { useType: "encrypt", type: "openpgp", publicKey: "UEdQ", notBefore: 1, notAfter: Date.now() + 60_000 };
+        const send = async (keys: any[], preferFormat?: string) =>
+            (
+                await prepareOutboundMime({
+                    raw,
+                    message,
+                    mailbox: mailbox({ keys, encryptPreference: { preferEncrypt: "mutual", preferFormat } }),
+                    domainUtils: domainUtilsOf(),
+                    dnsResolver: new StaticDnsResolver(),
+                })
+            ).raw.toString();
+
+        expect(await send([key, pgp], "openpgp")).toContain("RapidMX-Key: addr=sender@example.com; prefer-encrypt=mutual; _prefer-format=openpgp; type=x509;");
+        expect(await send([key], "openpgp")).not.toContain("_prefer-format");
+        expect(await send([key], "smime")).toContain("_prefer-format=smime;");
+        expect(await send([key, pgp])).not.toContain("_prefer-format");
+    });
+
     it("announces the newest of several active encryption keys (latest notBefore), whatever their order", async () => {
         const key = (publicKey: string, notBefore: number) => ({ useType: "encrypt", type: "x509", publicKey, notBefore, notAfter: Date.now() + 60_000 });
         const send = async (keys: any[]) =>

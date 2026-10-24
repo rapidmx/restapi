@@ -313,14 +313,17 @@ export async function prepareOutboundMime(args: {
         .filter((k) => k.useType === "encrypt" && !isOpenPgpKey(k) && !k.revokedAt && k.notAfter > Date.now())
         .reduce<PublicKey | undefined>((newest, k) => (newest === undefined || k.notBefore > newest.notBefore ? k : newest), undefined);
     const preferEncrypt = (mailbox?.encryptPreference ?? { preferEncrypt: "nopreference" as const }).preferEncrypt;
-    if (activeEncryptKey) {
-        raw = prependHeaders(raw, [{ name: "RapidMX-Key", value: buildRapidMxKeyHeader(message.from.address, preferEncrypt, activeEncryptKey) }]);
-    }
     // The OpenPGP certificate rides in a standard `Autocrypt` header, for every OpenPGP mail client (the RapidMX discovery
     // endpoint and WKD publish it too). The newest active one.
     const activeOpenPgpKey: PublicKey | undefined = (mailbox?.keys ?? [])
         .filter((k) => isOpenPgpKey(k) && !k.revokedAt && k.notAfter > Date.now())
         .reduce<PublicKey | undefined>((newest, k) => (newest === undefined || k.notBefore > newest.notBefore ? k : newest), undefined);
+    // The owner's preferred format rides along - OpenPGP only while there is an OpenPGP key to use.
+    const preferFormat = mailbox?.encryptPreference?.preferFormat;
+    const advertisedFormat = preferFormat === "smime" || (preferFormat === "openpgp" && activeOpenPgpKey) ? preferFormat : undefined;
+    if (activeEncryptKey) {
+        raw = prependHeaders(raw, [{ name: "RapidMX-Key", value: buildRapidMxKeyHeader(message.from.address, preferEncrypt, activeEncryptKey, advertisedFormat) }]);
+    }
     if (activeOpenPgpKey) {
         raw = prependHeaders(raw, [{ name: AUTOCRYPT_HEADER, value: buildAutocryptHeader(message.from.address, preferEncrypt, activeOpenPgpKey) }]);
     }

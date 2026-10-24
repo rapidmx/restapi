@@ -18,6 +18,7 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import { AuditAction, DistributionList, EscrowScope, Mailbox, MailboxPolicy, Matter } from "../models/types.js";
+import { isEndToEndFormat } from "../util/PreferredFormatUtils.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { AuditLogUtils, isNonOwnerAccess } from "../util/AuditLogUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS, hasMailAccess, isAdminScope, isTrustedUser, stripTrustedRoles } from "../util/MailAccessUtils.js";
@@ -128,6 +129,10 @@ function rejectServerManagedFields(obj: Record<string, unknown>): void {
     // An empty list or a null round-tripped back is dropped rather than stored over the server's own value.
     if ("zeroAccessKeys" in obj) {
         delete obj.zeroAccessKeys;
+    }
+    const preferFormat: unknown = (obj.encryptPreference as { preferFormat?: unknown } | null | undefined)?.preferFormat;
+    if (preferFormat !== undefined && preferFormat !== null && !isEndToEndFormat(preferFormat)) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'encryptPreference.preferFormat' must be \"smime\" or \"openpgp\".");
     }
     if (obj.zeroAccessEnabled !== undefined && obj.zeroAccessEnabled !== null && typeof obj.zeroAccessEnabled !== "boolean") {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'zeroAccessEnabled' must be a boolean.");

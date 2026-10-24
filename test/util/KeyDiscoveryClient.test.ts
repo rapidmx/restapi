@@ -453,6 +453,17 @@ describe("parseKeyDiscoveryResponse() Tests", () => {
         });
     });
 
+    it("Keeps a known preferred format and ignores an unknown one without refusing the response.", () => {
+        const base = { keys: [validKey], escrow: false };
+        expect(parseKeyDiscoveryResponse({ ...base, encryptPreference: { preferEncrypt: "mutual", preferFormat: "openpgp" } })!.encryptPreference).toEqual({
+            preferEncrypt: "mutual",
+            preferFormat: "openpgp",
+        });
+        expect(parseKeyDiscoveryResponse({ ...base, encryptPreference: { preferEncrypt: "mutual", preferFormat: "telegram" } })!.encryptPreference).toEqual({
+            preferEncrypt: "mutual",
+        });
+    });
+
     it("Keeps the primary address of an alias response when it is one address, and drops anything else.", () => {
         const base = { encryptPreference: { preferEncrypt: "mutual" }, keys: [validKey], escrow: false };
         expect(parseKeyDiscoveryResponse({ ...base, address: "bob@primary.example" })!.address).toBe("bob@primary.example");

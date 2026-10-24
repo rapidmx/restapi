@@ -80,6 +80,19 @@ export interface EncryptionPreference {
     lastSeen?: number;
     /** The encryption preference to apply to outgoing messages. */
     preferEncrypt: "mutual" | "nopreference";
+    /** Which end-to-end format the address would rather receive when a sender can use either (`specs/end-to-end_encryption.md`
+     * *Choosing the format*). Absent: no preference, and senders use S/MIME whenever they can. A mailbox owner sets it; a
+     * contact's is what that address advertised (discovery, the `RapidMX-Key` header's `_prefer-format`). */
+    preferFormat?: EndToEndFormat;
+}
+
+/** The two end-to-end encryption formats. */
+export type EndToEndFormat = "smime" | "openpgp";
+
+/** The format an address was last seen using (`Contact.observedFormat`), and when - the message's effective date. */
+export interface ObservedFormat {
+    format: EndToEndFormat;
+    at: number;
 }
 
 /**
@@ -1704,6 +1717,14 @@ export interface Contact extends RecoverableBaseEntity {
      * use) anchor compared against a `KeyConflict.observedAt` and surfaced to the user so they can
      * judge a key change's plausibility (e.g. "first seen 3 years ago" vs. "first seen yesterday"). */
     keysFirstSeen?: number;
+
+    /** The format the user chose for this contact ("Preferred format"), overriding what the address advertises and what was
+     * observed. Absent: automatic. */
+    preferredFormat?: EndToEndFormat;
+
+    /** The end-to-end format this address was last seen using, from authenticated inbound mail (a signed or encrypted message,
+     * or an `Autocrypt` header from a non-RapidMX sender). Written by the server only. */
+    observedFormat?: ObservedFormat;
 
     /** UTC timestamp (epoch ms) of the most recent message observed from this contact, with or without a key
      * header - updated on every message regardless of outcome, per the Anti-Downgrade rule: a message with no

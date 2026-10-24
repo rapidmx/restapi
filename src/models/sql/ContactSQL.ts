@@ -10,7 +10,7 @@ import {
     RecoverableBaseEntity,
 } from "@rapidrest/service-core";
 import { ObjectDecorators } from "@rapidrest/core";
-import { Contact, ContactEmail, ContactPhone, ContactPostalAddress, EncryptionPreference, KeyConflict, PreviousKey, PublicKey, RejectedKey } from "../types.js";
+import { Contact, ContactEmail, ContactPhone, ContactPostalAddress, EncryptionPreference, EndToEndFormat, KeyConflict, ObservedFormat, PreviousKey, PublicKey, RejectedKey } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Nullable } = ObjectDecorators;
@@ -147,6 +147,16 @@ export class ContactSQL extends RecoverableBaseEntity implements Contact {
     @Nullable
     public keysFirstSeen?: number;
 
+    @Column({ type: "varchar", nullable: true })
+    @Description("The end-to-end format the user chose for this contact (smime or openpgp); absent for automatic.")
+    @Nullable
+    public preferredFormat?: EndToEndFormat;
+
+    @Column({ type: "simple-json", nullable: true })
+    @Description("The end-to-end format this address was last seen using, and when (server-written).")
+    @Nullable
+    public observedFormat?: ObservedFormat;
+
     @Column({ type: "double precision", nullable: true })
     @Description("UTC timestamp (epoch ms) of the most recent message observed from this contact.")
     @Nullable
@@ -190,6 +200,8 @@ export class ContactSQL extends RecoverableBaseEntity implements Contact {
             this.encryptPreference = "encryptPreference" in other ? other.encryptPreference : this.encryptPreference;
             this.keys = "keys" in other ? other.keys : this.keys;
             this.keysFirstSeen = "keysFirstSeen" in other ? other.keysFirstSeen : this.keysFirstSeen;
+            this.preferredFormat = "preferredFormat" in other ? other.preferredFormat : this.preferredFormat;
+            this.observedFormat = "observedFormat" in other ? other.observedFormat : this.observedFormat;
             this.lastMessageSeen = "lastMessageSeen" in other ? other.lastMessageSeen : this.lastMessageSeen;
             this.keyConflicts = "keyConflicts" in other ? other.keyConflicts : this.keyConflicts;
             this.previousKeys = "previousKeys" in other ? other.previousKeys : this.previousKeys;

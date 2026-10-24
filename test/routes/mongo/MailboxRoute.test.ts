@@ -361,6 +361,20 @@ describe("Route:MailboxMongo Tests", () => {
         expect(result.status).toBe(400);
     });
 
+    it("Lets the owner advertise a preferred end-to-end format, and refuses an unknown one (400).", async () => {
+        const obj = await createMailboxMongo();
+        const put = (version: number, preferFormat: unknown) =>
+            request(server.getApplication())
+                .put(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: obj.uid, version, encryptPreference: { preferEncrypt: "mutual", preferFormat } });
+
+        const set = await put(obj.version, "openpgp");
+        expect(set.status).toBe(200);
+        expect(((await repo.findOne({ uid: obj.uid } as any)) as any)?.encryptPreference).toEqual({ preferEncrypt: "mutual", preferFormat: "openpgp" });
+        expect((await put(set.body.version, "carrier-pigeon")).status).toBe(400);
+    });
+
     it("Lets the owner turn zeroAccessEnabled off and on again.", async () => {
         const obj = await createMailboxMongo();
 

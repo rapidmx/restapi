@@ -123,6 +123,18 @@ export function keyLocalDiscoverySuite(ctx: KeyLocalDiscoverySuiteContext): void
             expect(res.body.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 500 });
         });
 
+        it("answers with the format the recipient prefers, and where that came from", async () => {
+            const own = await createMailbox(`alice-${uuid.v4()}`);
+            const recipient = await createMailbox(`bob-${uuid.v4()}`, { encryptPreference: { preferEncrypt: "mutual", preferFormat: "smime" } }, "example.com", stranger);
+            await ctx.setMailboxKeys(recipient.uid, [await certKey(recipient.primarySmtpAddress)]);
+
+            const res = await lookup(own.uid, recipient.primarySmtpAddress);
+
+            expect(res.status).toBe(200);
+            expect(res.body).toMatchObject({ preferredFormat: "smime", preferredFormatSource: "advertised" });
+            expect((await ctx.findContacts(own.uid))[0].encryptPreference.preferFormat).toBe("smime");
+        });
+
         it("matches the address case-insensitively, keeping the caller's contact under the address as typed", async () => {
             const own = await createMailbox(`alice-${uuid.v4()}`);
             const local = `bob-${uuid.v4()}`;

@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import "reflect-metadata";
 import * as x509 from "@peculiar/x509";
-import { parseRapidMxKeyHeader } from "../../src/util/RapidMxKeyHeaderUtils.js";
+import { buildRapidMxKeyHeader, parseRapidMxKeyHeader } from "../../src/util/RapidMxKeyHeaderUtils.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -36,6 +36,23 @@ describe("parseRapidMxKeyHeader() Tests", () => {
         expect(result?.publicKey.type).toBe("x509");
         expect(result?.publicKey.publicKey).toBe(keydata);
         expect(result?.publicKey.fingerprint).toMatch(/^[0-9a-f]+$/);
+    });
+
+    it("Carries a preferred format as the non-critical _prefer-format attribute, and reads it back.", async () => {
+        const keydata = await makeCertBase64("alice@example.com");
+        const key = { publicKey: keydata, type: "x509", useType: "encrypt" as const, fingerprint: "f", notBefore: 0, notAfter: 1 };
+
+        const withFormat = buildRapidMxKeyHeader("alice@example.com", "mutual", key, "openpgp");
+        expect(withFormat).toBe(`addr=alice@example.com; prefer-encrypt=mutual; _prefer-format=openpgp; type=x509; keydata=${keydata}`);
+        expect(parseRapidMxKeyHeader([withFormat], "alice@example.com")?.preferFormat).toBe("openpgp");
+
+        const without = buildRapidMxKeyHeader("alice@example.com", "mutual", key);
+        expect(without).not.toContain("_prefer-format");
+        expect(parseRapidMxKeyHeader([without], "alice@example.com")).not.toHaveProperty("preferFormat");
+        // A format this server doesn't know is ignored, never a reason to drop the key.
+        const unknown = parseRapidMxKeyHeader([`addr=alice@example.com; _prefer-format=carrier-pigeon; type=x509; keydata=${keydata}`], "alice@example.com");
+        expect(unknown?.publicKey.publicKey).toBe(keydata);
+        expect(unknown).not.toHaveProperty("preferFormat");
     });
 
     it("Defaults preferEncrypt to 'nopreference' when the attribute is absent.", async () => {

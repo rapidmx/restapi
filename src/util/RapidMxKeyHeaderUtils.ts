@@ -4,7 +4,8 @@
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
 import { normalizeAddress } from "./AddressUtils.js";
-import { PublicKey } from "../models/types.js";
+import { EndToEndFormat, PublicKey } from "../models/types.js";
+import { isEndToEndFormat } from "./PreferredFormatUtils.js";
 
 /** The result of successfully parsing and validating an inbound `RapidMX-Key` header - the header's own
  * `addr` attribute (already confirmed to match the message's `From` address) plus the encryption `PublicKey`
@@ -16,6 +17,8 @@ import { PublicKey } from "../models/types.js";
 export interface ParsedRapidMxKeyHeader {
     addr: string;
     preferEncrypt: "mutual" | "nopreference";
+    /** The `_prefer-format` hint, when the sender advertises one (`specs/end-to-end_encryption.md` *Choosing the format*). */
+    preferFormat?: EndToEndFormat;
     publicKey: PublicKey;
 }
 
@@ -63,8 +66,10 @@ function parseAttributes(value: string): Record<string, string> | undefined {
  * `parseRapidMxKeyHeader()`, emitting only the four attributes that function understands (never a signing
  * key - per the spec, this header never carries one).
  */
-export function buildRapidMxKeyHeader(address: string, preferEncrypt: "mutual" | "nopreference", key: PublicKey): string {
-    return `addr=${address}; prefer-encrypt=${preferEncrypt}; type=${key.type}; keydata=${key.publicKey}`;
+export function buildRapidMxKeyHeader(address: string, preferEncrypt: "mutual" | "nopreference", key: PublicKey, preferFormat?: EndToEndFormat): string {
+    // `_prefer-format` starts with an underscore - a non-critical attribute - because a parser before it rejects the whole header
+    // for any attribute it doesn't know that doesn't.
+    return `addr=${address}; prefer-encrypt=${preferEncrypt};${preferFormat ? ` _prefer-format=${preferFormat};` : ""} type=${key.type}; keydata=${key.publicKey}`;
 }
 
 export function parseRapidMxKeyHeader(headerValues: string[], fromAddress: string): ParsedRapidMxKeyHeader | undefined {
@@ -110,6 +115,7 @@ export function parseRapidMxKeyHeader(headerValues: string[], fromAddress: strin
     return {
         addr: attrs.addr,
         preferEncrypt: attrs["prefer-encrypt"] === "mutual" ? "mutual" : "nopreference",
+        ...(isEndToEndFormat(attrs["_prefer-format"]) ? { preferFormat: attrs["_prefer-format"] } : {}),
         publicKey: {
             publicKey: keydata,
             type: attrs.type,
