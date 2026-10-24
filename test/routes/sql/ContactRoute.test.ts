@@ -314,7 +314,7 @@ describe("Route:ContactSQL Tests", () => {
         expect((await put(chosen.body.version, "pgp")).status).toBe(400);
         const cleared = await put(chosen.body.version, null);
         expect(cleared.status).toBe(200);
-        expect(((await contactRepo.findOne({ where: { uid: contact.uid } } as any)) as any)?.preferredFormat ?? undefined).toBeUndefined();
+        expect(((await contactRepo.findOne({ where: { uid: contact.uid } })) as any)?.preferredFormat ?? undefined).toBeUndefined();
     });
 
     it("Rejects updating a contact that attempts to set a key-discovery-managed field directly (400), leaving it unchanged.", async () => {
