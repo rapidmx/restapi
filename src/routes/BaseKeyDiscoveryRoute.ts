@@ -8,7 +8,8 @@
 import * as crypto from "crypto";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors, type HttpRequest, type HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { KeyDiscoveryResponse, KeyVault, Mailbox } from "../models/types.js";
+import { EncryptionPolicy, KeyDiscoveryResponse, KeyVault, Mailbox } from "../models/types.js";
+import { OPENPGP_ALLOWED_CONFIG, OpenPgpPolicy } from "../util/OpenPgpPolicy.js";
 import { DomainUtils } from "../util/DomainUtils.js";
 import { isValidKeyDiscoveryHash } from "../util/KeyDiscoveryClient.js";
 import { buildKeyDiscoveryResponse } from "../util/LocalKeyDiscoveryUtils.js";
@@ -74,6 +75,15 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
      * mailbox it resolves to has one. */
     protected abstract domainClass: any;
 
+    /** The `EncryptionPolicy` model, read for "Allow OpenPGP" (`OpenPgpPolicy`). Optional: without it, the config default applies. */
+    protected encryptionPolicyClass?: any;
+
+    /** Seeds "Allow OpenPGP" until an administrator saves a value (`OpenPgpPolicy`). */
+    @Config(OPENPGP_ALLOWED_CONFIG, true)
+    protected openPgpAllowedDefault: boolean = true;
+
+    protected openPgpPolicy?: OpenPgpPolicy;
+
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
@@ -92,6 +102,12 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
     protected async initialize(): Promise<void> {
         if (!this._objectFactory) {
             throw new Error("objectFactory is not set.");
+        }
+        if (!this.openPgpPolicy) {
+            const policyRepo: RepoUtils<EncryptionPolicy> | undefined = this.encryptionPolicyClass
+                ? await this._objectFactory.newInstance(RepoUtils, { name: this.encryptionPolicyClass.name, args: [this.encryptionPolicyClass] })
+                : undefined;
+            this.openPgpPolicy = new OpenPgpPolicy(policyRepo, this.openPgpAllowedDefault);
         }
         if (!this.mailboxRepo && this.mailboxClass) {
             this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, {
@@ -170,7 +186,7 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
                 viaAliasDomain = match !== undefined;
             }
         }
-        const body: KeyDiscoveryResponse = await buildKeyDiscoveryResponse(this.keyVaultRepo!, match);
+        const body: KeyDiscoveryResponse = await buildKeyDiscoveryResponse(this.keyVaultRepo!, match, await this.openPgpPolicy!.allowed());
         // The certificates name the mailbox's primary address, not the alias-domain address that was asked about: say so, so the asking server can check
         // the certificate against it (`KeyDiscoveryResponse.address`).
         if (viaAliasDomain && match?.primarySmtpAddress) {

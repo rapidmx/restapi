@@ -20,7 +20,9 @@ import {
     MAX_PREVIOUS_KEYS_PER_USE_TYPE,
     MAX_REJECTED_KEYS,
     normalizeKeyConflicts,
+    parseAnyContactKey,
     sanitizeDiscoveredKey,
+    sanitizeKey,
     withoutKey,
     type ContactKeyState,
 } from "../../src/util/KeyringUtils.js";
@@ -34,6 +36,7 @@ import {
     type SignerCertificateOptions,
     type TestIssuer,
 } from "./signerCertificates.js";
+import { certifiedBy, openPgpKey } from "../openPgpTestKeys.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -142,7 +145,7 @@ function makeDiscovery(keys: PublicKey[], lastSeen?: number): KeyDiscoveryRespon
 describe("applyDiscoveredKeys() Tests", () => {
     it("TOFU-pins the first key ever observed for a useType, with no conflict, and stamps keysFirstSeen.", async () => {
         const newKey = await makeKey();
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([newKey]), NOW, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([newKey]), NOW, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([newKey]);
         expect(result.keyConflicts).toBeUndefined();
@@ -151,12 +154,12 @@ describe("applyDiscoveredKeys() Tests", () => {
 
     it("Does not pin a first key whose certificate names another address or is expired.", async () => {
         const otherAddress = await makeKey({ publicKey: await makeCertDer("mallory", "mallory@example.com") });
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([otherAddress]), NOW, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([otherAddress]), NOW, "discovery", ADDRESS);
         expect(result.keys).toEqual([]);
         expect(result.keysFirstSeen).toBeUndefined();
 
         const valid = await makeKey();
-        const expired = applyDiscoveredKeys(undefined, makeDiscovery([valid]), Date.now() + 2 * 365 * 24 * 60 * 60 * 1000, "discovery", ADDRESS);
+        const expired = await applyDiscoveredKeys(undefined, makeDiscovery([valid]), Date.now() + 2 * 365 * 24 * 60 * 60 * 1000, "discovery", ADDRESS);
         expect(expired.keys).toEqual([]);
     });
 
@@ -164,18 +167,18 @@ describe("applyDiscoveredKeys() Tests", () => {
         const primaryKey = await makeKey({ publicKey: await makeCertDer("primary", "primary@primary.example") });
         const alias = "bob@alias-domain.example";
         // Without the primary address in the response, the certificate does not name the alias that was asked for.
-        expect(applyDiscoveredKeys(undefined, makeDiscovery([primaryKey]), NOW, "discovery", alias).keys).toEqual([]);
+        expect((await applyDiscoveredKeys(undefined, makeDiscovery([primaryKey]), NOW, "discovery", alias)).keys).toEqual([]);
         const answered = { ...makeDiscovery([primaryKey]), address: "primary@primary.example" };
-        const result = applyDiscoveredKeys(undefined, answered, NOW, "discovery", alias);
+        const result = await applyDiscoveredKeys(undefined, answered, NOW, "discovery", alias);
         expect(result.keys).toEqual([primaryKey]);
         // A response that names an address its certificate does not name pins nothing.
-        expect(applyDiscoveredKeys(undefined, { ...answered, address: "other@primary.example" }, NOW, "discovery", alias).keys).toEqual([]);
+        expect((await applyDiscoveredKeys(undefined, { ...answered, address: "other@primary.example" }, NOW, "discovery", alias)).keys).toEqual([]);
     });
 
     it("TOFU-pins encrypt and sign keys independently from the same discovery response.", async () => {
         const encryptKey = await makeKey({ useType: "encrypt" });
         const signKey = await makeKey({ useType: "sign" });
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([encryptKey, signKey]), NOW, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([encryptKey, signKey]), NOW, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([encryptKey, signKey]);
     });
@@ -183,7 +186,7 @@ describe("applyDiscoveredKeys() Tests", () => {
     it("Is a no-op when the observed key exactly matches the pinned one.", async () => {
         const pinned = await makeKey();
         const existing: ContactKeyState = { keys: [pinned], encryptPreference: { preferEncrypt: "mutual", lastSeen: 500 } };
-        const result = applyDiscoveredKeys(existing, makeDiscovery([{ ...pinned }], 500), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(existing, makeDiscovery([{ ...pinned }], 500), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([pinned]);
         expect(result.keyConflicts).toBeUndefined();
@@ -194,7 +197,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const existing: ContactKeyState = { keys: [pinned] };
         const observed = await makeKey();
 
-        const result = applyDiscoveredKeys(existing, makeDiscovery([observed]), 2000, "header", ADDRESS);
+        const result = await applyDiscoveredKeys(existing, makeDiscovery([observed]), 2000, "header", ADDRESS);
 
         expect(result.keys).toEqual([pinned]);
         expect(result.keyConflicts).toEqual([{ useType: "encrypt", observedKey: observed, observedAt: 2000, source: "header" }]);
@@ -205,7 +208,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const pinned = await makeKey({ publicKey: first, notAfter: 500 });
         const observed = await makeKey({ publicKey: second });
 
-        const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([pinned]);
         expect(result.keyConflicts).toEqual([{ useType: "encrypt", observedKey: observed, observedAt: 1000, source: "discovery" }]);
@@ -216,7 +219,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const pinned = await makeKey({ publicKey: first, notAfter: Date.now() + 1_000_000, revokedAt: 999 });
         const observed = await makeKey({ publicKey: second });
 
-        const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([pinned]);
         expect(result.keyConflicts?.[0].observedKey.fingerprint).toBe(observed.fingerprint);
@@ -228,7 +231,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const pinned = await makeKey({ publicKey: pinnedCertDer, notAfter: 500 });
         const observed = await makeKey({ publicKey: observedCertDer });
 
-        const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([pinned]);
         expect(result.keyConflicts?.[0].observedKey.fingerprint).toBe(observed.fingerprint);
@@ -244,7 +247,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const pinned = await makeKey({ publicKey: pinnedCertDer, notAfter: 500 });
         const observed = await makeKey({ publicKey: forgedCertDer });
 
-        const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([pinned]);
         expect(result.keyConflicts?.[0].observedKey.fingerprint).toBe(observed.fingerprint);
@@ -254,7 +257,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const pinned = await makeKey({ publicKey: "not-a-real-cert", fingerprint: "fp-unparseable-pinned", notAfter: 500 });
         const observed = await makeKey();
 
-        const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([observed]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([pinned]);
         expect(result.keyConflicts?.[0].observedKey.fingerprint).toBe(observed.fingerprint);
@@ -265,7 +268,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const existing: ContactKeyState = { keys: [pinned] };
         const unparseable: PublicKey = { publicKey: "also-not-a-cert", type: "x509", useType: "encrypt", fingerprint: "fp-whatever", notBefore: 0, notAfter: Date.now() + 1_000_000 };
 
-        const result = applyDiscoveredKeys(existing, makeDiscovery([unparseable]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(existing, makeDiscovery([unparseable]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([pinned]);
         expect(result.keyConflicts).toBeUndefined();
@@ -282,7 +285,7 @@ describe("applyDiscoveredKeys() Tests", () => {
             notAfter: Date.now() + 1_000_000,
         };
 
-        const result = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([notACert]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([notACert]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([pinned]);
         expect(result.keyConflicts).toBeUndefined();
@@ -305,7 +308,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         expect(Number.isFinite(new Date(new nodeCrypto.X509Certificate(der).validFrom).getTime())).toBe(false);
         const badTime: PublicKey = { publicKey: der.toString("base64"), type: "x509", useType: "sign", fingerprint: "fp", notBefore: 0, notAfter: 1 };
 
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([badTime]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([badTime]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([]);
     });
@@ -314,7 +317,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const realKey = await makeKey();
         const lying: PublicKey = { ...realKey, notBefore: 1, notAfter: 8_000_000_000_000 };
 
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([lying]), NOW, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([lying]), NOW, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([realKey]);
         expect(result.keys![0].notAfter).not.toBe(8_000_000_000_000);
@@ -324,7 +327,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const existing: ContactKeyState = { keys: [], encryptPreference: { preferEncrypt: "mutual", lastSeen: 1 } };
         const malformed = { keys: [await makeKey()], escrow: false } as unknown as KeyDiscoveryResponse;
 
-        const result = applyDiscoveredKeys(existing, malformed, 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(existing, malformed, 1000, "discovery", ADDRESS);
 
         expect(result).toEqual({ ...existing, keysFirstSeen: undefined, keyConflicts: undefined, previousKeys: undefined, rejectedKeys: undefined });
     });
@@ -333,7 +336,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const realKey = await makeKey();
         const bogus: PublicKey = { ...realKey, useType: "decode" as any };
 
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([]);
     });
@@ -342,7 +345,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const realKey = await makeKey();
         const bogus: PublicKey = { ...realKey, publicKey: "" };
 
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([]);
     });
@@ -351,7 +354,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const realKey = await makeKey();
         const bogus: PublicKey = { ...realKey, publicKey: "A".repeat(9000) };
 
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([]);
     });
@@ -360,7 +363,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const realKey = await makeKey();
         const bogus: PublicKey = { ...realKey, notAfter: NaN };
 
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([bogus]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([]);
     });
@@ -376,37 +379,37 @@ describe("applyDiscoveredKeys() Tests", () => {
             rejectedKeys: [{ useType: "encrypt", fingerprint: "r", rejectedAt: 3 }],
         };
 
-        const result = applyDiscoveredKeys(existing, undefined, 9999, "header", ADDRESS);
+        const result = await applyDiscoveredKeys(existing, undefined, 9999, "header", ADDRESS);
 
         expect(result).toEqual(existing);
     });
 
-    it("Anti-Downgrade: does not apply a preference update whose lastSeen is not strictly newer than what's on file.", () => {
+    it("Anti-Downgrade: does not apply a preference update whose lastSeen is not strictly newer than what's on file.", async () => {
         const existing: ContactKeyState = { keys: [], encryptPreference: { preferEncrypt: "mutual", lastSeen: 500 } };
-        const result = applyDiscoveredKeys(existing, makeDiscovery([], 500), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(existing, makeDiscovery([], 500), 1000, "discovery", ADDRESS);
 
         expect(result.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 500 });
     });
 
-    it("Applies a preference update whose lastSeen is strictly newer than what's on file.", () => {
+    it("Applies a preference update whose lastSeen is strictly newer than what's on file.", async () => {
         const existing: ContactKeyState = { keys: [], encryptPreference: { preferEncrypt: "mutual", lastSeen: 500 } };
         const discovered = makeDiscovery([], 600);
         discovered.encryptPreference.preferEncrypt = "nopreference";
 
-        const result = applyDiscoveredKeys(existing, discovered, 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(existing, discovered, 1000, "discovery", ADDRESS);
 
         expect(result.encryptPreference).toEqual({ preferEncrypt: "nopreference", lastSeen: 600 });
     });
 
-    it("Applies the discovered preference outright when nothing was previously on file.", () => {
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([], 1), 1000, "discovery", ADDRESS);
+    it("Applies the discovered preference outright when nothing was previously on file.", async () => {
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([], 1), 1000, "discovery", ADDRESS);
         expect(result.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 1 });
     });
 
     it("Preserves an already-set keysFirstSeen rather than overwriting it on a later call.", async () => {
         const key = await makeKey();
         const existing: ContactKeyState = { keys: [key], keysFirstSeen: 42 };
-        const result = applyDiscoveredKeys(existing, makeDiscovery([{ ...key }]), 9999, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(existing, makeDiscovery([{ ...key }]), 9999, "discovery", ADDRESS);
 
         expect(result.keysFirstSeen).toBe(42);
     });
@@ -419,7 +422,7 @@ describe("applyDiscoveredKeys() Tests", () => {
         const key = await makeKey();
         const manyKeys: PublicKey[] = Array.from({ length: 50 }, () => ({ ...key }));
 
-        const result = applyDiscoveredKeys(undefined, makeDiscovery(manyKeys), NOW, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery(manyKeys), NOW, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([key]);
     });
@@ -452,7 +455,7 @@ describe("Key rotation continuity Tests", () => {
         const observed = keyOf(next, { issuerCertificate: issuer.certificate });
         const now = Date.now();
 
-        const result = applyDiscoveredKeys(
+        const result = await applyDiscoveredKeys(
             { keys: [pinnedKey], keyConflicts: [staleConflict, encryptConflict] },
             makeDiscovery([observed]),
             now,
@@ -470,7 +473,7 @@ describe("Key rotation continuity Tests", () => {
         const { issuer, pinned, next } = await rotation({ pinned: expired });
         const staleConflict: KeyConflict = { useType: "sign", observedKey: keyOf(await makeSignerCertificate()), observedAt: 1, source: "header" };
 
-        const result = applyDiscoveredKeys(
+        const result = await applyDiscoveredKeys(
             { keys: [keyOf(pinned)], keyConflicts: [staleConflict] },
             makeDiscovery([keyOf(next, { issuerCertificate: issuer.certificate })]),
             Date.now(),
@@ -486,7 +489,7 @@ describe("Key rotation continuity Tests", () => {
         const pinnedKey = keyOf(pinned, { revokedAt: 5, revocationReason: "superseded" });
         const observed = keyOf(next, { issuerCertificate: issuer.certificate });
 
-        const result = applyDiscoveredKeys({ keys: [pinnedKey] }, makeDiscovery([observed]), 1000 + Date.now(), "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys({ keys: [pinnedKey] }, makeDiscovery([observed]), 1000 + Date.now(), "discovery", ADDRESS);
 
         expect(result.keys).toEqual([observed]);
         expect(result.previousKeys).toEqual([expect.objectContaining({ fingerprint: pinned.fingerprint, revokedAt: 5, revocationReason: "superseded", replacement: "automatic" })]);
@@ -498,7 +501,7 @@ describe("Key rotation continuity Tests", () => {
         const listedOld = keyOf(pinned, { revokedAt: 7, revocationReason: "superseded" });
 
         // The new key is listed first: the listed revocation still applies before it's considered.
-        const result = applyDiscoveredKeys({ keys: [keyOf(pinned)] }, makeDiscovery([observed, listedOld]), Date.now(), "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys({ keys: [keyOf(pinned)] }, makeDiscovery([observed, listedOld]), Date.now(), "discovery", ADDRESS);
 
         expect(result.keys).toEqual([observed]);
         expect(result.previousKeys).toEqual([expect.objectContaining({ fingerprint: pinned.fingerprint, revokedAt: 7, revocationReason: "superseded" })]);
@@ -509,7 +512,7 @@ describe("Key rotation continuity Tests", () => {
         const { issuer, pinned, next } = await rotation();
         const observed = keyOf(next, { issuerCertificate: issuer.certificate });
 
-        const result = applyDiscoveredKeys(
+        const result = await applyDiscoveredKeys(
             { keys: [keyOf(pinned, { revokedAt: 3, revocationReason: "superseded" })] },
             makeDiscovery([keyOf(pinned, { revokedAt: 9 }), observed]),
             Date.now(),
@@ -529,7 +532,7 @@ describe("Key rotation continuity Tests", () => {
         const previous: PreviousKey = { ...keyOf(previousCert), replacedAt: 1, replacement: "user" };
         const compromised: PreviousKey = { ...keyOf(compromisedCert, { revokedAt: 2, revocationReason: "compromised" }), replacedAt: 1, replacement: "user" };
 
-        const result = applyDiscoveredKeys(
+        const result = await applyDiscoveredKeys(
             { keys: [keyOf(pinnedCert)], previousKeys: [previous, compromised] },
             makeDiscovery([
                 keyOf(pinnedCert, { revokedAt: 10, revocationReason: "superseded" }),
@@ -562,7 +565,7 @@ describe("Key rotation continuity Tests", () => {
         const { issuer, pinned, next } = await rotation({ issuer: await makeTestIssuer({ ca: null }), pinned: expired });
         const observed = keyOf(next, { issuerCertificate: issuer.certificate });
 
-        const result = applyDiscoveredKeys({ keys: [keyOf(pinned)] }, makeDiscovery([observed]), Date.now(), "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys({ keys: [keyOf(pinned)] }, makeDiscovery([observed]), Date.now(), "discovery", ADDRESS);
 
         expect(result.keys).toEqual([observed]);
     });
@@ -577,14 +580,14 @@ describe("Key rotation continuity Tests", () => {
         });
         const observed = keyOf(next, { useType: "encrypt", issuerCertificate: issuer.certificate });
 
-        const result = applyDiscoveredKeys({ keys: [keyOf(pinned, { useType: "encrypt" })] }, makeDiscovery([observed]), Date.now(), "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys({ keys: [keyOf(pinned, { useType: "encrypt" })] }, makeDiscovery([observed]), Date.now(), "discovery", ADDRESS);
 
         expect(result.keys).toEqual([observed]);
     });
 
     describe("records a conflict instead of replacing", () => {
         async function expectConflict(pinnedKey: PublicKey, observed: PublicKey, observedAt: number = Date.now()): Promise<void> {
-            const result = applyDiscoveredKeys({ keys: [pinnedKey] }, makeDiscovery([observed]), observedAt, "discovery", ADDRESS);
+            const result = await applyDiscoveredKeys({ keys: [pinnedKey] }, makeDiscovery([observed]), observedAt, "discovery", ADDRESS);
             expect(result.keys).toEqual([pinnedKey]);
             expect(result.previousKeys).toBeUndefined();
             expect(result.keyConflicts).toEqual([{ useType: observed.useType, observedKey: observed, observedAt, source: "discovery" }]);
@@ -653,7 +656,7 @@ describe("Key rotation continuity Tests", () => {
     it("Never pins a revoked key on first use.", async () => {
         const revoked = keyOf(await makeSignerCertificate({ sanEmails: [ADDRESS] }), { revokedAt: 1, revocationReason: "superseded" });
 
-        const result = applyDiscoveredKeys(undefined, makeDiscovery([revoked]), 1000, "discovery", ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([revoked]), 1000, "discovery", ADDRESS);
 
         expect(result.keys).toEqual([]);
         expect(result.keysFirstSeen).toBeUndefined();
@@ -663,7 +666,7 @@ describe("Key rotation continuity Tests", () => {
         const pinned = keyOf(await makeSignerCertificate({ sanEmails: [ADDRESS] }));
         const old = keyOf(await makeSignerCertificate({ sanEmails: [ADDRESS] }));
 
-        const result = applyDiscoveredKeys(
+        const result = await applyDiscoveredKeys(
             { keys: [pinned], previousKeys: [{ ...old, replacedAt: 1, replacement: "automatic" }] },
             makeDiscovery([old]),
             1000,
@@ -680,8 +683,8 @@ describe("Key rotation continuity Tests", () => {
         const first = await makeKey();
         const second = await makeKey();
 
-        const once = applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([first]), 1000, "header", ADDRESS);
-        const twice = applyDiscoveredKeys({ keys: [pinned], keyConflicts: once.keyConflicts }, makeDiscovery([second]), 2000, "discovery", ADDRESS);
+        const once = await applyDiscoveredKeys({ keys: [pinned] }, makeDiscovery([first]), 1000, "header", ADDRESS);
+        const twice = await applyDiscoveredKeys({ keys: [pinned], keyConflicts: once.keyConflicts }, makeDiscovery([second]), 2000, "discovery", ADDRESS);
 
         expect(twice.keyConflicts).toEqual([{ useType: "encrypt", observedKey: second, observedAt: 2000, source: "discovery" }]);
     });
@@ -691,12 +694,12 @@ describe("Key rotation continuity Tests", () => {
         const rejected = await makeKey();
         const rejectedKeys: RejectedKey[] = [{ useType: "encrypt", fingerprint: rejected.fingerprint, rejectedAt: 5 }];
 
-        const result = applyDiscoveredKeys({ keys: [pinned], rejectedKeys }, makeDiscovery([rejected]), 1000, "header", ADDRESS);
+        const result = await applyDiscoveredKeys({ keys: [pinned], rejectedKeys }, makeDiscovery([rejected]), 1000, "header", ADDRESS);
 
         expect(result.keyConflicts).toBeUndefined();
         expect(result.rejectedKeys).toBe(rejectedKeys);
         // The same fingerprint rejected for the other use type doesn't count.
-        const otherUse = applyDiscoveredKeys(
+        const otherUse = await applyDiscoveredKeys(
             { keys: [pinned], rejectedKeys: [{ useType: "sign", fingerprint: rejected.fingerprint, rejectedAt: 5 }] },
             makeDiscovery([rejected]),
             1000,
@@ -741,7 +744,7 @@ describe("Key rotation continuity Tests", () => {
             const next = keyOf(await issueCertificate(issuer, { sanEmails: [ADDRESS] }), { issuerCertificate: issuer.certificate });
             const previousPinned = state.keys![0];
             // The pinned key is superseded by the next one.
-            state = applyDiscoveredKeys(
+            state = await applyDiscoveredKeys(
                 state,
                 makeDiscovery([{ ...previousPinned, revokedAt: i + 1, revocationReason: "superseded" }, next]),
                 Date.now(),
@@ -808,13 +811,13 @@ describe("Key rotation continuity Tests", () => {
 
         // A contact that still carries the former single `keyConflict` (read from an old row) loses it on any merge.
         const existing = { keys: [pinned], keyConflict: legacy, keyConflicts: [legacy] } as unknown as ContactKeyState;
-        const untouched = applyDiscoveredKeys(existing, undefined, 1000, "header", ADDRESS);
+        const untouched = await applyDiscoveredKeys(existing, undefined, 1000, "header", ADDRESS);
         expect(untouched.keyConflicts).toEqual([]);
         expect(untouched).not.toHaveProperty("keyConflict");
 
         // The next observation of the differing key records a complete conflict that can be accepted.
         const observed = await makeKey();
-        const recorded = applyDiscoveredKeys(existing, makeDiscovery([observed]), 2000, "header", ADDRESS);
+        const recorded = await applyDiscoveredKeys(existing, makeDiscovery([observed]), 2000, "header", ADDRESS);
         expect(recorded.keyConflicts).toEqual([{ useType: "encrypt", observedKey: observed, observedAt: 2000, source: "header" }]);
     });
 
@@ -870,7 +873,7 @@ describe("discoverAndMergeKeys() Tests", () => {
         expect(result).toBeUndefined();
     });
 
-    it("Resolves the peer, fetches its keys, and merges them via applyDiscoveredKeys().", async () => {
+    it("Resolves the peer, fetches its keys, and merges them via (await applyDiscoveredKeys()).", async () => {
         (dnsResolver.resolveTxt as any).mockResolvedValue([["v=RMXv1; id=1; host=mail.participating-2.example.com;"]]);
         const remoteKey = await makeKey({ publicKey: await makeCertDer("alice", "alice@participating-2.example.com") });
         const discovered = makeDiscovery([remoteKey], 100);
@@ -885,5 +888,54 @@ describe("discoverAndMergeKeys() Tests", () => {
 
         expect(result?.keys).toEqual([remoteKey]);
         expect(result?.keysFirstSeen).toBe(NOW);
+    });
+});
+
+describe("OpenPGP certificates in a contact's keyring", () => {
+    it("pins an OpenPGP certificate next to the S/MIME certificates, each slot on its own", async () => {
+        const smime = await makeKey({ publicKey: await makeCertDer("smime", ADDRESS) });
+        const pgp = await openPgpKey(ADDRESS);
+        const result = await applyDiscoveredKeys(undefined, makeDiscovery([smime, pgp.key]), NOW, "discovery", ADDRESS);
+        expect(result.keys).toEqual([smime, pgp.key]);
+
+        // A new S/MIME certificate conflicts with the S/MIME one only; the OpenPGP pin is untouched, and vice versa.
+        const otherSmime = await makeKey({ publicKey: await makeCertDer("smime2", ADDRESS) });
+        const otherPgp = await openPgpKey(ADDRESS);
+        const next = await applyDiscoveredKeys(result, makeDiscovery([otherSmime, otherPgp.key]), NOW + 1, "discovery", ADDRESS);
+        expect(next.keys).toEqual([smime, pgp.key]);
+        expect(next.keyConflicts!.map((c) => [c.observedKey.type, c.observedKey.fingerprint])).toEqual([
+            ["x509", otherSmime.fingerprint],
+            ["openpgp", otherPgp.fingerprint],
+        ]);
+        expect(normalizeKeyConflicts(next.keyConflicts)).toHaveLength(2);
+    });
+
+    it("does not pin an OpenPGP certificate that names someone else, and replaces a retired one its successor was certified by", async () => {
+        const stranger = await openPgpKey("someone@example.com");
+        expect((await applyDiscoveredKeys(undefined, makeDiscovery([stranger.key]), NOW, "discovery", ADDRESS)).keys).toEqual([]);
+
+        const pinned = await openPgpKey(ADDRESS);
+        const successor = await certifiedBy(await openPgpKey(ADDRESS), pinned);
+        const existing: ContactKeyState = { keys: [{ ...pinned.key, revokedAt: NOW - 1000, revocationReason: "superseded" }] };
+        const result = await applyDiscoveredKeys(existing, makeDiscovery([successor.key]), NOW, "discovery", ADDRESS);
+        expect(result.keys).toEqual([successor.key]);
+        expect(result.previousKeys).toEqual([expect.objectContaining({ fingerprint: pinned.fingerprint, replacement: "automatic" })]);
+    });
+
+    it("sanitizes and validates either format", async () => {
+        const pgp = await openPgpKey(ADDRESS);
+        expect(await sanitizeKey({ ...pgp.key, fingerprint: "forged" })).toEqual(pgp.key);
+        const smime = await makeKey();
+        expect(await sanitizeKey(smime)).toEqual(sanitizeDiscoveredKey(smime));
+        expect(await parseAnyContactKey(pgp.armored, "openpgp", ADDRESS, "sign")).toEqual(pgp.key);
+        await expect(parseAnyContactKey(pgp.armored, undefined, ADDRESS, "sign")).rejects.toMatchObject({ status: 400 });
+    });
+
+    it("keeps previous keys per slot", () => {
+        const make = (type: string, n: number): PreviousKey =>
+            ({ publicKey: "x", type, useType: "encrypt", fingerprint: `${type}${n}`, notBefore: 0, notAfter: 1, replacedAt: n, replacement: "user" });
+        const stored: PreviousKey[] = [1, 2, 3, 4, 5].map((n) => make("x509", n));
+        const result = addPreviousKey(stored, make("openpgp", 1));
+        expect(result.map((k) => k.fingerprint)).toEqual(["openpgp1", "x5091", "x5092", "x5093", "x5094", "x5095"]);
     });
 });

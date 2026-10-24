@@ -184,12 +184,16 @@ export function keyRotationContinuitySuite(ctx: KeyRotationContinuitySuiteContex
             // Old encryption private keys are retained.
             expect((await ctx.findKeyVault(mailbox.uid))?.wrappedKeys).toHaveLength(3);
 
+            // Discovery lists the active keys first.
             const discovered = (await discover(mailbox)).body.keys;
-            expect(discovered[0].revokedAt).toBe(keys[0].revokedAt);
-            expect(discovered[0].revocationReason).toBe("superseded");
-            expect(discovered[2].revokedAt ?? undefined).toBeUndefined();
+            const listedOld = discovered.find((key: any) => key.fingerprint === keys[0].fingerprint);
+            expect(discovered.indexOf(listedOld)).toBe(2);
+            expect(listedOld.revokedAt).toBe(keys[0].revokedAt);
+            expect(listedOld.revocationReason).toBe("superseded");
+            expect(discovered[0].revokedAt ?? undefined).toBeUndefined();
             // Both encryption keys share the issuing CA a peer can compare.
-            expect(discovered[0].issuerCertificate).toBe(discovered[2].issuerCertificate);
+            const listedNew = discovered.find((key: any) => key.useType === "encrypt" && key.revokedAt == null);
+            expect(listedNew.issuerCertificate).toBe(listedOld.issuerCertificate);
         });
 
         it("revokes nothing when an enrollment fails: CA outage, stale master key generation, active fingerprint collision, wrong identity", async () => {
@@ -232,7 +236,7 @@ export function keyRotationContinuitySuite(ctx: KeyRotationContinuitySuiteContex
             expect(keys[1].revokedAt ?? undefined).toBeUndefined();
             const discovered = (await discover(mailbox)).body.keys;
             expect(discovered.map((key: any) => key.issuerCertificate)).toEqual([signCa.der, signCa.der]);
-            expect(discovered.map((key: any) => key.revocationReason ?? null)).toEqual(["superseded", null]);
+            expect(discovered.map((key: any) => key.revocationReason ?? null)).toEqual([null, "superseded"]);
         });
 
         it("drops a chain's second certificate when it didn't issue the leaf (other name, same name with another key, unparseable)", async () => {

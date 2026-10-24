@@ -4395,3 +4395,53 @@ The delivery path is now done for zero-access recipients. No plaintext spool exi
   - `SharedKeyStatus` gained `escrowScopeId` and `escrowPending` (the keys with no copy for that scope; always `[]` for an owned mailbox).
   - `EscrowAccessMaterial.zeroAccessEscrowWraps` releases the matter scope's wraps for an ownerless mailbox (`[]` once it has an owner), and `certificates` includes their keys.
   - Audit: `key_vault.escrow_wraps`; `key_vault.enroll` carries `escrowScopeId`.
+
+## 2026-10-24 - OpenPGP interoperability: standing decisions and Phase 1
+
+JP's decisions. The plan is at `C:\Users\caska\.claude\plans\openpgp-interop.md`.
+- **OpenPGP is a second format, for interoperability only:** Proton Mail, Thunderbird, GnuPG and similar.
+  - **S/MIME stays RapidMX's own format, and MUST be preferred** whenever a recipient has an S/MIME certificate.
+  - Spec: `end-to-end_encryption.md` *Message Format*, *OpenPGP Interoperability*, and Resolved Decision 16.
+- **Full two-way.** Every mailbox gets a client-generated, self-certified **v6** (RFC 9580) Ed25519/X25519 key.
+  - v4 keys from others are still read.
+  - GnuPG can't import v6 keys; JP accepted this.
+- **Mixed recipients:** one encrypted copy per format, never a plaintext copy.
+- **Discovery.**
+  - The RapidMX discovery endpoint publishes the OpenPGP certificate alongside the S/MIME ones. JP's reasoning: our protocol is richer than Autocrypt, because it works before first contact and carries the preference and the escrow flag.
+  - Phase 2 adds WKD and an `Autocrypt` header.
+  - No public keyservers.
+
+Phase 1 (restapi): the key model.
+- **One `PublicKey` per OpenPGP certificate**, with `type: "openpgp"` and `useType: "encrypt"`. The certificate also signs, and its pin covers signature verification.
+  - `publicKey` is the base64 of the binary transferable key.
+  - `fingerprint` is the primary key's: 64 hex for v6, 40 for v4.
+  - `notAfter` is `OPENPGP_NO_EXPIRY` when the key never expires.
+  - `WrappedPrivateKey.type: "openpgp"` marks its sealed secret key.
+- **Key slots.** `keySlot()` (in `OpenPgpKeyUtils.ts`) is `useType` plus format. All of these work per slot, so an S/MIME certificate and an OpenPGP certificate never replace each other:
+  - pinning
+  - conflicts (`normalizeKeyConflicts`, keyed by the slot of `observedKey`)
+  - the `addPreviousKey` limits
+  - `supersedeKeys`/`revokeInactiveKeys`
+  - `trust`/`resolve`
+- **`util/OpenPgpKeyUtils.ts`** uses OpenPGP.js 6.3 (LGPL-3.0+), imported lazily, for parsing and verifying only.
+  - `parseOpenPgpCertificate`.
+  - `sanitizeOpenPgpKey`: every field comes from the certificate. An embedded revocation becomes `revokedAt` with `"compromised"`.
+  - `parseOpenPgpContactKey`: 400 unless the key is current and unrevoked, a verified UID names the address, and it can encrypt. Signing is not required.
+  - `canReplaceOpenPgpKeyAutomatically`: true when the pinned key is expired or revoked AND it certified the successor's UID for the address.
+  - The `orElse`/`succeeds` helpers exist so every fallback path is reachable from tests (the 100% function gate).
+- **`applyDiscoveredKeys` is now async**, because OpenPGP.js parsing is async. So are `sanitizeKey` and `parseAnyContactKey`. The sync X.509 helpers are unchanged.
+  - Tests had to `await` it. Watch the precedence: write `(await f()).keys`.
+- **Enrollment.** `POST /:id/keyvault/keys` takes `type: "openpgp"`, `useType: "encrypt"`, `publicKey` (armored or base64) and `wrappedKey`.
+  - No CA is involved.
+  - The key must name the mailbox's primary address.
+  - 403 when "Allow OpenPGP" is off.
+- **"Allow OpenPGP"** is `EncryptionPolicy.allowOpenPgp` (config `mail:encryption:openpgp_allowed`, default on), served by the policy route like `allowZeroAccess`.
+  - `OpenPgpPolicy` reads it for `BaseKeyVaultRoute` (enrollment) and `BaseKeyDiscoveryRoute` (OpenPGP keys are left out when it's off).
+  - Both routes have an optional `encryptionPolicyClass`, which the Mongo/SQL subclasses set.
+- **Discovery.** `buildKeyDiscoveryResponse` lists active keys first, because older peers keep only `MAX_DISCOVERED_KEYS` (8), and it can leave OpenPGP keys out.
+  - Older RapidMX peers silently drop OpenPGP keys, since their `sanitizeDiscoveredKey` only parses X.509.
+- **The `RapidMX-Key` header and the MDN key announcement stay X.509 only** (`!isOpenPgpKey`).
+- **Inbound.** `isEncryptedBody` also treats an inline OpenPGP message as encrypted: a `text/plain` body that is one armored `PGP MESSAGE`, with no HTML and no attachments.
+  - `Message.encrypted` now means "end-to-end encrypted, in either format".
+  - There is no separate format field; the client tells the format from the MIME.
+- **Escrow.** The OpenPGP secret key has `useType: "encrypt"`, so `/material` already releases it along with its certificate.

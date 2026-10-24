@@ -14,6 +14,8 @@ import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { computeKeyDiscoveryHash } from "../../../src/util/KeyDiscoveryClient.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 
+import { ENCRYPTION_POLICY_UID } from "../../../src/zeroaccess/ZeroAccessResolver.js";
+import { EncryptionPolicySQL } from "../../../src/models/sql/EncryptionPolicySQL.js";
 describe("Route:KeyDiscoverySQL Tests", () => {
     const logger = Logger();
     const objectFactory: ObjectFactory = new ObjectFactory(config, logger);
@@ -102,6 +104,23 @@ describe("Route:KeyDiscoverySQL Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.body).toEqual({ encryptPreference: { preferEncrypt: "mutual", lastSeen: 100 }, keys: [publicKey], escrow: false });
+    });
+
+    it("Publishes OpenPGP certificates next to the S/MIME ones, active keys first, and leaves them out while OpenPGP is disallowed.", async () => {
+        const smime = { publicKey: "b64", type: "x509", useType: "encrypt" as const, fingerprint: "smime", notBefore: 0, notAfter: Date.now() + 86_400_000 };
+        const retired = { ...smime, fingerprint: "retired", revokedAt: 5 };
+        const pgp = { publicKey: "cGdw", type: "openpgp", useType: "encrypt" as const, fingerprint: "pgp", notBefore: 0, notAfter: Date.now() + 86_400_000 };
+        const mailbox = await createMailbox({ keys: [retired, smime, pgp] });
+        const get = () => request(server.getApplication()).get(`${baseUrl}/${mailbox.keyDiscoveryHash}`).set("Host", "example.com");
+
+        expect((await get()).body.keys.map((k: any) => k.fingerprint)).toEqual(["smime", "pgp", "retired"]);
+        const policies = (objectFactory.getInstance(ConnectionManager)!.connections.get("sql") as any).getRepository(EncryptionPolicySQL);
+        await policies.save(new EncryptionPolicySQL({ uid: ENCRYPTION_POLICY_UID, allowOpenPgp: false }));
+        try {
+            expect((await get()).body.keys.map((k: any) => k.fingerprint)).toEqual(["smime", "retired"]);
+        } finally {
+            await policies.clear();
+        }
     });
 
     it("Reports escrow: true when the mailbox's KeyVault holds an escrow-method master key wrap.", async () => {

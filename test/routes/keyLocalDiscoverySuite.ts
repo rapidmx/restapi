@@ -212,7 +212,8 @@ export function keyLocalDiscoverySuite(ctx: KeyLocalDiscoverySuiteContext): void
             expect(res.status).toBe(200);
             expect(res.body.keys.map((k: any) => k.fingerprint)).toEqual([current.fingerprint]);
             const published = (await request(ctx.app()).get(`${ctx.discoveryUrl}/${computeKeyDiscoveryHash(local)}?domain=example.com`)).body;
-            expect(published.keys.map((k: any) => k.publicKey)).toEqual([old.publicKey, current.publicKey]);
+            // Active keys first, so a peer keeping only the first few never drops the current one.
+            expect(published.keys.map((k: any) => k.publicKey)).toEqual([current.publicKey, old.publicKey]);
             expect(published.encryptPreference).toEqual(res.body.encryptPreference);
         });
 

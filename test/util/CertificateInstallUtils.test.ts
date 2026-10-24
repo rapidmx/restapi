@@ -113,6 +113,20 @@ describe("CertificateInstallUtils", () => {
         });
     });
 
+    describe("per format", () => {
+        it("an OpenPGP key supersedes only OpenPGP keys, and each format keeps its own active key", () => {
+            const keys: PublicKey[] = [key({ fingerprint: "smime" }), key({ fingerprint: "pgp-old", type: "openpgp" })];
+            const installed = key({ fingerprint: "pgp-new", type: "openpgp" });
+            expect(supersedeKeys(keys, installed, 100).map((k) => [k.fingerprint, k.revokedAt ?? null])).toEqual([
+                ["smime", null],
+                ["pgp-old", 100],
+                ["pgp-new", null],
+            ]);
+            const both: PublicKey[] = [key({ fingerprint: "smime", notBefore: 1 }), key({ fingerprint: "pgp", type: "openpgp", notBefore: 2 })];
+            expect(revokeInactiveKeys(both, 10).every((k) => k.revokedAt === undefined)).toBe(true);
+        });
+    });
+
     describe("revokeInactiveKeys()", () => {
         it("keeps each useType's active key (latest notBefore among unrevoked, unexpired) and revokes the other unrevoked ones as superseded", () => {
             const now = 1_000;

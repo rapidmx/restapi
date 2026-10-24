@@ -28,6 +28,7 @@ import type { SearchProvider } from "../search/SearchProvider.js";
 import { ERASURE_IN_PROGRESS } from "./ErasureExecutionJob.js";
 import { writeContactKeys } from "../util/ContactKeyUtils.js";
 import { applyDiscoveredKeys, ContactKeyState, discoverAndMergeKeys } from "../util/KeyringUtils.js";
+import { isOpenPgpKey } from "../util/OpenPgpKeyUtils.js";
 import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchContext } from "../util/MailFilterUtils.js";
 import { evaluateSenderLists, type SenderListVerdict } from "../util/SenderListUtils.js";
 import { MAX_EVENT_ATTENDEES, MAX_REQUESTED_GUESTS, guestPermissionsOf } from "../util/CalendarEventUtils.js";
@@ -1838,7 +1839,7 @@ export abstract class ScanQueueJob<
                     return undefined;
                 }
             }
-            const update: ContactKeyState = applyDiscoveredKeys(existingContact, discovered, now, "header", fromAddress);
+            const update: ContactKeyState = await applyDiscoveredKeys(existingContact, discovered, now, "header", fromAddress);
             headerConflict = !!update.keyConflicts?.some((conflict) => conflict.source === "header" && conflict.observedAt === now);
             return update;
         });
@@ -2385,7 +2386,7 @@ export abstract class ScanQueueJob<
             // Rotation Notification (Group E5) - mirrors E4's "announce my own active encrypt key" logic
             // exactly, just riding on the MDN instead of the original outbound message.
             const activeEncryptKey: PublicKey | undefined = (mailbox.keys ?? []).find(
-                (k) => k.useType === "encrypt" && !k.revokedAt && k.notAfter > Date.now(),
+                (k) => k.useType === "encrypt" && !isOpenPgpKey(k) && !k.revokedAt && k.notAfter > Date.now(),
             );
             const composed: Buffer = await buildDispositionNotification({
                 from: { address: mailbox.primarySmtpAddress, displayName: safeDisplayName(mailbox.displayName) },

@@ -23,11 +23,19 @@ import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { ContactKeyMerge, ContactKeyWriteResult, ContactKeyWriteTarget, writeContactKeys } from "../util/ContactKeyUtils.js";
 import { DomainUtils } from "../util/DomainUtils.js";
 import { hasMailAccess } from "../util/MailAccessUtils.js";
-import { addPreviousKey, addRejectedKey, discoverAndMergeKeys, listField, normalizeKeyConflicts, withoutKey } from "../util/KeyringUtils.js";
+import {
+    addPreviousKey,
+    addRejectedKey,
+    discoverAndMergeKeys,
+    listField,
+    normalizeKeyConflicts,
+    parseAnyContactKey,
+    withoutKey,
+} from "../util/KeyringUtils.js";
 import { LocalKeyDiscovery } from "../util/LocalKeyDiscoveryUtils.js";
 import { isPlainAddress } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-import { parseContactKey, parseTrustedSignerKey } from "../util/SignerCertificateUtils.js";
+import { isOpenPgpKey, keySlot, OPENPGP_KEY_TYPE } from "../util/OpenPgpKeyUtils.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Query, RateLimit, Request, User: AuthUser } = RouteDecorators;
 
@@ -44,8 +52,11 @@ export interface PublicKeyLookupResult {
 export interface TrustSignerRequest {
     /** The signer's address, one plain `local@domain`. */
     address: string;
-    /** The signer's certificate, base64 DER X.509. */
+    /** The signer's certificate: base64 DER X.509, or with `type: "openpgp"` an OpenPGP public key (ASCII armored or base64
+     * binary). */
     certificate: string;
+    /** `"openpgp"` for an OpenPGP key; omitted (or `"x509"`) for an X.509 certificate. */
+    type?: string;
 }
 
 /** The body of `POST /mailbox/:id/keys/resolve`. */
@@ -58,8 +69,12 @@ export interface ResolveKeyConflictRequest {
     action: "accept" | "reject";
     /** The fingerprint of the pinned key the user saw; the request is refused with 409 when it's no longer pinned. */
     expectedPinnedFingerprint: string;
-    /** For `"accept"` only: the new key's certificate, base64 DER X.509. Defaults to the recorded conflict's key. */
+    /** For `"accept"` only: the new key's certificate, base64 DER X.509 (or an OpenPGP key with `type: "openpgp"`). Defaults
+     * to the recorded conflict's key. */
     certificate?: string;
+    /** Which of the contact's keys of `useType`: `"openpgp"` for its OpenPGP certificate (always `useType: "encrypt"`),
+     * omitted (or `"x509"`) for its X.509 certificate. */
+    type?: string;
 }
 
 /** The longest `expectedPinnedFingerprint` accepted (a SHA-256 hex fingerprint is 64 characters). */
@@ -73,11 +88,22 @@ function pinnedKeyChanged(): ApiError {
     );
 }
 
-/** A conflict's observed key, validated as a key of its `useType` for `address` at `now` (400 when it no longer is),
- * keeping the `issuerCertificate` it was published with. */
-function revalidatedConflictKey(conflict: KeyConflict, address: string, now: number): PublicKey {
-    const key: PublicKey = parseContactKey(conflict.observedKey.publicKey, address, conflict.useType, now);
+/** A conflict's observed key, validated as a key of its `useType` and format for `address` at `now` (400 when it no longer
+ * is), keeping the `issuerCertificate` it was published with. */
+async function revalidatedConflictKey(conflict: KeyConflict, address: string, now: number): Promise<PublicKey> {
+    const key: PublicKey = await parseAnyContactKey(conflict.observedKey.publicKey, conflict.observedKey.type, address, conflict.useType, now);
     return conflict.observedKey.issuerCertificate ? { ...key, issuerCertificate: conflict.observedKey.issuerCertificate } : key;
+}
+
+/** `type` of a trust or resolve request: `"openpgp"`, or `"x509"` when omitted (400 for anything else). */
+function requestKeyType(type: unknown): typeof OPENPGP_KEY_TYPE | "x509" {
+    if (type === undefined || type === "x509") {
+        return "x509";
+    }
+    if (type === OPENPGP_KEY_TYPE) {
+        return OPENPGP_KEY_TYPE;
+    }
+    throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'type' must be 'x509' or 'openpgp'.");
 }
 
 /**
@@ -315,9 +341,14 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
     }
 
     /**
-     * `POST /mailbox/:id/keys/trust` with `{ address, certificate }`: pins `certificate` (base64 DER X.509) as the signing
+     * `POST /mailbox/:id/keys/trust` with `{ address, certificate, type? }`: pins `certificate` (base64 DER X.509) as the signing
      * key of `address`'s contact in this mailbox - the "Trust this signer" action for a validly signed message whose
      * sender has no signing key pinned. Returns the same shape as `lookup()` for that address.
+     *
+     * With `type: "openpgp"`, `certificate` is an OpenPGP public key (armored or base64 binary) - from a signed message, a
+     * key attached to one, or pasted by the user - validated by `OpenPgpKeyUtils.parseOpenPgpContactKey()` and pinned as the
+     * contact's OpenPGP certificate (one key that both encrypts and signs), next to any S/MIME certificates it has. The same
+     * rules apply to that slot: only ever the first one, 409 for a different one already pinned.
      *
      * Only ever adds the first signing key. A contact that already pins a signing key gets 409 when it's a different
      * certificate (replacing a pinned key is `resolve()`'s job, which needs the pinned fingerprint the user saw, so this
@@ -349,12 +380,13 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         if (!body || typeof body !== "object" || Array.isArray(body)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The request body must be an object with 'address' and 'certificate'.");
         }
-        const { address, certificate } = body as Partial<TrustSignerRequest>;
+        const { address, certificate, type } = body as Partial<TrustSignerRequest>;
         if (!isPlainAddress(address)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'address' must be a single plain email address.");
         }
+        const keyType = requestKeyType(type);
         const mailbox: M = await this.requireUpdatableMailbox(mailboxId, user);
-        const key: PublicKey = parseTrustedSignerKey(certificate, address);
+        const key: PublicKey = await parseAnyContactKey(certificate, keyType, address, "sign");
 
         const now: number = Date.now();
         const { contact, written } = await this.writeKeys(
@@ -365,7 +397,7 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
                 if (existing) {
                     await this.requirePermission(user, existing.folderUid, ACLAction.UPDATE);
                 }
-                const pinned: PublicKey | undefined = existing?.keys?.find((k) => k.useType === "sign");
+                const pinned: PublicKey | undefined = existing?.keys?.find((k) => keySlot(k) === keySlot(key));
                 if (pinned) {
                     if (pinned.fingerprint === key.fingerprint) {
                         return undefined;
@@ -373,7 +405,9 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
                     throw new ApiError(
                         ApiErrors.IDENTIFIER_EXISTS,
                         409,
-                        "A different signing key is already pinned for this address. It can't be replaced from here.",
+                        isOpenPgpKey(key)
+                            ? "A different OpenPGP key is already pinned for this address. It can't be replaced from here."
+                            : "A different signing key is already pinned for this address. It can't be replaced from here.",
                     );
                 }
                 return { keys: [...(existing?.keys ?? []), key], keysFirstSeen: existing?.keysFirstSeen ?? now } as Partial<C>;
@@ -388,7 +422,7 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
                     targetType: "Contact",
                     targetUid: contact!.uid,
                     mailboxUid: mailbox.uid,
-                    details: { address, fingerprint: key.fingerprint },
+                    details: { address, fingerprint: key.fingerprint, ...(isOpenPgpKey(key) ? { type: OPENPGP_KEY_TYPE } : {}) },
                 },
                 { req, user },
             );
@@ -397,9 +431,11 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
     }
 
     /**
-     * `POST /mailbox/:id/keys/resolve` with `{ address, useType, action, expectedPinnedFingerprint, certificate? }`: the
+     * `POST /mailbox/:id/keys/resolve` with `{ address, useType, action, expectedPinnedFingerprint, certificate?, type? }`: the
      * user's explicit decision on a changed key (`specs/end-to-end_encryption.md`'s Key Conflict Handling, step 4).
-     * Returns the same shape as `lookup()` for that address.
+     * Returns the same shape as `lookup()` for that address. `type: "openpgp"` (with `useType: "encrypt"`) addresses the
+     * contact's OpenPGP certificate; otherwise its X.509 certificate of `useType` - each format's key is pinned, and its
+     * conflict recorded, on its own.
      *
      * `accept` replaces the pinned `useType` key of `address`'s contact. The new key is `certificate` when given, else the
      * key recorded in that `useType`'s conflict; either way it's validated by `parseContactKey()` at the time of the
@@ -438,13 +474,18 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
                 "The request body must be an object with 'address', 'useType', 'action' and 'expectedPinnedFingerprint'.",
             );
         }
-        const { address, useType, action, expectedPinnedFingerprint, certificate } = body as Partial<ResolveKeyConflictRequest>;
+        const { address, useType, action, expectedPinnedFingerprint, certificate, type } = body as Partial<ResolveKeyConflictRequest>;
         if (!isPlainAddress(address)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'address' must be a single plain email address.");
         }
         if (useType !== "sign" && useType !== "encrypt") {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'useType' must be 'sign' or 'encrypt'.");
         }
+        const keyType = requestKeyType(type);
+        if (keyType === OPENPGP_KEY_TYPE && useType !== "encrypt") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "An OpenPGP key is resolved with 'useType' 'encrypt'.");
+        }
+        const slot: string = keySlot({ useType, type: keyType });
         if (action !== "accept" && action !== "reject") {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'action' must be 'accept' or 'reject'.");
         }
@@ -460,7 +501,7 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         }
         const mailbox: M = await this.requireUpdatableMailbox(mailboxId, user);
         const now: number = Date.now();
-        const givenKey: PublicKey | undefined = certificate === undefined ? undefined : parseContactKey(certificate, address, useType, now);
+        const givenKey: PublicKey | undefined = certificate === undefined ? undefined : await parseAnyContactKey(certificate, keyType, address, useType, now);
 
         let audit: { action: AuditAction; details: Record<string, string> } | undefined;
         const { contact } = await this.writeKeys(mailbox, address, user, async (existing) => {
@@ -470,12 +511,12 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
             }
             await this.requirePermission(user, existing.folderUid, ACLAction.UPDATE);
             const keys: PublicKey[] = [...(existing.keys ?? [])];
-            const pinnedIndex: number = keys.findIndex((k) => k.useType === useType);
+            const pinnedIndex: number = keys.findIndex((k) => keySlot(k) === slot);
             const pinned: PublicKey | undefined = keys[pinnedIndex];
             const conflicts: KeyConflict[] = normalizeKeyConflicts(existing.keyConflicts);
-            const conflict: KeyConflict | undefined = conflicts.find((c) => c.useType === useType);
+            const conflict: KeyConflict | undefined = conflicts.find((c) => keySlot(c.observedKey) === slot);
             const remainingConflicts = listField(
-                conflicts.filter((c) => c.useType !== useType),
+                conflicts.filter((c) => keySlot(c.observedKey) !== slot),
                 existing.keyConflicts,
             );
 
@@ -510,7 +551,7 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
                 throw new ApiError(ApiErrors.NOT_FOUND, 404, "There is no key conflict to accept for this address.");
             }
             // Re-validated now: the conflict's key may have expired since it was observed.
-            const newKey: PublicKey = givenKey ?? revalidatedConflictKey(conflict!, address, now);
+            const newKey: PublicKey = givenKey ?? (await revalidatedConflictKey(conflict!, address, now));
             keys[pinnedIndex] = newKey;
             audit = {
                 action: AuditAction.CONTACT_KEY_REPLACED,

@@ -11,6 +11,7 @@ import type { DnsResolver } from "../dns/DnsResolver.js";
 import { resolveFederationPolicy } from "./FederationUtils.js";
 import { fetchRemoteKeys, MAX_DISCOVERED_KEYS, parseKeyDiscoveryAddress, parseKeyDiscoveryResponse } from "./KeyDiscoveryClient.js";
 import { discoverLocalKeys, type LocalKeyDiscovery } from "./LocalKeyDiscoveryUtils.js";
+import { canReplaceOpenPgpKeyAutomatically, isOpenPgpKey, keySlot, parseOpenPgpContactKey, sanitizeOpenPgpKey } from "./OpenPgpKeyUtils.js";
 import { parseContactKey } from "./SignerCertificateUtils.js";
 import { Contact, EncryptionPreference, KeyConflict, KeyDiscoveryResponse, PreviousKey, PublicKey, RejectedKey } from "../models/types.js";
 
@@ -22,7 +23,7 @@ export type ContactKeyState = Pick<Contact, "keys" | "encryptPreference" | "keys
  * `Contact` it's tracking (creating one first if this is the first time the address has ever been seen). */
 export type KeyringUpdate = ContactKeyState;
 
-/** How many replaced keys `Contact.previousKeys` keeps per `useType`. */
+/** How many replaced keys `Contact.previousKeys` keeps per key slot (`keySlot()`). */
 export const MAX_PREVIOUS_KEYS_PER_USE_TYPE = 5;
 
 /** How many rejected keys `Contact.rejectedKeys` keeps. */
@@ -79,15 +80,40 @@ export function sanitizeDiscoveredKey(key: PublicKey): PublicKey | undefined {
 }
 
 /**
+ * `sanitizeDiscoveredKey()` for a key of either format: an OpenPGP certificate goes through
+ * `OpenPgpKeyUtils.sanitizeOpenPgpKey()`, anything else must be an X.509 certificate.
+ */
+export async function sanitizeKey(key: PublicKey, now: number = Date.now()): Promise<PublicKey | undefined> {
+    return isOpenPgpKey(key) ? await sanitizeOpenPgpKey(key, now) : sanitizeDiscoveredKey(key);
+}
+
+/**
+ * `SignerCertificateUtils.parseContactKey()` for a key of either format (`type`): validates `certificate` as `address`'s
+ * `useType` key at `now`. An OpenPGP certificate is always pinned as its `encrypt` slot (it signs too), so `useType` is
+ * ignored for one.
+ *
+ * @throws `ApiError` 400 as `parseContactKey()` / `OpenPgpKeyUtils.parseOpenPgpContactKey()`.
+ */
+export async function parseAnyContactKey(
+    certificate: unknown,
+    type: string | undefined,
+    address: string,
+    useType: PublicKey["useType"],
+    now: number = Date.now(),
+): Promise<PublicKey> {
+    return isOpenPgpKey({ type }) ? await parseOpenPgpContactKey(certificate, address, now) : parseContactKey(certificate, address, useType, now);
+}
+
+/**
  * `Contact.keyConflicts` as stored, keeping only well-formed entries (a `useType`, an `observedKey` of that `useType`
- * with a certificate and fingerprint, a finite `observedAt` and a known `source`), at most one per `useType` (the latest
- * `observedAt`). This is also the read-time migration of the former single `Contact.keyConflict` (a fingerprint without
+ * with a certificate and fingerprint, a finite `observedAt` and a known `source`), at most one per key slot (`keySlot()` of its
+ * observed key; the latest `observedAt`). This is also the read-time migration of the former single `Contact.keyConflict` (a fingerprint without
  * the observed key): it isn't a model field any more, so it never reaches here and is dropped, and an entry shaped like
  * it inside the array is dropped too. Neither can be accepted, and the pinned key is unchanged, so the next observation
  * of the differing key records a complete conflict.
  */
 export function normalizeKeyConflicts(conflicts: unknown): KeyConflict[] {
-    const byUseType = new Map<UseType, KeyConflict>();
+    const bySlot = new Map<string, KeyConflict>();
     for (const conflict of Array.isArray(conflicts) ? conflicts : []) {
         const observedKey: unknown = conflict?.observedKey;
         if (
@@ -103,26 +129,27 @@ export function normalizeKeyConflicts(conflicts: unknown): KeyConflict[] {
         ) {
             continue;
         }
-        const current: KeyConflict | undefined = byUseType.get(conflict.useType);
+        const slot: string = keySlot(observedKey as PublicKey);
+        const current: KeyConflict | undefined = bySlot.get(slot);
         if (!current || conflict.observedAt >= current.observedAt) {
-            byUseType.set(conflict.useType, conflict as KeyConflict);
+            bySlot.set(slot, conflict as KeyConflict);
         }
     }
-    return [...byUseType.values()];
+    return [...bySlot.values()];
 }
 
 /** `previousKeys` with `replaced` added first (replacing an entry of the same `useType` and fingerprint), bounded to
- * `MAX_PREVIOUS_KEYS_PER_USE_TYPE` per `useType`. */
+ * `MAX_PREVIOUS_KEYS_PER_USE_TYPE` per key slot (`keySlot()`). */
 export function addPreviousKey(previousKeys: PreviousKey[] | undefined, replaced: PreviousKey): PreviousKey[] {
     const result: PreviousKey[] = [replaced];
-    const counts: Record<UseType, number> = { sign: 0, encrypt: 0 };
-    counts[replaced.useType] = 1;
+    const counts = new Map<string, number>([[keySlot(replaced), 1]]);
     for (const key of previousKeys ?? []) {
         if (key.useType === replaced.useType && key.fingerprint === replaced.fingerprint) {
             continue;
         }
-        if (counts[key.useType] < MAX_PREVIOUS_KEYS_PER_USE_TYPE) {
-            counts[key.useType]++;
+        const count: number = counts.get(keySlot(key)) ?? 0;
+        if (count < MAX_PREVIOUS_KEYS_PER_USE_TYPE) {
+            counts.set(keySlot(key), count + 1);
             result.push(key);
         }
     }
@@ -226,7 +253,8 @@ export function escalateRevocation<K extends PublicKey>(key: K, listed: PublicKe
  * (`RapidMX-Key` processing) apply identical logic regardless of which authenticated source
  * (`"discovery"` vs `"header"`) triggered it.
  *
- * - **Validation**: `discovered` is re-run through `parseKeyDiscoveryResponse()` - a structurally malformed response is treated exactly like no response at all (the Anti-Downgrade no-op below), never partially applied. Each key goes through `sanitizeDiscoveredKey()`.
+ * - **Validation**: `discovered` is re-run through `parseKeyDiscoveryResponse()` - a structurally malformed response is treated exactly like no response at all (the Anti-Downgrade no-op below), never partially applied. Each key goes through `sanitizeKey()`.
+ * - **Formats**: keys are pinned per key slot (`keySlot()`: `useType` and format), so an address's S/MIME certificates and its OpenPGP certificate are pinned side by side. Everything below applies per slot; an OpenPGP certificate's checks are `OpenPgpKeyUtils`' (`parseOpenPgpContactKey()`, `canReplaceOpenPgpKeyAutomatically()`: the pinned key certified its successor).
  * - **Revocation evidence**: a listed key with `revokedAt` is never pinned or recorded as a conflict. When it matches a pinned or previous key (same `useType` and fingerprint), that key takes its `revokedAt`/`revocationReason` if they're stronger than the stored ones (`escalateRevocation()`), which also feeds the automatic replacement below. A non-revoked key already in `previousKeys` for its `useType` is ignored (it was replaced before).
  * - **TOFU pinning**: the first key ever observed for a given `useType` (encrypt/sign) is pinned immediately, with no conflict recorded.
  * - **Automatic replacement**: a different key for a `useType` that has one pinned replaces it when `canReplaceAutomatically()` holds (same issuing CA, proven with the published `issuerCertificate`; pinned key expired or revoked; new key valid for the address). The old key moves to `previousKeys` (`replacement: "automatic"`, keeping its `revokedAt`/`revocationReason`) and the `useType`'s conflict is cleared.
@@ -243,13 +271,13 @@ export function escalateRevocation<K extends PublicKey>(key: K, listed: PublicKe
  * @param source Whether this observation came from the in-band `RapidMX-Key` header or a live Discovery call.
  * @param address The contact's address, which a key replacing a pinned one automatically must name.
  */
-export function applyDiscoveredKeys(
+export async function applyDiscoveredKeys(
     existing: ContactKeyState | undefined,
     discovered: KeyDiscoveryResponse | undefined,
     observedAt: number,
-    source: "header" | "discovery",
+    source: KeyConflict["source"],
     address: string,
-): KeyringUpdate {
+): Promise<KeyringUpdate> {
     const storedConflicts: KeyConflict[] = normalizeKeyConflicts(existing?.keyConflicts);
     const unchanged: KeyringUpdate = {
         keys: existing?.keys ?? [],
@@ -267,14 +295,13 @@ export function applyDiscoveredKeys(
 
     // The certificates of an alias (or alias domain's) mailbox name its primary address, which the response says when it answers for one.
     const certificateAddress: string = validated.address ?? address;
-    const sanitizedKeys: PublicKey[] = validated.keys
-        .slice(0, MAX_DISCOVERED_KEYS)
-        .map(sanitizeDiscoveredKey)
-        .filter((k): k is PublicKey => k !== undefined);
-    const listedRevocations = new Map<string, PublicKey>(
-        sanitizedKeys.filter((k) => k.revokedAt !== undefined).map((k) => [`${k.useType}:${k.fingerprint}`, k]),
+    const sanitizedKeys: PublicKey[] = (await Promise.all(validated.keys.slice(0, MAX_DISCOVERED_KEYS).map((k) => sanitizeKey(k, observedAt)))).filter(
+        (k): k is PublicKey => k !== undefined,
     );
-    const listedRevocation = (key: PublicKey): PublicKey | undefined => listedRevocations.get(`${key.useType}:${key.fingerprint}`);
+    const listedRevocations = new Map<string, PublicKey>(
+        sanitizedKeys.filter((k) => k.revokedAt !== undefined).map((k) => [`${keySlot(k)}:${k.fingerprint}`, k]),
+    );
+    const listedRevocation = (key: PublicKey): PublicKey | undefined => listedRevocations.get(`${keySlot(key)}:${key.fingerprint}`);
 
     // Revocations the response lists for keys already on file (pinned or previous) are recorded first.
     const resultKeys: PublicKey[] = unchanged.keys!.map((k) => escalateRevocation(k, listedRevocation(k)));
@@ -287,12 +314,13 @@ export function applyDiscoveredKeys(
         if (discoveredKey.revokedAt !== undefined || previousKeys?.some((k) => k.useType === useType && k.fingerprint === fingerprint)) {
             continue;
         }
-        const pinnedIndex: number = resultKeys.findIndex((k) => k.useType === useType);
+        const slot: string = keySlot(discoveredKey);
+        const pinnedIndex: number = resultKeys.findIndex((k) => keySlot(k) === slot);
         if (pinnedIndex === -1) {
-            // The first key pinned for a use type gets the checks every later pin does (`canReplaceAutomatically()`, the trust
+            // The first key pinned for a slot gets the checks every later pin does (`canReplaceAutomatically()`, the trust
             // endpoint): valid now, naming this address, usage fitting its use type. A certificate that fails them is not pinned.
             try {
-                parseContactKey(discoveredKey.publicKey, certificateAddress, useType, observedAt);
+                await parseAnyContactKey(discoveredKey.publicKey, discoveredKey.type, certificateAddress, useType, observedAt);
             } catch {
                 continue;
             }
@@ -304,20 +332,23 @@ export function applyDiscoveredKeys(
         if (pinned.fingerprint === fingerprint) {
             continue;
         }
-        if (canReplaceAutomatically(pinned, discoveredKey, certificateAddress, observedAt)) {
+        const replaceable: boolean = isOpenPgpKey(discoveredKey)
+            ? await canReplaceOpenPgpKeyAutomatically(pinned, discoveredKey, certificateAddress, observedAt)
+            : canReplaceAutomatically(pinned, discoveredKey, certificateAddress, observedAt);
+        if (replaceable) {
             resultKeys[pinnedIndex] = discoveredKey;
             previousKeys = addPreviousKey(previousKeys, {
                 ...pinned,
                 replacedAt: observedAt,
                 replacement: "automatic",
             });
-            conflicts = conflicts.filter((c) => c.useType !== useType);
+            conflicts = conflicts.filter((c) => keySlot(c.observedKey) !== slot);
             continue;
         }
         if (existing?.rejectedKeys?.some((k) => k.useType === useType && k.fingerprint === fingerprint)) {
             continue;
         }
-        conflicts = [...conflicts.filter((c) => c.useType !== useType), { useType, observedKey: discoveredKey, observedAt, source }];
+        conflicts = [...conflicts.filter((c) => keySlot(c.observedKey) !== slot), { useType, observedKey: discoveredKey, observedAt, source }];
     }
 
     const existingLastSeen: number = existing?.encryptPreference?.lastSeen ?? -Infinity;
@@ -365,7 +396,7 @@ export async function discoverAndMergeKeys(
         const found = await discoverLocalKeys(local, address);
         if (found) {
             // The mailbox's primary address is what its certificates name, whichever alias or plus-tagged form was asked for.
-            return found.response ? applyDiscoveredKeys(existing, found.response, observedAt, "discovery", found.address) : undefined;
+            return found.response ? await applyDiscoveredKeys(existing, found.response, observedAt, "discovery", found.address) : undefined;
         }
     }
     // The same parser `fetchRemoteKeys()` uses, so the policy is resolved for exactly the domain keys are fetched for
@@ -382,5 +413,5 @@ export async function discoverAndMergeKeys(
     if (!discovered) {
         return undefined;
     }
-    return applyDiscoveredKeys(existing, discovered, observedAt, "discovery", address);
+    return await applyDiscoveredKeys(existing, discovered, observedAt, "discovery", address);
 }

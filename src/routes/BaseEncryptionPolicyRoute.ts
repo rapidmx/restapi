@@ -12,6 +12,7 @@ const { Get, Put, RequiresTrustedRole, User: AuthUser, Validate } = RouteDecorat
 /** The fixed, well-known identifier of the one `EncryptionPolicy` row this route ever reads/writes - same
  * singleton-row convention as `BaseBrandingRoute.ts`'s `BRANDING_UID`. */
 import { ENCRYPTION_POLICY_UID } from "../zeroaccess/ZeroAccessResolver.js";
+import { OPENPGP_ALLOWED_CONFIG } from "../util/OpenPgpPolicy.js";
 
 /** The wire shape of `EncryptionPolicy` - identical to the entity today, but kept as its own type (mirroring
  * `BaseBrandingRoute.ts`'s `PublicBranding`) so a future field this route shouldn't expose (e.g. internal
@@ -19,6 +20,8 @@ import { ENCRYPTION_POLICY_UID } from "../zeroaccess/ZeroAccessResolver.js";
 export type PublicEncryptionPolicy = Pick<EncryptionPolicy, "encryptSameOrg" | "encryptFederated" | "encryptExternal"> & {
     /** Always present on the wire: the stored value, or `mail:zero_access:allowed` when none has been saved. */
     allowZeroAccess: boolean;
+    /** Always present on the wire: the stored value, or `mail:encryption:openpgp_allowed` when none has been saved. */
+    allowOpenPgp: boolean;
 };
 
 /** The config key seeding `EncryptionPolicy.allowZeroAccess` until an administrator saves a value. */
@@ -29,7 +32,7 @@ export const ZERO_ACCESS_ALLOWED_CONFIG = "mail:zero_access:allowed";
  * (not `"prohibited"`) matches the spec's explicit same-organisation default, extended to all three tiers
  * since encryption is a *protective* capability with no reason to default more restrictively for a
  * federated/external tier than for same-organisation. */
-const DEFAULT_ENCRYPTION_POLICY: Omit<PublicEncryptionPolicy, "allowZeroAccess"> = {
+const DEFAULT_ENCRYPTION_POLICY: Omit<PublicEncryptionPolicy, "allowZeroAccess" | "allowOpenPgp"> = {
     encryptSameOrg: "optional",
     encryptFederated: "optional",
     encryptExternal: "optional",
@@ -72,6 +75,10 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
     @Config(ZERO_ACCESS_ALLOWED_CONFIG, true)
     protected zeroAccessAllowedDefault: boolean = true;
 
+    /** Seeds `EncryptionPolicy.allowOpenPgp` (on by default) until an administrator saves a value. */
+    @Config(OPENPGP_ALLOWED_CONFIG, true)
+    protected openPgpAllowedDefault: boolean = true;
+
     @Init
     protected async initialize(): Promise<void> {
         if (!this._objectFactory) {
@@ -112,13 +119,14 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
         }
     }
 
-    private toPublic(policy: Omit<PublicEncryptionPolicy, "allowZeroAccess"> & { allowZeroAccess?: boolean | null }): PublicEncryptionPolicy {
+    private toPublic(policy: Omit<PublicEncryptionPolicy, "allowZeroAccess" | "allowOpenPgp"> & { allowZeroAccess?: boolean | null; allowOpenPgp?: boolean | null }): PublicEncryptionPolicy {
         return {
             encryptSameOrg: policy.encryptSameOrg,
             encryptFederated: policy.encryptFederated,
             encryptExternal: policy.encryptExternal,
             // `null` is a SQL row from before the column existed: unset, like `undefined`.
             allowZeroAccess: typeof policy.allowZeroAccess === "boolean" ? policy.allowZeroAccess : this.zeroAccessAllowedDefault !== false,
+            allowOpenPgp: typeof policy.allowOpenPgp === "boolean" ? policy.allowOpenPgp : this.openPgpAllowedDefault !== false,
         };
     }
 
@@ -134,6 +142,9 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
         }
         if (obj?.allowZeroAccess !== undefined) {
             patch.allowZeroAccess = obj.allowZeroAccess;
+        }
+        if (obj?.allowOpenPgp !== undefined) {
+            patch.allowOpenPgp = obj.allowOpenPgp;
         }
         return patch;
     }
@@ -154,6 +165,9 @@ export abstract class BaseEncryptionPolicyRoute<T extends EncryptionPolicy> {
         }
         if (obj?.allowZeroAccess !== undefined && typeof obj.allowZeroAccess !== "boolean") {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'allowZeroAccess' must be a boolean.");
+        }
+        if (obj?.allowOpenPgp !== undefined && typeof obj.allowOpenPgp !== "boolean") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'allowOpenPgp' must be a boolean.");
         }
     }
 

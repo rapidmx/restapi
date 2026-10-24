@@ -63,7 +63,7 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
                 .set("Authorization", "jwt " + userToken);
 
             expect(result.status).toBe(200);
-            expect(result.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: true });
+            expect(result.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: true, allowOpenPgp: true });
         });
 
         it("Answers 200 with the defaults for any signed-in user - a token with no roles and no elevation, an ordinary one, an administrator - and creates no row for any of them.", async () => {
@@ -75,7 +75,7 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
                     .set("Authorization", "jwt " + token);
 
                 expect(result.status).toBe(200);
-                expect(result.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: true });
+                expect(result.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: true, allowOpenPgp: true });
             }
             expect(await policyRepo.find({}).toArray()).toEqual([]);
         });
@@ -122,7 +122,7 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
                 .send({ encryptSameOrg: "automatic" });
 
             expect(result.status).toBe(200);
-            expect(result.body).toEqual({ encryptSameOrg: "automatic", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: true });
+            expect(result.body).toEqual({ encryptSameOrg: "automatic", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: true, allowOpenPgp: true });
 
             const rows = await policyRepo.find().toArray();
             expect(rows).toHaveLength(1);
@@ -141,7 +141,7 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
                 .send({ encryptExternal: "prohibited" });
 
             expect(result.status).toBe(200);
-            expect(result.body).toEqual({ encryptSameOrg: "automatic", encryptFederated: "prohibited", encryptExternal: "prohibited", allowZeroAccess: true });
+            expect(result.body).toEqual({ encryptSameOrg: "automatic", encryptFederated: "prohibited", encryptExternal: "prohibited", allowZeroAccess: true, allowOpenPgp: true });
         });
 
         it("Rejects an invalid policy state value (400).", async () => {
@@ -180,10 +180,10 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
             const put = await request(server.getApplication())
                 .put(baseUrl)
                 .set("Authorization", "jwt " + adminToken)
-                .send({ allowZeroAccess: false });
+                .send({ allowZeroAccess: false, allowOpenPgp: true });
 
             expect(put.status).toBe(200);
-            expect(put.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: false });
+            expect(put.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: false, allowOpenPgp: true });
 
             const result = await request(server.getApplication())
                 .get(baseUrl)
@@ -196,7 +196,7 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
             await request(server.getApplication())
                 .put(baseUrl)
                 .set("Authorization", "jwt " + adminToken)
-                .send({ allowZeroAccess: false });
+                .send({ allowZeroAccess: false, allowOpenPgp: true });
 
             const result = await request(server.getApplication())
                 .put(baseUrl)
@@ -220,9 +220,29 @@ describe("Route:EncryptionPolicyMongo Tests", () => {
             const result = await request(server.getApplication())
                 .put(baseUrl)
                 .set("Authorization", "jwt " + userToken)
-                .send({ allowZeroAccess: false });
+                .send({ allowZeroAccess: false, allowOpenPgp: true });
 
             expect(result.status).toBe(403);
+        });
+    });
+
+    describe("allowOpenPgp", () => {
+        it("Defaults to true (mail:encryption:openpgp_allowed), and a trusted caller turns it off without touching the other fields.", async () => {
+            const before = await request(server.getApplication()).get(baseUrl).set("Authorization", "jwt " + userToken);
+            expect(before.body.allowOpenPgp).toBe(true);
+
+            const put = await request(server.getApplication()).put(baseUrl).set("Authorization", "jwt " + adminToken).send({ allowOpenPgp: false });
+            expect(put.status).toBe(200);
+            expect(put.body).toEqual({ encryptSameOrg: "optional", encryptFederated: "optional", encryptExternal: "optional", allowZeroAccess: true, allowOpenPgp: false });
+            expect((await policyRepo.find().toArray())[0].allowOpenPgp).toBe(false);
+
+            const kept = await request(server.getApplication()).put(baseUrl).set("Authorization", "jwt " + adminToken).send({ encryptSameOrg: "automatic" });
+            expect(kept.body.allowOpenPgp).toBe(false);
+        });
+
+        it("Rejects a non-boolean value (400).", async () => {
+            const result = await request(server.getApplication()).put(baseUrl).set("Authorization", "jwt " + adminToken).send({ allowOpenPgp: "no" });
+            expect(result.status).toBe(400);
         });
     });
 });

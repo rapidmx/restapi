@@ -37,10 +37,12 @@ import {
     verifiedIssuerCertificate,
 } from "../util/CertificateInstallUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
-import { AuditAction, EscrowScope, KeyUseType, KeyVault, Mailbox, MasterKeyWrap, MemberKeyWrap, PublicKey, WrappedPrivateKey, ZeroAccessEscrowWrap, ZeroAccessKey } from "../models/types.js";
+import { AuditAction, EncryptionPolicy, EscrowScope, KeyUseType, KeyVault, Mailbox, MasterKeyWrap, MemberKeyWrap, PublicKey, WrappedPrivateKey, ZeroAccessEscrowWrap, ZeroAccessKey } from "../models/types.js";
 import { activeZeroAccessKey } from "../util/ZeroAccessUtils.js";
 import { canonicalUserUid, zeroAccessMembers } from "../zeroaccess/ZeroAccessResolver.js";
 import { isSealedToCertificate } from "../zeroaccess/ZeroAccessSealer.js";
+import { isOpenPgpKey, OPENPGP_KEY_TYPE, parseOpenPgpContactKey } from "../util/OpenPgpKeyUtils.js";
+import { OPENPGP_ALLOWED_CONFIG, OpenPgpPolicy } from "../util/OpenPgpPolicy.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
 const { Delete, Get, Param, Post, Put, Query, Response, User: AuthUser } = RouteDecorators;
@@ -175,7 +177,12 @@ export interface EnrollKeyRequest extends ExpectedMasterKeyGeneration {
      * `SigningCertificateEnrollment` flow (`startEnrollment()`/`checkStatus()`), which has already completed
      * by the time this call is made - this endpoint only validates and installs the result. */
     certificate?: string;
-    wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType">;
+    /** `"openpgp"` to enroll an OpenPGP key (`useType: "encrypt"` only): the client generated and self-certified it, so it
+     * needs no CA - `publicKey` is the certificate and `wrappedKey` its secret key, sealed under the master key. */
+    type?: string;
+    /** The OpenPGP public key (ASCII armored, or base64 binary) - required, and only meaningful, with `type: "openpgp"`. */
+    publicKey?: string;
+    wrappedKey: Omit<WrappedPrivateKey, "fingerprint" | "useType" | "type">;
     masterKeyWraps?: MasterKeyWrap[];
 }
 
@@ -290,7 +297,14 @@ function pickMasterKeyWrap(wrap: MasterKeyWrap): MasterKeyWrap {
 
 /** `key` reduced to `WrappedPrivateKey`'s own fields - see `pickMasterKeyWrap()`. */
 function pickWrappedKey(key: WrappedPrivateKey): WrappedPrivateKey {
-    return { ciphertext: key.ciphertext, nonce: key.nonce, algorithm: key.algorithm, fingerprint: key.fingerprint, useType: key.useType };
+    return {
+        ciphertext: key.ciphertext,
+        nonce: key.nonce,
+        algorithm: key.algorithm,
+        fingerprint: key.fingerprint,
+        useType: key.useType,
+        ...(isOpenPgpKey(key) ? { type: OPENPGP_KEY_TYPE } : {}),
+    };
 }
 
 /** Refuses (409) bootstrap `masterKeyWraps` for a vault that is already set up - holding wraps or wrapped keys. They
@@ -371,6 +385,15 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
      * `escrowScopeId` refers to a real `EscrowScope` without depending on either backend directly. */
     protected abstract escrowScopeClass: any;
 
+    /** The `EncryptionPolicy` model, read for "Allow OpenPGP" (`OpenPgpPolicy`). Optional: without it, the config default applies. */
+    protected encryptionPolicyClass?: any;
+
+    /** Seeds "Allow OpenPGP" until an administrator saves a value (`OpenPgpPolicy`). */
+    @Config(OPENPGP_ALLOWED_CONFIG, true)
+    protected openPgpAllowedDefault: boolean = true;
+
+    protected openPgpPolicy?: OpenPgpPolicy;
+
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
@@ -407,6 +430,12 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     protected async initialize(): Promise<void> {
         if (!this._objectFactory) {
             throw new Error("objectFactory is not set.");
+        }
+        if (!this.openPgpPolicy) {
+            const policyRepo: RepoUtils<EncryptionPolicy> | undefined = this.encryptionPolicyClass
+                ? await this._objectFactory.newInstance(RepoUtils, { name: this.encryptionPolicyClass.name, args: [this.encryptionPolicyClass] })
+                : undefined;
+            this.openPgpPolicy = new OpenPgpPolicy(policyRepo, this.openPgpAllowedDefault);
         }
         if (!this.keyVaultRepo && this.keyVaultClass) {
             this.keyVaultRepo = await this._objectFactory.newInstance(RepoUtils, {
@@ -603,7 +632,20 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
 
         let publicKey: PublicKey | ZeroAccessKey;
         let fingerprint: string;
-        if (body.useType === "encrypt") {
+        if (body.type !== undefined && body.type !== "x509" && body.type !== OPENPGP_KEY_TYPE) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "type must be 'x509' or 'openpgp'.");
+        }
+        if (body.type === OPENPGP_KEY_TYPE) {
+            // Self-certified by the client: checked, never issued. It must be usable now and name the mailbox's own address.
+            if (body.useType !== "encrypt") {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "An OpenPGP key is enrolled with useType 'encrypt'.");
+            }
+            if (!(await this.openPgpPolicy!.allowed())) {
+                throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "OpenPGP keys are disabled on this server.");
+            }
+            publicKey = await parseOpenPgpContactKey(body.publicKey, mailbox.primarySmtpAddress);
+            fingerprint = publicKey.fingerprint;
+        } else if (body.useType === "encrypt") {
             if (!body.csr) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "csr is required for useType 'encrypt'.");
             }
@@ -660,7 +702,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A non-expired, non-revoked key with this fingerprint is already enrolled.");
         }
 
-        const wrappedKey: WrappedPrivateKey = pickWrappedKey({ ...body.wrappedKey, fingerprint, useType: body.useType });
+        const wrappedKey: WrappedPrivateKey = pickWrappedKey({ ...body.wrappedKey, fingerprint, useType: body.useType, type: publicKey.type });
 
         // Checked here too (not only in `persistEnrollment()`), so a doomed request doesn't reach the writes.
         const currentVault: K | undefined = await this.findKeyVault(mailbox.uid);
@@ -675,7 +717,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                 targetType: "KeyVault",
                 targetUid: persisted.keyVault.uid,
                 mailboxUid: mailbox.uid,
-                details: { useType: body.useType, fingerprint },
+                details: { useType: body.useType, fingerprint, ...(isOpenPgpKey(publicKey) ? { type: OPENPGP_KEY_TYPE } : {}) },
             },
             { user },
         );

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
-import { AuditLogEntrySQL, EscrowScopeSQL, KeyVaultSQL, MailboxSQL } from "../../sql.js";
+import { AuditLogEntrySQL, EncryptionPolicySQL, EscrowScopeSQL, KeyVaultSQL, MailboxSQL } from "../../sql.js";
 import { BaseKeyVaultRoute } from "../BaseKeyVaultRoute.js";
 const { Model } = RouteDecorators;
 
@@ -15,4 +15,5 @@ export class KeyVaultRouteSQL extends BaseKeyVaultRoute<KeyVaultSQL, MailboxSQL>
     protected mailboxClass: any = MailboxSQL;
     protected auditLogClass: any = AuditLogEntrySQL;
     protected escrowScopeClass: any = EscrowScopeSQL;
+    protected encryptionPolicyClass: any = EncryptionPolicySQL;
 }

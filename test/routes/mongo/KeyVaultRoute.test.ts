@@ -16,7 +16,10 @@ import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { FakeEncryptionCertificateAuthority, generateTestCsr, registerTestDoubles } from "../../testDoubles.js";
-import { sharedZeroAccessKeySuite } from "../sharedZeroAccessKeySuite.js";
+import { sharedZeroAccessKeySuite, type SharedZeroAccessKeySuiteContext } from "../sharedZeroAccessKeySuite.js";
+import { openPgpEnrollSuite } from "../openPgpEnrollSuite.js";
+import { ENCRYPTION_POLICY_UID } from "../../../src/zeroaccess/ZeroAccessResolver.js";
+import { EncryptionPolicyMongo } from "../../../src/models/mongo/EncryptionPolicyMongo.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -1151,7 +1154,7 @@ describe("Route:KeyVaultMongo Tests", () => {
         });
     });
 
-    sharedZeroAccessKeySuite({
+    const sharedCtx: SharedZeroAccessKeySuiteContext = {
         app: () => server.getApplication(),
         baseUrl,
         tokenFor: (uid) => JWTUtils.createTokenSync(config.get("auth"), { uid, roles: [], elevated: Date.now() } as any),
@@ -1190,5 +1193,16 @@ describe("Route:KeyVaultMongo Tests", () => {
                     requiredHolders: 1,
                 }),
             ),
+    };
+    sharedZeroAccessKeySuite(sharedCtx);
+    openPgpEnrollSuite({
+        ...sharedCtx,
+        setOpenPgpAllowed: async (allowed) => {
+            const repo = (objectFactory.getInstance(ConnectionManager)!.connections.get("mongo") as any).getMongoRepository("EncryptionPolicyMongo");
+            await repo.deleteMany({});
+            if (allowed !== undefined) {
+                await repo.save(new EncryptionPolicyMongo({ uid: ENCRYPTION_POLICY_UID, allowOpenPgp: allowed }));
+            }
+        },
     });
 });

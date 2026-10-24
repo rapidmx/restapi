@@ -33,11 +33,27 @@ function isOpenPgpMimeEncrypted(parsed: ParsedMail, params: Record<string, strin
     return types.length === 2 && types[0] === "application/octet-stream" && types[1] === "application/pgp-encrypted";
 }
 
+/** An inline OpenPGP message: the whole body is one ASCII-armored `PGP MESSAGE` block. */
+const INLINE_PGP_MESSAGE = /^-----BEGIN PGP MESSAGE-----\r?\n[\s\S]*\r?\n-----END PGP MESSAGE-----$/;
+
 /**
- * `true` if `parsed`'s top-level `Content-Type` marks this message's body as S/MIME (CMS) encrypted - either
+ * Whether `parsed` is an inline OpenPGP encrypted message (the pre-RFC 3156 form some clients still send): a plain-text body that
+ * is entirely one armored `PGP MESSAGE` block, with no HTML body and no attachments. Anything beside the armor - readable text,
+ * an HTML part, an attachment - makes it ordinary mail (it is then scanned, previewed and indexed as such), for the same reason
+ * `isOpenPgpMimeEncrypted()` checks the MIME shape: "encrypted" switches the attachment scan and the HTML sanitizing off.
+ */
+function isInlinePgpEncrypted(parsed: ParsedMail, contentTypeValue: string | undefined): boolean {
+    if ((contentTypeValue !== undefined && contentTypeValue !== "text/plain") || typeof parsed.html === "string" || (parsed.attachments ?? []).length > 0) {
+        return false;
+    }
+    return typeof parsed.text === "string" && INLINE_PGP_MESSAGE.test(parsed.text.trim());
+}
+
+/**
+ * `true` if `parsed`'s top-level `Content-Type` marks this message's body as end-to-end encrypted - either
  * an `enveloped-data`/`authEnveloped-data` `application/pkcs7-mime` (or legacy `application/x-pkcs7-mime`)
  * part, or `multipart/encrypted` (the OpenPGP/MIME shape, checked defensively for interop with a sender this
- * library never itself produces).
+ * library never itself produces), or an inline OpenPGP message (`isInlinePgpEncrypted()`).
  *
  * A `false` result says nothing about whether the message is *signed* - a detached `multipart/signed`
  * message carries its plaintext body in the clear as one of its parts, which mailparser already parses into
@@ -50,12 +66,11 @@ function isOpenPgpMimeEncrypted(parsed: ParsedMail, params: Record<string, strin
  */
 export function isEncryptedBody(parsed: ParsedMail): boolean {
     const contentType = parsed.headers.get("content-type");
-    if (
-        !contentType ||
-        typeof contentType !== "object" ||
-        Array.isArray(contentType) ||
-        typeof (contentType as { value: unknown }).value !== "string"
-    ) {
+    if (!contentType) {
+        // No Content-Type is text/plain (RFC 2045).
+        return isInlinePgpEncrypted(parsed, undefined);
+    }
+    if (typeof contentType !== "object" || Array.isArray(contentType) || typeof (contentType as { value: unknown }).value !== "string") {
         return false;
     }
     const { value, params } = contentType as { value: string; params?: Record<string, string> };
@@ -67,5 +82,5 @@ export function isEncryptedBody(parsed: ParsedMail): boolean {
         const smimeType: string | undefined = params?.["smime-type"]?.toLowerCase();
         return !!smimeType && ENCRYPTED_SMIME_TYPES.has(smimeType);
     }
-    return false;
+    return isInlinePgpEncrypted(parsed, contentTypeValue);
 }

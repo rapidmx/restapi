@@ -10,6 +10,7 @@ import * as uuid from "uuid";
 import { AuditAction } from "../../src/models/types.js";
 import type { StaticDnsResolver } from "../testDoubles.js";
 import { makeSignerCertificate, x509 } from "../util/signerCertificates.js";
+import { openPgpKey } from "../openPgpTestKeys.js";
 
 export interface KeyTrustSuiteContext {
     app: () => any;
@@ -324,6 +325,71 @@ export function keyTrustSuite(ctx: KeyTrustSuiteContext): void {
             const pinned = signKeys(contacts[0]);
             expect(pinned).toHaveLength(1);
             expect(pinned[0].fingerprint).toBe(trustRes.status === 200 ? trusted.fingerprint : discovered.fingerprint);
+        });
+    });
+
+    describe("OpenPGP keys (POST /:id/keys/trust and /:id/keys/resolve with type openpgp)", () => {
+        const resolve = (mailboxUid: string, body: any) =>
+            request(ctx.app())
+                .post(`${ctx.baseUrl}/${mailboxUid}/keys/resolve`)
+                .set("Authorization", "jwt " + ctx.tokenFor(owner))
+                .send(body);
+
+        it("pins an OpenPGP key next to the contact's S/MIME keys, refuses a different one, and audits its type", async () => {
+            const mailbox = await createMailbox();
+            const address = "pgp-trust@proton.example";
+            const pgp = await openPgpKey(address);
+            const { certificate } = await signer(address);
+            expect((await trust(mailbox.uid, { address, certificate })).status).toBe(200);
+
+            const res = await trust(mailbox.uid, { address, certificate: pgp.armored, type: "openpgp" });
+            expect(res.status).toBe(200);
+            expect(res.body.keys.map((k: any) => [k.type, k.useType])).toEqual([
+                ["x509", "sign"],
+                ["openpgp", "encrypt"],
+            ]);
+            expect(res.body.keys[1]).toEqual(pgp.key);
+            expect((await trust(mailbox.uid, { address, certificate: pgp.base64, type: "openpgp" })).status).toBe(200);
+            const other = await trust(mailbox.uid, { address, certificate: (await openPgpKey(address)).armored, type: "openpgp" });
+            expect(other.status).toBe(409);
+            expect(other.body.message).toContain("OpenPGP");
+            const audits = (await ctx.findAuditEntries(mailbox.uid)).filter((e: any) => e.action === AuditAction.CONTACT_KEY_TRUSTED);
+            expect(audits.map((e: any) => e.details.type ?? null)).toEqual([null, "openpgp"]);
+        });
+
+        it("refuses an unknown type, and an OpenPGP key that doesn't name the address", async () => {
+            const mailbox = await createMailbox();
+            expect((await trust(mailbox.uid, { address: "a@b.example", certificate: "x", type: "pgp" })).status).toBe(400);
+            const res = await trust(mailbox.uid, { address: "a@b.example", certificate: (await openPgpKey("c@d.example")).armored, type: "openpgp" });
+            expect(res.status).toBe(400);
+        });
+
+        it("accepts or rejects a changed OpenPGP key on its own slot", async () => {
+            const mailbox = await createMailbox();
+            const address = "pgp-resolve@proton.example";
+            const pinned = await openPgpKey(address);
+            const observed = await openPgpKey(address);
+            const conflict = { useType: "encrypt", observedKey: observed.key, observedAt: Date.now(), source: "discovery" };
+            // Created through trust, so it is filed in the mailbox's Contacts folder; then given an S/MIME key and the conflict.
+            expect((await trust(mailbox.uid, { address, certificate: pinned.armored, type: "openpgp" })).status).toBe(200);
+            const [created] = await ctx.findContacts(mailbox.uid);
+            await ctx.saveContact({ ...created, keys: [encryptKey("smime-fp"), pinned.key], keyConflicts: [conflict] });
+            const base = { address, useType: "encrypt", expectedPinnedFingerprint: pinned.fingerprint, type: "openpgp" };
+            expect((await resolve(mailbox.uid, { ...base, useType: "sign" })).status).toBe(400);
+            expect((await resolve(mailbox.uid, { ...base, type: "nope" })).status).toBe(400);
+            // The X.509 slot's pinned fingerprint isn't this one.
+            expect((await resolve(mailbox.uid, { ...base, type: undefined, action: "accept" })).status).toBe(409);
+
+            const accepted = await resolve(mailbox.uid, { ...base, action: "accept" });
+            expect(accepted.status).toBe(200);
+            expect(accepted.body.keys.map((k: any) => k.fingerprint)).toEqual(["smime-fp", observed.fingerprint]);
+            expect(accepted.body.keyConflicts).toBeUndefined();
+            expect(accepted.body.previousKeys).toEqual([expect.objectContaining({ fingerprint: pinned.fingerprint, type: "openpgp", replacement: "user" })]);
+
+            // A given certificate replaces it too, validated as OpenPGP.
+            const third = await openPgpKey(address);
+            const given = await resolve(mailbox.uid, { ...base, expectedPinnedFingerprint: observed.fingerprint, action: "accept", certificate: third.armored });
+            expect(given.body.keys.map((k: any) => k.fingerprint)).toEqual(["smime-fp", third.fingerprint]);
         });
     });
 }

@@ -7,6 +7,7 @@ import { ApiError } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { PublicKey } from "../models/types.js";
 import { MAX_ISSUER_CERTIFICATE_BASE64_LENGTH } from "./KeyDiscoveryClient.js";
+import { keySlot } from "./OpenPgpKeyUtils.js";
 
 const PEM_CERTIFICATE_PATTERN = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g;
 
@@ -114,6 +115,7 @@ export const REVOCATION_REASONS = ["superseded", "compromised"] as const;
 /** The fields of a mailbox key (`PublicKey` or `ZeroAccessKey`) that superseding reads and writes. */
 interface SupersedableKey {
     useType: string;
+    type?: string;
     fingerprint: string;
     revokedAt?: number;
     revocationReason?: PublicKey["revocationReason"];
@@ -129,7 +131,8 @@ function superseded<K extends SupersedableKey>(key: K, at: number): K {
  * already revoked gets `revokedAt: installedAt` and `revocationReason: "superseded"`, so a peer re-running discovery sees the previous key as retired (the
  * condition, with a shared issuer, under which the spec lets it replace a pinned key without prompting). Entries with
  * `installed`'s own fingerprint (a re-enrollment of the same certificate) are replaced by `installed`, which is
- * appended last. Keys of the other `useType` are untouched. Only the public record changes - wrapped private keys are
+ * appended last. Keys of another `useType`, or of the same `useType` in the other format (`keySlot()`: an S/MIME certificate
+ * and an OpenPGP certificate are each a mailbox's active key of their own format), are untouched. Only the public record changes - wrapped private keys are
  * not touched here (see `specs/end-to-end_encryption.md`'s rotation table).
  *
  * The caller must write the result in the same update that publishes `installed`, so a failed install revokes nothing.
@@ -137,12 +140,12 @@ function superseded<K extends SupersedableKey>(key: K, at: number): K {
 export function supersedeKeys<K extends SupersedableKey>(keys: K[] | null | undefined, installed: K, installedAt: number): K[] {
     const kept: K[] = (keys ?? [])
         .filter((key) => key.fingerprint !== installed.fingerprint)
-        .map((key) => (key.useType === installed.useType && !key.revokedAt ? superseded(key, installedAt) : key));
+        .map((key) => (keySlot(key) === keySlot(installed) && !key.revokedAt ? superseded(key, installedAt) : key));
     return [...kept, installed];
 }
 
 /**
- * For each `useType`, revokes as superseded (`revokedAt: at`, `revocationReason: "superseded"`) every unrevoked key except the active one - the unrevoked, unexpired
+ * For each key slot (`keySlot()`: `useType` and format), revokes as superseded (`revokedAt: at`, `revocationReason: "superseded"`) every unrevoked key except the active one - the unrevoked, unexpired
  * key with the latest `notBefore` (later array position on a tie), the same choice react-shared's
  * `findActivePublicKey()` makes. A `useType` with no unexpired unrevoked key is left as it is. Used by `rekey()` so a
  * mailbox whose keys were enrolled before superseded keys were revoked is normalized on its next rotation.
@@ -153,13 +156,13 @@ export function revokeInactiveKeys(keys: PublicKey[], at: number): PublicKey[] {
         if (key.revokedAt || !(key.notAfter > at)) {
             return;
         }
-        const current: number | undefined = activeIndex.get(key.useType);
+        const current: number | undefined = activeIndex.get(keySlot(key));
         if (current === undefined || key.notBefore >= keys[current].notBefore) {
-            activeIndex.set(key.useType, index);
+            activeIndex.set(keySlot(key), index);
         }
     });
     return keys.map((key, index) => {
-        const active: number | undefined = activeIndex.get(key.useType);
+        const active: number | undefined = activeIndex.get(keySlot(key));
         return active !== undefined && active !== index && !key.revokedAt ? superseded(key, at) : key;
     });
 }

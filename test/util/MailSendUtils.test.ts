@@ -453,7 +453,9 @@ describe("prepareOutboundMime() and seedReceiptStatus() Tests", () => {
 
         expect(await send([key()], { preferEncrypt: "mutual" })).toMatch(/^RapidMX-Key: addr=sender@example.com; prefer-encrypt=mutual; type=x509; keydata=S0VZ\r\n/);
         expect(await send([key()])).toContain("prefer-encrypt=nopreference");
-        expect(await send([key({ revokedAt: Date.now() - 1 }), key({ notAfter: Date.now() - 1 }), key({ useType: "sign" })])).toBe(raw.toString());
+        expect(await send([key({ revokedAt: Date.now() - 1 }), key({ notAfter: Date.now() - 1 }), key({ useType: "sign" }), key({ type: "openpgp", publicKey: "UEdQ", notBefore: Date.now() })])).toBe(raw.toString());
+        // An OpenPGP certificate never rides in the header, even when it is newer than the S/MIME one.
+        expect(await send([key(), key({ type: "openpgp", publicKey: "UEdQ", notBefore: Date.now() + 1 })])).toContain("type=x509; keydata=S0VZ");
         expect((await prepareOutboundMime({ raw, message, mailbox: { ...mailbox(), keys: null }, domainUtils: domainUtilsOf(), dnsResolver: dns })).raw).toBe(raw);
     });
 

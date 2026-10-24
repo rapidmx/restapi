@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ModelUtils, type RepoUtils } from "@rapidrest/service-core";
 import type { EncryptionPreference, KeyDiscoveryResponse, KeyVault, Mailbox, PublicKey } from "../models/types.js";
+import { isOpenPgpKey } from "./OpenPgpKeyUtils.js";
 import { normalizeAddress, stripPlusTag } from "./AddressUtils.js";
 import { parseKeyDiscoveryAddress } from "./KeyDiscoveryClient.js";
 
@@ -26,11 +27,20 @@ export const NOT_PUBLISHED_RESPONSE: KeyDiscoveryResponse = {
  * `escrow` is whether the mailbox's own `KeyVault` (read server-side with `ignoreACL: true`; nothing else from it is ever
  * returned) holds any `MasterKeyWrap` with `method: "escrow"`.
  *
+ * `keys` lists the active (unrevoked, unexpired) keys first, so a peer that keeps only the first few (`MAX_DISCOVERED_KEYS`)
+ * never drops a current one for a retired one. `includeOpenPgp: false` (the server's "Allow OpenPGP" is off) leaves the
+ * mailbox's OpenPGP certificates out.
+ *
  * Always performs exactly one `KeyVault` lookup, even when there is no mailbox (a `mailboxUid` no real mailbox can have),
  * so the not-found and no-keys-published cases cost the same number of round trips - the timing side channel the public
  * endpoint's "Timing" note closes.
  */
-export async function buildKeyDiscoveryResponse(keyVaultRepo: RepoUtils<any>, mailbox: Mailbox | undefined): Promise<KeyDiscoveryResponse> {
+export async function buildKeyDiscoveryResponse(
+    keyVaultRepo: RepoUtils<any>,
+    mailbox: Mailbox | undefined,
+    includeOpenPgp: boolean = true,
+    now: number = Date.now(),
+): Promise<KeyDiscoveryResponse> {
     const vaults: KeyVault[] = await keyVaultRepo.find({ mailboxUid: mailbox?.uid ?? "" } as any, {
         ignoreACL: true,
         limit: 1,
@@ -39,7 +49,10 @@ export async function buildKeyDiscoveryResponse(keyVaultRepo: RepoUtils<any>, ma
         return NOT_PUBLISHED_RESPONSE;
     }
     const escrow: boolean = !!vaults[0]?.masterKeyWraps.some((w) => w.method === "escrow");
-    return { encryptPreference: mailbox.encryptPreference ?? NOT_PUBLISHED_RESPONSE.encryptPreference, keys: mailbox.keys ?? [], escrow };
+    const published: PublicKey[] = (mailbox.keys ?? []).filter((key) => includeOpenPgp || !isOpenPgpKey(key));
+    const active = (key: PublicKey): boolean => key.revokedAt === undefined && key.notAfter > now;
+    const keys: PublicKey[] = [...published.filter(active), ...published.filter((key) => !active(key))];
+    return { encryptPreference: mailbox.encryptPreference ?? NOT_PUBLISHED_RESPONSE.encryptPreference, keys, escrow };
 }
 
 /** What `discoverLocalKeys()` needs from its caller - the concrete (Mongo/SQL) repos and query shapes. */

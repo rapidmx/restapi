@@ -73,4 +73,41 @@ describe("isEncryptedBody() Tests", () => {
         const parsed = await simpleParser(Buffer.from(raw));
         expect(isEncryptedBody(parsed)).toBe(false);
     });
+
+    const armored = "-----BEGIN PGP MESSAGE-----\r\n\r\nwV4DAAAAAAAAAAASAQdA\r\n=abcd\r\n-----END PGP MESSAGE-----";
+
+    it("Returns true for an inline OpenPGP message: a plain-text body that is one armored PGP MESSAGE block.", async () => {
+        expect(isEncryptedBody(await parse("Content-Type: text/plain; charset=us-ascii", armored))).toBe(true);
+        // No Content-Type at all is text/plain.
+        expect(isEncryptedBody(await simpleParser(Buffer.from(["From: a@example.com", "Subject: x", "", armored, ""].join("\r\n"))))).toBe(true);
+    });
+
+    it("Returns false for a Content-Type header mailparser didn't structure.", () => {
+        expect(isEncryptedBody({ headers: new Map([["content-type", "text/plain"]]) } as any)).toBe(false);
+        expect(isEncryptedBody({ headers: new Map([["content-type", { value: 5 }]]) } as any)).toBe(false);
+    });
+
+    it("Does not treat text around an armored block, an HTML body, an attachment or a signed block as an inline encrypted message.", async () => {
+        expect(isEncryptedBody(await parse("Content-Type: text/plain", `Hello\r\n${armored}`))).toBe(false);
+        expect(isEncryptedBody(await parse("Content-Type: text/html", armored))).toBe(false);
+        expect(isEncryptedBody(await parse("Content-Type: text/plain", "-----BEGIN PGP SIGNED MESSAGE-----\r\nHash: SHA256\r\n\r\nhi\r\n-----BEGIN PGP SIGNATURE-----\r\nx\r\n-----END PGP SIGNATURE-----"))).toBe(false);
+        const withAttachment = [
+            "From: a@example.com",
+            'Content-Type: multipart/mixed; boundary="M"',
+            "",
+            "--M",
+            "Content-Type: text/plain",
+            "",
+            armored,
+            "--M",
+            "Content-Type: application/octet-stream",
+            "Content-Disposition: attachment; filename=x.bin",
+            "",
+            "AAAA",
+            "--M--",
+            "",
+        ].join("\r\n");
+        expect(isEncryptedBody(await simpleParser(Buffer.from(withAttachment)))).toBe(false);
+        expect(isEncryptedBody(await simpleParser(Buffer.from(["From: a@example.com", "Subject: x", "", "plain words", ""].join("\r\n"))))).toBe(false);
+    });
 });

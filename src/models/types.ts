@@ -37,13 +37,16 @@ export enum FolderType {
  * `PublicKey`.
  */
 export interface PublicKey {
-    /** The base64 encoded public key (DER-encoded X.509 certificate). */
+    /** The base64 encoded public key: a DER-encoded X.509 certificate, or for `type: "openpgp"` the binary transferable
+     * OpenPGP public key. */
     publicKey: string;
-    /** The key's type and format (e.g. `x509`). */
+    /** The key's type and format: `x509` (S/MIME), or `openpgp` - an OpenPGP certificate, which both encrypts and signs and is
+     * therefore listed once, with `useType: "encrypt"` (see `util/OpenPgpKeyUtils.ts`). */
     type: string;
     /** The purpose this key is used for. */
     useType: "sign" | "encrypt";
-    /** SHA-256 fingerprint of the certificate, hex encoded. Used for TOFU pinning and out-of-band verification. */
+    /** SHA-256 fingerprint of the certificate, hex encoded - for an OpenPGP certificate, its primary key's fingerprint (64 hex
+     * characters for a v6 key, 40 for v4). Used for TOFU pinning and out-of-band verification. */
     fingerprint: string;
     /** UTC timestamp (epoch ms) at which this key becomes valid. */
     notBefore: number;
@@ -96,6 +99,9 @@ export interface WrappedPrivateKey {
     fingerprint: string;
     /** The purpose this key is used for. */
     useType: KeyUseType;
+    /** `"openpgp"` when this is an OpenPGP secret key (the corresponding `PublicKey.type`); absent for every other key, whose
+     * ciphertext holds a PKCS#8 private key. */
+    type?: string;
 }
 
 /** What a mailbox's own key is used for: `sign`/`encrypt` keys are published (`Mailbox.keys`), `zero-access` keys never are
@@ -505,6 +511,10 @@ export interface EncryptionPolicy extends BaseEntity {
      * Unset falls back to `mail:zero_access:allowed` (default `true`). Off, every mailbox stores new mail in plaintext
      * regardless of its own `Mailbox.zeroAccessEnabled`; mail already encrypted stays encrypted. */
     allowZeroAccess?: boolean;
+    /** "Allow OpenPGP" (`specs/end-to-end_encryption.md` *OpenPGP Interoperability*): whether mailboxes may enroll and publish
+     * OpenPGP keys, for end-to-end mail with OpenPGP users (Proton Mail and others). Unset falls back to
+     * `mail:encryption:openpgp_allowed` (default `true`). S/MIME stays this server's own format either way. */
+    allowOpenPgp?: boolean;
 }
 
 /** The minimum enforceable `RetentionPolicy.auditLogRetentionDays` - approximates HIPAA's typical
@@ -1274,7 +1284,8 @@ export interface Message extends RecoverableBaseEntity {
      * equivalent to an empty array. */
     labelUids?: string[];
 
-    /** `true` when this message's body is S/MIME (CMS) encrypted - see `util/SmimeUtils.ts`'s
+    /** `true` when this message's body is end-to-end encrypted - S/MIME (CMS), OpenPGP/MIME or an inline OpenPGP message - see
+     * `util/SmimeUtils.ts`'s
      * `isEncryptedBody()`, which `ScanPipeline.run()` computes this from at ingest/send time. Downstream
      * consumers that would otherwise try to read plaintext out of an encrypted body (`AttachmentExtractionJob`,
      * derived-entity creation from an encrypted calendar invite) key off of this rather than re-deriving it

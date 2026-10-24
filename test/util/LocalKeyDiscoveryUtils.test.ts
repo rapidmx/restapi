@@ -53,6 +53,20 @@ describe("LocalKeyDiscoveryUtils", () => {
             expect(vaults.find.mock.calls[0][0]).toEqual({ mailboxUid: "" });
         });
 
+        it("lists active keys first, and leaves OpenPGP certificates out when asked to", async () => {
+            const vaults = fakeRepo([]);
+            const now = 1_000;
+            const keys = [
+                { publicKey: "a", type: "x509", useType: "encrypt", fingerprint: "retired", notBefore: 0, notAfter: 5_000, revokedAt: 10 },
+                { publicKey: "b", type: "x509", useType: "encrypt", fingerprint: "expired", notBefore: 0, notAfter: 500 },
+                { publicKey: "c", type: "openpgp", useType: "encrypt", fingerprint: "pgp", notBefore: 0, notAfter: 5_000 },
+                { publicKey: "d", type: "x509", useType: "encrypt", fingerprint: "current", notBefore: 0, notAfter: 5_000 },
+            ];
+            const box = { uid: "m", primarySmtpAddress: "bob@example.com", keys };
+            expect((await buildKeyDiscoveryResponse(vaults as any, box as any, true, now)).keys.map((k) => k.fingerprint)).toEqual(["pgp", "current", "retired", "expired"]);
+            expect((await buildKeyDiscoveryResponse(vaults as any, box as any, false, now)).keys.map((k) => k.fingerprint)).toEqual(["current", "retired", "expired"]);
+        });
+
         it("answers a mailbox's keys and preference, with escrow only when its vault holds an escrow wrap", async () => {
             const plain = fakeRepo([{ mailboxUid: "bob@example.com", masterKeyWraps: [{ method: "password" }] }]);
             const escrowed = fakeRepo([{ mailboxUid: "bob@example.com", masterKeyWraps: [{ method: "password" }, { method: "escrow" }] }]);

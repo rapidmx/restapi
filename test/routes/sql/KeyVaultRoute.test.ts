@@ -16,7 +16,10 @@ import { KeyVaultSQL } from "../../../src/models/sql/KeyVaultSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { FakeEncryptionCertificateAuthority, generateTestCsr, registerTestDoubles } from "../../testDoubles.js";
-import { sharedZeroAccessKeySuite } from "../sharedZeroAccessKeySuite.js";
+import { sharedZeroAccessKeySuite, type SharedZeroAccessKeySuiteContext } from "../sharedZeroAccessKeySuite.js";
+import { openPgpEnrollSuite } from "../openPgpEnrollSuite.js";
+import { ENCRYPTION_POLICY_UID } from "../../../src/zeroaccess/ZeroAccessResolver.js";
+import { EncryptionPolicySQL } from "../../../src/models/sql/EncryptionPolicySQL.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -1130,7 +1133,7 @@ describe("Route:KeyVaultSQL Tests", () => {
         });
     });
 
-    sharedZeroAccessKeySuite({
+    const sharedCtx: SharedZeroAccessKeySuiteContext = {
         app: () => server.getApplication(),
         baseUrl,
         tokenFor: (uid) => JWTUtils.createTokenSync(config.get("auth"), { uid, roles: [], elevated: Date.now() } as any),
@@ -1169,5 +1172,16 @@ describe("Route:KeyVaultSQL Tests", () => {
                     requiredHolders: 1,
                 }),
             ),
+    };
+    sharedZeroAccessKeySuite(sharedCtx);
+    openPgpEnrollSuite({
+        ...sharedCtx,
+        setOpenPgpAllowed: async (allowed) => {
+            const repo = (objectFactory.getInstance(ConnectionManager)!.connections.get("sql") as any).getRepository(EncryptionPolicySQL);
+            await repo.clear();
+            if (allowed !== undefined) {
+                await repo.save(new EncryptionPolicySQL({ uid: ENCRYPTION_POLICY_UID, allowOpenPgp: allowed }));
+            }
+        },
     });
 });

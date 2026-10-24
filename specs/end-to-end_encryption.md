@@ -17,11 +17,13 @@ The goal is for RapidMX to be the first mail system to offer true end-to-end enc
 
 ### Message Format
 
-RapidMX MUST use **S/MIME (CMS)** as the on-the-wire message format for both signatures and encryption.
+RapidMX MUST use **S/MIME (CMS)** as its own on-the-wire message format for both signatures and encryption, and MUST prefer it whenever a recipient can receive it.
 
 This is a deliberate choice over OpenPGP. S/MIME is natively supported by Outlook for Windows, Outlook mobile, Apple Mail and Exchange ActiveSync; OpenPGP requires a COM add-in in Outlook, which the new Outlook for Windows does not support at all, and has no implementation on Outlook mobile. Because RapidMX commits to supporting existing clients, encrypted mail MUST remain readable by them.
 
-All key material described in this document is therefore X.509.
+**OpenPGP is supported as a second format, for interoperability only** — with Proton Mail, Thunderbird and other OpenPGP users, who cannot receive S/MIME. See *OpenPGP Interoperability* below. It never replaces S/MIME between RapidMX users or for a recipient with an S/MIME certificate.
+
+Key material in this document is X.509 unless it is explicitly an OpenPGP certificate.
 
 **Certificate issuance is two-tier:**
 
@@ -31,6 +33,29 @@ All key material described in this document is therefore X.509.
 Public enrolment MUST be automated. RFC 8823 defines an ACME `email-reply-00` challenge for S/MIME issuance, and the CA/Browser Forum S/MIME Baseline Requirements permit it as a mailbox-control validation method. Certificate lifetimes are capped at 825 days under those requirements and are shortening, so unattended reissue is a launch requirement, not a later feature.
 
 > **Non-goal:** forward secrecy. Ratcheting protocols (MLS, Signal) derive their strength from deleting old keys, which is incompatible with a mailbox users expect to keep and search for a decade.
+
+### OpenPGP Interoperability
+
+Each RapidMX mailbox also has an **OpenPGP certificate**, so OpenPGP users can encrypt to it and verify its signatures. Server administrators MAY turn this off ("Allow OpenPGP", `EncryptionPolicy.allowOpenPgp`, default on); S/MIME is unaffected.
+
+**Keys.**
+- The client generates a **v6 (RFC 9580)** key: an Ed25519 primary key (certification and signing) with an X25519 encryption subkey, and one user ID, the mailbox's primary address. v4 keys from correspondents MUST still be read, encrypted to and verified.
+- Its secret key is sealed under MK like every other private key (AAD purpose `openpgp-private-key`, `WrappedPrivateKey.type: "openpgp"`), escrowed exactly like the encryption key, and released by escrow with it.
+- There is no CA: the key is self-certified and enrolled with `POST /:id/keyvault/keys` (`type: "openpgp"`). The server checks it (it parses, is valid now, its self-signatures verify, a user ID names the address, it can encrypt) and never issues anything.
+- An OpenPGP certificate both encrypts and signs, so it is one `PublicKey` (`type: "openpgp"`, `useType: "encrypt"`) whose pin covers signature verification too. Its fingerprint is the primary key's (64 hex characters for v6, 40 for v4).
+- On rotation, the old key SHOULD certify the new one's user ID, which lets correspondents replace the pinned key automatically (below).
+
+**Pinning.** Keys are pinned per **slot** — `useType` and format — so a contact's S/MIME certificates and its OpenPGP certificate are pinned side by side and never replace each other. TOFU, key conflicts, rejection and anti-downgrade apply to each slot as for X.509. The automatic replacement rule's OpenPGP form: the pinned key is expired or revoked, and the new key's user ID for the address carries a certification by the pinned key.
+
+**Publication and discovery.**
+- The RapidMX discovery endpoint (`/.well-known/rapidmx/keys/:hash`) publishes the OpenPGP certificate alongside the S/MIME certificates, so a RapidMX peer learns both in one lookup, with the encryption preference and the escrow disclosure that OpenPGP's own mechanisms lack. Active keys are listed first.
+- Web Key Directory (WKD, both the advanced and the direct method) publishes it to every other OpenPGP implementation, and is how Proton Mail finds it.
+- An `Autocrypt` header carries it on outgoing mail, next to `RapidMX-Key`, and MUST be DKIM-oversigned the same way.
+- For a recipient outside RapidMX, the server looks it up with WKD and from DKIM-aligned `Autocrypt` headers of mail it received. A key attached to a signed message is pinned only when the user confirms it. Public keyservers are not consulted (they reveal who users write to).
+
+**Format choice.** For each recipient, the client uses S/MIME when the recipient has a usable S/MIME encryption certificate, and OpenPGP only when they have an OpenPGP certificate and no S/MIME one. A message whose recipients need both formats is sent as **one encrypted copy per format**, each encrypting to every recipient of that format (and to the sender). A plaintext copy is never made.
+
+**Message format.** PGP/MIME (RFC 3156) with protected headers: the encrypted part carries the real `Subject`, the outer one is `[...]`, as for S/MIME. Inline OpenPGP and cleartext signatures are read, never sent. The server treats PGP/MIME and inline OpenPGP mail as encrypted (no preview, no content indexing, no body rules), and seals it at rest like any other mail when zero-access encryption is on.
 
 ### Scoping Principle
 
@@ -670,6 +695,7 @@ These indicators also serve the enablement migration: a user who enables E2E aft
 | 13 | Zero-access encryption at rest | Adopted. A server-wide "Allow zero-access encryption" setting (administrator, default on) and a per-mailbox "Enable zero-access encryption" setting (owner only, default on). Covers the mail that can never be end-to-end encrypted. Specified in the search design document, which owns the delivery-path ordering. |
 | 14 | Zero-access vs. E2EE in the UI | Separate indicator states. A zero-access message MUST NOT be described as end-to-end encrypted. |
 | 15 | Search index key | None. The index is encrypted to a dedicated zero-access public key — a third keypair whose private key is wrapped under MK — because the server must write the index at delivery and cannot use a symmetric key. Old zero-access keys are retained on rotation, so nothing is re-encrypted. |
+| 16 | OpenPGP | Supported as a second format, for interoperability with OpenPGP users (Proton Mail and others) only. S/MIME stays RapidMX's own format and is preferred for any recipient that can receive it. Every mailbox gets a self-certified v6 OpenPGP key, published on the RapidMX discovery endpoint, over WKD and in an `Autocrypt` header. Recipients that need both formats get one encrypted copy each; never a plaintext copy. No public keyservers. |
 
 ## Deferred
 

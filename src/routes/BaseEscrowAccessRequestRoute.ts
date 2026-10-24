@@ -58,7 +58,8 @@ const MATTER_PAGE_SIZE = 500;
  */
 export interface EscrowAccessMaterial {
     masterKeyWraps: MasterKeyWrap[];
-    /** The wrapped private keys of `useType` `zero-access` and `encrypt`, current and retained. */
+    /** The wrapped private keys of `useType` `zero-access` and `encrypt`, current and retained - including the mailbox's OpenPGP
+     * secret keys (`type: "openpgp"`: an OpenPGP transferable secret key rather than PKCS#8, sealed the same way). */
     wrappedKeys: WrappedPrivateKey[];
     /** A mailbox without an owner, which has no master key: its zero-access private keys wrapped straight to this matter's escrow scope
      * certificate (`KeyVault.zeroAccessEscrowWraps`). Empty for a mailbox with an owner. */

@@ -52,6 +52,12 @@ export class EncryptionPolicySQL extends BaseEntity implements EncryptionPolicy 
     @Nullable
     public allowZeroAccess?: boolean = undefined;
 
+    // Unset falls back to `mail:encryption:openpgp_allowed`.
+    @Column({ nullable: true })
+    @Description("Whether mailboxes on this server may enroll and publish OpenPGP keys. Unset uses the server default.")
+    @Nullable
+    public allowOpenPgp?: boolean = undefined;
+
     constructor(other?: Partial<EncryptionPolicySQL>) {
         super(other);
 
@@ -60,6 +66,7 @@ export class EncryptionPolicySQL extends BaseEntity implements EncryptionPolicy 
             this.encryptFederated = other.encryptFederated !== undefined ? other.encryptFederated : this.encryptFederated;
             this.encryptExternal = other.encryptExternal !== undefined ? other.encryptExternal : this.encryptExternal;
             this.allowZeroAccess = "allowZeroAccess" in other ? other.allowZeroAccess : this.allowZeroAccess;
+            this.allowOpenPgp = "allowOpenPgp" in other ? other.allowOpenPgp : this.allowOpenPgp;
         }
     }
 }

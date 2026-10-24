@@ -8,6 +8,7 @@ import { ApiErrors } from "@rapidrest/service-core";
 import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { type Mailbox, type MessageReceiptEntry, type PublicKey, SpamVerdict } from "../models/types.js";
+import { isOpenPgpKey } from "./OpenPgpKeyUtils.js";
 import { type MailSendContext, publishTransportOutcome } from "../events/MailEventStream.js";
 import { MailRelayError, type MailRelayFailureDetails, relayFailureDetails } from "../transport/TransportResultUtils.js";
 import { normalizeAddress } from "./AddressUtils.js";
@@ -291,9 +292,10 @@ export async function prepareOutboundMime(args: {
     // Announces the sending mailbox's current encryption key (the Autocrypt-style opportunistic-discovery half of the protocol).
     // `?? []`: defense in depth against a legacy row whose SQL `keys` column was backfilled to `null` rather than the column's
     // own default - the documented "SQL returns null, not undefined, for an unset column" hazard.
-    // With several active ones (legacy duplicates), the newest - the one `revokeInactiveKeys()` and the clients keep.
+    // With several active ones (legacy duplicates), the newest - the one `revokeInactiveKeys()` and the clients keep. Only an
+    // S/MIME certificate: the header's `type=x509` key is what a RapidMX peer encrypts to, the format it prefers.
     const activeEncryptKey: PublicKey | undefined = (mailbox?.keys ?? [])
-        .filter((k) => k.useType === "encrypt" && !k.revokedAt && k.notAfter > Date.now())
+        .filter((k) => k.useType === "encrypt" && !isOpenPgpKey(k) && !k.revokedAt && k.notAfter > Date.now())
         .reduce<PublicKey | undefined>((newest, k) => (newest === undefined || k.notBefore > newest.notBefore ? k : newest), undefined);
     if (activeEncryptKey) {
         raw = prependHeaders(raw, [
