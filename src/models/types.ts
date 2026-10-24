@@ -1152,6 +1152,12 @@ export interface IndexWeekEntries {
     latestEntryAt: string;
     /** The week has closed and its grace period has passed, so a client may compact it. */
     compactable: boolean;
+    /** When the week becomes (or became) compactable (ISO 8601): its end plus the grace period. Clients stagger compaction from
+     * this by platform - desktop first, then web, then mobile (`specs/search.md` §8 *Who compacts*). */
+    compactableAt: string;
+    /** The total size of the week's pending sealed entries, in bytes of base64 - with the week's current segment's `bytes`, about
+     * what compacting it downloads and uploads. A mobile client declines a week above its limit. */
+    pendingBytes: number;
 }
 
 /** `GET /mail/mailboxes/:id/search-index/manifest`. */

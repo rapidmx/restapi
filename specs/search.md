@@ -357,7 +357,7 @@ Source A is also **the authority on current state**. See *Mutations* below.
 The content index for all zero-access mail.
 
 - **Index entries.** At delivery the server writes one **sealed index entry** per message: the extracted subject, body text, attachment text and envelope fields, as a small record encrypted to the mailbox's zero-access public key. The server never holds an index it can read after the delivery request completes.
-- **Segments.** Once a week has closed, the first unlocked client device **compacts** that week's entries into a **SQLite FTS5 database file**, encrypts it to the same public key, and uploads it. Every other device then downloads that one file instead of the week's individual entries.
+- **Segments.** Once a week has closed, an unlocked client device **compacts** that week's entries into a **SQLite FTS5 database file**, encrypts it to the same public key, and uploads it. Every other device then downloads that one file instead of the week's individual entries.
 
 The server cannot build or update a segment itself: appending to a segment requires reading it, and a segment the server can read is a plaintext index at rest. Splitting the work this way keeps every expensive step on the server while the plaintext is legitimately in hand, and leaves the client only a cheap insert of already-extracted text.
 
@@ -387,6 +387,16 @@ This unification is what retires the previous design's server-assisted candidate
 A closed week becomes eligible for compaction a configurable grace period (default 24 hours) after it ends, to absorb delayed delivery. Entries that arrive in a week after it has been compacted wait for the next compaction, which produces a new **generation** of that week's segment. Compaction is a compare-and-swap on the generation, and the upload names the entries it folded in. Two devices racing to compact the same week therefore cannot lose entries: the loser re-reads the manifest, and an entry that arrived while a compaction was being built is not in its list, so it stays pending for the next generation. After a successful upload the server deletes exactly the folded entries and the previous generation. The server refuses a segment that is not CMS `EnvelopedData` addressed to one of the mailbox's zero-access certificates, so it never stores what could be a readable index.
 
 A week that no client has compacted yet is still fully searchable from its entries; compaction is an optimisation and MUST NOT be required for correctness.
+
+**Who compacts.** Compaction downloads a week's entries and its current segment, builds the new segment and uploads it — exactly the cost this design keeps off phones. Clients therefore take a week in a preference order, staggered from the week's `compactableAt`, and the generation compare-and-swap settles any overlap:
+
+| Platform | Takes a week | Declines |
+|---|---|---|
+| Desktop (the native app on a computer) | At once | Never |
+| Web (a browser on a computer) | 6 hours after `compactableAt` | Never |
+| Mobile (the native app on a phone or tablet, or a phone browser) | 24 hours after `compactableAt` | A week whose `pendingBytes` plus its current segment's `bytes` exceed 5 MB, and any week while on a cellular or data-saver connection |
+
+A user who has a desktop or web client signed in therefore never has a phone compact. Someone who uses only a phone still gets small weeks compacted, a day later. A large week stays as entries, which costs nothing but a longer live-tail read.
 
 ### The Live Tail
 
@@ -595,6 +605,10 @@ export interface IndexWeekEntries {
     latestEntryAt: string;
     /** True once the week has closed and its grace period has elapsed, so a client may compact it. */
     compactable: boolean;
+    /** When it becomes (or became) compactable (ISO 8601) - the start of the platform stagger under *Who compacts*. */
+    compactableAt: string;
+    /** Size of the week's pending sealed entries (bytes of base64). */
+    pendingBytes: number;
 }
 
 export interface SegmentManifest {

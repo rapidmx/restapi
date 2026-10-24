@@ -40,6 +40,8 @@ export function isoWeekStart(weekId: string): Date | undefined {
 export interface PendingWeek {
     weekId: string;
     count: number;
+    /** The total length of their sealed content (base64), about what a client downloads to compact the week. */
+    bytes: number;
     /** When the newest of them was written. */
     latestEntryAt: Date;
 }
@@ -55,18 +57,19 @@ export async function pendingEntriesByWeek(entryRepo: RepoUtils<any>, mailboxUid
             ? await repo
                   .aggregate([
                       { $match: { mailboxUid } },
-                      { $group: { _id: "$weekId", count: { $sum: 1 }, latest: { $max: "$dateCreated" } } },
+                      { $group: { _id: "$weekId", count: { $sum: 1 }, bytes: { $sum: { $strLenBytes: "$sealed" } }, latest: { $max: "$dateCreated" } } },
                   ])
                   .toArray()
             : await repo
                   .createQueryBuilder("e")
                   .select("e.weekId", "_id")
                   .addSelect("COUNT(*)", "count")
+                  .addSelect("SUM(LENGTH(e.sealed))", "bytes")
                   .addSelect("MAX(e.dateCreated)", "latest")
                   .where("e.mailboxUid = :mailboxUid", { mailboxUid })
                   .groupBy("e.weekId")
                   .getRawMany();
     return rows
-        .map((row) => ({ weekId: String(row._id), count: Number(row.count), latestEntryAt: new Date(row.latest) }))
+        .map((row) => ({ weekId: String(row._id), count: Number(row.count), bytes: Number(row.bytes ?? 0), latestEntryAt: new Date(row.latest) }))
         .sort((a, b) => a.weekId.localeCompare(b.weekId));
 }

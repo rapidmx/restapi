@@ -135,10 +135,15 @@ export abstract class BaseZeroAccessIndexRoute<M extends Mailbox> {
         }
     }
 
+    /** When `weekId` becomes compactable: its end plus the compaction grace period (epoch ms; `NaN` for a malformed week). */
+    private compactableAt(weekId: string): number {
+        const start: Date | undefined = isoWeekStart(weekId);
+        return start ? start.getTime() + 7 * 86_400_000 + this.compactionGraceHours * 3_600_000 : NaN;
+    }
+
     /** Whether `weekId` has ended and its compaction grace period has passed. */
     private compactable(weekId: string, now: number = Date.now()): boolean {
-        const start: Date | undefined = isoWeekStart(weekId);
-        return !!start && start.getTime() + 7 * 86_400_000 + this.compactionGraceHours * 3_600_000 <= now;
+        return this.compactableAt(weekId) <= now;
     }
 
     private static toIndexSegment(segment: ZeroAccessIndexSegment): IndexSegment {
@@ -173,6 +178,8 @@ export abstract class BaseZeroAccessIndexRoute<M extends Mailbox> {
                 pendingEntries: week.count,
                 latestEntryAt: week.latestEntryAt.toISOString(),
                 compactable: this.compactable(week.weekId, now),
+                compactableAt: new Date(this.compactableAt(week.weekId)).toISOString(),
+                pendingBytes: week.bytes,
             })),
         };
     }

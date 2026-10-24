@@ -87,7 +87,7 @@ export function zeroAccessIndexSuite(ctx: ZeroAccessIndexSuiteContext): void {
         it("lists no segments and counts the pending entries per week, marking only a closed week compactable", async () => {
             const { mailbox } = await setup();
             await entry(mailbox, closedWeek);
-            await entry(mailbox, closedWeek);
+            await entry(mailbox, closedWeek, { sealed: "c2VhbGVkIGxvbmdlcg==" });
             await entry(mailbox, currentWeek);
 
             const result = await request(ctx.app()).get(url(mailbox, "/manifest")).set("Authorization", auth());
@@ -95,9 +95,14 @@ export function zeroAccessIndexSuite(ctx: ZeroAccessIndexSuiteContext): void {
             expect(result.status, JSON.stringify(result.body)).toBe(200);
             expect(result.body.segments).toEqual([]);
             expect(result.body.weeks).toEqual([
-                expect.objectContaining({ weekId: closedWeek, pendingEntries: 2, compactable: true }),
-                expect.objectContaining({ weekId: currentWeek, pendingEntries: 1, compactable: false }),
+                expect.objectContaining({ weekId: closedWeek, pendingEntries: 2, compactable: true, pendingBytes: 8 + 20 }),
+                expect.objectContaining({ weekId: currentWeek, pendingEntries: 1, compactable: false, pendingBytes: 8 }),
             ]);
+            // A week becomes compactable when it ends plus the grace period: in the past for the closed week, ahead for this one.
+            const [closed, current] = result.body.weeks.map((week: any) => Date.parse(week.compactableAt));
+            expect(closed).toBeLessThan(Date.now());
+            expect(current).toBeGreaterThan(Date.now());
+            expect(current - closed).toBe(3 * WEEK_MS);
         });
 
         it("refuses everyone but the owner, and a mailbox that doesn't exist", async () => {

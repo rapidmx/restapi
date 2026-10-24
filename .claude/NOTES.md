@@ -4481,3 +4481,9 @@ Phase 1 (restapi): the key model.
 - `Message.envelopeRecipients?: string[]` (Mongo and SQL columns, nullable) restricts relay delivery. `MailSendUtils.envelopeRecipientsOf()` keeps only addresses that are also in `recipients` (case-insensitive), so the field can narrow delivery but never add an address. Empty or absent means every recipient.
 - Used by `BaseMessageRoute` send and recall, and by `ScheduledSendJob` (relay plus receipt seeding).
 - The server's `assemble-raw` sets it from the client's `deliverTo`.
+
+### 2026-10-24: Who compacts a week (JP: keep compaction off phones)
+- The manifest's `IndexWeekEntries` gains `compactableAt` (week end plus `compaction_grace_hours`, ISO) and `pendingBytes`.
+  - `pendingBytes` is the summed length of the pending entries' base64 `sealed`: `$strLenBytes` on Mongo, `SUM(LENGTH())` on SQL. It comes from the same grouped query, so no entry is loaded.
+- Clients stagger from `compactableAt`: desktop at once, web after 6 h, mobile after 24 h. Mobile also declines above 5 MB (pending plus current segment) and on cellular or data saver. Spec: `specs/search.md` §8 *Who compacts*.
+- The server enforces nothing new: the generation compare-and-swap already settles overlap, and the stagger is a client courtesy.
