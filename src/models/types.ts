@@ -1755,6 +1755,14 @@ export interface Contact extends RecoverableBaseEntity {
      * judge a key change's plausibility (e.g. "first seen 3 years ago" vs. "first seen yesterday"). */
     keysFirstSeen?: number;
 
+    /** The protected details, sealed field by field to the mailbox's zero-access key while zero-access covers contacts
+     * (`zeroaccess/ZeroAccessFieldSealer.ts`): `displayName` then shows the first email address, `emails` keeps the addresses, the other
+     * protected fields are empty. Written by the server only. */
+    sealedFields?: Record<string, string> | null;
+
+    /** The photo blob (`photoBlobKey`) is sealed to the mailbox's zero-access key: served as stored, opened by the client. Server-written. */
+    photoSealed?: boolean | null;
+
     /** The format the user chose for this contact ("Preferred format"), overriding what the address advertises and what was
      * observed. Absent: automatic. */
     preferredFormat?: EndToEndFormat;

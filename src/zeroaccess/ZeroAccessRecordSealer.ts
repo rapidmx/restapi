@@ -6,7 +6,7 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { ACLUtils, type ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { Mailbox, ZeroAccessDataType } from "../models/types.js";
 import { PROTECTED_TEXT, type ProtectedField, sealFieldsOnWrite } from "./ZeroAccessFieldSealer.js";
-import { type ZeroAccessMailbox, ZeroAccessResolver } from "./ZeroAccessResolver.js";
+import { type ZeroAccessMailbox, ZeroAccessResolver, type ZeroAccessTarget } from "./ZeroAccessResolver.js";
 const { Config, Inject } = ObjectDecorators;
 
 /** What a protected task's title shows while it is sealed. */
@@ -18,9 +18,31 @@ export const TASK_PROTECTED_FIELDS: readonly ProtectedField[] = [
     { name: "body", placeholder: () => null },
 ];
 
+/** What a protected contact's name shows when it has no email address to show instead. */
+export const PROTECTED_CONTACT_NAME = "Protected contact";
+
+/**
+ * A contact's protected fields (`specs/search.md` §3 *What It Covers*): everything but its email addresses, which the server needs to
+ * deliver mail and to find the contact's encryption keys. The name shows the first address; the email list is sealed whole (its labels
+ * are protected) and its readable copy keeps every address, labelled "other".
+ */
+export const CONTACT_PROTECTED_FIELDS: readonly ProtectedField[] = [
+    { name: "displayName", placeholder: (contact) => contact.emails?.[0]?.address || PROTECTED_CONTACT_NAME },
+    { name: "givenName", placeholder: () => null },
+    { name: "surname", placeholder: () => null },
+    { name: "company", placeholder: () => null },
+    { name: "jobTitle", placeholder: () => null },
+    { name: "notes", placeholder: () => null },
+    { name: "phones", placeholder: () => [] },
+    { name: "addresses", placeholder: () => [] },
+    { name: "categories", placeholder: () => [] },
+    { name: "emails", placeholder: (contact) => (contact.emails ?? []).map((email: { address: string }) => ({ address: email.address, type: "other" })) },
+];
+
 /** The protected fields of each data type that is sealed field by field. Mail is sealed whole (`ZeroAccessWriter`). */
 export const PROTECTED_FIELDS: Readonly<Partial<Record<ZeroAccessDataType, readonly ProtectedField[]>>> = {
     tasks: TASK_PROTECTED_FIELDS,
+    contacts: CONTACT_PROTECTED_FIELDS,
 };
 
 /** Re-exported so writers outside restapi (activesync, mapi) reach the placeholder without importing the field sealer. */
@@ -58,10 +80,12 @@ export class ZeroAccessRecordSealer {
         if (!fields) {
             return;
         }
-        const target = mailbox
-            ? await new ZeroAccessResolver(this.policyRepo, this.aclUtils, this.allowedDefault, this.trustedRoles).target(mailbox, type)
-            : undefined;
-        await sealFieldsOnWrite(patch, existing, fields, target);
+        await sealFieldsOnWrite(patch, existing, fields, mailbox ? await this.target(type, mailbox) : undefined);
+    }
+
+    /** What `type` content of `mailbox` is sealed to now - its active zero-access key - or `undefined` when that type isn't protected. */
+    public target(type: ZeroAccessDataType, mailbox: Pick<Mailbox, "uid"> & ZeroAccessMailbox): Promise<ZeroAccessTarget | undefined> {
+        return new ZeroAccessResolver(this.policyRepo, this.aclUtils, this.allowedDefault, this.trustedRoles).target(mailbox, type);
     }
 }
 

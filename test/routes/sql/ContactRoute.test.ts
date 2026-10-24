@@ -21,6 +21,7 @@ import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
 import { ContactAddressKind, FolderType } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { openSealedField, testZeroAccessKey } from "../../zeroAccessTestKeys.js";
 
 describe("Route:ContactSQL Tests", () => {
     const logger = Logger();
@@ -455,5 +456,71 @@ describe("Route:ContactSQL Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.headers["content-length"]).toBe("0");
+    });
+
+    describe("zero-access encryption of contacts", () => {
+        const protect = async (types: any) => {
+            const mailbox: any = await createMailbox(owner.uid);
+            const za = await testZeroAccessKey();
+            mailbox.zeroAccessKeys = [za.key];
+            mailbox.zeroAccessTypes = types;
+            await mailboxRepo.save(mailbox);
+            const folder = await createFolder(mailbox.uid);
+            return { mailbox, folder, za };
+        };
+        const stored = async (uid: string): Promise<any> => await contactRepo.findOne({ where: { uid } });
+        const CARD = {
+            displayName: "CANARY Jane Doe",
+            givenName: "CANARY-G",
+            surname: "CANARY-S",
+            company: "CANARY Corp",
+            jobTitle: "CANARY Counsel",
+            notes: "CANARY notes",
+            categories: ["CANARY-cat"],
+            emails: [{ address: "jane@example.com", type: "work" }],
+            phones: [{ phoneNumber: "+1 555 0100", type: "work" }],
+            addresses: [{ street: "CANARY 1 Main St", city: "Springfield", type: "home" }],
+        };
+
+        it("Seals everything but the email addresses, showing the first address as the name, and keeps the addresses readable", async () => {
+            const { mailbox, folder, za } = await protect({ contacts: true });
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ mailboxUid: mailbox.uid, folderUid: folder.uid, ...CARD, sealedFields: { displayName: "forged" } });
+
+            expect(result.status, JSON.stringify(result.body)).toBe(200);
+            const row = await stored(result.body.uid);
+            expect(row.displayName).toBe("jane@example.com");
+            expect(row.emails).toEqual([{ address: "jane@example.com", type: "other" }]);
+            expect(row.phones).toEqual([]);
+            expect(row.company ?? null).toBeNull();
+            expect(JSON.stringify(row)).not.toContain("CANARY");
+            expect(await openSealedField(row.sealedFields.displayName, za)).toBe("CANARY Jane Doe");
+            expect(await openSealedField(row.sealedFields.emails, za)).toEqual([{ address: "jane@example.com", type: "work" }]);
+            expect(await openSealedField(row.sealedFields.addresses, za)).toEqual(CARD.addresses);
+
+            // A partial update (the star) leaves every sealed field alone; the name sent back as shown is ignored.
+            const starred = await request(server.getApplication())
+                .put(`${baseUrl}/${row.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: row.uid, version: result.body.version, favorite: true, displayName: "jane@example.com" });
+            expect(starred.status, JSON.stringify(starred.body)).toBe(200);
+            const after = await stored(row.uid);
+            expect(after.favorite).toBe(true);
+            expect(after.sealedFields).toEqual(row.sealedFields);
+        });
+
+        it("Stores a contact readable while contacts aren't protected", async () => {
+            const { mailbox, folder } = await protect({ contacts: false });
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ mailboxUid: mailbox.uid, folderUid: folder.uid, ...CARD });
+            expect(result.status).toBe(200);
+            const row = await stored(result.body.uid);
+            expect(row.displayName).toBe("CANARY Jane Doe");
+            expect(row.sealedFields ?? null).toBeNull();
+        });
     });
 });

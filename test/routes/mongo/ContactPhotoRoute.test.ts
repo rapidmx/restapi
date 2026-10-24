@@ -22,6 +22,7 @@ import { ContactAddressKind, FolderType } from "../../../src/models/types.js";
 import { CONTACT_PHOTO_MAX_BYTES } from "../../../src/routes/BaseContactRoute.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles, InMemoryBlobStore } from "../../testDoubles.js";
+import { openSealedField, testZeroAccessKey } from "../../zeroAccessTestKeys.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -598,5 +599,37 @@ describe("Route:ContactPhotoMongo Tests", () => {
         expect(await blobStore.exists(keys[0])).toBe(false);
         expect(await blobStore.exists(keys[1])).toBe(false);
         expect(await blobStore.exists(keys[2])).toBe(true);
+    });
+
+    describe("zero-access encryption of contact photos", () => {
+        it("Stores the photo of a protected contact sealed, serves it as opaque bytes, and a readable one otherwise", async () => {
+            const mailbox: any = await createMailbox(owner.uid);
+            const za = await testZeroAccessKey();
+            mailbox.zeroAccessKeys = [za.key];
+            mailbox.zeroAccessTypes = { contacts: true };
+            await mailboxRepo.save(mailbox);
+            const folder = await createFolder(mailbox.uid);
+            const contact = await createContact(mailbox.uid, folder.uid);
+
+            const put = await putPhoto(contact.uid, PNG, "image/png");
+            expect(put.status, JSON.stringify(put.body)).toBe(200);
+            expect(put.body.photoSealed).toBe(true);
+            const uid = contact.uid;
+            const row: any = await contactRepo.findOne({ uid } as any);
+            const blob: Buffer = await blobStore.get(row.photoBlobKey);
+            expect(blob.includes(Buffer.from("png-bytes"))).toBe(false);
+
+            const read = await getPhoto(contact.uid);
+            expect(read.status).toBe(200);
+            expect(read.headers["content-type"]).toBe("application/octet-stream");
+            expect(read.headers["content-length"]).toBe(String(blob.length));
+
+            mailbox.zeroAccessTypes = { contacts: false };
+            await mailboxRepo.save(mailbox);
+            const plain = await putPhoto(contact.uid, PNG, "image/png");
+            expect(plain.status).toBe(200);
+            expect(plain.body.photoSealed).toBe(false);
+            expect((await getPhoto(contact.uid)).headers["content-type"]).toBe("image/png");
+        });
     });
 });

@@ -153,6 +153,16 @@ export class ContactSQL extends RecoverableBaseEntity implements Contact {
     public preferredFormat?: EndToEndFormat;
 
     @Column({ type: "simple-json", nullable: true })
+    @Description("The protected details, sealed to the mailbox's zero-access key while zero-access covers contacts. Server-written.")
+    @Nullable
+    public sealedFields?: Record<string, string> | null;
+
+    @Column({ type: "boolean", nullable: true })
+    @Description("Whether the photo blob is sealed to the mailbox's zero-access key. Server-written.")
+    @Nullable
+    public photoSealed?: boolean | null;
+
+    @Column({ type: "simple-json", nullable: true })
     @Description("The end-to-end format this address was last seen using, and when (server-written).")
     @Nullable
     public observedFormat?: ObservedFormat;
@@ -201,6 +211,8 @@ export class ContactSQL extends RecoverableBaseEntity implements Contact {
             this.keys = "keys" in other ? other.keys : this.keys;
             this.keysFirstSeen = "keysFirstSeen" in other ? other.keysFirstSeen : this.keysFirstSeen;
             this.preferredFormat = "preferredFormat" in other ? other.preferredFormat : this.preferredFormat;
+            this.sealedFields = "sealedFields" in other ? other.sealedFields : this.sealedFields;
+            this.photoSealed = "photoSealed" in other ? other.photoSealed : this.photoSealed;
             this.observedFormat = "observedFormat" in other ? other.observedFormat : this.observedFormat;
             this.lastMessageSeen = "lastMessageSeen" in other ? other.lastMessageSeen : this.lastMessageSeen;
             this.keyConflicts = "keyConflicts" in other ? other.keyConflicts : this.keyConflicts;

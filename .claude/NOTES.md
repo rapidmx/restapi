@@ -4537,3 +4537,12 @@ Phase 1 (restapi): the key model.
   - `TaskMongo`/`TaskSQL.sealedFields` is a json column.
   - activesync `SyncCommand.sealDeviceWrite` seals device Adds and Changes.
   - MAPI only reads tasks: Outlook shows "Protected task".
+- (Phase 4) Contacts:
+  - `CONTACT_PROTECTED_FIELDS` seals displayName (placeholder: first email, else "Protected contact"), given/surname, company, jobTitle, notes, phones, addresses, categories and **emails**.
+    - Emails are sealed whole so their labels are protected. The readable placeholder keeps every address with type "other", so key lookup, Focused Inbox, suggestions and SQL `LIKE` matching still work.
+  - `BaseContactRoute` seals through `ZeroAccessRouteSealing`, the shared route helper `BaseTaskRoute` now uses too.
+  - Photos: `setPhoto` checks the image's type while it is in the request, then stores `sealToCertificate(raw)` when contacts are protected.
+    - The contact gets `photoSealed: true` (server-managed, stripped from bodies), and `getPhoto` serves the sealed bytes as `application/octet-stream`.
+    - SQL needs `type: "boolean"` for `boolean | null`.
+  - Server-created contacts are **not** sealed on creation: key contacts from lookup, trust and headers, and suggested contacts. They hold only an address and a mail-header name, which `Correspondent` keeps readable anyway, and the first user edit seals them. The spec says so.
+  - ActiveSync contact writes are sealed by `SyncCommand.sealDeviceWrite` once restapi exports contacts in `PROTECTED_FIELDS`.

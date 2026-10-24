@@ -10,3 +10,4 @@ export * from "./ZeroAccessIndexStore.js";
 export * from "./ZeroAccessWriter.js";
 export * from "./ZeroAccessFieldSealer.js";
 export * from "./ZeroAccessRecordSealer.js";
+export * from "./ZeroAccessRouteSealing.js";

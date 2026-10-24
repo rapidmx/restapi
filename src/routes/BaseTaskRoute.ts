@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
-import { ApiErrors, RepoUtils } from "@rapidrest/service-core";
-import type { Mailbox, Task } from "../models/types.js";
+import { ApiErrors } from "@rapidrest/service-core";
+import type { Task } from "../models/types.js";
 import { queryNamesFields } from "../util/CalendarEventUtils.js";
-import { newZeroAccessRecordSealer, TASK_PROTECTED_FIELDS, ZeroAccessRecordSealer } from "../zeroaccess/ZeroAccessRecordSealer.js";
+import { TASK_PROTECTED_FIELDS } from "../zeroaccess/ZeroAccessRecordSealer.js";
+import { ZeroAccessRouteSealing } from "../zeroaccess/ZeroAccessRouteSealing.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 const { Init } = ObjectDecorators;
 
@@ -22,39 +23,24 @@ export abstract class BaseTaskRoute<T extends Task> extends BaseScopedChildRoute
     protected abstract mailboxClass: any;
     protected abstract encryptionPolicyClass: any;
 
-    protected mailboxRepo?: RepoUtils<Mailbox & { version: number }>;
-    protected recordSealer?: ZeroAccessRecordSealer;
+    protected sealing?: ZeroAccessRouteSealing;
 
     @Init
     protected async initTaskSealing(): Promise<void> {
         if (!this._objectFactory) {
             throw new Error("objectFactory is not set.");
         }
-        if (!this.mailboxRepo && this.mailboxClass) {
-            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
-        }
-        this.recordSealer ??= await newZeroAccessRecordSealer(this._objectFactory, this.encryptionPolicyClass);
+        this.sealing ??= await ZeroAccessRouteSealing.create(this._objectFactory, "tasks", this.mailboxClass, this.encryptionPolicyClass);
     }
 
     protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
         await super.prepareCreate(obj, user);
-        await this.seal(obj, undefined);
+        await this.sealing?.seal(obj, undefined);
     }
 
     protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
         await super.prepareUpdate(obj, existing, user);
-        await this.seal(obj, existing);
-    }
-
-    /** Seals (or stores readable) `obj`'s title and notes for its mailbox; a client's own `sealedFields` is never kept. */
-    private async seal(obj: any, existing: T | undefined): Promise<void> {
-        if (!this.recordSealer) {
-            delete obj.sealedFields;
-            return;
-        }
-        const mailboxUid: string | undefined = existing?.mailboxUid ?? obj.mailboxUid;
-        const mailbox = mailboxUid ? await this.mailboxRepo?.findOne(mailboxUid, { ignoreACL: true }) : undefined;
-        await this.recordSealer.sealWrite("tasks", mailbox, obj, existing);
+        await this.sealing?.seal(obj, existing);
     }
 
     protected async assertQueryAllowed(query: any, scopeUid: string, effectiveUser: JWTUser | undefined): Promise<void> {

@@ -20,7 +20,9 @@ import { deleteBlobsIfUnreferenced } from "../util/BlobReferenceUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import { Contact } from "../models/types.js";
 import { isEndToEndFormat } from "../util/PreferredFormatUtils.js";
-const { Inject } = ObjectDecorators;
+import { ZeroAccessRouteSealing } from "../zeroaccess/ZeroAccessRouteSealing.js";
+import { sealToCertificate } from "../zeroaccess/ZeroAccessSealer.js";
+const { Init, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Delete, Get, Param, Post, Put, Query, RateLimit, Request, Response, User: AuthUser } = RouteDecorators;
 
@@ -123,15 +125,41 @@ function rejectDiscoveryManagedFields(obj: Partial<Contact>): void {
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChildRoute<T> {
-    /** `photoBlobKey` names a stored object; a client-chosen key would point this contact's photo at any blob (another
-     * mailbox's message body or attachment). Only `setPhoto()`/`deletePhoto()` (below) set it. */
-    protected readonly serverManagedFields: readonly string[] = ["photoBlobKey"];
+    /** The backend's `Mailbox` and `EncryptionPolicy` models, for zero-access sealing (`ZeroAccessRouteSealing`). */
+    protected abstract mailboxClass: any;
+    protected abstract encryptionPolicyClass: any;
+    protected sealing?: ZeroAccessRouteSealing;
 
-    /** `photoBlobKey` is dropped from every caller's body, a trusted one's included (the base class leaves those alone): a stored
-     * key is deleted with the contact (`afterPurge()`, the erasure job), so no body may be able to name another object's blob. */
+    /** `photoBlobKey` names a stored object; a client-chosen key would point this contact's photo at any blob (another
+     * mailbox's message body or attachment). Only `setPhoto()`/`deletePhoto()` (below) set it, and `photoSealed` with it. */
+    protected readonly serverManagedFields: readonly string[] = ["photoBlobKey", "photoSealed"];
+
+    /** `photoBlobKey` (and whether it is sealed) is dropped from every caller's body, a trusted one's included (the base class leaves
+     * those alone): a stored key is deleted with the contact (`afterPurge()`, the erasure job), so no body may be able to name another
+     * object's blob. */
     protected stripServerManagedFields(obj: any, user: JWTUser | undefined): void {
         delete obj.photoBlobKey;
+        delete obj.photoSealed;
         super.stripServerManagedFields(obj, user);
+    }
+
+    @Init
+    protected async initContactSealing(): Promise<void> {
+        if (!this._objectFactory) {
+            throw new Error("objectFactory is not set.");
+        }
+        this.sealing ??= await ZeroAccessRouteSealing.create(this._objectFactory, "contacts", this.mailboxClass, this.encryptionPolicyClass);
+    }
+
+    /** A contact's details are sealed while zero-access covers contacts (`specs/search.md` §3 *What It Covers*); its email addresses never. */
+    protected async prepareCreate(obj: any, user: JWTUser | undefined): Promise<void> {
+        await super.prepareCreate(obj, user);
+        await this.sealing?.seal(obj, undefined);
+    }
+
+    protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
+        await super.prepareUpdate(obj, existing, user);
+        await this.sealing?.seal(obj, existing);
     }
 
     @Inject("BlobStore")
@@ -217,6 +245,7 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
         user: JWTUser | undefined,
         version: number | undefined,
         key: string | null,
+        sealed: boolean = false,
     ): Promise<{ saved: T; previous: string | undefined }> {
         for (let attempt = 1; ; attempt++) {
             const existing: T = await this.findWritable(id, user);
@@ -229,7 +258,7 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
             }
             try {
                 const saved: T = await this.repoUtils!.update(
-                    { uid: existing.uid, version: (existing as any).version, photoBlobKey: key } as any,
+                    { uid: existing.uid, version: (existing as any).version, photoBlobKey: key, photoSealed: key ? sealed : null } as any,
                     existing,
                     { user, ignoreACL: true },
                 );
@@ -277,9 +306,12 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
         }
 
         const key: string = `${CONTACT_PHOTO_KEY_PREFIX}${existing.uid}/${crypto.randomUUID()}`;
-        await this.blobStore!.put(key, raw, { contentType: declared });
+        // While zero-access covers contacts the picture is stored sealed: checked above while in the request, never stored readable.
+        const certDer: Uint8Array | undefined = await this.sealing?.certificateFor(existing.mailboxUid);
+        const stored: Buffer = certDer ? await sealToCertificate(raw, certDer) : raw;
+        await this.blobStore!.put(key, stored, { contentType: certDer ? "application/octet-stream" : declared });
         try {
-            const { saved, previous } = await this.savePhotoKey(id, user, requested, key);
+            const { saved, previous } = await this.savePhotoKey(id, user, requested, key, !!certDer);
             await this.deletePhotoBlobs([previous]);
             return saved;
         } catch (err) {
@@ -325,8 +357,9 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
         /* v8 ignore stop */
-        // The type is what the bytes are (the upload was checked against them), never a client-supplied string.
-        const contentType: string | undefined = sniffContactPhotoType(content);
+        // The type is what the bytes are (the upload was checked against them), never a client-supplied string. A sealed picture is
+        // opaque bytes the client opens.
+        const contentType: string | undefined = existing.photoSealed ? "application/octet-stream" : sniffContactPhotoType(content);
         /* v8 ignore start -- only a blob replaced behind this route's back */
         if (!contentType) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
