@@ -108,11 +108,16 @@ const DETAIL_FIELDS: readonly string[] = [
 
 /** Whether a list `query` filters or sorts by a field holding an event's details (`title`, `location`, `description`, `attendees` ...). */
 export function queryNamesEventDetails(query: any): boolean {
+    return queryNamesFields(query, DETAIL_FIELDS);
+}
+
+/** Whether a list `query` filters or sorts by any of `fields` (a filter key, dotted or not, or a name anywhere in `sort`). */
+export function queryNamesFields(query: any, fields: readonly string[]): boolean {
     const names: Set<string> = new Set(Object.keys(query ?? {}).map((key: string) => key.split(".")[0]));
     for (const word of query?.sort === undefined ? [] : (JSON.stringify(query.sort).match(/[A-Za-z_]+/g) ?? [])) {
         names.add(word);
     }
-    return DETAIL_FIELDS.some((field: string) => names.has(field));
+    return fields.some((field: string) => names.has(field));
 }
 
 /**

@@ -422,6 +422,30 @@ describe("Route:KeyVaultSQL Tests", () => {
             expect(updatedMailbox?.zeroAccessKeys[0].fingerprint).toBe(result.body.wrappedKeys[0].fingerprint);
         });
 
+        it("Decides what the first zero-access key protects from the owner's devices: what a phone syncs off, the rest on.", async () => {
+            const enroll = async (mailbox: any) =>
+                request(server.getApplication())
+                    .post(`${baseUrl}/${mailbox.uid}/keyvault/keys`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .send({
+                        useType: "zero-access",
+                        csr: await generateTestCsr(mailbox.primarySmtpAddress),
+                        wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" },
+                        masterKeyWraps: [
+                            { method: "password", ciphertext: "mkct", nonce: "mkn", salt: "salt", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() },
+                        ],
+                    });
+            const plain: any = await createMailbox();
+            expect((await enroll(plain)).status).toBe(200);
+            expect(((await mailboxRepo.findOne({ where: { uid: plain.uid } })) as any)?.zeroAccessTypes).toEqual({ mail: true, calendar: true, contacts: true, tasks: true });
+
+            const mailbox: any = await createMailbox();
+            mailbox.syncClients = { activesync: { devices: [{ id: "d1", model: "iPhone", types: ["mail", "calendar", "contacts"], lastSeenAt: 1 }] } };
+            await mailboxRepo.save(mailbox);
+            expect((await enroll(mailbox)).status).toBe(200);
+            expect(((await mailboxRepo.findOne({ where: { uid: mailbox.uid } })) as any)?.zeroAccessTypes).toEqual({ mail: false, calendar: false, contacts: false, tasks: true });
+        });
+
         it("A second zero-access key supersedes the first on zeroAccessKeys only, leaving the published encryption key active.", async () => {
             const mailbox = await createMailbox();
             const enroll = (useType: string, masterKeyWraps?: any[]) =>
@@ -635,6 +659,8 @@ describe("Route:KeyVaultSQL Tests", () => {
             expect(entries).toHaveLength(1);
             expect(entries[0].details).toEqual({ keys });
             expect(entries[0].mailboxUid).toBe(mailbox.uid);
+            // A zero-access key went: phones and Outlook with it installed can read protected mail.
+            expect(((await mailboxRepo.findOne({ where: { uid: mailbox.uid } })) as any)?.zeroAccessKeysExportedAt).toBeGreaterThan(0);
         });
 
         it("Refuses a delegate, another user and an administrator (403).", async () => {

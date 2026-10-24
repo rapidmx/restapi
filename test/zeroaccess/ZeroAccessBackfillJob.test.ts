@@ -20,7 +20,7 @@ function job(options: { mailboxes?: any[]; messages?: any[]; writer?: any; updat
     Object.assign(instance, {
         logger,
         blobStore: { get: vi.fn().mockResolvedValue(Buffer.from("raw")), delete: vi.fn().mockResolvedValue(undefined) },
-        mailboxRepo: { find: vi.fn(async () => pages.shift() ?? []) },
+        mailboxRepo: { find: vi.fn(async () => pages.shift() ?? []), update: vi.fn(async (patch: any) => patch) },
         folderRepo: { find: vi.fn().mockResolvedValue([{ uid: "drafts", type: "drafts" }]) },
         messageRepo: {
             find: vi.fn(async (query: any) => (query.deleted ? [] : (options.messages ?? []))),
@@ -66,6 +66,23 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
 
         expect(sealRaw).toHaveBeenCalledTimes(2);
         expect(target.mock.calls.map(([mb]) => mb.uid)).toEqual(["off", "mb"]);
+    });
+
+    it("decides the data types a protected mailbox hasn't yet from its devices, keeping mail protected, and leaves the rest alone", async () => {
+        const phone = { activesync: { devices: [{ id: "d", types: ["mail", "contacts"], lastSeenAt: 1 }] } };
+        const decided = { mail: true, calendar: false, contacts: false, tasks: false };
+        const { instance } = job({
+            mailboxes: [
+                { uid: "old", version: 3, zeroAccessKeys: [{}], syncClients: phone },
+                { uid: "off", zeroAccessKeys: [{}], zeroAccessEnabled: false },
+                { uid: "decided", zeroAccessKeys: [{}], zeroAccessTypes: decided },
+            ],
+        });
+
+        await instance.run();
+
+        expect(instance.mailboxRepo.update).toHaveBeenCalledTimes(1);
+        expect(instance.mailboxRepo.update.mock.calls[0][0]).toEqual({ uid: "old", version: 3, zeroAccessTypes: { mail: true, calendar: true, contacts: false, tasks: true } });
     });
 
     it("leaves the rest of a mailbox when zero-access stops being active mid-run", async () => {

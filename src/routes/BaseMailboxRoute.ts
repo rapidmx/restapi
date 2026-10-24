@@ -19,6 +19,7 @@ import {
 } from "@rapidrest/service-core";
 import { AuditAction, DistributionList, EscrowScope, Mailbox, MailboxPolicy, Matter } from "../models/types.js";
 import { isEndToEndFormat } from "../util/PreferredFormatUtils.js";
+import { isZeroAccessDataType, settleZeroAccessTypes } from "../util/ZeroAccessUtils.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { AuditLogUtils, isNonOwnerAccess } from "../util/AuditLogUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS, hasMailAccess, isAdminScope, isTrustedUser, stripTrustedRoles } from "../util/MailAccessUtils.js";
@@ -133,6 +134,18 @@ function rejectServerManagedFields(obj: Record<string, unknown>): void {
     const preferFormat: unknown = (obj.encryptPreference as { preferFormat?: unknown } | null | undefined)?.preferFormat;
     if (preferFormat !== undefined && preferFormat !== null && !isEndToEndFormat(preferFormat)) {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'encryptPreference.preferFormat' must be \"smime\" or \"openpgp\".");
+    }
+    // Written by the activesync and mapi services and by recording a key export - a full-object round trip carries them, so they are
+    // dropped rather than refused.
+    delete obj.syncClients;
+    delete obj.zeroAccessKeysExportedAt;
+    const types: unknown = obj.zeroAccessTypes;
+    if (
+        types !== undefined &&
+        types !== null &&
+        (typeof types !== "object" || Array.isArray(types) || !Object.entries(types).every(([type, on]) => isZeroAccessDataType(type) && typeof on === "boolean"))
+    ) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'zeroAccessTypes' must map mail, calendar, contacts and tasks to booleans.");
     }
     if (obj.zeroAccessEnabled !== undefined && obj.zeroAccessEnabled !== null && typeof obj.zeroAccessEnabled !== "boolean") {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'zeroAccessEnabled' must be a boolean.");
@@ -1291,7 +1304,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * with update access would otherwise wipe the owner's published certificates (`keys: []`) from key discovery. */
     private async dropKeyFieldsOfNonOwner(id: string, obj: Record<string, any>, user: JWTUser | undefined): Promise<void> {
         // By presence, not value: a property write with no body carries the key with the value `undefined`, which a document store saves as null.
-        if (!("keys" in obj) && !("keyDiscoveryHash" in obj) && !("zeroAccessEnabled" in obj)) {
+        if (!("keys" in obj) && !("keyDiscoveryHash" in obj) && !("zeroAccessEnabled" in obj) && !("zeroAccessTypes" in obj)) {
             return;
         }
         const existing: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
@@ -1300,9 +1313,29 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
             delete obj.keys;
             delete obj.keyDiscoveryHash;
             // Zero-access is the owner's own protection against everybody else, delegates and administrators included
-            // (`specs/search.md` §3), so only the owner turns it off or on; anybody else's value is dropped silently, the same
-            // way a full-object round trip of the other key fields is.
+            // (`specs/search.md` §3), so only the owner turns it off or on, or chooses what it covers; anybody else's value is
+            // dropped silently, the same way a full-object round trip of the other key fields is.
             delete obj.zeroAccessEnabled;
+            delete obj.zeroAccessTypes;
+            return;
+        }
+        this.settleZeroAccessTypesOnChange(obj, existing!);
+    }
+
+    /**
+     * The owner's change to what zero-access covers (`specs/search.md` §3 *What It Covers*): a partial `zeroAccessTypes` is merged into
+     * the stored one, so `{ calendar: true }` changes only the calendar; and turning zero-access back on decides any type still
+     * undecided from the owner's devices, as a first activation does.
+     */
+    private settleZeroAccessTypesOnChange(obj: Record<string, any>, existing: T): void {
+        if (obj.zeroAccessTypes && typeof obj.zeroAccessTypes === "object") {
+            obj.zeroAccessTypes = { ...(existing.zeroAccessTypes ?? {}), ...obj.zeroAccessTypes };
+        }
+        if (obj.zeroAccessEnabled === true && existing.zeroAccessEnabled === false) {
+            const settled = settleZeroAccessTypes({ ...existing, zeroAccessTypes: obj.zeroAccessTypes ?? existing.zeroAccessTypes }, true);
+            if (settled) {
+                obj.zeroAccessTypes = settled;
+            }
         }
     }
 

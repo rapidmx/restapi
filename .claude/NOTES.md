@@ -4503,3 +4503,37 @@ Phase 1 (restapi): the key model.
   - Only a newer `Date` replaces an observation (`newerObservation`).
   - It is written only onto a contact the message touches anyway, never a new contact. `observedFormat` is discovery-managed, so the contact routes refuse it (400).
 - `Contact.preferredFormat` is user-writable (`smime`/`openpgp`/null, otherwise 400). The SQL column needs `type: "varchar"`, as every string-union column does; otherwise TypeORM sees `Object`.
+
+### 2026-10-24: Zero-access for calendar, contacts and tasks - Phases 0-1 (spec, per-type settings)
+- Plan: `C:\Users\caska\.claude\plans\zae-calendar-contacts-tasks.md`. Spec: `search.md` §3 *What It Covers* (per-type table, why email addresses stay readable, devices, defaults); §4's "contacts never" now says "never end-to-end".
+- JP's decisions:
+  - Per-type switches (mail/calendar/contacts/tasks), chosen by the user; there is no per-type admin control.
+  - Defaults follow devices: a type an ActiveSync device or Outlook syncs defaults to off. Mail stays on once `zeroAccessKeysExportedAt` is set.
+  - The user may still include everything; the UI says what breaks.
+  - The server seals on arrival.
+  - Invitations are sent at save time.
+- **Model (Mailbox):**
+  - `zeroAccessTypes`: owner-only. A partial PUT is merged (`settleZeroAccessTypesOnChange`). Validated against `isZeroAccessDataType` (400).
+  - `syncClients`: `{ activesync: { devices: [{ id, model, types, lastSeenAt }] }, mapi: { lastSeenAt } }`. Written by the activesync and mapi services; dropped from client bodies.
+  - `zeroAccessKeysExportedAt`: stamped by `POST keyvault/exports` when a zero-access key is listed; dropped from client bodies.
+- **`ZeroAccessUtils`:**
+  - `zeroAccessTypeIncluded`: an undecided type counts as mail on, the others off.
+  - `syncedDataTypes` (MAPI = all four), `defaultZeroAccessTypes`.
+  - `settleZeroAccessTypes(mailbox, activating)`: an undecided mail stays on unless `activating`, so settling never takes protection away from mail.
+  - `zeroAccessStatus(mailbox, ctx, type = "mail")` adds `type_not_included`. The resolver and writer `target(mailbox, type)` default to mail, so the mail writers are unchanged.
+- **Settling happens at:**
+  - the first zero-access key enrollment (`activating`);
+  - the owner turning `zeroAccessEnabled` back on (`activating`);
+  - `ZeroAccessBackfillJob` for already-active mailboxes (not activating; skips owner-disabled ones).
+- **Status:** calendar, contacts and tasks are not sealed yet (Phases 2-5). web-client exposes only the Mail switch until each type's protection lands (`ZERO_ACCESS_SUPPORTED_TYPES`).
+- (Phases 2-3) `zeroaccess/ZeroAccessFieldSealer.sealFieldsOnWrite` seals each protected field on its own (`sealedFields[name]` = CMS of the JSON value; the column holds a placeholder).
+  - A field missing from the patch is kept.
+  - A placeholder sent back unchanged (a phone round-trip) is dropped from the patch.
+  - Writing a field while its type isn't protected stores it readable and drops that field's sealed copy.
+  - A client's own `sealedFields` is always replaced.
+- `ZeroAccessRecordSealer.sealWrite(type, mailbox, patch, existing)` holds `PROTECTED_FIELDS` per type and resolves the target per type. It is exported for activesync and mapi.
+- Tasks:
+  - `BaseTaskRoute` seals `title` (placeholder "Protected task") and `body`, and 400s any filter or sort on them.
+  - `TaskMongo`/`TaskSQL.sealedFields` is a json column.
+  - activesync `SyncCommand.sealDeviceWrite` seals device Adds and Changes.
+  - MAPI only reads tasks: Outlook shows "Protected task".

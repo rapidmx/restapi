@@ -58,6 +58,11 @@ export class TaskMongo extends RecoverableBaseMongoEntity implements Task {
     public body?: string;
 
     @Column()
+    @Description("The protected title and notes, sealed to the mailbox's zero-access key while zero-access covers tasks. Server-written.")
+    @Nullable
+    public sealedFields?: Record<string, string> | null;
+
+    @Column()
     @Description("The date the task is due.")
     @Nullable
     public dueDate?: Date;
@@ -98,6 +103,7 @@ export class TaskMongo extends RecoverableBaseMongoEntity implements Task {
             this.folderUid = other.folderUid !== undefined ? other.folderUid : this.folderUid;
             this.title = other.title !== undefined ? other.title : this.title;
             this.body = "body" in other ? other.body : this.body;
+            this.sealedFields = "sealedFields" in other ? other.sealedFields : this.sealedFields;
             this.dueDate = "dueDate" in other ? other.dueDate : this.dueDate;
             this.completed = other.completed !== undefined ? other.completed : this.completed;
             this.priority = other.priority !== undefined ? other.priority : this.priority;

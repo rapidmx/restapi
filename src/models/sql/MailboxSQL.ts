@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { EncryptionPreference, FreeBusyVisibility, Mailbox, PublicKey, ZeroAccessKey } from "../types.js";
+import { EncryptionPreference, FreeBusyVisibility, Mailbox, PublicKey, SyncClients, ZeroAccessKey, ZeroAccessTypes } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity, Index } = PersistenceDecorators;
@@ -196,6 +196,21 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
     @Nullable
     public zeroAccessEnabled?: boolean = undefined;
 
+    @Column({ type: "simple-json", nullable: true })
+    @Description("Which data types (mail, calendar, contacts, tasks) zero-access encryption covers. Owner only.")
+    @Nullable
+    public zeroAccessTypes?: ZeroAccessTypes = undefined;
+
+    @Column({ type: "simple-json", nullable: true })
+    @Description("The ActiveSync and Outlook clients that sync this mailbox, as those services last saw them. Server-written.")
+    @Nullable
+    public syncClients?: SyncClients = undefined;
+
+    @Column({ type: "double precision", nullable: true })
+    @Description("When the owner last exported a zero-access key. Server-written.")
+    @Nullable
+    public zeroAccessKeysExportedAt?: number = undefined;
+
     @Column({ nullable: true })
     @Description("Precomputed zbase32(sha256(localPart)) of primarySmtpAddress, for the discovery endpoint's indexed lookup.")
     @Nullable
@@ -286,6 +301,9 @@ export class MailboxSQL extends BaseEntity implements Mailbox {
             this.keys = other.keys !== undefined ? other.keys : this.keys;
             this.zeroAccessKeys = "zeroAccessKeys" in other ? other.zeroAccessKeys : this.zeroAccessKeys;
             this.zeroAccessEnabled = "zeroAccessEnabled" in other ? other.zeroAccessEnabled : this.zeroAccessEnabled;
+            this.zeroAccessTypes = "zeroAccessTypes" in other ? other.zeroAccessTypes : this.zeroAccessTypes;
+            this.syncClients = "syncClients" in other ? other.syncClients : this.syncClients;
+            this.zeroAccessKeysExportedAt = "zeroAccessKeysExportedAt" in other ? other.zeroAccessKeysExportedAt : this.zeroAccessKeysExportedAt;
             this.keyDiscoveryHash = "keyDiscoveryHash" in other ? other.keyDiscoveryHash : this.keyDiscoveryHash;
             this.escrowScopeId = "escrowScopeId" in other ? other.escrowScopeId : this.escrowScopeId;
             this.correspondentsBackfilledAt =

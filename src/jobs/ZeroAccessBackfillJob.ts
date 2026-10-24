@@ -6,6 +6,7 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { BlobStore } from "../blob/BlobStore.js";
 import { FolderType, type Folder, type Mailbox, type Message } from "../models/types.js";
+import { settleZeroAccessTypes } from "../util/ZeroAccessUtils.js";
 import type { MessageBlobRepos } from "../util/BlobReferenceUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
@@ -102,11 +103,30 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                 if (budget <= 0) {
                     return;
                 }
-                if (!(mailbox.zeroAccessKeys ?? []).length || !(await this.zeroAccessWriter.target(mailbox))) {
+                if (!(mailbox.zeroAccessKeys ?? []).length) {
+                    continue;
+                }
+                await this.settleTypes(mailbox);
+                if (!(await this.zeroAccessWriter.target(mailbox))) {
                     continue;
                 }
                 budget -= await this.backfillMailbox(mailbox, budget);
             }
+        }
+    }
+
+    /**
+     * Decides the data types a mailbox that already has zero-access hasn't decided yet - one from before calendar, contacts and tasks
+     * could be protected - from the owner's devices (`specs/search.md` §3 *What It Covers*). Mail that is already protected stays so.
+     * Leaves a mailbox whose owner turned zero-access off alone: turning it back on decides them.
+     */
+    private async settleTypes(mailbox: X): Promise<void> {
+        const settled = mailbox.zeroAccessEnabled === false ? undefined : settleZeroAccessTypes(mailbox, false);
+        if (settled) {
+            Object.assign(
+                mailbox,
+                await this.mailboxRepo!.update({ uid: mailbox.uid, version: (mailbox as any).version, zeroAccessTypes: settled } as any, mailbox, { ignoreACL: true }),
+            );
         }
     }
 

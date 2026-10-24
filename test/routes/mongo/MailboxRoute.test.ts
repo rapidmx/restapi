@@ -375,6 +375,39 @@ describe("Route:MailboxMongo Tests", () => {
         expect((await put(set.body.version, "carrier-pigeon")).status).toBe(400);
     });
 
+    it("Lets the owner choose what zero-access protects, merging a partial choice, refusing a malformed one (400), and ignoring anyone else's.", async () => {
+        const obj = await createMailboxMongo({ zeroAccessTypes: { mail: true, calendar: false, contacts: false, tasks: false } });
+        const put = (token: string, version: number, body: any) =>
+            request(server.getApplication())
+                .put(`${baseUrl}/${obj.uid}`)
+                .set("Authorization", "jwt " + token)
+                .send({ uid: obj.uid, version, ...body });
+
+        const chosen = await put(ownerToken, obj.version, { zeroAccessTypes: { contacts: true } });
+        expect(chosen.status).toBe(200);
+        expect(((await repo.findOne({ uid: obj.uid } as any)) as any)?.zeroAccessTypes).toEqual({ mail: true, calendar: false, contacts: true, tasks: false });
+        for (const zeroAccessTypes of [{ notes: true }, { mail: "yes" }, ["mail"], "mail"]) {
+            expect((await put(ownerToken, chosen.body.version, { zeroAccessTypes })).status, JSON.stringify(zeroAccessTypes)).toBe(400);
+        }
+        const byAdmin = await put(adminToken, chosen.body.version, { zeroAccessTypes: { mail: false } });
+        expect(byAdmin.status).toBe(200);
+        expect(((await repo.findOne({ uid: obj.uid } as any)) as any)?.zeroAccessTypes.mail).toBe(true);
+    });
+
+    it("Never takes syncClients or zeroAccessKeysExportedAt from a client, and decides undecided types when the owner turns zero-access back on.", async () => {
+        const obj = await createMailboxMongo({ zeroAccessEnabled: false, syncClients: { activesync: { devices: [{ id: "d1", model: "iPhone", types: ["mail", "calendar", "contacts"], lastSeenAt: 1 }] } } });
+        const result = await request(server.getApplication())
+            .put(`${baseUrl}/${obj.uid}`)
+            .set("Authorization", "jwt " + ownerToken)
+            .send({ uid: obj.uid, version: obj.version, zeroAccessEnabled: true, syncClients: null, zeroAccessKeysExportedAt: 1 });
+
+        expect(result.status).toBe(200);
+        const stored: any = await repo.findOne({ uid: obj.uid } as any);
+        expect(stored?.syncClients?.activesync?.devices).toHaveLength(1);
+        expect(stored?.zeroAccessKeysExportedAt ?? undefined).toBeUndefined();
+        expect(stored?.zeroAccessTypes).toEqual({ mail: false, calendar: false, contacts: false, tasks: true });
+    });
+
     it("Lets the owner turn zeroAccessEnabled off and on again.", async () => {
         const obj = await createMailboxMongo();
 

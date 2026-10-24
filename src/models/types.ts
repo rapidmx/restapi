@@ -95,6 +95,30 @@ export interface ObservedFormat {
     at: number;
 }
 
+/** The data types zero-access encryption can cover (`specs/search.md` §3 *What It Covers*). */
+export type ZeroAccessDataType = "mail" | "calendar" | "contacts" | "tasks";
+
+/** `Mailbox.zeroAccessTypes`: per data type, whether zero-access encryption covers it. */
+export type ZeroAccessTypes = Partial<Record<ZeroAccessDataType, boolean>>;
+
+/** One device the ActiveSync service syncs for a mailbox. */
+export interface SyncClientDevice {
+    /** The device's ActiveSync `DeviceId`. */
+    id: string;
+    /** Its model or type, as the device reports it (`DeviceType`/`Model`), for the settings page. */
+    model?: string;
+    /** The data types it syncs. */
+    types: ZeroAccessDataType[];
+    lastSeenAt: number;
+}
+
+/** `Mailbox.syncClients`. */
+export interface SyncClients {
+    activesync?: { devices: SyncClientDevice[] };
+    /** Outlook over MAPI syncs every data type. */
+    mapi?: { lastSeenAt: number };
+}
+
 /**
  * A private key encrypted under a mailbox's master key (MK) - only ever returned from an authenticated
  * `GET /mailbox/:id/keyvault` call (`KeyVault`, below), never from an ordinary `Mailbox` fetch. The server
@@ -854,6 +878,19 @@ export interface Mailbox extends BaseEntity {
      * server allows it (`EncryptionPolicy.allowZeroAccess`) and a zero-access key is enrolled. Unset means on. Only the
      * mailbox's owner may change it - never an administrator or a delegate. */
     zeroAccessEnabled?: boolean;
+
+    /** Which data types zero-access encryption covers for this mailbox (`specs/search.md` §3 *What It Covers*). Only the owner
+     * changes it. A type left unset hasn't been decided yet: mail counts as on (as before types existed), the others as off,
+     * until `settleZeroAccessTypes()` writes the defaults for the owner's devices. */
+    zeroAccessTypes?: ZeroAccessTypes;
+
+    /** The ActiveSync and Outlook (MAPI) clients that sync this mailbox, as the activesync and mapi services last saw them -
+     * what the zero-access defaults and settings' warnings are based on. Written by those services only. */
+    syncClients?: SyncClients;
+
+    /** When the owner last exported a zero-access key (`POST .../keyvault/exports`), so a phone or Outlook can read protected mail.
+     * Server-written. */
+    zeroAccessKeysExportedAt?: number;
 
     /** Precomputed `zbase32(sha256(lowercase(localPart)))` of `primarySmtpAddress` (see
      * `util/KeyDiscoveryClient.ts`'s `computeKeyDiscoveryHash()`), maintained alongside `primarySmtpAddress`
@@ -2784,6 +2821,10 @@ export interface Task extends RecoverableBaseEntity {
     title: string;
 
     body?: string;
+
+    /** The protected title and notes, sealed field by field to the mailbox's zero-access key while zero-access covers tasks
+     * (`zeroaccess/ZeroAccessFieldSealer.ts`); `title` then holds a placeholder. Written by the server only. */
+    sealedFields?: Record<string, string> | null;
 
     dueDate?: Date;
 

@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ACLAction, type ACLUtils, type RepoUtils } from "@rapidrest/service-core";
-import type { EncryptionPolicy, Mailbox, ZeroAccessKey } from "../models/types.js";
+import type { EncryptionPolicy, Mailbox, ZeroAccessDataType, ZeroAccessKey } from "../models/types.js";
 import { normalizeUserUid } from "../util/UserUidUtils.js";
-import { activeZeroAccessKey, type ZeroAccessStatus } from "../util/ZeroAccessUtils.js";
+import { activeZeroAccessKey, type ZeroAccessStatus, zeroAccessStatus } from "../util/ZeroAccessUtils.js";
 
 /** The fixed uid of the one `EncryptionPolicy` row (`BaseEncryptionPolicyRoute`). */
 export const ENCRYPTION_POLICY_UID = "encryption-policy";
@@ -18,7 +18,7 @@ export interface ZeroAccessTarget {
 }
 
 /** The mailbox fields zero-access decisions read. */
-export type ZeroAccessMailbox = Pick<Mailbox, "uid" | "ownerUserUid" | "zeroAccessEnabled" | "zeroAccessKeys">;
+export type ZeroAccessMailbox = Pick<Mailbox, "uid" | "ownerUserUid" | "zeroAccessEnabled" | "zeroAccessKeys" | "zeroAccessTypes">;
 
 /** A user uid as member comparisons use it: normalized when it is a UUID, else trimmed and lowercased. */
 export function canonicalUserUid(uid: string | undefined): string | undefined {
@@ -55,21 +55,15 @@ export class ZeroAccessResolver {
         return zeroAccessMembers(await this.aclUtils?.findACL(mailbox.uid), mailbox, this.trustedRoles);
     }
 
-    /** `zeroAccessStatus()` for `mailbox`, reading the policy only when the mailbox's own state hasn't decided it. */
-    public async status(mailbox: ZeroAccessMailbox): Promise<ZeroAccessStatus> {
-        if (!(await this.allowed())) {
-            return "disabled_by_admin";
-        }
-        if (mailbox.zeroAccessEnabled === false) {
-            return "disabled_by_owner";
-        }
-        return activeZeroAccessKey(mailbox) ? "active" : "no_key";
+    /** `zeroAccessStatus()` for `type` (mail unless given) of `mailbox`. */
+    public async status(mailbox: ZeroAccessMailbox, type: ZeroAccessDataType = "mail"): Promise<ZeroAccessStatus> {
+        return zeroAccessStatus(mailbox, { allowZeroAccess: await this.allowed() }, type);
     }
 
-    /** What new mail for `mailbox` must be encrypted to - its active zero-access key - or `undefined` when zero-access isn't
-     * active for it, in which case mail is stored as it arrives. */
-    public async target(mailbox: ZeroAccessMailbox): Promise<ZeroAccessTarget | undefined> {
-        if ((await this.status(mailbox)) !== "active") {
+    /** What new `type` content (mail unless given) of `mailbox` must be encrypted to - its active zero-access key - or `undefined`
+     * when zero-access isn't active for it, in which case it is stored as it arrives. */
+    public async target(mailbox: ZeroAccessMailbox, type: ZeroAccessDataType = "mail"): Promise<ZeroAccessTarget | undefined> {
+        if ((await this.status(mailbox, type)) !== "active") {
             return undefined;
         }
         return toTarget(activeZeroAccessKey(mailbox)!);

@@ -38,7 +38,7 @@ import {
 } from "../util/CertificateInstallUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { AuditAction, EncryptionPolicy, EscrowScope, KeyUseType, KeyVault, Mailbox, MasterKeyWrap, MemberKeyWrap, PublicKey, WrappedPrivateKey, ZeroAccessEscrowWrap, ZeroAccessKey } from "../models/types.js";
-import { activeZeroAccessKey } from "../util/ZeroAccessUtils.js";
+import { activeZeroAccessKey, settleZeroAccessTypes } from "../util/ZeroAccessUtils.js";
 import { canonicalUserUid, zeroAccessMembers } from "../zeroaccess/ZeroAccessResolver.js";
 import { isSealedToCertificate } from "../zeroaccess/ZeroAccessSealer.js";
 import { isOpenPgpKey, OPENPGP_KEY_TYPE, parseOpenPgpContactKey } from "../util/OpenPgpKeyUtils.js";
@@ -741,10 +741,12 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         assertMasterKeyWrapsAccepted(keyVault, initialMasterKeyWraps);
         assertMasterKeyGeneration(keyVault, expectedGeneration);
 
-        // A zero-access key supersedes only the mailbox's earlier zero-access keys, on their own (never published) list.
+        // A zero-access key supersedes only the mailbox's earlier zero-access keys, on their own (never published) list. The first one
+        // activates zero-access for the mailbox, which decides what it covers from the owner's devices (`specs/search.md` §3).
+        const settled = publicKey.useType === "zero-access" && !mailbox.zeroAccessKeys?.length ? settleZeroAccessTypes(mailbox, true) : undefined;
         const keyField: Partial<Mailbox> =
             publicKey.useType === "zero-access"
-                ? { zeroAccessKeys: supersedeKeys(mailbox.zeroAccessKeys, publicKey, Date.now()) }
+                ? { zeroAccessKeys: supersedeKeys(mailbox.zeroAccessKeys, publicKey, Date.now()), ...(settled ? { zeroAccessTypes: settled } : {}) }
                 : { keys: supersedeKeys(mailbox.keys, publicKey, Date.now()) };
         const updatedMailbox: M = await this.mailboxRepo!.update(
             { uid: mailbox.uid, version: (mailbox as any).version, ...keyField } as any,
@@ -1564,6 +1566,12 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             }
         }
 
+        // A phone or Outlook with the exported zero-access key installed reads protected mail: what the default for mail goes by.
+        if (keys.some((key) => key.kind === "zero-access")) {
+            await this.mailboxRepo!.update({ uid: mailbox.uid, version: (mailbox as any).version, zeroAccessKeysExportedAt: Date.now() } as any, mailbox, {
+                ignoreACL: true,
+            });
+        }
         await this.auditLogUtils!.record(
             {
                 action: AuditAction.KEY_VAULT_EXPORT,

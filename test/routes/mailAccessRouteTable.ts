@@ -37,7 +37,7 @@ export const ROUTE_TABLE: Record<string, RouteRow> = {
     ContactRoute: { kind: "mailbox", base: "BaseContactRoute", gate: "hasMailAccess on the folder" },
     ContactListRoute: { kind: "mailbox", base: "BaseScopedChildRoute", gate: "hasMailAccess on the mailbox" },
     NoteRoute: { kind: "mailbox", base: "BaseScopedChildRoute", gate: "hasMailAccess on the folder" },
-    TaskRoute: { kind: "mailbox", base: "BaseScopedChildRoute", gate: "hasMailAccess on the folder" },
+    TaskRoute: { kind: "mailbox", base: "BaseTaskRoute", gate: "hasMailAccess on the folder (BaseScopedChildRoute)" },
     TaskListRoute: { kind: "mailbox", base: "BaseScopedChildRoute", gate: "hasMailAccess on the mailbox" },
     LabelRoute: { kind: "mailbox", base: "BaseLabelRoute", gate: "hasMailAccess on the mailbox" },
     MailSignatureRoute: { kind: "mailbox", base: "BaseScopedChildRoute", gate: "hasMailAccess on the mailbox" },

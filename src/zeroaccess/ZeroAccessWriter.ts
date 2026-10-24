@@ -7,7 +7,7 @@ import { ObjectDecorators } from "@rapidrest/core";
 import { ACLUtils, type ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { simpleParser, type ParsedMail } from "mailparser";
 import type { BlobStore } from "../blob/BlobStore.js";
-import type { Mailbox, MessageZeroAccess, Recipient } from "../models/types.js";
+import type { Mailbox, MessageZeroAccess, Recipient, ZeroAccessDataType } from "../models/types.js";
 import { htmlPreview } from "../scan/HtmlPreview.js";
 import { ExtractorRegistry } from "../search/extraction/ExtractorRegistry.js";
 import { deleteBlobsIfUnreferenced, messageBlobReferenceSources, type MessageBlobRepos } from "../util/BlobReferenceUtils.js";
@@ -98,8 +98,8 @@ export class ZeroAccessWriter {
     ) {}
 
     /** The key `mailbox`'s mail is sealed to now, or `undefined` when zero-access isn't active for it. */
-    public async target(mailbox: ZeroAccessMailbox): Promise<ZeroAccessTarget | undefined> {
-        return new ZeroAccessResolver(this.policyRepo, this.aclUtils, this.allowedDefault, this.trustedRoles).target(mailbox);
+    public async target(mailbox: ZeroAccessMailbox, type: ZeroAccessDataType = "mail"): Promise<ZeroAccessTarget | undefined> {
+        return new ZeroAccessResolver(this.policyRepo, this.aclUtils, this.allowedDefault, this.trustedRoles).target(mailbox, type);
     }
 
     /**

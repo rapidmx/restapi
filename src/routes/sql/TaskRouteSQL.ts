@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
-import { FolderSQL, TaskSQL } from "../../sql.js";
-import { BaseScopedChildRoute } from "../BaseScopedChildRoute.js";
+import { EncryptionPolicySQL, FolderSQL, MailboxSQL, TaskSQL } from "../../sql.js";
+import { BaseTaskRoute } from "../BaseTaskRoute.js";
 import { RecoverableRepoUtils } from "../../util/RecoverableRepoUtils.js";
 const { Model } = RouteDecorators;
 
 @Model(TaskSQL)
-export class TaskRouteSQL extends BaseScopedChildRoute<TaskSQL> {
+export class TaskRouteSQL extends BaseTaskRoute<TaskSQL> {
+    protected mailboxClass: any = MailboxSQL;
+    protected encryptionPolicyClass: any = EncryptionPolicySQL;
     protected readonly repoUtilsClass: any = RecoverableRepoUtils;
     protected readonly scopeProperty: string = "folderUid";
     protected readonly dateFields: readonly string[] = ["dueDate", "reminderDate"];

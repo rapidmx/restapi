@@ -96,8 +96,9 @@ Zero-access is controlled by two settings:
 | --- | --- | --- | --- |
 | **Allow zero-access encryption** (`EncryptionPolicy.allowZeroAccess`) | Server-wide | On | Administrator |
 | **Enable zero-access encryption** (`Mailbox.zeroAccessEnabled`) | Per mailbox | On | Mailbox owner only |
+| **What to protect** (`Mailbox.zeroAccessTypes`: mail, calendar, contacts, tasks) | Per mailbox, per data type | Depends on the user's devices — see *What It Covers* | Mailbox owner only |
 
-Zero-access is **active** for a mailbox when the global setting allows it, the mailbox setting enables it, **and** the mailbox has a zero-access key enrolled. When any of the three is false, mail is stored exactly as before zero-access existed: plaintext at rest, full server-side content search.
+Zero-access is **active** for a data type of a mailbox when the global setting allows it, the mailbox setting enables it, the mailbox's `zeroAccessTypes` includes that type, **and** the mailbox has a zero-access key enrolled. When any of the three is false, mail is stored exactly as before zero-access existed: plaintext at rest, full server-side content search.
 
 When the administrator turns the global setting off, the mailbox setting is shown disabled with an explanation that the administrator has disabled it. Administrators MUST NOT be able to change the mailbox setting — their only lever is the global switch, which is visible to every user. Turning zero-access off never decrypts anything (the server cannot); only mail arriving afterwards is stored in plaintext.
 
@@ -108,6 +109,28 @@ The settings exist because zero-access has real costs beyond search, which the p
 - **Server-side rules matching on body text** cannot be evaluated after delivery. Header and envelope rules are unaffected. Rules that must match on body text MUST be evaluated in the delivery path, before encryption, or not at all.
 - **Archive and compliance search** operates on ciphertext. Recoverable only through the escrow scope that covers the mailbox.
 - **Retrospective antivirus rescanning** of stored attachments is not possible. Scanning at delivery is unaffected.
+
+### What It Covers
+
+Zero-access protects four data types, each switched on or off separately by the mailbox owner. A type that is on is sealed field by field (`sealedFields`, one CMS `EnvelopedData` per field, with a placeholder in the readable column) on every write, whoever writes it: the web client, ActiveSync, Outlook (MAPI), a plugin, or the server itself creating a contact. The same rule as for mail applies: plaintext may pass through a request, and is sealed before it is stored.
+
+| Data type | Encrypted | Stays readable by the server, and why |
+| --- | --- | --- |
+| Mail | Body, subject, preview, attachments | Sender, recipients, dates, size, flags, folder: needed to deliver, thread, enforce quota and search by envelope. |
+| Calendar | Title, location, description | Start, end, time zone, recurrence, organizer and attendee addresses and names, responses, busy status, the out-of-office auto-reply text: needed for free/busy, invitations, reminders' timing and automatic replies. |
+| Contacts | Names, company, job title, phone numbers, postal addresses, notes, categories, the labels of email addresses, photo | **Email addresses**: the server needs them to deliver mail, to find and pin each contact's encryption keys, to tell known senders (Focused Inbox) and to suggest contacts. Favorite flag and folder. |
+| Tasks | Title, notes | Due date, reminder time, priority, completion, list, My Day. |
+| All types | | Folder, calendar and list names; how many items there are, how large, and when they change. |
+
+**Email addresses are deliberately not encrypted.** They are what mail is routed by, the key every end-to-end encryption key is pinned and looked up under, and how incoming mail is matched to a contact. Encrypting them would break end-to-end encryption and Focused Inbox, and protect little: the addresses of everyone a mailbox exchanges mail with are already visible to the server in the mail's own headers and kept in its correspondents list.
+
+**Protected types and other devices.** ActiveSync phones and Outlook have no way to read a zero-access calendar, contact or task, and can read zero-access mail only after the user installs their exported keys. For a protected type they still sync each item, with placeholders: an event is a busy block named "Protected event", a contact shows only its email addresses, a task is "Protected task", a message is S/MIME the device can open only with the exported key. Edits made on a device are sealed on arrival; a placeholder sent back unchanged is ignored and never overwrites the protected value.
+
+**Defaults follow the user's devices.** When zero-access is turned on for a mailbox whose owner syncs with ActiveSync or Outlook, the types those clients use default to **off** so the device keeps working — mail stays on only if the user has exported their keys. Without such a client, every type defaults to on. The owner can switch any type on regardless; each switch states plainly what it will break on which device. A device first connected after a type was protected raises a notice in settings; nothing is switched off automatically. The activesync and mapi services record which clients they serve on the mailbox (`Mailbox.syncClients`) for this.
+
+Turning a type off never decrypts anything. Items written afterwards are stored readable; an existing protected item stays protected until it is next edited. Turning a type on starts a background backfill of that type's existing items.
+
+**Calendar invitations** for a protected calendar are composed and handed to the outbound mail path while the server still holds the plaintext of the save request, so attendees receive ordinary invitations while the stored event is sealed. Reminders carry only the event and its time; the client shows its own decrypted title.
 
 ### Ordering Within the Delivery Path
 
@@ -160,7 +183,7 @@ Encryption is scoped by **provenance**, not by entity type and not by the corres
 | --- | --- |
 | `message` | Yes, per the E2E policy. |
 | `calendarEvent` | When materialised from an encrypted message received from a federated peer or external sender, **or** when the user originates an invitation sent over an encrypted channel (any tier). |
-| `contact` | Never. See below. |
+| `contact` | Never end-to-end. See below. (At rest, contacts are protected by zero-access encryption when the owner includes them — §3 *What It Covers*.) |
 | `note`, `task` | Only when user-created from encrypted content, and only with explicit warning. |
 
 The majority of calendar events — user-created and sent unencrypted, internal invitations, and invitations from unencrypted external senders — remain plaintext and are served entirely by Source A at existing fidelity, content included.
@@ -179,7 +202,9 @@ This does not extend to same-organisation mail *by default*. Where both parties 
 
 Without this distinction, an internal sender's deliberate encryption is silently undone on the receiving side. The motivating case is privileged communication: counsel encrypts an internal invitation, the recipient's client materialises the event, and a tier-based rule would index its title in plaintext.
 
-### Contacts Are Never Encrypted
+### Contacts Are Never Encrypted End-to-End
+
+This section is about end-to-end provenance: a contact never inherits encryption from a message. It is independent of zero-access encryption, which protects a contact's details at rest when the owner includes contacts (§3 *What It Covers*); that protection never extends to email addresses.
 
 A contact is a record the user authored about another person. The correspondent never sent it and has no expectation about it. `prefer-encrypt=mutual` is a statement about messages in transit, not about the recipient's address book, and MUST NOT be interpreted as retroactively changing how an existing contact is stored.
 
@@ -909,7 +934,9 @@ Measure how long a device takes to import version 1 segments (§16) on a cold st
 | Server-assisted candidate narrowing | Removed. On-demand segment fetch replaces it; `CandidateQuery` is deleted. |
 | Cache budget rationale | Storage and bandwidth, not build cost. Clients no longer build an index for zero-access mail. |
 | Honest trust statement | A server-built index entry is trusted to be honest. Different from, not larger than, the delivery-time trust already required. |
-| Which entity types are encrypted | Scoped by provenance, not type. Messages per policy; calendar events when derived from an encrypted **external** message or originated as an encrypted invitation; contacts never. |
+| Which entity types are encrypted | End-to-end: scoped by provenance, not type. Messages per policy; calendar events when derived from an encrypted **external** message or originated as an encrypted invitation; contacts never. At rest (zero-access): per data type, chosen by the owner — mail, calendar, contacts (all but email addresses), tasks. |
+| Which zero-access types are on by default | All, unless the owner syncs with ActiveSync or Outlook: then the types those clients use default to off (mail stays on once the keys are exported). Any type can be switched on, with what it breaks stated plainly. |
+| Why contact email addresses stay readable | Mail routing, end-to-end key lookup and pinning, known-sender detection and contact suggestions all match on them, and the server already sees them in mail headers. |
 | Can a user originate an encrypted invitation | Yes, at any tier. The organiser's own copy is encrypted, per encrypt-to-self. |
 | Explicit user choice vs. tier scoping | Explicit choice wins. Automatic protection is external-only; a deliberate decision to encrypt applies everywhere. |
 | Free/busy for encrypted events | Preserved. Temporal fields stay server-visible; content fields are encrypted. |

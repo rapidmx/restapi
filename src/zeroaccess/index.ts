@@ -8,3 +8,5 @@ export * from "./ZeroAccessResolver.js";
 export * from "./ZeroAccessFiling.js";
 export * from "./ZeroAccessIndexStore.js";
 export * from "./ZeroAccessWriter.js";
+export * from "./ZeroAccessFieldSealer.js";
+export * from "./ZeroAccessRecordSealer.js";

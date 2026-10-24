@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
-import { FolderMongo, TaskMongo } from "../../mongo.js";
-import { BaseScopedChildRoute } from "../BaseScopedChildRoute.js";
+import { EncryptionPolicyMongo, FolderMongo, MailboxMongo, TaskMongo } from "../../mongo.js";
+import { BaseTaskRoute } from "../BaseTaskRoute.js";
 import { RecoverableRepoUtils } from "../../util/RecoverableRepoUtils.js";
 const { Model } = RouteDecorators;
 
 @Model(TaskMongo)
-export class TaskRouteMongo extends BaseScopedChildRoute<TaskMongo> {
+export class TaskRouteMongo extends BaseTaskRoute<TaskMongo> {
+    protected mailboxClass: any = MailboxMongo;
+    protected encryptionPolicyClass: any = EncryptionPolicyMongo;
     protected readonly repoUtilsClass: any = RecoverableRepoUtils;
     protected readonly scopeProperty: string = "folderUid";
     /** Stored as real `Date`s so due/reminder range queries match on Mongo (see `BaseScopedChildRoute.dateFields`). */

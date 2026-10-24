@@ -3,7 +3,16 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { Mailbox, ZeroAccessKey } from "../../src/models/types.js";
-import { activeZeroAccessKey, isZeroAccessActive, zeroAccessStatus } from "../../src/util/ZeroAccessUtils.js";
+import {
+    activeZeroAccessKey,
+    defaultZeroAccessTypes,
+    isZeroAccessActive,
+    isZeroAccessDataType,
+    settleZeroAccessTypes,
+    syncedDataTypes,
+    zeroAccessStatus,
+    zeroAccessTypeIncluded,
+} from "../../src/util/ZeroAccessUtils.js";
 
 const key = (fields: Partial<ZeroAccessKey>): ZeroAccessKey => ({
     publicKey: "QUJD",
@@ -15,7 +24,7 @@ const key = (fields: Partial<ZeroAccessKey>): ZeroAccessKey => ({
     ...fields,
 });
 
-type ZeroAccessMailbox = Pick<Mailbox, "ownerUserUid" | "zeroAccessEnabled" | "zeroAccessKeys">;
+type ZeroAccessMailbox = Pick<Mailbox, "ownerUserUid" | "zeroAccessEnabled" | "zeroAccessKeys" | "zeroAccessTypes">;
 
 const mailbox = (fields: Partial<ZeroAccessMailbox> = {}): ZeroAccessMailbox => ({
     ownerUserUid: "owner",
@@ -81,6 +90,49 @@ describe("ZeroAccessUtils", () => {
             expect(isZeroAccessActive(mailbox(), allowed)).toBe(true);
             expect(isZeroAccessActive(mailbox({ zeroAccessKeys: [] }), allowed)).toBe(false);
             expect(isZeroAccessActive(mailbox(), { ...allowed, allowZeroAccess: false })).toBe(false);
+        });
+    });
+
+    describe("data types", () => {
+        const phone = (types: string[]) => ({ activesync: { devices: [{ id: "d1", model: "iPhone", types: types as any, lastSeenAt: 1 }] } });
+
+        it("knows the four types, and counts an undecided mail as on and the others as off", () => {
+            expect(["mail", "calendar", "contacts", "tasks"].every(isZeroAccessDataType)).toBe(true);
+            expect(isZeroAccessDataType("notes")).toBe(false);
+            expect(zeroAccessTypeIncluded({}, "mail")).toBe(true);
+            expect(zeroAccessTypeIncluded({}, "calendar")).toBe(false);
+            expect(zeroAccessTypeIncluded({ zeroAccessTypes: { mail: false, tasks: true } }, "mail")).toBe(false);
+            expect(zeroAccessTypeIncluded({ zeroAccessTypes: { mail: false, tasks: true } }, "tasks")).toBe(true);
+        });
+
+        it("reports a type the owner left out as not included, after the switches and before the key", () => {
+            const box = mailbox({ zeroAccessTypes: { mail: true, calendar: false } });
+            expect(zeroAccessStatus(box, allowed, "calendar")).toBe("type_not_included");
+            expect(zeroAccessStatus(box, allowed)).toBe("active");
+            expect(zeroAccessStatus({ ...box, zeroAccessKeys: [] }, allowed, "calendar")).toBe("type_not_included");
+            expect(zeroAccessStatus({ ...box, zeroAccessEnabled: false }, allowed, "calendar")).toBe("disabled_by_owner");
+            expect(isZeroAccessActive(mailbox({ zeroAccessTypes: { contacts: true } }), allowed, "contacts")).toBe(true);
+        });
+
+        it("collects what ActiveSync devices sync, and every type for Outlook", () => {
+            expect([...syncedDataTypes(undefined)]).toEqual([]);
+            expect([...syncedDataTypes(phone(["mail", "calendar", "bogus"]))].sort()).toEqual(["calendar", "mail"]);
+            expect([...syncedDataTypes({ activesync: { devices: [{ id: "d", lastSeenAt: 1 } as any] } })]).toEqual([]);
+            expect([...syncedDataTypes({ mapi: { lastSeenAt: 1 } })].sort()).toEqual(["calendar", "contacts", "mail", "tasks"]);
+        });
+
+        it("defaults the types a device syncs to off - mail on only once the keys are exported - and everything else to on", () => {
+            expect(defaultZeroAccessTypes({})).toEqual({ mail: true, calendar: true, contacts: true, tasks: true });
+            expect(defaultZeroAccessTypes({ syncClients: phone(["mail", "calendar", "contacts"]) })).toEqual({ mail: false, calendar: false, contacts: false, tasks: true });
+            expect(defaultZeroAccessTypes({ syncClients: phone(["mail"]), zeroAccessKeysExportedAt: 5 }).mail).toBe(true);
+        });
+
+        it("decides only the undecided types, keeping protected mail protected unless zero-access is being turned on now", () => {
+            const withPhone = { syncClients: phone(["mail", "calendar"]) };
+            expect(settleZeroAccessTypes({ ...withPhone, zeroAccessTypes: { mail: true, calendar: true, contacts: false, tasks: false } }, true)).toBeUndefined();
+            expect(settleZeroAccessTypes({ ...withPhone, zeroAccessTypes: { calendar: true } }, false)).toEqual({ mail: true, calendar: true, contacts: true, tasks: true });
+            expect(settleZeroAccessTypes(withPhone, true)).toEqual({ mail: false, calendar: false, contacts: true, tasks: true });
+            expect(settleZeroAccessTypes({ ...withPhone, zeroAccessTypes: { mail: false } }, false)).toEqual({ mail: false, calendar: false, contacts: true, tasks: true });
         });
     });
 });

@@ -21,6 +21,7 @@ import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { TaskSQL } from "../../../src/models/sql/TaskSQL.js";
 import { FolderType, TaskPriority } from "../../../src/models/types.js";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { openSealedField, testZeroAccessKey } from "../../zeroAccessTestKeys.js";
 
 describe("Route:TaskSQL Tests", () => {
     const logger = Logger();
@@ -345,5 +346,68 @@ describe("Route:TaskSQL Tests", () => {
 
         expect(result.status).toBe(200);
         expect(result.headers["content-length"]).toBe("0");
+    });
+
+    describe("zero-access encryption of tasks", () => {
+        const protect = async (types: any) => {
+            const mailbox: any = await createMailbox(owner.uid);
+            const za = await testZeroAccessKey();
+            mailbox.zeroAccessKeys = [za.key];
+            mailbox.zeroAccessTypes = types;
+            await mailboxRepo.save(mailbox);
+            const folder = await createFolder(mailbox.uid);
+            return { mailbox, folder, za };
+        };
+        const create = (mailbox: any, folder: any, fields: any) =>
+            request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ mailboxUid: mailbox.uid, folderUid: folder.uid, completed: false, priority: TaskPriority.NORMAL, ...fields });
+        const stored = async (uid: string): Promise<any> => await taskRepo.findOne({ where: { uid } });
+
+        it("Seals a protected task's title and notes on create, storing a placeholder, and nothing readable", async () => {
+            const { mailbox, folder, za } = await protect({ tasks: true });
+
+            const result = await create(mailbox, folder, { title: "CANARY-TITLE pay the lawyer", body: "CANARY-BODY retainer", sealedFields: { title: "forged" } });
+
+            expect(result.status, JSON.stringify(result.body)).toBe(200);
+            expect(result.body.title).toBe("Protected task");
+            const row = await stored(result.body.uid);
+            expect(row.title).toBe("Protected task");
+            expect(row.body ?? null).toBeNull();
+            expect(await openSealedField(row.sealedFields.title, za)).toBe("CANARY-TITLE pay the lawyer");
+            expect(await openSealedField(row.sealedFields.body, za)).toBe("CANARY-BODY retainer");
+            expect(JSON.stringify(await taskRepo.find())).not.toContain("CANARY");
+        });
+
+        it("Replaces only what an update sends, ignores the placeholder sent back, and stores readable when tasks aren't protected", async () => {
+            const { mailbox, folder, za } = await protect({ tasks: true });
+            const created = (await create(mailbox, folder, { title: "Secret", body: "Notes" })).body;
+
+            const done = await request(server.getApplication())
+                .put(`${baseUrl}/${created.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: created.uid, version: created.version, title: "Protected task", completed: true });
+            expect(done.status, JSON.stringify(done.body)).toBe(200);
+            const row = await stored(created.uid);
+            expect(row.completed).toBe(true);
+            expect(await openSealedField(row.sealedFields.title, za)).toBe("Secret");
+            expect(await openSealedField(row.sealedFields.body, za)).toBe("Notes");
+
+            const plain = await protect({ tasks: false });
+            const readable = (await create(plain.mailbox, plain.folder, { title: "Readable", body: "Plain" })).body;
+            expect(readable.title).toBe("Readable");
+            expect((await stored(readable.uid)).sealedFields ?? null).toBeNull();
+        });
+
+        it("Refuses filtering or sorting tasks by title or notes", async () => {
+            const { folder } = await protect({ tasks: true });
+            for (const query of [`title=Secret`, `body=x`, `sort=${encodeURIComponent(JSON.stringify({ title: "ASC" }))}`]) {
+                const result = await request(server.getApplication())
+                    .get(`${baseUrl}?folderUid=${folder.uid}&${query}`)
+                    .set("Authorization", "jwt " + ownerToken);
+                expect(result.status, query).toBe(400);
+            }
+        });
     });
 });
