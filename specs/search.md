@@ -134,6 +134,15 @@ Turning a type off never decrypts anything. Items written afterwards are stored 
 
 **Calendar invitations** for a protected calendar are composed and handed to the outbound mail path while the server still holds the plaintext of the save request, so attendees receive ordinary invitations while the stored event is sealed. Reminders carry only the event and its time; the client shows its own decrypted title.
 
+- **What the client sends.** A save of a protected event sends only the fields that changed, plus `invitationContent` — the event's full title, location and description in plaintext — whenever the change needs the attendees told. The server builds the invitation from it, sends it, records the sequence as sent, and stores the content sealed. `invitationContent` itself is never stored.
+- **Without it,** the save still succeeds but no invitation goes out; the change stays pending (the server logs it) until a save that carries the content. The background scheduling job never sends an invitation for a protected event, because all it could send is the placeholder.
+- **Replies and change requests** to a protected invitation are named by the `invitationContent` the attendee's client sends.
+- **Cancellations** of a protected event go out with the placeholder title ("Protected event") — the attendees already have the real one from the invitation.
+- **Incoming invitations** are filed sealed into a protected calendar even when the mail that carried them isn't zero-access.
+- **ActiveSync.** A meeting a phone creates in a protected calendar is sealed on arrival and its invitations are sent then, from what the phone sent. A change made on a phone is sealed too, but sends nothing: the phone sends back the placeholders it was shown, so the server has no full content to invite with. The change reaches attendees the next time the meeting is saved in RapidMX.
+- **Outlook (MAPI).** An event Outlook saves into a protected calendar is sealed, and Outlook's meeting invitations for it are not sent: Outlook sends them after saving, from the stored event, which then holds only placeholders. Send meeting invitations from RapidMX instead, or leave the calendar out of zero-access.
+- **Plugins.** The booking plugin seals the event it puts on a protected calendar, and composes the invitation it mails the booker from the booking itself. The booking record keeps the booker's name, notes and location readable: the booking page and the host's booking list need them.
+
 ### Ordering Within the Delivery Path
 
 The sequence is load-bearing and MUST be:

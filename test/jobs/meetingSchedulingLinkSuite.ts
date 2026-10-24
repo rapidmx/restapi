@@ -247,8 +247,8 @@ export function meetingSchedulingLinkSuite(ctx: MeetingSchedulingLinkSuiteContex
             });
             await ctx.createLink({ mailboxUid: ctx.mailboxUid(), calendarEventUid: event.uid, attendeeAddress: ALICE, url: ALICE_URL });
             await ctx.createLink({ mailboxUid: ctx.mailboxUid(), calendarEventUid: event.uid, attendeeAddress: BOB, url: BOB_URL });
-            const real = ctx.job().scanPipeline.run.bind(ctx.job().scanPipeline);
-            vi.spyOn(ctx.job().scanPipeline, "run").mockImplementation(async (raw: any, envelope: any, options: any) =>
+            const real = ctx.job().inviteSender.scanPipeline.run.bind(ctx.job().inviteSender.scanPipeline);
+            vi.spyOn(ctx.job().inviteSender.scanPipeline, "run").mockImplementation(async (raw: any, envelope: any, options: any) =>
                 envelope?.to?.includes(ALICE) ? Promise.reject(new Error("simulated scan failure")) : real(raw, envelope, options),
             );
 

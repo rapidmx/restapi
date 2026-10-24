@@ -15,6 +15,7 @@ import {
     FolderSQL,
     IngestQueueEntrySQL,
     KeyVaultSQL,
+    EncryptionPolicySQL,
     MailboxSQL,
     MailFilterRuleSQL,
     MessageSQL,
@@ -53,6 +54,7 @@ export class ScanQueueJobSQL extends ScanQueueJob<
     protected correspondentClass: any = CorrespondentSQL;
     protected domainClass: any = DomainSQL;
     protected keyVaultClass: any = KeyVaultSQL;
+    protected encryptionPolicyClass: any = EncryptionPolicySQL;
     protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestSQL;
     protected zeroAccessIndexEntryClass: any = ZeroAccessIndexEntrySQL;
 

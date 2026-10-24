@@ -21,6 +21,7 @@ import { htmlMailSuite } from "../htmlMailSuite.js";
 import { senderListsSuite } from "../senderListsSuite.js";
 import { eventDialogItipSuite } from "../eventDialogItipSuite.js";
 import { registerTestDoubles, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
+import { openSealedField, testZeroAccessKey } from "../../zeroAccessTestKeys.js";
 import { ScanQueueJobSQL } from "../../../src/jobs/sql/ScanQueueJobSQL.js";
 import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
@@ -34,6 +35,7 @@ import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
 import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { KeyVaultSQL } from "../../../src/models/sql/KeyVaultSQL.js";
+import { EncryptionPolicySQL } from "../../../src/models/sql/EncryptionPolicySQL.js";
 import { FocusedInboxOverrideSQL } from "../../../src/models/sql/FocusedInboxOverrideSQL.js";
 import { CorrespondentSQL } from "../../../src/models/sql/CorrespondentSQL.js";
 import { OofReplySuppressionSQL } from "../../../src/models/sql/OofReplySuppressionSQL.js";
@@ -293,6 +295,7 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         models.set("ContactSQL", ContactSQL);
         models.set("DomainSQL", DomainSQL);
         models.set("KeyVaultSQL", KeyVaultSQL);
+        models.set("EncryptionPolicySQL", EncryptionPolicySQL);
         models.set("DataSubjectErasureRequestSQL", DataSubjectErasureRequestSQL);
         await connectionManager.connect(config.get("datastores"), models);
 
@@ -1895,6 +1898,23 @@ ${oversigningDkimSignature("example.com", "RapidMX-Key", "Autocrypt")}`,
             const messages = await messageRepo.find({ where: { folderUid: inbox!.uid } });
             expect(messages).toHaveLength(1);
             expect(messages[0].meetingMethod).toBe("REQUEST");
+        });
+
+        it("Files an invitation sealed when zero-access covers the calendar but not the mail it came in.", async () => {
+            const za = await testZeroAccessKey();
+            await createMailbox({ zeroAccessKeys: [za.key], zeroAccessTypes: { mail: false, calendar: true } });
+            const icalUid = uuid.v4();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid }), "REQUEST")));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const [event]: any[] = (await calendarEventRepo.find({ where: { mailboxUid, icalUid } }));
+            expect(event.title).toBe("Protected event");
+            expect(JSON.stringify(event)).not.toContain("Team Sync");
+            expect(await openSealedField(event.sealedFields.title, za)).toBe("Team Sync");
         });
 
         it("Preserves encryptionOrigin: 'derived' on an existing event when a later resent REQUEST updates it - encryption state is sticky, never recomputed from the current message.", async () => {

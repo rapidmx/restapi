@@ -2601,6 +2601,10 @@ export interface CalendarEvent extends RecoverableBaseEntity {
      * Temporal fields, the organizer and the attendees stay plaintext, so free/busy and scheduling still work. */
     sealedContent?: SealedEventContent;
 
+    /** The protected title, location and description of an event of a calendar zero-access encryption covers, sealed field by field to the
+     * mailbox's zero-access key (`zeroaccess/ZeroAccessFieldSealer.ts`); `title` then shows "Protected event". Written by the server only. */
+    sealedFields?: Record<string, string> | null;
+
     /**
      * The identifier of the video meeting a compose client linked to this event, if any - e.g. a
      * `@rapidmx/meet-plugin` `VideoMeeting.uid`, named here generically and by name only: this library

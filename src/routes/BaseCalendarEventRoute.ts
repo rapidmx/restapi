@@ -72,6 +72,9 @@ import {
     SealedEventContent,
     RecipientType,
 } from "../models/types.js";
+import { hasSealedFields } from "../zeroaccess/ZeroAccessFieldSealer.js";
+import { ZeroAccessRouteSealing } from "../zeroaccess/ZeroAccessRouteSealing.js";
+import { type InvitationContent, MeetingInviteSender, protectedInvitationsPending } from "../scheduling/MeetingInviteSender.js";
 const { Config, Init, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Auth, Get, Param, Post, RateLimit, Request, User: AuthUser } = RouteDecorators;
@@ -158,6 +161,11 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     protected mailboxRepo?: RepoUtils<any>;
     protected messageRepo?: RepoUtils<any>;
     protected folderRepo?: RepoUtils<any>;
+    /** The backend's `EncryptionPolicy` model, for zero-access sealing of events (`ZeroAccessRouteSealing`). */
+    protected encryptionPolicyClass?: any;
+    protected sealing?: ZeroAccessRouteSealing;
+    /** Sends the invitations of a protected event at save time (`sendProtectedInvitations()`). */
+    protected inviteSender?: MeetingInviteSender;
     protected correspondentRepo?: RepoUtils<any>;
     protected correspondentUtils?: CorrespondentUtils;
 
@@ -182,6 +190,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             obj.icalUid = boundIndexedValue(obj.icalUid);
         }
         BaseCalendarEventRoute.normalizeDescriptionAndPolicy(obj, true);
+        // A request's invitation content is for composing invitations only, never stored (`takeInvitationContent()`).
+        delete obj.invitationContent;
         if (GUEST_PERMISSION_FIELDS.some((field) => field in obj) && !(await this.isOrganizedByOwner(existing))) {
             // An attendee's copy holds the permissions the organizer sent: an edit of them on a copy the mailbox doesn't organize is
             // ignored (not refused, so a full object read back and written again still works).
@@ -192,6 +202,11 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (BaseCalendarEventRoute.changesInvitation(obj, existing) && !(typeof obj.sequence === "number" && obj.sequence > existing.sequence)) {
             // The description, visibility and guest permissions travel in the invitation, so changing one is a scheduling-relevant change.
             obj.sequence = existing.sequence + 1;
+        }
+        // Sealed last, once everything above has read the plaintext. An event made from a zero-access invitation keeps its own sealing
+        // (`keepSealed()`, one sealed blob).
+        if (!(existing as any).sealedContent) {
+            await this.sealing?.seal(obj, existing);
         }
     }
 
@@ -240,6 +255,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         delete obj.sealedContent;
         BaseCalendarEventRoute.assertParticipants(obj);
         BaseCalendarEventRoute.normalizeDescriptionAndPolicy(obj, false);
+        delete obj.invitationContent;
+        await this.sealing?.seal(obj, undefined);
     }
 
     /**
@@ -360,6 +377,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                 args: [this.correspondentClass],
             });
         }
+        if (!this.sealing && this.encryptionPolicyClass) {
+            this.sealing = await ZeroAccessRouteSealing.create(this._objectFactory, "calendar", this.mailboxClass, this.encryptionPolicyClass);
+        }
         if (!this.correspondentUtils && this.correspondentClass) {
             this.correspondentUtils = await this._objectFactory.newInstance(CorrespondentUtils, {
                 name: this.correspondentClass.name,
@@ -377,14 +397,49 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     /** Coerces every date field to a real `Date` (a `400` for an unparseable one) before anything is saved - see
      * `util/DateCoercionUtils.ts` for why MongoDB would otherwise store the client's ISO strings as strings. */
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
+        const contents: (InvitationContent | undefined)[] = [];
         for (const single of Array.isArray(obj) ? obj : [obj]) {
             coerceCalendarEventDates(single);
+            contents.push(BaseCalendarEventRoute.takeInvitationContent(single, true));
         }
         const created: T | T[] = await super.create(obj, req, user);
-        for (const event of Array.isArray(created) ? created : [created]) {
-            await this.recordEventCorrespondents(event);
+        const events: T[] = Array.isArray(created) ? created : [created];
+        for (let i = 0; i < events.length; i++) {
+            await this.recordEventCorrespondents(events[i]);
+            await this.sendProtectedInvitations(events[i], contents[i]);
         }
         return created;
+    }
+
+    /** `event` named by the request's `invitationContent` when its own content is sealed - what a reply or a change request about it says;
+     * `event` itself otherwise, or when the request sends none. */
+    private static withInvitationContent<E extends CalendarEvent>(event: E, body: any): E {
+        const content: InvitationContent | undefined = hasSealedFields(event) ? BaseCalendarEventRoute.takeInvitationContent(body, false) : undefined;
+        return content ? { ...event, ...content } : event;
+    }
+
+    /**
+     * The title, location and description an invitation for `obj` (a create or update body) is composed with: its `invitationContent`
+     * when the client sends one - all of them, also those it doesn't change (a client editing a protected event sends only the fields it
+     * changes, so that a change is recognized; the stored ones are sealed and the server can't compare them) - else, on a create, the
+     * body's own fields. `undefined` when there is no title to compose with.
+     */
+    private static takeInvitationContent(obj: any, create: boolean): InvitationContent | undefined {
+        const given: any = obj?.invitationContent && typeof obj.invitationContent === "object" ? obj.invitationContent : create ? obj : undefined;
+        const text = (value: unknown): string | undefined => (typeof value === "string" && value.length > 0 ? value : undefined);
+        const title: string | undefined = text(given?.title);
+        return title ? { title, location: text(given.location), description: text(given.description), descriptionHtml: text(given.descriptionHtml) } : undefined;
+    }
+
+    /** Sends the invitations of a protected event at save time, from the request's plaintext `content` - see
+     * `MeetingInviteSender.sendProtectedInvitations()`. */
+    private async sendProtectedInvitations(event: T, content: InvitationContent | undefined): Promise<void> {
+        if (!protectedInvitationsPending(event)) {
+            return;
+        }
+        // Built on first use: most events are never protected.
+        this.inviteSender ??= await this._objectFactory!.newInstance(MeetingInviteSender, { name: "MeetingInviteSender", args: [this.mailboxRepo, undefined] });
+        await this.inviteSender.sendProtectedInvitations(event, content, this.repoUtils!, "BaseCalendarEventRoute");
     }
 
     /** Records an event's organizer and attendees as correspondents of the mailbox it is on, for recipient suggestions.
@@ -399,11 +454,13 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         coerceCalendarEventDates(obj);
+        const content: InvitationContent | undefined = BaseCalendarEventRoute.takeInvitationContent(obj, false);
         const existing: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
         if (existing && this.isSchedulingRelevantChange(existing, obj)) {
             (obj as any).sequence = existing.sequence + 1;
         }
         const updated: T = await super.update(id, obj, req, user);
+        await this.sendProtectedInvitations(updated, content);
         // Only an update that names the people involved is a new sighting of them (a move or a rename is not).
         if ((obj as any).attendees !== undefined || (obj as any).organizer !== undefined) {
             await this.recordEventCorrespondents(updated);
@@ -508,7 +565,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         }
 
         const updatedAttendee: Attendee = { ...respondingAttendee, responseStatus };
-        const ics = buildEventIcs({ ...event, attendees: [updatedAttendee] }, "REPLY", { onlyAttendee: updatedAttendee });
+        // A protected event's reply names it by the title the reader's client sends, not the stored placeholder.
+        const shown: T = BaseCalendarEventRoute.withInvitationContent(event, body);
+        const ics = buildEventIcs({ ...shown, attendees: [updatedAttendee] }, "REPLY", { onlyAttendee: updatedAttendee });
 
         let result: T | { uid: string };
         if (responseStatus === AttendeeResponseStatus.DECLINED) {
@@ -523,7 +582,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             );
         }
 
-        await this.sendItipReply(event, mailbox, respondingAttendee, body.responseStatus, ics);
+        await this.sendItipReply(shown, mailbox, respondingAttendee, body.responseStatus, ics);
 
         return result;
     }
@@ -619,19 +678,22 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             startDate?: string;
             endDate?: string;
             addAttendees?: { address: string; displayName?: string }[];
+            invitationContent?: InvitationContent;
         } | undefined,
         @AuthUser user?: JWTUser,
     ): Promise<{ requested: true; changes: string[]; addAttendees: { address: string; displayName?: string }[] }> {
         if (!this.repoUtils || !this.mailTransport) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
-        const event: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
-        if (!event) {
+        const stored: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
+        if (!stored) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        if (!(await this.hasMailAccess(user, event.folderUid, ACLAction.UPDATE))) {
+        if (!(await this.hasMailAccess(user, stored.folderUid, ACLAction.UPDATE))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
+        // A protected event's request names it, and compares the asked-for changes with it, by what the reader's client sends.
+        const event: T = BaseCalendarEventRoute.withInvitationContent(stored, body);
         const invalid = (message: string): ApiError => new ApiError(ApiErrors.INVALID_REQUEST, 400, message);
         if (!body || typeof body !== "object" || Array.isArray(body)) {
             throw invalid(ApiErrorMessages.INVALID_REQUEST);
@@ -1221,6 +1283,11 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                           }
                         : {}),
                 };
+                // The invitation's content is in this request (decrypted by the reader for a zero-access message): sealed when the calendar
+                // is protected, never stored readable then.
+                if (!(existing as any).sealedContent) {
+                    await this.sealing?.seal(patch, existing);
+                }
                 try {
                     await this.repoUtils!.update(patch, existing as any, { user, ignoreACL: true });
                     return;
@@ -1252,19 +1319,18 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                 })),
             );
             const Entity = this.modelClass;
+            const filed: any = {
+                ...this.eventFromInvite(parsed, attendees, mailbox.uid),
+                // The uid inbound processing (`ScanQueueJob`) derives for the same invitation, so the two can't make two copies.
+                uid: filedUid,
+                folderUid: folder.uid,
+                busyStatus,
+                // Somebody else's invitation: marked as already sent, so the scheduling job never mails it again as though this mailbox organized it.
+                inviteSequenceSent: parsed.sequence,
+            };
+            await this.sealing?.seal(filed, undefined);
             try {
-                await this.repoUtils!.create(
-                    new Entity({
-                        ...this.eventFromInvite(parsed, attendees, mailbox.uid),
-                        // The uid inbound processing (`ScanQueueJob`) derives for the same invitation, so the two can't make two copies.
-                        uid: filedUid,
-                        folderUid: folder.uid,
-                        busyStatus,
-                        // Somebody else's invitation: marked as already sent, so the scheduling job never mails it again as though this mailbox organized it.
-                        inviteSequenceSent: parsed.sequence,
-                    }),
-                    { user, ignoreACL: true },
-                );
+                await this.repoUtils!.create(new Entity(filed), { user, ignoreACL: true });
                 return;
             } catch (err: any) {
                 // Inbound processing filed its copy between the lookup and here: answer on that one.

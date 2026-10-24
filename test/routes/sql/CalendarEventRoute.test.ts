@@ -25,6 +25,7 @@ import { AttendeeResponseStatus, AttendeeRole, BusyStatus, CalendarEventStatus, 
 import { calendarInviteSuite, type CalendarInviteSuiteContext } from "../calendarInviteSuite.js";
 import { calendarEventDialogSuite } from "../calendarEventDialogSuite.js";
 import { registerTestDoubles, RecordingMailTransport, type InMemoryBlobStore } from "../../testDoubles.js";
+import { openSealedField, testZeroAccessKey } from "../../zeroAccessTestKeys.js";
 
 describe("Route:CalendarEventSQL Tests", () => {
     const logger = Logger();
@@ -979,5 +980,116 @@ describe("Route:CalendarEventSQL Tests", () => {
         },
         findEvent: async (uid) => (await calendarEventRepo.findOne({ where: { uid } }))!,
         shareLinksUrl: "/sql/calendar-share-links",
+    });
+
+    describe("zero-access encryption of calendar events", () => {
+        const protect = async (types: any) => {
+            const mailbox: any = await createMailbox(owner.uid);
+            const za = await testZeroAccessKey();
+            mailbox.zeroAccessKeys = [za.key];
+            mailbox.zeroAccessTypes = types;
+            await mailboxRepo.save(mailbox);
+            const folder = await createFolder(mailbox.uid);
+            return { mailbox, folder, za };
+        };
+        const stored = async (uid: string): Promise<any> => await calendarEventRepo.findOne({ where: { uid } });
+        const transport = () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const meeting = (mailbox: any, folder: any, fields: any = {}) => ({
+            mailboxUid: mailbox.uid,
+            folderUid: folder.uid,
+            title: "CANARY board meeting",
+            location: "CANARY room 4",
+            description: "CANARY agenda",
+            startDate: "2026-11-02T10:00:00.000Z",
+            endDate: "2026-11-02T11:00:00.000Z",
+            organizer: { address: mailbox.primarySmtpAddress, displayName: "Owner", type: "to" },
+            attendees: [{ address: "bob@example.org", role: "required", responseStatus: "needsAction" }],
+            ...fields,
+        });
+
+        it("Seals a protected event's title, location and description, and sends its invitations at save time with the real title", async () => {
+            const { mailbox, folder, za } = await protect({ calendar: true });
+            transport().sent = [];
+            const result = await request(server.getApplication())
+                .post(baseUrl)
+                .set("Authorization", "jwt " + ownerToken)
+                .send(meeting(mailbox, folder));
+
+            expect(result.status, JSON.stringify(result.body)).toBe(200);
+            const row = await stored(result.body.uid);
+            expect(row.title).toBe("Protected event");
+            expect(row.location ?? null).toBeNull();
+            expect(JSON.stringify(row)).not.toContain("CANARY");
+            expect(await openSealedField(row.sealedFields.title, za)).toBe("CANARY board meeting");
+            expect(row.inviteSequenceSent).toBe(row.sequence);
+            expect(transport().sent).toHaveLength(1);
+            expect(transport().sent[0].envelopeTo).toEqual(["bob@example.org"]);
+            const raw = transport().sent[0].raw.toString();
+            expect(raw).toContain("Invitation: CANARY board meeting");
+            expect(raw).toContain("METHOD:REQUEST");
+        });
+
+        it("Re-invites with the invitation content when only the time changes, and sends nothing without it", async () => {
+            const { mailbox, folder } = await protect({ calendar: true });
+            const created = (await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send(meeting(mailbox, folder))).body;
+            transport().sent = [];
+
+            const moved = await request(server.getApplication())
+                .put(`${baseUrl}/${created.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({
+                    uid: created.uid,
+                    version: created.version + 1,
+                    startDate: "2026-11-02T12:00:00.000Z",
+                    endDate: "2026-11-02T13:00:00.000Z",
+                    invitationContent: { title: "CANARY board meeting", location: "CANARY room 4" },
+                });
+            expect(moved.status, JSON.stringify(moved.body)).toBe(200);
+            expect(transport().sent).toHaveLength(1);
+            expect(transport().sent[0].raw.toString()).toContain("CANARY room 4");
+            const row = await stored(created.uid);
+            expect(row.sealedFields.location).toEqual(expect.any(String));
+            expect(JSON.stringify(row)).not.toContain("CANARY");
+
+            transport().sent = [];
+            const silent = await request(server.getApplication())
+                .put(`${baseUrl}/${created.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: created.uid, version: row.version, startDate: "2026-11-02T14:00:00.000Z", endDate: "2026-11-02T15:00:00.000Z" });
+            expect(silent.status).toBe(200);
+            expect(transport().sent).toHaveLength(0);
+        });
+
+        it("Names a protected event in a reply by the title the client sends, and by its placeholder without one", async () => {
+            const { mailbox, folder } = await protect({ calendar: true });
+            const invited = async () =>
+                await createCalendarEvent(mailbox.uid, folder.uid, {
+                    title: "Protected event",
+                    sealedFields: { title: "c2VhbGVk" },
+                    organizer: { address: "organizer@example.com", displayName: "Organizer", type: "to" },
+                    attendees: [{ address: mailbox.primarySmtpAddress, displayName: "Me", role: "required", responseStatus: "needsAction", isOrganizer: false }],
+                });
+            const respond = async (event: any, body: any) =>
+                request(server.getApplication()).post(`${baseUrl}/${event.uid}/respond`).set("Authorization", "jwt " + ownerToken).send(body);
+
+            transport().sent = [];
+            expect((await respond(await invited(), { responseStatus: "accepted", invitationContent: { title: "Quarterly review" } })).status).toBe(200);
+            expect(transport().sent[0].raw.toString()).toContain("Accepted: Quarterly review");
+
+            transport().sent = [];
+            expect((await respond(await invited(), { responseStatus: "tentative" })).status).toBe(200);
+            expect(transport().sent[0].raw.toString()).toContain("Tentative: Protected event");
+        });
+
+        it("Stores an event readable while the calendar isn't protected, leaving its invitations to the scheduling job", async () => {
+            const { mailbox, folder } = await protect({ calendar: false });
+            transport().sent = [];
+            const result = await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send(meeting(mailbox, folder));
+            expect(result.status).toBe(200);
+            const row = await stored(result.body.uid);
+            expect(row.title).toBe("CANARY board meeting");
+            expect(row.sealedFields ?? null).toBeNull();
+            expect(transport().sent).toHaveLength(0);
+        });
     });
 });

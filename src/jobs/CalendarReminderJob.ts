@@ -7,6 +7,7 @@ import { ApiErrors, BackgroundService, NotificationUtils, ObjectFactory } from "
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { expandOccurrences, OccurrenceWindow } from "../util/IcsUtils.js";
 import { CalendarEvent, CalendarEventStatus } from "../models/types.js";
+import { hasSealedFields } from "../zeroaccess/ZeroAccessFieldSealer.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 const MS_PER_MINUTE = 60 * 1000;
@@ -342,6 +343,8 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
             title: event.title,
             startDate: occurrence.start,
             location: event.location,
+            // The title and location are placeholders: the client opens the event by its uid to show the real ones.
+            ...(hasSealedFields(event) ? { protected: true } : {}),
         });
     }
 

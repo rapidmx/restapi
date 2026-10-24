@@ -14,6 +14,7 @@ import {
     FolderMongo,
     IngestQueueEntryMongo,
     KeyVaultMongo,
+    EncryptionPolicyMongo,
     MailboxMongo,
     MailFilterRuleMongo,
     MessageMongo,
@@ -52,6 +53,7 @@ export class ScanQueueJobMongo extends ScanQueueJob<
     protected correspondentClass: any = CorrespondentMongo;
     protected domainClass: any = DomainMongo;
     protected keyVaultClass: any = KeyVaultMongo;
+    protected encryptionPolicyClass: any = EncryptionPolicyMongo;
     protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestMongo;
     protected zeroAccessIndexEntryClass: any = ZeroAccessIndexEntryMongo;
 }

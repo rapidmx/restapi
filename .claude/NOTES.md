@@ -4546,3 +4546,14 @@ Phase 1 (restapi): the key model.
     - SQL needs `type: "boolean"` for `boolean | null`.
   - Server-created contacts are **not** sealed on creation: key contacts from lookup, trust and headers, and suggested contacts. They hold only an address and a mail-header name, which `Correspondent` keeps readable anyway, and the first user edit seals them. The spec says so.
   - ActiveSync contact writes are sealed by `SyncCommand.sealDeviceWrite` once restapi exports contacts in `PROTECTED_FIELDS`.
+
+### 2026-10-24: Zero-access for calendar - Phase 5 (server)
+- `EVENT_PROTECTED_FIELDS` = title (placeholder "Protected event"), location, description, descriptionHtml. `CalendarEvent.sealedFields` (json column, both backends). The legacy `sealedContent` (ZAE-mail-derived events) is left alone: an event that has it isn't re-sealed.
+- `BaseCalendarEventRoute` seals in `prepareCreate`/`prepareUpdate` through `ZeroAccessRouteSealing` (only when the subclass sets `encryptionPolicyClass`), and in `putInviteOnCalendar`.
+- **Invitations at save time:** `scheduling/MeetingInviteSender` (extracted from `MeetingSchedulingJob`; `organizerIdentity`, `sendToAttendees`). The route takes `invitationContent` off the body (never stored), and for a protected event claims `inviteSequenceSent` then sends with that content (on create the body itself is the content). No content -> nothing sent, warning logged, left pending.
+  - `MeetingSchedulingJob` skips REQUESTs for events with `sealedFields`; CANCELs still go, with the placeholder title.
+  - `respond`/`requestChange`/`sendItipReply` use `withInvitationContent(event, body)`.
+- `ScanQueueJob.protectedCalendarContent` seals an inbound invitation's content when the calendar is protected but the mail isn't (`encryptionPolicyClass` on the backend subclasses; SQL tests must register `EncryptionPolicySQL`).
+- The guard + claim + send live in `MeetingInviteSender.sendProtectedInvitations(event, content, eventRepo, source)` (+ `protectedInvitationsPending`), exported from the package root with `InvitationContent`: the route, activesync (a device Add) and anything else that saves a protected event with plaintext in hand call it.
+- `CalendarReminderJob` adds `protected: true` to a sealed event's reminder payload; web-client then reads the event by uid to show its real title.
+- Siblings: activesync invites a device's Add (not a Change - it carries placeholders); mapi seals `saveAppointment` (Outlook's own invites for protected events are not sent - documented); booking-plugin seals its event and composes the booker's ICS from the booking (`bookingEventContent`). All take `encryptionPolicyClass` + `newZeroAccessRecordSealer`.

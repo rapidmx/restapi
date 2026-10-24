@@ -2,27 +2,15 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ObjectDecorators } from "@rapidrest/core";
+import { type MailboxIdentity, MeetingInviteSender } from "../scheduling/MeetingInviteSender.js";
 import { ApiErrors, BackgroundService, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
-import { BlobStore } from "../blob/BlobStore.js";
-import { ScanPipeline } from "../scan/ScanPipeline.js";
-import { normalizeAddress } from "../util/AddressUtils.js";
-import { guestPermissionsOf } from "../util/CalendarEventUtils.js";
-import { buildEventIcs } from "../util/IcsUtils.js";
-import { scanAndRelay } from "../util/MailSendUtils.js";
-import { isPlainAddress, safeDisplayName } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-import { sendOrThrow } from "../transport/TransportResultUtils.js";
-import type { MailTransport, OutboundMessage, TransportResult } from "../transport/MailTransport.js";
-import { Attendee, CalendarEvent, CalendarEventAttendeeLink, CalendarEventStatus, Mailbox } from "../models/types.js";
-const { Config, Init, Inject, Logger } = ObjectDecorators;
+import { CalendarEvent, CalendarEventStatus } from "../models/types.js";
+import { hasSealedFields } from "../zeroaccess/ZeroAccessFieldSealer.js";
+const { Config, Init, Logger } = ObjectDecorators;
 
 /** A mailbox's own identity, as this job sends for it: its (lowercased) addresses and its safe display name. */
-interface MailboxIdentity {
-    addresses: Set<string>;
-    displayName?: string;
-}
 
 /** A keyset position in `(dateModified, uid)` order. */
 interface InviteCursor {
@@ -109,14 +97,8 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
     protected mailboxRepo?: RepoUtils<any>;
     protected attendeeLinkRepo?: RepoUtils<any>;
 
-    @Inject("MailTransport")
-    private mailTransport?: MailTransport;
-
-    @Inject(ScanPipeline)
-    private scanPipeline?: ScanPipeline;
-
-    @Inject("BlobStore")
-    private blobStore?: BlobStore;
+    /** Composes and sends the invitations and cancellations - shared with the routes that send them at save time. */
+    protected inviteSender?: MeetingInviteSender;
 
     /** How often invitations and cancellations are mailed - every 10 seconds, so a guest hears of a deleted or cancelled meeting within moments, not minutes. */
     @Config("mail:jobs:meeting_scheduling:schedule", "*/10 * * * * *")
@@ -173,6 +155,10 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                 args: [this.attendeeLinkClass],
             });
         }
+        this.inviteSender ??= await this._objectFactory.newInstance(MeetingInviteSender, {
+            name: "MeetingInviteSender",
+            args: [this.mailboxRepo, this.attendeeLinkRepo, this],
+        });
     }
 
     public async start(): Promise<void> {
@@ -196,25 +182,8 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
 
     /** The owning mailbox's identity when `event`'s organizer is one of that mailbox's own addresses - i.e. this row is
      * the organizer's copy, not an attendee copy received from someone else; otherwise `undefined`. */
-    private async organizerIdentity(event: CE, cache: Map<string, MailboxIdentity>): Promise<MailboxIdentity | undefined> {
-        const organizerAddress: string = (event.organizer?.address ?? "").trim().toLowerCase();
-        if (!organizerAddress || !event.mailboxUid) {
-            return undefined;
-        }
-        let identity: MailboxIdentity | undefined = cache.get(event.mailboxUid);
-        if (!identity) {
-            const mailbox: Mailbox | undefined = await this.mailboxRepo?.findOne(event.mailboxUid, { ignoreACL: true });
-            identity = {
-                addresses: new Set(
-                    (mailbox ? [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])] : [])
-                        .filter((address) => typeof address === "string")
-                        .map((address) => address.trim().toLowerCase()),
-                ),
-                displayName: safeDisplayName(mailbox?.displayName),
-            };
-            cache.set(event.mailboxUid, identity);
-        }
-        return identity.addresses.has(organizerAddress) ? identity : undefined;
+    private organizerIdentity(event: CE, cache: Map<string, MailboxIdentity>): Promise<MailboxIdentity | undefined> {
+        return this.inviteSender!.organizerIdentity(event, cache);
     }
 
     /** Applies `changes` with an optimistic-lock update. Returns `false` (instead of throwing) only for a version
@@ -344,6 +313,11 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                 if (event.inviteSequenceSent !== undefined && event.inviteSequenceSent === event.sequence) {
                     continue;
                 }
+                // A protected event's title is sealed: its invitations are sent by the route that saves it, from the request's plaintext
+                // (`BaseCalendarEventRoute.sendProtectedInvitations()`), never composed here from placeholders. Left pending, not stamped.
+                if (hasSealedFields(event)) {
+                    continue;
+                }
 
                 const organizer: MailboxIdentity | undefined = await this.organizerIdentity(event, identities);
 
@@ -430,179 +404,8 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
         }
     }
 
-    /**
-     * Mails the event's iTIP `method` to every mailable attendee except the organizer (see this class's doc comment): one
-     * message, composed as the organizer's mailbox identity and scanned once by `scanAndRelay()`, relayed to each
-     * attendee on its own envelope. A failure for one attendee is logged and the rest still go out (see this class's doc
-     * comment for why the row stays claimed); a refused scan, or no attendee accepting it, throws.
-     *
-     * The exceptions are a `REQUEST` for an event carrying a `videoMeetingUid`, and any `REQUEST`/`CANCEL` for an event whose guests
-     * can't see the guest list, which are handed to `sendPerAttendee()` instead - see its own doc comment. Everything above it here (the plain-address filter,
-     * the deduplication that also excludes the organizer's own address, the attendee cap, the "nobody left to mail"
-     * early return) is shared by both paths and deliberately identical for them.
-     */
+    /** Mails the event's iTIP `method` to its attendees as `organizer` - `MeetingInviteSender.sendToAttendees()`. */
     private async sendToAttendees(event: CE, organizer: MailboxIdentity, method: "request" | "cancel"): Promise<void> {
-        const what: string = method === "cancel" ? "cancellation" : "invite";
-        const seen: Set<string> = new Set([normalizeAddress(event.organizer.address)]);
-        const recipients: string[] = [];
-        const listed: Attendee[] = [];
-        for (const attendee of event.attendees) {
-            if (!attendee?.address) {
-                continue;
-            }
-            if (!isPlainAddress(attendee.address)) {
-                this.logger?.warn(`MeetingSchedulingJob: skipping an attendee of event ${event.uid} that isn't a plain address: ${JSON.stringify(String(attendee.address).slice(0, 100))}`);
-                continue;
-            }
-            listed.push({ ...attendee, displayName: safeDisplayName(attendee.displayName) });
-            const normalized: string = normalizeAddress(attendee.address);
-            if (!seen.has(normalized)) {
-                seen.add(normalized);
-                recipients.push(attendee.address);
-            }
-        }
-        if (recipients.length === 0) {
-            return;
-        }
-        if (recipients.length > Number(this.maxAttendees)) {
-            this.logger?.error(
-                `MeetingSchedulingJob: not sending the ${what} for event ${event.uid} - it has ${recipients.length} attendees, more than the ${this.maxAttendees} allowed.`,
-            );
-            return;
-        }
-
-        // The only branches on the way to a send, and the only ones an event with no linked video meeting and a
-        // visible guest list ever evaluates: plain field reads of a row already in memory, no query. Everything below
-        // them - the whole compose-once, fan-out-by-envelope path - is untouched for such an event.
-        const hiddenGuestList: boolean = !guestPermissionsOf(event).guestsCanSeeGuestList;
-        if ((method === "request" && event.videoMeetingUid) || hiddenGuestList) {
-            await this.sendPerAttendee(event, organizer, listed, recipients, method, what, hiddenGuestList);
-            return;
-        }
-
-        const mailed: CE = { ...event, organizer: { ...event.organizer, displayName: organizer.displayName }, attendees: listed };
-        const ics: string = buildEventIcs(mailed, method === "cancel" ? "CANCEL" : "REQUEST");
-        const composed: Buffer = await new MailComposer({
-            from: organizer.displayName ? { name: organizer.displayName, address: event.organizer.address } : event.organizer.address,
-            to: recipients,
-            subject: method === "cancel" ? `Cancelled: ${event.title}` : `Invitation: ${event.title}`,
-            text: method === "cancel" ? `This meeting has been cancelled: ${event.title}` : `You have been invited to: ${event.title}${this.descriptionNote(event)}`,
-            icalEvent: { method, content: ics },
-        })
-            .compile()
-            .build();
-
-        // One relay per attendee, each through `sendOrThrow()`; `scanAndRelay()` sees the whole fan-out as one send.
-        const fanOut = {
-            send: async (outbound: OutboundMessage): Promise<TransportResult> => {
-                const result: TransportResult = { accepted: [], rejected: [] };
-                for (const to of outbound.envelopeTo) {
-                    try {
-                        await sendOrThrow(this.mailTransport!, { ...outbound, envelopeTo: [to] });
-                        result.accepted.push(to);
-                    } catch (err: any) {
-                        result.rejected.push(to);
-                        this.logger?.warn(`MeetingSchedulingJob: failed to send ${what} for event ${event.uid} to ${to}: ${err.message}`);
-                    }
-                }
-                return result;
-            },
-        };
-        await scanAndRelay(composed, event.organizer.address, recipients, this.scanPipeline!, fanOut, this.blobStore!);
-    }
-
-    /** The event's plain-text description as a paragraph to add to an invitation's body, or `""` when it has none. */
-    private descriptionNote(event: CE): string {
-        return event.description ? `\n\n${event.description}` : "";
-    }
-
-    /**
-     * Mails an event's `method` (`REQUEST` or `CANCEL`) as one message composed, scanned and relayed *per attendee*, for the
-     * two events that can't share one message between everybody:
-     *
-     * - **A `REQUEST` for an event with a linked video meeting**: each attendee's copy carries that attendee's own
-     * personalized link (their own `LOCATION`, and a line naming it in the body) from this event's `CalendarEventAttendeeLink`
-     * rows - see this class's doc comment for why that lookup is generic and knows nothing of whichever plugin wrote those rows.
-     * Every fallback here is graceful and per-attendee: a lookup that fails outright, one that returns nothing, and one that
-     * returns rows for only some attendees all end in the same place - an attendee with no matching row gets the event's own
-     * plain stored `location` and today's plain invite text, exactly what the shared path would have mailed them.
-     * - **An event whose guests can't see the guest list** (`CalendarEvent.guestsCanSeeGuestList` `false`; `hiddenGuestList`), a
-     * `REQUEST` *and* a `CANCEL`: each attendee's copy lists only that attendee (and the organizer's own attendee entry, if the
-     * event has one - the `ORGANIZER` line names the organizer regardless), so the copy that lands in their calendar never holds
-     * anyone else. The organizer's own row still lists everyone.
-     *
-     * `recipients` is the shared, already-deduplicated recipient list, which never contains the organizer's own address; a stray
-     * `CalendarEventAttendeeLink` row for the organizer therefore cannot cause a message to them, since this only ever mails
-     * addresses that list already holds.
-     */
-    private async sendPerAttendee(
-        event: CE,
-        organizer: MailboxIdentity,
-        listed: Attendee[],
-        recipients: string[],
-        method: "request" | "cancel",
-        what: string,
-        hiddenGuestList: boolean,
-    ): Promise<void> {
-        const links: Map<string, { url: string; label?: string }> = new Map();
-        try {
-            if (method === "request" && event.videoMeetingUid) {
-                // Bounded by the same cap the attendee list itself is bounded by - there can be no more useful rows
-                // than there are attendees this job is willing to mail.
-                const rows: CalendarEventAttendeeLink[] = await this.attendeeLinkRepo!.find(
-                    { calendarEventUid: ModelUtils.literal(event.uid), limit: Number(this.maxAttendees) } as any,
-                    { ignoreACL: true, limit: Number(this.maxAttendees) },
-                );
-                for (const row of rows) {
-                    links.set(normalizeAddress(row.attendeeAddress), { url: row.url, label: row.label });
-                }
-            }
-        } catch (err: any) {
-            // Never abort the send over this: an empty map means every attendee falls back to the event's own
-            // stored location, which is exactly what would have been mailed before personalization existed.
-            this.logger?.warn(`MeetingSchedulingJob: failed to read personalized attendee links for event ${event.uid}: ${err.message}`);
-        }
-        const organizerAddress: string = normalizeAddress(event.organizer.address);
-
-        // Each attendee's own relay, through `sendOrThrow()` exactly like the shared path's fan-out - a transport
-        // that reports its one recipient as rejected still counts as a failure.
-        const relay = {
-            name: this.mailTransport!.name,
-            send: async (outbound: OutboundMessage): Promise<TransportResult> => await sendOrThrow(this.mailTransport!, outbound),
-        };
-        // Identical for every copy - only the location and the body's link line differ per attendee.
-        const from = organizer.displayName ? { name: organizer.displayName, address: event.organizer.address } : event.organizer.address;
-        for (const to of recipients) {
-            try {
-                const link: { url: string; label?: string } | undefined = links.get(normalizeAddress(to));
-                const attendee: string = normalizeAddress(to);
-                const mailed: CE = {
-                    ...event,
-                    organizer: { ...event.organizer, displayName: organizer.displayName },
-                    attendees: hiddenGuestList
-                        ? listed.filter((entry) => normalizeAddress(entry.address) === attendee || normalizeAddress(entry.address) === organizerAddress)
-                        : listed,
-                    location: link ? link.url : event.location,
-                };
-                const ics: string = buildEventIcs(mailed, method === "cancel" ? "CANCEL" : "REQUEST");
-                const composed: Buffer = await new MailComposer({
-                    from,
-                    to: [to],
-                    subject: method === "cancel" ? `Cancelled: ${event.title}` : `Invitation: ${event.title}`,
-                    text:
-                        method === "cancel"
-                            ? `This meeting has been cancelled: ${event.title}`
-                            : link
-                              ? `You have been invited to: ${event.title}\n\nJoin the video call: ${link.url}${this.descriptionNote(event)}`
-                              : `You have been invited to: ${event.title}${this.descriptionNote(event)}`,
-                    icalEvent: { method, content: ics },
-                })
-                    .compile()
-                    .build();
-                await scanAndRelay(composed, event.organizer.address, [to], this.scanPipeline!, relay, this.blobStore!);
-            } catch (err: any) {
-                this.logger?.warn(`MeetingSchedulingJob: failed to send ${what} for event ${event.uid} to ${to}: ${err.message}`);
-            }
-        }
+        await this.inviteSender!.sendToAttendees(event, organizer, method);
     }
 }

@@ -23,6 +23,7 @@ import { Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import config from "../../config.js";
 import { registerTestDoubles, RecordingMailTransport, StaticDnsResolver } from "../../testDoubles.js";
+import { openSealedField, testZeroAccessKey } from "../../zeroAccessTestKeys.js";
 import { ScanQueueJobMongo } from "../../../src/jobs/mongo/ScanQueueJobMongo.js";
 import { IngestQueueEntryMongo } from "../../../src/models/mongo/IngestQueueEntryMongo.js";
 import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
@@ -2028,6 +2029,23 @@ ${oversigningDkimSignature("example.com", "RapidMX-Key", "Autocrypt")}`,
             const messages = await messageRepo.find({ folderUid: inbox!.uid }).toArray();
             expect(messages).toHaveLength(1);
             expect(messages[0].meetingMethod).toBe("REQUEST");
+        });
+
+        it("Files an invitation sealed when zero-access covers the calendar but not the mail it came in.", async () => {
+            const za = await testZeroAccessKey();
+            await createMailbox({ zeroAccessKeys: [za.key], zeroAccessTypes: { mail: false, calendar: true } });
+            const icalUid = uuid.v4();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(rawBlobKey, makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid }), "REQUEST")));
+            await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+
+            await job.run();
+
+            const [event]: any[] = (await calendarEventRepo.find({ mailboxUid, icalUid }).toArray());
+            expect(event.title).toBe("Protected event");
+            expect(JSON.stringify(event)).not.toContain("Team Sync");
+            expect(await openSealedField(event.sealedFields.title, za)).toBe("Team Sync");
         });
 
         it("Preserves encryptionOrigin: 'derived' on an existing event when a later resent REQUEST updates it - encryption state is sticky, never recomputed from the current message.", async () => {

@@ -85,6 +85,8 @@ import {
     ScanResult,
     ScanTargetType,
 } from "../models/types.js";
+import { sealFieldsOnWrite } from "../zeroaccess/ZeroAccessFieldSealer.js";
+import { EVENT_PROTECTED_FIELDS, newZeroAccessRecordSealer, type ZeroAccessRecordSealer } from "../zeroaccess/ZeroAccessRecordSealer.js";
 
 /** `true` if two `CalendarEvent.recurrenceId` values name the same occurrence (or both are the master row's
  * "no occurrence" `undefined`) - used to match an iTIP message to the right row among a master/override set
@@ -226,6 +228,9 @@ export abstract class ScanQueueJob<
      * (`CorrespondentUtils.recordCorrespondents()`), for recipient suggestions. */
     protected abstract correspondentClass: any;
     protected abstract domainClass: any;
+    /** The backend's `EncryptionPolicy` model, for sealing invitations into a calendar zero-access protects (`protectedCalendarContent()`). */
+    protected encryptionPolicyClass?: any;
+    private recordSealer?: ZeroAccessRecordSealer;
     protected abstract keyVaultClass: any;
     /** The `ZeroAccessIndexEntry` model class for this backend, supplied by the Mongo/SQL subclasses. Left unset, a zero-access
      * entry fails (its MTA retries) rather than being filed without its index entry. */
@@ -391,6 +396,9 @@ export abstract class ScanQueueJob<
     public async init(): Promise<void> {
         if (!this._objectFactory) {
             throw new Error("objectFactory is not set.");
+        }
+        if (!this.recordSealer && this.encryptionPolicyClass) {
+            this.recordSealer = await newZeroAccessRecordSealer(this._objectFactory, this.encryptionPolicyClass);
         }
         if (!this.ingestQueueRepo && this.ingestQueueClass) {
             this.ingestQueueRepo = await this._objectFactory.newInstance(RepoUtils, {
@@ -2686,6 +2694,26 @@ export abstract class ScanQueueJob<
      * (`CalendarEvent.encryptionOrigin`'s own doc comment). This inbound iTIP pipeline only ever produces
      * `"derived"` or `"none"` - `"originated"` is set by a client explicitly creating/marking its own
      * outbound invite as encrypted, a different code path entirely (see `MeetingSchedulingJob`). */
+    /**
+     * The sealed title, location and description an invitation's copy is filed with when the mail itself wasn't sealed but zero-access covers
+     * the mailbox's calendar (`specs/search.md` §3 *What It Covers*), the placeholders included - or `undefined` when its calendar isn't
+     * protected.
+     */
+    private async protectedCalendarContent(mailbox: X | undefined, parsed: ParsedIcsEvent): Promise<Record<string, any> | undefined> {
+        const target = mailbox && this.recordSealer ? await this.recordSealer.target("calendar", mailbox) : undefined;
+        if (!target) {
+            return undefined;
+        }
+        const content: Record<string, any> = {
+            title: parsed.summary ?? "",
+            location: parsed.location ?? null,
+            description: parsed.description ?? null,
+            descriptionHtml: parsed.descriptionHtml ?? null,
+        };
+        await sealFieldsOnWrite(content, undefined, EVENT_PROTECTED_FIELDS, target);
+        return content;
+    }
+
     private async processItipRequest(
         mailboxUid: string,
         parsed: ParsedIcsEvent,
@@ -2755,7 +2783,7 @@ export abstract class ScanQueueJob<
                       descriptionHtml: parsed.descriptionHtml,
                   }),
               }
-            : undefined;
+            : await this.protectedCalendarContent(mailbox, parsed);
 
         let row: CE;
         if (!existing) {
@@ -2796,7 +2824,11 @@ export abstract class ScanQueueJob<
                     icalUid: parsed.uid,
                     sequence: parsed.sequence,
                     encryptionOrigin: (encrypted || content ? "derived" : "none") as EncryptionOrigin,
-                    ...(content ? { ...content, location: undefined, description: undefined, descriptionHtml: undefined } : {}),
+                    ...(content
+                        ? content.sealedFields
+                            ? content
+                            : { ...content, location: undefined, description: undefined, descriptionHtml: undefined }
+                        : {}),
                     // This is an attendee's copy of someone else's invitation - marked as already sent so
                     // `MeetingSchedulingJob` never re-sends it as if this mailbox were the organizer.
                     inviteSequenceSent: parsed.sequence,

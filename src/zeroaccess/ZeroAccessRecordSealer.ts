@@ -18,6 +18,18 @@ export const TASK_PROTECTED_FIELDS: readonly ProtectedField[] = [
     { name: "body", placeholder: () => null },
 ];
 
+/** What a protected calendar event's title shows while it is sealed. */
+export const PROTECTED_EVENT_TITLE = "Protected event";
+
+/** A calendar event's protected fields (`specs/search.md` §3 *What It Covers*): its title, location and description. Its times, people,
+ * responses and busy status stay readable for free/busy, invitations and reminders. */
+export const EVENT_PROTECTED_FIELDS: readonly ProtectedField[] = [
+    { name: "title", placeholder: () => PROTECTED_EVENT_TITLE },
+    { name: "location", placeholder: () => null },
+    { name: "description", placeholder: () => null },
+    { name: "descriptionHtml", placeholder: () => null },
+];
+
 /** What a protected contact's name shows when it has no email address to show instead. */
 export const PROTECTED_CONTACT_NAME = "Protected contact";
 
@@ -43,6 +55,7 @@ export const CONTACT_PROTECTED_FIELDS: readonly ProtectedField[] = [
 export const PROTECTED_FIELDS: Readonly<Partial<Record<ZeroAccessDataType, readonly ProtectedField[]>>> = {
     tasks: TASK_PROTECTED_FIELDS,
     contacts: CONTACT_PROTECTED_FIELDS,
+    calendar: EVENT_PROTECTED_FIELDS,
 };
 
 /** Re-exported so writers outside restapi (activesync, mapi) reach the placeholder without importing the field sealer. */
