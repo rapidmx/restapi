@@ -14,6 +14,9 @@ import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles, StaticDnsResolver } from "../../testDoubles.js";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { keyResolveSuite } from "../keyResolveSuite.js";
+import { openPgpKey, revoked } from "../../openPgpTestKeys.js";
+import { setDiscoveryAddressLookup } from "../../../src/util/KeyDiscoveryClient.js";
+import { clearWkdCache } from "../../../src/util/WkdClient.js";
 import { keyTrustSuite, type KeyTrustSuiteContext } from "../keyTrustSuite.js";
 
 x509.cryptoProvider.set(crypto);
@@ -194,6 +197,27 @@ describe("Route:KeyLookupMongo Tests", () => {
             .set("Authorization", "jwt " + ownerToken);
 
         expect(result.status).toBe(404);
+    });
+
+    it("Returns 404 and creates no Contact when the address's Web Key Directory serves only a revoked certificate.", async () => {
+        const mailbox = await createMailbox();
+        const addr = `revoked@wkd-revoked-lookup-mongo.example`;
+        const revocation = await revoked(await openPgpKey(addr));
+        mockFetch.mockImplementation(async () => new Response(revocation.publicKey.write()));
+        setDiscoveryAddressLookup(async () => ["93.184.216.34"]);
+        clearWkdCache();
+        try {
+            const result = await request(server.getApplication())
+                .get(`${baseUrl}/${mailbox.uid}/keys/lookup?addr=${encodeURIComponent(addr)}`)
+                .set("Authorization", "jwt " + ownerToken);
+
+            expect(mockFetch).toHaveBeenCalled();
+            expect(result.status).toBe(404);
+            expect(await contactRepo.find({ mailboxUid: mailbox.uid }).toArray()).toHaveLength(0);
+        } finally {
+            setDiscoveryAddressLookup();
+            clearWkdCache();
+        }
     });
 
     it("Falls back to the existing Contact's keys (Anti-Downgrade) when the domain is no longer a federated peer.", async () => {

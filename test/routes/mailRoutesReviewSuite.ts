@@ -461,6 +461,54 @@ export function mailRoutesReviewSuite(ctx: MailRoutesReviewSuiteContext): void {
             expect(recall[0].raw.toString()).toContain("Recall: Subject");
         });
 
+        it("a zero-access message's recall and receipts never mail its placeholder subject", async () => {
+            const mine = await createMailbox(owner.uid, { autoSendReceiptsExternal: true, autoSendReceiptsInternal: true, autoSendReceiptsFederated: true });
+            const sentItems = await createFolder(mine.uid, FolderType.SENT_ITEMS);
+            const inbox = await createFolder(mine.uid);
+            const sealed = { subject: "[...]", zeroAccess: { keyFingerprint: "fp", sealedSummary: "c2VhbGVk" } };
+            const sentDate = new Date(Date.UTC(2026, 9, 20, 9, 30));
+            const sent = await createMessage(mine, sentItems.uid, { ...sealed, sentByServerAt: new Date(), sentDate });
+
+            const before = ctx.transport().sent.length;
+            expect((await auth(request(ctx.app()).post(url(`/messages/${sent.uid}/recall`)), owner)).status).toBe(200);
+            const [recall] = ctx.transport().sent.slice(before);
+            const notice: string = recall.raw.toString();
+            expect(notice).toMatch(/^Subject: Recall\r?$/m);
+            expect(notice).toContain(sentDate.toUTCString());
+            expect(notice).not.toContain("[...]");
+
+            // A read receipt sent as the message is marked read.
+            const received = await createMessage(mine, inbox.uid, {
+                ...sealed,
+                from: { address: "friend@example.net", type: RecipientType.TO },
+                scanResultUid: uuid.v4(),
+                dispositionNotificationTo: "friend@example.net",
+            });
+            const read = await auth(request(ctx.app()).put(url(`/messages/${received.uid}`)), owner).send({
+                uid: received.uid,
+                version: received.version,
+                flags: { read: true, flagged: false, answered: false, forwarded: false },
+            });
+            expect(read.status).toBe(200);
+            const readReceipt: string = ctx.transport().sent[ctx.transport().sent.length - 1].raw.toString();
+            expect(readReceipt).toMatch(/^Subject: Read receipt\r?$/m);
+            expect(readReceipt).not.toContain("[...]");
+
+            // A delivery receipt the owner approves.
+            const pending = await createMessage(mine, inbox.uid, {
+                ...sealed,
+                from: { address: "friend@example.net", type: RecipientType.TO },
+                scanResultUid: uuid.v4(),
+                dispositionNotificationTo: "friend@example.net",
+                deliveryReceiptPending: true,
+            });
+            const approved = await auth(request(ctx.app()).post(url(`/messages/${pending.uid}/receipt/approve`)), owner).send({ type: "delivery" });
+            expect(approved.status).toBe(200);
+            const deliveryReceipt: string = ctx.transport().sent[ctx.transport().sent.length - 1].raw.toString();
+            expect(deliveryReceipt).toMatch(/^Subject: Delivery receipt\r?$/m);
+            expect(deliveryReceipt).not.toContain("[...]");
+        });
+
         it("a delegate can't make mail outside Drafts come from someone the mailbox can't send as", async () => {
             const mine = await createMailbox(owner.uid);
             const inbox = await createFolder(mine.uid);

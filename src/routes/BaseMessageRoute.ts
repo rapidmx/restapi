@@ -56,7 +56,7 @@ import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { SEARCH_REINDEX } from "../util/SearchIndexUtils.js";
 import { deleteBlobsIfUnreferenced, messageBlobReferenceSources } from "../util/BlobReferenceUtils.js";
-import { buildDispositionNotification } from "../util/ReceiptUtils.js";
+import { buildDispositionNotification, dispositionSubject, quotableSubject } from "../util/ReceiptUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import {
     AuditAction,
@@ -987,14 +987,14 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         dispositionNotificationTo: string,
         mailbox: Mailbox,
         originalMessageId: string,
-        originalSubject: string,
+        originalSubject: string | undefined,
         dispositionType: "read" | "delivery",
     ): Promise<boolean> {
         try {
             const composed: Buffer = await buildDispositionNotification({
                 from: { address: mailbox.primarySmtpAddress, displayName: safeDisplayName(mailbox.displayName) },
                 to: dispositionNotificationTo,
-                subject: `${dispositionType === "read" ? "Read" : "Delivered"}: ${originalSubject}`,
+                subject: dispositionSubject(dispositionType, originalSubject),
                 finalRecipient: mailbox.primarySmtpAddress,
                 originalMessageId,
                 dispositionType,
@@ -1851,12 +1851,17 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const envelopeTo: string[] = envelopeRecipientsOf(message);
         // `from.displayName` is ordinary client-writable data - an address-like one is left out (`safeDisplayName()`).
         const fromName: string | undefined = safeDisplayName(message.from.displayName);
+        // A zero-access message's row holds only the placeholder subject: its notice names the message by its date instead.
+        const subject: string | undefined = quotableSubject(message);
         const composed: Buffer = await new MailComposer({
             from: { address: message.from.address, name: fromName },
             // Every recipient - Bcc ones included - gets the notice by envelope only: listing them in `To` would show a Bcc recipient to everyone.
             to: message.from.address,
-            subject: `Recall: ${message.subject}`,
-            text: `${fromName ?? message.from.address} is attempting to recall the message: "${message.subject}".`,
+            subject: subject !== undefined ? `Recall: ${subject}` : "Recall",
+            text:
+                subject !== undefined
+                    ? `${fromName ?? message.from.address} is attempting to recall the message: "${subject}".`
+                    : `${fromName ?? message.from.address} is attempting to recall the message sent ${new Date(message.sentDate).toUTCString()}.`,
             headers: { "X-RapidMX-Recall-Of": message.messageId },
         })
             .compile()
@@ -2670,7 +2675,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             message.dispositionNotificationTo!,
             mailbox,
             message.messageId,
-            message.subject,
+            quotableSubject(message),
             "read",
         );
         if (sent) {
@@ -2709,7 +2714,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             message.dispositionNotificationTo!,
             mailbox,
             message.messageId,
-            message.subject,
+            quotableSubject(message),
             type,
         );
 

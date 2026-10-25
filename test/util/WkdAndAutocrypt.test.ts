@@ -122,11 +122,12 @@ describe("fetchWkdKeys()", () => {
         expect(both?.keys).toEqual([expect.objectContaining({ fingerprint: pinned.fingerprint, revocationReason: "compromised" })]);
         expect(both?.keyConflicts).toEqual([expect.objectContaining({ observedKey: expect.objectContaining({ fingerprint: successor.fingerprint }) })]);
 
-        // A revoked key nothing pins is never pinned.
+        // A revoked key nothing pins is never pinned, and with no contact there is nothing to merge: no contact is created for it.
         clearWkdCache();
         mockFetch.mockResolvedValue(new Response(revocation.publicKey.write()));
-        const fresh = await discoverAndMergeKeys(new StaticDnsResolver(), ADDRESS, undefined);
-        expect(fresh?.keys ?? []).toEqual([]);
+        expect(await discoverAndMergeKeys(new StaticDnsResolver(), ADDRESS, undefined)).toBeUndefined();
+        const unrelated = await discoverAndMergeKeys(new StaticDnsResolver(), ADDRESS, { keys: [] });
+        expect(unrelated?.keys).toEqual([]);
     });
 
     it("is how discovery finds the key of an address whose domain isn't a RapidMX peer", async () => {

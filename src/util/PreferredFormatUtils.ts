@@ -77,8 +77,14 @@ export function messageEndToEndFormat(contentType: string | undefined): EndToEnd
     return type === "multipart/encrypted" && protocol === "application/pgp-encrypted" ? "openpgp" : undefined;
 }
 
+/** How far ahead of the clock a stored effective date may be and still be taken as one: a message's effective date is never later
+ * than its receipt, so one further ahead than replicas' clocks can disagree was stored before that rule and is no evidence at all. */
+export const MAX_EFFECTIVE_DATE_SKEW_MS = 60 * 60 * 1000;
+
 /** `next` when it is newer than `existing` (the anti-downgrade rule for preferences: an older message never overrides what a
- * newer one showed), else `undefined`. */
-export function newerObservation(existing: ObservedFormat | undefined, next: ObservedFormat | undefined): ObservedFormat | undefined {
-    return next && (!existing || next.at > existing.at) ? next : undefined;
+ * newer one showed), else `undefined`. An `existing` dated more than `MAX_EFFECTIVE_DATE_SKEW_MS` after `now` counts as none, so a
+ * future-dated observation recorded once doesn't keep every later message from counting. */
+export function newerObservation(existing: ObservedFormat | undefined, next: ObservedFormat | undefined, now: number = Date.now()): ObservedFormat | undefined {
+    const current: ObservedFormat | undefined = existing && existing.at <= now + MAX_EFFECTIVE_DATE_SKEW_MS ? existing : undefined;
+    return next && (!current || next.at > current.at) ? next : undefined;
 }

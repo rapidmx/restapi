@@ -46,4 +46,11 @@ describe("PreferredFormatUtils", () => {
         expect(newerObservation(old, { format: "openpgp", at: 10 })).toBeUndefined();
         expect(newerObservation(old, undefined)).toBeUndefined();
     });
+
+    it("takes an observation dated far ahead of now as none, so it can't freeze the format", () => {
+        const poisoned = { format: "smime" as const, at: Date.UTC(9999, 11, 31) };
+        expect(newerObservation(poisoned, { format: "openpgp", at: 10 }, 1000)).toEqual({ format: "openpgp", at: 10 });
+        expect(newerObservation(poisoned, { format: "openpgp", at: 10 })).toEqual({ format: "openpgp", at: 10 });
+        expect(newerObservation({ format: "smime", at: 1000 + 60_000 }, { format: "openpgp", at: 900 }, 1000)).toBeUndefined();
+    });
 });

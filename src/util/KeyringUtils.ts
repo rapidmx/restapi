@@ -12,6 +12,7 @@ import { resolveFederationPolicy } from "./FederationUtils.js";
 import { fetchRemoteKeys, MAX_DISCOVERED_KEYS, parseKeyDiscoveryAddress, parseKeyDiscoveryResponse } from "./KeyDiscoveryClient.js";
 import { discoverLocalKeys, type LocalKeyDiscovery } from "./LocalKeyDiscoveryUtils.js";
 import { canReplaceOpenPgpKeyAutomatically, isOpenPgpKey, keySlot, mergeOpenPgpCertificate, parseOpenPgpContactKey, sanitizeOpenPgpKey } from "./OpenPgpKeyUtils.js";
+import { MAX_EFFECTIVE_DATE_SKEW_MS } from "./PreferredFormatUtils.js";
 import { parseContactKey } from "./SignerCertificateUtils.js";
 import { fetchWkdKeys } from "./WkdClient.js";
 import { normalizeAddress } from "./AddressUtils.js";
@@ -361,10 +362,18 @@ export async function applyDiscoveredKeys(
         ];
     }
 
-    const existingLastSeen: number = existing?.encryptPreference?.lastSeen ?? -Infinity;
-    const discoveredLastSeen: number = validated.encryptPreference.lastSeen ?? -Infinity;
+    // An effective date is never later than its receipt (Autocrypt Level 1): a response's `lastSeen` after `observedAt` is taken as
+    // `observedAt`, and a stored one further ahead than clocks can disagree (recorded before this rule) is no evidence at all, so one
+    // future-dated message or answer can't freeze the preference against every later one.
+    const storedLastSeen: number = existing?.encryptPreference?.lastSeen ?? -Infinity;
+    const existingLastSeen: number = storedLastSeen > observedAt + MAX_EFFECTIVE_DATE_SKEW_MS ? -Infinity : storedLastSeen;
+    const discoveredLastSeen: number = Math.min(validated.encryptPreference.lastSeen ?? -Infinity, observedAt);
     const preferenceIsNewer: boolean = !existing?.encryptPreference || discoveredLastSeen > existingLastSeen;
-    const encryptPreference: EncryptionPreference = preferenceIsNewer ? validated.encryptPreference : existing!.encryptPreference!;
+    const discoveredPreference: EncryptionPreference =
+        validated.encryptPreference.lastSeen !== undefined && validated.encryptPreference.lastSeen > observedAt
+            ? { ...validated.encryptPreference, lastSeen: observedAt }
+            : validated.encryptPreference;
+    const encryptPreference: EncryptionPreference = preferenceIsNewer ? discoveredPreference : existing!.encryptPreference!;
 
     return {
         keys: resultKeys,
@@ -395,8 +404,9 @@ export async function applyDiscoveredKeys(
  *
  * Returns `undefined` - not a "no-op" `KeyringUpdate` - when there is nothing to merge: the domain isn't a federated peer
  * and publishes no OpenPGP key over WKD, the fetch failed with nothing cached, or the address is of this deployment's own
- * domain but no mailbox has it. A caller can thereby distinguish "nothing to update" from "this address isn't running
- * RapidMX", which `GET /keys/lookup` (Group E2) surfaces differently (e.g. a `404`) than "found the peer, no conflict".
+ * domain but no mailbox has it, or - for an address with no contact yet - WKD lists only revoked certificates. A caller can
+ * thereby distinguish "nothing to update" from "this address isn't running RapidMX", which `GET /keys/lookup` (Group E2)
+ * surfaces differently (e.g. a `404`) than "found the peer, no conflict".
  *
  * @param source `"discovery"` for `GET /keys/lookup` (Group E2); `"header"` callers (Group E3) call
  * `applyDiscoveredKeys()` directly instead, since they already have a `KeyDiscoveryResponse`-shaped payload
@@ -428,7 +438,8 @@ export async function discoverAndMergeKeys(
     const policy = await resolveFederationPolicy(dnsResolver, parsed.domain);
     if (!policy) {
         const wkdKeys: PublicKey[] = await fetchWkdKeys(address);
-        return wkdKeys.length > 0
+        // Revoked certificates only escalate onto a contact that pins or retired them: with no contact, they create none.
+        return wkdKeys.length > 0 && (existing !== undefined || wkdKeys.some((k) => k.revokedAt === undefined))
             ? await applyDiscoveredKeys(existing, { encryptPreference: { preferEncrypt: "nopreference" }, keys: wkdKeys, escrow: false }, observedAt, "discovery", address)
             : undefined;
     }

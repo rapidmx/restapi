@@ -153,6 +153,79 @@ describe("OpenPgpKeyUtils", () => {
             expect(await mergeOpenPgpCertificate(stored, revocation.key)).toMatchObject({ revokedAt: 5, revocationReason: "superseded" });
         });
 
+        it("takes nothing its holder didn't sign: no foreign subkey or user ID, third-party certification or forged revocation", async () => {
+            const pinned = await openPgpKey(ADDRESS, { created: new Date(Date.now() - 10 * DAY), expiresIn: 20 * 86_400 });
+            const mallory = await openPgpKey("mallory@example.com", { created: new Date(Date.now() - 10 * DAY) });
+            const forgedRevocation = (await openpgp.revokeKey({ key: mallory.privateKey, date: new Date(Date.now() - 5 * DAY), format: "object" })).publicKey
+                .revocationSignatures[0];
+            const withJunk = (base: openpgp.PublicKey): string => {
+                const junk = base.clone();
+                for (const _i of [1, 2, 3]) {
+                    const subkey = mallory.publicKey.subkeys[0].clone();
+                    (subkey as any).mainKey = junk;
+                    junk.subkeys.push(subkey);
+                }
+                const user = mallory.publicKey.users[0].clone();
+                (user as any).mainKey = junk;
+                junk.users.push(user);
+                junk.revocationSignatures.push(forgedRevocation);
+                return Buffer.from(junk.write()).toString("base64");
+            };
+            const certified = await certifiedBy(pinned, mallory);
+            expect(certified.publicKey.users[0].otherCertifications).toHaveLength(1);
+
+            // A copy of the pinned key carrying only junk stores nothing.
+            expect(await mergeOpenPgpCertificate(pinned.key, { ...pinned.key, publicKey: withJunk(certified.publicKey) })).toBeUndefined();
+
+            // An extended expiry carrying the same junk is taken in without it.
+            const extended = await reexpired(await certifiedBy(pinned, mallory), 800 * 86_400);
+            const merged = (await mergeOpenPgpCertificate(pinned.key, { ...extended.key, publicKey: withJunk(extended.publicKey) }))!;
+            expect(merged.notAfter).toBe(extended.key.notAfter);
+            expect(merged.revokedAt).toBeUndefined();
+            const cert = await openpgp.readKey({ binaryKey: Buffer.from(merged.publicKey, "base64") });
+            expect(cert.users.map((u) => u.userID?.email)).toEqual([ADDRESS]);
+            expect(cert.users[0].otherCertifications).toEqual([]);
+            expect(cert.subkeys.map((k) => k.getFingerprint())).toEqual([pinned.publicKey.subkeys[0].getFingerprint()]);
+            expect(cert.revocationSignatures).toEqual([]);
+
+            // Junk a pin already holds is dropped by its next refresh.
+            const junkPin = { ...pinned.key, publicKey: withJunk(certified.publicKey) };
+            const cleaned = (await mergeOpenPgpCertificate(junkPin, extended.key))!;
+            expect(cleaned.publicKey.length).toBeLessThan(junkPin.publicKey.length);
+            const cleanedCert = await openpgp.readKey({ binaryKey: Buffer.from(cleaned.publicKey, "base64") });
+            expect(cleanedCert.users).toHaveLength(1);
+            expect(cleanedCert.subkeys).toHaveLength(1);
+            expect(cleanedCert.revocationSignatures).toEqual([]);
+        });
+
+        it("dates a revocation by one that verifies, not a forged one listed first", async () => {
+            const pinned = await openPgpKey(ADDRESS, { created: new Date(Date.now() - 10 * DAY) });
+            const mallory = await openPgpKey("mallory@example.com", { created: new Date(Date.now() - 10 * DAY) });
+            const forged = (await openpgp.revokeKey({ key: mallory.privateKey, date: new Date(Date.now() - 5 * DAY), format: "object" })).publicKey.revocationSignatures[0];
+            const genuine = (await revoked(pinned)).publicKey.clone();
+            const genuineAt: number = genuine.revocationSignatures[0].created!.getTime();
+            genuine.revocationSignatures.unshift(forged);
+            const parsed = (await parseOpenPgpCertificate(Buffer.from(genuine.write()).toString("base64")))!;
+            expect(parsed.revokedAt).toBe(genuineAt);
+        });
+
+        it("keeps the holder's subkey and user ID revocations and direct signatures", async () => {
+            const pinned = await openPgpKey(ADDRESS, { version: 6, aliases: ["old@example.com"] });
+            expect((pinned.publicKey as any).directSignatures.length).toBeGreaterThan(0);
+            const rotated = await withRotatedSubkey(pinned);
+            const published = rotated.publicKey.clone();
+            const old = published.users.findIndex((u) => u.userID?.email === "old@example.com");
+            published.users[old] = await rotated.privateKey.users[old].revoke(rotated.privateKey.keyPacket as any);
+            (published.users[old] as any).mainKey = published;
+
+            const merged = (await mergeOpenPgpCertificate(pinned.key, { ...pinned.key, publicKey: Buffer.from(published.write()).toString("base64") }))!;
+            const cert = await openpgp.readKey({ binaryKey: Buffer.from(merged.publicKey, "base64") });
+            expect(cert.subkeys).toHaveLength(2);
+            expect(cert.subkeys[0].revocationSignatures).toHaveLength(1);
+            expect(cert.users.find((u) => u.userID?.email === "old@example.com")!.revocationSignatures).toHaveLength(1);
+            expect((cert as any).directSignatures).toHaveLength((pinned.publicKey as any).directSignatures.length);
+        });
+
         it("stores nothing for another certificate, an unreadable one, a private key, the same bytes or a merge too large", async () => {
             const pinned = await openPgpKey(ADDRESS);
             expect(await mergeOpenPgpCertificate(pinned.key, (await openPgpKey(ADDRESS)).key)).toBeUndefined();

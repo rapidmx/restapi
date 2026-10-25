@@ -425,6 +425,20 @@ describe("applyDiscoveredKeys() Tests", () => {
         expect(result.encryptPreference).toEqual({ preferEncrypt: "nopreference", lastSeen: 600 });
     });
 
+    it("Takes a discovered lastSeen after observedAt as observedAt, and a stored one far ahead of it as no evidence.", async () => {
+        const future = makeDiscovery([], 5000);
+        const clamped = await applyDiscoveredKeys(undefined, future, 1000, "discovery", ADDRESS);
+        expect(clamped.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 1000 });
+
+        const poisoned: ContactKeyState = { keys: [], encryptPreference: { preferEncrypt: "nopreference", lastSeen: Date.UTC(9999, 11, 31) } };
+        const superseded = await applyDiscoveredKeys(poisoned, makeDiscovery([], 600), 1000, "discovery", ADDRESS);
+        expect(superseded.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 600 });
+
+        // One only as far ahead as clocks can disagree still holds.
+        const skewed: ContactKeyState = { keys: [], encryptPreference: { preferEncrypt: "nopreference", lastSeen: 1000 + 60_000 } };
+        expect((await applyDiscoveredKeys(skewed, makeDiscovery([], 900), 1000, "discovery", ADDRESS)).encryptPreference).toEqual(skewed.encryptPreference);
+    });
+
     it("Applies the discovered preference outright when nothing was previously on file.", async () => {
         const result = await applyDiscoveredKeys(undefined, makeDiscovery([], 1), 1000, "discovery", ADDRESS);
         expect(result.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: 1 });

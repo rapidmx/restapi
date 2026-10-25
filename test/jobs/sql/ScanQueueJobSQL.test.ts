@@ -41,6 +41,7 @@ import { FocusedInboxOverrideSQL } from "../../../src/models/sql/FocusedInboxOve
 import { CorrespondentSQL } from "../../../src/models/sql/CorrespondentSQL.js";
 import { OofReplySuppressionSQL } from "../../../src/models/sql/OofReplySuppressionSQL.js";
 import { DataSubjectErasureRequestSQL } from "../../../src/models/sql/DataSubjectErasureRequestSQL.js";
+import { ZeroAccessIndexEntrySQL } from "../../../src/models/sql/ZeroAccessIndexEntrySQL.js";
 import { buildEventIcs } from "../../../src/util/IcsUtils.js";
 import { sanitizeDiscoveredKey } from "../../../src/util/KeyringUtils.js";
 import { issueCertificate, makeTestIssuer } from "../../util/signerCertificates.js";
@@ -299,6 +300,7 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         models.set("KeyVaultSQL", KeyVaultSQL);
         models.set("EncryptionPolicySQL", EncryptionPolicySQL);
         models.set("DataSubjectErasureRequestSQL", DataSubjectErasureRequestSQL);
+        models.set("ZeroAccessIndexEntrySQL", ZeroAccessIndexEntrySQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");
@@ -741,6 +743,85 @@ ${oversigningDkimSignature("example.com", "RapidMX-Key", "Autocrypt")}`,
             expect(await observed()).toEqual({ format: "smime", at: Date.UTC(2026, 9, 7, 10) });
             await deliver("Date: Sat, 10 Oct 2026 10:00:00 +0000", pgpEncrypted, auth, oversigningDkimSignature("example.com"));
             expect(await observed()).toEqual({ format: "openpgp", at: Date.UTC(2026, 9, 10, 10) });
+        });
+
+        it("Takes a message's effective date as its bottom-most Date and never later than its receipt, so a future-dated or prepended Date or Content-Type can't freeze the preference or format.", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const pgp = await openPgpKey("sender@example.com");
+            const mutual = `Autocrypt: addr=sender@example.com; prefer-encrypt=mutual; keydata=${pgp.base64}`;
+            const noPreference = `Autocrypt: addr=sender@example.com; keydata=${pgp.base64}`;
+            const auth = "Authentication-Results: mx.example.com; dkim=pass header.d=example.com";
+            const smimeSigned = 'Content-Type: multipart/signed; protocol="application/pkcs7-signature"; micalg=sha-256; boundary="b"';
+            const pgpEncrypted = 'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="b"';
+            const future = "Date: Fri, 31 Dec 9999 00:00:00 +0000";
+            const deliver = async (...headers: string[]): Promise<void> => {
+                const rawBlobKey = `raw/${uuid.v4()}`;
+                await blobStore.put(rawBlobKey, makePlainRawMessage(headers.join("\r\n")));
+                await createIngestEntry({ rawBlobKey });
+                await job.run();
+            };
+            const contacts = async () => (await contactRepo.find({ where: { mailboxUid } })).filter((c: any) => c.emails?.some((e: any) => e.address === "sender@example.com"));
+
+            // A future-dated message counts as received now.
+            const before: number = Date.now();
+            await deliver(future, mutual, auth, oversigningDkimSignature("example.com", "Autocrypt"));
+            let [contact] = await contacts();
+            expect(contact.encryptPreference.preferEncrypt).toBe("mutual");
+            expect(contact.encryptPreference.lastSeen).toBeGreaterThanOrEqual(before);
+            expect(contact.encryptPreference.lastSeen).toBeLessThanOrEqual(Date.now());
+            expect(contact.observedFormat.at).toBe(contact.encryptPreference.lastSeen);
+
+            // An old message replayed with a future Date prepended over its signed one is as old as it was.
+            await deliver(future, "Date: Mon, 5 Oct 2020 10:00:00 +0000", noPreference, auth, oversigningDkimSignature("example.com", "Autocrypt"));
+            [contact] = await contacts();
+            expect(contact.encryptPreference.preferEncrypt).toBe("mutual");
+
+            // A later message still counts: the first one froze nothing.
+            await deliver(future, noPreference, smimeSigned, auth, oversigningDkimSignature("example.com", "Autocrypt"));
+            [contact] = await contacts();
+            expect(contact.encryptPreference.preferEncrypt).toBe("nopreference");
+            expect(contact.observedFormat.format).toBe("smime");
+
+            // A second, prepended Content-Type shows no format at all.
+            await deliver(pgpEncrypted, smimeSigned, auth, oversigningDkimSignature("example.com"));
+            [contact] = await contacts();
+            expect(contact.observedFormat.format).toBe("smime");
+        });
+
+        it("Supersedes a preference and format stored with a future date before effective dates were clamped.", async () => {
+            const pgp = await openPgpKey("sender@example.com");
+            await contactRepo.save(
+                new ContactSQL({
+                    mailboxUid,
+                    folderUid: uuid.v4(),
+                    displayName: "sender@example.com",
+                    emails: [{ address: "sender@example.com", type: "other" as any }],
+                    phones: [],
+                    addresses: [],
+                    keys: [],
+                    encryptPreference: { preferEncrypt: "nopreference", lastSeen: Date.UTC(9999, 11, 31) },
+                    observedFormat: { format: "smime", at: Date.UTC(9999, 11, 31) },
+                }),
+            );
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const rawBlobKey = `raw/${uuid.v4()}`;
+            await blobStore.put(
+                rawBlobKey,
+                makePlainRawMessage(
+                    [
+                        "Date: Mon, 5 Oct 2020 10:00:00 +0000",
+                        `Autocrypt: addr=sender@example.com; prefer-encrypt=mutual; keydata=${pgp.base64}`,
+                        "Authentication-Results: mx.example.com; dkim=pass header.d=example.com",
+                        oversigningDkimSignature("example.com", "Autocrypt"),
+                    ].join("\r\n"),
+                ),
+            );
+            await createIngestEntry({ rawBlobKey });
+            await job.run();
+
+            const [contact] = (await contactRepo.find({ where: { mailboxUid } })).filter((c: any) => c.emails?.some((e: any) => e.address === "sender@example.com"));
+            expect(contact.encryptPreference).toEqual({ preferEncrypt: "mutual", lastSeen: Date.UTC(2020, 9, 5, 10) });
+            expect(contact.observedFormat).toEqual({ format: "openpgp", at: Date.UTC(2020, 9, 5, 10) });
         });
 
         it("Creates no further Contact from a key header once the mailbox holds max_header_key_contacts of them, but still updates one it already has.", async () => {
@@ -3183,6 +3264,31 @@ ${oversigningDkimSignature("example.com", "RapidMX-Key", "Autocrypt")}`,
             expect(transport.sent).toHaveLength(1);
             expect(transport.sent[0].envelopeTo).toEqual(["colleague@example.com"]);
             expect(transport.sent[0].raw.toString()).toContain("multipart/report");
+            expect(transport.sent[0].raw.toString()).toContain("Subject: Delivered: Plain message");
+        });
+
+        it("Names no subject in the delivery receipt of a message it seals for a zero-access mailbox, never its placeholder.", async () => {
+            const za = await testZeroAccessKey();
+            await createMailbox({ zeroAccessKeys: [za.key] });
+            await verifiedDomain();
+            const raw = Buffer.from(
+                "From: colleague@example.com\r\nTo: recipient@example.com\r\nSubject: Merger codename Bluebird\r\n" +
+                    "Message-ID: <za-receipt@example.com>\r\nDisposition-Notification-To: colleague@example.com\r\n" +
+                    "Authentication-Results: mx.example.com; dkim=pass header.d=example.com\r\n\r\nHello there.\r\n",
+            );
+            const entry = await createIngestEntry({ rawBlobKey: "", envelopeFrom: "colleague@example.com", zeroAccessKeyFingerprint: za.key.fingerprint });
+
+            await job.processInline(entry.uid, raw);
+
+            const [message] = await messageRepo.find({ where: { mailboxUid } });
+            expect(message.subject).toBe("[...]");
+            expect(message.deliveryReceiptSentAt).toBeInstanceOf(Date);
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(1);
+            const receipt: string = transport.sent[0].raw.toString();
+            expect(receipt).toContain("Subject: Delivery receipt");
+            expect(receipt).not.toContain("[...]");
+            expect(receipt).not.toContain("Bluebird");
         });
 
         it("Holds the delivery receipt pending approval for an external requester (the default).", async () => {

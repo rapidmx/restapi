@@ -125,8 +125,12 @@ export async function parseOpenPgpCertificate(text: unknown, now: number = Date.
         return undefined;
     }
     const at = new Date(now);
-    const revocation = cert.revocationSignatures[0];
     const revoked: boolean = await orElse(cert.isRevoked(undefined, undefined, at), false);
+    // The revocation's date comes from one that verifies, not from whichever signature happens to be listed first.
+    const { enums } = await openpgp();
+    const revocation = revoked
+        ? (await holderSignatures(cert.revocationSignatures, cert.keyPacket, enums.signature.keyRevocation, { key: cert.keyPacket }))[0]
+        : undefined;
     if (!revoked) {
         // Self-signatures of a revoked key may still be fine, but an unrevoked key must have a verifiable primary key at all.
         try {
@@ -234,14 +238,55 @@ function checkedContactKey(parsed: OpenPgpCertificate | undefined, address: stri
     return parsed.key;
 }
 
+/** The signatures of `signatures` that verify with `primaryKey` as `type` over `data`, whatever their dates: a revocation, or the binding
+ * of an expired subkey, still says what the key holder said. */
+async function holderSignatures(
+    signatures: import("openpgp").SignaturePacket[],
+    primaryKey: import("openpgp").PublicKeyPacket | import("openpgp").SecretKeyPacket,
+    type: import("openpgp").enums.signature,
+    data: object,
+): Promise<import("openpgp").SignaturePacket[]> {
+    const verified: boolean[] = await Promise.all(signatures.map((signature) => succeeds(signature.verify(primaryKey, type, data, null as any, false))));
+    return signatures.filter((_signature, i) => verified[i]);
+}
+
+/**
+ * Strips `cert` down to what its holder made: user IDs with their self-certifications and revocations, subkeys with their bindings and
+ * revocations, and the primary key's revocations and direct signatures - each only when it verifies with the primary key. Third-party
+ * certifications are dropped, and so is a user ID or subkey left with nothing that binds it. OpenPGP.js's `Key.update()` doesn't do
+ * this: it takes a user ID or subkey the destination lacks, third-party certifications, and any revocation or direct signature when the
+ * destination has none, all unverified.
+ */
+async function keepHolderComponents(cert: import("openpgp").Key): Promise<void> {
+    const { enums } = await openpgp();
+    const primary = cert.keyPacket;
+    cert.revocationSignatures = await holderSignatures(cert.revocationSignatures, primary, enums.signature.keyRevocation, { key: primary });
+    const direct = cert as unknown as { directSignatures: import("openpgp").SignaturePacket[] };
+    direct.directSignatures = await holderSignatures(direct.directSignatures, primary, enums.signature.key, { key: primary });
+    for (const user of cert.users) {
+        const data = { userID: user.userID, userAttribute: user.userAttribute, key: primary };
+        user.selfCertifications = await holderSignatures(user.selfCertifications, primary, enums.signature.certGeneric, data);
+        user.otherCertifications = [];
+        user.revocationSignatures = await holderSignatures(user.revocationSignatures, primary, enums.signature.certRevocation, data);
+    }
+    cert.users = cert.users.filter((user) => user.selfCertifications.length > 0);
+    for (const subkey of cert.subkeys) {
+        const data = { key: primary, bind: subkey.keyPacket };
+        subkey.bindingSignatures = await holderSignatures(subkey.bindingSignatures, primary, enums.signature.subkeyBinding, data);
+        subkey.revocationSignatures = await holderSignatures(subkey.revocationSignatures, primary, enums.signature.subkeyRevocation, data);
+    }
+    cert.subkeys = cert.subkeys.filter((subkey) => subkey.bindingSignatures.length > 0);
+}
+
 /**
  * `pinned`, an OpenPGP certificate on file, refreshed with what `observed` - the same certificate (its primary key's fingerprint) as it
  * is served now - adds: newer self-signatures (an extended expiry), new subkeys, subkey and primary key revocations. The two are merged
- * by OpenPGP.js (`Key.update()`), which takes only components whose signatures verify with the primary key, so nobody but the key holder
- * can add anything, and a stale copy, one without a revocation or a subkey already on file, takes nothing away. `publicKey`, `notBefore`
- * and `notAfter` are read again from the merged certificate, and a primary key revocation it now carries marks it revoked (as
- * `"compromised"`, as `sanitizeOpenPgpKey()` reads one) unless it already is; the pin itself is unchanged. `undefined` when there is
- * nothing to store: not the same certificate, unreadable, nothing new, or a merge larger than `MAX_OPENPGP_KEY_BYTES`.
+ * by OpenPGP.js (`Key.update()`) and the result is stripped to what verifies with the primary key (`keepHolderComponents()`), so nobody
+ * but the key holder can add anything - no third-party certification, foreign subkey or forged revocation grows the pin - and a stale
+ * copy, one without a revocation or a subkey already on file, takes nothing away. `publicKey`, `notBefore` and `notAfter` are read
+ * again from the merged certificate, and a primary key revocation it now carries marks it revoked (as `"compromised"`, as
+ * `sanitizeOpenPgpKey()` reads one) unless it already is; the pin itself is unchanged. `undefined` when there is nothing to store: not
+ * the same certificate, unreadable, nothing new, or a merge larger than `MAX_OPENPGP_KEY_BYTES`.
  */
 export async function mergeOpenPgpCertificate(pinned: PublicKey, observed: PublicKey, now: number = Date.now()): Promise<PublicKey | undefined> {
     const [pinnedCert, observedCert] = await Promise.all([readCertificate(pinned.publicKey), readCertificate(observed.publicKey)]);
@@ -249,6 +294,9 @@ export async function mergeOpenPgpCertificate(pinned: PublicKey, observed: Publi
         return undefined;
     }
     const merged = await orElse(pinnedCert.update(observedCert, new Date(now)), undefined);
+    if (merged) {
+        await keepHolderComponents(merged);
+    }
     const text: string | undefined = merged ? Buffer.from(merged.write()).toString("base64") : undefined;
     const parsed: OpenPgpCertificate | undefined = text && text !== pinned.publicKey ? await parseOpenPgpCertificate(text, now) : undefined;
     if (!parsed) {

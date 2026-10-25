@@ -35,10 +35,10 @@ import { evaluateMailFilterRules, MailFilterEvaluationResult, MailFilterMatchCon
 import { evaluateSenderLists, type SenderListVerdict } from "../util/SenderListUtils.js";
 import { MAX_EVENT_ATTENDEES, MAX_REQUESTED_GUESTS, guestPermissionsOf } from "../util/CalendarEventUtils.js";
 import { mailboxAddressSet, meetingMethodOf } from "../util/MeetingInviteUtils.js";
-import { extractHeader, extractHeaders, isPlainAddress, prepareRelayCopy, prependHeaders, safeDisplayName, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
+import { extractHeaders, isPlainAddress, prepareRelayCopy, prependHeaders, safeDisplayName, verifiedFromAddress } from "../util/MimeHeaderUtils.js";
 import { resolveActiveOof } from "../util/OofUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-import { buildDispositionNotification, parseDispositionNotification } from "../util/ReceiptUtils.js";
+import { buildDispositionNotification, dispositionSubject, parseDispositionNotification, quotableSubject } from "../util/ReceiptUtils.js";
 import { parseRapidMxKeyHeader } from "../util/RapidMxKeyHeaderUtils.js";
 import { buildDeliveredRecipients } from "../util/RecipientUtils.js";
 import { CorrespondentUtils, eventObservations, messageObservations } from "../util/CorrespondentUtils.js";
@@ -1660,7 +1660,7 @@ export abstract class ScanQueueJob<
             result.dispositionNotificationTo,
             mailbox,
             claimed.messageId,
-            claimed.subject ?? "",
+            quotableSubject(claimed),
             "delivery",
         );
         if (!sent) {
@@ -1841,10 +1841,13 @@ export abstract class ScanQueueJob<
         let discovered: KeyDiscoveryResponse | undefined;
         const keyHeaders: string[] = extractHeaders(raw, RAPIDMX_KEY_HEADER);
         const autocryptHeaders: string[] = extractHeaders(raw, AUTOCRYPT_HEADER);
-        // The message's effective date (see the Anti-Downgrade note below).
-        const dateHeader: string | undefined = extractHeader(raw, "Date");
-        const effectiveDate: number = dateHeader ? Date.parse(dateHeader) : NaN;
-        const lastSeen: number = Number.isNaN(effectiveDate) ? Date.now() : effectiveDate;
+        const now: number = Date.now();
+        // The message's effective date (see the Anti-Downgrade note below), as Autocrypt Level 1 defines it: its `Date`, or the time
+        // of receipt when that is in the future, so a future-dated message can't freeze the preference against every later one. Of
+        // several `Date` headers the bottom-most is read, the one a DKIM signature covers; one prepended to a signed message is not.
+        const dateHeaders: string[] = extractHeaders(raw, "Date");
+        const effectiveDate: number = dateHeaders.length > 0 ? Date.parse(dateHeaders[dateHeaders.length - 1]) : NaN;
+        const lastSeen: number = Number.isNaN(effectiveDate) ? now : Math.min(effectiveDate, now);
         const alignedDkim: boolean = hasAlignedPassingDkim(this.authenticationResults(raw), fromDomain, this.trustedAuthservId);
         let autocryptFromNonRapidMx = false;
         // Aligned, passing DKIM alone isn't enough: the header must also be *oversigned* by that aligned signature,
@@ -1894,10 +1897,12 @@ export abstract class ScanQueueJob<
         // What format the sender was seen using (`specs/end-to-end_encryption.md` *Choosing the format*): the message's own, when it
         // is signed or encrypted, else OpenPGP for an OpenPGP client's `Autocrypt` header - only from authenticated (aligned DKIM)
         // mail, and only recorded on a contact this message has reason to touch anyway.
-        const seenFormat = alignedDkim ? (messageEndToEndFormat(extractHeader(raw, "Content-Type")) ?? (autocryptFromNonRapidMx ? "openpgp" : undefined)) : undefined;
+        // A message with more than one top-level `Content-Type` shows no format: one prepended to a signed message would otherwise pick it.
+        const contentTypes: string[] = extractHeaders(raw, "Content-Type");
+        const ownFormat = contentTypes.length === 1 ? messageEndToEndFormat(contentTypes[0]) : undefined;
+        const seenFormat = alignedDkim ? (ownFormat ?? (autocryptFromNonRapidMx ? "openpgp" : undefined)) : undefined;
         const observed = seenFormat ? { format: seenFormat, at: lastSeen } : undefined;
 
-        const now: number = Date.now();
         let headerConflict = false;
         await this.persistContactKeyUpdate(entry.mailboxUid, fromAddress, now, async (existingContact) => {
             if (!existingContact && !discovered) {
@@ -1916,7 +1921,7 @@ export abstract class ScanQueueJob<
             }
             const update: ContactKeyState = await applyDiscoveredKeys(existingContact, discovered, now, "header", fromAddress);
             headerConflict = !!update.keyConflicts?.some((conflict) => conflict.source === "header" && conflict.observedAt === now);
-            const newer = newerObservation(existingContact?.observedFormat, observed);
+            const newer = newerObservation(existingContact?.observedFormat, observed, now);
             return newer ? { ...update, observedFormat: newer } : update;
         });
 
@@ -2455,7 +2460,7 @@ export abstract class ScanQueueJob<
         dispositionNotificationTo: string,
         mailbox: X,
         originalMessageId: string,
-        originalSubject: string,
+        originalSubject: string | undefined,
         dispositionType: "read" | "delivery",
     ): Promise<boolean> {
         try {
@@ -2467,7 +2472,7 @@ export abstract class ScanQueueJob<
             const composed: Buffer = await buildDispositionNotification({
                 from: { address: mailbox.primarySmtpAddress, displayName: safeDisplayName(mailbox.displayName) },
                 to: dispositionNotificationTo,
-                subject: `${dispositionType === "read" ? "Read" : "Delivered"}: ${originalSubject}`,
+                subject: dispositionSubject(dispositionType, originalSubject),
                 finalRecipient: mailbox.primarySmtpAddress,
                 originalMessageId,
                 dispositionType,

@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import MimeNode from "nodemailer/lib/mime-node/index.js";
 import { extractHeader, safeDisplayName } from "./MimeHeaderUtils.js";
+import { PROTECTED_SUBJECT } from "../zeroaccess/ZeroAccessSealer.js";
 
 /**
  * Generates and parses real RFC 3798 Message Disposition Notifications (MDNs) - the wire format behind both
@@ -113,6 +114,24 @@ export function parseDispositionNotification(raw: string): ParsedDispositionNoti
     const policyId: string | undefined = extractHeader(buffer, "X-RapidMX-Policy-Id");
 
     return { originalMessageId, finalRecipient, dispositionType, rotatedKeyFingerprint, policyId };
+}
+
+/**
+ * The subject a notice the server composes about `message` (a receipt, a recall) may quote, or `undefined` when it has none to quote:
+ * a zero-access message (`Message.zeroAccess`), whose row holds only the placeholder subject (`PROTECTED_SUBJECT`) and whose real one
+ * the server can't read, or one without a subject. A notice then names no subject rather than mailing out "[...]".
+ */
+export function quotableSubject(message: { subject?: string; zeroAccess?: unknown }): string | undefined {
+    return message.zeroAccess || !message.subject || message.subject === PROTECTED_SUBJECT ? undefined : message.subject;
+}
+
+/** An MDN's subject: `Read: <subject>` or `Delivered: <subject>`, or `Read receipt` / `Delivery receipt` when the original's subject
+ * can't be quoted (`quotableSubject()`). */
+export function dispositionSubject(dispositionType: "read" | "delivery", originalSubject: string | undefined): string {
+    if (originalSubject === undefined) {
+        return dispositionType === "read" ? "Read receipt" : "Delivery receipt";
+    }
+    return `${dispositionType === "read" ? "Read" : "Delivered"}: ${originalSubject}`;
 }
 
 /** The parameters `buildDispositionNotification()` needs to compose one MDN. */

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { simpleParser } from "mailparser";
-import { buildDispositionNotification, parseDispositionNotification } from "../../src/util/ReceiptUtils.js";
+import { buildDispositionNotification, dispositionSubject, parseDispositionNotification, quotableSubject } from "../../src/util/ReceiptUtils.js";
 
 /** Builds an MDN then runs it back through `mailparser` exactly the way `ScanPipeline` does in production
  * (scan `parsed.attachments` for the `message/disposition-notification` part), returning that part's raw
@@ -168,5 +168,22 @@ describe("parseDispositionNotification() Tests", () => {
         const result = parseDispositionNotification("Original-Message-ID: <abc123@example.com>\r\n");
         expect(result?.rotatedKeyFingerprint).toBeUndefined();
         expect(result?.policyId).toBeUndefined();
+    });
+});
+
+describe("quotableSubject() / dispositionSubject()", () => {
+    it("quotes a readable subject, and none of a zero-access message, its placeholder or an empty one", () => {
+        expect(quotableSubject({ subject: "Q3 budget" })).toBe("Q3 budget");
+        expect(quotableSubject({ subject: "Q3 budget", zeroAccess: { keyFingerprint: "fp" } })).toBeUndefined();
+        expect(quotableSubject({ subject: "[...]" })).toBeUndefined();
+        expect(quotableSubject({ subject: "" })).toBeUndefined();
+        expect(quotableSubject({})).toBeUndefined();
+    });
+
+    it("names the original's subject when it can, else says only what the receipt is", () => {
+        expect(dispositionSubject("read", "Q3 budget")).toBe("Read: Q3 budget");
+        expect(dispositionSubject("delivery", "Q3 budget")).toBe("Delivered: Q3 budget");
+        expect(dispositionSubject("read", undefined)).toBe("Read receipt");
+        expect(dispositionSubject("delivery", undefined)).toBe("Delivery receipt");
     });
 });
