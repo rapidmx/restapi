@@ -291,8 +291,38 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         BaseCalendarEventRoute.assertParticipants(obj);
         BaseCalendarEventRoute.normalizeDescriptionAndPolicy(obj, false);
         delete obj.invitationContent;
-        await this.sealing?.seal(obj, undefined);
+        const sealedSibling: T | undefined = await this.findSealedSibling(obj);
+        if (sealedSibling) {
+            // One occurrence of an event filed from a zero-access invitation, detached (a drag, a resize, "This event only"): the
+            // client sends the content it opened, which is sealed again into one blob to the series' key and never stored readable,
+            // whatever the calendar's own setting (a 409 when that key is gone, as for an update).
+            ZeroAccessRouteSealing.takeClearedFields(obj);
+            delete obj.sealedFields;
+            await this.keepSealed(obj, sealedSibling);
+            const origin: string | undefined = (sealedSibling as any).encryptionOrigin;
+            // Sticky across a series' instances (`CalendarEvent.encryptionOrigin`).
+            obj.encryptionOrigin = origin && origin !== "none" ? origin : "derived";
+        } else {
+            await this.sealing?.seal(obj, undefined);
+        }
         delete obj.clearedFields;
+    }
+
+    /** A row of the create body's mailbox with the body's `icalUid` (the series, or another occurrence of it) whose content is sealed whole
+     * (`sealedContent`): the body is then an occurrence of an event filed from a zero-access invitation (`prepareCreate()`). The `icalUid`
+     * is the client's value and is matched as a literal. */
+    private async findSealedSibling(obj: any): Promise<T | undefined> {
+        if (typeof obj.mailboxUid !== "string" || typeof obj.icalUid !== "string" || obj.icalUid.length === 0) {
+            return undefined;
+        }
+        const key: string = boundIndexedValue(obj.icalUid);
+        const rows: T[] = await this.repoUtils!.find({ mailboxUid: obj.mailboxUid, icalUid: ModelUtils.literal(key), limit: 50 } as any, {
+            ignoreACL: true,
+            limit: 50,
+        });
+        const sealed: T[] = rows.filter((row) => row.icalUid === key && (row as any).sealedContent);
+        // The series' own row first: what the occurrence is a part of.
+        return sealed.find((row) => !row.recurrenceId) ?? sealed[0];
     }
 
     /**

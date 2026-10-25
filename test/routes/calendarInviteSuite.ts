@@ -14,7 +14,7 @@ import * as uuid from "uuid";
 import { AttendeeResponseStatus, AttendeeRole, BusyStatus, CalendarEventStatus, FolderType, RecipientType } from "../../src/models/types.js";
 import { nameBasedUuid } from "../../src/util/UuidUtils.js";
 import type { InMemoryBlobStore, RecordingMailTransport } from "../testDoubles.js";
-import type { TestZeroAccessKey } from "../zeroAccessTestKeys.js";
+import { openSealedField, type TestZeroAccessKey } from "../zeroAccessTestKeys.js";
 
 export interface CalendarInviteSuiteContext {
     app: () => any;
@@ -242,6 +242,96 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             expect(row.sealedContent.keyFingerprint).toBe((await keyOf(mailbox.uid)).key.fingerprint);
             // The per-field copies the revision replaces go, so no client opens the old ones over it.
             expect(row.sealedFields ?? null).toBeNull();
+        });
+
+        describe("one occurrence detached from a series filed from a zero-access invitation (a create naming its icalUid)", () => {
+            /** A mailbox whose mail is zero-access and whose calendar isn't protected, with a daily series accepted from a sealed message. */
+            const acceptedSeries = async () => {
+                const context = await setup();
+                keys.set(context.mailbox.uid, await ctx.addZeroAccessKey(context.mailbox.uid, { mail: true, calendar: false, contacts: false, tasks: false }));
+                const message = await receiveSealed(context.mailbox.uid, context.inbox.uid);
+                const answered = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({
+                    responseStatus: "accepted",
+                    ics: requestFor(context.me, { extra: ["RRULE:FREQ=DAILY;COUNT=5"] }),
+                });
+                expect(answered.status).toBe(200);
+                const [series] = await ctx.findEvents(context.mailbox.uid);
+                expect(series.sealedContent).toBeTruthy();
+                return { ...context, series };
+            };
+            const occurrenceStart = new Date(start.getTime() + 24 * HOUR);
+            const occurrence = (mailbox: any, calendar: any, me: string, fields: any = {}) => ({
+                mailboxUid: mailbox.uid,
+                folderUid: calendar.uid,
+                icalUid: eventUid,
+                recurrenceId: occurrenceStart,
+                startDate: new Date(occurrenceStart.getTime() + 2 * HOUR),
+                endDate: new Date(occurrenceStart.getTime() + 3 * HOUR),
+                allDay: false,
+                title: "CANARY Video Test",
+                location: "CANARY https://meet.example.com/m/1#k=secret",
+                description: "CANARY agenda",
+                organizer: { address: "boss@boss.example.com", type: RecipientType.TO },
+                attendees: [{ address: me, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.ACCEPTED, isOrganizer: false }],
+                ...fields,
+            });
+
+            it("Seals the occurrence's content to the series' key, though the calendar isn't protected, and stores only placeholders", async () => {
+                const { mailbox, calendar, me, series } = await acceptedSeries();
+
+                const result = await owner(request(ctx.app()).post(ctx.baseUrl)).send(
+                    occurrence(mailbox, calendar, me, { sealedFields: { title: "c2VhbGVk" }, sealedContent: { keyFingerprint: "forged", sealed: "eA==" } }),
+                );
+
+                expect(result.status).toBeLessThan(300);
+                const row: any = (await ctx.findEvents(mailbox.uid)).find((event: any) => event.uid !== series.uid);
+                expect(row).toBeTruthy();
+                expect(row.title).toBe("[...]");
+                expect(row.location ?? null).toBeNull();
+                expect(row.description ?? null).toBeNull();
+                expect(row.descriptionHtml ?? null).toBeNull();
+                expect(row.sealedFields ?? null).toBeNull();
+                expect(row.encryptionOrigin).toBe("derived");
+                expect(JSON.stringify(row)).not.toContain("CANARY");
+                expect(JSON.stringify(row)).not.toContain("secret");
+                expect(JSON.stringify(result.body)).not.toContain("CANARY");
+                expect(row.sealedContent.keyFingerprint).toBe(series.sealedContent.keyFingerprint);
+                expect(await openSealedField(row.sealedContent.sealed, keys.get(mailbox.uid)!)).toEqual({
+                    title: "CANARY Video Test",
+                    location: "CANARY https://meet.example.com/m/1#k=secret",
+                    description: "CANARY agenda",
+                });
+            });
+
+            it("Refuses (409) the occurrence when the series' key is gone, storing nothing", async () => {
+                const { mailbox, calendar, me } = await acceptedSeries();
+                // The mailbox's keys replaced wholesale: the series' key is no longer among them.
+                await ctx.addZeroAccessKey(mailbox.uid, { mail: true, calendar: false, contacts: false, tasks: false });
+
+                const result = await owner(request(ctx.app()).post(ctx.baseUrl)).send(occurrence(mailbox, calendar, me));
+
+                expect(result.status).toBe(409);
+                const rows: any[] = await ctx.findEvents(mailbox.uid);
+                expect(rows).toHaveLength(1);
+                expect(JSON.stringify(rows)).not.toContain("CANARY");
+            });
+
+            it("Leaves a create of another icalUid, or of another mailbox's series, to the calendar's own setting", async () => {
+                const { mailbox, calendar, me } = await acceptedSeries();
+                const other = await setup();
+
+                const unrelated = await owner(request(ctx.app()).post(ctx.baseUrl)).send(occurrence(mailbox, calendar, me, { icalUid: "another@boss.example.com", recurrenceId: undefined }));
+                const elsewhere = await owner(request(ctx.app()).post(ctx.baseUrl)).send(occurrence(other.mailbox, other.calendar, other.me));
+
+                expect(unrelated.status).toBeLessThan(300);
+                expect(elsewhere.status).toBeLessThan(300);
+                const readable: any = (await ctx.findEvents(mailbox.uid)).find((event: any) => event.icalUid === "another@boss.example.com");
+                expect(readable.title).toBe("CANARY Video Test");
+                expect(readable.sealedContent ?? null).toBeNull();
+                const [copied] = await ctx.findEvents(other.mailbox.uid);
+                expect(copied.title).toBe("CANARY Video Test");
+                expect(copied.sealedContent ?? null).toBeNull();
+            });
         });
 
         it("Clears the readable location of a copy not sealed yet when a newer revision in a protected calendar names none", async () => {
