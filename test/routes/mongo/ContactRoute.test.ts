@@ -21,7 +21,7 @@ import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
 import { ContactAddressKind, FolderType } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
-import { registerTestDoubles } from "../../testDoubles.js";
+import { registerTestDoubles, type InMemoryBlobStore } from "../../testDoubles.js";
 import { openSealedField, testZeroAccessKey } from "../../zeroAccessTestKeys.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
@@ -793,7 +793,7 @@ describe("Route:ContactMongo Tests", () => {
             const cleared = await request(server.getApplication())
                 .put(`${baseUrl}/${created.uid}`)
                 .set("Authorization", "jwt " + ownerToken)
-                .send({ uid: created.uid, version: created.version, notes: null, phones: [] });
+                .send({ uid: created.uid, version: created.version, notes: null, phones: [], clearedFields: ["notes", "phones"] });
             expect(cleared.status, JSON.stringify(cleared.body)).toBe(200);
             const row = await stored(created.uid);
             expect(row.sealedFields.notes).toBeUndefined();
@@ -818,6 +818,55 @@ describe("Route:ContactMongo Tests", () => {
             expect(row.mailboxUid).toBe(destination.mailbox.uid);
             expect(row.notes ?? null).toBeNull();
             expect(await openSealedField(row.sealedFields.notes, destination.za)).toBe("CANARY moved notes");
+            // What the move didn't carry is sealed for the destination too: nothing of it stays readable there.
+            expect(JSON.stringify(row)).not.toContain("CANARY");
+            expect(await openSealedField(row.sealedFields.company, destination.za)).toBe("CANARY Corp");
+            expect(row.zeroAccessBackfillError ?? null).toBeNull();
+        });
+
+        it("Seals all of a contact on its first protected write, its readable photo included, and never wipes what a client that couldn't open it sends back", async () => {
+            const { mailbox, folder, za } = await protect({ contacts: false });
+            const put = (body: any) => request(server.getApplication()).put(`${baseUrl}/${body.uid}`).set("Authorization", "jwt " + ownerToken).send(body);
+            const created = (await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send({ mailboxUid: mailbox.uid, folderUid: folder.uid, ...CARD })).body;
+            const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const photoKey = `contact-photos/${created.uid}/readable`;
+            await blobStore.put(photoKey, Buffer.from("CANARY-PHOTO"));
+            await contactRepo.updateOne({ uid: created.uid } as any, { $set: { photoBlobKey: photoKey } });
+            mailbox.zeroAccessTypes = { contacts: true };
+            await mailboxRepo.save(mailbox);
+
+            // A list's bulk categorize sends the categories alone, before the backfill reached the contact.
+            const categorized = await put({ uid: created.uid, version: (await stored(created.uid)).version, categories: ["CANARY-new"] });
+            expect(categorized.status, JSON.stringify(categorized.body)).toBe(200);
+            const row = await stored(created.uid);
+            expect(JSON.stringify(row)).not.toContain("CANARY");
+            expect(Object.keys(row.sealedFields).sort()).toEqual(
+                ["addresses", "categories", "company", "displayName", "emails", "givenName", "jobTitle", "notes", "phones", "surname"],
+            );
+            expect(await openSealedField(row.sealedFields.notes, za)).toBe("CANARY notes");
+            expect(await openSealedField(row.sealedFields.categories, za)).toEqual(["CANARY-new"]);
+            expect(row.photoSealed).toBe(true);
+            expect(row.photoBlobKey).not.toBe(photoKey);
+            expect(await blobStore.exists(photoKey)).toBe(false);
+            expect((await blobStore.get(row.photoBlobKey)).toString("latin1")).not.toContain("CANARY");
+
+            // A client that couldn't open it (keys locked, no key) sends its whole form back as shown: placeholders, nothing named cleared.
+            const echoed = await put({
+                uid: created.uid,
+                version: row.version,
+                displayName: row.displayName,
+                givenName: null,
+                surname: null,
+                company: null,
+                jobTitle: null,
+                notes: null,
+                phones: [],
+                addresses: [],
+                categories: [],
+                emails: row.emails,
+            });
+            expect(echoed.status, JSON.stringify(echoed.body)).toBe(200);
+            expect((await stored(created.uid)).sealedFields).toEqual(row.sealedFields);
         });
     });
 });

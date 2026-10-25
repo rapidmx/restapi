@@ -14,7 +14,7 @@ import { Logger } from "@rapidrest/core";
 import { MailboxImportJobMongo } from "../../src/jobs/mongo/MailboxImportJobMongo.js";
 import { ScheduledSendJobMongo } from "../../src/jobs/mongo/ScheduledSendJobMongo.js";
 import { MessageRouteMongo } from "../../src/routes/mongo/MessageRouteMongo.js";
-import { newZeroAccessWriter, ZeroAccessParseError, ZeroAccessWriter } from "../../src/zeroaccess/ZeroAccessWriter.js";
+import { newZeroAccessWriter, ZeroAccessWriter } from "../../src/zeroaccess/ZeroAccessWriter.js";
 
 x509.cryptoProvider.set(webcrypto as unknown as Crypto);
 
@@ -79,10 +79,16 @@ describe("ZeroAccessWriter", () => {
         expect(index.delete).toHaveBeenCalledWith(sealed!.indexEntryUid, expect.objectContaining({ purge: true }));
     });
 
-    it("tells a message it can't parse from a failure that passes", async () => {
+    it("seals deeply nested HTML, which mailparser's own HTML-to-text can't convert, indexing its text", async () => {
         const mailbox = { uid: "mbx", ownerUserUid: "u", zeroAccessKeys: [await zeroAccessKey()] };
-        const deep = "<div>".repeat(3000) + "x" + "</div>".repeat(3000);
-        await expect(writer({ blobStore: {} }, { index: {} }).sealRaw(mailbox, Buffer.from("Content-Type: text/html\r\n\r\n" + deep), "m1", new Date())).rejects.toBeInstanceOf(ZeroAccessParseError);
+        const blobs = new Map<string, Buffer>();
+        const blobStore = { exists: async (k: string) => blobs.has(k), put: async (k: string, v: Buffer) => void blobs.set(k, v) };
+        const index = { findOne: vi.fn().mockResolvedValue(undefined), create: vi.fn() };
+        const deep = "<div>".repeat(3000) + "CANARY deep text" + "</div>".repeat(3000);
+        const raw = Buffer.from("Subject: nested\r\nContent-Type: text/html\r\n\r\n" + deep);
+        const sealed = await writer({ blobStore, extractorRegistry: undefined }, { index }).sealRaw(mailbox, raw, "m1", new Date());
+        expect(sealed).toMatchObject({ subject: "[...]", bodyBlobKey: "za/mbx/m1" });
+        expect(index.create).toHaveBeenCalledTimes(1);
         expect(await writer().allowed()).toBe(true);
     });
 

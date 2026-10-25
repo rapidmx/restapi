@@ -29,6 +29,7 @@ import { openSealedField, testZeroAccessKey } from "../../zeroAccessTestKeys.js"
 import { simpleParser } from "mailparser";
 import { CalendarEventAttendeeLinkSQL } from "../../../src/models/sql/CalendarEventAttendeeLinkSQL.js";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
+import { MeetingInviteSender } from "../../../src/scheduling/MeetingInviteSender.js";
 
 describe("Route:CalendarEventSQL Tests", () => {
     const logger = Logger();
@@ -1164,6 +1165,11 @@ describe("Route:CalendarEventSQL Tests", () => {
 
         it("Sends a keyed meeting's link key to no mailbox here whose copy would be stored readable", async () => {
             const { mailbox, folder } = await protect({ calendar: false });
+            // As the server builds MeetingSchedulingJob's sender at startup, under the name the route once used: the route must not be handed it.
+            await objectFactory.newInstance(MeetingInviteSender, { name: "MeetingInviteSender", args: [undefined, undefined, {}] });
+            const route: any = (objectFactory as any).instances.get("routes.CalendarEventRoute:default");
+            expect(route).toBeDefined();
+            route.inviteSender = undefined;
             const domain = `za-${uuid.v4().slice(0, 8)}.test`;
             const domains = (): any => (objectFactory.getInstance(ConnectionManager)!.connections.get("sql") as any).getRepository(DomainSQL);
             await domains().save(new DomainSQL({ uid: domain, name: domain, enabled: true, verified: true, verificationToken: uuid.v4() }));
@@ -1188,6 +1194,8 @@ describe("Route:CalendarEventSQL Tests", () => {
                 .send({ uid: created.uid, version: created.version, videoMeetingUid: "vm-3", invitationContent: { meetingLinkSecrets: Object.fromEntries(guests.map((address) => [address, KEY])) } });
             expect(sent.status, JSON.stringify(sent.body)).toBe(200);
             expect(transport().sent.map((mail: any) => mail.envelopeTo[0]).sort()).toEqual([`bea@${domain}`, "bob@example.org"]);
+            // The SQL database outlives this file: a verified domain left behind makes later files' example.com mailboxes invalid.
+            await domains().delete({ uid: domain });
         });
 
         it("Stores an event readable while the calendar isn't protected, leaving its invitations to the scheduling job", async () => {

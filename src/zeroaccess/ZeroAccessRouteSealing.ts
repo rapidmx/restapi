@@ -30,19 +30,46 @@ export class ZeroAccessRouteSealing {
 
     /**
      * Seals (or stores readable) the protected fields of `obj`, a create (`existing` undefined) or update body, for the mailbox it will be
-     * in - on a move to another mailbox, the destination, whose `mailboxUid` the route has already set on `obj`. A client's own
-     * `sealedFields` is never kept. The client opened the record and sends only what it changes, so an empty value clears a field
-     * (`SealFieldsOptions.emptyClears`). A record with sealed content can't move to another mailbox (409, `refuseSealedMove()`).
+     * in - on a move to another mailbox, the destination, whose `mailboxUid` the route has already set on `obj`. The first protected write
+     * of a record seals all of it, whatever the body carries (`sealFieldsOnWrite()`); a record moved to another mailbox is selected by the
+     * backfill again (its `zeroAccessBackfillError` is cleared). A client's own `sealedFields` is never kept. A record with sealed content
+     * can't move to another mailbox (409, `refuseSealedMove()`).
+     *
+     * An empty value (`null`, `[]`) of a sealed field is a clear only when the body names that field in `clearedFields` (`takeClearedFields()`):
+     * a client that couldn't open the record sends back the empty placeholders it was shown, and those leave the sealed values alone.
+     * `serverWrite`: `obj` was built by the server from what it was given in full (an invitation's revision), so every empty value is a clear.
      */
-    public async seal(obj: any, existing: { mailboxUid?: string; sealedFields?: Record<string, string> | null } | undefined): Promise<void> {
+    public async seal(obj: any, existing: { mailboxUid?: string; sealedFields?: Record<string, string> | null } | undefined, serverWrite?: boolean): Promise<void> {
+        const cleared: string[] = ZeroAccessRouteSealing.takeClearedFields(obj);
         ZeroAccessRouteSealing.refuseSealedMove(obj, existing);
+        if (existing && obj.mailboxUid !== undefined && obj.mailboxUid !== existing.mailboxUid) {
+            obj.zeroAccessBackfillError = null;
+        }
         if (!this.sealer) {
             delete obj.sealedFields;
             return;
         }
         const mailboxUid: string | undefined = obj.mailboxUid ?? existing?.mailboxUid;
         const mailbox = mailboxUid ? await this.mailboxRepo?.findOne(mailboxUid, { ignoreACL: true }) : undefined;
-        await this.sealer.sealWrite(this.type, mailbox, obj, existing, { emptyClears: true });
+        await this.sealer.sealWrite(this.type, mailbox, obj, existing, { emptyClears: serverWrite || cleared });
+    }
+
+    /**
+     * Takes `clearedFields` off a create or update body (it is never stored) and returns it: the sealed fields the client empties on
+     * purpose. A client sends it only for a field of a record it opened that held a value and that the user emptied - the proof that an
+     * empty value is a clear rather than the placeholder a client that couldn't open the record was shown. Refused (400) unless it is a
+     * list of field names.
+     */
+    public static takeClearedFields(obj: any): string[] {
+        const cleared: unknown = obj.clearedFields;
+        delete obj.clearedFields;
+        if (cleared === undefined) {
+            return [];
+        }
+        if (!Array.isArray(cleared) || cleared.length > 100 || !cleared.every((name) => typeof name === "string")) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "clearedFields must be a list of field names.");
+        }
+        return cleared;
     }
 
     /**

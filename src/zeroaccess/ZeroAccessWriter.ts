@@ -24,9 +24,6 @@ const { Config, Inject } = ObjectDecorators;
 export const ZERO_ACCESS_DRAFT_MESSAGE =
     "This draft is stored with zero-access encryption, which the server can't send. Open it and send it again.";
 
-/** Thrown by `ZeroAccessWriter.sealRaw()` for a message it can't parse: unlike a failure to store it, trying again won't help. */
-export class ZeroAccessParseError extends Error {}
-
 /** Where `seal()` stores the sealed message and how it treats an existing index entry - the defaults are a message filed once. */
 export interface ZeroAccessSealOptions {
     /** The blob key to store the sealed message under, instead of `zeroAccessBlobKey(mailboxUid, messageUid)`. */
@@ -175,7 +172,12 @@ export class ZeroAccessWriter {
         await this.indexEntryRepo?.delete(uid, { ignoreACL: true, purge: true });
     }
 
-    /** `seal()` for a writer holding only the raw message: parses it here for the subject, preview, index text and attachments. */
+    /**
+     * `seal()` for a writer holding only the raw message: parses it here for the subject, preview, index text and attachments. The
+     * parse only feeds those - sealing needs nothing but the bytes - so a message mailparser can't read is still sealed whole, with an
+     * empty summary and nothing indexed, never left readable. The HTML is converted by the bounded `htmlPreview()`: mailparser's own
+     * conversion fails on deeply nested HTML (about 3000 `<div>`s), as `ScanPipeline` and the transport rules found.
+     */
     public async sealRaw(
         mailbox: Pick<Mailbox, "uid"> & ZeroAccessMailbox,
         raw: Buffer,
@@ -186,24 +188,25 @@ export class ZeroAccessWriter {
         if (!(await this.target(mailbox))) {
             return undefined;
         }
-        let parsed: ParsedMail;
+        let parsed: ParsedMail | undefined;
         try {
-            parsed = await simpleParser(raw, { skipImageLinks: true });
-        } catch (err: any) {
-            throw new ZeroAccessParseError(`The message couldn't be parsed: ${err?.message ?? err}`);
+            parsed = await simpleParser(raw, { skipImageLinks: true, skipHtmlToText: true });
+        } catch {
+            parsed = undefined;
         }
-        const bodyText: string = (parsed.text || (typeof parsed.html === "string" ? htmlPreview(parsed.html, BODY_TEXT_MAX_LENGTH) : "")).slice(0, BODY_TEXT_MAX_LENGTH);
+        // With `skipHtmlToText`, an HTML-only message's `text` is "", not undefined.
+        const bodyText: string = (parsed?.text || (typeof parsed?.html === "string" ? htmlPreview(parsed.html, BODY_TEXT_MAX_LENGTH) : "")).slice(0, BODY_TEXT_MAX_LENGTH);
         return this.seal(mailbox, {
             messageUid,
             receivedAt,
             raw,
-            subject: parsed.subject ?? "",
+            subject: parsed?.subject ?? "",
             preview: bodyText.trim().slice(0, PREVIEW_MAX_LENGTH),
             bodyText,
-            fromAddress: parsed.from?.value?.[0]?.address ?? "",
-            fromDisplayName: parsed.from?.value?.[0]?.name || undefined,
-            recipients: parseHeaderRecipients(parsed),
-            attachments: (parsed.attachments ?? []).map((a) => ({ filename: a.filename, contentType: a.contentType, content: a.content })),
+            fromAddress: parsed?.from?.value?.[0]?.address ?? "",
+            fromDisplayName: parsed?.from?.value?.[0]?.name || undefined,
+            recipients: parsed ? parseHeaderRecipients(parsed) : [],
+            attachments: (parsed?.attachments ?? []).map((a) => ({ filename: a.filename, contentType: a.contentType, content: a.content })),
         }, options);
     }
 

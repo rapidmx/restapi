@@ -414,6 +414,54 @@ describe("Route:TaskMongo Tests", () => {
             expect((await stored(readable.uid)).sealedFields ?? null).toBeNull();
         });
 
+        it("Seals all of a task on its first protected write, and on a move into a mailbox that protects tasks", async () => {
+            const plain = await protect({ tasks: false });
+            const before = (await create(plain.mailbox, plain.folder, { title: "CANARY-TITLE", body: "CANARY-BODY" })).body;
+            plain.mailbox.zeroAccessTypes = { tasks: true };
+            await mailboxRepo.save(plain.mailbox);
+            // A title-only edit, before the backfill reached the task: its notes are sealed with it.
+            const edited = await request(server.getApplication())
+                .put(`${baseUrl}/${before.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: before.uid, version: before.version, title: "CANARY-RENAMED" });
+            expect(edited.status, JSON.stringify(edited.body)).toBe(200);
+            const row = await stored(before.uid);
+            expect(JSON.stringify(row)).not.toContain("CANARY");
+            expect(await openSealedField(row.sealedFields.body, plain.za)).toBe("CANARY-BODY");
+            expect(await openSealedField(row.sealedFields.title, plain.za)).toBe("CANARY-RENAMED");
+
+            // A move that carries nothing but the folder.
+            const open = await protect({ tasks: false });
+            const destination = await protect({ tasks: true });
+            const readable = (await create(open.mailbox, open.folder, { title: "CANARY-MOVED", body: "CANARY-MOVED-BODY" })).body;
+            const moved = await request(server.getApplication())
+                .put(`${baseUrl}/${readable.uid}/folderUid`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send(destination.folder.uid);
+            expect(moved.status, JSON.stringify(moved.body)).toBe(200);
+            const movedRow = await stored(readable.uid);
+            expect(movedRow.mailboxUid).toBe(destination.mailbox.uid);
+            expect(JSON.stringify(movedRow)).not.toContain("CANARY");
+            expect(await openSealedField(movedRow.sealedFields.title, destination.za)).toBe("CANARY-MOVED");
+            expect(await openSealedField(movedRow.sealedFields.body, destination.za)).toBe("CANARY-MOVED-BODY");
+        });
+
+        it("Clears a task's notes only when the client names them, never on a placeholder sent back", async () => {
+            const { mailbox, folder, za } = await protect({ tasks: true });
+            const created = (await create(mailbox, folder, { title: "Secret", body: "Notes" })).body;
+            const put = (body: any) => request(server.getApplication()).put(`${baseUrl}/${created.uid}`).set("Authorization", "jwt " + ownerToken).send(body);
+
+            expect((await put({ uid: created.uid, version: created.version, title: "Protected task", body: null })).status).toBe(200);
+            const echoed = await stored(created.uid);
+            expect(await openSealedField(echoed.sealedFields.body, za)).toBe("Notes");
+
+            expect((await put({ uid: created.uid, version: echoed.version, body: null, clearedFields: ["body"] })).status).toBe(200);
+            const cleared = await stored(created.uid);
+            expect(cleared.sealedFields.body).toBeUndefined();
+            expect(cleared.clearedFields).toBeUndefined();
+            expect(await openSealedField(cleared.sealedFields.title, za)).toBe("Secret");
+        });
+
         it("Refuses filtering or sorting tasks by title or notes", async () => {
             const { folder } = await protect({ tasks: true });
             for (const query of [`title=Secret`, `body=x`, `sort=${encodeURIComponent(JSON.stringify({ title: "ASC" }))}`]) {

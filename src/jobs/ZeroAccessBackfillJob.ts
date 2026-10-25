@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
 import { ObjectDecorators } from "@rapidrest/core";
-import { ApiErrors, BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { ApiErrors, BackgroundService, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { BlobStore } from "../blob/BlobStore.js";
 import { FolderType, type Folder, type Mailbox, type Message, type ZeroAccessDataType } from "../models/types.js";
 import { CONTACT_PHOTO_KEY_PREFIX } from "../routes/BaseContactRoute.js";
@@ -13,7 +13,7 @@ import { deleteBlobsIfUnreferenced, type MessageBlobRepos } from "../util/BlobRe
 import { asEntity } from "../util/EntityUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-import { newZeroAccessWriter, ZeroAccessParseError, type ZeroAccessSealedFields, type ZeroAccessWriter } from "../zeroaccess/ZeroAccessWriter.js";
+import { newZeroAccessWriter, type ZeroAccessSealedFields, type ZeroAccessWriter } from "../zeroaccess/ZeroAccessWriter.js";
 import { sealFieldsOnWrite } from "../zeroaccess/ZeroAccessFieldSealer.js";
 import { newZeroAccessRecordSealer, PROTECTED_FIELDS, type ZeroAccessRecordSealer } from "../zeroaccess/ZeroAccessRecordSealer.js";
 import type { ZeroAccessTarget } from "../zeroaccess/ZeroAccessResolver.js";
@@ -36,8 +36,9 @@ const RECORD_TYPES: readonly ZeroAccessDataType[] = ["calendar", "contacts", "ta
  * Each run seals at most `batch_size` messages across all mailboxes, newest first within a mailbox, so the newest mail is protected
  * first and a large backlog is worked through over many runs. It is idempotent: a message is selected while its `zeroAccess` is unset,
  * and the sealed blob and index entry are keyed by the message, so a run interrupted halfway is completed by the next. A message it
- * can never seal - its body is gone, or can't be parsed - gets `zeroAccessBackfillError` and is never selected again, so it can't block
- * the rest; one that failed for a reason that passes (the blob store or the database failing for a moment) is tried again next run.
+ * can never seal - its body is gone - gets `zeroAccessBackfillError` and is never selected again, so it can't block the rest; one that
+ * failed for a reason that passes (the blob store or the database failing for a moment) is tried again next run. A body that can't be
+ * parsed is still sealed whole (`ZeroAccessWriter.sealRaw()`).
  *
  * Messages in Outbox are left alone - they are being sent, and `ScheduledSendJob` seals the Sent Items copy - and so is mail the
  * sender encrypted end to end. Turning zero-access off never decrypts anything (the server can't): this job only ever seals.
@@ -179,28 +180,45 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
     }
 
     /** Seals up to `limit` of `mailbox`'s `type` records not sealed yet - the deleted-but-restorable ones too - when `type` is protected
-     * for it, and returns how many it attempted. */
+     * for it, and returns how many it attempted. Then contacts whose fields are sealed but whose photo is still readable: one written by
+     * a writer that seals fields but not photos (a device), before the type was protected or in a mailbox it moved from. */
     private async backfillRecords(mailbox: X, type: ZeroAccessDataType, limit: number, allowed: boolean): Promise<number> {
         const repo: RecoverableRepoUtils<any> | undefined = this.recordRepos[type];
         const target: ZeroAccessTarget | undefined = repo && this.recordSealer ? await this.recordSealer.target(type, mailbox, allowed) : undefined;
         if (!repo || !target) {
             return 0;
         }
-        const query = (deleted?: true) =>
+        const query = (selector: Record<string, any>, deleted?: true) =>
             repo.find(
                 {
                     mailboxUid: mailbox.uid,
-                    sealedFields: null,
                     zeroAccessBackfillError: null,
-                    ...(type === "calendar" ? { sealedContent: null } : {}),
+                    ...selector,
                     ...(deleted ? { deleted: true } : {}),
                     sort: { uid: "ASC" },
                     limit,
                 } as any,
                 { ignoreACL: true, limit },
             );
-        const live: any[] = await query();
-        const candidates: any[] = live.length < limit ? [...live, ...(await query(true))] : live;
+        const selectors: Record<string, any>[] = [{ sealedFields: null, ...(type === "calendar" ? { sealedContent: null } : {}) }];
+        if (type === "contacts") {
+            selectors.push({
+                photoBlobKey: `like(${CONTACT_PHOTO_KEY_PREFIX}*)`,
+                $or: [{ photoSealed: ModelUtils.literal(false) }, { photoSealed: ModelUtils.literal(null) }],
+            });
+        }
+        const candidates: any[] = [];
+        const seen: Set<string> = new Set();
+        for (const selector of selectors) {
+            for (const deleted of [undefined, true] as const) {
+                for (const record of candidates.length < limit ? await query(selector, deleted) : []) {
+                    if (!seen.has(record.uid)) {
+                        seen.add(record.uid);
+                        candidates.push(record);
+                    }
+                }
+            }
+        }
         let attempted: number = 0;
         for (const record of candidates.slice(0, limit)) {
             attempted++;
@@ -298,7 +316,8 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
     private async backfillMailbox(mailbox: X, limit: number): Promise<number> {
         // `limit` baked into the query too (SQL reads only that); Outbox is skipped in code, so a few extra rows are asked for. `find()`
         // returns a soft-deleted (restorable) row only for an explicit `deleted: true`, so those - still readable mail at rest - are a
-        // second query, after the live ones.
+        // second query, after the live ones. Not end-to-end encrypted is `encrypted` false or unset: on SQL, rows stored before the column
+        // existed hold NULL, which `ne(true)` (`NOT (encrypted = true)`) never matches, so both are named.
         const pageSize: number = limit + 100;
         const query = (deleted?: true) =>
             this.messageRepo!.find(
@@ -306,7 +325,7 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                     mailboxUid: mailbox.uid,
                     zeroAccess: null,
                     zeroAccessBackfillError: null,
-                    encrypted: "ne(true)",
+                    $or: [{ encrypted: ModelUtils.literal(false) }, { encrypted: ModelUtils.literal(null) }],
                     ...(deleted ? { deleted: true } : {}),
                     sort: { receivedDate: "DESC", uid: "ASC" },
                     limit: pageSize,
@@ -357,12 +376,8 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                 ? await this.zeroAccessWriter!.sealDraft(mailbox, raw, message.uid, receivedAt)
                 : await this.zeroAccessWriter!.sealRaw(mailbox, raw, message.uid, receivedAt);
         } catch (err: any) {
-            // Only a message that can't be parsed is given up on; storing the sealed copy or its index entry fails only for a while.
-            if (err instanceof ZeroAccessParseError) {
-                await this.recordFailure(message, `The message couldn't be sealed: ${err.message}`);
-            } else {
-                this.logger?.warn(`ZeroAccessBackfillJob: message ${message.uid} couldn't be sealed this run: ${err?.message ?? err}`);
-            }
+            // Even a message that can't be parsed is sealed (`sealRaw()`): storing the sealed copy or its index entry fails only for a while.
+            this.logger?.warn(`ZeroAccessBackfillJob: message ${message.uid} couldn't be sealed this run: ${err?.message ?? err}`);
             return true;
         }
         if (!sealed) {

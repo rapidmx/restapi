@@ -2740,6 +2740,24 @@ export abstract class ScanQueueJob<
         return content;
     }
 
+    /**
+     * What a newer revision applied to `current` drops of the sealed copies it supersedes, so no client opens the old title, location or
+     * description over the new ones: a zero-access message's revision carries all of them in `sealedContent`, so the row's per-field
+     * copies go; otherwise (`content` sealed field by field, or readable while neither the mail nor the calendar is protected) the old
+     * `sealedContent` goes, and readable fields drop their sealed copies - the title's only when the revision names one.
+     */
+    private supersededSealing(current: CE, parsed: ParsedIcsEvent, content: Record<string, any> | undefined): Record<string, any> {
+        if (content?.sealedContent) {
+            return { sealedFields: null };
+        }
+        const keepTitle: boolean = parsed.summary === undefined;
+        const sealedTitle: string | undefined = (current as any).sealedFields?.title;
+        return {
+            ...(keepTitle ? {} : { sealedContent: null }),
+            ...(content ? {} : { sealedFields: keepTitle && sealedTitle ? { title: sealedTitle } : null }),
+        };
+    }
+
     private async processItipRequest(
         mailboxUid: string,
         parsed: ParsedIcsEvent,
@@ -2886,6 +2904,7 @@ export abstract class ScanQueueJob<
                     recurrenceRule: parsed.recurrenceRule ?? current.recurrenceRule,
                     sequence: parsed.sequence,
                     inviteSequenceSent: parsed.sequence,
+                    ...this.supersededSealing(current, parsed, content),
                     ...(content ?? {}),
                 };
             });

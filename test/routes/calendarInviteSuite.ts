@@ -209,6 +209,39 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             expect(updated.sealedContent.sealed).not.toBe(accepted.sealedContent.sealed);
         });
 
+        it("Seals a newer revision into the message's key though the copy was sealed field by field while the calendar was protected", async () => {
+            const { mailbox, inbox, calendar, me } = await setup();
+            // Mail stays zero-access; the calendar isn't protected any more (undecided here), but the copy kept its per-field sealing.
+            const message = await receiveSealed(mailbox.uid, inbox.uid);
+            await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                uid: nameBasedUuid(`itip:${mailbox.uid}:${eventUid}:master`),
+                icalUid: eventUid,
+                title: "Protected event",
+                sealedFields: { title: "c2VhbGVk", location: "c2VhbGVk" },
+                organizer: { address: "boss@boss.example.com", type: RecipientType.TO },
+                attendees: [{ address: me, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+                sequence: 0,
+                inviteSequenceSent: 0,
+            });
+
+            const result = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({
+                responseStatus: "accepted",
+                ics: requestFor(me, { sequence: 1, extra: ["LOCATION:CANARY Room 9", "DESCRIPTION:CANARY agenda"] }),
+            });
+
+            expect(result.status).toBe(200);
+            const [row] = await ctx.findEvents(mailbox.uid);
+            expect(row.sequence).toBe(1);
+            expect(row.title).toBe("[...]");
+            expect(row.location ?? null).toBeNull();
+            expect(row.description ?? null).toBeNull();
+            expect(JSON.stringify(row)).not.toContain("CANARY");
+            expect(JSON.stringify(row)).not.toContain("Video Test");
+            expect(row.sealedContent.keyFingerprint).toBe((await keyOf(mailbox.uid)).key.fingerprint);
+            // The per-field copies the revision replaces go, so no client opens the old ones over it.
+            expect(row.sealedFields ?? null).toBeNull();
+        });
+
         it("Still tells a verified organizer's change of a meeting on the calendar from a forged one, by the stored Authentication-Results.", async () => {
             const { mailbox, inbox, me } = await setup();
             const first = await receiveSealed(mailbox.uid, inbox.uid);

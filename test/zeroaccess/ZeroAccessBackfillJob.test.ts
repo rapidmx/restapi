@@ -9,7 +9,6 @@ import { ApiErrors, ObjectFactory } from "@rapidrest/service-core";
 import config from "../config.js";
 import { ZeroAccessBackfillJobMongo } from "../../src/jobs/mongo/ZeroAccessBackfillJobMongo.js";
 import { openSealedField, testZeroAccessKey, type TestZeroAccessKey } from "../zeroAccessTestKeys.js";
-import { ZeroAccessParseError } from "../../src/zeroaccess/ZeroAccessWriter.js";
 
 const objectFactory = new ObjectFactory(config, Logger());
 const sealed = { subject: "[...]", bodyPreview: "", bodyBlobKey: "za/mb/m", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" }, indexEntryUid: "ix" };
@@ -98,16 +97,13 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
         expect(instance.messageRepo.update).not.toHaveBeenCalled();
     });
 
-    it("marks a message the writer can't parse, and tolerates the mark itself failing", async () => {
+    it("marks a message whose body is gone, and tolerates the mark itself failing", async () => {
         const update = vi.fn().mockRejectedValue(new Error("conflict"));
-        const { instance, logger } = job({
-            messages: [message("m1")],
-            update,
-            writer: { target: vi.fn().mockResolvedValue({}), sealRaw: vi.fn().mockRejectedValue(new ZeroAccessParseError("bad mime")) },
-        });
+        const { instance, logger } = job({ messages: [message("m1")], update });
+        instance.blobStore.get = vi.fn().mockRejectedValue(new Error("NoSuchKey"));
         await instance.run();
-        expect(update.mock.calls[0][0].zeroAccessBackfillError).toContain("bad mime");
-        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("bad mime"));
+        expect(update.mock.calls[0][0].zeroAccessBackfillError).toContain("NoSuchKey");
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("NoSuchKey"));
     });
 
     it("leaves a message whose sealing or body read failed for a while unmarked, for the next run", async () => {
@@ -237,6 +233,9 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
             expect(bytes.toString()).not.toContain("PHOTO");
             expect(instance.blobStore.delete).toHaveBeenCalledWith("contact-photos/c1/old");
             expect(repos.contacts.update.mock.calls[1][0].photoBlobKey).toBeUndefined();
+            // Contacts whose fields are sealed but whose photo isn't are selected too, each once.
+            expect(repos.contacts.find.mock.calls.map(([query]: any[]) => query.photoBlobKey)).toContain("like(contact-photos/*)");
+            expect(repos.contacts.update).toHaveBeenCalledTimes(2);
         });
 
         it("leaves a type that isn't protected alone, stops at the budget, and retries a record that changed meanwhile next run", async () => {

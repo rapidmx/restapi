@@ -4564,7 +4564,7 @@ Phase 1 (restapi): the key model.
   - A row with nothing to seal gets `sealedFields: {}`, so it is never selected again.
   - A contact photo under `contact-photos/` is stored again sealed under a new key (`photoSealed`), and the old blob is removed via `deleteBlobsIfUnreferenced`.
   - A conflicting write leaves the row for the next run; the new sealed photo blob is dropped.
-  - Known gap (stated in the doc comment): a row edited while its type was off after it had been sealed keeps those fields readable until its next edit.
+  - Known gap (stated in the doc comment): a row edited while its type was off after it had been sealed keeps those fields readable until its next edit. Since 2026-10-25 that next protected edit seals the whole record (see "Second review fixes").
 - The models are optional subclass fields (`calendarEventClass`/`contactClass`/`taskClass`).
 - Escrow: the escrow console never decrypts by design, so there is no console change. Matter exports carry `sealedFields` as part of each row; `end-to-end_encryption.md`'s release paragraph says the offline tooling opens them.
 
@@ -4628,14 +4628,14 @@ Batch: zero-access, delivery, scheduling (review ids 13, 14, 16, 18, 19, 59, 60,
 - **Index weeks (66).** `ZeroAccessFiling.index()` files a `receivedAt` outside years 1000-9999 into the current week. The manifest leaves out (and logs) a stored week that isn't an ISO week, instead of throwing a RangeError.
 - **Field sealing (75, 76).**
   - `sealFieldsOnWrite(..., { emptyClears })`: with this set, an empty value (`null`, `[]`) of a field whose placeholder is empty is a clear and is applied. A non-empty placeholder sent back is still ignored.
-    - `ZeroAccessRouteSealing.seal()` (the REST routes) passes it.
+    - `ZeroAccessRouteSealing.seal()` (the REST routes) passes it. **Superseded 2026-10-25 (review 110):** the routes now clear only the fields the body names in `clearedFields`; see "Second review fixes".
     - The device writers (activesync, mapi) and the backfill keep the echo rule, because devices send back the empty placeholders they were shown. A device adapter must omit a sealed field it didn't change before a clear from it can count.
     - Setting a contact's display name to its first address still counts as an echo.
   - `ZeroAccessRouteSealing.seal()` seals for `obj.mailboxUid ?? existing.mailboxUid`, which is the destination on a move.
   - `refuseSealedMove()` answers 409 for moving a record with `sealedFields`, `sealedContent` or `photoSealed` to another mailbox; the calendar route checks it before `keepSealed()`. The client copies such a record instead.
     - **web-client TODO:** cross-mailbox moves of protected items.
 - **Backfill (77, 78, 79).**
-  - Messages get `zeroAccessBackfillError` only when the failure is permanent: the body blob is gone (`exists()` is false after a failed `get()`), or `sealRaw` throws the new `ZeroAccessParseError`. Other failures are logged at warn and retried next run.
+  - Messages get `zeroAccessBackfillError` only when the failure is permanent: the body blob is gone (`exists()` is false after a failed `get()`), or `sealRaw` throws the new `ZeroAccessParseError`. Other failures are logged at warn and retried next run. **Changed 2026-10-25 (review 106):** `sealRaw` no longer throws on a parse failure (it seals the raw bytes with an empty summary), and `ZeroAccessParseError` was removed; only a gone body is marked.
   - Records:
     - A contact's photo is handled before its fields. A missing photo blob is dropped (`photoBlobKey: null`) and the fields are still sealed.
     - A photo read or store that fails for a while is retried next run.
@@ -4678,3 +4678,40 @@ Batch: deletes, erasure, attestations, key handling, outbound headers (review id
   - `resolve()` revalidates the conflict's key against that address.
   - A given certificate is tried against the contact's address first. Otherwise it is checked against the conflict's address, and its own 400 applies.
   - Conflicts recorded before this change have no `address`. For those, accepting through an alias still answers 400 until discovery records the conflict again.
+
+
+### 2026-10-25: Second review fixes
+Batch: zero-access sealing, delivery, scheduling (review ids 101-111, 114; 103 and 114 are the same defect).
+- **Backfill on SQL (101).** `backfillMailbox()` selected `encrypted: "ne(true)"`, which SQL renders `NOT (encrypted = true)`: never true for a NULL column, and rows stored before `Message.encrypted` existed hold NULL. It now selects `$or: [{ encrypted: false }, { encrypted: null }]` (`ModelUtils.literal`). A suite test sets the column NULL; it failed on SQL before the fix.
+- **Stale sealed copies on an iTIP revision (102).** `ScanQueueJob.supersededSealing()` adds to the update patch:
+  - a zero-access message's revision (`sealedContent`): `sealedFields: null`;
+  - otherwise `sealedContent: null`, and with no field sealing (calendar off) `sealedFields: null`.
+  - A revision without SUMMARY keeps the row's title, so it keeps the title's sealed copy and leaves `sealedContent` alone.
+- **Invitation answered from a zero-access message (103 = 114).** `sealInvite()` decides the fallback on what field sealing left readable (a non-empty content field without a sealed copy), not on `hasSealedFields(existing)`. The content goes into `sealedContent` with the message's key and `sealedFields` is set to null. It calls `seal(obj, existing, true)`: the revision's empty fields are clears.
+- **First protected write is complete (111, 104).**
+  - `sealFieldsOnWrite()` with a target and an `existing` row also seals every protected field the patch doesn't carry that is still readable and non-empty. This covers a row the backfill hadn't reached, a move in from an unprotected mailbox (`PUT /:id/folderUid`), and fields edited while the type was off. The device writers and the booking plugin get this too, since they pass `existing`.
+  - A row with `sealedContent` is skipped: its columns are placeholders.
+  - A move to another mailbox clears `zeroAccessBackfillError` (`ZeroAccessRouteSealing.seal()`).
+  - Contact photo: `BaseContactRoute.sealReadablePhoto()` stores a readable photo again sealed in the same update when the destination protects contacts. The new and old keys ride on the body under a non-enumerable symbol. `update()` deletes the readable blob after the write, or the sealed one if the write fails. A read or store failure is logged and left to the backfill.
+  - `ZeroAccessBackfillJob.backfillRecords()` also selects contacts whose photo is readable (`photoBlobKey like contact-photos/*`, `photoSealed` false or null), whatever `sealedFields` says, so photos left by device writes are sealed too.
+- **Clears need proof (110, restapi half).** An empty value of a sealed field is a clear only when the request names that field in `clearedFields: string[]`.
+  - The list is taken off the body by `ZeroAccessRouteSealing.takeClearedFields()` and never stored. Anything but a list of strings (at most 100) is a 400.
+  - `SealFieldsOptions.emptyClears` is now `boolean | readonly string[]`. Only server-built writes (`sealInvite`) pass `true`.
+  - Without the list, the echo rule applies to every client: a locked client, a delegate without the key, or a REST tool echoing what it read can no longer wipe sealed values. A deliberate clear from a client that opened the record still works when it names the field.
+  - Why not a version or fingerprint token: every client holds `sealedFields`, so echoing them proves nothing. The server can't verify that a client decrypted anything without storing something derived from the plaintext. An explicit list is the one signal a naive echo never carries. Optimistic `version` already covers staleness.
+  - The calendar route also drops `clearedFields` where it doesn't call `seal()`.
+  - Spec: `specs/search.md` §3 "Protected types and other devices".
+  - **web-client TODO:** ContactForm, TaskForm and protectedEventWrite must send `clearedFields`, only for fields that held a value in the opened record and that the user emptied. Until they do, a clear from web-client is ignored (the safe failure). Not done here (other repo).
+  - **Left:** `PUT /:id/:property` can't carry `clearedFields`, so it can't clear a sealed field. Use a full PUT.
+- **Sent Items copy search document (105).** `fileSentMessage()` and `ScheduledSendJob` add `SEARCH_REINDEX` to the filing patch, unconditionally. `SEARCH_REINDEX` (`util/SearchIndexUtils.ts`) is `searchIndexedAt`, `searchIndexAttempts`, `searchIndexNextAttemptAt` and `searchIndexError` all set to null. A sealed copy is then re-indexed as metadata only, which replaces the readable draft's document; a plain one gets its Sent Items folder.
+  - **Left:** SearchIndexJob still indexes the readable send copy of a zero-access draft while it sits in Outbox (scheduled send). This is the same transient exception as the readable `bodies/` blob itself. Closing it would need mailbox and policy lookups in SearchIndexJob.
+- **sealRaw and deeply nested HTML (106).** It parses with `skipHtmlToText` (body text from `htmlPreview()`, which is bounded). If mailparser still throws, the raw bytes are sealed anyway with an empty summary, no recipients and nothing indexed. `ZeroAccessParseError` was removed (it was exported but unused outside restapi). The backfill's permanent mark now applies only to a gone body. The unparseable path is tested in `test/zeroaccess/ZeroAccessWriter.unparseable.test.ts`, which mocks mailparser.
+- **Unknown-recipient notice for a zero-access sender (107).** `reportUnresolvableRecipient()` resolves the sender's zero-access target. With one, it writes no `ingest/` blob and creates the entry with `rawBlobKey: ""` and the fingerprint, then files it inline with `processZeroAccessInline()`. If that fails, it purges the entry so the MTA's retry can make it again. It stays best-effort and never fails the transaction.
+- **Quarantine vs external list members (108).** `deliver()` relays nothing to a list's external members when `quarantineReason` is set, and logs how many were held. A list with only external members reports `queued: false`.
+  - **Left:** releasing the quarantined copies doesn't relay to external members (no QuarantineEntry for the relay).
+- **Shared MeetingInviteSender (109).** The route and MeetingSchedulingJob called `newInstance(MeetingInviteSender, { name: "MeetingInviteSender" })`. A named instance is shared through the factory, so the route got the job's sender, whose host has no `mayCarryMeetingKey`, and `#k=` keys went to local mailboxes whose mail isn't zero-access.
+  - Both now build unnamed instances.
+  - `sendPerAttendee()` fails closed: a keyed link goes to no one unless the host's `mayCarryMeetingKey` says yes.
+  - The route test first builds a named `MeetingInviteSender` with an empty host in the same factory, then resets the route's cached sender (`instances.get("routes.CalendarEventRoute:default")`).
+  - activesync's `SyncCommand` still uses the name `"MeetingInviteSender"`. It is harmless now: it passes no secrets, and the route and job no longer use that name. It belongs to activesync and wasn't changed here.
+- **Test isolation.** The SQL test database (`rrst-test`) outlives each file. The keyed-meeting test in `test/routes/sql/CalendarEventRoute.test.ts` left a verified `za-*.test` domain behind, so later files' `@example.com` mailboxes were refused (400) in some full-suite orders (RoutesKeysRound5, WellKnownFolders). It now deletes that domain itself.

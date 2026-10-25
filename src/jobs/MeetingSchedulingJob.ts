@@ -155,8 +155,8 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                 args: [this.attendeeLinkClass],
             });
         }
+        // Unnamed, so it is this job's own: a named instance would be shared through the factory with the calendar route's, whose host differs.
         this.inviteSender ??= await this._objectFactory.newInstance(MeetingInviteSender, {
-            name: "MeetingInviteSender",
             args: [this.mailboxRepo, this.attendeeLinkRepo, this],
         });
     }

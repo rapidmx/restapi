@@ -30,14 +30,21 @@ describe("zero-access route sealing (isolated)", () => {
         sealing.sealer = { sealWrite: vi.fn(), target: vi.fn(async () => ({ certDer: new Uint8Array([7]) })) };
         sealing.mailboxRepo = { findOne: vi.fn(async (uid: string) => (uid === "mb" ? { uid } : undefined)) };
 
-        // A REST client sends only what it changes: an emptied field is a clear.
+        // An emptied field is a clear only when the body names it in clearedFields, which is never stored.
         await sealing.seal({ displayName: "x" }, undefined);
-        expect(sealing.sealer.sealWrite).toHaveBeenLastCalledWith("contacts", undefined, { displayName: "x" }, undefined, { emptyClears: true });
-        await sealing.seal({}, { mailboxUid: "mb" });
+        expect(sealing.sealer.sealWrite).toHaveBeenLastCalledWith("contacts", undefined, { displayName: "x" }, undefined, { emptyClears: [] });
+        await sealing.seal({ notes: null, clearedFields: ["notes"] }, { mailboxUid: "mb" });
+        expect(sealing.sealer.sealWrite).toHaveBeenLastCalledWith("contacts", { uid: "mb" }, { notes: null }, { mailboxUid: "mb" }, { emptyClears: ["notes"] });
+        // What the server builds from a whole revision clears every empty field.
+        await sealing.seal({}, { mailboxUid: "mb" }, true);
         expect(sealing.sealer.sealWrite).toHaveBeenLastCalledWith("contacts", { uid: "mb" }, {}, { mailboxUid: "mb" }, { emptyClears: true });
-        // A move is sealed for the mailbox the record goes to.
-        await sealing.seal({ mailboxUid: "mb" }, { mailboxUid: "elsewhere" });
+        // A move is sealed for the mailbox the record goes to, and the backfill selects it there again.
+        const moved: any = { mailboxUid: "mb" };
+        await sealing.seal(moved, { mailboxUid: "elsewhere" });
         expect(sealing.mailboxRepo.findOne).toHaveBeenLastCalledWith("mb", { ignoreACL: true });
+        expect(moved.zeroAccessBackfillError).toBeNull();
+        await expect(sealing.seal({ clearedFields: "notes" }, undefined)).rejects.toMatchObject({ status: 400 });
+        await expect(sealing.seal({ clearedFields: [1] }, undefined)).rejects.toMatchObject({ status: 400 });
 
         expect(Array.from(await sealing.certificateFor("mb"))).toEqual([7]);
         expect(await sealing.certificateFor("gone")).toBeUndefined();

@@ -5,6 +5,18 @@
 import type { SearchEntityType, SearchProvider } from "../search/SearchProvider.js";
 
 /**
+ * The fields of a `Message` patch that send it back to `SearchIndexJob` to be indexed again from scratch, retries included - for a direct
+ * repository write that changes what its search document says (a sealed Sent Items copy whose readable draft may already have been
+ * indexed). Explicit `null`s, so SQL clears them too.
+ */
+export const SEARCH_REINDEX = Object.freeze({
+    searchIndexedAt: null,
+    searchIndexAttempts: null,
+    searchIndexNextAttemptAt: null,
+    searchIndexError: null,
+});
+
+/**
  * Removes documents from the full-text search index after their entities were purged from the primary datastore.
  *
  * Every hard-delete/purge path (erasure, retention, quarantine retention, recall, route deletes/truncates) must call

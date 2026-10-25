@@ -28,6 +28,7 @@ import { registerTestDoubles, RecordingMailTransport, type InMemoryBlobStore } f
 import { openSealedField, testZeroAccessKey } from "../../zeroAccessTestKeys.js";
 import { simpleParser } from "mailparser";
 import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
+import { MeetingInviteSender } from "../../../src/scheduling/MeetingInviteSender.js";
 import { CalendarEventAttendeeLinkMongo } from "../../../src/models/mongo/CalendarEventAttendeeLinkMongo.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
@@ -1178,6 +1179,11 @@ describe("Route:CalendarEventMongo Tests", () => {
 
         it("Sends a keyed meeting's link key to no mailbox here whose copy would be stored readable", async () => {
             const { mailbox, folder } = await protect({ calendar: false });
+            // As the server builds MeetingSchedulingJob's sender at startup, under the name the route once used: the route must not be handed it.
+            await objectFactory.newInstance(MeetingInviteSender, { name: "MeetingInviteSender", args: [undefined, undefined, {}] });
+            const route: any = (objectFactory as any).instances.get("routes.CalendarEventRoute:default");
+            expect(route).toBeDefined();
+            route.inviteSender = undefined;
             const domain = `za-${uuid.v4().slice(0, 8)}.test`;
             const domains = (): any => (objectFactory.getInstance(ConnectionManager)!.connections.get("mongo") as any).getMongoRepository("DomainMongo");
             await domains().save(new DomainMongo({ uid: domain, name: domain, enabled: true, verified: true, verificationToken: uuid.v4() }));

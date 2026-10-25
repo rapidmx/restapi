@@ -118,6 +118,44 @@ describe("sealFieldsOnWrite()", () => {
         expect(device).toEqual({ sealedFields: { displayName: "OLD", phones: "PH", notes: "NT" } });
     });
 
+    it("clears only the fields a writer names, so a client that couldn't open the record wipes nothing it sends back", async () => {
+        const existing: Card = { displayName: "jane@example.com", emails: [{ address: "jane@example.com" }], phones: [], notes: null, sealedFields: { displayName: "OLD", phones: "PH", notes: "NT" } };
+
+        // A locked client's whole form: every placeholder sent back, nothing named.
+        const locked: any = { displayName: "jane@example.com", phones: [], notes: null };
+        await sealFieldsOnWrite<Card>(locked, existing, FIELDS, target(), { emptyClears: [] });
+        expect(locked).toEqual({ sealedFields: { displayName: "OLD", phones: "PH", notes: "NT" } });
+
+        const named: any = { displayName: "jane@example.com", phones: [], notes: null };
+        await sealFieldsOnWrite<Card>(named, existing, FIELDS, target(), { emptyClears: ["notes"] });
+        expect(named).toEqual({ notes: null, sealedFields: { displayName: "OLD", phones: "PH" } });
+    });
+
+    it("seals what a record still holds readable on its first protected write, whatever the write carries", async () => {
+        // Not reached by the backfill yet: one field sent, the others readable.
+        const existing: Card = { displayName: "Jane Doe", emails: [{ address: "jane@example.com" }], phones: ["+1 555 0100"], notes: "CANARY notes" };
+        const patch: any = { phones: ["+1 555 0199"] };
+        await sealFieldsOnWrite<Card>(patch, existing, FIELDS, target());
+        expect(patch).toMatchObject({ displayName: "jane@example.com", phones: [], notes: null });
+        expect(Object.keys(patch.sealedFields).sort()).toEqual(["displayName", "notes", "phones"]);
+        expect(await open(patch.sealedFields.notes)).toBe("CANARY notes");
+        expect(await open(patch.sealedFields.phones)).toEqual(["+1 555 0199"]);
+        expect(JSON.stringify(patch)).not.toContain("CANARY");
+
+        // A field already sealed, or empty, is left alone; and so is everything while the type isn't protected.
+        const partly: any = { phones: [] };
+        await sealFieldsOnWrite<Card>(partly, { ...existing, notes: "", sealedFields: { displayName: "OLD" } }, FIELDS, target());
+        expect(partly).toEqual({ phones: [], sealedFields: { displayName: "OLD" } });
+        const off: any = { phones: [] };
+        await sealFieldsOnWrite<Card>(off, existing, FIELDS, undefined);
+        expect(off).toEqual({ phones: [], sealedFields: null });
+
+        // Content sealed whole (an event's sealedContent) leaves its placeholder columns to that sealing.
+        const whole: any = { phones: [] };
+        await sealFieldsOnWrite<Card>(whole, { ...existing, sealedContent: { keyFingerprint: "fp" } } as any, FIELDS, target());
+        expect(whole).toEqual({ phones: [], sealedFields: null });
+    });
+
     it("never takes sealedFields from the client", async () => {
         const patch: any = { favorite: true, sealedFields: { displayName: "forged" } };
         await sealFieldsOnWrite<Card>(patch, undefined, FIELDS, target());

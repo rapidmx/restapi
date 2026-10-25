@@ -54,6 +54,7 @@ import { checkOriginatorHeaders, extractHeader, safeDisplayName, singleFromAddre
 import { changeMailboxSenderList, parseSenderAddress } from "../util/SenderListUtils.js";
 import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
+import { SEARCH_REINDEX } from "../util/SearchIndexUtils.js";
 import { buildDispositionNotification } from "../util/ReceiptUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import {
@@ -1555,6 +1556,9 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 scheduledSendRelayedAt: null,
                 // The server relayed this message: the one thing that makes it recallable (see `recall()`).
                 sentByServerAt: new Date(),
+                // Indexed again, from scratch: the search document names the Outbox, and may hold the text of the readable draft a
+                // zero-access mailbox sends - which a sealed copy must replace with its metadata only (as the backfill does).
+                ...SEARCH_REINDEX,
                 ...sealedFields,
             } as any,
             current,

@@ -105,6 +105,15 @@ describe("MeetingInviteSender (isolated)", () => {
         expect(transport.send).not.toHaveBeenCalled();
     });
 
+    it("sends no keyed link at all from a sender that can't tell whose copy may carry its key", async () => {
+        const { instance, logger } = sender({ links: [{ attendeeAddress: "bob@example.org", url: "https://meet.example/j/1", keyed: true }] });
+        const transport = { name: "test", send: vi.fn() };
+        (instance as any).mailTransport = transport;
+        await instance.sendToAttendees(event({ videoMeetingUid: "vm" }), { addresses: new Set(["owner@example.com"]) }, "request", { "bob@example.org": KEY });
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("would be stored here readable"));
+        expect(transport.send).not.toHaveBeenCalled();
+    });
+
     it("never sends an attendee a keyed link without their key", async () => {
         const { instance, logger } = sender({ links: [{ attendeeAddress: "bob@example.org", url: "https://meet.example/j/1", keyed: true }] });
         const transport = { name: "test", send: vi.fn() };

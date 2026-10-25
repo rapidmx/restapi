@@ -244,6 +244,35 @@ describe("BaseMailIngestRoute Tests (distribution list expansion/relay/unsubscri
         expect(res.status).not.toHaveBeenCalledWith(202);
     });
 
+    it("Relays a message the transport rules quarantine to no external member, holding the internal members' copies.", async () => {
+        const member = mailbox("member-uid", "member@example.com");
+        const target = list("target", "target@example.com", ["member@example.com", "ext@outside.com"]);
+        const external = list("external", "external@example.com", ["ext@outside.com"]);
+        const raw = "From: sender@example.com\r\nSubject: confidential\r\n\r\nHi\r\n";
+        for (const rcpt of ["target@example.com", "external@example.com"]) {
+            const { route, logger, mailTransport, ingestQueueRepo } = await makeRoute({
+                lists: { "target@example.com": target, "external@example.com": external },
+                mailboxes: { "member@example.com": member },
+            });
+            (route as any).transportRuleRepo.find.mockResolvedValue([
+                { uid: "r1", name: "Hold", enabled: true, sequence: 0, stopProcessingRules: false, conditions: {}, actions: [{ type: "quarantine" }] },
+            ]);
+            const res = makeRes();
+
+            await route.deliver(makeReq("sender@example.com", rcpt, raw), res);
+
+            expect(mailTransport.send).not.toHaveBeenCalled();
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("not relaying a quarantined message to the 1 external member(s)"));
+            if (rcpt === "target@example.com") {
+                expect(ingestQueueRepo.create.mock.calls[0][0]).toMatchObject({ mailboxUid: "member-uid", quarantineReason: "transport_rule" });
+                expect(res.json).toHaveBeenCalledWith({ results: [{ rcpt, queued: true }] });
+            } else {
+                // A list whose members are all external has nothing queued: it isn't reported as relayed.
+                expect(res.json).toHaveBeenCalledWith({ results: [{ rcpt, queued: false }] });
+            }
+        }
+    });
+
     it("Treats a queue entry a concurrent retry made first (a duplicate-key error) as made, and fails on any other error.", async () => {
         const target = list("target", "target@example.com", ["real@example.com"]);
         const real = { uid: "real-uid", primarySmtpAddress: "real@example.com", aliasAddresses: [] };

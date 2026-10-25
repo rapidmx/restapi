@@ -91,7 +91,8 @@ export class MeetingInviteSender {
     private ownMaxAttendees: number = 500;
 
     /** `host`: what sends through this (`MeetingSchedulingJob`), whose logger and attendee cap it uses when given; and, for a sender of
-     * keyed meetings, whether an attendee's copy may carry their link's key (`mayCarryMeetingKey`, see `sendPerAttendee()`). */
+     * keyed meetings, whether an attendee's copy may carry their link's key (`mayCarryMeetingKey`, see `sendPerAttendee()`; without it no
+     * copy does). Build one per caller (no `name` to `ObjectFactory.newInstance()`): a named one is shared, `host` and all. */
     constructor(
         private readonly mailboxRepo: RepoUtils<any> | undefined,
         private readonly attendeeLinkRepo: RepoUtils<any> | undefined,
@@ -348,8 +349,9 @@ export class MeetingInviteSender {
                     this.logger?.warn(`MeetingSchedulingJob: not sending the ${what} for event ${event.uid} to ${to}: no key for their meeting link.`);
                     continue;
                 }
-                // The key must never be stored here, so it doesn't go to a mailbox of this server whose copy would be filed readable.
-                if (stored?.keyed && this.host?.mayCarryMeetingKey && !(await this.host.mayCarryMeetingKey(attendee))) {
+                // The key must never be stored here, so it doesn't go to a mailbox of this server whose copy would be filed readable - nor
+                // to anybody from a sender that can't tell (no `mayCarryMeetingKey`).
+                if (stored?.keyed && !(await this.host?.mayCarryMeetingKey?.(attendee))) {
                     this.logger?.warn(
                         `MeetingSchedulingJob: not sending the ${what} for event ${event.uid} to ${to}: their copy would be stored here readable, with their meeting link's key.`,
                     );

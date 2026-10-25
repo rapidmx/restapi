@@ -616,7 +616,10 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
      * delivered.
      *
      * The notice (`util/DeliveryFailureNoticeUtils.ts`) is queued as an ordinary `IngestQueueEntry` with a null envelope
-     * sender, so `ScanQueueJob` files it in the sender's Inbox like any other bounce. It is idempotent per (message, recipient)
+     * sender, so `ScanQueueJob` files it in the sender's Inbox like any other bounce. For a sender whose mail is zero-access it quotes
+     * a subject and headers that mailbox keeps only sealed, so it is never spooled readable: its entry names the key, with no raw blob,
+     * and is filed sealed right here, as delivery to such a mailbox is (`processZeroAccessInline()`). An entry that fails is removed,
+     * so the MTA's retry of the same transaction makes it again. It is idempotent per (message, recipient)
      * - the entry's uid derives from them, so the MTA redelivering the same transaction adds nothing - and never sent for a
      * null sender (a bounce) or a message marked `Auto-Submitted` (an auto-reply or another notice), so it cannot loop.
      * Best-effort: a failure here is logged and never changes the response to the MTA.
@@ -663,8 +666,11 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 ],
                 reason: `No mailbox or distribution list exists at ${rcpt}.`,
             });
-            const rawBlobKey: string = `ingest/${crypto.randomUUID()}`;
-            await this.blobStore!.put(rawBlobKey, notice.raw, { contentType: "message/rfc822" });
+            const target: ZeroAccessTarget | undefined = await this.zeroAccessTargetFor(sender);
+            const rawBlobKey: string = target ? "" : `ingest/${crypto.randomUUID()}`;
+            if (!target) {
+                await this.blobStore!.put(rawBlobKey, notice.raw, { contentType: "message/rfc822" });
+            }
             await this.ingestQueueRepo!.create(
                 new this.ingestQueueClass({
                     uid,
@@ -672,10 +678,15 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                     envelopeFrom: "",
                     envelopeTo: [sender.primarySmtpAddress],
                     rawBlobKey,
+                    ...(target ? { zeroAccessKeyFingerprint: target.key.fingerprint } : {}),
                     status: IngestStatus.PENDING,
                 }),
                 { ignoreACL: true },
             );
+            // Best effort like the rest: a notice that can't be filed doesn't fail the transaction it reports on.
+            if (target && (await this.processZeroAccessInline([{ uid, raw: notice.raw }])) > 0) {
+                await this.ingestQueueRepo!.delete(uid, { ignoreACL: true, purge: true });
+            }
         } catch (err: any) {
             this.logger?.warn(`MailIngestRoute: failed to notify '${envelopeFrom}' that delivery to '${rcpt}' was dropped: ${err.message}`);
         }
@@ -902,8 +913,16 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                     `MailIngestRoute: not relaying calendar content from an unauthenticated sender to the external members of '${list.primarySmtpAddress}'.`,
                 );
             }
+            // A message the transport rules hold for review (or can't read) leaves the organisation no sooner than it reaches anyone
+            // inside it: the internal members' copies wait in quarantine, and releasing them doesn't relay to the external members.
+            const relayExternally: boolean = !!externalRaw && !quarantineReason;
+            if (externalRaw && quarantineReason) {
+                this.logger?.warn(
+                    `MailIngestRoute: not relaying a quarantined message to the ${externalAddresses.length} external member(s) of '${list.primarySmtpAddress}'.`,
+                );
+            }
 
-            for (const external of externalRaw ? externalAddresses : []) {
+            for (const external of relayExternally ? externalAddresses : []) {
                 try {
                     // Throws on a transport rejection too, so a relay that reached nobody is logged like an error.
                     await sendOrThrow(this.mailTransport!, {
@@ -925,7 +944,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
                 }
             }
 
-            results.push({ rcpt: address, queued: mailboxes.length > 0 || (!!externalRaw && externalAddresses.length > 0) });
+            results.push({ rcpt: address, queued: mailboxes.length > 0 || (relayExternally && externalAddresses.length > 0) });
         }
 
         // A zero-access recipient that couldn't be delivered here has nothing queued to fall back on: the MTA must retry the transaction,

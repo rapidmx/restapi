@@ -38,6 +38,9 @@ export const CONTACT_PHOTO_CONTENT_TYPES: readonly string[] = ["image/jpeg", "im
  * route only ever deletes keys under it, whatever a contact's `photoBlobKey` says. */
 export const CONTACT_PHOTO_KEY_PREFIX: string = "contact-photos/";
 
+/** On an update body: the photo `sealReadablePhoto()` stored sealed for it, and the readable one it replaces. Never stored (not enumerable). */
+const RESEALED_PHOTO: unique symbol = Symbol("resealedPhoto");
+
 /** Generous per-user limits (per minute) on the photo writes; the read is not limited (a contact list shows many avatars). */
 const PHOTO_UPLOAD_MAX_ATTEMPTS: number = 60;
 const PHOTO_DELETE_MAX_ATTEMPTS: number = 120;
@@ -160,6 +163,32 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
     protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
         await super.prepareUpdate(obj, existing, user);
         await this.sealing?.seal(obj, existing);
+        await this.sealReadablePhoto(obj, existing);
+    }
+
+    /**
+     * Stores `existing`'s readable photo again sealed when the write leaves the contact in a mailbox whose contacts are protected (the
+     * destination, on a move), so the first protected write of a contact leaves nothing of it readable, its picture included - as its
+     * fields (`ZeroAccessRouteSealing.seal()`). The readable blob is removed once the write is stored, the sealed one if the write fails
+     * (`update()`). A photo that can't be read or stored now is left to `ZeroAccessBackfillJob`, which selects contacts by readable photo too.
+     */
+    private async sealReadablePhoto(obj: any, existing: T): Promise<void> {
+        const previous: string | undefined = existing.photoSealed ? undefined : this.photoKeyOf(existing);
+        const certDer: Uint8Array | undefined = previous ? await this.sealing?.certificateFor(obj.mailboxUid ?? existing.mailboxUid) : undefined;
+        if (!previous || !certDer) {
+            return;
+        }
+        const sealedKey: string = `${CONTACT_PHOTO_KEY_PREFIX}${existing.uid}/${crypto.randomUUID()}`;
+        try {
+            const photo: Buffer = await this.blobStore!.get(previous);
+            await this.blobStore!.put(sealedKey, await sealToCertificate(photo, certDer), { contentType: "application/octet-stream" });
+        } catch (err: any) {
+            this.logger?.warn(`BaseContactRoute: contact ${existing.uid}'s photo couldn't be sealed with this write, leaving it to the backfill: ${err?.message ?? err}`);
+            return;
+        }
+        obj.photoBlobKey = sealedKey;
+        obj.photoSealed = true;
+        Object.defineProperty(obj, RESEALED_PHOTO, { value: { sealedKey, previous }, enumerable: false });
     }
 
     @Inject("BlobStore")
@@ -181,7 +210,16 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
         @AuthUser user?: JWTUser,
     ): Promise<T> {
         rejectDiscoveryManagedFields(obj);
-        return super.update(id, obj, req, user);
+        let updated: T;
+        try {
+            updated = await super.update(id, obj, req, user);
+        } catch (err) {
+            // Nothing points at a photo sealed for this write (`sealReadablePhoto()`).
+            await this.deletePhotoBlobs([(obj as any)?.[RESEALED_PHOTO]?.sealedKey]);
+            throw err;
+        }
+        await this.deletePhotoBlobs([(obj as any)[RESEALED_PHOTO]?.previous]);
+        return updated;
     }
 
     /** The key of `existing`'s photo blob when it is one this route may serve: under its own `contact-photos/<uid>/`

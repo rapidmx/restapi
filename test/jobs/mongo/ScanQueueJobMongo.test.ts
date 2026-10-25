@@ -2048,6 +2048,30 @@ ${oversigningDkimSignature("example.com", "RapidMX-Key", "Autocrypt")}`,
             expect(await openSealedField(event.sealedFields.title, za)).toBe("Team Sync");
         });
 
+        it("Drops the sealed copies a newer revision rewrites readable once the calendar isn't protected, so clients don't show the old ones.", async () => {
+            const za = await testZeroAccessKey();
+            await createMailbox({ zeroAccessKeys: [za.key], zeroAccessTypes: { mail: false, calendar: true } });
+            const icalUid = uuid.v4();
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const deliver = async (event: any) => {
+                const rawBlobKey = `raw/${uuid.v4()}`;
+                await blobStore.put(rawBlobKey, makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, ...event }), "REQUEST")));
+                await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+                await job.run();
+            };
+            await deliver({ location: "Room 1" });
+            const [sealed]: any[] = (await calendarEventRepo.find({ mailboxUid, icalUid }).toArray());
+            expect(Object.keys(sealed.sealedFields).sort()).toEqual(["location", "title"]);
+
+            // The owner turns calendar protection off (for Outlook); the organizer moves and renames the meeting.
+            await mailboxRepo.updateOne({ uid: mailboxUid } as any, { $set: { zeroAccessTypes: { mail: false, calendar: false } } } as any);
+            await deliver({ title: "Moved sync", location: "Room 9", sequence: 1 });
+
+            const [event]: any[] = (await calendarEventRepo.find({ mailboxUid, icalUid }).toArray());
+            expect(event).toMatchObject({ title: "Moved sync", location: "Room 9", sequence: 1 });
+            expect(event.sealedFields ?? null).toBeNull();
+        });
+
         it("Preserves encryptionOrigin: 'derived' on an existing event when a later resent REQUEST updates it - encryption state is sticky, never recomputed from the current message.", async () => {
             const icalUid = uuid.v4();
             const folder = await folderRepo.save(

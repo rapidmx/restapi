@@ -27,6 +27,7 @@ import { envelopeRecipientsOf, prepareOutboundMime, scanAndRelay, seedReceiptSta
 import { deriveMessageListFields } from "../util/MessageListUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
+import { SEARCH_REINDEX } from "../util/SearchIndexUtils.js";
 import { FolderType, Mailbox, Message, RecipientType } from "../models/types.js";
 import { newZeroAccessWriter, ZERO_ACCESS_DRAFT_MESSAGE, ZeroAccessWriter, type ZeroAccessSealedFields } from "../zeroaccess/ZeroAccessWriter.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
@@ -606,6 +607,8 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     scheduledSendRelayedAt: null,
                     // The server relayed this message: the one thing that makes it recallable (`BaseMessageRoute.recall()`).
                     sentByServerAt: new Date(),
+                    // Indexed again: the search document names the Outbox, and may hold the readable draft's text (`SEARCH_REINDEX`).
+                    ...SEARCH_REINDEX,
                 } as any,
                 asEntity(this.messageRepo!, refetched),
                 { ignoreACL: true },

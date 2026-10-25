@@ -223,6 +223,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (!(existing as any).sealedContent) {
             await this.sealing?.seal(obj, existing);
         }
+        // Read by field sealing alone (`ZeroAccessRouteSealing.takeClearedFields()`), never stored.
+        delete obj.clearedFields;
     }
 
     /**
@@ -272,6 +274,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         BaseCalendarEventRoute.normalizeDescriptionAndPolicy(obj, false);
         delete obj.invitationContent;
         await this.sealing?.seal(obj, undefined);
+        delete obj.clearedFields;
     }
 
     /**
@@ -470,9 +473,10 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (!invitationsPending(event) || !(hasSealedFields(event) || event.videoMeetingUid)) {
             return event;
         }
-        // Built on first use: most events are never protected.
+        // Built on first use: most events are never protected. Unnamed, so it is this route's own: a named instance is shared through the
+        // factory, and another caller's (`MeetingSchedulingJob`'s, another backend's route) would come back without this route's
+        // `mayCarryMeetingKey` and repositories.
         this.inviteSender ??= await this._objectFactory!.newInstance(MeetingInviteSender, {
-            name: "MeetingInviteSender",
             args: [this.mailboxRepo, this.attendeeLinkRepo, { mayCarryMeetingKey: (address: string) => this.mayCarryMeetingKey(address) }],
         });
         const claimed = (await this.inviteSender.sendProtectedInvitations(event, content, this.repoUtils!, "BaseCalendarEventRoute", secrets)) as T | undefined;
@@ -1313,17 +1317,22 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * in plaintext (decrypted by the reader for a zero-access message), so it is never stored readable where it must not be: a row made from
      * a zero-access invitation keeps its one sealed blob (`keepSealed()`); otherwise it is sealed field by field when the calendar is
      * protected; and the invitation of a zero-access message is sealed to that message's key whatever the calendar's setting, as inbound
-     * delivery files it (`ScanQueueJob`, `specs/search.md` §3: no plaintext of a zero-access mailbox's mail at rest).
+     * delivery files it (`ScanQueueJob`, `specs/search.md` §3: no plaintext of a zero-access mailbox's mail at rest). That last is decided on
+     * what field sealing left readable, not on the row: a row sealed field by field while the calendar was protected, answered once it no
+     * longer is, gets its content in `sealedContent` too, and loses the per-field copies it replaces.
      */
     private async sealInvite(obj: any, existing: CalendarEvent | undefined, context: InviteContext): Promise<void> {
         if ((existing as any)?.sealedContent) {
             await this.keepSealed(obj, existing as T);
             return;
         }
-        await this.sealing?.seal(obj, existing);
+        // The revision's own empty fields are clears: the invitation says what the event now is.
+        await this.sealing?.seal(obj, existing, true);
         const zeroAccess: { keyFingerprint: string } | undefined = context.message.zeroAccess ?? undefined;
-        if (zeroAccess && !hasSealedFields(obj) && !hasSealedFields(existing)) {
+        const readable: boolean = SEALED_EVENT_FIELDS.some((field) => obj[field] !== undefined && obj[field] !== null && obj[field] !== "" && obj.sealedFields?.[field] === undefined);
+        if (zeroAccess && readable) {
             await this.keepSealed(obj, { mailboxUid: context.mailbox.uid, sealedContent: { keyFingerprint: zeroAccess.keyFingerprint } } as any);
+            obj.sealedFields = null;
             if (!existing) {
                 obj.encryptionOrigin = "derived";
             }
