@@ -224,6 +224,30 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
             expect(logger.debug).toHaveBeenCalledWith(expect.stringContaining("version"));
         });
 
+        it("stops at the budget mail used up, and keeps going when the sealed photo it couldn't attach won't delete either", async () => {
+            const spent = await recordJob({ tasks: [{ uid: "t1", title: "x" }] });
+            spent.instance.messageRepo.find = vi.fn(async (query: any) => (query.deleted ? [] : [message("m1")]));
+            spent.instance.batchSize = 1;
+            await spent.instance.run();
+            expect(spent.repos.calendar.find).not.toHaveBeenCalled();
+
+            // The last type uses up the budget: the next mailbox isn't started.
+            const last = await recordJob({ tasks: [{ uid: "t1", title: "x" }] });
+            const pages = [[{ uid: "mb", zeroAccessKeys: [{}] }, { uid: "next", zeroAccessKeys: [{}] }], []];
+            last.instance.mailboxRepo.find = vi.fn(async () => pages.shift() ?? []);
+            last.instance.batchSize = 1;
+            await last.instance.run();
+            expect(last.instance.recordSealer.target.mock.calls.map(([, mb]: any[]) => mb.uid)).not.toContain("next");
+
+            const stuck = await recordJob(
+                { contacts: [{ uid: "c1", version: 0, mailboxUid: "mb", displayName: "Jane", emails: [], photoBlobKey: "contact-photos/c1/old" }] },
+                { update: vi.fn().mockRejectedValue(new Error("version")) },
+            );
+            stuck.instance.blobStore.delete.mockRejectedValue(new Error("store down"));
+            await expect(stuck.instance.run()).resolves.toBeUndefined();
+            expect(stuck.logger.debug).toHaveBeenCalledWith(expect.stringContaining("version"));
+        });
+
         it("keeps a contact sealed, logging it, when its readable photo can't be removed", async () => {
             const { instance, logger } = await recordJob({ contacts: [{ uid: "c1", version: 0, mailboxUid: "mb", displayName: "Jane", emails: [], photoBlobKey: "contact-photos/c1/old" }] });
             instance.blobStore.delete.mockRejectedValue(new Error("store down"));

@@ -26,6 +26,8 @@ import { calendarInviteSuite, type CalendarInviteSuiteContext } from "../calenda
 import { calendarEventDialogSuite } from "../calendarEventDialogSuite.js";
 import { registerTestDoubles, RecordingMailTransport, type InMemoryBlobStore } from "../../testDoubles.js";
 import { openSealedField, testZeroAccessKey } from "../../zeroAccessTestKeys.js";
+import { simpleParser } from "mailparser";
+import { CalendarEventAttendeeLinkSQL } from "../../../src/models/sql/CalendarEventAttendeeLinkSQL.js";
 
 describe("Route:CalendarEventSQL Tests", () => {
     const logger = Logger();
@@ -994,6 +996,7 @@ describe("Route:CalendarEventSQL Tests", () => {
         };
         const stored = async (uid: string): Promise<any> => await calendarEventRepo.findOne({ where: { uid } });
         const transport = () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+        const links = (): any => (objectFactory.getInstance(ConnectionManager)!.connections.get("sql") as any).getRepository(CalendarEventAttendeeLinkSQL);
         const meeting = (mailbox: any, folder: any, fields: any = {}) => ({
             mailboxUid: mailbox.uid,
             folderUid: folder.uid,
@@ -1079,6 +1082,36 @@ describe("Route:CalendarEventSQL Tests", () => {
             transport().sent = [];
             expect((await respond(await invited(), { responseStatus: "tentative" })).status).toBe(200);
             expect(transport().sent[0].raw.toString()).toContain("Tentative: Protected event");
+        });
+
+        it("Sends a keyed meeting's invitations at save time with each guest's link key, never storing it, and holds them without the keys", async () => {
+            const { mailbox, folder } = await protect({ calendar: false });
+            const created = (await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send(meeting(mailbox, folder))).body;
+            const LINK = "https://meet.example/j/abc";
+            const KEY = "k=" + "Zx9_-".repeat(9);
+            await links().save(new CalendarEventAttendeeLinkSQL({ mailboxUid: mailbox.uid, calendarEventUid: created.uid, attendeeAddress: "bob@example.org", url: LINK, label: "Join video call", keyed: true }));
+            const put = (body: any) => request(server.getApplication()).put(`${baseUrl}/${created.uid}`).set("Authorization", "jwt " + ownerToken).send(body);
+            transport().sent = [];
+
+            // The video meeting is linked, but the save carries no keys: nothing goes out, and the job won't send it either.
+            expect((await put({ uid: created.uid, version: (await stored(created.uid)).version, videoMeetingUid: "vm-1", location: "Video call" })).status).toBe(200);
+            expect(transport().sent).toHaveLength(0);
+
+            const sent = await put({
+                uid: created.uid,
+                version: (await stored(created.uid)).version,
+                startDate: "2026-11-02T12:00:00.000Z",
+                endDate: "2026-11-02T13:00:00.000Z",
+                invitationContent: { meetingLinkSecrets: { "Bob@Example.org": KEY, "eve@example.org": "not a key" } },
+            });
+            expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+            expect(transport().sent).toHaveLength(1);
+            const mail = await simpleParser(transport().sent[0].raw);
+            expect(mail.text).toContain(`Join the video call: ${LINK}#${KEY}`);
+            const row = await stored(created.uid);
+            expect(row.inviteSequenceSent).toBe(row.sequence);
+            expect(JSON.stringify(row)).not.toContain(KEY);
+            expect(JSON.stringify(await links().find())).not.toContain(KEY);
         });
 
         it("Stores an event readable while the calendar isn't protected, leaving its invitations to the scheduling job", async () => {

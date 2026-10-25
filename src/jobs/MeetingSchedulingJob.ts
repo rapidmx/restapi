@@ -318,6 +318,11 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                 if (hasSealedFields(event)) {
                     continue;
                 }
+                // A meeting protected by a per-meeting key: its guests' links need keys only a save carries (meet-plugin
+                // `specs/meeting_privacy.md` §4.1), so the save sends its invitations too.
+                if (await this.inviteSender!.isKeyedMeeting(event)) {
+                    continue;
+                }
 
                 const organizer: MailboxIdentity | undefined = await this.organizerIdentity(event, identities);
 

@@ -58,6 +58,11 @@ export class CalendarEventAttendeeLinkSQL extends BaseEntity implements Calendar
     @Nullable
     public label?: string;
 
+    @Column({ type: "boolean", nullable: true })
+    @Description("The link works only with the per-meeting key in its `#` part, supplied at save time and never stored.")
+    @Nullable
+    public keyed?: boolean | null;
+
     constructor(other?: Partial<CalendarEventAttendeeLinkSQL>) {
         super(other);
 
@@ -67,6 +72,7 @@ export class CalendarEventAttendeeLinkSQL extends BaseEntity implements Calendar
             this.attendeeAddress = other.attendeeAddress !== undefined ? other.attendeeAddress : this.attendeeAddress;
             this.url = other.url !== undefined ? other.url : this.url;
             this.label = "label" in other ? other.label : this.label;
+            this.keyed = "keyed" in other ? other.keyed : this.keyed;
         }
     }
 }

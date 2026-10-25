@@ -2809,6 +2809,11 @@ export interface CalendarEventAttendeeLink extends BaseEntity {
     /** An optional short label for `url` (e.g. `"Join video call"`). Unused by `MeetingSchedulingJob` today —
      * carried for a client, or a future personalization, that wants to render the link with its own wording. */
     label?: string;
+
+    /** The link opens a meeting protected by a per-meeting key (meet-plugin `specs/meeting_privacy.md`): it works only with the key in its
+     * `#` part, which the organizer's client supplies with each save that invites and which is never stored. Such an invitation is sent
+     * at save time only (`MeetingInviteSender.sendProtectedInvitations()`), never by `MeetingSchedulingJob`. */
+    keyed?: boolean | null;
 }
 
 export enum TaskPriority {

@@ -8,6 +8,7 @@ import * as asn1js from "asn1js";
 import * as pkijs from "pkijs";
 import * as x509 from "@peculiar/x509";
 import { hasSealedFields, PROTECTED_TEXT, type ProtectedField, sealFieldsOnWrite } from "../../src/zeroaccess/ZeroAccessFieldSealer.js";
+import { EVENT_PROTECTED_FIELDS } from "../../src/zeroaccess/ZeroAccessRecordSealer.js";
 
 x509.cryptoProvider.set(webcrypto as unknown as Crypto);
 const ENGINE = new pkijs.CryptoEngine({ name: "test", crypto: webcrypto as unknown as Crypto }) as unknown as pkijs.ICryptoEngine;
@@ -110,3 +111,13 @@ describe("sealFieldsOnWrite()", () => {
         expect(patch.sealedFields).toBeNull();
     });
 });
+
+describe("calendar events' protected fields", () => {
+    it("seals the title, location and both descriptions, each to its own placeholder", async () => {
+        const patch: any = { title: "Board", location: "Room 4", description: "Agenda", descriptionHtml: "<p>Agenda</p>" };
+        await sealFieldsOnWrite(patch, undefined, EVENT_PROTECTED_FIELDS, target());
+        expect(patch).toMatchObject({ title: "Protected event", location: null, description: null, descriptionHtml: null });
+        expect(await open(patch.sealedFields.descriptionHtml)).toBe("<p>Agenda</p>");
+    });
+});
+

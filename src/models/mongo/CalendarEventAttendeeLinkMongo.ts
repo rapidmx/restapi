@@ -62,6 +62,11 @@ export class CalendarEventAttendeeLinkMongo extends BaseMongoEntity implements C
     @Nullable
     public label?: string;
 
+    @Column()
+    @Description("The link works only with the per-meeting key in its `#` part, supplied at save time and never stored.")
+    @Nullable
+    public keyed?: boolean | null;
+
     constructor(other?: Partial<CalendarEventAttendeeLinkMongo>) {
         super(other);
 
@@ -71,6 +76,7 @@ export class CalendarEventAttendeeLinkMongo extends BaseMongoEntity implements C
             this.attendeeAddress = other.attendeeAddress !== undefined ? other.attendeeAddress : this.attendeeAddress;
             this.url = other.url !== undefined ? other.url : this.url;
             this.label = "label" in other ? other.label : this.label;
+            this.keyed = "keyed" in other ? other.keyed : this.keyed;
         }
     }
 }

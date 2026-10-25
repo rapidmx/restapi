@@ -74,7 +74,7 @@ import {
 } from "../models/types.js";
 import { hasSealedFields } from "../zeroaccess/ZeroAccessFieldSealer.js";
 import { ZeroAccessRouteSealing } from "../zeroaccess/ZeroAccessRouteSealing.js";
-import { type InvitationContent, MeetingInviteSender, protectedInvitationsPending } from "../scheduling/MeetingInviteSender.js";
+import { type InvitationContent, invitationsPending, MeetingInviteSender, type MeetingLinkSecrets, meetingLinkSecretsOf } from "../scheduling/MeetingInviteSender.js";
 const { Config, Init, Inject } = ObjectDecorators;
 const { Description, Returns, Summary } = DocDecorators;
 const { Auth, Get, Param, Post, RateLimit, Request, User: AuthUser } = RouteDecorators;
@@ -166,6 +166,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     protected sealing?: ZeroAccessRouteSealing;
     /** Sends the invitations of a protected event at save time (`sendProtectedInvitations()`). */
     protected inviteSender?: MeetingInviteSender;
+    /** The backend's `CalendarEventAttendeeLink` model: invitations sent at save time carry each attendee's own video link too. */
+    protected attendeeLinkClass?: any;
+    protected attendeeLinkRepo?: RepoUtils<any>;
     protected correspondentRepo?: RepoUtils<any>;
     protected correspondentUtils?: CorrespondentUtils;
 
@@ -371,6 +374,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (!this.folderRepo && this.folderClass) {
             this.folderRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.folderClass.name, args: [this.folderClass] });
         }
+        if (!this.attendeeLinkRepo && this.attendeeLinkClass) {
+            this.attendeeLinkRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.attendeeLinkClass.name, args: [this.attendeeLinkClass] });
+        }
         if (!this.correspondentRepo && this.correspondentClass) {
             this.correspondentRepo = await this._objectFactory.newInstance(RepoUtils, {
                 name: this.correspondentClass.name,
@@ -398,15 +404,17 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * `util/DateCoercionUtils.ts` for why MongoDB would otherwise store the client's ISO strings as strings. */
     public async create(obj: T | T[], @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T | T[]> {
         const contents: (InvitationContent | undefined)[] = [];
+        const secrets: (MeetingLinkSecrets | undefined)[] = [];
         for (const single of Array.isArray(obj) ? obj : [obj]) {
             coerceCalendarEventDates(single);
+            secrets.push(meetingLinkSecretsOf((single as any)?.invitationContent?.meetingLinkSecrets));
             contents.push(BaseCalendarEventRoute.takeInvitationContent(single, true));
         }
         const created: T | T[] = await super.create(obj, req, user);
         const events: T[] = Array.isArray(created) ? created : [created];
         for (let i = 0; i < events.length; i++) {
             await this.recordEventCorrespondents(events[i]);
-            await this.sendProtectedInvitations(events[i], contents[i]);
+            await this.sendProtectedInvitations(events[i], contents[i], secrets[i]);
         }
         return created;
     }
@@ -431,15 +439,18 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         return title ? { title, location: text(given.location), description: text(given.description), descriptionHtml: text(given.descriptionHtml) } : undefined;
     }
 
-    /** Sends the invitations of a protected event at save time, from the request's plaintext `content` - see
-     * `MeetingInviteSender.sendProtectedInvitations()`. */
-    private async sendProtectedInvitations(event: T, content: InvitationContent | undefined): Promise<void> {
-        if (!protectedInvitationsPending(event)) {
+    /** Sends the invitations of a protected event - sealed, or a meeting with a per-meeting key - at save time, from the request's
+     * plaintext `content` and the guests' link keys - see `MeetingInviteSender.sendProtectedInvitations()`. */
+    private async sendProtectedInvitations(event: T, content: InvitationContent | undefined, secrets?: MeetingLinkSecrets): Promise<void> {
+        if (!invitationsPending(event) || !(hasSealedFields(event) || event.videoMeetingUid)) {
             return;
         }
         // Built on first use: most events are never protected.
-        this.inviteSender ??= await this._objectFactory!.newInstance(MeetingInviteSender, { name: "MeetingInviteSender", args: [this.mailboxRepo, undefined] });
-        await this.inviteSender.sendProtectedInvitations(event, content, this.repoUtils!, "BaseCalendarEventRoute");
+        this.inviteSender ??= await this._objectFactory!.newInstance(MeetingInviteSender, {
+            name: "MeetingInviteSender",
+            args: [this.mailboxRepo, this.attendeeLinkRepo],
+        });
+        await this.inviteSender.sendProtectedInvitations(event, content, this.repoUtils!, "BaseCalendarEventRoute", secrets);
     }
 
     /** Records an event's organizer and attendees as correspondents of the mailbox it is on, for recipient suggestions.
@@ -454,13 +465,14 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         coerceCalendarEventDates(obj);
+        const secrets: MeetingLinkSecrets | undefined = meetingLinkSecretsOf((obj as any)?.invitationContent?.meetingLinkSecrets);
         const content: InvitationContent | undefined = BaseCalendarEventRoute.takeInvitationContent(obj, false);
         const existing: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
         if (existing && this.isSchedulingRelevantChange(existing, obj)) {
             (obj as any).sequence = existing.sequence + 1;
         }
         const updated: T = await super.update(id, obj, req, user);
-        await this.sendProtectedInvitations(updated, content);
+        await this.sendProtectedInvitations(updated, content, secrets);
         // Only an update that names the people involved is a new sighting of them (a move or a rename is not).
         if ((obj as any).attendees !== undefined || (obj as any).organizer !== undefined) {
             await this.recordEventCorrespondents(updated);

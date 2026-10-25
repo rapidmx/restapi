@@ -21,6 +21,7 @@ export interface AttendeeLinkSeed {
     attendeeAddress: string;
     url: string;
     label?: string;
+    keyed?: boolean;
 }
 
 export interface MeetingSchedulingLinkSuiteContext {
@@ -106,6 +107,25 @@ export function meetingSchedulingLinkSuite(ctx: MeetingSchedulingLinkSuiteContex
             expect(alice).toContain("METHOD:REQUEST");
             expect(alice).toContain(`mailto:${BOB}`);
             expect((await ctx.reload(event.uid)).inviteSequenceSent).toBe(0);
+        });
+
+        it("Leaves a meeting protected by a per-meeting key to the save that carries its guests' keys: sends nothing, and it stays pending.", async () => {
+            const event = await ctx.createEvent({ videoMeetingUid: "meeting-1", attendees: [attendee(ALICE)] });
+            await ctx.createLink({ mailboxUid: ctx.mailboxUid(), calendarEventUid: event.uid, attendeeAddress: ALICE, url: ALICE_URL, keyed: true });
+
+            await ctx.job().run();
+
+            expect(ctx.transport().sent).toHaveLength(0);
+            expect((await ctx.reload(event.uid)).inviteSequenceSent).not.toBe(0);
+        });
+
+        it("Leaves a protected event's invitations to the save that holds its plaintext: sends nothing, and it stays pending.", async () => {
+            const event = await ctx.createEvent({ title: "Protected event", sealedFields: { title: "c2VhbGVk" }, attendees: [attendee(ALICE)] });
+
+            await ctx.job().run();
+
+            expect(ctx.transport().sent).toHaveLength(0);
+            expect((await ctx.reload(event.uid)).inviteSequenceSent).not.toBe(0);
         });
 
         it("Matches an attendee's link case-insensitively, however the plugin stored the address.", async () => {

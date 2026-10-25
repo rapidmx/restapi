@@ -26,13 +26,40 @@ export interface InvitationContent {
     descriptionHtml?: string;
 }
 
-/** Whether `event` is of a calendar zero-access encryption protects and its current revision's invitations are still to be sent: it has
- * attendees, isn't cancelled, and its `sequence` hasn't been sent yet. */
-export function protectedInvitationsPending(event: CalendarEvent): boolean {
-    if (!hasSealedFields(event) || !event.attendees?.length || event.status === CalendarEventStatus.CANCELLED) {
+/** Per attendee (normalized address), the `#` part of their join link to a meeting protected by a per-meeting key: `k=` and the key
+ * (meet-plugin `specs/meeting_privacy.md` §4.1). Supplied by the organizer's client with a save that invites; never stored. */
+export type MeetingLinkSecrets = Record<string, string>;
+
+/** What one link's `#` part may be. */
+const MEETING_LINK_SECRET = /^k=[A-Za-z0-9_-]{16,1024}$/;
+
+/** `value` (a request's `meetingLinkSecrets`) as `MeetingLinkSecrets`: the well-formed entries for plain addresses, at most `max` of
+ * them - `undefined` when there are none. */
+export function meetingLinkSecretsOf(value: unknown, max: number = 500): MeetingLinkSecrets | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return undefined;
+    }
+    const secrets: MeetingLinkSecrets = {};
+    for (const [address, secret] of Object.entries(value as Record<string, unknown>).slice(0, max)) {
+        if (typeof secret === "string" && MEETING_LINK_SECRET.test(secret) && isPlainAddress(address)) {
+            secrets[normalizeAddress(address)] = secret;
+        }
+    }
+    return Object.keys(secrets).length > 0 ? secrets : undefined;
+}
+
+/** Whether `event`'s current revision's invitations are still to be sent: it has attendees, isn't cancelled, and its `sequence` hasn't
+ * been sent yet. */
+export function invitationsPending(event: CalendarEvent): boolean {
+    if (!event.attendees?.length || event.status === CalendarEventStatus.CANCELLED) {
         return false;
     }
     return event.inviteSequenceSent === undefined || event.inviteSequenceSent === null || event.inviteSequenceSent !== event.sequence;
+}
+
+/** Whether `event` is of a calendar zero-access encryption protects and its current revision's invitations are still to be sent. */
+export function protectedInvitationsPending(event: CalendarEvent): boolean {
+    return hasSealedFields(event) && invitationsPending(event);
 }
 
 /** The organizer's mailbox as an invitation is sent from it: the addresses it may organize as, and its display name. */
@@ -115,7 +142,18 @@ export class MeetingInviteSender {
      * the deduplication that also excludes the organizer's own address, the attendee cap, the "nobody left to mail"
      * early return) is shared by both paths and deliberately identical for them.
      */
-    public async sendToAttendees(event: CalendarEvent, organizer: MailboxIdentity, method: "request" | "cancel"): Promise<void> {
+    /**
+     * Whether `event`'s video meeting is protected by a per-meeting key: one of its attendee links is `keyed`, so its invitations need the
+     * keys only a save supplies (`sendProtectedInvitations()`).
+     */
+    public async isKeyedMeeting(event: CalendarEvent): Promise<boolean> {
+        if (!event.videoMeetingUid || !this.attendeeLinkRepo) {
+            return false;
+        }
+        return (await this.attendeeLinkRepo.count({ calendarEventUid: ModelUtils.literal(event.uid), keyed: true } as any, { ignoreACL: true })) > 0;
+    }
+
+    public async sendToAttendees(event: CalendarEvent, organizer: MailboxIdentity, method: "request" | "cancel", secrets?: MeetingLinkSecrets): Promise<void> {
         const what: string = method === "cancel" ? "cancellation" : "invite";
         const seen: Set<string> = new Set([normalizeAddress(event.organizer.address)]);
         const recipients: string[] = [];
@@ -150,7 +188,7 @@ export class MeetingInviteSender {
         // them - the whole compose-once, fan-out-by-envelope path - is untouched for such an event.
         const hiddenGuestList: boolean = !guestPermissionsOf(event).guestsCanSeeGuestList;
         if ((method === "request" && event.videoMeetingUid) || hiddenGuestList) {
-            await this.sendPerAttendee(event, organizer, listed, recipients, method, what, hiddenGuestList);
+            await this.sendPerAttendee(event, organizer, listed, recipients, method, what, hiddenGuestList, secrets);
             return;
         }
 
@@ -189,16 +227,30 @@ export class MeetingInviteSender {
      * Sends the invitations for an event of a calendar zero-access encryption protects, as it was just saved, from the plaintext `content`
      * of the request that saved it (`specs/search.md` §3 *What It Covers*, *Calendar invitations*): the stored title is sealed, so
      * `MeetingSchedulingJob`, which composes invitations from stored events, can't and doesn't. The job's rules apply - only the organizer's
-     * own copy, with attendees, not cancelled, whose current `sequence` hasn't been sent (`protectedInvitationsPending()`) - and the
-     * revision is claimed with a versioned update of `eventRepo` first, so it is sent once. Without `content` nothing is sent and the
-     * invitation stays pending until a save that has it. Never throws: a failure is logged, as `source`.
+     * own copy, with attendees, not cancelled, whose current `sequence` hasn't been sent (`invitationsPending()`) - and the revision is
+     * claimed with a versioned update of `eventRepo` first, so it is sent once. A meeting protected by a per-meeting key
+     * (`isKeyedMeeting()`, meet-plugin `specs/meeting_privacy.md` §4.1) is sent the same way, whether or not its event is sealed: each
+     * guest's keyed link gets that guest's key from `secrets`, which is never stored. Without the `content` a sealed event needs, or the
+     * `secrets` a keyed meeting needs, nothing is sent and the invitation stays pending until a save that has them. Never throws: a
+     * failure is logged, as `source`.
      */
-    public async sendProtectedInvitations(event: CalendarEvent, content: InvitationContent | undefined, eventRepo: RepoUtils<any>, source: string): Promise<void> {
-        if (!protectedInvitationsPending(event)) {
+    public async sendProtectedInvitations(
+        event: CalendarEvent,
+        content: InvitationContent | undefined,
+        eventRepo: RepoUtils<any>,
+        source: string,
+        secrets?: MeetingLinkSecrets,
+    ): Promise<void> {
+        if (!invitationsPending(event)) {
             return;
         }
-        if (!content) {
-            this.logger?.warn(`${source}: not sending the invitations for protected event ${event.uid}: the request carried no invitation content.`);
+        const sealed: boolean = hasSealedFields(event);
+        const keyed: boolean = await this.isKeyedMeeting(event);
+        if (!sealed && !keyed) {
+            return;
+        }
+        if ((sealed && !content) || (keyed && !secrets)) {
+            this.logger?.warn(`${source}: not sending the invitations for protected event ${event.uid}: the request carried no ${sealed && !content ? "invitation content" : "meeting link keys"}.`);
             return;
         }
         try {
@@ -207,7 +259,7 @@ export class MeetingInviteSender {
                 return;
             }
             await eventRepo.update({ uid: event.uid, version: (event as any).version, inviteSequenceSent: event.sequence } as any, event as any, { ignoreACL: true });
-            await this.sendToAttendees({ ...event, ...content }, organizer, "request");
+            await this.sendToAttendees(content ? { ...event, ...content } : event, organizer, "request", secrets);
         } catch (err: any) {
             this.logger?.warn(`${source}: failed to send the invitations for protected event ${event.uid}: ${err?.message ?? err}`);
         }
@@ -245,8 +297,9 @@ export class MeetingInviteSender {
         method: "request" | "cancel",
         what: string,
         hiddenGuestList: boolean,
+        secrets?: MeetingLinkSecrets,
     ): Promise<void> {
-        const links: Map<string, { url: string; label?: string }> = new Map();
+        const links: Map<string, { url: string; label?: string; keyed?: boolean | null }> = new Map();
         try {
             if (method === "request" && event.videoMeetingUid) {
                 // Bounded by the same cap the attendee list itself is bounded by - there can be no more useful rows
@@ -256,7 +309,7 @@ export class MeetingInviteSender {
                     { ignoreACL: true, limit: Number(this.maxAttendees) },
                 );
                 for (const row of rows) {
-                    links.set(normalizeAddress(row.attendeeAddress), { url: row.url, label: row.label });
+                    links.set(normalizeAddress(row.attendeeAddress), { url: row.url, label: row.label, keyed: row.keyed });
                 }
             }
         } catch (err: any) {
@@ -276,8 +329,15 @@ export class MeetingInviteSender {
         const from = organizer.displayName ? { name: organizer.displayName, address: event.organizer.address } : event.organizer.address;
         for (const to of recipients) {
             try {
-                const link: { url: string; label?: string } | undefined = links.get(normalizeAddress(to));
                 const attendee: string = normalizeAddress(to);
+                const stored: { url: string; label?: string; keyed?: boolean | null } | undefined = links.get(attendee);
+                // A keyed link opens its meeting only with the attendee's key, which is added here and never stored; without it the
+                // attendee isn't sent a link that can't work.
+                if (stored?.keyed && !secrets?.[attendee]) {
+                    this.logger?.warn(`MeetingSchedulingJob: not sending the ${what} for event ${event.uid} to ${to}: no key for their meeting link.`);
+                    continue;
+                }
+                const link: { url: string; label?: string } | undefined = stored && { ...stored, url: stored.keyed ? `${stored.url}#${secrets![attendee]}` : stored.url };
                 const mailed: CalendarEvent = {
                     ...event,
                     organizer: { ...event.organizer, displayName: organizer.displayName },

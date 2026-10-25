@@ -4567,3 +4567,16 @@ Phase 1 (restapi): the key model.
   - Known gap (stated in the doc comment): a row edited while its type was off after it had been sealed keeps those fields readable until its next edit.
 - The models are optional subclass fields (`calendarEventClass`/`contactClass`/`taskClass`).
 - Escrow: the escrow console never decrypts by design, so there is no console change. Matter exports carry `sealedFields` as part of each row; `end-to-end_encryption.md`'s release paragraph says the offline tooling opens them.
+
+### 2026-10-24: Per-meeting keys for meetings with external guests - restapi (Phase 1)
+- JP corrected an earlier misreading: every calendar event title stays sealed, meetings included. Meetings with external attendees get a temporary per-meeting keypair instead.
+  - Spec: meet-plugin `specs/meeting_privacy.md`. Plan: `C:/Users/caska/.claude/plans/meeting-keys-external-attendees.md`.
+- JP chose "give everyone a link key" (keys are unlocked per tab, so a RapidMX participant opening a link in a new tab couldn't open a wrap). Every invitee's link carries the key; the only wrap is the organizer's own, so no zero-access certificate lookup was kept.
+- `CalendarEventAttendeeLink.keyed`: meet-plugin marks a link that needs its guest's key.
+  - `MeetingInviteSender.isKeyedMeeting(event)` checks it.
+  - `sendProtectedInvitations(event, content, repo, source, secrets?)` handles sealed and/or keyed meetings.
+  - `sendPerAttendee` appends `#<secret>` and skips a keyed attendee with no secret.
+  - `meetingLinkSecretsOf` validates `invitationContent.meetingLinkSecrets` (plain addresses, `k=[A-Za-z0-9_-]{16,1024}`).
+  - `MeetingSchedulingJob` skips keyed REQUESTs.
+- Fixed: the calendar route built `MeetingInviteSender` without an attendee-link repository, so save-time invitations for protected events lost each attendee's video link. Routes now set `attendeeLinkClass`.
+- Gotcha: a shared test suite must not import `test/config.js`. The SQL run then loads the Mongo defaults and its hooks time out on a Mongo connection, so pass tokens in from the backend test instead.
