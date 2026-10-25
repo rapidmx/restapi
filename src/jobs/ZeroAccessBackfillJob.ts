@@ -13,6 +13,7 @@ import { deleteBlobsIfUnreferenced, type MessageBlobRepos } from "../util/BlobRe
 import { asEntity } from "../util/EntityUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
+import { SEARCH_REINDEX } from "../util/SearchIndexUtils.js";
 import { newZeroAccessWriter, type ZeroAccessSealedFields, type ZeroAccessWriter } from "../zeroaccess/ZeroAccessWriter.js";
 import { sealFieldsOnWrite } from "../zeroaccess/ZeroAccessFieldSealer.js";
 import { newZeroAccessRecordSealer, PROTECTED_FIELDS, type ZeroAccessRecordSealer } from "../zeroaccess/ZeroAccessRecordSealer.js";
@@ -394,8 +395,9 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                     bodyBlobKey: sealed.bodyBlobKey,
                     sanitizedHtmlBlobKey: null,
                     zeroAccess: sealed.zeroAccess,
-                    // Indexed again, now as metadata only: the server-side search document still holds the readable text.
-                    searchIndexedAt: null,
+                    // Indexed again, now as metadata only: the server-side search document still holds the readable text. Retries
+                    // included (`SEARCH_REINDEX`): a message whose indexing retries had run out is otherwise never selected again.
+                    ...SEARCH_REINDEX,
                 } as any,
                 asEntity(this.messageRepo!, message),
                 { ignoreACL: true, includeDeleted: true } as any,

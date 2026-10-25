@@ -215,6 +215,27 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
             expect(repos.contacts.update).not.toHaveBeenCalled();
         });
 
+        it("keeps a sealed name when it seals the photo of a contact whose name column names an old first address", async () => {
+            const { instance, repos } = await recordJob({
+                contacts: [
+                    {
+                        uid: "c1",
+                        version: 0,
+                        mailboxUid: "mb",
+                        displayName: "a@x",
+                        emails: [{ address: "b@x", type: "other" }],
+                        sealedFields: { displayName: "ALICE", emails: "EM" },
+                        photoBlobKey: "contact-photos/c1/old",
+                    },
+                ],
+            });
+
+            await instance.run();
+
+            const [patch] = repos.contacts.update.mock.calls[0];
+            expect(patch).toMatchObject({ displayName: "b@x", photoSealed: true, sealedFields: { displayName: "ALICE", emails: "EM" } });
+        });
+
         it("stores a contact's photo again sealed and removes the readable one, and leaves an outside photo key alone", async () => {
             const { instance, za, repos } = await recordJob({
                 contacts: [

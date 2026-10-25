@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { convert } from "html-to-text";
+import { Parser } from "htmlparser2";
 import { AddressObject, ParsedMail, simpleParser } from "mailparser";
 import { TransportRule, TransportRuleAction, TransportRuleActionType, TransportRuleConditions } from "../models/types.js";
 import { addressDomainOf, stripPlusTag } from "./AddressUtils.js";
@@ -206,12 +206,63 @@ export function evaluateTransportRules(
     return result;
 }
 
-/** The bounds `htmlText()` converts HTML within: deeper or wider content is left out, rather than recursing without end. */
-const HTML_TEXT_LIMITS = { maxDepth: 100, maxChildNodes: 10_000 };
+/** Elements whose contents are never text of the message. */
+const HTML_SKIPPED: ReadonlySet<string> = new Set(["script", "style"]);
 
-/** `html` as plain text for `bodyContains`. */
+/** Elements a reader sees as a break between words. Any other element - an unknown one too, which browsers lay out inline - joins the text
+ * around it, so `wi<span></span>re` still reads "wire". */
+const HTML_BREAKS: ReadonlySet<string> = new Set(
+    (
+        "p div br hr li ul ol dl dt dd tr td th table caption thead tbody tfoot h1 h2 h3 h4 h5 h6 blockquote pre section article header " +
+        "footer nav aside main address figure figcaption center form fieldset legend details summary img"
+    ).split(" "),
+);
+
+/**
+ * `html` as plain text for `bodyContains`, up to `BODY_TEXT_MAX_LENGTH` characters: every text node in document order, a break element a
+ * space. It tokenizes (`htmlparser2`) and never builds a tree, so no nesting depth or width leaves text out - a converter that
+ * recurses either fails on a deeply nested body or bounds it and drops what lies past the bound, which any sender could hide a phrase
+ * behind (101 nested `<div>`s, 10,001 empty `<span>`s) while the reader's client still shows it.
+ */
 function htmlText(html: string): string {
-    return convert(html, { wordwrap: false, limits: HTML_TEXT_LIMITS });
+    const parts: string[] = [];
+    let length: number = 0;
+    let skipped: number = 0;
+    const separate = (): void => {
+        if (parts.length > 0 && parts[parts.length - 1] !== " ") {
+            parts.push(" ");
+            length++;
+        }
+    };
+    const parser: Parser = new Parser(
+        {
+            onopentagname(name: string): void {
+                if (HTML_SKIPPED.has(name)) {
+                    skipped++;
+                }
+                if (HTML_BREAKS.has(name)) {
+                    separate();
+                }
+            },
+            onclosetag(name: string): void {
+                if (HTML_SKIPPED.has(name) && skipped > 0) {
+                    skipped--;
+                }
+                if (HTML_BREAKS.has(name)) {
+                    separate();
+                }
+            },
+            ontext(text: string): void {
+                if (skipped === 0 && length < BODY_TEXT_MAX_LENGTH) {
+                    parts.push(text);
+                    length += text.length;
+                }
+            },
+        },
+        { decodeEntities: true },
+    );
+    parser.end(html);
+    return parts.join("").replace(/\s+/g, " ");
 }
 
 /**

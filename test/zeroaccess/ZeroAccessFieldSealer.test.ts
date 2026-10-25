@@ -145,7 +145,8 @@ describe("sealFieldsOnWrite()", () => {
         // A field already sealed, or empty, is left alone; and so is everything while the type isn't protected.
         const partly: any = { phones: [] };
         await sealFieldsOnWrite<Card>(partly, { ...existing, notes: "", sealedFields: { displayName: "OLD" } }, FIELDS, target());
-        expect(partly).toEqual({ phones: [], sealedFields: { displayName: "OLD" } });
+        // (its column shows its placeholder)
+        expect(partly).toEqual({ phones: [], displayName: "jane@example.com", sealedFields: { displayName: "OLD" } });
         const off: any = { phones: [] };
         await sealFieldsOnWrite<Card>(off, existing, FIELDS, undefined);
         expect(off).toEqual({ phones: [], sealedFields: null });
@@ -154,6 +155,43 @@ describe("sealFieldsOnWrite()", () => {
         const whole: any = { phones: [] };
         await sealFieldsOnWrite<Card>(whole, { ...existing, sealedContent: { keyFingerprint: "fp" } } as any, FIELDS, target());
         expect(whole).toEqual({ phones: [], sealedFields: null });
+    });
+
+    it("keeps a sealed name's placeholder in step with a changed first address, whether the write leaves the name out or echoes it", async () => {
+        const existing: Card = { displayName: "a@x", emails: [{ address: "a@x" }], phones: [], sealedFields: { displayName: "ALICE", phones: "PH" } };
+
+        const left: any = { emails: [{ address: "b@x" }] };
+        await sealFieldsOnWrite<Card>(left, existing, FIELDS, target());
+        expect(left).toEqual({ emails: [{ address: "b@x" }], displayName: "b@x", sealedFields: { displayName: "ALICE", phones: "PH" } });
+
+        // A device sends back the name it was shown with the new address.
+        const echoed: any = { displayName: "a@x", emails: [{ address: "b@x" }] };
+        await sealFieldsOnWrite<Card>(echoed, existing, FIELDS, target());
+        expect(echoed).toEqual({ emails: [{ address: "b@x" }], displayName: "b@x", sealedFields: { displayName: "ALICE", phones: "PH" } });
+    });
+
+    it("never seals a stale name column sent back over the sealed name, and repairs the column on the next write", async () => {
+        // Written before the placeholder followed the address: the column still names the old first address.
+        const stale: Card = { displayName: "a@x", emails: [{ address: "b@x" }], phones: [], sealedFields: { displayName: "ALICE", phones: "PH" } };
+
+        const echo: any = { displayName: "a@x", phones: [] };
+        await sealFieldsOnWrite<Card>(echo, stale, FIELDS, target());
+        expect(echo).toEqual({ displayName: "b@x", sealedFields: { displayName: "ALICE", phones: "PH" } });
+
+        const untouched: any = { notes: null };
+        await sealFieldsOnWrite<Card>(untouched, stale, FIELDS, target());
+        expect(untouched).toEqual({ notes: null, displayName: "b@x", sealedFields: { displayName: "ALICE", phones: "PH" } });
+
+        // A name the writer really changes is sealed as always.
+        const renamed: any = { displayName: "Alice Smith-Jones" };
+        await sealFieldsOnWrite<Card>(renamed, stale, FIELDS, target());
+        expect(renamed.displayName).toBe("b@x");
+        expect(await open(renamed.sealedFields.displayName)).toBe("Alice Smith-Jones");
+
+        // An empty stored column named as cleared is a clear, not an echo.
+        const cleared: any = { notes: null };
+        await sealFieldsOnWrite<Card>(cleared, { emails: [], notes: null, sealedFields: { notes: "NT" } }, FIELDS, target(), { emptyClears: ["notes"] });
+        expect(cleared).toEqual({ notes: null, sealedFields: null });
     });
 
     it("never takes sealedFields from the client", async () => {

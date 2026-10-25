@@ -57,6 +57,8 @@ export interface ZeroAccessDeliverySuiteContext {
     calendarEventsUrl: string;
     /** Runs one pass of `ZeroAccessBackfillJob`. */
     runBackfill: () => Promise<void>;
+    /** Runs one pass of `ScheduledSendJob`. */
+    runScheduledSend: () => Promise<void>;
     updateMessage: (uid: string, fields: object) => Promise<void>;
     /** Saves a `DataSubjectErasureRequest` for `mailboxUid` in `status`. */
     createErasureRequest: (mailboxUid: string, status: string) => Promise<any>;
@@ -507,6 +509,51 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
             expect(JSON.parse((await open(Buffer.from(event.sealedContent.sealed, "base64"), recipient)).toString("utf-8"))).toMatchObject({ title: "Moved meeting", location: "Room 9" });
         });
 
+        it("keeps an event's title when a zero-access revision names none: its sealed copy stays, a readable one is sealed", async () => {
+            const recipient = await makeKey();
+            const mailbox = await zeroAccessMailbox(recipient);
+            const calendar = await ctx.createFolder(mailbox.uid, "calendar");
+            const row = (icalUid: string, fields: object) =>
+                ctx.createCalendarEvent({
+                    uid: nameBasedUuid(`itip:${mailbox.uid}:${icalUid}:master`),
+                    mailboxUid: mailbox.uid,
+                    folderUid: calendar.uid,
+                    icalUid,
+                    organizer: { address: "bob@example.org", type: "to" },
+                    attendees: [{ address: mailbox.primarySmtpAddress, role: "required", responseStatus: "needsAction", isOrganizer: false }],
+                    sequence: 0,
+                    inviteSequenceSent: 0,
+                    ...fields,
+                });
+            // One sealed field by field while the calendar was protected and the mail wasn't; one filed readable before either was.
+            await row("za-event-3", { title: "Protected event", sealedFields: { title: "b2xk", location: "b2xk" } });
+            await row("za-event-4", { title: "CANARY review", location: "CANARY room" });
+            const revision = (icalUid: string) => [
+                `UID:${icalUid}`,
+                "DTSTAMP:20261022T100000Z",
+                "DTSTART:20261101T150000Z",
+                "DTEND:20261101T160000Z",
+                "LOCATION:Room 9",
+                "ORGANIZER;CN=Bob:mailto:bob@example.org",
+                `ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:${mailbox.primarySmtpAddress}`,
+                "SEQUENCE:1",
+            ];
+
+            for (const icalUid of ["za-event-3", "za-event-4"]) {
+                expect((await deliver([mailbox.primarySmtpAddress], itipMessage(mailbox.primarySmtpAddress, "REQUEST", revision(icalUid)))).status).toBe(202);
+            }
+
+            const events = await ctx.calendarEvents();
+            const kept = events.find((event) => event.icalUid === "za-event-3");
+            expect(kept).toMatchObject({ sequence: 1, title: "[...]" });
+            expect(kept.sealedFields).toEqual({ title: "b2xk" });
+            expect(JSON.parse((await open(Buffer.from(kept.sealedContent.sealed, "base64"), recipient)).toString("utf-8"))).toMatchObject({ title: "", location: "Room 9" });
+            const sealed = events.find((event) => event.icalUid === "za-event-4");
+            expect(sealed).toMatchObject({ sequence: 1, title: "[...]" });
+            expect(JSON.stringify(sealed)).not.toContain("CANARY");
+            expect(JSON.parse((await open(Buffer.from(sealed.sealedContent.sealed, "base64"), recipient)).toString("utf-8"))).toMatchObject({ title: "CANARY review", location: "Room 9" });
+        });
+
         it("seals the reader's own edit of a sealed event again, storing none of it readable, and ignores a sealedContent sent with it", async () => {
             const recipient = await makeKey();
             const mailbox = await zeroAccessMailbox(recipient);
@@ -661,6 +708,22 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 // Nothing left to do: a second run changes nothing.
                 await ctx.runBackfill();
                 expect((await ctx.findMessage(message.uid)).version).toBe(sealed.version);
+            });
+
+            it("sends a sealed message back to be indexed even after its indexing retries had run out, so its readable document goes", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const inbox = await ctx.createFolder(mailbox.uid, "inbox");
+                // Indexed readable, then changed during a search outage long enough to use up every retry.
+                const { message } = await stored(mailbox, inbox, { searchIndexedAt: null, searchIndexAttempts: 5, searchIndexNextAttemptAt: null, searchIndexError: "down" });
+
+                await ctx.runBackfill();
+
+                const sealed = await ctx.findMessage(message.uid);
+                expect(sealed.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                for (const field of ["searchIndexedAt", "searchIndexAttempts", "searchIndexNextAttemptAt", "searchIndexError"]) {
+                    expect(sealed[field] ?? null, field).toBeNull();
+                }
             });
 
             it("seals drafts and restorable deleted mail, but leaves Outbox, end-to-end mail and a mailbox without zero-access alone", async () => {
@@ -856,6 +919,51 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 // Indexed again, as metadata only now.
                 expect((await ctx.findMessage(message.uid)).searchIndexedAt ?? null).toBeNull();
             }, 20_000);
+
+            it("leaves no readable sanitized render behind when filing a relayed message fails and the job finishes it", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const { message, bodyBlobKey } = await draft(mailbox);
+                await ctx
+                    .blobStore()
+                    .put(bodyBlobKey, Buffer.from(`From: ${mailbox.primarySmtpAddress}\r\nTo: carol@example.org\r\nSubject: ${CANARY_SUBJECT}\r\nContent-Type: text/html\r\n\r\n<p>${CANARY_BODY}</p>\r\n`));
+                const renders = (): string[] => blobs().filter(([key]) => key.startsWith("sanitized/")).map(([key]) => key);
+                // A render the draft already had, which the relay's own replaces.
+                const draftRender = `sanitized/draft-${message.uid}`;
+                await ctx.blobStore().put(draftRender, Buffer.from(`<p>${CANARY_BODY}</p>`));
+                await ctx.updateMessage(message.uid, { sanitizedHtmlBlobKey: draftRender });
+                // Sealing the Sent Items copy fails once, after the relay: the filing throws.
+                const store: any = ctx.blobStore();
+                const realPut = store.put.bind(store);
+                const put = vi.spyOn(store, "put").mockImplementation(async (key: any, ...rest: any[]) => {
+                    if (String(key).startsWith("za/")) {
+                        throw new Error("simulated store failure");
+                    }
+                    return realPut(key, ...rest);
+                });
+
+                const result = await request(ctx.app())
+                    .post(`${ctx.messagesUrl}/${message.uid}/send`)
+                    .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                    .send({});
+                put.mockRestore();
+
+                expect(result.status).toBeGreaterThanOrEqual(500);
+                const relayed = await ctx.findMessage(message.uid);
+                expect(relayed.scheduledSendRelayedAt).toBeTruthy();
+                // The relay's render is recorded on the row, not left for nobody to find.
+                expect(renders()).toEqual([relayed.sanitizedHtmlBlobKey]);
+
+                await ctx.runScheduledSend();
+
+                const filed = await ctx.findMessage(message.uid);
+                expect(filed.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                expect(filed.sanitizedHtmlBlobKey ?? null).toBeNull();
+                expect(renders()).toEqual([]);
+                for (const [key, content] of blobs()) {
+                    expect(content.toString("latin1"), key).not.toContain(CANARY_BODY);
+                }
+            });
 
             it("refuses to send a draft still stored sealed, which it can't relay", async () => {
                 const recipient = await makeKey();

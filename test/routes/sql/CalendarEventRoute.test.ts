@@ -969,10 +969,13 @@ describe("Route:CalendarEventSQL Tests", () => {
         findMessage: async (uid) => (await messageRepo.findOne({ where: { uid } }))!,
         findEvents: async (mailboxUid) => (await calendarEventRepo.find({ where: { mailboxUid } })).filter((row: any) => !row.deleted),
         createAttendeeLink: async (data) => await (objectFactory.getInstance(ConnectionManager)!.connections.get("sql") as any).getRepository(CalendarEventAttendeeLinkSQL).save(new CalendarEventAttendeeLinkSQL(data)),
-        addZeroAccessKey: async (mailboxUid) => {
+        addZeroAccessKey: async (mailboxUid, types) => {
             const za = await testZeroAccessKey();
             const mailbox: any = await mailboxRepo.findOne({ where: { uid: mailboxUid } });
             mailbox.zeroAccessKeys = [za.key];
+            if (types) {
+                mailbox.zeroAccessTypes = types;
+            }
             await mailboxRepo.save(mailbox);
             return za;
         },
@@ -1073,6 +1076,33 @@ describe("Route:CalendarEventSQL Tests", () => {
                 .send({ uid: created.uid, version: row.version, startDate: "2026-11-02T14:00:00.000Z", endDate: "2026-11-02T15:00:00.000Z" });
             expect(silent.status).toBe(200);
             expect(transport().sent).toHaveLength(0);
+        });
+
+        it("Invites from what a meeting held readable when a time-only change is its first protected write", async () => {
+            const { mailbox, folder } = await protect({ calendar: true });
+            // Not reached by the backfill yet: readable, its invitations sent; the organizer drags it, which sends no invitationContent.
+            const created = await createCalendarEvent(mailbox.uid, folder.uid, {
+                ...meeting(mailbox, folder),
+                startDate: new Date("2026-11-02T10:00:00.000Z"),
+                endDate: new Date("2026-11-02T11:00:00.000Z"),
+                inviteSequenceSent: 0,
+            });
+            transport().sent = [];
+
+            const moved = await request(server.getApplication())
+                .put(`${baseUrl}/${created.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: created.uid, version: (created as any).version, startDate: "2026-11-02T14:00:00.000Z", endDate: "2026-11-02T15:00:00.000Z" });
+
+            expect(moved.status, JSON.stringify(moved.body)).toBe(200);
+            const row = await stored(created.uid);
+            expect(JSON.stringify(row)).not.toContain("CANARY");
+            expect(row.sequence).toBe(1);
+            expect(row.inviteSequenceSent).toBe(1);
+            expect(transport().sent).toHaveLength(1);
+            const raw = transport().sent[0].raw.toString();
+            expect(raw).toContain("Invitation: CANARY board meeting");
+            expect(raw).toContain("CANARY room 4");
         });
 
         it("Names a protected event in a reply by the title the client sends, and by no placeholder without one", async () => {

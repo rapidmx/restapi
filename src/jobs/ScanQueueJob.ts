@@ -2697,7 +2697,7 @@ export abstract class ScanQueueJob<
      */
     private async updateCalendarEventWithRetry(
         uid: string,
-        mutate: (current: CE) => Record<string, any> | undefined,
+        mutate: (current: CE) => Record<string, any> | undefined | Promise<Record<string, any> | undefined>,
         options: { skipPush?: boolean } = {},
         attempts: number = 3,
     ): Promise<CE | undefined> {
@@ -2706,7 +2706,7 @@ export abstract class ScanQueueJob<
             if (!current) {
                 return undefined;
             }
-            const patch: Record<string, any> | undefined = mutate(current);
+            const patch: Record<string, any> | undefined = await mutate(current);
             if (!patch) {
                 return undefined;
             }
@@ -2732,36 +2732,59 @@ export abstract class ScanQueueJob<
      * outbound invite as encrypted, a different code path entirely (see `MeetingSchedulingJob`). */
     /**
      * The sealed title, location and description an invitation's copy is filed with when the mail itself wasn't sealed but zero-access covers
-     * the mailbox's calendar (`specs/search.md` §3 *What It Covers*), the placeholders included - or `undefined` when its calendar isn't
-     * protected.
+     * the mailbox's calendar (`target`, `specs/search.md` §3 *What It Covers*), the placeholders included. A newer revision applied to
+     * `current` is sealed over it, so the row keeps what the revision leaves out: one without SUMMARY keeps the title - its sealed copy, or
+     * the readable one sealed now (the first protected write of a row the backfill hadn't reached).
      */
-    private async protectedCalendarContent(mailbox: X | undefined, parsed: ParsedIcsEvent): Promise<Record<string, any> | undefined> {
-        const target = mailbox && this.recordSealer ? await this.recordSealer.target("calendar", mailbox) : undefined;
-        if (!target) {
-            return undefined;
-        }
+    private async protectedCalendarContent(target: ZeroAccessTarget, parsed: ParsedIcsEvent, current?: CE): Promise<Record<string, any>> {
         const content: Record<string, any> = {
-            title: parsed.summary ?? "",
+            ...(parsed.summary !== undefined || !current ? { title: parsed.summary ?? "" } : {}),
             location: parsed.location ?? null,
             description: parsed.description ?? null,
             descriptionHtml: parsed.descriptionHtml ?? null,
         };
-        await sealFieldsOnWrite(content, undefined, EVENT_PROTECTED_FIELDS, target);
+        // The revision's own empty fields are clears: the invitation says what the event now is.
+        await sealFieldsOnWrite(content, current, EVENT_PROTECTED_FIELDS, target, { emptyClears: true });
         return content;
+    }
+
+    /**
+     * The content a zero-access message's revision is filed with (`specs/search.md` §4): its title, location and description only in
+     * `sealedContent`, sealed to the message's key, under placeholders. Applied to `current`, a revision without SUMMARY keeps the row's
+     * title: a readable one is sealed into the new content, a sealed per-field copy stays (`supersededSealing()`). A title only the old
+     * `sealedContent` holds can't be carried over - the server can't open it - so the new content's title is empty.
+     */
+    private async zeroAccessEventContent(zeroAccess: ZeroAccessFiling, parsed: ParsedIcsEvent, current?: CE): Promise<Record<string, any>> {
+        const readableTitle: string | undefined =
+            current && !(current as any).sealedContent && (current as any).sealedFields?.title === undefined && current.title !== PROTECTED_SUBJECT
+                ? current.title
+                : undefined;
+        return {
+            title: PROTECTED_SUBJECT,
+            location: null,
+            description: null,
+            descriptionHtml: null,
+            sealedContent: await zeroAccess.eventContent({
+                title: parsed.summary ?? readableTitle ?? "",
+                location: parsed.location,
+                description: parsed.description,
+                descriptionHtml: parsed.descriptionHtml,
+            }),
+        };
     }
 
     /**
      * What a newer revision applied to `current` drops of the sealed copies it supersedes, so no client opens the old title, location or
      * description over the new ones: a zero-access message's revision carries all of them in `sealedContent`, so the row's per-field
-     * copies go; otherwise (`content` sealed field by field, or readable while neither the mail nor the calendar is protected) the old
+     * copies go - but the title's when the revision names no title, which the new content can't carry; otherwise (`content` sealed field by field, or readable while neither the mail nor the calendar is protected) the old
      * `sealedContent` goes, and readable fields drop their sealed copies - the title's only when the revision names one.
      */
     private supersededSealing(current: CE, parsed: ParsedIcsEvent, content: Record<string, any> | undefined): Record<string, any> {
-        if (content?.sealedContent) {
-            return { sealedFields: null };
-        }
         const keepTitle: boolean = parsed.summary === undefined;
         const sealedTitle: string | undefined = (current as any).sealedFields?.title;
+        if (content?.sealedContent) {
+            return { sealedFields: keepTitle && sealedTitle ? { title: sealedTitle } : null };
+        }
         return {
             ...(keepTitle ? {} : { sealedContent: null }),
             ...(content ? {} : { sealedFields: keepTitle && sealedTitle ? { title: sealedTitle } : null }),
@@ -2824,23 +2847,19 @@ export abstract class ScanQueueJob<
 
         // A zero-access mailbox's copy keeps the invitation's title, location and description only sealed (`specs/search.md` §4): the
         // row holds a placeholder title, the client shows the real one after decrypting `sealedContent`.
-        const content = zeroAccess
-            ? {
-                  title: PROTECTED_SUBJECT,
-                  location: null,
-                  description: null,
-                  descriptionHtml: null,
-                  sealedContent: await zeroAccess.eventContent({
-                      title: parsed.summary ?? "",
-                      location: parsed.location,
-                      description: parsed.description,
-                      descriptionHtml: parsed.descriptionHtml,
-                  }),
-              }
-            : await this.protectedCalendarContent(mailbox, parsed);
+        // A protected calendar's copy is sealed field by field instead. Either is sealed over the row a revision updates, on each attempt.
+        const calendarTarget: ZeroAccessTarget | undefined =
+            !zeroAccess && mailbox && this.recordSealer ? await this.recordSealer.target("calendar", mailbox) : undefined;
+        const sealedOver = async (current?: CE): Promise<Record<string, any> | undefined> =>
+            zeroAccess
+                ? await this.zeroAccessEventContent(zeroAccess, parsed, current)
+                : calendarTarget
+                  ? await this.protectedCalendarContent(calendarTarget, parsed, current)
+                  : undefined;
 
         let row: CE;
         if (!existing) {
+            const content: Record<string, any> | undefined = await sealedOver();
             const folder: F = await findOrCreateWellKnownFolder(this.folderRepo!, this.folderClass, mailboxUid, FolderType.CALENDAR);
             row = await this.calendarEventRepo!.create(
                 new this.calendarEventClass({
@@ -2894,13 +2913,15 @@ export abstract class ScanQueueJob<
             // the same event processed concurrently by two workers must not let the loser's 409 be silently
             // swallowed. The staleness check is re-evaluated against each freshly-read row too, since a
             // concurrent update could have already applied a same-or-newer SEQUENCE by the time of a retry.
-            const updated: CE | undefined = await this.updateCalendarEventWithRetry(existing.uid, (current) => {
+            const updated: CE | undefined = await this.updateCalendarEventWithRetry(existing.uid, async (current) => {
                 if (parsed.sequence <= current.sequence) {
                     return undefined;
                 }
+                const content: Record<string, any> | undefined = await sealedOver(current);
                 return {
                     title: parsed.summary ?? current.title,
-                    location: parsed.location,
+                    // Cleared (`null`) when the newer revision has none: SQL's update skips an undefined value.
+                    location: parsed.location ?? null,
                     // Cleared (`null`) when the newer revision has none, so a removed description doesn't linger on the guest's copy.
                     description: parsed.description ?? null,
                     descriptionHtml: parsed.descriptionHtml ?? null,

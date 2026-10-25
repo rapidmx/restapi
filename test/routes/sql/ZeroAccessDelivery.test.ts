@@ -23,6 +23,7 @@ import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 import { zeroAccessDeliverySuite } from "../zeroAccessDeliverySuite.js";
 import { zeroAccessIndexSuite } from "../zeroAccessIndexSuite.js";
 import { ZeroAccessBackfillJobSQL } from "../../../src/jobs/sql/ZeroAccessBackfillJobSQL.js";
+import { ScheduledSendJobSQL } from "../../../src/jobs/sql/ScheduledSendJobSQL.js";
 import { ZeroAccessIndexSegmentSQL } from "../../../src/models/sql/ZeroAccessIndexSegmentSQL.js";
 
 describe("Zero-access delivery (SQL)", () => {
@@ -143,6 +144,10 @@ describe("Zero-access delivery (SQL)", () => {
             repo(DataSubjectErasureRequestSQL).save(new DataSubjectErasureRequestSQL({ mailboxUid, requestedByUserUid: uuid.v4(), status })),
         runBackfill: async () => {
             const job = await objectFactory.newInstance<ZeroAccessBackfillJobSQL>(ZeroAccessBackfillJobSQL, { name: `za-backfill-${uuid.v4()}` });
+            await job.run();
+        },
+        runScheduledSend: async () => {
+            const job = await objectFactory.newInstance<ScheduledSendJobSQL>(ScheduledSendJobSQL, { name: `za-send-${uuid.v4()}` });
             await job.run();
         },
     });

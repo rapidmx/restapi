@@ -1947,6 +1947,41 @@ ${oversigningDkimSignature("example.com", "RapidMX-Key", "Autocrypt")}`,
             expect(event.sealedFields ?? null).toBeNull();
         });
 
+        it("Keeps the title and its sealed copy when a newer revision to a protected calendar has no SUMMARY, sealing a title still readable.", async () => {
+            const za = await testZeroAccessKey();
+            await createMailbox({ zeroAccessKeys: [za.key], zeroAccessTypes: { mail: false, calendar: true } });
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const deliver = async (icalUid: string, event: any) => {
+                const rawBlobKey = `raw/${uuid.v4()}`;
+                await blobStore.put(rawBlobKey, makeItipRawMessage(buildEventIcs(makeIcsEventFixture({ icalUid, ...event }), "REQUEST")));
+                await createIngestEntry({ rawBlobKey, envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"] });
+                await job.run();
+            };
+            const find = async (icalUid: string): Promise<any> => (await calendarEventRepo.find({ where: { mailboxUid, icalUid } }))[0] as any;
+
+            // Sealed field by field when it was filed; the organizer's revision moves it and names no title (an empty title sends no SUMMARY).
+            const sealedUid = uuid.v4();
+            await deliver(sealedUid, { title: "Board review", location: "Room 1" });
+            const before = await find(sealedUid);
+            await deliver(sealedUid, { title: "", location: "Room 2", sequence: 1 });
+            const after = await find(sealedUid);
+            expect(after).toMatchObject({ sequence: 1, title: "Protected event" });
+            expect(after.sealedFields.title).toBe(before.sealedFields.title);
+            expect(await openSealedField(after.sealedFields.location, za)).toBe("Room 2");
+
+            // Filed readable before the calendar was protected, and not reached by the backfill yet: its title is sealed now, not lost.
+            await mailboxRepo.update({ uid: mailboxUid }, { zeroAccessTypes: { mail: false, calendar: false } });
+            const readableUid = uuid.v4();
+            await deliver(readableUid, { title: "CANARY review" });
+            expect((await find(readableUid)).title).toBe("CANARY review");
+            await mailboxRepo.update({ uid: mailboxUid }, { zeroAccessTypes: { mail: false, calendar: true } });
+            await deliver(readableUid, { title: "", sequence: 1 });
+            const sealedNow = await find(readableUid);
+            expect(sealedNow.title).toBe("Protected event");
+            expect(JSON.stringify(sealedNow)).not.toContain("CANARY");
+            expect(await openSealedField(sealedNow.sealedFields.title, za)).toBe("CANARY review");
+        });
+
         it("Preserves encryptionOrigin: 'derived' on an existing event when a later resent REQUEST updates it - encryption state is sticky, never recomputed from the current message.", async () => {
             const icalUid = uuid.v4();
             const folder = await folderRepo.save(

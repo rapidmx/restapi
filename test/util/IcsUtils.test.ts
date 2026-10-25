@@ -137,6 +137,20 @@ describe("buildEventIcs() / parseIcsEvent() Tests", () => {
         expect(parsed.attendees).toEqual([{ address: "b@example.com", displayName: "Attendee", partstat: AttendeeResponseStatus.ACCEPTED }]);
     });
 
+    it("Never carries LOCATION in a REPLY or a plain COUNTER, so an attendee's keyed join link can't reach the organizer.", () => {
+        const event = makeEvent({ location: "https://meet.example.com/j/T#k=SECRET" });
+        const onlyAttendee = makeAttendee({ address: "b@example.com", responseStatus: AttendeeResponseStatus.ACCEPTED });
+
+        for (const method of ["REPLY", "COUNTER"] as const) {
+            const ics = buildEventIcs(event, method, { onlyAttendee });
+            expect(ics).not.toContain("LOCATION");
+            expect(ics).not.toContain("SECRET");
+        }
+        // The invitation itself, and a change request asking to move the meeting, still name the place.
+        expect(parseIcsEvent(buildEventIcs(event, "REQUEST"))!.location).toBe(event.location);
+        expect(parseIcsEvent(buildEventIcs({ ...event, location: "Room 4" }, "COUNTER", { onlyAttendee, changeRequest: true }))!.location).toBe("Room 4");
+    });
+
     it("REPLY with no onlyAttendee given emits zero ATTENDEE lines.", () => {
         const event = makeEvent();
         const parsed = parseIcsEvent(buildEventIcs(event, "REPLY"))!;

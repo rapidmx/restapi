@@ -18,6 +18,7 @@ import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles, InMemoryBlobStore } from "../../testDoubles.js";
+import { testZeroAccessKey } from "../../zeroAccessTestKeys.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
@@ -238,6 +239,27 @@ describe("Route:MailboxImportRequestMongo Tests", () => {
             const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
             const stored = await blobStore.get(result.body.sourceBlobKey);
             expect(Buffer.compare(stored, raw)).toBe(0);
+        });
+
+        it("Refuses an import into a mailbox whose mail is zero-access (409), storing nothing of the archive.", async () => {
+            // Its own user: create() is rate limited per user, and the other tests use up the owner's attempts.
+            const zaUser: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
+            const mailbox = await createMailbox(zaUser.uid);
+            await mailboxRepo.save(Object.assign(mailbox, { zeroAccessKeys: [(await testZeroAccessKey()).key] }) as any);
+            const folder = await createFolder(mailbox.uid);
+            const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const before: string[] = [...((blobStore as any).store as Map<string, Buffer>).keys()];
+
+            const result = await request(server.getApplication())
+                .post(importUrl({ format: "mbox", targetFolderUid: folder.uid }))
+                .set("Authorization", "jwt " + JWTUtils.createTokenSync(config.get("auth"), zaUser))
+                .set("Content-Type", "application/mbox")
+                .send(Buffer.from("From alice@example.com Thu Jan 01 00:00:00 2026\r\nSubject: CANARY\r\n\r\nBody\r\n\r\n"));
+
+            expect(result.status).toBe(409);
+            expect(result.body.message).toContain("zero-access");
+            expect([...((blobStore as any).store as Map<string, Buffer>).keys()]).toEqual(before);
+            expect(await requestRepo.count()).toBe(0);
         });
 
         it("A trusted caller can't import into another user's mailbox (403) - a trusted role is no grant on it - and nothing is created.", async () => {

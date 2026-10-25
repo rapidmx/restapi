@@ -297,7 +297,30 @@ describe("TransportRuleUtils Tests", () => {
             const context = await buildTransportRuleContext(raw, "sender@example.com", ["a@example.com"], []);
 
             expect(context.subject).toBe("Deep");
-            expect(typeof context.bodyText).toBe("string");
+            expect(context.bodyText).toBe("deep text");
+        });
+
+        it("Reads text past any nesting depth or sibling count, so a bodyContains rule can't be evaded by padding the HTML.", async () => {
+            const rule: any = { enabled: true, sequence: 1, conditions: { bodyContains: ["wire transfer"] }, actions: [{ type: TransportRuleActionType.QUARANTINE }] };
+            const bodies: string[] = [
+                "<div>".repeat(150) + "Please send the wire transfer" + "</div>".repeat(150),
+                "<span></span>".repeat(10_001) + "<p>CONFIDENTIAL wire transfer</p>",
+                "<p>hi</p>" + "<div>".repeat(150) + "wire transfer" + "</div>".repeat(150),
+                // Inline elements join the text around them, as the reader sees it; script and style are no text of the message.
+                "<p>wi<span></span>re tr<x-foo>ans</x-foo>fer</p><style>p { color: red }</style><script>var x = 1;</script>",
+            ];
+            for (const html of bodies) {
+                const raw = Buffer.from(["From: sender@example.com", "Content-Type: text/html", "", html, ""].join("\r\n"));
+                const context = await buildTransportRuleContext(raw, "sender@example.com", ["a@example.com"], []);
+                expect(evaluateTransportRules([rule], context).quarantine, html.slice(0, 40)).toBe(true);
+            }
+            const styled = await buildTransportRuleContext(
+                Buffer.from("From: s@example.com\r\nContent-Type: text/html\r\n\r\n<style>p{}</style><p>A&amp;B</p><br>C\r\n"),
+                "s@example.com",
+                ["a@example.com"],
+                [],
+            );
+            expect(styled.bodyText).toBe("A&B C");
         });
 
         it("anyRecipientExternal is false when mail:domains is unconfigured (empty).", async () => {

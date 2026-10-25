@@ -34,8 +34,8 @@ export interface CalendarInviteSuiteContext {
     findEvents: (mailboxUid: string) => Promise<any[]>;
     /** Clears the organizer recorded on a calendar event row. */
     deleteEventOrganizer: (uid: string) => Promise<void>;
-    /** Gives a mailbox a zero-access key (its mail is then sealed), returning it. */
-    addZeroAccessKey: (mailboxUid: string) => Promise<TestZeroAccessKey>;
+    /** Gives a mailbox a zero-access key (its mail is then sealed, unless `types` says otherwise), returning it. */
+    addZeroAccessKey: (mailboxUid: string, types?: Record<string, boolean>) => Promise<TestZeroAccessKey>;
     /** Saves a `CalendarEventAttendeeLink` row. */
     createAttendeeLink: (data: any) => Promise<any>;
 }
@@ -242,6 +242,32 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             expect(row.sealedContent.keyFingerprint).toBe((await keyOf(mailbox.uid)).key.fingerprint);
             // The per-field copies the revision replaces go, so no client opens the old ones over it.
             expect(row.sealedFields ?? null).toBeNull();
+        });
+
+        it("Clears the readable location of a copy not sealed yet when a newer revision in a protected calendar names none", async () => {
+            const { mailbox, inbox, calendar, me } = await setup();
+            await ctx.addZeroAccessKey(mailbox.uid, { mail: false, calendar: true, contacts: false, tasks: false });
+            // Filed before the calendar was protected, and not reached by the backfill yet.
+            await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                uid: nameBasedUuid(`itip:${mailbox.uid}:${eventUid}:master`),
+                icalUid: eventUid,
+                title: "Video Test",
+                location: "CANARY board room, door code 4411",
+                organizer: { address: "boss@boss.example.com", type: RecipientType.TO },
+                attendees: [{ address: me, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+                sequence: 0,
+                inviteSequenceSent: 0,
+            });
+            const message = await receive(mailbox.uid, inbox.uid, requestFor(me, { sequence: 1 }));
+
+            const result = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({ responseStatus: "accepted" });
+
+            expect(result.status).toBe(200);
+            const [row] = await ctx.findEvents(mailbox.uid);
+            expect(row.sequence).toBe(1);
+            expect(row.location ?? null).toBeNull();
+            expect(JSON.stringify(row)).not.toContain("CANARY");
+            expect(Object.keys(row.sealedFields)).toEqual(["title"]);
         });
 
         it("Still tells a verified organizer's change of a meeting on the calendar from a forged one, by the stored Authentication-Results.", async () => {
@@ -578,6 +604,19 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             expect(raw).toContain("PARTSTAT=ACCEPTED");
             expect(raw).toContain(`UID:${eventUid}`);
             expect((await ctx.findMessage(message.uid)).meetingResponse).toBe("accepted");
+        });
+
+        it("Never sends the meeting's location back in the REPLY, so a keyed join link's #k= key can't reach the organizer's mailbox.", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const message = await receive(mailbox.uid, inbox.uid, requestFor(me, { extra: ["LOCATION:https://meet.example.com/j/T#k=CANARYKEY"] }));
+
+            const result = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({ responseStatus: "accepted" });
+
+            expect(result.status).toBe(200);
+            const raw = decoded(ctx.transport().sent[0].raw);
+            expect(raw).toContain("METHOD:REPLY");
+            expect(raw).not.toContain("LOCATION");
+            expect(raw).not.toContain("CANARYKEY");
         });
 
         it("Tentatively accepting adds it as tentative, and changing the answer updates the one copy rather than making another.", async () => {

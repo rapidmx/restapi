@@ -749,7 +749,11 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
 
         it("Marks the claim in flight, and doesn't file a message that left Outbox under the claim mid-relay.", async () => {
             const drafts = await folderRepo.save(new FolderSQL({ mailboxUid, name: "Drafts", type: FolderType.DRAFTS }));
-            const message = await createMessage({ bodyBlobKey: await putBody(), scheduledSendTime: past() });
+            // An HTML body: the relay stores a sanitized render, which no row will name once the message isn't filed.
+            const html = `From: owner@example.com\r\nTo: recipient@example.com\r\nContent-Type: text/html\r\n\r\n<p>Hello there.</p>\r\n`;
+            const message = await createMessage({ bodyBlobKey: await putBody(html), scheduledSendTime: past() });
+            const renders = (): string[] => [...(blobStore().store as Map<string, Buffer>).keys()].filter((key) => key.startsWith("sanitized/"));
+            const rendersBefore: string[] = renders();
             let midFlight: any;
             const realSend = transport().send.bind(transport());
             vi.spyOn(transport(), "send").mockImplementationOnce(async (outbound: any) => {
@@ -773,6 +777,7 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
             expect(after.folderUid).toBe(drafts.uid);
             // The relay is still recorded, so the message can't be sent a second time.
             expect(after.scheduledSendRelayedAt).toBeTruthy();
+            expect(renders()).toEqual(rendersBefore);
         });
 
         it("Stores an over-long relayed Message-ID bounded, so a varchar(255) column can't fail the filing.", async () => {

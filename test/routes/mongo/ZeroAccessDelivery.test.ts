@@ -19,6 +19,7 @@ import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 import { zeroAccessDeliverySuite } from "../zeroAccessDeliverySuite.js";
 import { zeroAccessIndexSuite } from "../zeroAccessIndexSuite.js";
 import { ZeroAccessBackfillJobMongo } from "../../../src/jobs/mongo/ZeroAccessBackfillJobMongo.js";
+import { ScheduledSendJobMongo } from "../../../src/jobs/mongo/ScheduledSendJobMongo.js";
 import { ZeroAccessIndexEntryMongo } from "../../../src/models/mongo/ZeroAccessIndexEntryMongo.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({ instance: { port: 9999, dbName: "rrst-test" } });
@@ -148,6 +149,10 @@ describe("Zero-access delivery (Mongo)", () => {
             repos.DataSubjectErasureRequestMongo.save(new DataSubjectErasureRequestMongo({ mailboxUid, requestedByUserUid: uuid.v4(), status })),
         runBackfill: async () => {
             const job = await objectFactory.newInstance<ZeroAccessBackfillJobMongo>(ZeroAccessBackfillJobMongo, { name: `za-backfill-${uuid.v4()}` });
+            await job.run();
+        },
+        runScheduledSend: async () => {
+            const job = await objectFactory.newInstance<ScheduledSendJobMongo>(ScheduledSendJobMongo, { name: `za-send-${uuid.v4()}` });
             await job.run();
         },
     });

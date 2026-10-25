@@ -552,10 +552,14 @@ export function buildEventIcs(
     if (event.title) {
         lines.push(`SUMMARY:${escapeText(event.title)}`);
     }
-    if (event.location) {
+    const carriesDetails: boolean = method === "REQUEST" || method === "CANCEL" || !!options?.changeRequest;
+    // A reply or a proposal names the meeting, never where it is: an attendee's copy of a keyed meeting holds its join link with the
+    // meeting key after `#k=`, which must not reach the organizer's mailbox, where it may be stored readable (meet-plugin
+    // `specs/meeting_privacy.md` §4.1). RFC 5546 doesn't require LOCATION in a REPLY or COUNTER. A change request sets it only when it
+    // asks to move the meeting there.
+    if (event.location && carriesDetails) {
         lines.push(`LOCATION:${escapeText(event.location)}`);
     }
-    const carriesDetails: boolean = method === "REQUEST" || method === "CANCEL" || !!options?.changeRequest;
     if (carriesDetails) {
         const description = sanitizeInboundDescription(event.description ?? undefined, event.descriptionHtml ?? undefined);
         if (description.description) {

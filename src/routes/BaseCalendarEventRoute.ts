@@ -109,6 +109,10 @@ const MAX_CLIENT_ICS_LENGTH: number = 1024 * 1024;
 /** The content fields an event made from a zero-access mailbox's invitation keeps only sealed. */
 const SEALED_EVENT_FIELDS: readonly string[] = ["title", "location", "description", "descriptionHtml"];
 
+/** Per update body (`prepareUpdate()` to `update()`, in memory for the request only): the content an event still held readable when the
+ * update sealed it, which its invitations are composed with when the request sent no `invitationContent`. */
+const READABLE_CONTENT: WeakMap<object, InvitationContent> = new WeakMap();
+
 /**
  * Extends `BaseScopedChildRoute` (scoped by `folderUid`, same as `Message`) with the two pieces of
  * scheduling-relevant behavior a `CalendarEvent` needs beyond ordinary CRUD:
@@ -224,6 +228,17 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         // Sealed last, once everything above has read the plaintext. An event made from a zero-access invitation keeps its own sealing
         // (`keepSealed()`, one sealed blob).
         if (!(existing as any).sealedContent) {
+            if (!hasSealedFields(existing)) {
+                // Still readable (the backfill hadn't reached it, or it moved here): if this write is its first protected one, its
+                // invitations are composed from what it held, since the client had nothing sealed to send `invitationContent` for.
+                const readable = BaseCalendarEventRoute.takeInvitationContent(
+                    { invitationContent: Object.fromEntries(SEALED_EVENT_FIELDS.map((field) => [field, field in obj ? obj[field] : (existing as any)[field]])) },
+                    false,
+                );
+                if (readable) {
+                    READABLE_CONTENT.set(obj, readable);
+                }
+            }
             await this.sealing?.seal(obj, existing);
         }
         // Read by field sealing alone (`ZeroAccessRouteSealing.takeClearedFields()`), never stored.
@@ -544,7 +559,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (existing && this.isSchedulingRelevantChange(existing, obj)) {
             (obj as any).sequence = existing.sequence + 1;
         }
-        const updated: T = await this.sendProtectedInvitations(await super.update(id, obj, req, user), content, secrets);
+        const stored: T = await super.update(id, obj, req, user);
+        // Without invitationContent, an event this write sealed for the first time is invited for from what it held readable (`prepareUpdate()`).
+        const updated: T = await this.sendProtectedInvitations(stored, content ?? READABLE_CONTENT.get(obj), secrets);
         // Only an update that names the people involved is a new sighting of them (a move or a rename is not).
         if ((obj as any).attendees !== undefined || (obj as any).organizer !== undefined) {
             await this.recordEventCorrespondents(updated);
@@ -1399,7 +1416,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                     ...(newer
                         ? {
                               title: parsed.summary ?? existing.title,
-                              location: parsed.location,
+                              // An explicit clear: SQL's update skips an undefined value, which would keep the old location readable.
+                              location: parsed.location ?? null,
                               description: parsed.description ?? null,
                               descriptionHtml: parsed.descriptionHtml ?? null,
                               visibility: parsed.visibility ?? "default",

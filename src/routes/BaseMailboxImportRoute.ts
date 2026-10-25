@@ -16,6 +16,7 @@ import { hasMailAccess } from "../util/MailAccessUtils.js";
 import { resolveCallerMailboxUid } from "../util/MailboxScopeUtils.js";
 import { parseListPaging } from "../util/RequestListUtils.js";
 import { AuditAction, Folder, Mailbox, MailboxImportFormat, MailboxImportRequest } from "../models/types.js";
+import { ZeroAccessResolver } from "../zeroaccess/ZeroAccessResolver.js";
 /** The mailboxes an upload is streaming into right now, in this process - see `create()`. */
 const UPLOADS_IN_FLIGHT: Set<string> = new Set();
 const { Config, Init, Inject, Logger } = ObjectDecorators;
@@ -167,9 +168,18 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
     /** Supplied by the Mongo/SQL concrete subclasses so this route can persist an `AuditLogEntry`
      * without depending on either backend directly - see `util/AuditLogUtils.ts`. */
     protected abstract auditLogClass: any;
+    /** The `EncryptionPolicy` model class, supplied by the Mongo/SQL subclasses - read for "Allow zero-access encryption". Left unset,
+     * no mailbox is treated as zero-access. */
+    protected encryptionPolicyClass?: any;
 
     @Config("trusted_roles", ["admin"])
     protected trustedRoles: string[] = ["admin"];
+
+    @Config("mail:zero_access:allowed", true)
+    private zeroAccessAllowedDefault: boolean = true;
+
+    /** Decides whether the target mailbox's mail is zero-access - built by `initialize()` when `encryptionPolicyClass` is set. */
+    protected zeroAccessResolver?: ZeroAccessResolver;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -226,6 +236,13 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
                 name: this.auditLogClass.name,
                 args: [this.auditLogRepo],
             });
+        }
+        if (!this.zeroAccessResolver && this.encryptionPolicyClass) {
+            const policyRepo: RepoUtils<any> = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.encryptionPolicyClass.name,
+                args: [this.encryptionPolicyClass],
+            });
+            this.zeroAccessResolver = new ZeroAccessResolver(policyRepo, this.aclUtils, this.zeroAccessAllowedDefault, this.trustedRoles);
         }
     }
 
@@ -369,6 +386,11 @@ export abstract class BaseMailboxImportRoute<T extends MailboxImportRequest, MB 
         const mailbox: MB | undefined = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
         if (!mailbox) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        // The upload waits for `MailboxImportJob` as a readable archive in the blob store, a plaintext spool outside the request that a
+        // zero-access mailbox must never have (`specs/search.md` §3): its mail can only be imported by a client that seals each message.
+        if (this.zeroAccessResolver && (await this.zeroAccessResolver.target(mailbox))) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 409, "This mailbox's mail is zero-access encrypted, so the server can't import an archive into it.");
         }
         // One upload at a time per mailbox: a queued import holds its whole file on disk (uncharged to the quota) until the job runs,
         // so repeated uploads would otherwise fill the disk well past the mailbox's quota.

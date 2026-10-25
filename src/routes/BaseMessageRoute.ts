@@ -55,6 +55,7 @@ import { changeMailboxSenderList, parseSenderAddress } from "../util/SenderListU
 import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { SEARCH_REINDEX } from "../util/SearchIndexUtils.js";
+import { deleteBlobsIfUnreferenced, messageBlobReferenceSources } from "../util/BlobReferenceUtils.js";
 import { buildDispositionNotification } from "../util/ReceiptUtils.js";
 import { BaseScopedChildRoute } from "./BaseScopedChildRoute.js";
 import {
@@ -1443,7 +1444,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             });
             /* v8 ignore start -- only a blob store/database failure after a successful relay */
         } catch (err) {
-            await this.markRelayed(claimed, { messageId, conversationId });
+            // The relay's sanitized render is recorded too, so the job that finishes the filing files it or - sealed - discards it.
+            await this.markRelayed(claimed, { messageId, conversationId, sanitizedHtmlBlobKey: scannedHtmlBlobKey });
             throw err;
         }
         /* v8 ignore stop */
@@ -1525,6 +1527,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         /* v8 ignore start -- only a lapsed lease (a relay slower than lease_ms) or a trusted caller's move */
         if (!current || !BaseMessageRoute.stillClaimed(current, claimed)) {
             this.logger?.warn(`BaseMessageRoute: not filing message ${message.uid} - it is no longer in Outbox under this send's claim.`);
+            // The relay's sanitized render is on no row: nothing would ever remove it.
+            await this.deleteUnfiledBlob(scannedHtmlBlobKey);
             return current ?? claimed;
         }
         /* v8 ignore stop */
@@ -1721,15 +1725,18 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
 
     /** Records that a message was relayed but not filed: `scheduledSendRelayedAt`, the claim's lease released and - while
      * it's still in the Outbox it was claimed in - a due `scheduledSendTime`, so `ScheduledSendJob` finishes the filing
-     * without relaying again. Values from the relayed MIME are bounded (`boundIndexedValue()`). Best-effort (logged). */
+     * without relaying again. Values from the relayed MIME are bounded (`boundIndexedValue()`). Best-effort (logged).
+     *
+     * `fields.sanitizedHtmlBlobKey` - the relay's fresh sanitized render - replaces the row's own, which is removed, so the job files it
+     * (or, for a sealed copy, discards it with the rest of the plaintext). One that can't be recorded is removed at once: no row names it. */
     /* v8 ignore start -- reached only when filing fails after a successful relay */
-    private async markRelayed(claimed: T, fields: { messageId?: string; conversationId?: string }): Promise<void> {
+    private async markRelayed(claimed: T, fields: { messageId?: string; conversationId?: string; sanitizedHtmlBlobKey?: string }): Promise<void> {
         const uid: string = claimed.uid;
         for (let attempt = 1; attempt <= 3; attempt++) {
             try {
                 const current: T | undefined = await this.repoUtils!.findOne(uid, { ignoreACL: true, skipCache: true, includeDeleted: true });
                 if (!current) {
-                    return;
+                    break;
                 }
                 const inOutbox: boolean = current.folderUid === claimed.folderUid;
                 await this.repoUtils!.update(
@@ -1738,19 +1745,44 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                         version: (current as any).version,
                         ...(fields.messageId !== undefined ? { messageId: boundIndexedValue(fields.messageId) } : {}),
                         ...(fields.conversationId !== undefined ? { conversationId: boundIndexedValue(fields.conversationId) } : {}),
+                        ...(fields.sanitizedHtmlBlobKey !== undefined ? { sanitizedHtmlBlobKey: fields.sanitizedHtmlBlobKey } : {}),
                         scheduledSendRelayedAt: (current as any).scheduledSendRelayedAt ?? new Date(),
                         ...(inOutbox ? { scheduledSendTime: new Date(), scheduledSendLeaseExpiresAt: null } : {}),
                     } as any,
                     current,
                     { ignoreACL: true },
                 );
+                const replaced: string | undefined = (current as any).sanitizedHtmlBlobKey ?? undefined;
+                if (fields.sanitizedHtmlBlobKey !== undefined && replaced && replaced !== fields.sanitizedHtmlBlobKey) {
+                    await this.deleteUnfiledBlob(replaced);
+                }
                 return;
             } catch (err: any) {
                 this.logger?.warn(`BaseMessageRoute: failed to record the relay of message ${uid}: ${err.message}`);
             }
         }
+        await this.deleteUnfiledBlob(fields.sanitizedHtmlBlobKey);
     }
     /* v8 ignore stop */
+
+    /** Removes a sanitized render no row keeps any more - one a row named only once no other row still does (a rule copy may share it).
+     * Best-effort (logged). */
+    private async deleteUnfiledBlob(key: string | undefined): Promise<void> {
+        if (!key) {
+            return;
+        }
+        try {
+            await deleteBlobsIfUnreferenced(
+                this.blobStore!,
+                messageBlobReferenceSources({ messageRepo: this.repoUtils, attachmentRepo: this.attachmentRepo, quarantineEntryRepo: this.quarantineEntryRepo, ingestQueueEntryRepo: this.ingestQueueEntryRepo }),
+                [key],
+            );
+            /* v8 ignore start -- only a blob store failure */
+        } catch (err: any) {
+            this.logger?.warn(`BaseMessageRoute: could not remove sanitized render ${key}: ${err?.message ?? err}`);
+        }
+        /* v8 ignore stop */
+    }
 
     /**
      * Attempts to recall a message this mailbox previously sent — Exchange/Outlook's "Recall This Message" —

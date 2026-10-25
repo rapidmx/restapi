@@ -544,6 +544,16 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             // after the lease lapsed - either way it's no longer this run's to file, and nothing is written.
             if (!refetched || !this.stillClaimed(refetched, claimed)) {
                 this.logger?.warn(`ScheduledSendJob: not filing message ${claimed.uid} - it is no longer in Outbox under this run's claim.`);
+                // This relay's own sanitized render is on no row: nothing would ever remove it.
+                if (sanitizedHtmlBlobKey && sanitizedHtmlBlobKey !== ((claimed as any).sanitizedHtmlBlobKey ?? undefined)) {
+                    try {
+                        await this.blobStore!.delete(sanitizedHtmlBlobKey);
+                        /* v8 ignore start -- only a blob store failure */
+                    } catch (err: any) {
+                        this.logger?.warn(`ScheduledSendJob: could not remove sanitized render ${sanitizedHtmlBlobKey}: ${err?.message ?? err}`);
+                    }
+                    /* v8 ignore stop */
+                }
                 return;
             }
 

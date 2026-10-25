@@ -57,10 +57,21 @@ function clears(options: SealFieldsOptions, name: string): boolean {
 }
 
 /**
+ * Whether `value`, written to `field` while it is sealed, is what a client was shown rather than a new value: the field's placeholder for
+ * `existing`, or the column `existing` stores (which may predate the placeholder's current value - a name placeholder written before the
+ * first address changed). An empty one of either is a clear instead when `options` names the field.
+ */
+function echoes(value: unknown, field: ProtectedField, existing: unknown, options: SealFieldsOptions): boolean {
+    const shown: unknown[] = [field.placeholder(existing), (existing as any)[field.name]];
+    return shown.some((placeholder) => sameValue(value, placeholder) && !(clears(options, field.name) && isEmpty(placeholder)));
+}
+
+/**
  * Applies the protected `fields` of `patch` - a create or update body of a record whose type is protected when `target` is set - to what
  * will be stored, in place:
  *
- * - A field carrying the record's current placeholder while it is sealed is dropped from the patch: a device sent back what it was shown.
+ * - A field carrying the record's current placeholder, or the column it stores, while it is sealed is dropped from the patch: a device
+ * sent back what it was shown.
  * With `options.emptyClears` naming it, only a non-empty placeholder is: an empty value of a field with an empty placeholder clears it.
  * - With `target`: a field with a value is sealed into `sealedFields` and its column set to the placeholder; an empty one is stored
  * empty and its sealed copy removed. A field `patch` doesn't carry that `existing` still holds readable - the record wasn't sealed yet (the
@@ -96,8 +107,7 @@ export async function sealFieldsOnWrite<R extends { sealedFields?: SealedFields 
             continue;
         }
         const value: unknown = unsealed.has(field.name) ? (existing as any)[field.name] : patch[field.name];
-        const placeholder: unknown = existing ? field.placeholder(existing) : undefined;
-        if (sealed[field.name] !== undefined && existing && sameValue(value, placeholder) && !(clears(options, field.name) && isEmpty(placeholder))) {
+        if (sealed[field.name] !== undefined && existing && echoes(value, field, existing, options)) {
             delete patch[field.name];
             continue;
         }
@@ -106,10 +116,20 @@ export async function sealFieldsOnWrite<R extends { sealedFields?: SealedFields 
             sealed[field.name] = (await sealToCertificate(Buffer.from(JSON.stringify(value), "utf-8"), target.certDer)).toString("base64");
         }
     }
-    // Placeholders last: one may depend on another field (a contact's name placeholder is its address).
+    // Placeholders last: one may depend on another field (a contact's name placeholder is its address). So every sealed field's column
+    // follows the record as stored, not only the fields written: a name placeholder keeps up with a changed first address, and a column
+    // left stale by an earlier write is repaired. A record sealed whole keeps the placeholders its own sealing wrote.
     for (const field of fields) {
-        if ((field.name in patch || unsealed.has(field.name)) && sealed[field.name] !== undefined) {
+        if (sealed[field.name] === undefined) {
+            continue;
+        }
+        if (field.name in patch || unsealed.has(field.name)) {
             patch[field.name] = field.placeholder(merged);
+        } else if (existing && !(existing as any).sealedContent) {
+            const placeholder: unknown = field.placeholder(merged);
+            if (!sameValue(placeholder, (existing as any)[field.name])) {
+                patch[field.name] = placeholder;
+            }
         }
     }
     patch.sealedFields = Object.keys(sealed).length > 0 ? sealed : null;
