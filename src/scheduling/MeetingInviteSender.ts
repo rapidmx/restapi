@@ -90,11 +90,12 @@ export class MeetingInviteSender {
     @Config("mail:jobs:meeting_scheduling:max_attendees", 500)
     private ownMaxAttendees: number = 500;
 
-    /** `host`: what sends through this (`MeetingSchedulingJob`), whose logger and attendee cap it uses when given. */
+    /** `host`: what sends through this (`MeetingSchedulingJob`), whose logger and attendee cap it uses when given; and, for a sender of
+     * keyed meetings, whether an attendee's copy may carry their link's key (`mayCarryMeetingKey`, see `sendPerAttendee()`). */
     constructor(
         private readonly mailboxRepo: RepoUtils<any> | undefined,
         private readonly attendeeLinkRepo: RepoUtils<any> | undefined,
-        private readonly host?: { logger?: any; maxAttendees?: number },
+        private readonly host?: { logger?: any; maxAttendees?: number; mayCarryMeetingKey?: (address: string) => Promise<boolean> },
     ) {}
 
     private get logger(): any {
@@ -231,8 +232,12 @@ export class MeetingInviteSender {
      * claimed with a versioned update of `eventRepo` first, so it is sent once. A meeting protected by a per-meeting key
      * (`isKeyedMeeting()`, meet-plugin `specs/meeting_privacy.md` §4.1) is sent the same way, whether or not its event is sealed: each
      * guest's keyed link gets that guest's key from `secrets`, which is never stored. Without the `content` a sealed event needs, or the
-     * `secrets` a keyed meeting needs, nothing is sent and the invitation stays pending until a save that has them. Never throws: a
+     * `secrets` a keyed meeting needs, nothing is sent and the invitation stays pending until a save that has them. An event the organizer
+     * sends encrypted itself (`encryptionOrigin` `"originated"`) is claimed and never sent, as `MeetingSchedulingJob` does. Never throws: a
      * failure is logged, as `source`.
+     *
+     * Returns the row the claim wrote - a new `version` - or `undefined` when nothing was claimed: a caller holding `event` replaces it,
+     * so the version it hands back (a route's response, a notification) is the stored one.
      */
     public async sendProtectedInvitations(
         event: CalendarEvent,
@@ -240,29 +245,34 @@ export class MeetingInviteSender {
         eventRepo: RepoUtils<any>,
         source: string,
         secrets?: MeetingLinkSecrets,
-    ): Promise<void> {
+    ): Promise<CalendarEvent | undefined> {
         if (!invitationsPending(event)) {
-            return;
+            return undefined;
         }
         const sealed: boolean = hasSealedFields(event);
         const keyed: boolean = await this.isKeyedMeeting(event);
         if (!sealed && !keyed) {
-            return;
+            return undefined;
         }
-        if ((sealed && !content) || (keyed && !secrets)) {
+        const originated: boolean = event.encryptionOrigin === "originated";
+        if (!originated && ((sealed && !content) || (keyed && !secrets))) {
             this.logger?.warn(`${source}: not sending the invitations for protected event ${event.uid}: the request carried no ${sealed && !content ? "invitation content" : "meeting link keys"}.`);
-            return;
+            return undefined;
         }
+        let claimed: CalendarEvent | undefined;
         try {
             const organizer: MailboxIdentity | undefined = await this.organizerIdentity(event);
             if (!organizer) {
-                return;
+                return undefined;
             }
-            await eventRepo.update({ uid: event.uid, version: (event as any).version, inviteSequenceSent: event.sequence } as any, event as any, { ignoreACL: true });
-            await this.sendToAttendees(content ? { ...event, ...content } : event, organizer, "request", secrets);
+            claimed = await eventRepo.update({ uid: event.uid, version: (event as any).version, inviteSequenceSent: event.sequence } as any, event as any, { ignoreACL: true });
+            if (!originated) {
+                await this.sendToAttendees(content ? { ...event, ...content } : event, organizer, "request", secrets);
+            }
         } catch (err: any) {
             this.logger?.warn(`${source}: failed to send the invitations for protected event ${event.uid}: ${err?.message ?? err}`);
         }
+        return claimed;
     }
 
     /** The event's plain-text description as a paragraph to add to an invitation's body, or `""` when it has none. */
@@ -275,7 +285,8 @@ export class MeetingInviteSender {
      * two events that can't share one message between everybody:
      *
      * - **A `REQUEST` for an event with a linked video meeting**: each attendee's copy carries that attendee's own
-     * personalized link (their own `LOCATION`, and a line naming it in the body) from this event's `CalendarEventAttendeeLink`
+     * personalized link - a keyed one with the attendee's key, and not at all to an attendee whose copy would be stored on this server
+     * readable (`host.mayCarryMeetingKey`) - (their own `LOCATION`, and a line naming it in the body) from this event's `CalendarEventAttendeeLink`
      * rows - see this class's doc comment for why that lookup is generic and knows nothing of whichever plugin wrote those rows.
      * Every fallback here is graceful and per-attendee: a lookup that fails outright, one that returns nothing, and one that
      * returns rows for only some attendees all end in the same place - an attendee with no matching row gets the event's own
@@ -335,6 +346,13 @@ export class MeetingInviteSender {
                 // attendee isn't sent a link that can't work.
                 if (stored?.keyed && !secrets?.[attendee]) {
                     this.logger?.warn(`MeetingSchedulingJob: not sending the ${what} for event ${event.uid} to ${to}: no key for their meeting link.`);
+                    continue;
+                }
+                // The key must never be stored here, so it doesn't go to a mailbox of this server whose copy would be filed readable.
+                if (stored?.keyed && this.host?.mayCarryMeetingKey && !(await this.host.mayCarryMeetingKey(attendee))) {
+                    this.logger?.warn(
+                        `MeetingSchedulingJob: not sending the ${what} for event ${event.uid} to ${to}: their copy would be stored here readable, with their meeting link's key.`,
+                    );
                     continue;
                 }
                 const link: { url: string; label?: string } | undefined = stored && { ...stored, url: stored.keyed ? `${stored.url}#${secrets![attendee]}` : stored.url };

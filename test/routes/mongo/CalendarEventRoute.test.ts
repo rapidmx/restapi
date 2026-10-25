@@ -27,6 +27,7 @@ import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles, RecordingMailTransport, type InMemoryBlobStore } from "../../testDoubles.js";
 import { openSealedField, testZeroAccessKey } from "../../zeroAccessTestKeys.js";
 import { simpleParser } from "mailparser";
+import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { CalendarEventAttendeeLinkMongo } from "../../../src/models/mongo/CalendarEventAttendeeLinkMongo.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
@@ -982,6 +983,13 @@ describe("Route:CalendarEventMongo Tests", () => {
             ),
         findMessage: async (uid) => (await messageRepo.findOne({ uid } as any))!,
         findEvents: async (mailboxUid) => (await calendarEventRepo.find({ mailboxUid } as any).toArray()).filter((row: any) => !row.deleted),
+        addZeroAccessKey: async (mailboxUid) => {
+            const za = await testZeroAccessKey();
+            const mailbox: any = await mailboxRepo.findOne({ uid: mailboxUid } as any);
+            mailbox.zeroAccessKeys = [za.key];
+            await mailboxRepo.save(mailbox);
+            return za;
+        },
         deleteEventOrganizer: async (uid) => {
             await calendarEventRepo.updateOne({ uid } as any, { $unset: { organizer: "" } } as any);
         },
@@ -1055,8 +1063,9 @@ describe("Route:CalendarEventMongo Tests", () => {
                 .put(`${baseUrl}/${created.uid}`)
                 .set("Authorization", "jwt " + ownerToken)
                 .send({
+                    // The response carries the version the save's invitation claim wrote.
                     uid: created.uid,
-                    version: created.version + 1,
+                    version: created.version,
                     startDate: "2026-11-02T12:00:00.000Z",
                     endDate: "2026-11-02T13:00:00.000Z",
                     invitationContent: { title: "CANARY board meeting", location: "CANARY room 4" },
@@ -1065,6 +1074,7 @@ describe("Route:CalendarEventMongo Tests", () => {
             expect(transport().sent).toHaveLength(1);
             expect(transport().sent[0].raw.toString()).toContain("CANARY room 4");
             const row = await stored(created.uid);
+            expect(moved.body.version).toBe(row.version);
             expect(row.sealedFields.location).toEqual(expect.any(String));
             expect(JSON.stringify(row)).not.toContain("CANARY");
 
@@ -1126,6 +1136,72 @@ describe("Route:CalendarEventMongo Tests", () => {
             expect(row.inviteSequenceSent).toBe(row.sequence);
             expect(JSON.stringify(row)).not.toContain(KEY);
             expect(JSON.stringify(await links().find({}).toArray())).not.toContain(KEY);
+        });
+
+        it("Answers a save that sends invitations with the version the claim wrote, so the next save isn't refused as stale", async () => {
+            const { mailbox, folder } = await protect({ calendar: true });
+            const created = await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send(meeting(mailbox, folder));
+            expect(created.status).toBe(200);
+            expect(created.body.version).toBe((await stored(created.body.uid)).version);
+            const video = await request(server.getApplication())
+                .put(`${baseUrl}/${created.body.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: created.body.uid, version: created.body.version, videoMeetingUid: "vm-2" });
+            expect(video.status, JSON.stringify(video.body)).toBe(200);
+        });
+
+        it("Defers a create's invitations when it says so, sending the one invitation with the save that follows", async () => {
+            const { mailbox, folder } = await protect({ calendar: true });
+            transport().sent = [];
+            const createdRes = await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send(meeting(mailbox, folder, { invitationContent: { defer: true } }));
+            expect(createdRes.status, JSON.stringify(createdRes.body)).toBe(200);
+            const created = createdRes.body;
+            expect(transport().sent).toHaveLength(0);
+            expect((await stored(created.uid)).inviteSequenceSent ?? null).toBeNull();
+            const saved = await request(server.getApplication())
+                .put(`${baseUrl}/${created.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: created.uid, version: created.version, location: "CANARY video", invitationContent: { title: "CANARY board meeting", location: "CANARY video" } });
+            expect(saved.status, JSON.stringify(saved.body)).toBe(200);
+            expect(transport().sent).toHaveLength(1);
+            expect(transport().sent[0].raw.toString()).toContain("CANARY video");
+        });
+
+        it("Claims and never sends the invitations of a protected event its organizer sends encrypted", async () => {
+            const { mailbox, folder } = await protect({ calendar: true });
+            transport().sent = [];
+            const created = (await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send(meeting(mailbox, folder, { encryptionOrigin: "originated" }))).body;
+            expect(transport().sent).toHaveLength(0);
+            const row = await stored(created.uid);
+            expect(row.inviteSequenceSent).toBe(row.sequence);
+        });
+
+        it("Sends a keyed meeting's link key to no mailbox here whose copy would be stored readable", async () => {
+            const { mailbox, folder } = await protect({ calendar: false });
+            const domain = `za-${uuid.v4().slice(0, 8)}.test`;
+            const domains = (): any => (objectFactory.getInstance(ConnectionManager)!.connections.get("mongo") as any).getMongoRepository("DomainMongo");
+            await domains().save(new DomainMongo({ uid: domain, name: domain, enabled: true, verified: true, verificationToken: uuid.v4() }));
+            const plain: any = await createMailbox(otherUser.uid);
+            plain.primarySmtpAddress = `alice@${domain}`;
+            await mailboxRepo.save(plain);
+            const sealedMailbox: any = await createMailbox(otherUser.uid);
+            sealedMailbox.primarySmtpAddress = `bea@${domain}`;
+            sealedMailbox.zeroAccessKeys = [(await testZeroAccessKey()).key];
+            await mailboxRepo.save(sealedMailbox);
+            const guests = [`alice@${domain}`, `bea@${domain}`, `carl@${domain}`, "bob@example.org"];
+            const attendees = guests.map((address) => ({ address, role: "required", responseStatus: "needsAction" }));
+            const created = (await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send(meeting(mailbox, folder, { attendees }))).body;
+            const KEY = "k=" + "Qw3_-".repeat(9);
+            for (const address of guests) {
+                await links().save(new CalendarEventAttendeeLinkMongo({ mailboxUid: mailbox.uid, calendarEventUid: created.uid, attendeeAddress: address, url: "https://meet.example/j/x", keyed: true }));
+            }
+            transport().sent = [];
+            const sent = await request(server.getApplication())
+                .put(`${baseUrl}/${created.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: created.uid, version: created.version, videoMeetingUid: "vm-3", invitationContent: { meetingLinkSecrets: Object.fromEntries(guests.map((address) => [address, KEY])) } });
+            expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+            expect(transport().sent.map((mail: any) => mail.envelopeTo[0]).sort()).toEqual([`bea@${domain}`, "bob@example.org"]);
         });
 
         it("Stores an event readable while the calendar isn't protected, leaving its invitations to the scheduling job", async () => {

@@ -55,15 +55,16 @@ export class ZeroAccessResolver {
         return zeroAccessMembers(await this.aclUtils?.findACL(mailbox.uid), mailbox, this.trustedRoles);
     }
 
-    /** `zeroAccessStatus()` for `type` (mail unless given) of `mailbox`. */
-    public async status(mailbox: ZeroAccessMailbox, type: ZeroAccessDataType = "mail"): Promise<ZeroAccessStatus> {
-        return zeroAccessStatus(mailbox, { allowZeroAccess: await this.allowed() }, type);
+    /** `zeroAccessStatus()` for `type` (mail unless given) of `mailbox`. `allowed`: `allowed()` already read, by a caller deciding many
+     * mailboxes at once. */
+    public async status(mailbox: ZeroAccessMailbox, type: ZeroAccessDataType = "mail", allowed?: boolean): Promise<ZeroAccessStatus> {
+        return zeroAccessStatus(mailbox, { allowZeroAccess: allowed ?? (await this.allowed()) }, type);
     }
 
     /** What new `type` content (mail unless given) of `mailbox` must be encrypted to - its active zero-access key - or `undefined`
-     * when zero-access isn't active for it, in which case it is stored as it arrives. */
-    public async target(mailbox: ZeroAccessMailbox, type: ZeroAccessDataType = "mail"): Promise<ZeroAccessTarget | undefined> {
-        if ((await this.status(mailbox, type)) !== "active") {
+     * when zero-access isn't active for it, in which case it is stored as it arrives. `allowed`: as for `status()`. */
+    public async target(mailbox: ZeroAccessMailbox, type: ZeroAccessDataType = "mail", allowed?: boolean): Promise<ZeroAccessTarget | undefined> {
+        if ((await this.status(mailbox, type, allowed)) !== "active") {
             return undefined;
         }
         return toTarget(activeZeroAccessKey(mailbox)!);

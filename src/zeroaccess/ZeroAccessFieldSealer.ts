@@ -38,12 +38,24 @@ function sameValue(a: unknown, b: unknown): boolean {
     return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 }
 
+/** How `sealFieldsOnWrite()` reads a write. */
+export interface SealFieldsOptions {
+    /**
+     * The writer opened the record and sends only the fields it changes (the REST routes, for web-client and tauri-client): an empty value
+     * (`null`, `[]`) of a field whose placeholder is empty is a clear, applied, not a placeholder sent back. A device adapter (ActiveSync,
+     * MAPI) leaves this off - a device sends back the empty placeholders it was shown - and must omit a sealed field it doesn't change
+     * for a clear of it to be told apart. A non-empty placeholder ("Protected task", a contact's first address) sent back is ignored either way.
+     */
+    emptyClears?: boolean;
+}
+
 /**
  * Applies the protected `fields` of `patch` - a create or update body of a record whose type is protected when `target` is set - to what
  * will be stored, in place:
  *
  * - A field `patch` doesn't carry is left as it is (sealed or not).
  * - A field carrying the record's current placeholder while it is sealed is dropped from the patch: a device sent back what it was shown.
+ * With `options.emptyClears`, only a non-empty placeholder is: an empty value of a field with an empty placeholder clears it.
  * - With `target`: a field with a value is sealed into `sealedFields` and its column set to the placeholder; an empty one is stored
  * empty and its sealed copy removed.
  * - Without `target` (the type isn't protected, or no longer is): the value is stored readable and any sealed copy of the field
@@ -56,6 +68,7 @@ export async function sealFieldsOnWrite<R extends { sealedFields?: SealedFields 
     existing: R | undefined,
     fields: readonly ProtectedField<R>[],
     target: ZeroAccessTarget | undefined,
+    options: SealFieldsOptions = {},
 ): Promise<void> {
     const sealed: SealedFields = { ...(existing?.sealedFields ?? {}) };
     const merged = { ...(existing ?? {}), ...patch } as unknown as R;
@@ -64,7 +77,8 @@ export async function sealFieldsOnWrite<R extends { sealedFields?: SealedFields 
             continue;
         }
         const value: unknown = patch[field.name];
-        if (sealed[field.name] !== undefined && existing && sameValue(value, field.placeholder(existing))) {
+        const placeholder: unknown = existing ? field.placeholder(existing) : undefined;
+        if (sealed[field.name] !== undefined && existing && sameValue(value, placeholder) && !(options.emptyClears && isEmpty(placeholder))) {
             delete patch[field.name];
             continue;
         }

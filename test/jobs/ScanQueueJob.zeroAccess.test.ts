@@ -32,6 +32,26 @@ describe("ScanQueueJob (zero-access, isolated)", () => {
         expect(update).not.toHaveBeenCalled();
     });
 
+    it("processInline() refuses an entry another request is still processing, and takes over one whose lease lapsed", async () => {
+        const live = { ...ZA_ENTRY, status: IngestStatus.SCANNING, scanLeaseExpiresAt: new Date(Date.now() + 60_000) };
+        const update = vi.fn().mockRejectedValue(new Error("version"));
+        const findOne = vi.fn().mockResolvedValueOnce(live).mockResolvedValueOnce({ ...live, scanLeaseExpiresAt: new Date(Date.now() - 1000) });
+        const job = makeJob({ ingestQueueRepo: { findOne, update } });
+        await expect(job.processInline("e1", Buffer.from("x"))).rejects.toThrow("being processed by another request");
+        expect(update).not.toHaveBeenCalled();
+        await expect(job.processInline("e1", Buffer.from("x"))).rejects.toThrow("version");
+        expect(update).toHaveBeenCalled();
+    });
+
+    it("processInline() hands an entry deferred for a pending erasure back without counting a failed attempt, and throws for the MTA", async () => {
+        const job = makeJob({ ingestQueueRepo: { findOne: vi.fn().mockResolvedValue({ ...ZA_ENTRY, attempts: 0 }), update: vi.fn().mockResolvedValue(undefined) } });
+        job.erasureDisposition = vi.fn().mockResolvedValue("defer");
+        const recordFailure = vi.spyOn(job, "recordFailure");
+        await expect(job.processInline("e1", Buffer.from("x"))).rejects.toThrow("an erasure of mailbox mbx is pending");
+        expect(recordFailure).not.toHaveBeenCalled();
+        expect(job.ingestQueueRepo.update.mock.calls[1][0]).toMatchObject({ status: IngestStatus.FAILED, attempts: 0 });
+    });
+
     it("refuses to process a zero-access entry without its raw message in memory - there is no spool to read", async () => {
         const job = makeJob({ blobStore: { get: vi.fn() } });
         await expect(job.processEntry({ row: ZA_ENTRY, leaseGrantedAt: Date.now() })).rejects.toThrow("only processed inside its ingest request");

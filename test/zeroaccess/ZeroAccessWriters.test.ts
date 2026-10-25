@@ -14,7 +14,7 @@ import { Logger } from "@rapidrest/core";
 import { MailboxImportJobMongo } from "../../src/jobs/mongo/MailboxImportJobMongo.js";
 import { ScheduledSendJobMongo } from "../../src/jobs/mongo/ScheduledSendJobMongo.js";
 import { MessageRouteMongo } from "../../src/routes/mongo/MessageRouteMongo.js";
-import { newZeroAccessWriter, ZeroAccessWriter } from "../../src/zeroaccess/ZeroAccessWriter.js";
+import { newZeroAccessWriter, ZeroAccessParseError, ZeroAccessWriter } from "../../src/zeroaccess/ZeroAccessWriter.js";
 
 x509.cryptoProvider.set(webcrypto as unknown as Crypto);
 
@@ -77,6 +77,13 @@ describe("ZeroAccessWriter", () => {
         expect(created).toHaveLength(1);
         await w.removeIndexEntry(sealed!.indexEntryUid);
         expect(index.delete).toHaveBeenCalledWith(sealed!.indexEntryUid, expect.objectContaining({ purge: true }));
+    });
+
+    it("tells a message it can't parse from a failure that passes", async () => {
+        const mailbox = { uid: "mbx", ownerUserUid: "u", zeroAccessKeys: [await zeroAccessKey()] };
+        const deep = "<div>".repeat(3000) + "x" + "</div>".repeat(3000);
+        await expect(writer({ blobStore: {} }, { index: {} }).sealRaw(mailbox, Buffer.from("Content-Type: text/html\r\n\r\n" + deep), "m1", new Date())).rejects.toBeInstanceOf(ZeroAccessParseError);
+        expect(await writer().allowed()).toBe(true);
     });
 
     it("seals nothing through seal() either for a mailbox without zero-access", async () => {

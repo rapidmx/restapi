@@ -166,6 +166,19 @@ describe("TransportRuleUtils Tests", () => {
             expect(evaluateTransportRules(rules, makeContext()).addRecipients).toEqual([]);
         });
 
+        it("Skips a stored rule it can't evaluate, reporting it, and still applies the others.", () => {
+            const unreadable = vi.fn();
+            const rules = [
+                makeRule({ uid: "bad-conditions", conditions: { fromContains: "x" } as any, actions: [{ type: TransportRuleActionType.REJECT }] }),
+                makeRule({ uid: "bad-actions", sequence: 1, actions: null as any }),
+                makeRule({ uid: "good", sequence: 2, actions: [{ type: TransportRuleActionType.QUARANTINE }] }),
+            ];
+            const result = evaluateTransportRules(rules, makeContext(), unreadable);
+            expect(result).toMatchObject({ reject: false, quarantine: true });
+            expect(unreadable.mock.calls.map(([rule]) => rule.uid)).toEqual(["bad-conditions", "bad-actions"]);
+            expect(evaluateTransportRules(rules, makeContext()).quarantine).toBe(true);
+        });
+
         it("Returns an all-false/empty result when no rules are given.", () => {
             const result = evaluateTransportRules([], makeContext());
             expect(result).toEqual({ reject: false, quarantine: false, addHeaders: [], addRecipients: [] });
@@ -241,6 +254,15 @@ describe("TransportRuleUtils Tests", () => {
 
             expect(context.bodyPreview).toContain("Hello");
             expect(context.bodyPreview).toContain("world");
+        });
+
+        it("Reads a body nested far deeper than a parser recurses, rather than failing on it.", async () => {
+            const html = "<div>".repeat(3000) + "deep text" + "</div>".repeat(3000);
+            const raw = Buffer.from(["From: sender@example.com", "Subject: Deep", "Content-Type: text/html", "", html, ""].join("\r\n"));
+            const context = await buildTransportRuleContext(raw, "sender@example.com", ["a@example.com"], []);
+
+            expect(context.subject).toBe("Deep");
+            expect(typeof context.bodyText).toBe("string");
         });
 
         it("anyRecipientExternal is false when mail:domains is unconfigured (empty).", async () => {

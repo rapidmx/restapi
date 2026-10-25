@@ -25,6 +25,9 @@ export abstract class BaseTaskRoute<T extends Task> extends BaseScopedChildRoute
 
     protected sealing?: ZeroAccessRouteSealing;
 
+    /** `ZeroAccessBackfillJob`'s own mark, never a client's. */
+    protected readonly serverManagedFields: readonly string[] = ["zeroAccessBackfillError"];
+
     @Init
     protected async initTaskSealing(): Promise<void> {
         if (!this._objectFactory) {

@@ -5,7 +5,7 @@
 import { ObjectDecorators } from "@rapidrest/core";
 import { ACLUtils, type ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { Mailbox, ZeroAccessDataType } from "../models/types.js";
-import { PROTECTED_TEXT, type ProtectedField, sealFieldsOnWrite } from "./ZeroAccessFieldSealer.js";
+import { PROTECTED_TEXT, type ProtectedField, type SealFieldsOptions, sealFieldsOnWrite } from "./ZeroAccessFieldSealer.js";
 import { type ZeroAccessMailbox, ZeroAccessResolver, type ZeroAccessTarget } from "./ZeroAccessResolver.js";
 const { Config, Inject } = ObjectDecorators;
 
@@ -81,24 +81,26 @@ export class ZeroAccessRecordSealer {
     /**
      * Applies a create (`existing` undefined) or update `patch` of a `type` record of `mailbox` in place, sealing its protected fields when
      * `type` is protected for the mailbox and storing them readable otherwise - see `sealFieldsOnWrite()`. A type without protected fields
-     * leaves the patch alone.
+     * leaves the patch alone. `options`: how the writer sends a clear (`SealFieldsOptions`); a device adapter leaves it out.
      */
     public async sealWrite(
         type: ZeroAccessDataType,
         mailbox: (Pick<Mailbox, "uid"> & ZeroAccessMailbox) | undefined,
         patch: Record<string, any>,
         existing?: Record<string, any>,
+        options?: SealFieldsOptions,
     ): Promise<void> {
         const fields: readonly ProtectedField[] | undefined = PROTECTED_FIELDS[type];
         if (!fields) {
             return;
         }
-        await sealFieldsOnWrite(patch, existing, fields, mailbox ? await this.target(type, mailbox) : undefined);
+        await sealFieldsOnWrite(patch, existing, fields, mailbox ? await this.target(type, mailbox) : undefined, options);
     }
 
-    /** What `type` content of `mailbox` is sealed to now - its active zero-access key - or `undefined` when that type isn't protected. */
-    public target(type: ZeroAccessDataType, mailbox: Pick<Mailbox, "uid"> & ZeroAccessMailbox): Promise<ZeroAccessTarget | undefined> {
-        return new ZeroAccessResolver(this.policyRepo, this.aclUtils, this.allowedDefault, this.trustedRoles).target(mailbox, type);
+    /** What `type` content of `mailbox` is sealed to now - its active zero-access key - or `undefined` when that type isn't protected.
+     * `allowed`: the administrator's setting already read, for a caller deciding many mailboxes. */
+    public target(type: ZeroAccessDataType, mailbox: Pick<Mailbox, "uid"> & ZeroAccessMailbox, allowed?: boolean): Promise<ZeroAccessTarget | undefined> {
+        return new ZeroAccessResolver(this.policyRepo, this.aclUtils, this.allowedDefault, this.trustedRoles).target(mailbox, type, allowed);
     }
 }
 

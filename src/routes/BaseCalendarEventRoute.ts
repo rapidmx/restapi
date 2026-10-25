@@ -35,7 +35,8 @@ import {
     type InviteResponse,
     type MessageInvite,
 } from "../util/MeetingInviteUtils.js";
-import { normalizeAddress } from "../util/AddressUtils.js";
+import { addressDomainOf, normalizeAddress, stripPlusTag } from "../util/AddressUtils.js";
+import { DomainUtils } from "../util/DomainUtils.js";
 import {
     MAX_EVENT_ATTENDEES,
     MAX_REQUESTED_GUESTS,
@@ -143,8 +144,14 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     /** Bookkeeping only the scheduling/reminder jobs write (`MeetingSchedulingJob`, `CalendarReminderJob`) - a client
      * setting them could suppress invites, cancellation notices or reminders (or trigger them again). Dropped from a
      * non-trusted caller's create/update body by `BaseScopedChildRoute`, so a full-object round trip keeps the stored
-     * values. */
-    protected readonly serverManagedFields: readonly string[] = ["inviteSequenceSent", "cancelNoticeSentAt", "reminderSentFor", "startAlarmSentFor"];
+     * values. `zeroAccessBackfillError` is `ZeroAccessBackfillJob`'s. */
+    protected readonly serverManagedFields: readonly string[] = [
+        "inviteSequenceSent",
+        "cancelNoticeSentAt",
+        "reminderSentFor",
+        "startAlarmSentFor",
+        "zeroAccessBackfillError",
+    ];
 
     /** The concrete `Folder` entity class, supplied by the Mongo/SQL concrete subclass - used only by
      * `resolveMailboxUidFor()` below. */
@@ -169,6 +176,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     /** The backend's `CalendarEventAttendeeLink` model: invitations sent at save time carry each attendee's own video link too. */
     protected attendeeLinkClass?: any;
     protected attendeeLinkRepo?: RepoUtils<any>;
+    /** The backend's `Domain` model: which addresses are this server's, for what an invitation may carry (`mayCarryMeetingKey()`). */
+    protected domainClass?: any;
+    protected domainUtils?: DomainUtils;
     protected correspondentRepo?: RepoUtils<any>;
     protected correspondentUtils?: CorrespondentUtils;
 
@@ -188,6 +198,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     protected async prepareUpdate(obj: any, existing: T, user: JWTUser | undefined): Promise<void> {
         await super.prepareUpdate(obj, existing, user);
         BaseCalendarEventRoute.assertParticipants(obj, existing);
+        // Before `keepSealed()` would seal again to the key of the mailbox the event is leaving.
+        ZeroAccessRouteSealing.refuseSealedMove(obj, existing);
         await this.keepSealed(obj, existing);
         if (typeof obj.icalUid === "string") {
             obj.icalUid = boundIndexedValue(obj.icalUid);
@@ -383,6 +395,10 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                 args: [this.correspondentClass],
             });
         }
+        if (!this.domainUtils && this.domainClass) {
+            const domainRepo: RepoUtils<any> = await this._objectFactory.newInstance(RepoUtils, { name: this.domainClass.name, args: [this.domainClass] });
+            this.domainUtils = await this._objectFactory.newInstance(DomainUtils, { name: this.domainClass.name, args: [domainRepo] });
+        }
         if (!this.sealing && this.encryptionPolicyClass) {
             this.sealing = await ZeroAccessRouteSealing.create(this._objectFactory, "calendar", this.mailboxClass, this.encryptionPolicyClass);
         }
@@ -414,9 +430,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         const events: T[] = Array.isArray(created) ? created : [created];
         for (let i = 0; i < events.length; i++) {
             await this.recordEventCorrespondents(events[i]);
-            await this.sendProtectedInvitations(events[i], contents[i], secrets[i]);
+            events[i] = await this.sendProtectedInvitations(events[i], contents[i], secrets[i]);
         }
-        return created;
+        return Array.isArray(created) ? events : events[0];
     }
 
     /** `event` named by the request's `invitationContent` when its own content is sealed - what a reply or a change request about it says;
@@ -430,27 +446,63 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * The title, location and description an invitation for `obj` (a create or update body) is composed with: its `invitationContent`
      * when the client sends one - all of them, also those it doesn't change (a client editing a protected event sends only the fields it
      * changes, so that a change is recognized; the stored ones are sealed and the server can't compare them) - else, on a create, the
-     * body's own fields. `undefined` when there is no title to compose with.
+     * body's own fields. `undefined` when there is no title to compose with, and on a create whose `invitationContent` is
+     * `{ defer: true }`: the client defers the invitations to the save that follows (the event editor attaches a video meeting first), so
+     * attendees get one invitation, the one with the link.
      */
     private static takeInvitationContent(obj: any, create: boolean): InvitationContent | undefined {
+        if (create && obj?.invitationContent?.defer === true) {
+            return undefined;
+        }
         const given: any = obj?.invitationContent && typeof obj.invitationContent === "object" ? obj.invitationContent : create ? obj : undefined;
         const text = (value: unknown): string | undefined => (typeof value === "string" && value.length > 0 ? value : undefined);
         const title: string | undefined = text(given?.title);
         return title ? { title, location: text(given.location), description: text(given.description), descriptionHtml: text(given.descriptionHtml) } : undefined;
     }
 
-    /** Sends the invitations of a protected event - sealed, or a meeting with a per-meeting key - at save time, from the request's
-     * plaintext `content` and the guests' link keys - see `MeetingInviteSender.sendProtectedInvitations()`. */
-    private async sendProtectedInvitations(event: T, content: InvitationContent | undefined, secrets?: MeetingLinkSecrets): Promise<void> {
+    /**
+     * Sends the invitations of a protected event - sealed, or a meeting with a per-meeting key - at save time, from the request's
+     * plaintext `content` and the guests' link keys - see `MeetingInviteSender.sendProtectedInvitations()`. Returns the event as stored
+     * afterwards: claiming the revision writes a new `version`, which the response and a notification then carry, so the client's next
+     * save isn't refused as stale.
+     */
+    private async sendProtectedInvitations(event: T, content: InvitationContent | undefined, secrets?: MeetingLinkSecrets): Promise<T> {
         if (!invitationsPending(event) || !(hasSealedFields(event) || event.videoMeetingUid)) {
-            return;
+            return event;
         }
         // Built on first use: most events are never protected.
         this.inviteSender ??= await this._objectFactory!.newInstance(MeetingInviteSender, {
             name: "MeetingInviteSender",
-            args: [this.mailboxRepo, this.attendeeLinkRepo],
+            args: [this.mailboxRepo, this.attendeeLinkRepo, { mayCarryMeetingKey: (address: string) => this.mayCarryMeetingKey(address) }],
         });
-        await this.inviteSender.sendProtectedInvitations(event, content, this.repoUtils!, "BaseCalendarEventRoute", secrets);
+        const claimed = (await this.inviteSender.sendProtectedInvitations(event, content, this.repoUtils!, "BaseCalendarEventRoute", secrets)) as T | undefined;
+        if (!claimed) {
+            return event;
+        }
+        this.notify(claimed.folderUid, "update", claimed);
+        return claimed;
+    }
+
+    /**
+     * Whether an invitation to `address` may carry its link's per-meeting key (meet-plugin `specs/meeting_privacy.md` §4.1, which the
+     * server must never store): yes for an address elsewhere, whose copy leaves this server; for one of this server's mailboxes only when
+     * its mail is stored zero-access encrypted, since its copy - the message and the event filed from it - is stored here. An address
+     * of this server's domains that isn't a mailbox (a list, an unknown one) can't be told, so it is a no.
+     */
+    private async mayCarryMeetingKey(address: string): Promise<boolean> {
+        const domains: string[] = this.domainUtils ? (await this.domainUtils.getVerifiedDomainNames()).map((name) => name.toLowerCase()) : [];
+        for (const candidate of new Set([address, stripPlusTag(address)])) {
+            const rewritten: string | undefined = await this.domainUtils?.resolveDomainAlias(candidate);
+            for (const exact of rewritten ? [candidate, rewritten] : [candidate]) {
+                const mailbox: Mailbox | undefined =
+                    (await this.mailboxRepo!.find({ primarySmtpAddress: ModelUtils.literal(exact) } as any, { ignoreACL: true, limit: 1 }))[0] ??
+                    (await this.mailboxRepo!.find({ aliasAddresses: this.aliasQueryValue(exact) } as any, { ignoreACL: true, limit: 1 }))[0];
+                if (mailbox) {
+                    return !!(await this.sealing?.sealsMail(mailbox));
+                }
+            }
+        }
+        return !domains.includes(addressDomainOf(address) ?? "");
     }
 
     /** Records an event's organizer and attendees as correspondents of the mailbox it is on, for recipient suggestions.
@@ -471,8 +523,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (existing && this.isSchedulingRelevantChange(existing, obj)) {
             (obj as any).sequence = existing.sequence + 1;
         }
-        const updated: T = await super.update(id, obj, req, user);
-        await this.sendProtectedInvitations(updated, content, secrets);
+        const updated: T = await this.sendProtectedInvitations(await super.update(id, obj, req, user), content, secrets);
         // Only an update that names the people involved is a new sighting of them (a move or a rename is not).
         if ((obj as any).attendees !== undefined || (obj as any).organizer !== undefined) {
             await this.recordEventCorrespondents(updated);
@@ -1257,6 +1308,28 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         } as unknown as CalendarEvent;
     }
 
+    /**
+     * Seals the content of `obj` - a row filed from the invitation (`existing` undefined) or a patch of `existing` - which is in this request
+     * in plaintext (decrypted by the reader for a zero-access message), so it is never stored readable where it must not be: a row made from
+     * a zero-access invitation keeps its one sealed blob (`keepSealed()`); otherwise it is sealed field by field when the calendar is
+     * protected; and the invitation of a zero-access message is sealed to that message's key whatever the calendar's setting, as inbound
+     * delivery files it (`ScanQueueJob`, `specs/search.md` §3: no plaintext of a zero-access mailbox's mail at rest).
+     */
+    private async sealInvite(obj: any, existing: CalendarEvent | undefined, context: InviteContext): Promise<void> {
+        if ((existing as any)?.sealedContent) {
+            await this.keepSealed(obj, existing as T);
+            return;
+        }
+        await this.sealing?.seal(obj, existing);
+        const zeroAccess: { keyFingerprint: string } | undefined = context.message.zeroAccess ?? undefined;
+        if (zeroAccess && !hasSealedFields(obj) && !hasSealedFields(existing)) {
+            await this.keepSealed(obj, { mailboxUid: context.mailbox.uid, sealedContent: { keyFingerprint: zeroAccess.keyFingerprint } } as any);
+            if (!existing) {
+                obj.encryptionOrigin = "derived";
+            }
+        }
+    }
+
     /** Puts the invitation on the mailbox's calendar with `responder` as the reader's answer, or updates the answer on the copy that is there. */
     private async putInviteOnCalendar(context: InviteContext, responder: Attendee, user: JWTUser | undefined): Promise<void> {
         const { parsed, mailbox, addresses } = context;
@@ -1295,11 +1368,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                           }
                         : {}),
                 };
-                // The invitation's content is in this request (decrypted by the reader for a zero-access message): sealed when the calendar
-                // is protected, never stored readable then.
-                if (!(existing as any).sealedContent) {
-                    await this.sealing?.seal(patch, existing);
-                }
+                await this.sealInvite(patch, existing, context);
                 try {
                     await this.repoUtils!.update(patch, existing as any, { user, ignoreACL: true });
                     return;
@@ -1340,7 +1409,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                 // Somebody else's invitation: marked as already sent, so the scheduling job never mails it again as though this mailbox organized it.
                 inviteSequenceSent: parsed.sequence,
             };
-            await this.sealing?.seal(filed, undefined);
+            await this.sealInvite(filed, undefined, context);
             try {
                 await this.repoUtils!.create(new Entity(filed), { user, ignoreACL: true });
                 return;

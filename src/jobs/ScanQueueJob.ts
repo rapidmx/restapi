@@ -46,7 +46,8 @@ import { nameBasedUuid } from "../util/UuidUtils.js";
 import { sendOrThrow } from "../transport/TransportResultUtils.js";
 import { ExtractorRegistry } from "../search/extraction/ExtractorRegistry.js";
 import { ZeroAccessFiling } from "../zeroaccess/ZeroAccessFiling.js";
-import { buildIndexDocument } from "../zeroaccess/ZeroAccessIndexing.js";
+import { buildIndexDocument, type ExtractedIndexText, extractIndexText } from "../zeroaccess/ZeroAccessIndexing.js";
+import type { InlineDeliveryCache } from "../util/InlineDeliveryCache.js";
 import { zeroAccessTargetFor, type ZeroAccessTarget } from "../zeroaccess/ZeroAccessResolver.js";
 import { PROTECTED_SUBJECT } from "../zeroaccess/ZeroAccessSealer.js";
 import {
@@ -85,7 +86,7 @@ import {
     ScanResult,
     ScanTargetType,
 } from "../models/types.js";
-import { sealFieldsOnWrite } from "../zeroaccess/ZeroAccessFieldSealer.js";
+import { hasSealedFields, sealFieldsOnWrite } from "../zeroaccess/ZeroAccessFieldSealer.js";
 import { EVENT_PROTECTED_FIELDS, newZeroAccessRecordSealer, type ZeroAccessRecordSealer } from "../zeroaccess/ZeroAccessRecordSealer.js";
 
 /** `true` if two `CalendarEvent.recurrenceId` values name the same occurrence (or both are the master row's
@@ -174,6 +175,10 @@ interface StoredAttachment {
     contentId?: string;
     isInline: boolean;
 }
+
+/** `ScanQueueJob.processInline()`'s entry was deferred for a pending erasure of its mailbox: a temporary failure for the MTA, not a failed
+ * attempt. */
+class ErasureDeferral extends Error {}
 
 /**
  * Drains `IngestQueueEntry` rows staged by `BaseMailIngestRoute`: runs the `ScanPipeline` against each one's
@@ -546,17 +551,23 @@ export abstract class ScanQueueJob<
     /**
      * Processes one zero-access entry (`IngestQueueEntry.zeroAccessKeyFingerprint`) inside its ingest request, from `raw` in memory -
      * the only way such an entry is ever processed, since no plaintext spool of it exists (`specs/search.md` §3). Claims it like `run()`
-     * does (a concurrent attempt at the same entry - an overlapping MTA retry - loses the version check and throws), and records a
-     * failure on it before rethrowing, so `BaseMailIngestRoute` answers the MTA with a temporary failure and its retry processes the
-     * same entry again; the filing is idempotent across attempts, as for any entry. An entry already delivered is left alone.
+     * does, and records a failure on it before rethrowing, so `BaseMailIngestRoute` answers the MTA with a temporary failure and its
+     * retry processes the same entry again; the filing is idempotent across attempts, as for any entry. An entry already delivered is
+     * left alone. An entry another request is still processing (an overlapping MTA retry: `SCANNING` under a lease that hasn't lapsed) is
+     * refused with a temporary failure rather than processed twice at once; one whose lease lapsed (its request died) is taken over. An
+     * entry deferred for a pending erasure (`stopForErasure()`) throws too: the MTA keeps the message and retries, since nothing else ever
+     * processes the entry again.
      */
-    public async processInline(entryUid: string, raw: Buffer): Promise<void> {
+    public async processInline(entryUid: string, raw: Buffer, cache?: InlineDeliveryCache): Promise<void> {
         const entry: Q | undefined = await this.ingestQueueRepo!.findOne(entryUid, { ignoreACL: true, skipCache: true });
         if (!entry) {
             throw new Error(`Ingest entry ${entryUid} not found.`);
         }
         if (entry.status === IngestStatus.DELIVERED) {
             return;
+        }
+        if (entry.status === IngestStatus.SCANNING && entry.scanLeaseExpiresAt && new Date(entry.scanLeaseExpiresAt).getTime() > Date.now()) {
+            throw new Error(`Ingest entry ${entryUid} is being processed by another request; the MTA retries.`);
         }
         const grantedAt: number = Date.now();
         await this.ingestQueueRepo!.update(
@@ -572,9 +583,12 @@ export abstract class ScanQueueJob<
         );
         const claim: EntryClaim<Q> = { row: (await this.ingestQueueRepo!.findOne(entry.uid, { ignoreACL: true }))!, leaseGrantedAt: grantedAt };
         try {
-            await this.processEntry(claim, raw);
+            await this.processEntry(claim, raw, cache);
         } catch (err: any) {
-            await this.recordFailure(claim, err);
+            // A deferral has already handed the entry back (`deferEntry()`): it isn't a failed attempt.
+            if (!(err instanceof ErasureDeferral)) {
+                await this.recordFailure(claim, err);
+            }
             throw err;
         }
     }
@@ -608,9 +622,15 @@ export abstract class ScanQueueJob<
         entry: Q,
         result: ScanPipelineResult,
         recipients: Recipient[],
+        cache?: InlineDeliveryCache,
     ): Promise<SealedFields> {
         const bodyBlobKey: string = await filing.storeMessage(raw, targetUid);
         const state: MessageZeroAccess = await filing.messageState({ subject: result.subject ?? "", preview: result.bodyPreview ?? "" });
+        const extract = (mimeType: string, content: Buffer): Promise<string | undefined> =>
+            this.extractorRegistry?.extract(mimeType, content) ?? Promise.resolve(undefined);
+        const limits = { budgetMs: this.zeroAccessExtractionBudgetMs, maxAttachmentBytes: this.zeroAccessExtractionMaxBytes };
+        // Once per message for a delivery's recipients: the text depends on the message alone.
+        const extracted: ExtractedIndexText | undefined = cache ? await cache.once(raw, "extraction", () => extractIndexText(result.attachments, extract, limits)) : undefined;
         const { messageUid: _unused, ...document } = await buildIndexDocument(
             {
                 messageUid: targetUid,
@@ -622,8 +642,9 @@ export abstract class ScanQueueJob<
                 attachments: result.attachments,
                 dateForSort: new Date(),
             },
-            (mimeType, content) => this.extractorRegistry?.extract(mimeType, content) ?? Promise.resolve(undefined),
-            { budgetMs: this.zeroAccessExtractionBudgetMs, maxAttachmentBytes: this.zeroAccessExtractionMaxBytes },
+            extract,
+            limits,
+            extracted,
         );
         return { filing, bodyBlobKey, state, document };
     }
@@ -854,8 +875,9 @@ export abstract class ScanQueueJob<
     }
 
     /** Applies `erasureDisposition()` to a claimed entry: drops or defers it and returns `true`, or returns `false` when
-     * it should be delivered. */
-    private async stopForErasure(claim: EntryClaim<Q>): Promise<boolean> {
+     * it should be delivered. A deferral of an entry processed `inline` (a zero-access entry, which only its ingest request's retries
+     * process) throws `ErasureDeferral` instead, so the MTA keeps the message and retries. */
+    private async stopForErasure(claim: EntryClaim<Q>, inline: boolean): Promise<boolean> {
         const entry: Q = claim.row;
         const erasure = await this.erasureDisposition(entry);
         if (erasure === "drop") {
@@ -866,6 +888,9 @@ export abstract class ScanQueueJob<
         if (erasure === "defer") {
             this.logger?.info(`ScanQueueJob: deferring ingest entry ${entry.uid} - an erasure of mailbox ${entry.mailboxUid} is pending.`);
             await this.deferEntry(claim, "Deferred: an erasure of the mailbox is pending.");
+            if (inline) {
+                throw new ErasureDeferral(`Ingest entry ${entry.uid} is deferred: an erasure of mailbox ${entry.mailboxUid} is pending; the MTA retries.`);
+            }
             return true;
         }
         return false;
@@ -924,12 +949,12 @@ export abstract class ScanQueueJob<
      * after its purge pass already ran keeps its row and raw blob - a residual this job doesn't delete itself, since the
      * raw blob may be shared with other recipients' entries.
      */
-    private async processEntry(claim: EntryClaim<Q>, rawInMemory?: Buffer): Promise<void> {
+    private async processEntry(claim: EntryClaim<Q>, rawInMemory?: Buffer, cache?: InlineDeliveryCache): Promise<void> {
         const entry: Q = claim.row;
 
         // Checked before scanning, so an entry deferred for a pending erasure isn't re-scanned on every deferral, and again
         // after it, since a cascade can start while the (slow) scan runs.
-        if (await this.stopForErasure(claim)) {
+        if (await this.stopForErasure(claim, !!rawInMemory)) {
             return;
         }
         if (entry.zeroAccessKeyFingerprint && !rawInMemory) {
@@ -937,14 +962,12 @@ export abstract class ScanQueueJob<
         }
         const raw: Buffer = rawInMemory ?? (await this.blobStore!.get(entry.rawBlobKey));
         const zeroAccess: ZeroAccessFiling | undefined = await this.zeroAccessFilingFor(entry);
-        const result: ScanPipelineResult = await this.scanPipeline!.run(
-            raw,
-            { from: entry.envelopeFrom, to: entry.envelopeTo },
-            zeroAccess ? { includeBodyText: true } : {},
-        );
+        const scan = (): Promise<ScanPipelineResult> =>
+            this.scanPipeline!.run(raw, { from: entry.envelopeFrom, to: entry.envelopeTo }, zeroAccess ? { includeBodyText: true } : {});
+        const result: ScanPipelineResult = cache ? await cache.once(raw, `scan:${entry.envelopeFrom}\n${entry.envelopeTo.join(",")}`, scan) : await scan();
         // Scanning is the slow part - make sure this worker still owns the entry before writing anything.
         await this.renewLeaseIfDue(claim);
-        if (await this.stopForErasure(claim)) {
+        if (await this.stopForErasure(claim, !!rawInMemory)) {
             return;
         }
 
@@ -1035,7 +1058,7 @@ export abstract class ScanQueueJob<
             const charge = { bytes: 0 };
             let delivered: boolean;
             try {
-                delivered = await this.deliverMessage(claim, raw, targetUid, scanResult, result, verdict === "junk", charge, zeroAccess);
+                delivered = await this.deliverMessage(claim, raw, targetUid, scanResult, result, verdict === "junk", charge, zeroAccess, cache);
             } catch (err) {
                 // The retry of this entry charges the message again (nothing is filed yet), so an attempt that failed
                 // after its charge hands the charge back.
@@ -1085,17 +1108,19 @@ export abstract class ScanQueueJob<
             envelopeFrom: entry.envelopeFrom,
             envelopeTo: [...entry.envelopeTo],
             fromAddress: result.fromAddress,
-            // A zero-access message's subject is sealed: the stream (and every plugin reading it) gets none.
+            // A zero-access message's content is sealed: the stream (and every plugin reading it) gets none of it - no subject, and no
+            // report parsed from its body (a bounce's diagnostics, the returned original's headers), only that they were left out.
             subject: zeroAccess ? undefined : result.subject,
+            zeroAccess: zeroAccess ? true : undefined,
             messageId: result.messageIdHeader,
             inReplyTo: result.inReplyTo,
             references: result.references,
             autoSubmitted: result.autoSubmittedHeader,
             precedence: result.precedenceHeader,
-            deliveryStatusReport: result.deliveryStatusReport,
-            feedbackReport: result.feedbackReport,
+            deliveryStatusReport: zeroAccess ? undefined : result.deliveryStatusReport,
+            feedbackReport: zeroAccess ? undefined : result.feedbackReport,
             // A report is attacker-controlled input - the event says whether its sender was authenticated, so a consumer can tell.
-            reportAuthenticated: isReport ? this.verifiedFromAddress(raw, result) !== undefined : undefined,
+            reportAuthenticated: isReport && !zeroAccess ? this.verifiedFromAddress(raw, result) !== undefined : undefined,
         });
     }
 
@@ -1241,6 +1266,7 @@ export abstract class ScanQueueJob<
         isJunk: boolean,
         charge: { bytes: number },
         zeroAccess?: ZeroAccessFiling,
+        cache?: InlineDeliveryCache,
     ): Promise<boolean> {
         const entry: Q = claim.row;
         // Who this message was actually addressed to, and who sent it, as its own headers say - shared by the
@@ -1364,7 +1390,7 @@ export abstract class ScanQueueJob<
         // lists and opens them from the decrypted message, as it does for an end-to-end encrypted one.
         const storedAttachments: StoredAttachment[] = zeroAccess ? [] : await this.storeAttachmentBlobs(result.attachments, targetUid);
         const flags: MessageFlags = { read: filterResult.markRead, flagged: false, answered: false, forwarded: false };
-        const sealed: SealedFields | undefined = zeroAccess ? await this.sealForFiling(zeroAccess, raw, targetUid, entry, result, recipients) : undefined;
+        const sealed: SealedFields | undefined = zeroAccess ? await this.sealForFiling(zeroAccess, raw, targetUid, entry, result, recipients, cache) : undefined;
         const contentFields = {
             subject: sealed ? PROTECTED_SUBJECT : (result.subject ?? ""),
             bodyBlobKey: sealed ? sealed.bodyBlobKey : entry.rawBlobKey,
@@ -3195,6 +3221,8 @@ export abstract class ScanQueueJob<
             return false;
         }
 
+        // A calendar zero-access protects keeps its events' content sealed too, whether or not the mail itself is.
+        const calendarProtected: boolean = !!(mailbox && this.recordSealer && (await this.recordSealer.target("calendar", mailbox)));
         let applied = false;
         await this.updateCalendarEventWithRetry(existing.uid, (current) => {
             const listed: Attendee | undefined = current.attendees.find((attendee) => normalizeAddress(attendee.address) === sender);
@@ -3202,20 +3230,22 @@ export abstract class ScanQueueJob<
                 return undefined;
             }
             const patch: Record<string, any> = {};
-            // A zero-access organizer's event content is sealed and can't be merged here: only a time change applies.
-            if (contentSealed && (parsed.summary !== undefined || parsed.location !== undefined || parsed.description !== undefined)) {
+            // A zero-access organizer's event content is sealed and can't be merged here, nor written readable: only a time change and
+            // new guests apply.
+            const sealed: boolean = contentSealed || calendarProtected || hasSealedFields(current) || !!(current as any).sealedContent;
+            if (sealed && (parsed.summary !== undefined || parsed.location !== undefined || parsed.description !== undefined)) {
                 this.logger?.info(`ScanQueueJob: not applying a guest's title, location or description change to zero-access event ${current.uid}.`);
             }
-            const title: string | undefined = contentSealed ? undefined : parsed.summary?.trim().slice(0, 1000);
+            const title: string | undefined = sealed ? undefined : parsed.summary?.trim().slice(0, 1000);
             if (title && title !== current.title) {
                 patch.title = title;
             }
-            const location: string | undefined = contentSealed ? undefined : parsed.location?.trim().slice(0, 1000);
+            const location: string | undefined = sealed ? undefined : parsed.location?.trim().slice(0, 1000);
             if (location && location !== current.location) {
                 patch.location = location;
             }
             if (
-                !contentSealed &&
+                !sealed &&
                 (parsed.description !== undefined || parsed.descriptionHtml !== undefined) &&
                 ((parsed.description ?? null) !== (current.description ?? null) || (parsed.descriptionHtml ?? null) !== (current.descriptionHtml ?? null))
             ) {

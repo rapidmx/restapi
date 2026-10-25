@@ -786,5 +786,38 @@ describe("Route:ContactMongo Tests", () => {
             expect(row.displayName).toBe("CANARY Jane Doe");
             expect(row.sealedFields ?? null).toBeNull();
         });
+
+        it("Clears a sealed field the client empties, and leaves the sealed fields it doesn't send alone", async () => {
+            const { mailbox, folder, za } = await protect({ contacts: true });
+            const created = (await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send({ mailboxUid: mailbox.uid, folderUid: folder.uid, ...CARD })).body;
+            const cleared = await request(server.getApplication())
+                .put(`${baseUrl}/${created.uid}`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({ uid: created.uid, version: created.version, notes: null, phones: [] });
+            expect(cleared.status, JSON.stringify(cleared.body)).toBe(200);
+            const row = await stored(created.uid);
+            expect(row.sealedFields.notes).toBeUndefined();
+            expect(row.sealedFields.phones).toBeUndefined();
+            expect(await openSealedField(row.sealedFields.company, za)).toBe("CANARY Corp");
+        });
+
+        it("Refuses moving a sealed contact to another mailbox (409), and seals one moved into a protected mailbox for that mailbox", async () => {
+            const source = await protect({ contacts: true });
+            const destination = await protect({ contacts: true });
+            const put = (body: any) => request(server.getApplication()).put(`${baseUrl}/${body.uid}`).set("Authorization", "jwt " + ownerToken).send(body);
+            const sealed = (await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send({ mailboxUid: source.mailbox.uid, folderUid: source.folder.uid, ...CARD })).body;
+            const refused = await put({ uid: sealed.uid, version: sealed.version, folderUid: destination.folder.uid });
+            expect(refused.status).toBe(409);
+            expect((await stored(sealed.uid)).folderUid).toBe(source.folder.uid);
+
+            const open = await protect({ contacts: false });
+            const readable = (await request(server.getApplication()).post(baseUrl).set("Authorization", "jwt " + ownerToken).send({ mailboxUid: open.mailbox.uid, folderUid: open.folder.uid, ...CARD })).body;
+            const moved = await put({ uid: readable.uid, version: readable.version, folderUid: destination.folder.uid, notes: "CANARY moved notes" });
+            expect(moved.status, JSON.stringify(moved.body)).toBe(200);
+            const row = await stored(readable.uid);
+            expect(row.mailboxUid).toBe(destination.mailbox.uid);
+            expect(row.notes ?? null).toBeNull();
+            expect(await openSealedField(row.sealedFields.notes, destination.za)).toBe("CANARY moved notes");
+        });
     });
 });

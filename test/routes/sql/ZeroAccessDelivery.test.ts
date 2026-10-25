@@ -13,6 +13,7 @@ import { EncryptionPolicySQL } from "../../../src/models/sql/EncryptionPolicySQL
 import { FolderSQL } from "../../../src/models/sql/FolderSQL.js";
 import { IngestQueueEntrySQL } from "../../../src/models/sql/IngestQueueEntrySQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { DataSubjectErasureRequestSQL } from "../../../src/models/sql/DataSubjectErasureRequestSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
 import { QuarantineEntrySQL } from "../../../src/models/sql/QuarantineEntrySQL.js";
 import { ScanResultSQL } from "../../../src/models/sql/ScanResultSQL.js";
@@ -41,6 +42,7 @@ describe("Zero-access delivery (SQL)", () => {
         FolderSQL,
         ScanResultSQL,
         CalendarEventSQL,
+        DataSubjectErasureRequestSQL,
     ];
     const repos = new Map<any, Repository<any>>();
     let aclRepo: Repository<AccessControlListSQL>;
@@ -137,6 +139,8 @@ describe("Zero-access delivery (SQL)", () => {
         updateMessage: async (uid, fields) => {
             await repo(MessageSQL).update({ uid }, fields);
         },
+        createErasureRequest: async (mailboxUid, status) =>
+            repo(DataSubjectErasureRequestSQL).save(new DataSubjectErasureRequestSQL({ mailboxUid, requestedByUserUid: uuid.v4(), status })),
         runBackfill: async () => {
             const job = await objectFactory.newInstance<ZeroAccessBackfillJobSQL>(ZeroAccessBackfillJobSQL, { name: `za-backfill-${uuid.v4()}` });
             await job.run();

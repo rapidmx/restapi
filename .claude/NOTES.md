@@ -4580,3 +4580,66 @@ Phase 1 (restapi): the key model.
   - `MeetingSchedulingJob` skips keyed REQUESTs.
 - Fixed: the calendar route built `MeetingInviteSender` without an attendee-link repository, so save-time invitations for protected events lost each attendee's video link. Routes now set `attendeeLinkClass`.
 - Gotcha: a shared test suite must not import `test/config.js`. The SQL run then loads the Mongo defaults and its hooks time out on a Mongo connection, so pass tokens in from the backend test instead.
+
+### 2026-10-24: Review fixes (cross-repo adversarial review)
+Batch: zero-access, delivery, scheduling (review ids 13, 14, 16, 18, 19, 59, 60, 61, 62, 63, 65, 66, 68, 70, 75, 76, 77, 78, 79).
+- **Save-time invitations (13, 16, 19, 14).**
+  - `MeetingInviteSender.sendProtectedInvitations()` now returns the row its claim wrote, or `undefined`. `BaseCalendarEventRoute.create()`/`update()` return that row and notify it, so the client's next save carries the current version and no longer gets a 409.
+    - The old test PUT with `created.version + 1` was the bug showing through.
+  - An event with `encryptionOrigin: "originated"` is claimed and never mailed, as `MeetingSchedulingJob` does.
+  - A create may send `invitationContent: { defer: true }` to hold its invitations back for the save that follows. `invitationContent: null` can't be used, because body validation refuses a null property.
+    - **web-client TODO:** `EventEditor` should send `{ defer: true }` when it creates a protected event and then attaches video. Not done here.
+  - A keyed meeting's `#k=` link goes to no copy this server would store readable. The route passes `host.mayCarryMeetingKey` to the sender:
+    - an address of another server: yes;
+    - a mailbox here: only while its mail is zero-access (`ZeroAccessRouteSealing.sealsMail()`);
+    - any other address of a verified domain here (a list, an unknown one): no.
+    - The lookup checks primary and alias, the domain-alias rewrite and the plus-stripped form. The calendar routes now set `domainClass`.
+    - Such a guest is skipped with a warning, like a guest with no key. Option B (`ScanQueueJob` stripping `#k=` from unsealed rows) was not done.
+    - **meet-plugin TODO:** add a sentence to `specs/meeting_privacy.md` §4.1.
+- **Invitations answered from zero-access messages (18).** `putInviteOnCalendar` seals through `sealInvite()`:
+  - a row with `sealedContent` is resealed with `keepSealed()`;
+  - otherwise it is sealed field by field when the calendar is protected;
+  - otherwise, for a zero-access message, it is sealed into `sealedContent` with the message's key whatever the calendar setting (as `ScanQueueJob` files it), and a new row gets `encryptionOrigin: "derived"`.
+  - The invite suite's sealed messages now use a real key on the mailbox (`ctx.addZeroAccessKey`). With the fake `fp`, the create path now answers 409.
+- **Change requests (60).** `processItipChangeRequest` treats the content as sealed when any of these holds, and then applies only the time and new guests:
+  - the mail is zero-access;
+  - the organizer's calendar is protected (`recordSealer.target("calendar")`);
+  - the row has `sealedFields`;
+  - the row has `sealedContent`.
+- **Inline zero-access delivery (59, 62, 63).**
+  - An erasure deferral of an inline entry throws `ErasureDeferral`, which is not recorded as a failure. The route answers 503 and the MTA keeps the message; before, it answered 202 and the message was lost.
+  - `processInline()` refuses a `SCANNING` entry whose lease is still live (503). A request that crashed holds its entry for up to `lease_seconds`.
+  - `InlineDeliveryCache` (`src/util/`), one per `/deliver`:
+    - shares the scan between entries with the same raw message and envelope (every member of a distribution list);
+    - shares the attachment extraction across all of a message's recipients, using the new `extractIndexText()` and `buildIndexDocument(..., extracted)`;
+    - direct recipients still each get their own scan, because rspamd reads `Rcpt`.
+  - **Left:** the per-request time cap and concurrency limit, and moving inline processing ahead of the external DL relays. Also left are atomic once-markers (create-if-absent) for forward, auto-reply and charge.
+- **Transport rules (68).** No path delivers past the rules any more:
+  - a stored rule that can't be evaluated is skipped alone (`evaluateTransportRules(..., onUnreadable)`);
+  - a message whose context can't be built is quarantined (`TRANSPORT_RULE`);
+  - a failure to load the rules or domains is a 503.
+  - `buildTransportRuleContext` parses with `skipHtmlToText` and converts HTML itself under `limits: { maxDepth: 100, maxChildNodes: 10000 }`. mailparser and html-to-text both failed on about 3000 nested `<div>`s.
+  - With `skipHtmlToText`, `parsed.text` is `""` rather than undefined for an HTML-only message, so the HTML fallback now checks for an empty string.
+- **Event stream (70).** `message.delivered` for a zero-access copy sets `zeroAccess: true` and drops `deliveryStatusReport`, `feedbackReport` and `reportAuthenticated`. A plugin therefore can't process a bounce that lands in a zero-access mailbox (the CRM plugin, for example). This is stated in the spec. `messageId`, `inReplyTo` and `references` are still sent.
+- **Delivery failure notices (61).** `fileDeliveryFailureNotice` seals the notice through `sink.zeroAccessWriter.sealRaw(input.mailbox)`. Both `BaseMessageRoute` and `ScheduledSendJob` pass the writer and the mailbox.
+  - No `notices/` blob is written for a sealed notice.
+  - A create that fails removes the sealed blob and the index entry, unless a concurrent filer of the same notice won.
+- **Import retries (65).** `alreadyImported()` treats a row with `zeroAccess` as complete, because its attachments are in the sealed blob. It no longer deletes and re-imports the message, which used to leave an orphan index entry.
+- **Index weeks (66).** `ZeroAccessFiling.index()` files a `receivedAt` outside years 1000-9999 into the current week. The manifest leaves out (and logs) a stored week that isn't an ISO week, instead of throwing a RangeError.
+- **Field sealing (75, 76).**
+  - `sealFieldsOnWrite(..., { emptyClears })`: with this set, an empty value (`null`, `[]`) of a field whose placeholder is empty is a clear and is applied. A non-empty placeholder sent back is still ignored.
+    - `ZeroAccessRouteSealing.seal()` (the REST routes) passes it.
+    - The device writers (activesync, mapi) and the backfill keep the echo rule, because devices send back the empty placeholders they were shown. A device adapter must omit a sealed field it didn't change before a clear from it can count.
+    - Setting a contact's display name to its first address still counts as an echo.
+  - `ZeroAccessRouteSealing.seal()` seals for `obj.mailboxUid ?? existing.mailboxUid`, which is the destination on a move.
+  - `refuseSealedMove()` answers 409 for moving a record with `sealedFields`, `sealedContent` or `photoSealed` to another mailbox; the calendar route checks it before `keepSealed()`. The client copies such a record instead.
+    - **web-client TODO:** cross-mailbox moves of protected items.
+- **Backfill (77, 78, 79).**
+  - Messages get `zeroAccessBackfillError` only when the failure is permanent: the body blob is gone (`exists()` is false after a failed `get()`), or `sealRaw` throws the new `ZeroAccessParseError`. Other failures are logged at warn and retried next run.
+  - Records:
+    - A contact's photo is handled before its fields. A missing photo blob is dropped (`photoBlobKey: null`) and the fields are still sealed.
+    - A photo read or store that fails for a while is retried next run.
+    - A refused write that isn't a version conflict sets the new nullable `zeroAccessBackfillError` column on CalendarEvent, Contact and Task (both backends). That column is server-managed on all three routes and excluded by the record query.
+  - Each run reads "Allow zero-access" once (`ZeroAccessWriter.allowed()`) and returns early when it is off. The value is passed to `target(..., allowed)` on the writer, the record sealer and the resolver.
+  - A mailbox's folders are read only once it has candidate messages.
+  - **Left:** a per-mailbox "backfilled" marker for the steady state. There is still about 1 policy read per run plus about 9 indexed queries per zero-access mailbox. Also left: backoff for transient failures that keep recurring.

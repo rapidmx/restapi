@@ -4,11 +4,12 @@
 ///////////////////////////////////////////////////////////////////////////////
 // `ZeroAccessBackfillJob`'s paths the HTTP suite (`test/routes/zeroAccessDeliverySuite.ts`, "backfill of existing mail") can't reach.
 import "reflect-metadata";
-import { Logger } from "@rapidrest/core";
-import { ObjectFactory } from "@rapidrest/service-core";
+import { ApiError, Logger } from "@rapidrest/core";
+import { ApiErrors, ObjectFactory } from "@rapidrest/service-core";
 import config from "../config.js";
 import { ZeroAccessBackfillJobMongo } from "../../src/jobs/mongo/ZeroAccessBackfillJobMongo.js";
 import { openSealedField, testZeroAccessKey, type TestZeroAccessKey } from "../zeroAccessTestKeys.js";
+import { ZeroAccessParseError } from "../../src/zeroaccess/ZeroAccessWriter.js";
 
 const objectFactory = new ObjectFactory(config, Logger());
 const sealed = { subject: "[...]", bodyPreview: "", bodyBlobKey: "za/mb/m", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" }, indexEntryUid: "ix" };
@@ -20,20 +21,23 @@ function job(options: { mailboxes?: any[]; messages?: any[]; writer?: any; updat
     const logger = { warn: vi.fn(), debug: vi.fn() };
     Object.assign(instance, {
         logger,
-        blobStore: { get: vi.fn().mockResolvedValue(Buffer.from("raw")), delete: vi.fn().mockResolvedValue(undefined) },
+        blobStore: { get: vi.fn().mockResolvedValue(Buffer.from("raw")), delete: vi.fn().mockResolvedValue(undefined), exists: vi.fn().mockResolvedValue(false) },
         mailboxRepo: { find: vi.fn(async () => pages.shift() ?? []), update: vi.fn(async (patch: any) => patch) },
         folderRepo: { find: vi.fn().mockResolvedValue([{ uid: "drafts", type: "drafts" }]) },
         messageRepo: {
             find: vi.fn(async (query: any) => (query.deleted ? [] : (options.messages ?? []))),
             update: options.update ?? vi.fn(async (patch: any) => patch),
         },
-        zeroAccessWriter: options.writer ?? {
+        zeroAccessWriter: { allowed: vi.fn().mockResolvedValue(true), ...(options.writer ?? {}) },
+    });
+    if (!options.writer) {
+        Object.assign(instance.zeroAccessWriter, {
             target: vi.fn().mockResolvedValue({}),
             sealRaw: vi.fn().mockResolvedValue(sealed),
             sealDraft: vi.fn().mockResolvedValue(sealed),
             discardPlaintext: vi.fn().mockResolvedValue(undefined),
-        },
-    });
+        });
+    }
     return { instance, logger };
 }
 
@@ -94,16 +98,45 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
         expect(instance.messageRepo.update).not.toHaveBeenCalled();
     });
 
-    it("marks a message the writer can't seal, and tolerates the mark itself failing", async () => {
+    it("marks a message the writer can't parse, and tolerates the mark itself failing", async () => {
         const update = vi.fn().mockRejectedValue(new Error("conflict"));
         const { instance, logger } = job({
             messages: [message("m1")],
             update,
-            writer: { target: vi.fn().mockResolvedValue({}), sealRaw: vi.fn().mockRejectedValue(new Error("bad mime")) },
+            writer: { target: vi.fn().mockResolvedValue({}), sealRaw: vi.fn().mockRejectedValue(new ZeroAccessParseError("bad mime")) },
         });
         await instance.run();
         expect(update.mock.calls[0][0].zeroAccessBackfillError).toContain("bad mime");
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("bad mime"));
+    });
+
+    it("leaves a message whose sealing or body read failed for a while unmarked, for the next run", async () => {
+        const update = vi.fn();
+        const { instance, logger } = job({
+            messages: [message("m1"), message("m2"), message("m3")],
+            update,
+            writer: { target: vi.fn().mockResolvedValue({}), sealRaw: vi.fn().mockRejectedValue(new Error("store 503")) },
+        });
+        instance.blobStore.get = vi.fn().mockResolvedValueOnce(Buffer.from("raw")).mockRejectedValueOnce(new Error("timeout")).mockRejectedValueOnce(new Error("timeout"));
+        // The body is still there (a read that failed for a while), then a store that can't even say.
+        instance.blobStore.exists = vi.fn().mockResolvedValueOnce(true).mockRejectedValueOnce(new Error("down"));
+        await instance.run();
+        expect(update).not.toHaveBeenCalled();
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("couldn't be sealed this run: store 503"));
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("body couldn't be read this run"));
+    });
+
+    it("reads the administrator's setting once a run, does nothing while it is off, and reads a mailbox's folders only for mail to seal", async () => {
+        const { instance } = job({ mailboxes: [{ uid: "a", zeroAccessKeys: [{}] }, { uid: "b", zeroAccessKeys: [{}] }], messages: [] });
+        await instance.run();
+        expect(instance.zeroAccessWriter.allowed).toHaveBeenCalledTimes(1);
+        expect(instance.zeroAccessWriter.target.mock.calls.map((call: any[]) => call[2])).toEqual([true, true]);
+        expect(instance.folderRepo.find).not.toHaveBeenCalled();
+
+        const off = job();
+        off.instance.zeroAccessWriter.allowed.mockResolvedValue(false);
+        await off.instance.run();
+        expect(off.instance.mailboxRepo.find).not.toHaveBeenCalled();
     });
 
     it("drops a draft's fresh sealed blob when the draft changed meanwhile, and leaves it for the next run", async () => {
@@ -207,7 +240,7 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
         });
 
         it("leaves a type that isn't protected alone, stops at the budget, and retries a record that changed meanwhile next run", async () => {
-            const update = vi.fn().mockRejectedValue(new Error("version"));
+            const update = vi.fn().mockRejectedValue(new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "version"));
             const { instance, logger, repos } = await recordJob(
                 { contacts: [{ uid: "c1", version: 0, mailboxUid: "mb", displayName: "Jane", emails: [], photoBlobKey: "contact-photos/c1/old" }], tasks: [{ uid: "t1", title: "x" }] },
                 { protectedTypes: ["contacts", "tasks"], update },
@@ -241,11 +274,51 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
 
             const stuck = await recordJob(
                 { contacts: [{ uid: "c1", version: 0, mailboxUid: "mb", displayName: "Jane", emails: [], photoBlobKey: "contact-photos/c1/old" }] },
-                { update: vi.fn().mockRejectedValue(new Error("version")) },
+                { update: vi.fn().mockRejectedValue(new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "version")) },
             );
             stuck.instance.blobStore.delete.mockRejectedValue(new Error("store down"));
             await expect(stuck.instance.run()).resolves.toBeUndefined();
             expect(stuck.logger.debug).toHaveBeenCalledWith(expect.stringContaining("version"));
+        });
+
+        it("seals a contact whose photo blob is gone without it, and leaves one whose photo can't be read or stored for now for the next run", async () => {
+            const contact = (uid: string) => ({ uid, version: 0, mailboxUid: "mb", displayName: "Jane", emails: [], photoBlobKey: `contact-photos/${uid}/old` });
+            const { instance, logger, repos } = await recordJob({ contacts: [contact("gone"), contact("slow"), contact("full")] });
+            instance.blobStore.get = vi.fn().mockRejectedValueOnce(new Error("NoSuchKey")).mockRejectedValueOnce(new Error("timeout")).mockResolvedValueOnce(Buffer.from("PHOTO"));
+            instance.blobStore.exists = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+            instance.blobStore.put = vi.fn().mockRejectedValue(new Error("disk full"));
+
+            await instance.run();
+
+            expect(repos.contacts.update).toHaveBeenCalledTimes(1);
+            const [patch] = repos.contacts.update.mock.calls[0];
+            expect(patch).toMatchObject({ uid: "gone", photoBlobKey: null, displayName: "Protected contact" });
+            expect(patch.photoSealed).toBeUndefined();
+            expect(patch.sealedFields.displayName).toEqual(expect.any(String));
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("slow's photo couldn't be read this run"));
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("full's sealed photo couldn't be stored this run"));
+        });
+
+        it("marks a record whose sealed write is refused for anything but a concurrent change, so it can't use up the budget, tolerating the mark failing", async () => {
+            const update = vi.fn().mockRejectedValueOnce(new Error("validation failed")).mockResolvedValueOnce({});
+            const { instance, logger, repos } = await recordJob({ tasks: [{ uid: "t1", version: 4, mailboxUid: "mb", title: "x" }] }, { update });
+
+            await instance.run();
+
+            expect(repos.tasks.find.mock.calls[0][0]).toMatchObject({ sealedFields: null, zeroAccessBackfillError: null });
+            expect(update.mock.calls[1][0]).toEqual({ uid: "t1", version: 4, zeroAccessBackfillError: expect.stringContaining("validation failed") });
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("leaving tasks t1 unsealed"));
+
+            const stuck = await recordJob({ tasks: [{ uid: "t2", version: 0, mailboxUid: "mb", title: "x" }] }, { update: vi.fn().mockRejectedValue(new Error("db down")) });
+            await expect(stuck.instance.run()).resolves.toBeUndefined();
+
+            const raced = await recordJob(
+                { tasks: [{ uid: "t3", version: 0, mailboxUid: "mb", title: "x" }] },
+                { update: vi.fn().mockRejectedValue(new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "version")) },
+            );
+            await raced.instance.run();
+            expect(raced.repos.tasks.update).toHaveBeenCalledTimes(1);
+            expect(raced.logger.debug).toHaveBeenCalledWith(expect.stringContaining("changed while it was sealed"));
         });
 
         it("keeps a contact sealed, logging it, when its readable photo can't be removed", async () => {

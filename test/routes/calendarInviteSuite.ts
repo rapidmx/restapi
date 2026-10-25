@@ -14,6 +14,7 @@ import * as uuid from "uuid";
 import { AttendeeResponseStatus, AttendeeRole, BusyStatus, CalendarEventStatus, FolderType, RecipientType } from "../../src/models/types.js";
 import { nameBasedUuid } from "../../src/util/UuidUtils.js";
 import type { InMemoryBlobStore, RecordingMailTransport } from "../testDoubles.js";
+import type { TestZeroAccessKey } from "../zeroAccessTestKeys.js";
 
 export interface CalendarInviteSuiteContext {
     app: () => any;
@@ -33,6 +34,8 @@ export interface CalendarInviteSuiteContext {
     findEvents: (mailboxUid: string) => Promise<any[]>;
     /** Clears the organizer recorded on a calendar event row. */
     deleteEventOrganizer: (uid: string) => Promise<void>;
+    /** Gives a mailbox a zero-access key (its mail is then sealed), returning it. */
+    addZeroAccessKey: (mailboxUid: string) => Promise<TestZeroAccessKey>;
 }
 
 const HOUR = 60 * 60 * 1000;
@@ -122,6 +125,13 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
     describe("zero-access messages (the client sends the calendar file)", () => {
         /** A zero-access message as stored: the sealed form's outer headers - its MTA's `Authentication-Results` among them - over an
          * opaque body the server can't read a calendar file from. */
+        const keys: Map<string, TestZeroAccessKey> = new Map();
+        const keyOf = async (mailboxUid: string): Promise<TestZeroAccessKey> => {
+            if (!keys.has(mailboxUid)) {
+                keys.set(mailboxUid, await ctx.addZeroAccessKey(mailboxUid));
+            }
+            return keys.get(mailboxUid)!;
+        };
         const receiveSealed = async (mailboxUid: string, folderUid: string, verified: boolean = true) => {
             const raw: Buffer = Buffer.from(
                 [
@@ -144,7 +154,7 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
                 subject: "[...]",
                 from: { address: "boss@boss.example.com", type: RecipientType.TO },
                 hasAttachments: true,
-                zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" },
+                zeroAccess: { keyFingerprint: (await keyOf(mailboxUid)).key.fingerprint, sealedSummary: "s" },
             });
         };
 
@@ -167,8 +177,36 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
 
             expect(result.status).toBe(200);
             expect(result.body.onCalendar).toBe(true);
-            expect((await ctx.findEvents(mailbox.uid)).map((event: any) => event.icalUid)).toEqual([eventUid]);
+            const events: any[] = await ctx.findEvents(mailbox.uid);
+            expect(events.map((event: any) => event.icalUid)).toEqual([eventUid]);
             expect(ctx.transport().sent.length).toBeGreaterThan(0);
+            // Filed as inbound delivery files a zero-access invitation: its content only sealed, to the message's key.
+            expect(events[0].title).toBe("[...]");
+            expect(events[0].encryptionOrigin).toBe("derived");
+            expect(JSON.stringify(events[0])).not.toContain("Video Test");
+            expect(events[0].sealedContent.keyFingerprint).toBe((await keyOf(mailbox.uid)).key.fingerprint);
+        });
+
+        it("Keeps the meeting sealed when it is answered again after a decline, and seals a newer revision it applies", async () => {
+            const { mailbox, inbox, me } = await setup();
+            const message = await receiveSealed(mailbox.uid, inbox.uid);
+            const answer = async (responseStatus: string, file: string) =>
+                await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({ responseStatus, ics: file });
+
+            expect((await answer("declined", requestFor(me))).status).toBe(200);
+            expect((await answer("accepted", requestFor(me))).status).toBe(200);
+            const [accepted] = await ctx.findEvents(mailbox.uid);
+            expect(accepted.title).toBe("[...]");
+            expect(accepted.sealedContent).toBeTruthy();
+
+            const newer = await answer("accepted", requestFor(me, { sequence: 1, extra: ["LOCATION:Room 9"] }));
+            expect(newer.status).toBe(200);
+            const [updated] = await ctx.findEvents(mailbox.uid);
+            expect(updated.sequence).toBe(1);
+            expect(updated.title).toBe("[...]");
+            expect(updated.location ?? null).toBeNull();
+            expect(JSON.stringify(updated)).not.toContain("Room 9");
+            expect(updated.sealedContent.sealed).not.toBe(accepted.sealedContent.sealed);
         });
 
         it("Still tells a verified organizer's change of a meeting on the calendar from a forged one, by the stored Authentication-Results.", async () => {

@@ -82,6 +82,29 @@ describe("MeetingInviteSender (isolated)", () => {
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("failed to send the invitations for protected event e1: version"));
     });
 
+    it("claims an event its organizer sends encrypted without sending it, returning the row the claim wrote", async () => {
+        const { instance } = sender({ keyed: true });
+        vi.spyOn(instance, "organizerIdentity").mockResolvedValue({ addresses: new Set(["owner@example.com"]) });
+        const send = vi.spyOn(instance, "sendToAttendees");
+        const repo = { update: vi.fn(async (patch: any) => ({ ...event(), ...patch, version: 2 })) };
+        const claimed = await instance.sendProtectedInvitations(event({ videoMeetingUid: "vm", encryptionOrigin: "originated" }), undefined, repo as any, "test");
+        expect(claimed).toMatchObject({ uid: "e1", version: 2, inviteSequenceSent: 1 });
+        expect(send).not.toHaveBeenCalled();
+    });
+
+    it("sends no keyed link to an attendee whose copy may not carry its key", async () => {
+        const logger = { warn: vi.fn(), error: vi.fn() };
+        const linkRepo = { count: vi.fn(), find: vi.fn().mockResolvedValue([{ attendeeAddress: "bob@example.org", url: "https://meet.example/j/1", keyed: true }]) };
+        const mayCarryMeetingKey = vi.fn().mockResolvedValue(false);
+        const instance = new MeetingInviteSender(undefined, linkRepo as any, { logger, mayCarryMeetingKey });
+        const transport = { name: "test", send: vi.fn() };
+        (instance as any).mailTransport = transport;
+        await instance.sendToAttendees(event({ videoMeetingUid: "vm" }), { addresses: new Set(["owner@example.com"]) }, "request", { "bob@example.org": KEY });
+        expect(mayCarryMeetingKey).toHaveBeenCalledWith("bob@example.org");
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("would be stored here readable"));
+        expect(transport.send).not.toHaveBeenCalled();
+    });
+
     it("never sends an attendee a keyed link without their key", async () => {
         const { instance, logger } = sender({ links: [{ attendeeAddress: "bob@example.org", url: "https://meet.example/j/1", keyed: true }] });
         const transport = { name: "test", send: vi.fn() };

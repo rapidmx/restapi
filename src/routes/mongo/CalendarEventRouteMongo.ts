@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RouteDecorators } from "@rapidrest/service-core";
-import { EncryptionPolicyMongo, CalendarEventAttendeeLinkMongo, CalendarEventMongo, CalendarShareLinkMongo, CorrespondentMongo, FolderMongo, MailboxMongo, MessageMongo } from "../../mongo.js";
+import { DomainMongo, EncryptionPolicyMongo, CalendarEventAttendeeLinkMongo, CalendarEventMongo, CalendarShareLinkMongo, CorrespondentMongo, FolderMongo, MailboxMongo, MessageMongo } from "../../mongo.js";
 import { BaseCalendarEventRoute } from "../BaseCalendarEventRoute.js";
 import { RecoverableRepoUtils } from "../../util/RecoverableRepoUtils.js";
 const { Model } = RouteDecorators;
@@ -13,6 +13,7 @@ export class CalendarEventRouteMongo extends BaseCalendarEventRoute<CalendarEven
     protected readonly repoUtilsClass: any = RecoverableRepoUtils;
     protected mailboxClass: any = MailboxMongo;
     protected encryptionPolicyClass: any = EncryptionPolicyMongo;
+    protected domainClass: any = DomainMongo;
     protected attendeeLinkClass: any = CalendarEventAttendeeLinkMongo;
     protected correspondentClass: any = CorrespondentMongo;
     protected messageClass: any = MessageMongo;

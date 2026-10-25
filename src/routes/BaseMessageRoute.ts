@@ -1431,10 +1431,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             blobStore: this.blobStore!,
             notificationUtils: this.notificationUtils,
             logger: this.logger,
+            zeroAccessWriter: this.zeroAccessWriter,
         };
         await tryFileDeliveryFailureNotice(sink, `message ${message.uid}`, async () => ({
             mailboxUid: message.mailboxUid,
             mailboxAddress: mailbox.primarySmtpAddress,
+            mailbox,
             key: deliveryFailureKey("send-partial", message.uid),
             original: await describeOriginal(this.blobStore!, message, { messageId }),
             failures: details.failures,

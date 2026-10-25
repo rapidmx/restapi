@@ -105,6 +105,19 @@ describe("sealFieldsOnWrite()", () => {
         expect(hasSealedFields(undefined)).toBe(false);
     });
 
+    it("applies an empty value as a clear for a writer that sends only what it changes, still ignoring a non-empty placeholder sent back", async () => {
+        const existing: Card = { displayName: "jane@example.com", emails: [{ address: "jane@example.com" }], phones: [], notes: null, sealedFields: { displayName: "OLD", phones: "PH", notes: "NT" } };
+
+        const cleared: any = { displayName: "jane@example.com", phones: [], notes: null };
+        await sealFieldsOnWrite<Card>(cleared, existing, FIELDS, target(), { emptyClears: true });
+        expect(cleared).toEqual({ phones: [], notes: null, sealedFields: { displayName: "OLD" } });
+
+        // A device's round trip of the same empty placeholders leaves the sealed values alone.
+        const device: any = { phones: [], notes: null };
+        await sealFieldsOnWrite<Card>(device, existing, FIELDS, target());
+        expect(device).toEqual({ sealedFields: { displayName: "OLD", phones: "PH", notes: "NT" } });
+    });
+
     it("never takes sealedFields from the client", async () => {
         const patch: any = { favorite: true, sealedFields: { displayName: "forged" } };
         await sealFieldsOnWrite<Card>(patch, undefined, FIELDS, target());

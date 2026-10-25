@@ -13,6 +13,7 @@ import { FolderMongo } from "../../../src/models/mongo/FolderMongo.js";
 import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
 import { EncryptionPolicyMongo } from "../../../src/models/mongo/EncryptionPolicyMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
+import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSubjectErasureRequestMongo.js";
 import { TransportRuleMongo } from "../../../src/models/mongo/TransportRuleMongo.js";
 import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 import { zeroAccessDeliverySuite } from "../zeroAccessDeliverySuite.js";
@@ -40,6 +41,7 @@ describe("Zero-access delivery (Mongo)", () => {
         "FolderMongo",
         "ScanResultMongo",
         "CalendarEventMongo",
+        "DataSubjectErasureRequestMongo",
     ];
 
     beforeAll(async () => {
@@ -142,6 +144,8 @@ describe("Zero-access delivery (Mongo)", () => {
         updateMessage: async (uid, fields) => {
             await repos.MessageMongo.updateOne({ uid } as any, { $set: fields });
         },
+        createErasureRequest: async (mailboxUid, status) =>
+            repos.DataSubjectErasureRequestMongo.save(new DataSubjectErasureRequestMongo({ mailboxUid, requestedByUserUid: uuid.v4(), status })),
         runBackfill: async () => {
             const job = await objectFactory.newInstance<ZeroAccessBackfillJobMongo>(ZeroAccessBackfillJobMongo, { name: `za-backfill-${uuid.v4()}` });
             await job.run();

@@ -63,6 +63,11 @@ export class TaskMongo extends RecoverableBaseMongoEntity implements Task {
     public sealedFields?: Record<string, string> | null;
 
     @Column()
+    @Description("Why the zero-access backfill couldn't seal this record, if it couldn't. Server-written.")
+    @Nullable
+    public zeroAccessBackfillError?: string | null;
+
+    @Column()
     @Description("The date the task is due.")
     @Nullable
     public dueDate?: Date;
@@ -104,6 +109,7 @@ export class TaskMongo extends RecoverableBaseMongoEntity implements Task {
             this.title = other.title !== undefined ? other.title : this.title;
             this.body = "body" in other ? other.body : this.body;
             this.sealedFields = "sealedFields" in other ? other.sealedFields : this.sealedFields;
+            this.zeroAccessBackfillError = "zeroAccessBackfillError" in other ? other.zeroAccessBackfillError : this.zeroAccessBackfillError;
             this.dueDate = "dueDate" in other ? other.dueDate : this.dueDate;
             this.completed = other.completed !== undefined ? other.completed : this.completed;
             this.priority = other.priority !== undefined ? other.priority : this.priority;

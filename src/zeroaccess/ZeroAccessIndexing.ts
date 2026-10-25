@@ -37,21 +37,22 @@ export interface IndexExtractionLimits {
 /** Marks a budget that ran out before an extraction finished. */
 const TIMED_OUT: unique symbol = Symbol("timed out");
 
+/** The attachment text `buildIndexDocument()` indexes, and the attachments it left for a client to extract. */
+export interface ExtractedIndexText {
+    attachmentText: string[];
+    deferredAttachments: string[];
+}
+
 /**
- * The index document for one zero-access message (`ZeroAccessIndexDocument`), extracting attachment text within `limits`:
- * the server indexes what it can while it legitimately holds the plaintext, and names the rest in `deferredAttachments` for a
- * client to extract after decrypting (`specs/search.md` §9) - never a plaintext spool to extract from later. An attachment
- * with no extractor isn't deferred: like today, it is findable by name only.
+ * Extracts the text of `attachments` within `limits` (`buildIndexDocument()`): what doesn't fit is named in `deferredAttachments`. The
+ * result depends only on the message, so a delivery to several zero-access recipients extracts once and builds each recipient's document
+ * from it.
  */
-export async function buildIndexDocument(
-    input: IndexDocumentInput,
-    extract: AttachmentTextExtractor,
-    limits: IndexExtractionLimits,
-): Promise<ZeroAccessIndexDocument> {
+export async function extractIndexText(attachments: IndexableAttachment[], extract: AttachmentTextExtractor, limits: IndexExtractionLimits): Promise<ExtractedIndexText> {
     const attachmentText: string[] = [];
     const deferredAttachments: string[] = [];
     const deadline: number = Date.now() + limits.budgetMs;
-    for (const attachment of input.attachments) {
+    for (const attachment of attachments) {
         const name: string = attachment.filename ?? "";
         const remaining: number = deadline - Date.now();
         if (attachment.content.length > limits.maxAttachmentBytes || remaining <= 0) {
@@ -71,6 +72,23 @@ export async function buildIndexDocument(
             attachmentText.push(outcome);
         }
     }
+    return { attachmentText, deferredAttachments };
+}
+
+/**
+ * The index document for one zero-access message (`ZeroAccessIndexDocument`), extracting attachment text within `limits`:
+ * the server indexes what it can while it legitimately holds the plaintext, and names the rest in `deferredAttachments` for a
+ * client to extract after decrypting (`specs/search.md` §9) - never a plaintext spool to extract from later. An attachment
+ * with no extractor isn't deferred: like today, it is findable by name only. `extracted`: the message's attachment text already
+ * extracted (`extractIndexText()`), for another recipient of the same delivery.
+ */
+export async function buildIndexDocument(
+    input: IndexDocumentInput,
+    extract: AttachmentTextExtractor,
+    limits: IndexExtractionLimits,
+    extracted?: ExtractedIndexText,
+): Promise<ZeroAccessIndexDocument> {
+    const { attachmentText, deferredAttachments } = extracted ?? (await extractIndexText(input.attachments, extract, limits));
 
     const addresses = (type: RecipientType): string[] => input.recipients.filter((r) => r.type === type).map((r) => r.address);
     const participants: string[] = [

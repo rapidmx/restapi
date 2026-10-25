@@ -105,6 +105,17 @@ export function zeroAccessIndexSuite(ctx: ZeroAccessIndexSuiteContext): void {
             expect(current - closed).toBe(3 * WEEK_MS);
         });
 
+        it("leaves a week that isn't an ISO week out of the manifest, rather than failing it", async () => {
+            const { mailbox } = await setup();
+            await entry(mailbox, "499-W53");
+            await entry(mailbox, currentWeek);
+
+            const result = await request(ctx.app()).get(url(mailbox, "/manifest")).set("Authorization", auth());
+
+            expect(result.status, JSON.stringify(result.body)).toBe(200);
+            expect(result.body.weeks.map((week: any) => week.weekId)).toEqual([currentWeek]);
+        });
+
         it("refuses everyone but the owner, and a mailbox that doesn't exist", async () => {
             const { mailbox } = await setup();
             expect((await request(ctx.app()).get(url(mailbox, "/manifest")).set("Authorization", auth(uuid.v4()))).status).toBe(403);

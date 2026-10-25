@@ -30,10 +30,14 @@ describe("zero-access route sealing (isolated)", () => {
         sealing.sealer = { sealWrite: vi.fn(), target: vi.fn(async () => ({ certDer: new Uint8Array([7]) })) };
         sealing.mailboxRepo = { findOne: vi.fn(async (uid: string) => (uid === "mb" ? { uid } : undefined)) };
 
+        // A REST client sends only what it changes: an emptied field is a clear.
         await sealing.seal({ displayName: "x" }, undefined);
-        expect(sealing.sealer.sealWrite).toHaveBeenLastCalledWith("contacts", undefined, { displayName: "x" }, undefined);
+        expect(sealing.sealer.sealWrite).toHaveBeenLastCalledWith("contacts", undefined, { displayName: "x" }, undefined, { emptyClears: true });
         await sealing.seal({}, { mailboxUid: "mb" });
-        expect(sealing.sealer.sealWrite).toHaveBeenLastCalledWith("contacts", { uid: "mb" }, {}, { mailboxUid: "mb" });
+        expect(sealing.sealer.sealWrite).toHaveBeenLastCalledWith("contacts", { uid: "mb" }, {}, { mailboxUid: "mb" }, { emptyClears: true });
+        // A move is sealed for the mailbox the record goes to.
+        await sealing.seal({ mailboxUid: "mb" }, { mailboxUid: "elsewhere" });
+        expect(sealing.mailboxRepo.findOne).toHaveBeenLastCalledWith("mb", { ignoreACL: true });
 
         expect(Array.from(await sealing.certificateFor("mb"))).toEqual([7]);
         expect(await sealing.certificateFor("gone")).toBeUndefined();

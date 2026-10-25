@@ -62,6 +62,11 @@ export class TaskSQL extends RecoverableBaseEntity implements Task {
     @Nullable
     public sealedFields?: Record<string, string> | null;
 
+    @Column({ type: "text", nullable: true })
+    @Description("Why the zero-access backfill couldn't seal this record, if it couldn't. Server-written.")
+    @Nullable
+    public zeroAccessBackfillError?: string | null;
+
     @Column({ nullable: true })
     @Description("The date the task is due.")
     @Nullable
@@ -108,6 +113,7 @@ export class TaskSQL extends RecoverableBaseEntity implements Task {
             this.title = other.title !== undefined ? other.title : this.title;
             this.body = "body" in other ? other.body : this.body;
             this.sealedFields = "sealedFields" in other ? other.sealedFields : this.sealedFields;
+            this.zeroAccessBackfillError = "zeroAccessBackfillError" in other ? other.zeroAccessBackfillError : this.zeroAccessBackfillError;
             this.dueDate = "dueDate" in other ? other.dueDate : this.dueDate;
             this.completed = other.completed !== undefined ? other.completed : this.completed;
             this.priority = other.priority !== undefined ? other.priority : this.priority;

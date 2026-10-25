@@ -8,12 +8,14 @@ import type { NotificationUtils, RepoUtils } from "@rapidrest/service-core";
 import type { BlobStore } from "../blob/BlobStore.js";
 import type { TransportError, TransportFailure } from "../transport/MailTransport.js";
 import { cleanDiagnosticText } from "../transport/TransportResultUtils.js";
-import { FolderType, MessageImportance, RecipientType } from "../models/types.js";
+import { FolderType, type Mailbox, MessageImportance, RecipientType } from "../models/types.js";
 import { refreshFolderCounts } from "./FolderCountUtils.js";
 import { extractHeader } from "./MimeHeaderUtils.js";
 import { findOrCreateWellKnownFolder } from "./FolderUtils.js";
 import { boundIndexedValue, deriveConversationId } from "./ConversationUtils.js";
 import { nameBasedUuid } from "./UuidUtils.js";
+import type { ZeroAccessMailbox } from "../zeroaccess/ZeroAccessResolver.js";
+import type { ZeroAccessSealedFields, ZeroAccessWriter } from "../zeroaccess/ZeroAccessWriter.js";
 
 /** How many failed recipients a notice lists in full; the rest are counted. */
 export const MAX_NOTICE_RECIPIENTS: number = 50;
@@ -30,6 +32,9 @@ export interface DeliveryFailureNoticeInput {
     /** The mailbox the notice is filed in (the sender's), and its primary address (who the notice is addressed to). */
     mailboxUid: string;
     mailboxAddress: string;
+    /** That mailbox as zero-access decisions read it: with the sink's `zeroAccessWriter`, the notice is filed sealed while zero-access is
+     * active for it - it quotes the original's subject and headers. */
+    mailbox?: Pick<Mailbox, "uid"> & ZeroAccessMailbox;
     /**
      * Identifies the failed send: a notice with a key already filed - even one the user has since deleted - is not filed
      * again, so a retried or replayed failure never produces two notices. Built with `deliveryFailureKey()`.
@@ -329,6 +334,8 @@ export interface DeliveryNoticeSink {
     /** Tells connected clients (`sendMessage()`) about the new message; skipped when there is none. */
     notificationUtils?: NotificationUtils;
     logger?: any;
+    /** Seals the notice for a zero-access mailbox (`DeliveryFailureNoticeInput.mailbox`); without it every notice is filed readable. */
+    zeroAccessWriter?: ZeroAccessWriter;
 }
 
 /**
@@ -341,7 +348,8 @@ export interface DeliveryNoticeSink {
  * filed back. Returns the new message, or `undefined` when there already was one.
  *
  * Filed directly rather than queued for `ScanQueueJob`: the server wrote it, so there is nothing to scan, and it must not
- * be held up behind, or quarantined by, a scan.
+ * be held up behind, or quarantined by, a scan. For a zero-access mailbox it is filed sealed, like any other message the server
+ * writes there (`ZeroAccessWriter.sealRaw()`, `specs/search.md` §3): it names the original's subject and carries its headers.
  */
 export async function fileDeliveryFailureNotice(sink: DeliveryNoticeSink, input: DeliveryFailureNoticeInput): Promise<any | undefined> {
     const uid: string = deliveryFailureUid(input.mailboxUid, input.key);
@@ -349,11 +357,14 @@ export async function fileDeliveryFailureNotice(sink: DeliveryNoticeSink, input:
         return undefined;
     }
     const notice: DeliveryFailureNotice = await buildDeliveryFailureNotice(input);
-    const bodyBlobKey: string = `notices/${uid}`;
-    await sink.blobStore.put(bodyBlobKey, notice.raw, { contentType: "message/rfc822" });
+    const now: Date = input.now ?? new Date();
+    const sealed: ZeroAccessSealedFields | undefined = input.mailbox ? await sink.zeroAccessWriter?.sealRaw(input.mailbox, notice.raw, uid, now) : undefined;
+    const bodyBlobKey: string = sealed ? sealed.bodyBlobKey : `notices/${uid}`;
+    if (!sealed) {
+        await sink.blobStore.put(bodyBlobKey, notice.raw, { contentType: "message/rfc822" });
+    }
 
     const inbox: any = await findOrCreateWellKnownFolder(sink.folderRepo, sink.folderClass, input.mailboxUid, FolderType.INBOX);
-    const now: Date = input.now ?? new Date();
     let message: any;
     try {
         message = await sink.messageRepo.create(
@@ -362,13 +373,14 @@ export async function fileDeliveryFailureNotice(sink: DeliveryNoticeSink, input:
                 folderUid: inbox.uid,
                 mailboxUid: input.mailboxUid,
                 messageId: boundIndexedValue(notice.messageId),
-                subject: notice.subject,
+                subject: sealed ? sealed.subject : notice.subject,
                 from: { address: notice.from, displayName: NOTICE_SENDER_NAME, type: RecipientType.TO },
                 recipients: [{ address: input.mailboxAddress, type: RecipientType.TO }],
                 sentDate: now,
                 receivedDate: now,
                 bodyBlobKey,
-                bodyPreview: notice.preview,
+                bodyPreview: sealed ? sealed.bodyPreview : notice.preview,
+                ...(sealed ? { zeroAccess: sealed.zeroAccess } : {}),
                 flags: { read: false, flagged: false, answered: false, forwarded: false },
                 importance: MessageImportance.HIGH,
                 inReplyTo: input.original.messageId,
@@ -382,9 +394,14 @@ export async function fileDeliveryFailureNotice(sink: DeliveryNoticeSink, input:
             { ignoreACL: true },
         );
     } catch (err) {
-        // A concurrent filer of the same failure won the uid.
+        // A concurrent filer of the same failure won the uid (and shares the sealed blob and index entry, both keyed by it).
         if (await sink.messageRepo.findOne(uid, { ignoreACL: true, includeDeleted: true })) {
             return undefined;
+        }
+        if (sealed) {
+            // Nothing is left pointing at a message that doesn't exist.
+            await sink.zeroAccessWriter!.removeIndexEntry(sealed.indexEntryUid);
+            await sink.blobStore.delete(sealed.bodyBlobKey);
         }
         throw err;
     }

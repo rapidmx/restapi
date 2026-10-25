@@ -1102,6 +1102,48 @@ describe("MailboxImportJobSQL Tests (real DB + DI)", () => {
         expect(messages[0].messageId).toMatch(/^sha256:[0-9a-f]{64}$/);
     });
 
+    it("On a reclaimed retry, keeps a sealed message as it is: its attachments are inside its sealed blob, not rows.", async () => {
+        const mailbox = await createMailbox();
+        const folder = await createFolder(mailbox.uid);
+        const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+        const raw = makeRawMessage({ extraHeader: "Message-ID: <sealed-import@example.com>" });
+        const bodyBlobKey = `za/${mailbox.uid}/${uuid.v4()}`;
+        await blobStore.put(bodyBlobKey, Buffer.from("sealed"));
+        const stored = await messageRepo.save(
+            new MessageSQL({
+                mailboxUid: mailbox.uid,
+                folderUid: folder.uid,
+                messageId: "sealed-import@example.com",
+                subject: "[...]",
+                from: { address: "sender@example.com", type: RecipientType.TO },
+                recipients: [],
+                sentDate: new Date("2020-01-01"),
+                receivedDate: new Date("2020-01-01"),
+                bodyBlobKey,
+                flags: { read: true, flagged: false, answered: false, forwarded: false },
+                references: [],
+                hasAttachments: true,
+                zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" },
+            }),
+        );
+        const request = await createRequest({
+            mailboxUid: mailbox.uid,
+            targetFolderUid: folder.uid,
+            format: "mbox",
+            sourceBlobKey: await putMbox([buildMboxEntry(raw, "alice@example.com", new Date("2020-01-01"))]),
+            status: "processing",
+            processingAttempts: 1,
+            dateModified: new Date(Date.now() - 3 * 60 * 60_000),
+        });
+
+        await job.run();
+
+        expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("completed");
+        const messages = await messageRepo.find({ where: { folderUid: folder.uid } });
+        expect(messages.map((message: any) => message.uid)).toEqual([stored.uid]);
+        expect(await blobStore.exists(bodyBlobKey)).toBe(true);
+    });
+
     it("On a reclaimed retry, imports again a message an interrupted attempt left without its attachments (and gives back its charge), but keeps one that is complete.", async () => {
         const mailbox = await createMailbox();
         const folder = await createFolder(mailbox.uid);

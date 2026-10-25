@@ -140,13 +140,27 @@ function applyAction(result: TransportRuleEvaluationResult, action: TransportRul
  * Evaluates `rules` (only those with `enabled: true`, in ascending `sequence` order) against `context`,
  * folding every matching rule's actions into a single combined result. Stops evaluating further rules once
  * a matching rule has `stopProcessingRules: true` (same convention as `MailFilterUtils.evaluateMailFilterRules()`).
+ * A stored rule that isn't the shape evaluation reads (written before rules were validated) is skipped, reported to
+ * `onUnreadable`, and the others still apply - it can't stop inbound mail, nor take every other rule with it.
  */
-export function evaluateTransportRules(rules: TransportRule[], context: TransportRuleMatchContext): TransportRuleEvaluationResult {
+export function evaluateTransportRules(
+    rules: TransportRule[],
+    context: TransportRuleMatchContext,
+    onUnreadable?: (rule: TransportRule, err: unknown) => void,
+): TransportRuleEvaluationResult {
     const result: TransportRuleEvaluationResult = { reject: false, quarantine: false, addHeaders: [], addRecipients: [] };
 
     const sorted = rules.filter((rule) => rule.enabled).sort((a, b) => a.sequence - b.sequence);
     for (const rule of sorted) {
-        if (!matchesTransportRuleConditions(rule.conditions, context)) {
+        try {
+            if (!matchesTransportRuleConditions(rule.conditions, context)) {
+                continue;
+            }
+            if (!Array.isArray(rule.actions)) {
+                throw new Error("its actions aren't a list");
+            }
+        } catch (err) {
+            onUnreadable?.(rule, err);
             continue;
         }
         for (const action of rule.actions) {
@@ -158,6 +172,14 @@ export function evaluateTransportRules(rules: TransportRule[], context: Transpor
     }
 
     return result;
+}
+
+/** The bounds `htmlText()` converts HTML within: deeper or wider content is left out, rather than recursing without end. */
+const HTML_TEXT_LIMITS = { maxDepth: 100, maxChildNodes: 10_000 };
+
+/** `html` as plain text for `bodyContains`. */
+function htmlText(html: string): string {
+    return convert(html, { wordwrap: false, limits: HTML_TEXT_LIMITS });
 }
 
 /**
@@ -181,7 +203,9 @@ export async function buildTransportRuleContext(
     domains: string[],
     plusAddressingEnabled: boolean = false,
 ): Promise<TransportRuleMatchContext> {
-    const parsed: ParsedMail = await simpleParser(raw);
+    // HTML is turned into text here, bounded (`htmlText()`): mailparser's own conversion fails outright on a deeply nested body, which
+    // any sender can send.
+    const parsed: ParsedMail = await simpleParser(raw, { skipHtmlToText: true });
 
     // An S/MIME-encrypted body is ciphertext to this server - `bodyContains` can only ever see an empty
     // preview for it (mailparser never populates `parsed.text`/`parsed.html` from a non-text top-level part),
@@ -197,10 +221,10 @@ export async function buildTransportRuleContext(
 
     const bodyText: string = encrypted
         ? ""
-        : ((typeof parsed.text === "string"
+        : ((parsed.text
               ? parsed.text
               : typeof parsed.html === "string"
-                ? convert(parsed.html, { wordwrap: false })
+                ? htmlText(parsed.html)
                 : ""
           )?.trim().slice(0, BODY_TEXT_MAX_LENGTH) ?? "");
     const bodyPreview: string = bodyText.slice(0, BODY_PREVIEW_MAX_LENGTH);

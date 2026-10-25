@@ -64,3 +64,4 @@ export * from "./TransportRuleUtils.js";
 export * from "./UserUidUtils.js";
 export * from "./WindowsZones.js";
 export * from "./ZeroAccessUtils.js";
+export * from "./InlineDeliveryCache.js";

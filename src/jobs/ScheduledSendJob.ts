@@ -733,6 +733,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             blobStore: this.blobStore!,
             notificationUtils: this.notificationUtils,
             logger: this.logger,
+            zeroAccessWriter: this.zeroAccessWriter,
         };
     }
 
@@ -760,6 +761,7 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             return {
                 mailboxUid: message.mailboxUid,
                 mailboxAddress: mailbox.primarySmtpAddress,
+                mailbox,
                 key,
                 original: await describeOriginal(this.blobStore!, message, { messageId: extra.messageId }),
                 failures,

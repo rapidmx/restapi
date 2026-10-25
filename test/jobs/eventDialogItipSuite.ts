@@ -285,6 +285,20 @@ export function eventDialogItipSuite(ctx: EventDialogItipContext): void {
                 expect((await counterMessage()).meetingResponse).toBe("accepted");
             });
 
+            it("Applies only the time to an event of a protected calendar, never writing the guest's title, location or description readable.", async () => {
+                const row = await organized({ title: "Protected event", sealedFields: { title: "c2VhbGVk" } });
+
+                await requestChange(row, { title: "CANARY renamed", location: "CANARY room", description: "CANARY plan", startDate: NEW_START, endDate: NEW_END });
+
+                const changed = await ctx.event(row.uid);
+                expect(changed.title).toBe("Protected event");
+                expect(changed.location ?? null).toBeNull();
+                expect(changed.description ?? null).toBeNull();
+                expect(changed.sealedFields).toEqual({ title: "c2VhbGVk" });
+                expect(new Date(changed.startDate).getTime()).toBe(NEW_START.getTime());
+                expect(changed.sequence).toBe(3);
+            });
+
             it("Leaves everyone's answers alone when the time doesn't change.", async () => {
                 const row = await organized();
 

@@ -173,14 +173,25 @@ export abstract class BaseZeroAccessIndexRoute<M extends Mailbox> {
         return {
             mailboxUid: mailbox.uid,
             segments: segments.map(BaseZeroAccessIndexRoute.toIndexSegment).sort((a, b) => a.weekId.localeCompare(b.weekId) || a.origin.localeCompare(b.origin)),
-            weeks: (await pendingEntriesByWeek(this.entryRepo!, mailbox.uid)).map((week) => ({
-                weekId: week.weekId,
-                pendingEntries: week.count,
-                latestEntryAt: week.latestEntryAt.toISOString(),
-                compactable: this.compactable(week.weekId, now),
-                compactableAt: new Date(this.compactableAt(week.weekId)).toISOString(),
-                pendingBytes: week.bytes,
-            })),
+            // A week that isn't one (an entry written before its date was checked, e.g. year 499) can't be served or compacted: it is left
+            // out, rather than failing the whole manifest.
+            weeks: (await pendingEntriesByWeek(this.entryRepo!, mailbox.uid)).flatMap((week) => {
+                const compactableAt: number = this.compactableAt(week.weekId);
+                if (Number.isNaN(compactableAt)) {
+                    this.logger?.warn(`BaseZeroAccessIndexRoute: leaving week ${JSON.stringify(week.weekId)} of mailbox ${mailbox.uid} out of its manifest, not an ISO week.`);
+                    return [];
+                }
+                return [
+                    {
+                        weekId: week.weekId,
+                        pendingEntries: week.count,
+                        latestEntryAt: week.latestEntryAt.toISOString(),
+                        compactable: this.compactable(week.weekId, now),
+                        compactableAt: new Date(compactableAt).toISOString(),
+                        pendingBytes: week.bytes,
+                    },
+                ];
+            }),
         };
     }
 

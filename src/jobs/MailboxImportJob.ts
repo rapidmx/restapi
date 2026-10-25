@@ -522,7 +522,8 @@ export abstract class MailboxImportJob<MIR extends MailboxImportRequest, MB exte
             return false;
         }
         const message: M = existing[0];
-        if (!message.hasAttachments) {
+        // A sealed message keeps its attachments inside its sealed blob, written with its index entry before the row: the row is whole.
+        if (!message.hasAttachments || (message as any).zeroAccess) {
             return true;
         }
         const result: ScanPipelineResult = await this.scanPipeline!.run(raw, { from: "", to: [] });

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { InlineDeliveryCache } from "../util/InlineDeliveryCache.js";
 import * as crypto from "crypto";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
@@ -222,12 +223,14 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             (this._objectFactory!.getInstance(this.scanQueueJobClass) ??
                 (await this._objectFactory!.newInstance(this.scanQueueJobClass, { name: this.scanQueueJobClass.name })));
         let failures: number = 0;
+        // The recipients of one delivery share its scan and attachment text, so it is extracted once, not once per recipient.
+        const cache: InlineDeliveryCache = new InlineDeliveryCache();
         for (const { uid, raw } of entries) {
             try {
                 if (!job) {
                     throw new Error("no ScanQueueJob is configured");
                 }
-                await job.processInline(uid, raw);
+                await job.processInline(uid, raw, cache);
             } catch (err: any) {
                 failures++;
                 this.logger?.error(`MailIngestRoute: zero-access delivery of ingest entry ${uid} failed, asking the MTA to retry: ${err?.message}`);
@@ -547,8 +550,17 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
         }
 
         const domains: string[] = await this.domainUtils!.getVerifiedDomainNames();
-        const context = await buildTransportRuleContext(raw, envelopeFrom, envelopeTo, domains, this.plusAddressingEnabled);
-        const evaluation = evaluateTransportRules(rules, context);
+        let context: Awaited<ReturnType<typeof buildTransportRuleContext>>;
+        try {
+            context = await buildTransportRuleContext(raw, envelopeFrom, envelopeTo, domains, this.plusAddressingEnabled);
+        } catch (err: any) {
+            // The message itself can't be read for the rules (the sender's doing): held for review rather than let past them.
+            this.logger?.warn(`MailIngestRoute: could not read a message for the transport rules, quarantining it: ${err?.message ?? err}`);
+            return { reject: false, raw, envelopeTo, quarantineReason: QuarantineReason.TRANSPORT_RULE };
+        }
+        const evaluation = evaluateTransportRules(rules, context, (rule, err: any) =>
+            this.logger?.error(`MailIngestRoute: skipping transport rule ${rule.uid}, which can't be evaluated: ${err?.message ?? err}`),
+        );
 
         if (evaluation.reject) {
             // The message was already accepted, so the notice is a bounce after the fact: `envelopeFrom` is whatever the sender claimed, and a
@@ -742,15 +754,14 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
 
         // Evaluated once for the whole transaction, before any per-recipient resolution/fan-out below - see
         // `applyTransportRules()`'s own doc comment for why this must happen here rather than per-recipient.
-        // A rule set that can't be evaluated (a stored rule that isn't the shape evaluation reads) must not stop every inbound message: it is
-        // logged as an error and the message is delivered as it came.
+        // Never delivered past the rules: a stored rule that isn't the shape evaluation reads is skipped alone, a message that can't be read
+        // for them is quarantined, and rules or domains that can't be loaded (the datastore) are a temporary failure the MTA retries.
         let transportRuleOutcome: { reject: boolean; raw: Buffer; envelopeTo: string[]; quarantineReason?: QuarantineReason };
-        const received: Buffer = raw;
         try {
             transportRuleOutcome = await this.applyTransportRules(raw, envelopeFrom, envelopeTo);
         } catch (err: any) {
-            this.logger?.error(`MailIngestRoute: could not evaluate the transport rules, delivering without them: ${err?.message}`);
-            transportRuleOutcome = { reject: false, raw: received, envelopeTo };
+            this.logger?.error(`MailIngestRoute: could not evaluate the transport rules, asking the MTA to retry: ${err?.message}`);
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 503, "The transport rules couldn't be evaluated. Try again.");
         }
         if (transportRuleOutcome.reject) {
             const results = envelopeTo.map((rcpt) => ({ rcpt: normalizeAddress(rcpt), queued: false }));

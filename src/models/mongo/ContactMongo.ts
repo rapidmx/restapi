@@ -144,6 +144,11 @@ export class ContactMongo extends RecoverableBaseMongoEntity implements Contact 
     public sealedFields?: Record<string, string> | null;
 
     @Column()
+    @Description("Why the zero-access backfill couldn't seal this record, if it couldn't. Server-written.")
+    @Nullable
+    public zeroAccessBackfillError?: string | null;
+
+    @Column()
     @Description("Whether the photo blob is sealed to the mailbox's zero-access key. Server-written.")
     @Nullable
     public photoSealed?: boolean | null;
@@ -198,6 +203,7 @@ export class ContactMongo extends RecoverableBaseMongoEntity implements Contact 
             this.keysFirstSeen = "keysFirstSeen" in other ? other.keysFirstSeen : this.keysFirstSeen;
             this.preferredFormat = "preferredFormat" in other ? other.preferredFormat : this.preferredFormat;
             this.sealedFields = "sealedFields" in other ? other.sealedFields : this.sealedFields;
+            this.zeroAccessBackfillError = "zeroAccessBackfillError" in other ? other.zeroAccessBackfillError : this.zeroAccessBackfillError;
             this.photoSealed = "photoSealed" in other ? other.photoSealed : this.photoSealed;
             this.observedFormat = "observedFormat" in other ? other.observedFormat : this.observedFormat;
             this.lastMessageSeen = "lastMessageSeen" in other ? other.lastMessageSeen : this.lastMessageSeen;

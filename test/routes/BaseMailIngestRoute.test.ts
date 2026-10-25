@@ -73,4 +73,34 @@ describe("BaseMailIngestRoute Tests (blobStore guard clause only)", () => {
 
         await expect(route.deliver(req, res)).rejects.toThrow(/internal error/i);
     });
+
+    it("deliver() answers 503 when the transport rules can't be loaded, never delivering past them.", async () => {
+        const route = objectFactory.newInstance<TestMailIngestRoute>(TestMailIngestRoute, { initialize: false });
+        Object.assign(route as any, {
+            ingestSecret: "s3cr3t",
+            blobStore: {},
+            logger: { error: vi.fn(), warn: vi.fn() },
+            transportRuleRepo: { find: vi.fn().mockRejectedValue(new Error("datastore down")) },
+        });
+        const req: any = {
+            headers: { authorization: "Bearer s3cr3t", "x-envelope-from": "a@example.com", "x-envelope-to": "b@example.com" },
+            rawBody: Buffer.from("From: a@example.com\r\n\r\nHi\r\n"),
+            query: {},
+        };
+
+        await expect(route.deliver(req, makeRes())).rejects.toMatchObject({ status: 503 });
+    });
+
+    it("quarantines a message that can't be read for the transport rules, rather than letting it past them.", async () => {
+        const route = objectFactory.newInstance<TestMailIngestRoute>(TestMailIngestRoute, { initialize: false });
+        Object.assign(route as any, {
+            logger: { error: vi.fn(), warn: vi.fn() },
+            transportRuleRepo: { find: vi.fn().mockResolvedValue([{ uid: "r", enabled: true, sequence: 0, conditions: {}, actions: [] }]) },
+            domainUtils: { getVerifiedDomainNames: vi.fn().mockResolvedValue([]) },
+        });
+
+        const outcome = await (route as any).applyTransportRules({ length: 1 }, "a@example.com", ["b@example.com"]);
+
+        expect(outcome).toMatchObject({ reject: false, quarantineReason: "transport_rule" });
+    });
 });

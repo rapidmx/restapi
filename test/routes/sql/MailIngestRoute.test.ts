@@ -815,6 +815,44 @@ describe("Route:MailIngestRouteSQL Tests", () => {
         expect(new Set(entries.map((e) => e.mailboxUid))).toEqual(new Set([mailbox.uid, compliance.uid]));
     });
 
+    it("Applies a quarantine transport rule to a message whose body is nested deeper than a parser recurses, never delivering past it.", async () => {
+        const mailbox = await createMailbox();
+        await createTransportRule({ conditions: { hasAttachment: true }, actions: [{ type: TransportRuleActionType.QUARANTINE }] });
+        const html = "<div>".repeat(3000) + "deep" + "</div>".repeat(3000);
+        const raw = Buffer.from(
+            [
+                "From: sender@example.com",
+                `To: ${mailbox.primarySmtpAddress}`,
+                "MIME-Version: 1.0",
+                'Content-Type: multipart/mixed; boundary="b"',
+                "",
+                "--b",
+                "Content-Type: text/html",
+                "",
+                html,
+                "--b",
+                'Content-Type: application/octet-stream; name="run.exe"',
+                'Content-Disposition: attachment; filename="run.exe"',
+                "",
+                "MZ",
+                "--b--",
+                "",
+            ].join("\r\n"),
+        );
+
+        const result = await request(server.getApplication())
+            .post(`${baseUrl}/deliver`)
+            .set("Authorization", `Bearer ${secret}`)
+            .set("X-Envelope-From", "sender@example.com")
+            .set("X-Envelope-To", mailbox.primarySmtpAddress)
+            .set("Content-Type", "message/rfc822")
+            .send(raw);
+
+        expect(result.status).toBe(202);
+        const entries: IngestQueueEntrySQL[] = await ingestQueueRepo.find({ where: { mailboxUid: mailbox.uid } });
+        expect(entries.map((entry) => entry.quarantineReason)).toEqual([QuarantineReason.TRANSPORT_RULE]);
+    });
+
     it("A matching quarantine transport rule stamps quarantineReason on every created IngestQueueEntry.", async () => {
         const mailbox = await createMailbox();
         await createTransportRule({ actions: [{ type: TransportRuleActionType.QUARANTINE }] });

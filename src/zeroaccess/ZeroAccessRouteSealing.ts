@@ -2,8 +2,10 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { type ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { ApiError } from "@rapidrest/core";
+import { ApiErrors, type ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { Mailbox, ZeroAccessDataType } from "../models/types.js";
+import { hasSealedFields } from "./ZeroAccessFieldSealer.js";
 import { newZeroAccessRecordSealer, type ZeroAccessRecordSealer } from "./ZeroAccessRecordSealer.js";
 
 /**
@@ -26,16 +28,45 @@ export class ZeroAccessRouteSealing {
         return new ZeroAccessRouteSealing(type, mailboxRepo, await newZeroAccessRecordSealer(objectFactory, encryptionPolicyClass));
     }
 
-    /** Seals (or stores readable) the protected fields of `obj`, a create (`existing` undefined) or update body, for its mailbox. A client's
-     * own `sealedFields` is never kept. */
-    public async seal(obj: any, existing: { mailboxUid?: string } | undefined): Promise<void> {
+    /**
+     * Seals (or stores readable) the protected fields of `obj`, a create (`existing` undefined) or update body, for the mailbox it will be
+     * in - on a move to another mailbox, the destination, whose `mailboxUid` the route has already set on `obj`. A client's own
+     * `sealedFields` is never kept. The client opened the record and sends only what it changes, so an empty value clears a field
+     * (`SealFieldsOptions.emptyClears`). A record with sealed content can't move to another mailbox (409, `refuseSealedMove()`).
+     */
+    public async seal(obj: any, existing: { mailboxUid?: string; sealedFields?: Record<string, string> | null } | undefined): Promise<void> {
+        ZeroAccessRouteSealing.refuseSealedMove(obj, existing);
         if (!this.sealer) {
             delete obj.sealedFields;
             return;
         }
-        const mailboxUid: string | undefined = existing?.mailboxUid ?? obj.mailboxUid;
+        const mailboxUid: string | undefined = obj.mailboxUid ?? existing?.mailboxUid;
         const mailbox = mailboxUid ? await this.mailboxRepo?.findOne(mailboxUid, { ignoreACL: true }) : undefined;
-        await this.sealer.sealWrite(this.type, mailbox, obj, existing);
+        await this.sealer.sealWrite(this.type, mailbox, obj, existing, { emptyClears: true });
+    }
+
+    /**
+     * Refuses (409) moving a record whose content is sealed - field by field, as one blob (an event from a zero-access invitation) or its
+     * photo - to another mailbox: what it keeps sealed is addressed to the mailbox it is in, the server can't seal it again to the
+     * destination's key, and that mailbox's other members couldn't open it. The client copies it instead: it creates the record in the
+     * destination with the content it opened, and deletes this one.
+     */
+    public static refuseSealedMove(obj: any, existing: Record<string, any> | undefined): void {
+        if (!existing || obj.mailboxUid === undefined || obj.mailboxUid === existing.mailboxUid) {
+            return;
+        }
+        if (hasSealedFields(existing) || existing.sealedContent || existing.photoSealed) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                409,
+                "This item's details are sealed to its mailbox's zero-access key, so it can't be moved to another mailbox. Copy it there instead.",
+            );
+        }
+    }
+
+    /** Whether `mailbox`'s mail is stored zero-access encrypted now - what its copy of a message carrying a secret must be filed as. */
+    public async sealsMail(mailbox: Mailbox): Promise<boolean> {
+        return !!(await this.sealer?.target("mail", mailbox));
     }
 
     /** The certificate `type` content of `mailboxUid` is sealed to now - for what a route keeps outside the record (a contact's photo

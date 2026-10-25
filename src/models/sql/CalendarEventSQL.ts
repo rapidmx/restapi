@@ -195,6 +195,11 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
     @Nullable
     public sealedFields?: Record<string, string> | null = undefined;
 
+    @Column({ type: "text", nullable: true })
+    @Description("Why the zero-access backfill couldn't seal this record, if it couldn't. Server-written.")
+    @Nullable
+    public zeroAccessBackfillError?: string | null;
+
     // Not indexed: nothing ever queries by this field - `MeetingSchedulingJob` only reads it off rows it has
     // already loaded, to decide whether that one event's invites need per-attendee personalization.
     // `nullable: true` for the same reason as `encryptionOrigin` above: added after the table already existed.
@@ -285,6 +290,7 @@ export class CalendarEventSQL extends RecoverableBaseEntity implements CalendarE
             this.encryptionOrigin = other.encryptionOrigin !== undefined ? other.encryptionOrigin : this.encryptionOrigin;
             this.sealedContent = "sealedContent" in other ? other.sealedContent : this.sealedContent;
             this.sealedFields = "sealedFields" in other ? other.sealedFields : this.sealedFields;
+            this.zeroAccessBackfillError = "zeroAccessBackfillError" in other ? other.zeroAccessBackfillError : this.zeroAccessBackfillError;
             this.videoMeetingUid = "videoMeetingUid" in other ? other.videoMeetingUid : this.videoMeetingUid;
             this.description = "description" in other ? other.description : this.description;
             this.descriptionHtml = "descriptionHtml" in other ? other.descriptionHtml : this.descriptionHtml;

@@ -132,7 +132,7 @@ export abstract class BaseContactRoute<T extends Contact> extends BaseScopedChil
 
     /** `photoBlobKey` names a stored object; a client-chosen key would point this contact's photo at any blob (another
      * mailbox's message body or attachment). Only `setPhoto()`/`deletePhoto()` (below) set it, and `photoSealed` with it. */
-    protected readonly serverManagedFields: readonly string[] = ["photoBlobKey", "photoSealed"];
+    protected readonly serverManagedFields: readonly string[] = ["photoBlobKey", "photoSealed", "zeroAccessBackfillError"];
 
     /** `photoBlobKey` (and whether it is sealed) is dropped from every caller's body, a trusted one's included (the base class leaves
      * those alone): a stored key is deleted with the contact (`afterPurge()`, the erasure job), so no body may be able to name another

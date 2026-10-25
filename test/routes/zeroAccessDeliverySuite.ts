@@ -16,6 +16,9 @@ import { request } from "@rapidrest/service-core/test";
 import { IngestStatus, TransportRuleActionType, type ZeroAccessKey } from "../../src/models/types.js";
 import type { InMemoryBlobStore } from "../testDoubles.js";
 import { isoWeekId } from "../../src/zeroaccess/ZeroAccessSealer.js";
+import { MailEventStream } from "../../src/events/MailEventStream.js";
+import { postfixDsn } from "../fixtures/postfixDsn.js";
+import { deliveryFailureUid } from "../../src/util/DeliveryFailureNoticeUtils.js";
 
 x509.cryptoProvider.set(webcrypto as unknown as Crypto);
 const ENGINE = new pkijs.CryptoEngine({ name: "test", crypto: webcrypto as unknown as Crypto }) as unknown as pkijs.ICryptoEngine;
@@ -54,6 +57,8 @@ export interface ZeroAccessDeliverySuiteContext {
     /** Runs one pass of `ZeroAccessBackfillJob`. */
     runBackfill: () => Promise<void>;
     updateMessage: (uid: string, fields: object) => Promise<void>;
+    /** Saves a `DataSubjectErasureRequest` for `mailboxUid` in `status`. */
+    createErasureRequest: (mailboxUid: string, status: string) => Promise<any>;
 }
 
 interface Recipient {
@@ -238,6 +243,42 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
             expect(await ctx.messages()).toHaveLength(1);
         });
 
+        it("tells the mail event stream a zero-access bounce arrived, but nothing parsed from its body", async () => {
+            const recipient = await makeKey();
+            const mailbox = await zeroAccessMailbox(recipient);
+            const publish = vi.spyOn(MailEventStream.prototype, "publish").mockResolvedValue();
+            try {
+                const result = await deliver([mailbox.primarySmtpAddress], postfixDsn({ to: mailbox.primarySmtpAddress, recipient: "canary-diagnostic@example.net" }));
+
+                expect(result.status).toBe(202);
+                expect(publish).toHaveBeenCalledTimes(1);
+                const event: any = publish.mock.calls[0][0];
+                expect(event).toMatchObject({ type: "message.delivered", mailboxUid: mailbox.uid, zeroAccess: true });
+                expect(event.deliveryStatusReport ?? event.feedbackReport ?? event.reportAuthenticated ?? event.subject).toBeUndefined();
+                expect(JSON.stringify(event)).not.toContain("canary-diagnostic");
+            } finally {
+                publish.mockRestore();
+            }
+        });
+
+        it("seals each of a delivery's zero-access recipients' copies, indexing the attachment text it extracts once for all of them", async () => {
+            const first = await makeKey();
+            const second = await makeKey();
+            const a = await zeroAccessMailbox(first);
+            const b = await zeroAccessMailbox(second);
+
+            const result = await deliver([a.primarySmtpAddress, b.primarySmtpAddress], rawMessage(a.primarySmtpAddress));
+
+            expect(result.status).toBe(202);
+            const entries = await ctx.indexEntries();
+            expect(entries.map((entry) => entry.mailboxUid).sort()).toEqual([a.uid, b.uid].sort());
+            for (const [mailbox, recipient] of [[a, first], [b, second]] as const) {
+                const entry = entries.find((e) => e.mailboxUid === mailbox.uid);
+                const document = JSON.parse(gunzipSync(await open(Buffer.from(entry.sealed, "base64"), recipient)).toString("utf-8"));
+                expect(document.attachmentText.join(" ")).toContain(CANARY_ATTACHMENT);
+            }
+        });
+
         it.each([
             ["the administrator disallowed it", async (mailbox: any) => ctx.setAllowZeroAccess(false)],
             ["the owner turned it off", async (mailbox: any) => ctx.updateMailbox(mailbox.uid, { zeroAccessEnabled: false })],
@@ -332,6 +373,25 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
             expect((await ctx.entries())[0].status).toBe(IngestStatus.DELIVERED);
             expect(await ctx.messages()).toHaveLength(1);
             expect(await ctx.indexEntries()).toHaveLength(1);
+        });
+
+        it("answers 503 while an erasure of the mailbox is pending, so the MTA keeps the message rather than it being lost", async () => {
+            const recipient = await makeKey();
+            const mailbox = await zeroAccessMailbox(recipient);
+            await ctx.createErasureRequest(mailbox.uid, "approved");
+            const raw = rawMessage(mailbox.primarySmtpAddress);
+
+            const deferred = await deliver([mailbox.primarySmtpAddress], raw);
+
+            expect(deferred.status).toBe(503);
+            const [entry] = await ctx.entries();
+            expect(entry.status).toBe(IngestStatus.FAILED);
+            expect(entry.attempts).toBe(0);
+            expect(await ctx.messages()).toEqual([]);
+
+            // The MTA's retry while it is still pending is deferred again, never filed or counted.
+            expect((await deliver([mailbox.primarySmtpAddress], raw)).status).toBe(503);
+            expect((await ctx.entries())[0].attempts).toBe(0);
         });
 
         it("seals an invitation's title, location and description on the event it creates and on its later updates", async () => {
@@ -624,6 +684,36 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
 
                 expect(result.status).toBeLessThan(300);
                 await expectSealedSentCopy(message.uid, recipient, [bodyBlobKey, attachmentBlobKey]);
+            });
+
+            it("files the notice of a send refused for some recipients sealed, quoting the subject nowhere readable", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const { message } = await draft(mailbox);
+                await ctx.updateMessage(message.uid, {
+                    recipients: [
+                        { address: "carol@example.org", type: "to" },
+                        { address: "partial-reject@example.com", type: "to" },
+                    ],
+                });
+
+                const result = await request(ctx.app())
+                    .post(`${ctx.messagesUrl}/${message.uid}/send`)
+                    .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                    .send({});
+
+                expect(result.status).toBeLessThan(300);
+                const uid = deliveryFailureUid(mailbox.uid, `send-partial:${message.uid}`);
+                const notice = await ctx.findMessage(uid);
+                expect(notice.subject).toBe("[...]");
+                expect(notice.bodyPreview).toBe("");
+                expect(notice.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                expect(await ctx.blobStore().exists(`notices/${uid}`)).toBe(false);
+                const opened = (await openSealedMessage(await ctx.blobStore().get(notice.bodyBlobKey), recipient)).toString("latin1");
+                expect(opened).toContain("partial-reject@example.com");
+                for (const [key, content] of blobs()) {
+                    expect(content.toString("latin1").includes(CANARY_SUBJECT), `${key} holds the subject`).toBe(false);
+                }
             });
 
             it("seals the Sent Items copy of a message sent in the background", async () => {

@@ -1760,6 +1760,10 @@ export interface Contact extends RecoverableBaseEntity {
      * protected fields are empty. Written by the server only. */
     sealedFields?: Record<string, string> | null;
 
+    /** Why the zero-access backfill couldn't seal this record (`ZeroAccessBackfillJob`), which then never selects it again. Written by
+     * the server only. */
+    zeroAccessBackfillError?: string | null;
+
     /** The photo blob (`photoBlobKey`) is sealed to the mailbox's zero-access key: served as stored, opened by the client. Server-written. */
     photoSealed?: boolean | null;
 
@@ -2605,6 +2609,10 @@ export interface CalendarEvent extends RecoverableBaseEntity {
      * mailbox's zero-access key (`zeroaccess/ZeroAccessFieldSealer.ts`); `title` then shows "Protected event". Written by the server only. */
     sealedFields?: Record<string, string> | null;
 
+    /** Why the zero-access backfill couldn't seal this record (`ZeroAccessBackfillJob`), which then never selects it again. Written by
+     * the server only. */
+    zeroAccessBackfillError?: string | null;
+
     /**
      * The identifier of the video meeting a compose client linked to this event, if any - e.g. a
      * `@rapidmx/meet-plugin` `VideoMeeting.uid`, named here generically and by name only: this library
@@ -2842,6 +2850,10 @@ export interface Task extends RecoverableBaseEntity {
     /** The protected title and notes, sealed field by field to the mailbox's zero-access key while zero-access covers tasks
      * (`zeroaccess/ZeroAccessFieldSealer.ts`); `title` then holds a placeholder. Written by the server only. */
     sealedFields?: Record<string, string> | null;
+
+    /** Why the zero-access backfill couldn't seal this record (`ZeroAccessBackfillJob`), which then never selects it again. Written by
+     * the server only. */
+    zeroAccessBackfillError?: string | null;
 
     dueDate?: Date;
 

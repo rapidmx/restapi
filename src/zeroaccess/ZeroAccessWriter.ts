@@ -24,6 +24,9 @@ const { Config, Inject } = ObjectDecorators;
 export const ZERO_ACCESS_DRAFT_MESSAGE =
     "This draft is stored with zero-access encryption, which the server can't send. Open it and send it again.";
 
+/** Thrown by `ZeroAccessWriter.sealRaw()` for a message it can't parse: unlike a failure to store it, trying again won't help. */
+export class ZeroAccessParseError extends Error {}
+
 /** Where `seal()` stores the sealed message and how it treats an existing index entry - the defaults are a message filed once. */
 export interface ZeroAccessSealOptions {
     /** The blob key to store the sealed message under, instead of `zeroAccessBlobKey(mailboxUid, messageUid)`. */
@@ -97,9 +100,19 @@ export class ZeroAccessWriter {
         protected readonly indexEntryClass: any,
     ) {}
 
-    /** The key `mailbox`'s mail is sealed to now, or `undefined` when zero-access isn't active for it. */
-    public async target(mailbox: ZeroAccessMailbox, type: ZeroAccessDataType = "mail"): Promise<ZeroAccessTarget | undefined> {
-        return new ZeroAccessResolver(this.policyRepo, this.aclUtils, this.allowedDefault, this.trustedRoles).target(mailbox, type);
+    /** The key `mailbox`'s mail is sealed to now, or `undefined` when zero-access isn't active for it. `allowed`: the administrator's
+     * setting already read (`allowed()`), for a caller deciding many mailboxes. */
+    public async target(mailbox: ZeroAccessMailbox, type: ZeroAccessDataType = "mail", allowed?: boolean): Promise<ZeroAccessTarget | undefined> {
+        return this.resolver().target(mailbox, type, allowed);
+    }
+
+    /** The effective "Allow zero-access encryption" (`ZeroAccessResolver.allowed()`). */
+    public allowed(): Promise<boolean> {
+        return this.resolver().allowed();
+    }
+
+    private resolver(): ZeroAccessResolver {
+        return new ZeroAccessResolver(this.policyRepo, this.aclUtils, this.allowedDefault, this.trustedRoles);
     }
 
     /**
@@ -173,7 +186,12 @@ export class ZeroAccessWriter {
         if (!(await this.target(mailbox))) {
             return undefined;
         }
-        const parsed: ParsedMail = await simpleParser(raw, { skipImageLinks: true });
+        let parsed: ParsedMail;
+        try {
+            parsed = await simpleParser(raw, { skipImageLinks: true });
+        } catch (err: any) {
+            throw new ZeroAccessParseError(`The message couldn't be parsed: ${err?.message ?? err}`);
+        }
         const bodyText: string = (parsed.text || (typeof parsed.html === "string" ? htmlPreview(parsed.html, BODY_TEXT_MAX_LENGTH) : "")).slice(0, BODY_TEXT_MAX_LENGTH);
         return this.seal(mailbox, {
             messageUid,

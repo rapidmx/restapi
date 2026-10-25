@@ -71,6 +71,9 @@ export interface MessageDeliveredEvent extends MailEventBase {
      * itself (`originalMessageId`, the VERP address in `envelopeTo`) before suppressing an address or the like.
      */
     reportAuthenticated?: boolean;
+    /** `true` when the copy was filed zero-access encrypted (restapi `specs/search.md` §3): its subject and any report parsed from its
+     * body (`deliveryStatusReport`, `feedbackReport`, `reportAuthenticated`) are sealed and left out of the event, not missing. */
+    zeroAccess?: true;
 }
 
 /** Where an outbound message came from. */

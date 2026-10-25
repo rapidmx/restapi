@@ -427,6 +427,31 @@ describe("fileDeliveryFailureNotice()", () => {
         messageRepo.create.mockRejectedValueOnce(new Error("datastore down"));
         await expect(fileDeliveryFailureNotice(sink, input())).rejects.toThrow("datastore down");
     });
+
+    it("Files the notice sealed for a zero-access mailbox, keeping no readable copy, and removes what it sealed when it can't be filed.", async () => {
+        const sealed = { subject: "[...]", bodyPreview: "", bodyBlobKey: "za/mailbox-1/n", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" }, indexEntryUid: "ix" };
+        const zeroAccessWriter = { sealRaw: vi.fn().mockResolvedValue(sealed), removeIndexEntry: vi.fn().mockResolvedValue(undefined) };
+        const mailbox = { uid: "mailbox-1", zeroAccessKeys: [] } as any;
+        const uid = deliveryFailureUid("mailbox-1", "send-partial:message-1");
+        await blobStore.put(sealed.bodyBlobKey, Buffer.from("sealed"));
+
+        const message = await fileDeliveryFailureNotice({ ...sink, zeroAccessWriter }, input({ mailbox }));
+
+        expect(zeroAccessWriter.sealRaw).toHaveBeenCalledWith(mailbox, expect.any(Buffer), uid, expect.any(Date));
+        expect(zeroAccessWriter.sealRaw.mock.calls[0][1].toString()).toContain("Undeliverable: Q3 plan");
+        expect(message.fields).toMatchObject({ subject: "[...]", bodyPreview: "", bodyBlobKey: "za/mailbox-1/n", zeroAccess: sealed.zeroAccess });
+        expect(await blobStore.exists(`notices/${uid}`)).toBe(false);
+
+        messageRepo.create.mockRejectedValueOnce(new Error("datastore down"));
+        await expect(fileDeliveryFailureNotice({ ...sink, zeroAccessWriter }, input({ mailbox }))).rejects.toThrow("datastore down");
+        expect(zeroAccessWriter.removeIndexEntry).toHaveBeenCalledWith("ix");
+        expect(await blobStore.exists(sealed.bodyBlobKey)).toBe(false);
+
+        // Not active for the mailbox: filed readable as before.
+        zeroAccessWriter.sealRaw.mockResolvedValueOnce(undefined);
+        const readable = await fileDeliveryFailureNotice({ ...sink, zeroAccessWriter }, input({ mailbox, key: "other" }));
+        expect(readable.fields.subject).toBe("Undeliverable: Q3 plan");
+    });
 });
 
 describe("tryFileDeliveryFailureNotice()", () => {
