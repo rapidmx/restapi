@@ -506,6 +506,33 @@ export function calendarEventDialogSuite(ctx: CalendarEventDialogSuiteContext): 
             expect(raw).not.toContain("DESCRIPTION");
         });
 
+        it("Names an event whose content is sealed by the invitationContent the client sends, and without it sends no SUMMARY that could rename the meeting.", async () => {
+            const newStart = new Date(start.getTime() + 3 * HOUR);
+            const time = { startDate: newStart.toISOString(), endDate: new Date(newStart.getTime() + HOUR).toISOString() };
+            // Sealed field by field, and (an event filed from a zero-access invitation) whole in sealedContent.
+            for (const sealed of [
+                { title: "Protected event", location: null, sealedFields: { title: "c2VhbGVk" } },
+                { title: "[...]", location: null, sealedContent: { keyFingerprint: "fp", sealed: "c2VhbGVk" } },
+            ]) {
+                const { event } = await guestOf(undefined, sealed);
+
+                ctx.transport().sent = [];
+                expect((await post(event.uid, { ...time, invitationContent: { title: "Team lunch" } })).status).toBe(200);
+                let raw = sentCounter();
+                expect(raw).toContain("SUMMARY:Team lunch");
+                expect(raw).toContain("Change requested: Team lunch");
+
+                ctx.transport().sent = [];
+                const result = await post(event.uid, time);
+                expect(result.status).toBe(200);
+                expect(result.body.changes).toEqual(["time"]);
+                raw = sentCounter();
+                expect(raw).not.toContain("SUMMARY");
+                expect(raw).not.toContain(sealed.title);
+                expect(raw).toContain("Change requested: Meeting invitation");
+            }
+        });
+
         it("Accepts a request that only adds guests when guests may invite others, even if they may not modify.", async () => {
             const { event } = await guestOf({ guestsCanModify: false, guestsCanInviteOthers: true });
 

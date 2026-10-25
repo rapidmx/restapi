@@ -36,7 +36,7 @@ import {
     type SignerCertificateOptions,
     type TestIssuer,
 } from "./signerCertificates.js";
-import { certifiedBy, openPgpKey } from "../openPgpTestKeys.js";
+import { certifiedBy, openPgpKey, reexpired } from "../openPgpTestKeys.js";
 
 x509.cryptoProvider.set(crypto);
 
@@ -198,6 +198,22 @@ describe("applyDiscoveredKeys() Tests", () => {
 
         expect(result.keys).toEqual([pinned]);
         expect(result.keyConflicts).toBeUndefined();
+    });
+
+    it("Refreshes a pinned OpenPGP certificate from a copy with the same fingerprint, keeping the pin, and an unchanged copy changes nothing.", async () => {
+        const address = "refresh@proton.example";
+        const pinned = await openPgpKey(address, { created: new Date(Date.now() - 10 * 86_400_000), expiresIn: 20 * 86_400 });
+        const extended = await reexpired(pinned, 800 * 86_400);
+        const existing: ContactKeyState = { keys: [pinned.key], keysFirstSeen: 1 };
+        const response = (key: PublicKey): KeyDiscoveryResponse => ({ encryptPreference: { preferEncrypt: "nopreference" }, keys: [key], escrow: false });
+
+        const refreshed = await applyDiscoveredKeys(existing, response(extended.key), Date.now(), "discovery", address);
+        expect(refreshed.keys).toEqual([expect.objectContaining({ fingerprint: pinned.fingerprint, notAfter: extended.key.notAfter })]);
+        expect(refreshed.keys![0].publicKey).not.toBe(pinned.key.publicKey);
+        expect(refreshed.keyConflicts).toBeUndefined();
+        expect(refreshed.previousKeys).toBeUndefined();
+
+        expect((await applyDiscoveredKeys(existing, response(pinned.key), Date.now(), "discovery", address)).keys).toEqual([pinned.key]);
     });
 
     it("Records a conflict (retaining the pinned key) when a different, still-valid key is observed.", async () => {

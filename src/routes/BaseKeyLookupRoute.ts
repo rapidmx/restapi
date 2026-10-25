@@ -36,7 +36,7 @@ import {
 import { LocalKeyDiscovery } from "../util/LocalKeyDiscoveryUtils.js";
 import { isPlainAddress } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-import { isOpenPgpKey, keySlot, OPENPGP_KEY_TYPE } from "../util/OpenPgpKeyUtils.js";
+import { isOpenPgpKey, keySlot, mergeOpenPgpCertificate, OPENPGP_KEY_TYPE } from "../util/OpenPgpKeyUtils.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Query, RateLimit, Request, User: AuthUser } = RouteDecorators;
 
@@ -366,7 +366,9 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
      *
      * Only ever adds the first signing key. A contact that already pins a signing key gets 409 when it's a different
      * certificate (replacing a pinned key is `resolve()`'s job, which needs the pinned fingerprint the user saw, so this
-     * can't be used to substitute a key) and 200 with nothing written when it's the same one. Existing encrypt keys, `encryptPreference` and
+     * can't be used to substitute a key) and 200 with nothing written when it's the same one - but for an OpenPGP certificate, whose
+     * fingerprint is its primary key's: what the given copy adds (an extended expiry, subkeys, revocations) is merged into the pinned one
+     * (`mergeOpenPgpCertificate()`). Existing encrypt keys, `encryptPreference` and
      * `keyConflicts` are left alone; `keysFirstSeen` is set when unset.
      *
      * The certificate is validated by `util/SignerCertificateUtils.ts`'s `parseTrustedSignerKey()` (400: unparseable, not
@@ -414,7 +416,9 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
                 const pinned: PublicKey | undefined = existing?.keys?.find((k) => keySlot(k) === keySlot(key));
                 if (pinned) {
                     if (pinned.fingerprint === key.fingerprint) {
-                        return undefined;
+                        // The same OpenPGP certificate as it is now: what it adds (an extended expiry, subkeys, revocations) is merged in.
+                        const refreshed: PublicKey | undefined = isOpenPgpKey(key) ? await mergeOpenPgpCertificate(pinned, key, now) : undefined;
+                        return refreshed ? ({ keys: existing!.keys!.map((k) => (k === pinned ? refreshed : k)) } as Partial<C>) : undefined;
                     }
                     throw new ApiError(
                         ApiErrors.IDENTIFIER_EXISTS,
@@ -456,7 +460,7 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
      * request (400: unparseable, not currently valid, doesn't name `address`, usage doesn't fit `useType`). Then:
      * - 404 when there's no contact, no pinned `useType` key, or (without `certificate`) no conflict for `useType`;
      * - 200 with nothing written when the given certificate is already the pinned key (checked before the fingerprint
-     * match, so a retried accept of the same certificate succeeds);
+     * match, so a retried accept of the same certificate succeeds) - an OpenPGP one's newer components merged in, as `trust()` does;
      * - 409 when the pinned key isn't `expectedPinnedFingerprint` (it changed since the user looked);
      * - otherwise the new key is pinned, the old one moves to `previousKeys` (`replacement: "user"`), the `useType`'s
      * conflict is cleared, the new fingerprint leaves `previousKeys` and `rejectedKeys`, and
@@ -571,7 +575,13 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
                 throw new ApiError(ApiErrors.NOT_FOUND, 404, "There is no pinned key of this type to replace for this address.");
             }
             if (givenKey?.fingerprint === pinned.fingerprint) {
-                return undefined;
+                // The pinned OpenPGP certificate as it is now: what it adds is merged in, as discovery does (`mergeOpenPgpCertificate()`).
+                const refreshed: PublicKey | undefined = isOpenPgpKey(givenKey) ? await mergeOpenPgpCertificate(pinned, givenKey, now) : undefined;
+                if (!refreshed) {
+                    return undefined;
+                }
+                keys[pinnedIndex] = refreshed;
+                return { keys } as Partial<C>;
             }
             if (pinned.fingerprint !== expectedPinnedFingerprint) {
                 throw pinnedKeyChanged();

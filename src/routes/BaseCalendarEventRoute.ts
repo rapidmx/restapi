@@ -100,6 +100,9 @@ export interface InviteSource {
     ics?: string;
 }
 
+/** What a reply or change request names an event by when its content is sealed and the request didn't send it (`withInvitationContent()`). */
+const UNNAMED_EVENT: string = "Meeting invitation";
+
 /** The longest calendar file a client may send for a zero-access invitation. */
 const MAX_CLIENT_ICS_LENGTH: number = 1024 * 1024;
 
@@ -438,11 +441,19 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         return Array.isArray(created) ? events : events[0];
     }
 
-    /** `event` named by the request's `invitationContent` when its own content is sealed - what a reply or a change request about it says;
-     * `event` itself otherwise, or when the request sends none. */
+    /**
+     * `event` named by the request's `invitationContent` when its own content is sealed - field by field (`sealedFields`), or whole as an
+     * event filed from a zero-access invitation (`sealedContent`) - what a reply or a change request about it says; `event` itself when it
+     * isn't. A sealed event the request sends no content for has none: its title, location and description are left empty rather than
+     * named by their placeholders, so its iTIP message carries no `SUMMARY` an organizer's server could take for the real title (an
+     * unprotected organizer's applies a change request's title) and its mail names it `UNNAMED_EVENT`.
+     */
     private static withInvitationContent<E extends CalendarEvent>(event: E, body: any): E {
-        const content: InvitationContent | undefined = hasSealedFields(event) ? BaseCalendarEventRoute.takeInvitationContent(body, false) : undefined;
-        return content ? { ...event, ...content } : event;
+        if (!hasSealedFields(event) && !event.sealedContent) {
+            return event;
+        }
+        const content: InvitationContent | undefined = BaseCalendarEventRoute.takeInvitationContent(body, false);
+        return content ? { ...event, ...content } : { ...event, title: "", location: undefined, description: undefined, descriptionHtml: undefined };
     }
 
     /**
@@ -473,18 +484,24 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (!invitationsPending(event) || !(hasSealedFields(event) || event.videoMeetingUid)) {
             return event;
         }
-        // Built on first use: most events are never protected. Unnamed, so it is this route's own: a named instance is shared through the
-        // factory, and another caller's (`MeetingSchedulingJob`'s, another backend's route) would come back without this route's
-        // `mayCarryMeetingKey` and repositories.
-        this.inviteSender ??= await this._objectFactory!.newInstance(MeetingInviteSender, {
-            args: [this.mailboxRepo, this.attendeeLinkRepo, { mayCarryMeetingKey: (address: string) => this.mayCarryMeetingKey(address) }],
-        });
-        const claimed = (await this.inviteSender.sendProtectedInvitations(event, content, this.repoUtils!, "BaseCalendarEventRoute", secrets)) as T | undefined;
+        const claimed = (await (await this.getInviteSender()).sendProtectedInvitations(event, content, this.repoUtils!, "BaseCalendarEventRoute", secrets)) as
+            | T
+            | undefined;
         if (!claimed) {
             return event;
         }
         this.notify(claimed.folderUid, "update", claimed);
         return claimed;
+    }
+
+    /** This route's `MeetingInviteSender`. Built on first use: most events are never protected. Unnamed, so it is this route's own: a named
+     * instance is shared through the factory, and another caller's (`MeetingSchedulingJob`'s, another backend's route) would come back
+     * without this route's `mayCarryMeetingKey` and repositories. */
+    private async getInviteSender(): Promise<MeetingInviteSender> {
+        this.inviteSender ??= await this._objectFactory!.newInstance(MeetingInviteSender, {
+            args: [this.mailboxRepo, this.attendeeLinkRepo, { mayCarryMeetingKey: (address: string) => this.mayCarryMeetingKey(address) }],
+        });
+        return this.inviteSender;
     }
 
     /**
@@ -666,12 +683,13 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         answer: "accepted" | "declined" | "tentative",
         ics: string,
     ): Promise<void> {
+        const name: string = event.title || UNNAMED_EVENT;
         await this.sendItipMail(
             event,
             mailbox,
             responder,
-            `${answer === "declined" ? "Declined" : answer === "tentative" ? "Tentative" : "Accepted"}: ${event.title}`,
-            `${responder.displayName ?? responder.address} has responded ${answer} to: ${event.title}`,
+            `${answer === "declined" ? "Declined" : answer === "tentative" ? "Tentative" : "Accepted"}: ${name}`,
+            `${responder.displayName ?? responder.address} has responded ${answer} to: ${name}`,
             "reply",
             ics,
         );
@@ -861,8 +879,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         const proposer: Attendee = { ...guest, responseStatus: AttendeeResponseStatus.TENTATIVE };
         const proposed: CalendarEvent = {
             ...event,
-            // The title is always named (the organizer's card shows it); the location only when it is asked to change - a guest's own copy
-            // may hold a link of their own (`CalendarEventAttendeeLink`) that must never be mistaken for a request.
+            // The title is always named (the organizer's card shows it) - but for a sealed event whose content the request didn't send
+            // (`withInvitationContent()`); the location only when it is asked to change - a guest's own copy may hold a link of their own
+            // (`CalendarEventAttendeeLink`) that must never be mistaken for a request.
             title: title ?? event.title,
             location: changes.includes("location") ? location : undefined,
             description: changes.includes("description") ? (description.description ?? undefined) : undefined,
@@ -874,12 +893,12 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             ...changes.map((change) => `- ${change === "time" ? `time: ${startDate.toUTCString()} - ${endDate.toUTCString()}` : change === "title" ? `title: ${title}` : change === "location" ? `location: ${location}` : "description"}`),
             ...added.map((entry) => `- add guest: ${entry.displayName ? `${entry.displayName} <${entry.address}>` : entry.address}`),
         ];
-        const note: string = `${proposer.displayName ?? proposer.address} asked to change: ${event.title}\n\n${lines.join("\n")}`;
+        const note: string = `${proposer.displayName ?? proposer.address} asked to change: ${event.title || UNNAMED_EVENT}\n\n${lines.join("\n")}`;
         const sent: boolean = await this.sendItipMail(
             event,
             mailbox,
             proposer,
-            `Change requested: ${event.title}`,
+            `Change requested: ${event.title || UNNAMED_EVENT}`,
             note,
             "counter",
             buildEventIcs(proposed, "COUNTER", { onlyAttendee: proposer, changeRequest: true, extraAttendees: added }),
@@ -1066,12 +1085,21 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * Accepts an attendee's proposed time (a `COUNTER` message) for a meeting the reader organizes: moves the meeting to the proposed start and
      * end, bumps its `SEQUENCE` - so the scheduling job mails every attendee the updated invitation - and resets the other attendees' answers,
      * since they answered another time. The proposer is marked accepted. `400` unless `canAcceptProposal`.
+     *
+     * A meeting whose content is sealed, or that is protected by a per-meeting key, is one the scheduling job can't invite for: its updated
+     * invitations are sent here, from the plaintext title, location and description and the guests' link keys the organizer's client sends
+     * in `invitationContent` (and its `meetingLinkSecrets`), as a save does (`MeetingInviteSender.sendProtectedInvitations()`). Without them
+     * it is a `400` and nothing moves, rather than a meeting moved that no guest is told of.
      */
     @Summary("Accept a proposed new time")
     @Description("Moves the meeting to the time an attendee proposed (an iTIP COUNTER) and re-invites the attendees.")
     @Returns([Object])
     @Post("/invite/:messageUid/accept-proposal")
-    public async acceptProposal(@Param("messageUid") messageUid: string, body: InviteSource | undefined, @AuthUser user?: JWTUser): Promise<MessageInvite> {
+    public async acceptProposal(
+        @Param("messageUid") messageUid: string,
+        body: (InviteSource & { invitationContent?: InvitationContent & { meetingLinkSecrets?: MeetingLinkSecrets } }) | undefined,
+        @AuthUser user?: JWTUser,
+    ): Promise<MessageInvite> {
         const context = await this.loadInvite(messageUid, user, ACLAction.UPDATE, body?.ics);
         const view: MessageInvite = await this.describe(context);
         const existing: CalendarEvent | undefined = context.existing;
@@ -1083,6 +1111,15 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         // The message's `From` is only as good as the DKIM result behind it: inbound processing applies a proposal from an authenticated sender only.
         if (context.verifiedSender !== normalizeAddress(context.message.from.address)) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "This proposal's sender could not be verified.");
+        }
+        const content: InvitationContent | undefined = BaseCalendarEventRoute.takeInvitationContent(body, false);
+        const secrets: MeetingLinkSecrets | undefined = meetingLinkSecretsOf(body?.invitationContent?.meetingLinkSecrets);
+        if (existing.encryptionOrigin !== "originated" && ((hasSealedFields(existing) && !content) || ((await (await this.getInviteSender()).isKeyedMeeting(existing)) && !secrets))) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                "This meeting's invitations are protected: accepting a proposal needs its invitationContent (and the guests' meetingLinkSecrets).",
+            );
         }
         const proposer: string = normalizeAddress(view.reply!.address);
         const patch: any = {
@@ -1099,7 +1136,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                       : { ...attendee, responseStatus: AttendeeResponseStatus.NEEDS_ACTION },
             ),
         };
-        const updated: CalendarEvent = await this.repoUtils!.update(patch, existing as any, { user, ignoreACL: true });
+        const updated: CalendarEvent = await this.sendProtectedInvitations(await this.repoUtils!.update(patch, existing as any, { user, ignoreACL: true }), content, secrets);
         await this.recordInviteAnswer(context.message, "accepted");
         context.message.meetingResponse = "accepted";
         return await this.describe(context, { existing: updated });

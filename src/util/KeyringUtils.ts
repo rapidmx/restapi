@@ -11,9 +11,10 @@ import type { DnsResolver } from "../dns/DnsResolver.js";
 import { resolveFederationPolicy } from "./FederationUtils.js";
 import { fetchRemoteKeys, MAX_DISCOVERED_KEYS, parseKeyDiscoveryAddress, parseKeyDiscoveryResponse } from "./KeyDiscoveryClient.js";
 import { discoverLocalKeys, type LocalKeyDiscovery } from "./LocalKeyDiscoveryUtils.js";
-import { canReplaceOpenPgpKeyAutomatically, isOpenPgpKey, keySlot, parseOpenPgpContactKey, sanitizeOpenPgpKey } from "./OpenPgpKeyUtils.js";
+import { canReplaceOpenPgpKeyAutomatically, isOpenPgpKey, keySlot, mergeOpenPgpCertificate, parseOpenPgpContactKey, sanitizeOpenPgpKey } from "./OpenPgpKeyUtils.js";
 import { parseContactKey } from "./SignerCertificateUtils.js";
-import { fetchWkdKey } from "./WkdClient.js";
+import { fetchWkdKeys } from "./WkdClient.js";
+import { normalizeAddress } from "./AddressUtils.js";
 import { Contact, EncryptionPreference, KeyConflict, KeyDiscoveryResponse, PreviousKey, PublicKey, RejectedKey } from "../models/types.js";
 
 /** The subset of `Contact` this module reads/writes - callers pass exactly this shape whether the caller has
@@ -258,6 +259,7 @@ export function escalateRevocation<K extends PublicKey>(key: K, listed: PublicKe
  * - **Formats**: keys are pinned per key slot (`keySlot()`: `useType` and format), so an address's S/MIME certificates and its OpenPGP certificate are pinned side by side. Everything below applies per slot; an OpenPGP certificate's checks are `OpenPgpKeyUtils`' (`parseOpenPgpContactKey()`, `canReplaceOpenPgpKeyAutomatically()`: the pinned key, expired or revoked as superseded but never as compromised, certified its successor).
  * - **Revocation evidence**: a listed key with `revokedAt` is never pinned or recorded as a conflict. When it matches a pinned or previous key (same `useType` and fingerprint), that key takes its `revokedAt`/`revocationReason` if they're stronger than the stored ones (`escalateRevocation()`), which also feeds the automatic replacement below. A non-revoked key already in `previousKeys` for its `useType` is ignored (it was replaced before).
  * - **TOFU pinning**: the first key ever observed for a given `useType` (encrypt/sign) is pinned immediately, with no conflict recorded.
+ * - **Refreshing an OpenPGP certificate**: one listed with the pinned key's fingerprint is the same certificate as served now, and what it adds - an extended expiry, new or revoked subkeys - is merged into the pinned copy (`mergeOpenPgpCertificate()`), keeping the pin. An X.509 fingerprint covers the whole certificate, so there is nothing to refresh.
  * - **Automatic replacement**: a different key for a `useType` that has one pinned replaces it when `canReplaceAutomatically()` holds (same issuing CA, proven with the published `issuerCertificate`; pinned key expired or revoked; new key valid for the address). The old key moves to `previousKeys` (`replacement: "automatic"`, keeping its `revokedAt`/`revocationReason`) and the `useType`'s conflict is cleared.
  * - **Key Conflict Handling**: otherwise the pinned key is retained and the observed key is recorded in `keyConflicts` (one per `useType`, the latest observation replacing an earlier one), unless the user rejected that fingerprint (`rejectedKeys`).
  * - **Anti-Downgrade**: a `discovered` of `undefined` (no key header, or Discovery found nothing) makes this function a no-op on `keys`/`encryptPreference` - the caller still decides separately whether to stamp `Contact.lastMessageSeen`. Keys are never removed. A present `discovered.encryptPreference` only replaces the stored one when its `lastSeen` is strictly newer than what's on file, per the spec's explicit anti-downgrade rule for preference updates.
@@ -331,6 +333,10 @@ export async function applyDiscoveredKeys(
         }
         const pinned: PublicKey = resultKeys[pinnedIndex];
         if (pinned.fingerprint === fingerprint) {
+            const refreshed: PublicKey | undefined = isOpenPgpKey(discoveredKey) ? await mergeOpenPgpCertificate(pinned, discoveredKey, observedAt) : undefined;
+            if (refreshed) {
+                resultKeys[pinnedIndex] = refreshed;
+            }
             continue;
         }
         const replaceable: boolean = isOpenPgpKey(discoveredKey)
@@ -380,8 +386,12 @@ export async function applyDiscoveredKeys(
  * (`util/KeyDiscoveryClient.ts`).
  *
  * An address whose domain isn't a RapidMX peer (no `_rapidmx` record) is looked up in its domain's OpenPGP Web Key Directory
- * instead (`WkdClient.fetchWkdKey()`, `specs/end-to-end_encryption.md` *OpenPGP Interoperability*) - how a Proton Mail user's key
- * is found. A key found there carries no encryption preference.
+ * instead (`WkdClient.fetchWkdKeys()`, `specs/end-to-end_encryption.md` *OpenPGP Interoperability*) - how a Proton Mail user's key
+ * is found, and how a revocation its holder published there reaches a contact that pins the revoked key. A key found there carries
+ * no encryption preference.
+ *
+ * A local alias or plus-tagged address is merged as the contact's own address (the one asked for), with the mailbox's primary address,
+ * which its certificates name, as the response's `address`, so a key conflict records the address its key was checked against.
  *
  * Returns `undefined` - not a "no-op" `KeyringUpdate` - when there is nothing to merge: the domain isn't a federated peer
  * and publishes no OpenPGP key over WKD, the fetch failed with nothing cached, or the address is of this deployment's own
@@ -404,7 +414,9 @@ export async function discoverAndMergeKeys(
         const found = await discoverLocalKeys(local, address);
         if (found) {
             // The mailbox's primary address is what its certificates name, whichever alias or plus-tagged form was asked for.
-            return found.response ? await applyDiscoveredKeys(existing, found.response, observedAt, "discovery", found.address) : undefined;
+            return found.response
+                ? await applyDiscoveredKeys(existing, { ...found.response, address: found.address }, observedAt, "discovery", normalizeAddress(address))
+                : undefined;
         }
     }
     // The same parser `fetchRemoteKeys()` uses, so the policy is resolved for exactly the domain keys are fetched for
@@ -415,9 +427,9 @@ export async function discoverAndMergeKeys(
     }
     const policy = await resolveFederationPolicy(dnsResolver, parsed.domain);
     if (!policy) {
-        const wkdKey: PublicKey | undefined = await fetchWkdKey(address);
-        return wkdKey
-            ? await applyDiscoveredKeys(existing, { encryptPreference: { preferEncrypt: "nopreference" }, keys: [wkdKey], escrow: false }, observedAt, "discovery", address)
+        const wkdKeys: PublicKey[] = await fetchWkdKeys(address);
+        return wkdKeys.length > 0
+            ? await applyDiscoveredKeys(existing, { encryptPreference: { preferEncrypt: "nopreference" }, keys: wkdKeys, escrow: false }, observedAt, "discovery", address)
             : undefined;
     }
     const discovered = await fetchRemoteKeys(policy.host, address);

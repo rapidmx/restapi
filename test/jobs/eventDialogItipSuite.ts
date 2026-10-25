@@ -30,6 +30,8 @@ export interface EventDialogItipContext {
     deliver: (raw: Buffer, envelopeFrom: string) => Promise<void>;
     /** Saves a `CalendarEvent` row of the test mailbox (a folder uid of "calendar-folder"); `data` overrides the defaults. */
     saveEvent: (data: any) => Promise<any>;
+    /** Saves a `CalendarEventAttendeeLink` row of the test mailbox. */
+    saveAttendeeLink: (data: any) => Promise<any>;
     events: (icalUid: string) => Promise<any[]>;
     event: (uid: string) => Promise<any>;
     /** Every message delivered to the test mailbox. */
@@ -285,18 +287,72 @@ export function eventDialogItipSuite(ctx: EventDialogItipContext): void {
                 expect((await counterMessage()).meetingResponse).toBe("accepted");
             });
 
-            it("Applies only the time to an event of a protected calendar, never writing the guest's title, location or description readable.", async () => {
-                const row = await organized({ title: "Protected event", sealedFields: { title: "c2VhbGVk" } });
+            // `MeetingSchedulingJob` can't invite for these, so applying the request would move the meeting with no guest told.
+            for (const [what, data] of [
+                ["sealed field by field", { title: "Protected event", sealedFields: { title: "c2VhbGVk" } }],
+                ["sealed whole (sealedContent)", { title: "[...]", sealedContent: { keyFingerprint: "fp", sealed: "c2VhbGVk" } }],
+            ] as const) {
+                it(`Leaves a request to change an event ${what} a proposal: nothing is applied and the message isn't marked.`, async () => {
+                    const row = await organized(data);
 
-                await requestChange(row, { title: "CANARY renamed", location: "CANARY room", description: "CANARY plan", startDate: NEW_START, endDate: NEW_END });
+                    await requestChange(row, { title: "CANARY renamed", location: "CANARY room", description: "CANARY plan", startDate: NEW_START, endDate: NEW_END }, {
+                        extra: [attendee("new@example.com")],
+                    });
 
-                const changed = await ctx.event(row.uid);
-                expect(changed.title).toBe("Protected event");
-                expect(changed.location ?? null).toBeNull();
-                expect(changed.description ?? null).toBeNull();
-                expect(changed.sealedFields).toEqual({ title: "c2VhbGVk" });
-                expect(new Date(changed.startDate).getTime()).toBe(NEW_START.getTime());
-                expect(changed.sequence).toBe(3);
+                    const unchanged = await ctx.event(row.uid);
+                    expect(unchanged.title).toBe(data.title);
+                    expect(unchanged.location ?? null).toBeNull();
+                    expect(unchanged.description ?? null).toBeNull();
+                    expect(new Date(unchanged.startDate).getTime()).toBe(START.getTime());
+                    expect(unchanged.sequence).toBe(2);
+                    expect(unchanged.attendees).toHaveLength(2);
+                    expect((await counterMessage()).meetingResponse ?? undefined).toBeUndefined();
+                });
+            }
+
+            it("Leaves a request to change a meeting protected by a per-meeting key a proposal: only a save with the guests' keys can invite them.", async () => {
+                const row = await organized({ videoMeetingUid: "video-1" });
+                await ctx.saveAttendeeLink({ calendarEventUid: row.uid, attendeeAddress: GUEST, url: "https://meet.example.com/j/1", keyed: true });
+
+                await requestChange(row, { startDate: NEW_START, endDate: NEW_END });
+
+                const unchanged = await ctx.event(row.uid);
+                expect(new Date(unchanged.startDate).getTime()).toBe(START.getTime());
+                expect(unchanged.sequence).toBe(2);
+                expect((await counterMessage()).meetingResponse ?? undefined).toBeUndefined();
+            });
+
+            it("Applies a request to a video meeting whose links carry no key, and takes every video meeting for a keyed one when the job can't read the links.", async () => {
+                const row = await organized({ videoMeetingUid: "video-1" });
+                await ctx.saveAttendeeLink({ calendarEventUid: row.uid, attendeeAddress: GUEST, url: "https://meet.example.com/j/1", keyed: false });
+
+                await requestChange(row, { startDate: NEW_START, endDate: NEW_END });
+                expect((await ctx.event(row.uid)).sequence).toBe(3);
+
+                const other = await organized({ videoMeetingUid: "video-2" });
+                const job = ctx.job();
+                const links = job.calendarEventAttendeeLinkRepo;
+                job.calendarEventAttendeeLinkRepo = undefined;
+                try {
+                    await requestChange(other, { startDate: NEW_START, endDate: NEW_END });
+                } finally {
+                    job.calendarEventAttendeeLinkRepo = links;
+                }
+                expect((await ctx.event(other.uid)).sequence).toBe(2);
+            });
+
+            it("Never takes a sealed event's placeholder title for a change: a guest's copy that is sealed names none.", async () => {
+                const row = await organized();
+
+                await requestChange(row, { title: "[...]", startDate: NEW_START, endDate: NEW_END });
+                const moved = await ctx.event(row.uid);
+                expect(moved.title).toBe("Team Sync");
+                expect(new Date(moved.startDate).getTime()).toBe(NEW_START.getTime());
+                expect(moved.sequence).toBe(3);
+
+                await requestChange(moved, { title: "Protected event" });
+                expect((await ctx.event(row.uid)).title).toBe("Team Sync");
+                expect((await ctx.event(row.uid)).sequence).toBe(3);
             });
 
             it("Leaves everyone's answers alone when the time doesn't change.", async () => {

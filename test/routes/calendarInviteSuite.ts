@@ -36,6 +36,8 @@ export interface CalendarInviteSuiteContext {
     deleteEventOrganizer: (uid: string) => Promise<void>;
     /** Gives a mailbox a zero-access key (its mail is then sealed), returning it. */
     addZeroAccessKey: (mailboxUid: string) => Promise<TestZeroAccessKey>;
+    /** Saves a `CalendarEventAttendeeLink` row. */
+    createAttendeeLink: (data: any) => Promise<any>;
 }
 
 const HOUR = 60 * 60 * 1000;
@@ -877,7 +879,7 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
     });
 
     describe("POST /invite/:messageUid/accept-proposal", () => {
-        const organized = async () => {
+        const organized = async (data: any = {}) => {
             const context = await setup();
             const event = await ctx.createCalendarEvent(context.mailbox.uid, context.calendar.uid, {
                 icalUid: eventUid,
@@ -892,6 +894,7 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
                     { address: "boss@boss.example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.TENTATIVE, isOrganizer: false },
                     { address: "other@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.ACCEPTED, isOrganizer: false },
                 ],
+                ...data,
             });
             return { ...context, event };
         };
@@ -920,6 +923,55 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             expect(row.attendees.find((a: any) => a.address === "boss@boss.example.com").responseStatus).toBe("accepted");
             expect(row.attendees.find((a: any) => a.address === "other@example.com").responseStatus).toBe("needsAction");
             expect((await ctx.findMessage(message.uid)).meetingResponse).toBe("accepted");
+        });
+
+        it("Sends a sealed meeting's updated invitations from the content the organizer's client sends, and moves nothing without it.", async () => {
+            const { mailbox, inbox, me, event } = await organized({ title: "Protected event", sealedFields: { title: "c2VhbGVk" } });
+            const proposedStart = new Date(start.getTime() + 3 * HOUR);
+            const message = await receive(mailbox.uid, inbox.uid, counter(me, proposedStart, new Date(proposedStart.getTime() + HOUR)), "counter");
+            ctx.transport().sent = [];
+
+            const refused = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/accept-proposal")));
+            expect(refused.status).toBe(400);
+            expect(refused.body.message ?? refused.text).toContain("invitationContent");
+            expect((await ctx.findEvents(mailbox.uid))[0]).toMatchObject({ uid: event.uid, sequence: 1 });
+            expect(ctx.transport().sent).toHaveLength(0);
+
+            const result = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/accept-proposal"))).send({ invitationContent: { title: "CANARY review", location: "Room 4" } });
+            expect(result.status, JSON.stringify(result.body)).toBe(200);
+            const [row] = await ctx.findEvents(mailbox.uid);
+            expect(row.sequence).toBe(2);
+            // Sent here, so stamped: the scheduling job never composes it from the placeholders.
+            expect(row.inviteSequenceSent).toBe(2);
+            expect(row.title).toBe("Protected event");
+            expect(JSON.stringify(row)).not.toContain("CANARY");
+            expect(ctx.transport().sent.map((sent: any) => sent.envelopeTo).flat().sort()).toEqual(["boss@boss.example.com", "other@example.com"]);
+            expect(decoded(ctx.transport().sent[0].raw)).toContain("SUMMARY:CANARY review");
+        });
+
+        it("Moves a keyed meeting only with the guests' link keys, and one its organizer sends encrypted without any.", async () => {
+            const { mailbox, inbox, me, event } = await organized({ videoMeetingUid: "vm-1" });
+            await ctx.createAttendeeLink({ mailboxUid: mailbox.uid, calendarEventUid: event.uid, attendeeAddress: "other@example.com", url: "https://meet.example/j/x", keyed: true });
+            const proposedStart = new Date(start.getTime() + 3 * HOUR);
+            const message = await receive(mailbox.uid, inbox.uid, counter(me, proposedStart, new Date(proposedStart.getTime() + HOUR)), "counter");
+
+            expect((await owner(request(ctx.app()).post(inviteUrl(message.uid, "/accept-proposal"))).send({ invitationContent: { title: "Video Test" } })).status).toBe(400);
+            expect((await ctx.findEvents(mailbox.uid))[0].sequence).toBe(1);
+
+            const KEY = "k=" + "Zx9_-".repeat(9);
+            const result = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/accept-proposal"))).send({
+                invitationContent: { title: "Video Test", meetingLinkSecrets: { "other@example.com": KEY } },
+            });
+            expect(result.status, JSON.stringify(result.body)).toBe(200);
+            const [row] = await ctx.findEvents(mailbox.uid);
+            expect(row.sequence).toBe(2);
+            expect(row.inviteSequenceSent).toBe(2);
+            expect(JSON.stringify(row)).not.toContain(KEY);
+
+            const encrypted = await organized({ title: "Protected event", sealedFields: { title: "c2VhbGVk" }, encryptionOrigin: "originated" });
+            const proposal = await receive(encrypted.mailbox.uid, encrypted.inbox.uid, counter(encrypted.me, proposedStart, new Date(proposedStart.getTime() + HOUR)), "counter");
+            expect((await owner(request(ctx.app()).post(inviteUrl(proposal.uid, "/accept-proposal")))).status).toBe(200);
+            expect((await ctx.findEvents(encrypted.mailbox.uid))[0]).toMatchObject({ sequence: 2, inviteSequenceSent: 2 });
         });
 
         it("Refuses a proposal whose sender's DKIM signature wasn't verified, changing nothing.", async () => {

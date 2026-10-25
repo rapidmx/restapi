@@ -426,6 +426,75 @@ export function mailRoutesReviewSuite(ctx: MailRoutesReviewSuiteContext): void {
             expect((await put(draft.uid, draft.version, { subject: "Edited draft" })).status).toBe(200);
         });
 
+        it("a sent message's sender, recipients, subject and Message-ID can't be rewritten, so a recall goes where and as it was sent", async () => {
+            const mine = await createMailbox(owner.uid);
+            const sentItems = await createFolder(mine.uid, FolderType.SENT_ITEMS);
+            const message = await createMessage(mine, sentItems.uid, { sentByServerAt: new Date() });
+            const put = (fields: any) => auth(request(ctx.app()).put(url(`/messages/${message.uid}`)), owner).send({ uid: message.uid, version: message.version, ...fields });
+            for (const fields of [
+                { recipients: Array.from({ length: 100 }, (_, i) => ({ address: `r${i}@example.net`, type: "to" })) },
+                { envelopeRecipients: ["elsewhere@example.net"] },
+                { subject: "Urgent: verify your account" },
+                { messageId: `${uuid.v4()}@example.com` },
+                { from: { address: "ceo@corp.example", type: "to" } },
+            ]) {
+                expect((await put(fields)).status).toBe(409);
+            }
+            // A round-tripped object, its values unchanged, still saves its flags.
+            const same = await put({
+                subject: "Subject",
+                recipients: [{ address: "recipient@example.net", type: "to" }],
+                from: { address: mine.primarySmtpAddress, type: "to" },
+                messageId: message.messageId,
+                flags: { read: true, flagged: false, answered: false, forwarded: false },
+            });
+            expect(same.status).toBe(200);
+            const stored = await ctx.findOne("Message", message.uid);
+            expect(stored.flags.read).toBe(true);
+            expect(stored.subject).toBe("Subject");
+
+            const before = ctx.transport().sent.length;
+            expect((await auth(request(ctx.app()).post(url(`/messages/${message.uid}/recall`)), owner)).status).toBe(200);
+            const recall = ctx.transport().sent.slice(before);
+            expect(recall).toHaveLength(1);
+            expect(recall[0].envelopeTo).toEqual(["recipient@example.net"]);
+            expect(recall[0].raw.toString()).toContain("Recall: Subject");
+        });
+
+        it("a delegate can't make mail outside Drafts come from someone the mailbox can't send as", async () => {
+            const mine = await createMailbox(owner.uid);
+            const inbox = await createFolder(mine.uid);
+            const drafts = await createFolder(mine.uid, FolderType.DRAFTS);
+            const deleted = await createFolder(mine.uid, FolderType.DELETED_ITEMS);
+            await grant(mine, other.uid, ["read", "list", "update"]);
+            const received = await createMessage(mine, inbox.uid, { from: { address: "friend@example.net", type: RecipientType.TO }, scanResultUid: uuid.v4() });
+            const put = (row: any, fields: any) =>
+                auth(request(ctx.app()).put(url(`/messages/${row.uid}`)), other).send({ uid: row.uid, version: row.version, ...fields });
+            const ceo = { address: "ceo@corp.example", displayName: "CEO", type: "to" };
+
+            expect((await put(received, { from: ceo, subject: "Urgent wire" })).status).toBe(200);
+            const forged = await ctx.findOne("Message", received.uid);
+            expect(forged.from.address).toBe(mine.primarySmtpAddress);
+            // The sender sort and list mirror follow the sender stored.
+            expect(forged.fromAddress).toBe(mine.primarySmtpAddress.toLowerCase());
+            // Unchanged, as a round-tripped object carries it, it stays.
+            const kept = await createMessage(mine, inbox.uid, { from: { address: "friend@example.net", type: RecipientType.TO } });
+            expect((await put(kept, { from: { address: "friend@example.net", type: "to" }, flags: { read: true, flagged: false, answered: false, forwarded: false } })).status).toBe(200);
+            expect((await ctx.findOne("Message", kept.uid)).from.address).toBe("friend@example.net");
+
+            // A draft is being written: its sender is its author's to choose, until it leaves Drafts.
+            const draft = await createMessage(mine, drafts.uid);
+            expect((await put(draft, { from: ceo })).status).toBe(200);
+            expect((await ctx.findOne("Message", draft.uid)).from.address).toBe("ceo@corp.example");
+            const scrubbed = await ctx.findOne("Message", draft.uid);
+            const throwAway = await auth(request(ctx.app()).put(url(`/messages/${draft.uid}`)), owner).send({ uid: draft.uid, version: scrubbed.version, folderUid: deleted.uid });
+            expect(throwAway.status).toBe(200);
+            const thrownAway = await ctx.findOne("Message", draft.uid);
+            expect(thrownAway.from.address).toBe(mine.primarySmtpAddress);
+            expect((await put(thrownAway, { from: ceo })).status).toBe(200);
+            expect((await ctx.findOne("Message", draft.uid)).from.address).toBe(mine.primarySmtpAddress);
+        });
+
         it("a draft can't be moved into the Inbox to pass for received mail, only thrown away", async () => {
             const mine = await createMailbox(owner.uid);
             const inbox = await createFolder(mine.uid);

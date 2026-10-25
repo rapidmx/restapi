@@ -32,6 +32,7 @@ import { ScanResultSQL } from "../../../src/models/sql/ScanResultSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MailFilterRuleSQL } from "../../../src/models/sql/MailFilterRuleSQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
+import { CalendarEventAttendeeLinkSQL } from "../../../src/models/sql/CalendarEventAttendeeLinkSQL.js";
 import { ContactSQL } from "../../../src/models/sql/ContactSQL.js";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { KeyVaultSQL } from "../../../src/models/sql/KeyVaultSQL.js";
@@ -289,6 +290,7 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
         models.set("MailboxSQL", MailboxSQL);
         models.set("MailFilterRuleSQL", MailFilterRuleSQL);
         models.set("CalendarEventSQL", CalendarEventSQL);
+        models.set("CalendarEventAttendeeLinkSQL", CalendarEventAttendeeLinkSQL);
         models.set("OofReplySuppressionSQL", OofReplySuppressionSQL);
         models.set("CorrespondentSQL", CorrespondentSQL);
         models.set("FocusedInboxOverrideSQL", FocusedInboxOverrideSQL);
@@ -536,6 +538,10 @@ describe("ScanQueueJobSQL Tests (real DB + DI)", () => {
             await job.run();
         },
         saveEvent: async (data) => await calendarEventRepo.save(new CalendarEventSQL({ mailboxUid, ...data })),
+        saveAttendeeLink: async (data) => {
+            const conn: any = connectionManager.connections.get("sql");
+            return await conn.getRepository(CalendarEventAttendeeLinkSQL).save(new CalendarEventAttendeeLinkSQL({ mailboxUid, ...data }));
+        },
         events: async (icalUid) => await calendarEventRepo.find({ where: { mailboxUid, icalUid } }),
         event: async (uid) => (await calendarEventRepo.findOne({ where: { uid } }))!,
         messages: async () => await messageRepo.find({ where: { mailboxUid } }),

@@ -7,11 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AUTOCRYPT_HEADER, buildAutocryptHeader, parseAutocryptHeader } from "../../src/util/AutocryptHeaderUtils.js";
 import { readBoundedBytes, setDiscoveryAddressLookup } from "../../src/util/KeyDiscoveryClient.js";
 import { discoverAndMergeKeys } from "../../src/util/KeyringUtils.js";
-import { selectOpenPgpKeyFor } from "../../src/util/OpenPgpKeyUtils.js";
-import { clearWkdCache, fetchWkdKey } from "../../src/util/WkdClient.js";
+import { selectOpenPgpKeysFor } from "../../src/util/OpenPgpKeyUtils.js";
+import { clearWkdCache, fetchWkdKeys } from "../../src/util/WkdClient.js";
 import { computeWkdHash, isValidWkdHash } from "../../src/util/WkdUtils.js";
 import { StaticDnsResolver } from "../testDoubles.js";
-import { openPgpKey } from "../openPgpTestKeys.js";
+import { openPgpKey, revoked } from "../openPgpTestKeys.js";
 
 const ADDRESS = "Joe.Doe@proton.example";
 
@@ -35,20 +35,20 @@ describe("readBoundedBytes()", () => {
     });
 });
 
-describe("selectOpenPgpKeyFor()", () => {
+describe("selectOpenPgpKeysFor()", () => {
     it("picks the newest certificate naming the address out of concatenated keys", async () => {
         const older = await openPgpKey(ADDRESS, { created: new Date(Date.now() - 60_000) });
         const newer = await openPgpKey(ADDRESS);
         const stranger = await openPgpKey("someone@proton.example");
         const bundle = new Uint8Array([...older.publicKey.write(), ...stranger.publicKey.write(), ...newer.publicKey.write()]);
-        expect(await selectOpenPgpKeyFor(bundle, ADDRESS)).toEqual(newer.key);
-        expect(await selectOpenPgpKeyFor(stranger.publicKey.write(), ADDRESS)).toBeUndefined();
-        expect(await selectOpenPgpKeyFor(new Uint8Array(), ADDRESS)).toBeUndefined();
-        expect(await selectOpenPgpKeyFor(new Uint8Array([1, 2, 3]), ADDRESS)).toBeUndefined();
+        expect(await selectOpenPgpKeysFor(bundle, ADDRESS)).toEqual([newer.key]);
+        expect(await selectOpenPgpKeysFor(stranger.publicKey.write(), ADDRESS)).toEqual([]);
+        expect(await selectOpenPgpKeysFor(new Uint8Array(), ADDRESS)).toEqual([]);
+        expect(await selectOpenPgpKeysFor(new Uint8Array([1, 2, 3]), ADDRESS)).toEqual([]);
     });
 });
 
-describe("fetchWkdKey()", () => {
+describe("fetchWkdKeys()", () => {
     let mockFetch: ReturnType<typeof vi.fn>;
     beforeEach(() => {
         mockFetch = vi.fn();
@@ -65,26 +65,26 @@ describe("fetchWkdKey()", () => {
         const key = await openPgpKey(ADDRESS);
         mockFetch.mockResolvedValueOnce(new Response(null, { status: 404 })).mockResolvedValueOnce(new Response(key.publicKey.write()));
 
-        expect(await fetchWkdKey(ADDRESS)).toEqual(key.key);
+        expect(await fetchWkdKeys(ADDRESS)).toEqual([key.key]);
         const hash = computeWkdHash("Joe.Doe");
         expect(mockFetch.mock.calls.map(([url]) => url)).toEqual([
             `https://openpgpkey.proton.example/.well-known/openpgpkey/proton.example/hu/${hash}?l=Joe.Doe`,
             `https://proton.example/.well-known/openpgpkey/hu/${hash}?l=Joe.Doe`,
         ]);
         expect(mockFetch.mock.calls[0][1]).toMatchObject({ redirect: "error" });
-        expect(await fetchWkdKey(ADDRESS)).toEqual(key.key);
+        expect(await fetchWkdKeys(ADDRESS)).toEqual([key.key]);
         expect(mockFetch).toHaveBeenCalledTimes(2);
     });
 
     it("finds nothing for a failed fetch, an unusable answer, a private host or a bad address, and caches the miss", async () => {
         mockFetch.mockRejectedValueOnce(new Error("offline")).mockResolvedValueOnce(new Response(new Uint8Array([9, 9])));
-        expect(await fetchWkdKey("nobody@proton.example")).toBeUndefined();
-        expect(await fetchWkdKey("nobody@proton.example")).toBeUndefined();
+        expect(await fetchWkdKeys("nobody@proton.example")).toEqual([]);
+        expect(await fetchWkdKeys("nobody@proton.example")).toEqual([]);
         expect(mockFetch).toHaveBeenCalledTimes(2);
 
         setDiscoveryAddressLookup(async () => ["10.0.0.1"]);
-        expect(await fetchWkdKey("x@internal.example")).toBeUndefined();
-        expect(await fetchWkdKey("not an address")).toBeUndefined();
+        expect(await fetchWkdKeys("x@internal.example")).toEqual([]);
+        expect(await fetchWkdKeys("not an address")).toEqual([]);
         expect(mockFetch).toHaveBeenCalledTimes(2);
     });
 
@@ -92,7 +92,41 @@ describe("fetchWkdKey()", () => {
         mockFetch.mockImplementation(
             (_url: string, init: any) => new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(new Error("aborted")))),
         );
-        expect(await fetchWkdKey("slow@proton.example", { timeoutMs: 5 })).toBeUndefined();
+        expect(await fetchWkdKeys("slow@proton.example", { timeoutMs: 5 })).toEqual([]);
+    });
+
+    it("takes the direct method's key when the advanced one serves only a revocation, keeping that revocation", async () => {
+        const old = await revoked(await openPgpKey(ADDRESS));
+        const current = await openPgpKey(ADDRESS);
+        mockFetch.mockResolvedValueOnce(new Response(old.publicKey.write())).mockResolvedValueOnce(new Response(current.publicKey.write()));
+
+        expect((await fetchWkdKeys(ADDRESS)).map((key) => key.fingerprint)).toEqual([current.fingerprint, old.fingerprint]);
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("marks a pinned key revoked when the directory serves its holder's revocation of it, alone or with a new key, never pinning it", async () => {
+        const pinned = await openPgpKey(ADDRESS);
+        const revocation = await revoked(pinned);
+        const existing = { keys: [pinned.key] };
+        mockFetch.mockResolvedValue(new Response(revocation.publicKey.write()));
+
+        const alone = await discoverAndMergeKeys(new StaticDnsResolver(), ADDRESS, existing);
+        expect(alone?.keys).toEqual([expect.objectContaining({ fingerprint: pinned.fingerprint, revokedAt: expect.any(Number), revocationReason: "compromised" })]);
+        expect(alone?.keyConflicts ?? []).toEqual([]);
+
+        // With a new key: the old one is marked revoked, and the new one is a conflict - a compromised key vouches for nothing.
+        clearWkdCache();
+        const successor = await openPgpKey(ADDRESS);
+        mockFetch.mockResolvedValue(new Response(new Uint8Array([...revocation.publicKey.write(), ...successor.publicKey.write()])));
+        const both = await discoverAndMergeKeys(new StaticDnsResolver(), ADDRESS, existing);
+        expect(both?.keys).toEqual([expect.objectContaining({ fingerprint: pinned.fingerprint, revocationReason: "compromised" })]);
+        expect(both?.keyConflicts).toEqual([expect.objectContaining({ observedKey: expect.objectContaining({ fingerprint: successor.fingerprint }) })]);
+
+        // A revoked key nothing pins is never pinned.
+        clearWkdCache();
+        mockFetch.mockResolvedValue(new Response(revocation.publicKey.write()));
+        const fresh = await discoverAndMergeKeys(new StaticDnsResolver(), ADDRESS, undefined);
+        expect(fresh?.keys ?? []).toEqual([]);
     });
 
     it("is how discovery finds the key of an address whose domain isn't a RapidMX peer", async () => {

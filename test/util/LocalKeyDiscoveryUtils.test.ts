@@ -63,8 +63,28 @@ describe("LocalKeyDiscoveryUtils", () => {
                 { publicKey: "d", type: "x509", useType: "encrypt", fingerprint: "current", notBefore: 0, notAfter: 5_000 },
             ];
             const box = { uid: "m", primarySmtpAddress: "bob@example.com", keys };
-            expect((await buildKeyDiscoveryResponse(vaults as any, box as any, true, now)).keys.map((k) => k.fingerprint)).toEqual(["pgp", "current", "retired", "expired"]);
-            expect((await buildKeyDiscoveryResponse(vaults as any, box as any, false, now)).keys.map((k) => k.fingerprint)).toEqual(["current", "retired", "expired"]);
+            // Retired keys most recently retired first: "expired" at 500, "retired" (revoked) at 10.
+            expect((await buildKeyDiscoveryResponse(vaults as any, box as any, true, now)).keys.map((k) => k.fingerprint)).toEqual(["pgp", "current", "expired", "retired"]);
+            expect((await buildKeyDiscoveryResponse(vaults as any, box as any, false, now)).keys.map((k) => k.fingerprint)).toEqual(["current", "expired", "retired"]);
+        });
+
+        it("keeps the most recently retired key within what a peer reads, however many older ones are stored", async () => {
+            const now = 1_000_000;
+            const key = (fingerprint: string, fields: Record<string, any> = {}) => ({ publicKey: fingerprint, type: "x509", useType: "encrypt", fingerprint, notBefore: 0, notAfter: now * 10, ...fields });
+            const keys = [
+                ...Array.from({ length: 6 }, (_, i) => key(`old-${i}`, { revokedAt: 100 + i, revocationReason: "superseded" })),
+                key("expired", { notAfter: 50 }),
+                key("sign", { useType: "sign" }),
+                key("pgp", { type: "openpgp" }),
+                // Retired a moment ago, and two retired at once: the later stored first.
+                key("compromised", { revokedAt: now - 1, revocationReason: "compromised" }),
+                key("tie-a", { revokedAt: 200 }),
+                key("tie-b", { revokedAt: 200 }),
+                key("current"),
+            ];
+            const listed = (await buildKeyDiscoveryResponse(fakeRepo([]) as any, { uid: "m", primarySmtpAddress: "bob@example.com", keys } as any, true, now)).keys;
+            expect(listed.map((k) => k.fingerprint)).toEqual(["sign", "pgp", "current", "compromised", "tie-b", "tie-a", "old-5", "old-4", "old-3", "old-2", "old-1", "old-0", "expired"]);
+            expect(listed.slice(0, 8).map((k) => k.fingerprint)).toContain("compromised");
         });
 
         it("answers a mailbox's keys and preference, with escrow only when its vault holds an escrow wrap", async () => {

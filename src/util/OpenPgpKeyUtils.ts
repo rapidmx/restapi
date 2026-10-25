@@ -211,7 +211,11 @@ function invalid(message: string): ApiError {
  * (A key that can't sign is still a recipient; its signatures just won't verify.)
  */
 export async function parseOpenPgpContactKey(certificate: unknown, address: string, now: number = Date.now()): Promise<PublicKey> {
-    const parsed: OpenPgpCertificate | undefined = await parseOpenPgpCertificate(certificate, now);
+    return checkedContactKey(await parseOpenPgpCertificate(certificate, now), address, now);
+}
+
+/** `parseOpenPgpContactKey()`'s checks of an already parsed certificate. */
+function checkedContactKey(parsed: OpenPgpCertificate | undefined, address: string, now: number): PublicKey {
     if (!parsed) {
         throw invalid("'certificate' must be an OpenPGP public key (ASCII armored, or base64 binary).");
     }
@@ -228,6 +232,34 @@ export async function parseOpenPgpContactKey(certificate: unknown, address: stri
         throw invalid("The provided OpenPGP key has no key usable for encryption.");
     }
     return parsed.key;
+}
+
+/**
+ * `pinned`, an OpenPGP certificate on file, refreshed with what `observed` - the same certificate (its primary key's fingerprint) as it
+ * is served now - adds: newer self-signatures (an extended expiry), new subkeys, subkey and primary key revocations. The two are merged
+ * by OpenPGP.js (`Key.update()`), which takes only components whose signatures verify with the primary key, so nobody but the key holder
+ * can add anything, and a stale copy, one without a revocation or a subkey already on file, takes nothing away. `publicKey`, `notBefore`
+ * and `notAfter` are read again from the merged certificate, and a primary key revocation it now carries marks it revoked (as
+ * `"compromised"`, as `sanitizeOpenPgpKey()` reads one) unless it already is; the pin itself is unchanged. `undefined` when there is
+ * nothing to store: not the same certificate, unreadable, nothing new, or a merge larger than `MAX_OPENPGP_KEY_BYTES`.
+ */
+export async function mergeOpenPgpCertificate(pinned: PublicKey, observed: PublicKey, now: number = Date.now()): Promise<PublicKey | undefined> {
+    const [pinnedCert, observedCert] = await Promise.all([readCertificate(pinned.publicKey), readCertificate(observed.publicKey)]);
+    if (!pinnedCert || !observedCert || observedCert.isPrivate() || pinnedCert.getFingerprint() !== observedCert.getFingerprint()) {
+        return undefined;
+    }
+    const merged = await orElse(pinnedCert.update(observedCert, new Date(now)), undefined);
+    const text: string | undefined = merged ? Buffer.from(merged.write()).toString("base64") : undefined;
+    const parsed: OpenPgpCertificate | undefined = text && text !== pinned.publicKey ? await parseOpenPgpCertificate(text, now) : undefined;
+    if (!parsed) {
+        return undefined;
+    }
+    const refreshed: PublicKey = { ...pinned, publicKey: parsed.key.publicKey, notBefore: parsed.key.notBefore, notAfter: parsed.key.notAfter };
+    if (pinned.revokedAt === undefined && parsed.revokedAt !== undefined) {
+        refreshed.revokedAt = parsed.revokedAt;
+        refreshed.revocationReason = "compromised";
+    }
+    return refreshed;
 }
 
 /**
@@ -276,21 +308,37 @@ export async function canReplaceOpenPgpKeyAutomatically(pinned: PublicKey, obser
 }
 
 /**
- * The OpenPGP certificate in `binary` (one or more concatenated transferable public keys, as a Web Key Directory answers) that
- * is `address`'s at `now` (`parseOpenPgpContactKey()`), the newest when several are; `undefined` when none is.
+ * The OpenPGP certificates in `binary` (one or more concatenated transferable public keys, as a Web Key Directory answers) that are
+ * `address`'s: the one that is its key at `now` (`parseOpenPgpContactKey()`), the newest when several are, first; then every one its
+ * holder revoked that names `address`, marked revoked (`revokedAt`, `"compromised"` as `sanitizeOpenPgpKey()` reads one). A revoked one
+ * is never pinned: it is revocation evidence for a contact that pins it (`KeyringUtils.applyDiscoveredKeys()`), and a directory can only
+ * replay a revocation the key holder signed. Empty when there is none.
  */
-export async function selectOpenPgpKeyFor(binary: Uint8Array, address: string, now: number = Date.now()): Promise<PublicKey | undefined> {
+export async function selectOpenPgpKeysFor(binary: Uint8Array, address: string, now: number = Date.now()): Promise<PublicKey[]> {
     if (binary.length === 0 || binary.length > MAX_OPENPGP_KEY_BYTES * 4) {
-        return undefined;
+        return [];
     }
     const pgp: OpenPgp = await openpgp();
     const certs = await orElse(pgp.readKeys({ binaryKeys: binary }), []);
     let newest: PublicKey | undefined;
+    const revoked: PublicKey[] = [];
     for (const cert of certs.slice(0, 8)) {
-        const key: PublicKey | undefined = await orElse(parseOpenPgpContactKey(Buffer.from(cert.write()).toString("base64"), address, now), undefined);
-        if (key && (!newest || key.notBefore > newest.notBefore)) {
+        const parsed: OpenPgpCertificate | undefined = await parseOpenPgpCertificate(Buffer.from(cert.write()).toString("base64"), now);
+        if (parsed?.revokedAt !== undefined) {
+            if (parsed.emails.includes(address.toLowerCase())) {
+                revoked.push({ ...parsed.key, revokedAt: parsed.revokedAt, revocationReason: "compromised" });
+            }
+            continue;
+        }
+        let key: PublicKey;
+        try {
+            key = checkedContactKey(parsed, address, now);
+        } catch {
+            continue;
+        }
+        if (!newest || key.notBefore > newest.notBefore) {
             newest = key;
         }
     }
-    return newest;
+    return [...(newest ? [newest] : []), ...revoked];
 }

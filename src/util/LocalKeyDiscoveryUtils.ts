@@ -28,8 +28,11 @@ export const NOT_PUBLISHED_RESPONSE: KeyDiscoveryResponse = {
  * returned) holds any `MasterKeyWrap` with `method: "escrow"`.
  *
  * `keys` lists the active (unrevoked, unexpired) keys first, so a peer that keeps only the first few (`MAX_DISCOVERED_KEYS`)
- * never drops a current one for a retired one. `includeOpenPgp: false` (the server's "Allow OpenPGP" is off) leaves the
- * mailbox's OpenPGP certificates out.
+ * never drops a current one for a retired one, then the retired ones most recently retired first (revoked at, else expired at;
+ * the later stored of two retired at once) - the key a peer most likely has pinned, whose revocation it must see to replace it
+ * automatically or to learn it was compromised, is never cut off by older ones (`Mailbox.keys` is never pruned, and keys are
+ * appended as they are enrolled). `includeOpenPgp: false` (the server's "Allow OpenPGP" is off) leaves the mailbox's OpenPGP
+ * certificates out.
  *
  * Always performs exactly one `KeyVault` lookup, even when there is no mailbox (a `mailboxUid` no real mailbox can have),
  * so the not-found and no-keys-published cases cost the same number of round trips - the timing side channel the public
@@ -51,7 +54,13 @@ export async function buildKeyDiscoveryResponse(
     const escrow: boolean = !!vaults[0]?.masterKeyWraps.some((w) => w.method === "escrow");
     const published: PublicKey[] = (mailbox.keys ?? []).filter((key) => includeOpenPgp || !isOpenPgpKey(key));
     const active = (key: PublicKey): boolean => key.revokedAt === undefined && key.notAfter > now;
-    const keys: PublicKey[] = [...published.filter(active), ...published.filter((key) => !active(key))];
+    const retiredAt = (key: PublicKey): number => key.revokedAt ?? key.notAfter;
+    const retired: PublicKey[] = published
+        .map((key, index) => ({ key, index }))
+        .filter(({ key }) => !active(key))
+        .sort((a, b) => retiredAt(b.key) - retiredAt(a.key) || b.index - a.index)
+        .map(({ key }) => key);
+    const keys: PublicKey[] = [...published.filter(active), ...retired];
     const preference: EncryptionPreference = mailbox.encryptPreference ?? NOT_PUBLISHED_RESPONSE.encryptPreference;
     // A preference for OpenPGP is only worth publishing with an OpenPGP key to use.
     const { preferFormat, ...rest } = preference;

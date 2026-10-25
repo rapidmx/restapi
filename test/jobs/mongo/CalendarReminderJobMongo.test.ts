@@ -197,6 +197,21 @@ describe("CalendarReminderJobMongo Tests (real DB + DI)", () => {
         expect(JSON.parse(fakeRedis.published[0].message).data).toEqual(expect.objectContaining({ title: "Protected event", protected: true }));
     });
 
+    it("Flags the reminder of an event filed from a zero-access invitation, whose content is sealed whole in sealedContent.", async () => {
+        const now = Date.now();
+        await createEvent({
+            startDate: new Date(now + 5 * 60 * 1000),
+            reminderMinutesBeforeStart: 4.5,
+            title: "[...]",
+            sealedContent: { keyFingerprint: "fp", sealed: "c2VhbGVk" },
+        });
+
+        await job.run();
+
+        expect(fakeRedis.published).toHaveLength(2);
+        expect(JSON.parse(fakeRedis.published[0].message).data).toEqual(expect.objectContaining({ title: "[...]", protected: true }));
+    });
+
     it("Carries the event's own location in the reminder, verbatim.", async () => {
         const now = Date.now();
         const event = await createEvent({

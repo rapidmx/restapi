@@ -984,6 +984,7 @@ describe("Route:CalendarEventMongo Tests", () => {
             ),
         findMessage: async (uid) => (await messageRepo.findOne({ uid } as any))!,
         findEvents: async (mailboxUid) => (await calendarEventRepo.find({ mailboxUid } as any).toArray()).filter((row: any) => !row.deleted),
+        createAttendeeLink: async (data) => await (objectFactory.getInstance(ConnectionManager)!.connections.get("mongo") as any).getMongoRepository("CalendarEventAttendeeLinkMongo").save(new CalendarEventAttendeeLinkMongo(data)),
         addZeroAccessKey: async (mailboxUid) => {
             const za = await testZeroAccessKey();
             const mailbox: any = await mailboxRepo.findOne({ uid: mailboxUid } as any);
@@ -1088,25 +1089,34 @@ describe("Route:CalendarEventMongo Tests", () => {
             expect(transport().sent).toHaveLength(0);
         });
 
-        it("Names a protected event in a reply by the title the client sends, and by its placeholder without one", async () => {
+        it("Names a protected event in a reply by the title the client sends, and by no placeholder without one", async () => {
             const { mailbox, folder } = await protect({ calendar: true });
-            const invited = async () =>
-                await createCalendarEvent(mailbox.uid, folder.uid, {
-                    title: "Protected event",
-                    sealedFields: { title: "c2VhbGVk" },
-                    organizer: { address: "organizer@example.com", displayName: "Organizer", type: "to" },
-                    attendees: [{ address: mailbox.primarySmtpAddress, displayName: "Me", role: "required", responseStatus: "needsAction", isOrganizer: false }],
-                });
-            const respond = async (event: any, body: any) =>
-                request(server.getApplication()).post(`${baseUrl}/${event.uid}/respond`).set("Authorization", "jwt " + ownerToken).send(body);
+            // Sealed field by field, and (an event filed from a zero-access invitation) whole in sealedContent.
+            for (const sealed of [
+                { title: "Protected event", sealedFields: { title: "c2VhbGVk" } },
+                { title: "[...]", sealedContent: { keyFingerprint: "fp", sealed: "c2VhbGVk" } },
+            ]) {
+                const invited = async () =>
+                    await createCalendarEvent(mailbox.uid, folder.uid, {
+                        ...sealed,
+                        organizer: { address: "organizer@example.com", displayName: "Organizer", type: "to" },
+                        attendees: [{ address: mailbox.primarySmtpAddress, displayName: "Me", role: "required", responseStatus: "needsAction", isOrganizer: false }],
+                    });
+                const respond = async (event: any, body: any) =>
+                    request(server.getApplication()).post(`${baseUrl}/${event.uid}/respond`).set("Authorization", "jwt " + ownerToken).send(body);
 
-            transport().sent = [];
-            expect((await respond(await invited(), { responseStatus: "accepted", invitationContent: { title: "Quarterly review" } })).status).toBe(200);
-            expect(transport().sent[0].raw.toString()).toContain("Accepted: Quarterly review");
+                transport().sent = [];
+                expect((await respond(await invited(), { responseStatus: "accepted", invitationContent: { title: "Quarterly review" } })).status).toBe(200);
+                expect(transport().sent[0].raw.toString()).toContain("Accepted: Quarterly review");
+                expect(transport().sent[0].raw.toString()).toContain("SUMMARY:Quarterly review");
 
-            transport().sent = [];
-            expect((await respond(await invited(), { responseStatus: "tentative" })).status).toBe(200);
-            expect(transport().sent[0].raw.toString()).toContain("Tentative: Protected event");
+                transport().sent = [];
+                expect((await respond(await invited(), { responseStatus: "tentative" })).status).toBe(200);
+                const raw = transport().sent[0].raw.toString();
+                expect(raw).toContain("Tentative: Meeting invitation");
+                expect(raw).not.toContain("SUMMARY");
+                expect(raw).not.toContain(sealed.title);
+            }
         });
 
         it("Sends a keyed meeting's invitations at save time with each guest's link key, never storing it, and holds them without the keys", async () => {

@@ -169,6 +169,53 @@ export function keyLocalDiscoverySuite(ctx: KeyLocalDiscoverySuiteContext): void
             expectNoFederation();
         });
 
+        it("records the primary address a conflicting key of an alias or plus-tagged address was checked against, so it can be accepted there", async () => {
+            const own = await createMailbox(`alice-${uuid.v4()}`);
+            const local = `bob-${uuid.v4()}`;
+            const alias = `sales-${uuid.v4()}@example.com`;
+            const recipient = await createMailbox(local, { aliasAddresses: [alias] }, "example.com", stranger);
+            const pinned = await certKey(recipient.primarySmtpAddress);
+            await ctx.setMailboxKeys(recipient.uid, [pinned]);
+            for (const addr of [alias, `${local}+news@example.com`]) {
+                expect((await lookup(own.uid, addr)).status).toBe(200);
+            }
+
+            // A certificate from another CA can't replace the pinned one by itself: a conflict for the user.
+            const otherIssuer = await makeTestIssuer();
+            const cert = await issueCertificate(otherIssuer, { sanEmails: [recipient.primarySmtpAddress] });
+            const successor = {
+                publicKey: cert.certificate,
+                type: "x509",
+                useType: "encrypt",
+                fingerprint: cert.fingerprint,
+                notBefore: Date.now() - DAY,
+                notAfter: Date.now() + 365 * DAY,
+                issuerCertificate: otherIssuer.certificate,
+            };
+            await ctx.setMailboxKeys(recipient.uid, [successor]);
+            for (const addr of [alias, `${local}+news@example.com`]) {
+                expect((await lookup(own.uid, addr)).status).toBe(200);
+            }
+            const contacts = await ctx.findContacts(own.uid);
+            expect(contacts).toHaveLength(2);
+            for (const contact of contacts) {
+                expect(contact.keyConflicts).toEqual([expect.objectContaining({ address: recipient.primarySmtpAddress.toLowerCase() })]);
+            }
+
+            for (const addr of [alias, `${local}+news@example.com`]) {
+                const accepted = await request(ctx.app())
+                    .post(`${ctx.baseUrl}/${own.uid}/keys/resolve`)
+                    .set("Authorization", "jwt " + ctx.tokenFor(caller))
+                    .send({ address: addr, useType: "encrypt", action: "accept", expectedPinnedFingerprint: pinned.fingerprint });
+                expect(accepted.status, `${addr}: ${JSON.stringify(accepted.body)}`).toBe(200);
+                expect(accepted.body.keys.map((k: any) => k.fingerprint)).toEqual([successor.fingerprint]);
+            }
+            // A lookup of the primary address itself names no other address.
+            expect((await lookup(own.uid, recipient.primarySmtpAddress)).status).toBe(200);
+            const direct = (await ctx.findContacts(own.uid)).find((contact: any) => contact.emails[0].address === recipient.primarySmtpAddress);
+            expect(direct.keys.map((k: any) => k.fingerprint)).toEqual([successor.fingerprint]);
+        });
+
         it("doesn't let a literal % or _ in the address match another mailbox's alias", async () => {
             const own = await createMailbox(`alice-${uuid.v4()}`);
             const recipient = await createMailbox(`bob-${uuid.v4()}`, { aliasAddresses: ["sales-wild@example.com"] }, "example.com", stranger);

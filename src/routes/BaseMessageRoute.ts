@@ -100,6 +100,10 @@ function heldValue(value: unknown): string {
 /** The fields of a message that make up what it says it is - who sent it to whom, about what. Frozen while an open legal hold covers the message. */
 const HELD_MESSAGE_FIELDS: readonly string[] = ["subject", "from", "recipients", "messageId"];
 
+/** What a message the server relayed (`sentByServerAt`) says was sent, by whom, to whom and about what: `recall()` mails its recipients again
+ * under its subject, so none of it changes once it is sent. */
+const SENT_MESSAGE_FIELDS: readonly string[] = [...HELD_MESSAGE_FIELDS, "envelopeRecipients"];
+
 /** The dates a legal hold's range is judged by - frozen with `HELD_MESSAGE_FIELDS`. */
 const HELD_MESSAGE_DATE_FIELDS: readonly string[] = ["sentDate", "receivedDate"];
 
@@ -747,6 +751,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * writes through the repository directly) - otherwise a held message could be re-dated out of its hold's range,
      * or moved to Drafts, re-dated and moved back. `dispositionNotificationTo` stays settable on a message currently
      * in Drafts only.
+     *
+     * Nor does it rewrite what mail outside Drafts says it is:
+     * - a message the server relayed (`sentByServerAt`) keeps its `SENT_MESSAGE_FIELDS` (409 for a change; an unchanged value is dropped,
+     * so a round-tripped object still saves), since `recall()` mails its recipients again under its subject;
+     * - any other message's new `from` goes through `forceOwnSender()`, as a create outside Drafts does, so received mail can't be made to
+     * come from anyone the mailbox can't send as.
      */
     //
     // For every caller, trusted included: `verificationSeal`/`verificationSealGeneration` are dropped (see
@@ -788,8 +798,29 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         if ("dispositionNotificationTo" in obj && !(await this.isDraftsFolder(existing.folderUid))) {
             delete obj.dispositionNotificationTo;
         }
+        await this.keepSentAndSender(obj, existing);
         await this.prepareScheduledSendUpdate(obj, existing);
         await this.assertHeldFieldsUnchanged(obj, existing, user);
+    }
+
+    /** `prepareUpdate()`'s rules for what a non-trusted update of mail outside Drafts may say it is: `SENT_MESSAGE_FIELDS` of a relayed
+     * message, and a `from` the mailbox can send as on any other. */
+    private async keepSentAndSender(obj: any, existing: T): Promise<void> {
+        if ((existing as any).sentByServerAt) {
+            if (SENT_MESSAGE_FIELDS.some((field) => field in obj && heldValue(obj[field]) !== heldValue((existing as any)[field]))) {
+                throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "A sent message's sender, recipients, subject and Message-ID can't be changed.");
+            }
+            for (const field of SENT_MESSAGE_FIELDS) {
+                delete obj[field];
+            }
+            return;
+        }
+        if ("from" in obj && heldValue(obj.from) !== heldValue((existing as any).from) && !(await this.isDraftsFolder(existing.folderUid))) {
+            const checked: any = { mailboxUid: existing.mailboxUid, from: obj.from };
+            await this.forceOwnSender(checked);
+            obj.from = checked.from;
+            syncMessageListFields(obj, existing);
+        }
     }
 
     /**

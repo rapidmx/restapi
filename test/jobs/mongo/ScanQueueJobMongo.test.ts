@@ -34,6 +34,7 @@ import { ScanResultMongo } from "../../../src/models/mongo/ScanResultMongo.js";
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { MailFilterRuleMongo } from "../../../src/models/mongo/MailFilterRuleMongo.js";
 import { CalendarEventMongo } from "../../../src/models/mongo/CalendarEventMongo.js";
+import { CalendarEventAttendeeLinkMongo } from "../../../src/models/mongo/CalendarEventAttendeeLinkMongo.js";
 import { ContactMongo } from "../../../src/models/mongo/ContactMongo.js";
 import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { KeyVaultMongo } from "../../../src/models/mongo/KeyVaultMongo.js";
@@ -298,6 +299,7 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
         models.set("MailboxMongo", MailboxMongo);
         models.set("MailFilterRuleMongo", MailFilterRuleMongo);
         models.set("CalendarEventMongo", CalendarEventMongo);
+        models.set("CalendarEventAttendeeLinkMongo", CalendarEventAttendeeLinkMongo);
         models.set("OofReplySuppressionMongo", OofReplySuppressionMongo);
         models.set("CorrespondentMongo", CorrespondentMongo);
         models.set("FocusedInboxOverrideMongo", FocusedInboxOverrideMongo);
@@ -545,6 +547,10 @@ describe("ScanQueueJobMongo Tests (real DB + DI)", () => {
             await job.run();
         },
         saveEvent: async (data) => await calendarEventRepo.save(new CalendarEventMongo({ mailboxUid, ...data })),
+        saveAttendeeLink: async (data) => {
+            const conn: any = connectionManager.connections.get("mongo");
+            return await conn.getMongoRepository("CalendarEventAttendeeLinkMongo").save(new CalendarEventAttendeeLinkMongo({ mailboxUid, ...data }));
+        },
         events: async (icalUid) => await calendarEventRepo.find({ mailboxUid, icalUid }).toArray(),
         event: async (uid) => (await calendarEventRepo.findOne({ uid } as any))!,
         messages: async () => await messageRepo.find({ mailboxUid }).toArray(),

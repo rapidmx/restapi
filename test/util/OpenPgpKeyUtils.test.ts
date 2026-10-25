@@ -10,12 +10,14 @@ import {
     keyFormat,
     keySlot,
     MAX_OPENPGP_KEY_BYTES,
+    mergeOpenPgpCertificate,
     OPENPGP_NO_EXPIRY,
     parseOpenPgpCertificate,
     parseOpenPgpContactKey,
     sanitizeOpenPgpKey,
+    selectOpenPgpKeysFor,
 } from "../../src/util/OpenPgpKeyUtils.js";
-import { certifiedBy, openPgpKey, revoked } from "../openPgpTestKeys.js";
+import { certifiedBy, openPgpKey, reexpired, revoked, withRotatedSubkey } from "../openPgpTestKeys.js";
 
 const ADDRESS = "alice@example.com";
 const DAY = 86_400_000;
@@ -110,6 +112,87 @@ describe("OpenPgpKeyUtils", () => {
             messages.push(err.message);
         }
         expect(new Set(messages).size).toBe(reasons.length);
+    });
+
+    describe("mergeOpenPgpCertificate()", () => {
+        it("takes in an extended expiry, keeping the pin", async () => {
+            const pinned = await openPgpKey(ADDRESS, { created: new Date(Date.now() - 10 * DAY), expiresIn: 20 * 86_400 });
+            const extended = await reexpired(pinned, 800 * 86_400);
+            expect(extended.fingerprint).toBe(pinned.fingerprint);
+
+            const merged = (await mergeOpenPgpCertificate({ ...pinned.key, issuerCertificate: "kept" }, extended.key))!;
+            expect(merged.fingerprint).toBe(pinned.fingerprint);
+            expect(merged.notAfter).toBe(extended.key.notAfter);
+            expect(merged.notAfter).toBeGreaterThan(pinned.key.notAfter);
+            expect(merged.publicKey).not.toBe(pinned.key.publicKey);
+            expect((merged as any).issuerCertificate).toBe("kept");
+            // Once the original expiry has passed, the merged copy is still the address's key.
+            expect((await parseOpenPgpContactKey(merged.publicKey, ADDRESS, Date.now() + 30 * DAY)).fingerprint).toBe(pinned.fingerprint);
+        });
+
+        it("takes in a new subkey and the revocation of the old one, which a stale copy can't undo", async () => {
+            const pinned = await openPgpKey(ADDRESS);
+            const rotated = await withRotatedSubkey(pinned);
+            const merged = (await mergeOpenPgpCertificate(pinned.key, rotated.key))!;
+            expect(merged).toBeDefined();
+            expect(merged.revokedAt).toBeUndefined();
+            const cert = await openpgp.readKey({ binaryKey: Buffer.from(merged.publicKey, "base64") });
+            const encryptTo = (await cert.getEncryptionKey()).getKeyID().toHex();
+            expect(encryptTo).toBe(rotated.privateKey.subkeys[1].getKeyID().toHex());
+            expect(encryptTo).not.toBe(pinned.privateKey.subkeys[0].getKeyID().toHex());
+
+            // A copy served without the revocation adds nothing.
+            expect(await mergeOpenPgpCertificate(merged, pinned.key)).toBeUndefined();
+        });
+
+        it("marks the pin revoked by a primary key revocation, never weakening one already stored", async () => {
+            const pinned = await openPgpKey(ADDRESS);
+            const revocation = await revoked(pinned);
+            expect(await mergeOpenPgpCertificate(pinned.key, revocation.key)).toMatchObject({ fingerprint: pinned.fingerprint, revokedAt: expect.any(Number), revocationReason: "compromised" });
+            const stored = { ...pinned.key, revokedAt: 5, revocationReason: "superseded" as const };
+            expect(await mergeOpenPgpCertificate(stored, revocation.key)).toMatchObject({ revokedAt: 5, revocationReason: "superseded" });
+        });
+
+        it("stores nothing for another certificate, an unreadable one, a private key, the same bytes or a merge too large", async () => {
+            const pinned = await openPgpKey(ADDRESS);
+            expect(await mergeOpenPgpCertificate(pinned.key, (await openPgpKey(ADDRESS)).key)).toBeUndefined();
+            expect(await mergeOpenPgpCertificate(pinned.key, { ...pinned.key, publicKey: "not a key" })).toBeUndefined();
+            expect(await mergeOpenPgpCertificate({ ...pinned.key, publicKey: "" }, pinned.key)).toBeUndefined();
+            expect(await mergeOpenPgpCertificate(pinned.key, { ...pinned.key, publicKey: pinned.privateKey.armor() })).toBeUndefined();
+            expect(await mergeOpenPgpCertificate(pinned.key, pinned.key)).toBeUndefined();
+
+            // Many user IDs, each with its own self-signature, merged past the size limit.
+            const many = await openpgp.reformatKey({
+                privateKey: pinned.privateKey,
+                userIDs: Array.from({ length: 80 }, (_, i) => ({ name: "x".repeat(60), email: `u${i}@example.com` })),
+                format: "object",
+            });
+            const big = Buffer.from(many.publicKey.write());
+            expect(big.length).toBeLessThanOrEqual(MAX_OPENPGP_KEY_BYTES);
+            const half = await openpgp.reformatKey({
+                privateKey: pinned.privateKey,
+                userIDs: Array.from({ length: 80 }, (_, i) => ({ name: "y".repeat(60), email: `v${i}@example.com` })),
+                format: "object",
+            });
+            const left = { ...pinned.key, publicKey: big.toString("base64") };
+            expect(await mergeOpenPgpCertificate(left, { ...pinned.key, publicKey: Buffer.from(half.publicKey.write()).toString("base64") })).toBeUndefined();
+        });
+    });
+
+    it("selects the address's current key and every certificate its holder revoked that names it", async () => {
+        const current = await openPgpKey(ADDRESS);
+        const older = await openPgpKey(ADDRESS, { created: new Date(Date.now() - DAY) });
+        const retired = await revoked(await openPgpKey(ADDRESS));
+        const strangerRevoked = await revoked(await openPgpKey("someone@example.com"));
+        const bundle = new Uint8Array([...retired.publicKey.write(), ...older.publicKey.write(), ...strangerRevoked.publicKey.write(), ...current.publicKey.write()]);
+
+        const keys = await selectOpenPgpKeysFor(bundle, ADDRESS);
+        expect(keys.map((key) => key.fingerprint)).toEqual([current.fingerprint, retired.fingerprint]);
+        expect(keys[0].revokedAt).toBeUndefined();
+        expect(keys[1]).toMatchObject({ revokedAt: expect.any(Number), revocationReason: "compromised" });
+        // Only a revocation: no current key.
+        expect((await selectOpenPgpKeysFor(retired.publicKey.write(), ADDRESS)).map((key) => key.fingerprint)).toEqual([retired.fingerprint]);
+        expect(await selectOpenPgpKeysFor(new Uint8Array(MAX_OPENPGP_KEY_BYTES * 4 + 1), ADDRESS)).toEqual([]);
     });
 
     it("replaces a pinned key automatically only when it is retired and certified its successor", async () => {

@@ -87,7 +87,7 @@ import {
     ScanTargetType,
 } from "../models/types.js";
 import { hasSealedFields, sealFieldsOnWrite } from "../zeroaccess/ZeroAccessFieldSealer.js";
-import { EVENT_PROTECTED_FIELDS, newZeroAccessRecordSealer, type ZeroAccessRecordSealer } from "../zeroaccess/ZeroAccessRecordSealer.js";
+import { EVENT_PROTECTED_FIELDS, newZeroAccessRecordSealer, PROTECTED_EVENT_TITLE, type ZeroAccessRecordSealer } from "../zeroaccess/ZeroAccessRecordSealer.js";
 
 /** `true` if two `CalendarEvent.recurrenceId` values name the same occurrence (or both are the master row's
  * "no occurrence" `undefined`) - used to match an iTIP message to the right row among a master/override set
@@ -240,6 +240,9 @@ export abstract class ScanQueueJob<
     /** The `ZeroAccessIndexEntry` model class for this backend, supplied by the Mongo/SQL subclasses. Left unset, a zero-access
      * entry fails (its MTA retries) rather than being filed without its index entry. */
     protected zeroAccessIndexEntryClass?: any;
+    /** The `CalendarEventAttendeeLink` model class, to tell a meeting protected by a per-meeting key (`processItipChangeRequest()`). Left
+     * unset, every event with a video meeting is taken for one. */
+    protected calendarEventAttendeeLinkClass?: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -258,6 +261,7 @@ export abstract class ScanQueueJob<
     protected oofReplySuppressionRepo?: RepoUtils<OS>;
     protected focusedInboxOverrideRepo?: RepoUtils<FIO>;
     protected contactRepo?: RecoverableRepoUtils<C>;
+    protected calendarEventAttendeeLinkRepo?: RepoUtils<any>;
     protected correspondentRepo?: RepoUtils<any>;
     protected domainRepo?: RepoUtils<any>;
     protected correspondentUtils?: CorrespondentUtils;
@@ -404,6 +408,12 @@ export abstract class ScanQueueJob<
         }
         if (!this.recordSealer && this.encryptionPolicyClass) {
             this.recordSealer = await newZeroAccessRecordSealer(this._objectFactory, this.encryptionPolicyClass);
+        }
+        if (!this.calendarEventAttendeeLinkRepo && this.calendarEventAttendeeLinkClass) {
+            this.calendarEventAttendeeLinkRepo = await this._objectFactory.newInstance(RepoUtils, {
+                name: this.calendarEventAttendeeLinkClass.name,
+                args: [this.calendarEventAttendeeLinkClass],
+            });
         }
         if (!this.ingestQueueRepo && this.ingestQueueClass) {
             this.ingestQueueRepo = await this._objectFactory.newInstance(RepoUtils, {
@@ -3223,11 +3233,17 @@ export abstract class ScanQueueJob<
      * its `guestsCanModify`, and new guests need its `guestsCanInviteOthers`; a request with one change not allowed applies nothing at all.
      *
      * What the message carries is a value only when it is present (a request can set a title, location or description, not clear one) and
-     * different from the row's. Applied: the changed fields are written, new guests are added as required, needs-action attendees (deduplicated,
-     * plain addresses only, at most `MAX_REQUESTED_GUESTS` a request and `MAX_EVENT_ATTENDEES` in all), `SEQUENCE` is bumped so that
-     * `MeetingSchedulingJob` mails every guest the updated invitation, and - only when the time changed - every attendee but the organizer goes
-     * back to needs-action, except the guest who asked, who is accepted (as `POST .../accept-proposal` does for the proposer). Version-checked
-     * with a retry like every other iTIP update here.
+     * different from the row's; a title that is a sealed event's placeholder (`PROTECTED_SUBJECT`, `PROTECTED_EVENT_TITLE`) is none - the
+     * guest's copy is sealed and their client didn't name it. Applied: the changed fields are written, new guests are added as required,
+     * needs-action attendees (deduplicated, plain addresses only, at most `MAX_REQUESTED_GUESTS` a request and `MAX_EVENT_ATTENDEES` in all),
+     * `SEQUENCE` is bumped so that `MeetingSchedulingJob` mails every guest the updated invitation, and - only when the time changed - every
+     * attendee but the organizer goes back to needs-action, except the guest who asked, who is accepted (as `POST .../accept-proposal` does
+     * for the proposer). Version-checked with a retry like every other iTIP update here.
+     *
+     * **Never applied to a row whose invitations the job can't send**: one with sealed content (`sealedFields`, `sealedContent`) or a meeting
+     * protected by a per-meeting key (`isKeyedMeeting()`). Only a save carrying the plaintext or the guests' keys sends those
+     * (`MeetingInviteSender.sendProtectedInvitations()`), so applying the request here would move the organizer's meeting and mark it applied
+     * while no guest is ever told. It stays a proposal, which the organizer's client accepts with that content (`POST .../accept-proposal`).
      */
     private async processItipChangeRequest(mailboxUid: string, parsed: ParsedIcsEvent, sender: string, contentSealed: boolean = false): Promise<boolean> {
         const existing: CE | undefined = await this.findCalendarEventRow(mailboxUid, parsed.uid, parsed.recurrenceId);
@@ -3240,6 +3256,10 @@ export abstract class ScanQueueJob<
             return false;
         }
 
+        if (await this.isKeyedMeeting(existing)) {
+            this.logger?.info(`ScanQueueJob: leaving a guest's change request to keyed meeting ${existing.uid} a proposal: only a save with the guests' keys can invite them.`);
+            return false;
+        }
         // A calendar zero-access protects keeps its events' content sealed too, whether or not the mail itself is.
         const calendarProtected: boolean = !!(mailbox && this.recordSealer && (await this.recordSealer.target("calendar", mailbox)));
         let applied = false;
@@ -3248,15 +3268,19 @@ export abstract class ScanQueueJob<
             if (!listed || listed.isOrganizer || own.has(sender) || current.status === CalendarEventStatus.CANCELLED || (parsed.sequence ?? 0) < (current.sequence ?? 0)) {
                 return undefined;
             }
+            if (hasSealedFields(current) || current.sealedContent) {
+                this.logger?.info(`ScanQueueJob: leaving a guest's change request to sealed event ${current.uid} a proposal: only a save with its content can invite the guests.`);
+                return undefined;
+            }
             const patch: Record<string, any> = {};
             // A zero-access organizer's event content is sealed and can't be merged here, nor written readable: only a time change and
             // new guests apply.
-            const sealed: boolean = contentSealed || calendarProtected || hasSealedFields(current) || !!(current as any).sealedContent;
+            const sealed: boolean = contentSealed || calendarProtected;
             if (sealed && (parsed.summary !== undefined || parsed.location !== undefined || parsed.description !== undefined)) {
                 this.logger?.info(`ScanQueueJob: not applying a guest's title, location or description change to zero-access event ${current.uid}.`);
             }
             const title: string | undefined = sealed ? undefined : parsed.summary?.trim().slice(0, 1000);
-            if (title && title !== current.title) {
+            if (title && title !== current.title && title !== PROTECTED_SUBJECT && title !== PROTECTED_EVENT_TITLE) {
                 patch.title = title;
             }
             const location: string | undefined = sealed ? undefined : parsed.location?.trim().slice(0, 1000);
@@ -3318,6 +3342,18 @@ export abstract class ScanQueueJob<
             return { ...patch, attendees: [...attendees, ...added], sequence: current.sequence + 1 };
         });
         return applied;
+    }
+
+    /** Whether `event` is a meeting protected by a per-meeting key - one of its attendee links is `keyed`, as
+     * `MeetingInviteSender.isKeyedMeeting()` tells it - or, without `calendarEventAttendeeLinkClass`, may be one: it has a video meeting. */
+    private async isKeyedMeeting(event: CE): Promise<boolean> {
+        if (!event.videoMeetingUid) {
+            return false;
+        }
+        if (!this.calendarEventAttendeeLinkRepo) {
+            return true;
+        }
+        return (await this.calendarEventAttendeeLinkRepo.count({ calendarEventUid: ModelUtils.literal(event.uid), keyed: true } as any, { ignoreACL: true })) > 0;
     }
 
     /** Marks the delivered message of an applied change request as answered (`Message.meetingResponse` `"accepted"`, as accepting a proposal does), so a client can say the change was applied. */

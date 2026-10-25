@@ -5,6 +5,7 @@
 import { ScanQueueJob } from "../ScanQueueJob.js";
 import {
     AttachmentMongo,
+    CalendarEventAttendeeLinkMongo,
     CalendarEventMongo,
     ContactMongo,
     CorrespondentMongo,
@@ -56,4 +57,5 @@ export class ScanQueueJobMongo extends ScanQueueJob<
     protected encryptionPolicyClass: any = EncryptionPolicyMongo;
     protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestMongo;
     protected zeroAccessIndexEntryClass: any = ZeroAccessIndexEntryMongo;
+    protected calendarEventAttendeeLinkClass: any = CalendarEventAttendeeLinkMongo;
 }

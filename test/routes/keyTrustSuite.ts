@@ -10,7 +10,9 @@ import * as uuid from "uuid";
 import { AuditAction } from "../../src/models/types.js";
 import type { StaticDnsResolver } from "../testDoubles.js";
 import { makeSignerCertificate, x509 } from "../util/signerCertificates.js";
-import { openPgpKey } from "../openPgpTestKeys.js";
+import { openPgpKey, reexpired, withRotatedSubkey } from "../openPgpTestKeys.js";
+
+const DAY = 86_400_000;
 
 export interface KeyTrustSuiteContext {
     app: () => any;
@@ -355,6 +357,29 @@ export function keyTrustSuite(ctx: KeyTrustSuiteContext): void {
             expect(other.body.message).toContain("OpenPGP");
             const audits = (await ctx.findAuditEntries(mailbox.uid)).filter((e: any) => e.action === AuditAction.CONTACT_KEY_TRUSTED);
             expect(audits.map((e: any) => e.details.type ?? null)).toEqual([null, "openpgp"]);
+        });
+
+        it("refreshes the pinned OpenPGP certificate from trust and resolve with the same fingerprint: an extended expiry, a rotated subkey", async () => {
+            const mailbox = await createMailbox();
+            const address = "pgp-refresh@proton.example";
+            const pinned = await openPgpKey(address, { created: new Date(Date.now() - 10 * DAY), expiresIn: 20 * 86_400 });
+            expect((await trust(mailbox.uid, { address, certificate: pinned.armored, type: "openpgp" })).status).toBe(200);
+
+            const extended = await reexpired(pinned, 800 * 86_400);
+            const trusted = await trust(mailbox.uid, { address, certificate: extended.armored, type: "openpgp" });
+            expect(trusted.status).toBe(200);
+            expect(trusted.body.keys).toEqual([expect.objectContaining({ fingerprint: pinned.fingerprint, notAfter: extended.key.notAfter })]);
+
+            const rotated = await withRotatedSubkey(extended);
+            const resolved = await resolve(mailbox.uid, { address, useType: "encrypt", type: "openpgp", action: "accept", expectedPinnedFingerprint: pinned.fingerprint, certificate: rotated.armored });
+            expect(resolved.status).toBe(200);
+            expect(resolved.body.keys).toHaveLength(1);
+            expect(resolved.body.keys[0].fingerprint).toBe(pinned.fingerprint);
+            expect(resolved.body.keys[0].publicKey).not.toBe(trusted.body.keys[0].publicKey);
+            expect(resolved.body.previousKeys).toBeUndefined();
+            // The same copy again changes nothing.
+            const again = await resolve(mailbox.uid, { address, useType: "encrypt", type: "openpgp", action: "accept", expectedPinnedFingerprint: pinned.fingerprint, certificate: rotated.armored });
+            expect(again.body.keys[0].publicKey).toBe(resolved.body.keys[0].publicKey);
         });
 
         it("refuses an unknown type, and an OpenPGP key that doesn't name the address", async () => {

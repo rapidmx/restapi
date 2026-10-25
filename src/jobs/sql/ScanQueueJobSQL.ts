@@ -6,6 +6,7 @@ import { escapeLike, rawLike } from "../../routes/sql/LikeUtils.js";
 import { ScanQueueJob } from "../ScanQueueJob.js";
 import {
     AttachmentSQL,
+    CalendarEventAttendeeLinkSQL,
     CalendarEventSQL,
     ContactSQL,
     CorrespondentSQL,
@@ -57,6 +58,7 @@ export class ScanQueueJobSQL extends ScanQueueJob<
     protected encryptionPolicyClass: any = EncryptionPolicySQL;
     protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestSQL;
     protected zeroAccessIndexEntryClass: any = ZeroAccessIndexEntrySQL;
+    protected calendarEventAttendeeLinkClass: any = CalendarEventAttendeeLinkSQL;
 
     /** `MailboxSQL.aliasAddresses` is a serialized `simple-json` column - see `MailIngestRouteSQL.aliasQueryValue()`, whose
      * anchored, `ESCAPE`d LIKE this repeats. */

@@ -84,6 +84,22 @@ export async function revoked(key: TestOpenPgpKey): Promise<TestOpenPgpKey> {
     return describeKey(privateKey, publicKey);
 }
 
+/** `key` re-published with its expiry moved to `expiresIn` seconds after its creation (new self-signatures made at `date`), as `gpg
+ * --quick-set-expire` does: the same primary key, so the same fingerprint. */
+export async function reexpired(key: TestOpenPgpKey, expiresIn: number, date: Date = new Date()): Promise<TestOpenPgpKey> {
+    const userIDs = key.publicKey.users.map((user) => ({ name: user.userID?.name, email: user.userID?.email }));
+    const { privateKey, publicKey } = await openpgp.reformatKey({ privateKey: key.privateKey, userIDs, keyExpirationTime: expiresIn, date, format: "object" });
+    return describeKey(privateKey, publicKey);
+}
+
+/** `key` re-published with a new encryption subkey and its first one revoked as compromised: the same primary key and fingerprint. */
+export async function withRotatedSubkey(key: TestOpenPgpKey): Promise<TestOpenPgpKey> {
+    const added = await key.privateKey.addSubkey();
+    const rotated = added.clone();
+    rotated.subkeys[0] = await added.subkeys[0].revoke(added.keyPacket as any, { flag: openpgp.enums.reasonForRevocation.keyCompromised });
+    return describeKey(rotated, rotated.toPublic());
+}
+
 /** `successor` with its primary user ID certified by `predecessor` - how a rotation lets correspondents replace a pinned key. */
 export async function certifiedBy(successor: TestOpenPgpKey, predecessor: TestOpenPgpKey): Promise<TestOpenPgpKey> {
     const certifiedPrivate = await successor.privateKey.signPrimaryUser([predecessor.privateKey]);
