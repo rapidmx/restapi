@@ -14,6 +14,7 @@ import {
     ApiErrors,
     DatabaseDecorators,
     HttpResponse,
+    ModelUtils,
     ObjectFactory,
     RepoUtils,
     RouteDecorators,
@@ -37,6 +38,7 @@ import {
     verifiedIssuerCertificate,
 } from "../util/CertificateInstallUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
+import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { AuditAction, EncryptionPolicy, EscrowScope, KeyUseType, KeyVault, Mailbox, MasterKeyWrap, MemberKeyWrap, PublicKey, WrappedPrivateKey, ZeroAccessEscrowWrap, ZeroAccessKey } from "../models/types.js";
 import { activeZeroAccessKey, settleZeroAccessTypes } from "../util/ZeroAccessUtils.js";
 import { canonicalUserUid, zeroAccessMembers } from "../zeroaccess/ZeroAccessResolver.js";
@@ -66,6 +68,12 @@ const MAX_MEMBER_KEY_WRAPS = 2000;
 
 /** The most escrow copies of zero-access keys one vault holds (keys times the scopes a mailbox was assigned to over time). */
 const MAX_ESCROW_ZERO_ACCESS_WRAPS = 200;
+
+/** How many members' certificates one mailbox query looks up (`memberCertificates()`), keeping each SQL `IN` list bounded. */
+const MEMBER_LOOKUP_CHUNK = 200;
+
+/** A member of a shared mailbox, as its access list names them (`zeroAccessMembers()`). */
+type MailboxMember = { userUid: string; full: boolean };
 
 /** An escrow copy of a zero-access key as a client sends it (`escrowKeyFingerprint` and `createdAt` are the server's). */
 export type ZeroAccessEscrowWrapInput = Pick<ZeroAccessEscrowWrap, "escrowScopeId" | "zeroAccessKeyFingerprint" | "cms">;
@@ -809,12 +817,12 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     @Put("/:id/keyvault/member-wraps")
     public async putMemberKeyWraps(@Param("id") mailboxId: string, body: { wraps?: MemberKeyWrapInput[] }, @AuthUser user?: JWTUser): Promise<SharedKeyStatus> {
         const mailbox: M = await this.requireMailbox(mailboxId);
-        await this.requireMailboxManager(mailbox, user);
+        const members: MailboxMember[] = await this.requireMailboxManager(mailbox, user);
         const wraps: MemberKeyWrapInput[] = Array.isArray(body?.wraps) ? body.wraps : [];
         if (wraps.length === 0 || wraps.length > MAX_MEMBER_KEY_WRAPS) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `wraps must list between 1 and ${MAX_MEMBER_KEY_WRAPS} wraps.`);
         }
-        const accepted: MemberKeyWrap[] = await this.validateMemberWraps(mailbox, wraps, false);
+        const accepted: MemberKeyWrap[] = await this.validateMemberWraps(mailbox, members, wraps, false);
         const keyVault: K = await this.findOrCreateKeyVault(mailbox.uid);
         const replaced = (existing: MemberKeyWrap) =>
             accepted.some((wrap) => wrap.memberUserUid === existing.memberUserUid && wrap.zeroAccessKeyFingerprint === existing.zeroAccessKeyFingerprint);
@@ -833,7 +841,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             },
             { user },
         );
-        return await this.sharedKeyStatus(await this.requireMailbox(mailbox.uid), user);
+        return await this.sharedKeyStatus(await this.requireMailbox(mailbox.uid), user, members);
     }
 
     /** `DELETE /mailbox/:id/keyvault/member-wraps/:memberUserUid` - removes every wrap of someone who is no longer a member (`409` for a
@@ -846,9 +854,9 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         @AuthUser user?: JWTUser,
     ): Promise<SharedKeyStatus> {
         const mailbox: M = await this.requireMailbox(mailboxId);
-        await this.requireMailboxManager(mailbox, user);
+        const members: MailboxMember[] = await this.requireMailboxManager(mailbox, user);
         const departed: string = canonicalUserUid(memberUserUid) ?? "";
-        if ((await this.members(mailbox)).some((member) => member.userUid === departed)) {
+        if (members.some((member) => member.userUid === departed)) {
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This user is still a member of the mailbox.");
         }
         const keyVault: K | undefined = await this.findKeyVault(mailbox.uid);
@@ -862,7 +870,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                 { user },
             );
         }
-        return await this.sharedKeyStatus(mailbox, user);
+        return await this.sharedKeyStatus(mailbox, user, members);
     }
 
     /**
@@ -885,7 +893,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         if (mailbox.ownerUserUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A mailbox with an owner gets its zero-access key from its owner.");
         }
-        await this.requireMailboxManager(mailbox, user);
+        const members: MailboxMember[] = await this.requireMailboxManager(mailbox, user);
         const wraps = Array.isArray(body?.wraps) ? body.wraps : [];
         if (!body?.csr || wraps.length === 0 || wraps.length > MAX_MEMBER_KEY_WRAPS) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `csr and between 1 and ${MAX_MEMBER_KEY_WRAPS} wraps are required.`);
@@ -913,6 +921,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         };
         const accepted: MemberKeyWrap[] = await this.validateMemberWraps(
             mailbox,
+            members,
             wraps.map((wrap) => ({ ...wrap, zeroAccessKeyFingerprint: publicKey.fingerprint })),
             true,
         );
@@ -936,7 +945,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             },
             { user },
         );
-        return await this.sharedKeyStatus(await this.requireMailbox(mailbox.uid), user);
+        return await this.sharedKeyStatus(await this.requireMailbox(mailbox.uid), user, members);
     }
 
     /** The new key on the mailbox and its member and escrow wraps in the vault, in one transaction. */
@@ -977,7 +986,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         if (mailbox.ownerUserUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A mailbox with an owner is escrowed through its master key.");
         }
-        await this.requireMailboxManager(mailbox, user);
+        const members: MailboxMember[] = await this.requireMailboxManager(mailbox, user);
         const scope: EscrowScope | undefined = await this.assignedEscrowScope(mailbox);
         if (!scope) {
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This mailbox is not assigned to an escrow scope.");
@@ -1007,7 +1016,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             },
             { user },
         );
-        return await this.sharedKeyStatus(mailbox, user);
+        return await this.sharedKeyStatus(mailbox, user, members);
     }
 
     /** The escrow scope a mailbox is assigned to, when it still exists. */
@@ -1050,39 +1059,53 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
 
     /** The mailbox's members (`ZeroAccessResolver.members()`), from its access list as stored now: who may hold the key is never decided
      * from a cached list, so a removed member stops getting wraps the moment they are removed. */
-    private async members(mailbox: M): Promise<{ userUid: string; full: boolean }[]> {
+    private async members(mailbox: M): Promise<MailboxMember[]> {
         return zeroAccessMembers(await this.aclUtils!.findACL(mailbox.uid, undefined, { skipCache: true }), mailbox, this.trustedRoles);
     }
 
-    /** Who may change a shared mailbox's member wraps: its owner, and members with full access (`403` for anyone else). */
-    private async requireMailboxManager(mailbox: M, user: JWTUser | undefined): Promise<void> {
+    /** Who may change a shared mailbox's member wraps: its owner, and members with full access (`403` for anyone else). Answers the
+     * mailbox's members (`members()`), read once for the whole request: none of these requests changes the access list. */
+    private async requireMailboxManager(mailbox: M, user: JWTUser | undefined): Promise<MailboxMember[]> {
+        const members: MailboxMember[] = await this.members(mailbox);
         if (user && mailbox.ownerUserUid && mailbox.ownerUserUid === user.uid) {
-            return;
+            return members;
         }
         const me: string | undefined = user ? (canonicalUserUid(user.uid)) : undefined;
-        if (!me || !(await this.members(mailbox)).some((member) => member.userUid === me && member.full)) {
+        if (!me || !members.some((member) => member.userUid === me && member.full)) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
+        return members;
     }
 
-    /** A user's own zero-access certificate: the active zero-access key of a mailbox they own (the first by uid, when they own several). */
-    private async memberCertificate(userUid: string): Promise<ZeroAccessKey | undefined> {
-        const owned: M[] = await this.mailboxRepo!.find({ ownerUserUid: userUid, sort: { uid: "ASC" }, limit: 50 } as any, { ignoreACL: true, limit: 50 });
-        for (const mailbox of owned) {
-            const key: ZeroAccessKey | undefined = activeZeroAccessKey(mailbox);
-            if (key) {
-                return key;
+    /** Each user's own zero-access certificate: the active zero-access key of a mailbox they own (the first by uid, when they own several),
+     * read for every user in a few queries rather than one per user. A user with none is absent. */
+    private async memberCertificates(userUids: string[]): Promise<Map<string, ZeroAccessKey>> {
+        const certificates: Map<string, ZeroAccessKey> = new Map();
+        const distinct: string[] = [...new Set(userUids)];
+        for (let start = 0; start < distinct.length; start += MEMBER_LOOKUP_CHUNK) {
+            const chunk: string[] = distinct.slice(start, start + MEMBER_LOOKUP_CHUNK);
+            for await (const page of findPagesByUid<M>(this.mailboxRepo!, { ownerUserUid: ModelUtils.literal(chunk, "in") })) {
+                for (const mailbox of page) {
+                    const key: ZeroAccessKey | undefined = activeZeroAccessKey(mailbox);
+                    if (key && !certificates.has(mailbox.ownerUserUid!)) {
+                        certificates.set(mailbox.ownerUserUid!, key);
+                    }
+                }
             }
         }
-        return undefined;
+        return certificates;
     }
 
     /** `wraps` checked and completed (`createdAt`), or a `400` naming what is wrong. `newKey` skips the check that the wrapped key is
      * already one of the mailbox's (it is being enrolled with them). */
-    private async validateMemberWraps(mailbox: M, wraps: MemberKeyWrapInput[], newKey: boolean): Promise<MemberKeyWrap[]> {
-        const members: Set<string> = new Set((await this.members(mailbox)).map((member) => member.userUid));
+    private async validateMemberWraps(mailbox: M, mailboxMembers: MailboxMember[], wraps: MemberKeyWrapInput[], newKey: boolean): Promise<MemberKeyWrap[]> {
+        const members: Set<string> = new Set(mailboxMembers.map((member) => member.userUid));
         const zeroAccessFingerprints: Set<string> = new Set((mailbox.zeroAccessKeys ?? []).map((key) => key.fingerprint));
-        const certificates: Map<string, ZeroAccessKey | undefined> = new Map();
+        // The certificates of every member the wraps name, read together up front.
+        const named: string[] = wraps
+            .map((wrap) => (typeof wrap?.memberUserUid === "string" ? canonicalUserUid(wrap.memberUserUid) : undefined))
+            .filter((uid): uid is string => !!uid && members.has(uid));
+        const certificates: Map<string, ZeroAccessKey> = await this.memberCertificates(named);
         const accepted: MemberKeyWrap[] = [];
         const seen: Set<string> = new Set();
         for (const wrap of wraps) {
@@ -1103,9 +1126,6 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A member can have only one wrap of each key.");
             }
             seen.add(key);
-            if (!certificates.has(memberUserUid)) {
-                certificates.set(memberUserUid, await this.memberCertificate(memberUserUid));
-            }
             const certificate: ZeroAccessKey | undefined = certificates.get(memberUserUid);
             if (!certificate || certificate.fingerprint !== wrap.recipientFingerprint || !isSealedToCertificate(Buffer.from(wrap.cms, "base64"), Buffer.from(certificate.publicKey, "base64"))) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Each wrap must be encrypted to its member's own zero-access certificate.");
@@ -1121,15 +1141,17 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         return accepted;
     }
 
-    private async sharedKeyStatus(mailbox: M, user: JWTUser | undefined): Promise<SharedKeyStatus> {
-        const members = await this.members(mailbox);
+    /** `members` is the mailbox's members when the request has read them already (`requireMailboxManager()`). */
+    private async sharedKeyStatus(mailbox: M, user: JWTUser | undefined, members?: MailboxMember[]): Promise<SharedKeyStatus> {
+        members ??= await this.members(mailbox);
         const memberUids: Set<string> = new Set(members.map((member) => member.userUid));
         const keyVault: K | undefined = await this.findKeyVault(mailbox.uid);
         const wraps: MemberKeyWrap[] = keyVault?.memberKeyWraps ?? [];
         const active: ZeroAccessKey | undefined = activeZeroAccessKey(mailbox);
         const memberStatus: SharedKeyMember[] = [];
+        const certificates: Map<string, ZeroAccessKey> = await this.memberCertificates(members.map((member) => member.userUid));
         for (const member of members) {
-            const certificate: ZeroAccessKey | undefined = await this.memberCertificate(member.userUid);
+            const certificate: ZeroAccessKey | undefined = certificates.get(member.userUid);
             memberStatus.push({
                 userUid: member.userUid,
                 full: member.full,

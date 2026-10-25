@@ -14,6 +14,7 @@ import {
     STALE_LOCK_AGE_MS,
     STALE_TEMP_FILE_AGE_MS,
     sweepStaleTempFiles,
+    takeOverStaleLock,
     updateJsonFile,
     withFileLock,
     withLock,
@@ -125,6 +126,57 @@ describe("FileStoreUtils Tests", () => {
                 s.n = 2;
             });
             expect(JSON.parse(await fs.readFile(filePath, "utf-8"))).toEqual({ n: 2 });
+        });
+
+        it("Lets only one of two processes that both find a lock stale take it over, so they never hold it at once.", async () => {
+            const filePath: string = path.join(freshDir(), "store.json");
+            await fs.mkdir(path.dirname(filePath), { recursive: true });
+            await fs.writeFile(`${filePath}.lock`, "12345");
+            const old = new Date(Date.now() - STALE_LOCK_AGE_MS - 5000);
+            await fs.utimes(`${filePath}.lock`, old, old);
+            let active = 0;
+            let most = 0;
+            // Straight to the file lock, as two replicas would (no in-process lock between them).
+            const hold = () =>
+                withFileLock(filePath, async () => {
+                    active += 1;
+                    most = Math.max(most, active);
+                    await new Promise((resolve) => setTimeout(resolve, 50));
+                    active -= 1;
+                });
+            await Promise.all([hold(), hold(), hold()]);
+            expect(most).toBe(1);
+            await expect(fs.access(`${filePath}.lock`)).rejects.toThrow();
+            expect((await fs.readdir(path.dirname(filePath))).filter((name) => name.endsWith(".stale"))).toEqual([]);
+        });
+
+        it("Puts back a fresh lock another process created after this one found the old one stale.", async () => {
+            const lockPath: string = path.join(freshDir(), "store.json.lock");
+            await fs.mkdir(path.dirname(lockPath), { recursive: true });
+            await fs.writeFile(lockPath, "crashed");
+            const old = new Date(Date.now() - STALE_LOCK_AGE_MS - 5000);
+            await fs.utimes(lockPath, old, old);
+            const observed = await fs.stat(lockPath);
+            // Another process took the stale lock over and holds a fresh one by the time this one acts.
+            await fs.rm(lockPath);
+            await fs.writeFile(lockPath, "fresh");
+            await takeOverStaleLock(lockPath, observed, "late");
+            expect(await fs.readFile(lockPath, "utf-8")).toBe("fresh");
+            expect(await fs.readdir(path.dirname(lockPath))).toEqual(["store.json.lock"]);
+            // And a lock that is gone by then is simply left gone.
+            await fs.rm(lockPath);
+            await expect(takeOverStaleLock(lockPath, observed, "later")).resolves.toBeUndefined();
+        });
+
+        it("Releases only its own lock, never one another process holds by then, nor fails when it is gone.", async () => {
+            const filePath: string = path.join(freshDir(), "store.json");
+            await withFileLock(filePath, async () => {
+                // Taken over (as a stale lock would be) while this holder ran.
+                await fs.writeFile(`${filePath}.lock`, "someone else");
+            });
+            expect(await fs.readFile(`${filePath}.lock`, "utf-8")).toBe("someone else");
+            await fs.rm(`${filePath}.lock`);
+            await expect(withFileLock(filePath, async () => fs.rm(`${filePath}.lock`))).resolves.toBeUndefined();
         });
 
         it("Gives up with an error when a live lock is not released in time, leaving it alone.", async () => {

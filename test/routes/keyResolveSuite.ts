@@ -155,6 +155,34 @@ export function keyResolveSuite(ctx: KeyTrustSuiteContext): void {
             expect(await ctx.findAuditEntries(mailbox.uid)).toHaveLength(1);
         });
 
+        it("accepts a conflict on a contact looked up by an alias, whose keys name the mailbox's primary address", async () => {
+            const mailbox = await createMailbox();
+            const alias = "dora@alias-resolve.example.com";
+            const primary = "dora@resolve-alias.example.com";
+            const pinned = keyOf(await signer(primary));
+            const observed = keyOf(await signer(primary));
+            const given = await signer(primary);
+            const stranger = await signer("eve@resolve-alias.example.com");
+            await saveContact(mailbox, alias, { keys: [pinned], keyConflicts: [{ ...conflictFor(observed), address: primary }] });
+            const accept = (certificate?: string) =>
+                resolve(mailbox.uid, { address: alias, useType: "sign", action: "accept", expectedPinnedFingerprint: pinned.fingerprint, ...(certificate ? { certificate } : {}) });
+
+            // A given certificate may name the address the conflict was checked against, and no other.
+            expect((await accept(stranger.certificate)).status).toBe(400);
+            const withCertificate = await accept(given.certificate);
+            expect(withCertificate.status).toBe(200);
+            expect(fingerprintsOf(withCertificate.body.keys)).toEqual([["sign", given.fingerprint]]);
+
+            // And the conflict's own key is accepted against it.
+            const other = "gail@alias-resolve.example.com";
+            const otherPinned = keyOf(await signer(primary));
+            const otherObserved = keyOf(await signer(primary));
+            await saveContact(mailbox, other, { keys: [otherPinned], keyConflicts: [{ ...conflictFor(otherObserved), address: primary }] });
+            const accepted = await resolve(mailbox.uid, { address: other, useType: "sign", action: "accept", expectedPinnedFingerprint: otherPinned.fingerprint });
+            expect(accepted.status).toBe(200);
+            expect(fingerprintsOf(accepted.body.keys)).toEqual([["sign", otherObserved.fingerprint]]);
+        });
+
         it("accepting a previous key again takes it out of previousKeys", async () => {
             const mailbox = await createMailbox();
             const address = "carl@resolve-3.example.com";

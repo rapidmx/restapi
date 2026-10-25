@@ -483,6 +483,7 @@ describe("Background job init() hook Tests", () => {
             "contactClass",
             "contactListClass",
             "calendarEventClass",
+            "calendarEventAttendeeLinkClass",
             "taskClass",
             "noteClass",
             "folderClass",

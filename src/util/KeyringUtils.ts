@@ -255,7 +255,7 @@ export function escalateRevocation<K extends PublicKey>(key: K, listed: PublicKe
  * (`"discovery"` vs `"header"`) triggered it.
  *
  * - **Validation**: `discovered` is re-run through `parseKeyDiscoveryResponse()` - a structurally malformed response is treated exactly like no response at all (the Anti-Downgrade no-op below), never partially applied. Each key goes through `sanitizeKey()`.
- * - **Formats**: keys are pinned per key slot (`keySlot()`: `useType` and format), so an address's S/MIME certificates and its OpenPGP certificate are pinned side by side. Everything below applies per slot; an OpenPGP certificate's checks are `OpenPgpKeyUtils`' (`parseOpenPgpContactKey()`, `canReplaceOpenPgpKeyAutomatically()`: the pinned key certified its successor).
+ * - **Formats**: keys are pinned per key slot (`keySlot()`: `useType` and format), so an address's S/MIME certificates and its OpenPGP certificate are pinned side by side. Everything below applies per slot; an OpenPGP certificate's checks are `OpenPgpKeyUtils`' (`parseOpenPgpContactKey()`, `canReplaceOpenPgpKeyAutomatically()`: the pinned key, expired or revoked as superseded but never as compromised, certified its successor).
  * - **Revocation evidence**: a listed key with `revokedAt` is never pinned or recorded as a conflict. When it matches a pinned or previous key (same `useType` and fingerprint), that key takes its `revokedAt`/`revocationReason` if they're stronger than the stored ones (`escalateRevocation()`), which also feeds the automatic replacement below. A non-revoked key already in `previousKeys` for its `useType` is ignored (it was replaced before).
  * - **TOFU pinning**: the first key ever observed for a given `useType` (encrypt/sign) is pinned immediately, with no conflict recorded.
  * - **Automatic replacement**: a different key for a `useType` that has one pinned replaces it when `canReplaceAutomatically()` holds (same issuing CA, proven with the published `issuerCertificate`; pinned key expired or revoked; new key valid for the address). The old key moves to `previousKeys` (`replacement: "automatic"`, keeping its `revokedAt`/`revocationReason`) and the `useType`'s conflict is cleared.
@@ -349,7 +349,10 @@ export async function applyDiscoveredKeys(
         if (existing?.rejectedKeys?.some((k) => k.useType === useType && k.fingerprint === fingerprint)) {
             continue;
         }
-        conflicts = [...conflicts.filter((c) => keySlot(c.observedKey) !== slot), { useType, observedKey: discoveredKey, observedAt, source }];
+        conflicts = [
+            ...conflicts.filter((c) => keySlot(c.observedKey) !== slot),
+            { useType, observedKey: discoveredKey, observedAt, source, ...(certificateAddress !== address ? { address: certificateAddress } : {}) },
+        ];
     }
 
     const existingLastSeen: number = existing?.encryptPreference?.lastSeen ?? -Infinity;

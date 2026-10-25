@@ -12,6 +12,7 @@ import {
     HttpRequest,
     HttpResponse,
     ModelUtils,
+    RecoverableBaseEntity,
     RepoUtils,
     RouteDecorators,
     type UpdateObject,
@@ -415,7 +416,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
      * default, so scoped-child entities uninvolved in eDiscovery (`Contact`/`Task`/`Note`/etc.) are
      * unaffected; `BaseMessageRoute` is the one override today, since email is what a `Matter`'s
      * `custodianMailboxUids` actually protects. An ordinary soft-delete never calls this - see `delete()`
-     * below. Called for `delete()` only under `purge: true` (the only way that method is irrecoverable),
+     * below. Called for `delete()` only under `purge: true` or of a model that isn't recoverable (the only ways that method is irrecoverable),
      * and for EVERY record `truncate()` matches (that method has no `purge` option at all - it is always
      * a hard, permanent delete, see `truncate()`'s own doc comment - so skipping this check there would
      * let a caller destroy held records simply by preferring the bulk endpoint over the equivalent
@@ -428,7 +429,7 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
     }
 
     /**
-     * Hook run just BEFORE records are permanently deleted (`delete()` with `purge: true`, and each batch of at most 500 records of
+     * Hook run just BEFORE records are permanently deleted (`delete()` with `purge: true` or of a model that isn't recoverable, and each batch of at most 500 records of
      * `truncate()`), after the legal-hold check, so an override can gather what the records point at that must go with them. Whatever
      * it returns is handed to `afterPurge()`. Nothing by default. `BaseMessageRoute` collects the messages' attachments and blob keys.
      * A failure here fails the request before anything is deleted.
@@ -609,7 +610,9 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
         await this.requirePermission(this.scopeUidOf(existing), user, ACLAction.DELETE);
-        const purgeRequested: boolean = purge === "true";
+        // A model that isn't recoverable has no soft delete - `RepoUtils.delete()` removes it for good whatever `purge` says, by this
+        // same test - so its plain delete is a permanent one, held and cleaned up like `?purge=true`.
+        const purgeRequested: boolean = purge === "true" || !(this.repoUtils.instantiateObject({}) instanceof RecoverableBaseEntity);
         if (purgeRequested) {
             await this.checkLegalHold(existing, user);
         }

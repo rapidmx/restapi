@@ -17,6 +17,7 @@ import {
 } from "../../src/util/MailSendUtils.js";
 import { AvVerdict, SpamVerdict } from "../../src/models/types.js";
 import { DomainUtils } from "../../src/util/DomainUtils.js";
+import { extractHeaders } from "../../src/util/MimeHeaderUtils.js";
 import { MailRelayError } from "../../src/transport/TransportResultUtils.js";
 import { InMemoryBlobStore, RecordingMailTransport, StaticDnsResolver } from "../testDoubles.js";
 
@@ -470,6 +471,32 @@ describe("prepareOutboundMime() and seedReceiptStatus() Tests", () => {
         expect(sent).toMatch(/^Autocrypt: addr=sender@example.com; prefer-encrypt=mutual; keydata= A{76} A{24}\r\n/);
         expect(sent).not.toContain("RapidMX-Key");
         expect(await send([pgp("T0xE")])).toContain("Autocrypt: addr=sender@example.com; keydata= T0xE\r\n");
+        // Longer than a peer reads: left out rather than sent.
+        expect(await send([pgp("A".repeat(8193))])).not.toContain("Autocrypt");
+    });
+
+    it("folds an Autocrypt header longer than the line limit, and replaces any key announcement the message already carries", async () => {
+        const pgp = { useType: "encrypt", type: "openpgp", publicKey: "B".repeat(1500), notBefore: 1, notAfter: Date.now() + 60_000 };
+        const x509 = { useType: "encrypt", type: "x509", publicKey: "S0VZ", notBefore: 1, notAfter: Date.now() + 60_000 };
+        const injected = Buffer.from(
+            "Autocrypt: addr=sender@example.com; keydata= QUZBS0U=\r\nRapidMX-Key: addr=sender@example.com; type=x509;\r\n keydata=RkFLRQ==\r\n" + raw.toString("binary"),
+            "binary",
+        );
+        const send = async (keys: any[]) =>
+            (await prepareOutboundMime({ raw: injected, message, mailbox: mailbox({ keys }), domainUtils: domainUtilsOf(), dnsResolver: new StaticDnsResolver() })).raw;
+
+        // No key of its own: whatever the client wrote is gone, nothing is announced.
+        const none: Buffer = await send([]);
+        expect(extractHeaders(none, "Autocrypt")).toEqual([]);
+        expect(extractHeaders(none, "RapidMX-Key")).toEqual([]);
+        expect(none.toString()).toContain("Hello world");
+        // With keys: exactly the server's own, the long Autocrypt one folded within the line limit.
+        const own: Buffer = await send([pgp, x509]);
+        expect(extractHeaders(own, "RapidMX-Key")).toEqual(["addr=sender@example.com; prefer-encrypt=nopreference; type=x509; keydata=S0VZ"]);
+        const autocrypt: string[] = extractHeaders(own, "Autocrypt");
+        expect(autocrypt).toHaveLength(1);
+        expect(autocrypt[0].replace(/\s+/g, "")).toBe(`addr=sender@example.com;keydata=${"B".repeat(1500)}`);
+        expect(own.toString("binary").split("\r\n\r\n")[0].split("\r\n").every((line) => line.length <= 998)).toBe(true);
     });
 
     it("advertises the owner's preferred format in the RapidMX-Key header - OpenPGP only with an OpenPGP key to use", async () => {

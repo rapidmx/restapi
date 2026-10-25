@@ -6,6 +6,7 @@ import { ErasureExecutionJob } from "../ErasureExecutionJob.js";
 import {
     AttachmentSQL,
     AuditLogEntrySQL,
+    CalendarEventAttendeeLinkSQL,
     CalendarEventSQL,
     CalendarShareLinkSQL,
     ContactListSQL,
@@ -42,6 +43,7 @@ export class ErasureExecutionJobSQL extends ErasureExecutionJob<DataSubjectErasu
     protected contactClass: any = ContactSQL;
     protected contactListClass: any = ContactListSQL;
     protected calendarEventClass: any = CalendarEventSQL;
+    protected calendarEventAttendeeLinkClass: any = CalendarEventAttendeeLinkSQL;
     protected taskClass: any = TaskSQL;
     protected noteClass: any = NoteSQL;
     protected attachmentClass: any = AttachmentSQL;

@@ -173,6 +173,14 @@ describe("applyDiscoveredKeys() Tests", () => {
         expect(result.keys).toEqual([primaryKey]);
         // A response that names an address its certificate does not name pins nothing.
         expect((await applyDiscoveredKeys(undefined, { ...answered, address: "other@primary.example" }, NOW, "discovery", alias)).keys).toEqual([]);
+
+        // A conflict on the alias's contact records the address its key was checked against, for accepting it later.
+        const nextKey = await makeKey({ publicKey: await makeCertDer("primary", "primary@primary.example") });
+        const conflicted = await applyDiscoveredKeys({ keys: [primaryKey] }, { ...answered, keys: [nextKey] }, NOW, "discovery", alias);
+        expect(conflicted.keyConflicts).toEqual([{ useType: nextKey.useType, observedKey: nextKey, observedAt: NOW, source: "discovery", address: "primary@primary.example" }]);
+        // The contact's own address is not repeated.
+        const own = await applyDiscoveredKeys({ keys: [primaryKey] }, makeDiscovery([nextKey]), NOW, "discovery", "primary@primary.example");
+        expect(own.keyConflicts![0]).not.toHaveProperty("address");
     });
 
     it("TOFU-pins encrypt and sign keys independently from the same discovery response.", async () => {

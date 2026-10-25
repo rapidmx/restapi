@@ -94,6 +94,12 @@ function pinnedKeyChanged(): ApiError {
     );
 }
 
+/** The address `conflict`'s key names: the one it was checked against when it was observed (an alias mailbox's primary address), or
+ * `address`, the contact's own. */
+function conflictAddress(conflict: KeyConflict | undefined, address: string): string {
+    return isPlainAddress(conflict?.address) ? conflict.address : address;
+}
+
 /** A conflict's observed key, validated as a key of its `useType` and format for `address` at `now` (400 when it no longer
  * is), keeping the `issuerCertificate` it was published with. */
 async function revalidatedConflictKey(conflict: KeyConflict, address: string, now: number): Promise<PublicKey> {
@@ -509,7 +515,16 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
         }
         const mailbox: M = await this.requireUpdatableMailbox(mailboxId, user);
         const now: number = Date.now();
-        const givenKey: PublicKey | undefined = certificate === undefined ? undefined : await parseAnyContactKey(certificate, keyType, address, useType, now);
+        // A given certificate names the contact's address - or, for an alias mailbox's, its primary address, which only the conflict knows.
+        let givenKey: PublicKey | undefined;
+        let givenError: unknown;
+        if (certificate !== undefined) {
+            try {
+                givenKey = await parseAnyContactKey(certificate, keyType, address, useType, now);
+            } catch (err) {
+                givenError = err;
+            }
+        }
 
         let audit: { action: AuditAction; details: Record<string, string> } | undefined;
         const { contact } = await this.writeKeys(mailbox, address, user, async (existing) => {
@@ -527,6 +542,12 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
                 conflicts.filter((c) => keySlot(c.observedKey) !== slot),
                 existing.keyConflicts,
             );
+            if (givenError !== undefined && !givenKey) {
+                if (conflictAddress(conflict, address) === address) {
+                    throw givenError;
+                }
+                givenKey = await parseAnyContactKey(certificate, keyType, conflictAddress(conflict, address), useType, now);
+            }
 
             if (action === "reject") {
                 if (!conflict) {
@@ -559,7 +580,7 @@ export abstract class BaseKeyLookupRoute<M extends Mailbox, C extends Contact, F
                 throw new ApiError(ApiErrors.NOT_FOUND, 404, "There is no key conflict to accept for this address.");
             }
             // Re-validated now: the conflict's key may have expired since it was observed.
-            const newKey: PublicKey = givenKey ?? (await revalidatedConflictKey(conflict!, address, now));
+            const newKey: PublicKey = givenKey ?? (await revalidatedConflictKey(conflict!, conflictAddress(conflict, address), now));
             keys[pinnedIndex] = newKey;
             audit = {
                 action: AuditAction.CONTACT_KEY_REPLACED,

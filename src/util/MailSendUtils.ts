@@ -9,13 +9,13 @@ import { BlobStore } from "../blob/BlobStore.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { type Mailbox, type MessageReceiptEntry, type PublicKey, SpamVerdict } from "../models/types.js";
 import { isOpenPgpKey } from "./OpenPgpKeyUtils.js";
-import { AUTOCRYPT_HEADER, buildAutocryptHeader } from "./AutocryptHeaderUtils.js";
+import { AUTOCRYPT_HEADER, buildAutocryptHeader, MAX_KEYDATA_LENGTH } from "./AutocryptHeaderUtils.js";
 import { type MailSendContext, publishTransportOutcome } from "../events/MailEventStream.js";
 import { MailRelayError, type MailRelayFailureDetails, relayFailureDetails } from "../transport/TransportResultUtils.js";
 import { normalizeAddress } from "./AddressUtils.js";
 import { deriveConversationId } from "./ConversationUtils.js";
 import { createFederatedPeerCheck, type DomainUtils } from "./DomainUtils.js";
-import { checkOriginatorHeaders, extractHeader, prependHeaders } from "./MimeHeaderUtils.js";
+import { checkOriginatorHeaders, dropHeaders, extractHeader, prependHeaders } from "./MimeHeaderUtils.js";
 import { buildRapidMxKeyHeader } from "./RapidMxKeyHeaderUtils.js";
 import { resolveDeliveryVerdict, ScanPipeline } from "../scan/ScanPipeline.js";
 
@@ -262,6 +262,11 @@ export interface OutboundMessageInfo {
  * classified same-organisation/federated/external (`DomainUtils.classifyRecipientTier()`) and the per-draft `requestReceipt` overrides all
  * three of the mailbox's `alwaysRequestReceipt*` defaults at once when set.
  * - `RapidMX-Key`, announcing the mailbox's active (non-revoked, non-expired) encryption key.
+ * - `Autocrypt`, announcing its active OpenPGP certificate - unless that is longer than a peer reads (`MAX_KEYDATA_LENGTH`).
+ *
+ * Any `RapidMX-Key` or `Autocrypt` header the message already carries is removed first: a key announcement is this server's to
+ * make, and the recipient's DKIM check can't tell one a client wrote into its MIME from this server's - so a member of a shared
+ * mailbox could otherwise announce a key of their own for it, or suppress the real one (two headers are both ignored).
  *
  * Shared by `BaseMessageRoute.send()` and `ScheduledSendJob`, so a message goes out the same whichever of them sends it - a
  * background send is relayed by the job. `attachesReceiptRequest` says whether the first header was added (the Sent Items
@@ -303,6 +308,7 @@ export async function prepareOutboundMime(args: {
     if (attachesReceiptRequest) {
         raw = prependHeaders(raw, [{ name: "Disposition-Notification-To", value: message.from.address }]);
     }
+    raw = dropHeaders(raw, ["rapidmx-key", AUTOCRYPT_HEADER.toLowerCase()]);
 
     // Announces the sending mailbox's current encryption key (the Autocrypt-style opportunistic-discovery half of the protocol).
     // `?? []`: defense in depth against a legacy row whose SQL `keys` column was backfilled to `null` rather than the column's
@@ -324,7 +330,7 @@ export async function prepareOutboundMime(args: {
     if (activeEncryptKey) {
         raw = prependHeaders(raw, [{ name: "RapidMX-Key", value: buildRapidMxKeyHeader(message.from.address, preferEncrypt, activeEncryptKey, advertisedFormat) }]);
     }
-    if (activeOpenPgpKey) {
+    if (activeOpenPgpKey && activeOpenPgpKey.publicKey.length <= MAX_KEYDATA_LENGTH) {
         raw = prependHeaders(raw, [{ name: AUTOCRYPT_HEADER, value: buildAutocryptHeader(message.from.address, preferEncrypt, activeOpenPgpKey) }]);
     }
     return { raw, attachesReceiptRequest };

@@ -494,6 +494,37 @@ describe("MatterExportJobSQL Tests (real DB + DI)", () => {
         expect(error).toHaveBeenCalledWith(expect.stringContaining("simulated update failure"));
     });
 
+    it("Strikes a long attestation list off as it goes, and stops once another replica took the request over.", async () => {
+        const escrowScopeId = uuid.v4();
+        const mailboxes = [await createMailbox({ escrowScopeId }), await createMailbox({ escrowScopeId }), await createMailbox({ escrowScopeId })];
+        const uids: string[] = mailboxes.map((m) => m.uid);
+        const matter = await createMatter({ escrowScopeId, custodianMailboxUids: uids });
+        const request = await createRequest({ matterId: matter.uid, status: "ready", blobKey: "matter-exports/x-1.ndjson", pendingAttestationMailboxUids: uids });
+        const repoUtils = (job as any).requestRepo;
+        const escrowAuditUtils = (job as any).escrowAuditUtils;
+        const original = escrowAuditUtils.record.bind(escrowAuditUtils);
+        let calls = 0;
+        const record = vi.spyOn(escrowAuditUtils, "record").mockImplementation(async (entry: any) => {
+            const result = await original(entry);
+            calls += 1;
+            if (calls === 2) {
+                // Another replica claims the request (attestOwed()'s version-checked write) while this one is still recording.
+                const fresh = await repoUtils.findOne(request.uid, { ignoreACL: true });
+                await repoUtils.update({ uid: fresh.uid, version: fresh.version, pendingAttestationMailboxUids: fresh.pendingAttestationMailboxUids }, fresh, { ignoreACL: true });
+            }
+            return result;
+        });
+        try {
+            await (job as any).attestPending(await repoUtils.findOne(request.uid, { ignoreACL: true }));
+        } finally {
+            record.mockRestore();
+        }
+        // The first mailbox was struck off before the takeover; the loop stopped at the second instead of recording the third.
+        expect(calls).toBe(2);
+        expect((await escrowAuditLogRepo.find({ where: { action: EscrowAuditAction.MATTER_EXPORT_READY } })).map((e: any) => e.mailboxUid).sort()).toEqual([uids[0], uids[1]].sort());
+        expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.pendingAttestationMailboxUids).toEqual([uids[1], uids[2]]);
+    });
+
     it("Records the attestations a ready export still owes (the run that made it ready died before recording them).", async () => {
         const escrowScopeId = uuid.v4();
         const mailbox = await createMailbox({ escrowScopeId });
@@ -730,8 +761,9 @@ describe("MatterExportJobSQL Tests (real DB + DI)", () => {
 
         const updated = (await requestRepo.findOne({ where: { uid: request.uid } }));
         expect(updated!.status).toBe("ready");
-        // claim + one renewal per custodian + ready + the attestation record cleared
-        expect(updated!.version).toBe(request.version + 5);
+        // claim + one renewal per custodian + ready + the first attestation struck off (this suite's grace of -1 checkpoints after every
+        // attestation but the last) + the attestation record cleared
+        expect(updated!.version).toBe(request.version + 6);
     });
 
     it("A run that lost its lease mid-export (another replica reclaimed the request) neither marks it ready nor leaves its blob or attestations behind.", async () => {

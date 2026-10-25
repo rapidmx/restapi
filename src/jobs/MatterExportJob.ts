@@ -407,11 +407,20 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
      * sequence-contention retries exhausted under a concurrent writer) must not route through `run()`'s `catch`/`markFailed()`,
      * which would write a stale version and fail its own optimistic lock. What could not be recorded stays on the request and is
      * retried by the next run (`run()`), logged loudly meanwhile.
+     *
+     * A long list is struck off as it goes, every quarter of `attestation_grace_seconds`: each such write renews the request's
+     * `dateModified`, so another replica's `attestOwed()` never finds it overdue mid-loop, and one that fails its version check means
+     * another replica took the request over - this one stops there, so at most the entries since the last write are recorded twice.
      */
     private async attestPending(request: T): Promise<void> {
         const owed: string[] = request.pendingAttestationMailboxUids ?? [];
+        if (owed.length === 0) {
+            return;
+        }
         const stillOwed: string[] = [];
-        for (const mailboxUid of owed) {
+        let current: T = request;
+        let checkpointAt: number = Date.now();
+        for (const [index, mailboxUid] of owed.entries()) {
             try {
                 await this.escrowAuditUtils!.record({
                     action: EscrowAuditAction.MATTER_EXPORT_READY,
@@ -426,13 +435,23 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
                     `MatterExportJob: request ${request.uid} is ready and its bundle already includes mailbox ${mailboxUid}'s content, but recording that mailbox's own EscrowAuditLogEntry attestation failed - it is retried on a later run: ${err.message}`,
                 );
             }
+            if (index < owed.length - 1 && Date.now() - checkpointAt >= Math.max(this.attestationGraceSeconds, 0) * 250) {
+                const updated: T | undefined = await this.strikeOffAttestations(current, [...stillOwed, ...owed.slice(index + 1)]);
+                if (!updated) {
+                    return;
+                }
+                current = updated;
+                checkpointAt = Date.now();
+            }
         }
-        if (owed.length === 0) {
-            return;
-        }
+        await this.strikeOffAttestations(current, stillOwed);
+    }
+
+    /** Leaves `owed` as what `request` still owes, version-checked; `undefined` (logged) when the write failed. */
+    private async strikeOffAttestations(request: T, owed: string[]): Promise<T | undefined> {
         try {
-            await this.requestRepo!.update(
-                { uid: request.uid, version: (request as any).version, pendingAttestationMailboxUids: stillOwed.length > 0 ? stillOwed : null } as any,
+            return await this.requestRepo!.update(
+                { uid: request.uid, version: (request as any).version, pendingAttestationMailboxUids: owed.length > 0 ? owed : null } as any,
                 asEntity(this.requestRepo!, request),
                 { ignoreACL: true },
             );
@@ -440,6 +459,7 @@ export abstract class MatterExportJob<T extends MatterExportRequest, M extends M
             // Recorded, but not struck off the request: a later run records them a second time - a duplicate entry in the
             // ledger, rather than a missing one.
             this.logger?.error(`MatterExportJob: recorded the attestations of request ${request.uid} but could not update what it still owes: ${err.message}`);
+            return undefined;
         }
     }
 

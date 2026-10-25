@@ -64,19 +64,52 @@ export interface TransportRuleEvaluationResult {
     addRecipients: string[];
 }
 
-function containsAnyIgnoreCase(haystack: string, needles?: string[]): boolean {
+/** `lower` (already lowercased) contains any of `needles`, ignoring case. */
+function containsAnyIgnoreCase(lower: string, needles?: string[]): boolean {
     if (!needles || needles.length === 0) {
         return false;
     }
-    const lower = haystack.toLowerCase();
     return needles.some((needle) => lower.includes(needle.toLowerCase()));
 }
 
-function containsAnyInList(haystackList: string[], needles?: string[]): boolean {
+function containsAnyInList(lowerList: string[], needles?: string[]): boolean {
     if (!needles || needles.length === 0) {
         return false;
     }
-    return haystackList.some((haystack) => containsAnyIgnoreCase(haystack, needles));
+    return lowerList.some((lower) => containsAnyIgnoreCase(lower, needles));
+}
+
+/** The lowercased text of a context the conditions match, each field made on first use and then kept. */
+interface LoweredContext {
+    readonly from: string[];
+    readonly subject: string;
+    readonly body: string;
+    readonly recipients: string[];
+    readonly attachmentFilenames: string[];
+}
+
+/** `context`'s text lowercased once for every rule `evaluateTransportRules()` checks, rather than again per rule - the body alone can be
+ * `BODY_TEXT_MAX_LENGTH` characters. Lazy, so a body no rule looks at is never copied. */
+function lowerContext(context: TransportRuleMatchContext): LoweredContext {
+    const cache: Partial<Record<keyof LoweredContext, any>> = {};
+    const once = <K extends keyof LoweredContext>(key: K, make: () => LoweredContext[K]): LoweredContext[K] => (cache[key] ??= make());
+    return {
+        get from() {
+            return once("from", () => [context.fromAddress, ...(context.headerFromAddresses ?? [])].map((address) => address.toLowerCase()));
+        },
+        get subject() {
+            return once("subject", () => context.subject.toLowerCase());
+        },
+        get body() {
+            return once("body", () => (context.bodyText ?? context.bodyPreview).toLowerCase());
+        },
+        get recipients() {
+            return once("recipients", () => [...context.recipientAddresses, ...(context.headerRecipientAddresses ?? [])].map((address) => address.toLowerCase()));
+        },
+        get attachmentFilenames() {
+            return once("attachmentFilenames", () => context.attachmentFilenames.map((name) => name.toLowerCase()));
+        },
+    };
 }
 
 /**
@@ -85,19 +118,20 @@ function containsAnyInList(haystackList: string[], needles?: string[]): boolean 
  * entries - same evaluation shape as `MailFilterUtils.matchesConditions()`.
  */
 export function matchesTransportRuleConditions(conditions: TransportRuleConditions, context: TransportRuleMatchContext): boolean {
-    if (conditions.fromContains && !containsAnyInList([context.fromAddress, ...(context.headerFromAddresses ?? [])], conditions.fromContains)) {
+    return matchesLowered(conditions, context, lowerContext(context));
+}
+
+function matchesLowered(conditions: TransportRuleConditions, context: TransportRuleMatchContext, lowered: LoweredContext): boolean {
+    if (conditions.fromContains && !containsAnyInList(lowered.from, conditions.fromContains)) {
         return false;
     }
-    if (conditions.subjectContains && !containsAnyIgnoreCase(context.subject, conditions.subjectContains)) {
+    if (conditions.subjectContains && !containsAnyIgnoreCase(lowered.subject, conditions.subjectContains)) {
         return false;
     }
-    if (conditions.bodyContains && !containsAnyIgnoreCase(context.bodyText ?? context.bodyPreview, conditions.bodyContains)) {
+    if (conditions.bodyContains && !containsAnyIgnoreCase(lowered.body, conditions.bodyContains)) {
         return false;
     }
-    if (
-        conditions.recipientContains &&
-        !containsAnyInList([...context.recipientAddresses, ...(context.headerRecipientAddresses ?? [])], conditions.recipientContains)
-    ) {
+    if (conditions.recipientContains && !containsAnyInList(lowered.recipients, conditions.recipientContains)) {
         return false;
     }
     if (conditions.anyRecipientExternal !== undefined && conditions.anyRecipientExternal !== context.anyRecipientExternal) {
@@ -106,10 +140,7 @@ export function matchesTransportRuleConditions(conditions: TransportRuleConditio
     if (conditions.hasAttachment !== undefined && conditions.hasAttachment !== context.hasAttachment) {
         return false;
     }
-    if (
-        conditions.attachmentNameContains &&
-        !containsAnyInList(context.attachmentFilenames, conditions.attachmentNameContains)
-    ) {
+    if (conditions.attachmentNameContains && !containsAnyInList(lowered.attachmentFilenames, conditions.attachmentNameContains)) {
         return false;
     }
     return true;
@@ -151,9 +182,10 @@ export function evaluateTransportRules(
     const result: TransportRuleEvaluationResult = { reject: false, quarantine: false, addHeaders: [], addRecipients: [] };
 
     const sorted = rules.filter((rule) => rule.enabled).sort((a, b) => a.sequence - b.sequence);
+    const lowered: LoweredContext = lowerContext(context);
     for (const rule of sorted) {
         try {
-            if (!matchesTransportRuleConditions(rule.conditions, context)) {
+            if (!matchesLowered(rule.conditions, context, lowered)) {
                 continue;
             }
             if (!Array.isArray(rule.actions)) {

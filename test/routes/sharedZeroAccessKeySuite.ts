@@ -164,6 +164,32 @@ export function sharedZeroAccessKeySuite(ctx: SharedZeroAccessKeySuiteContext): 
             expect(byReader.status).toBe(403);
         });
 
+        it("reports each member's certificate from the first mailbox by uid they own that has a zero-access key", async () => {
+            const manager = await user();
+            const several = uuid.v4();
+            const first = await zeroAccessKey();
+            const second = await zeroAccessKey();
+            await ctx.createMailbox({ ownerUserUid: several });
+            const a = await ctx.createMailbox({ ownerUserUid: several, zeroAccessKeys: [first.key] });
+            const b = await ctx.createMailbox({ ownerUserUid: several, zeroAccessKeys: [second.key] });
+            const expected = a.uid < b.uid ? first.key : second.key;
+            const keyless = uuid.v4();
+            await ctx.createMailbox({ ownerUserUid: keyless });
+            const shared = await ctx.createMailbox({ ownerUserUid: null });
+            await ctx.setAcl(shared.uid, [
+                { userOrRoleId: manager.uid, actions: [ACLAction.FULL] },
+                { userOrRoleId: several, actions: [ACLAction.READ] },
+                { userOrRoleId: keyless, actions: [ACLAction.READ] },
+            ]);
+
+            const status = await request(ctx.app()).get(`${ctx.baseUrl}/${shared.uid}/keyvault/members`).set("Authorization", as(manager.uid));
+            expect(status.status).toBe(200);
+            const byUid = new Map(status.body.members.map((m: any) => [m.userUid, m]));
+            expect((byUid.get(manager.uid) as any).certificate.fingerprint).toBe(manager.za.key.fingerprint);
+            expect((byUid.get(several) as any).certificate.fingerprint).toBe(expected.fingerprint);
+            expect((byUid.get(keyless) as any).certificate).toBeUndefined();
+        });
+
         it("lets an owner wrap their mailbox's key for delegates, flags a rotation once one leaves, and clears the departed's wraps afterwards", async () => {
             const owner = await user();
             const delegate = await user();

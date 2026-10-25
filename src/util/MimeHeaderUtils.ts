@@ -568,11 +568,40 @@ export function prepareRelayCopy(raw: Buffer, options: RelayCopyOptions): Buffer
     return Buffer.concat([Buffer.from([...added, ...kept].join("\r\n") + "\r\n\r\n", "binary"), body]);
 }
 
+/** RFC 5322's limit on a header line, in characters (CRLF excluded). */
+const MAX_HEADER_LINE_LENGTH = 998;
+/** The line length `foldHeaderLine()` folds to, RFC 5322's recommended one. */
+const FOLD_LINE_LENGTH = 78;
+
+/**
+ * `line` folded (RFC 5322 §2.2.3: CRLF inserted before whitespace) into lines of about `FOLD_LINE_LENGTH`, when it is longer than
+ * `MAX_HEADER_LINE_LENGTH` - an `Autocrypt` header's key, say; anything shorter is kept as it is. Folds only before whitespace that is
+ * followed by more text, so no line is whitespace only; a run without whitespace longer than the limit can't be folded and stays.
+ */
+function foldHeaderLine(line: string): string {
+    if (line.length <= MAX_HEADER_LINE_LENGTH) {
+        return line;
+    }
+    const lines: string[] = [];
+    let current: string = "";
+    for (const word of line.split(/(?=[ \t][^ \t])/)) {
+        if (current.length > 0 && current.length + word.length > FOLD_LINE_LENGTH) {
+            lines.push(current);
+            current = word;
+        } else {
+            current += word;
+        }
+    }
+    lines.push(current);
+    return lines.join("\r\n");
+}
+
 /**
  * One header line this server writes (`Name: value`) made safe to write out one byte per character, which keeps only the
  * low byte of each character - so U+010D and U+010A would otherwise become CR and LF and start a new header (or the body).
  * The name keeps only RFC 5322 field-name characters (the line is dropped when none are left); the value loses every
- * control character, and a value that still has a non-ASCII character is written as one RFC 2047 encoded word.
+ * control character, and a value that still has a non-ASCII character is written as one RFC 2047 encoded word. A line over the
+ * 998-character limit is folded (`foldHeaderLine()`).
  */
 function safeNewHeaderLine(line: string): string | undefined {
     const colon: number = line.indexOf(":");
@@ -581,7 +610,7 @@ function safeNewHeaderLine(line: string): string | undefined {
         return undefined;
     }
     const value: string = singleLineHeaderValue(line.slice(colon + 1));
-    return `${name}:${/^[\x20-\x7E\t]*$/.test(value) ? value : ` =?UTF-8?B?${Buffer.from(value.trim(), "utf8").toString("base64")}?=`}`;
+    return foldHeaderLine(`${name}:${/^[\x20-\x7E\t]*$/.test(value) ? value : ` =?UTF-8?B?${Buffer.from(value.trim(), "utf8").toString("base64")}?=`}`);
 }
 
 /**
@@ -611,6 +640,23 @@ function rebuildWithHeaders(
 export function prependHeaders(raw: Buffer, headers: { name: string; value: string }[]): Buffer {
     const newHeaders: string[] = headers.map(({ name, value }) => `${name}: ${value}`);
     return rebuildWithHeaders(raw, newHeaders);
+}
+
+/** The lowercased name of the header `line` (one logical header line), whitespace before the colon allowed - `""` for none. */
+function headerNameOf(line: string): string {
+    return (line.match(/^([^:\s]*)[ \t]*:/)?.[1] ?? "").toLowerCase();
+}
+
+/**
+ * A copy of `raw` without any top-level header named in `lowerNames` (lowercased), folded continuation lines included - `raw`
+ * itself, untouched, when it has none of them.
+ */
+export function dropHeaders(raw: Buffer, lowerNames: readonly string[]): Buffer {
+    const { headerText } = splitRawIntoHeaderAndBody(raw);
+    if (!splitLogicalHeaderLines(headerText, true).some((line) => lowerNames.includes(headerNameOf(line)))) {
+        return raw;
+    }
+    return rebuildWithHeaders(raw, [], (line) => !lowerNames.includes(headerNameOf(line)));
 }
 
 /**

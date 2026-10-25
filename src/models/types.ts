@@ -1805,6 +1805,9 @@ export interface KeyConflict {
     observedAt: number;
     /** Whether the key came from an inbound `RapidMX-Key` header or a discovery fetch. */
     source: "header" | "discovery";
+    /** The address the observed key was checked against, when it isn't the contact's own: an alias (or alias domain's) mailbox's
+     * certificates name its primary address, so accepting the key checks it against that address too. */
+    address?: string;
 }
 
 /** A formerly pinned key of a contact (`Contact.previousKeys`). */

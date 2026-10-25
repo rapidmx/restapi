@@ -4643,3 +4643,38 @@ Batch: zero-access, delivery, scheduling (review ids 13, 14, 16, 18, 19, 59, 60,
   - Each run reads "Allow zero-access" once (`ZeroAccessWriter.allowed()`) and returns early when it is off. The value is passed to `target(..., allowed)` on the writer, the record sealer and the resolver.
   - A mailbox's folders are read only once it has candidate messages.
   - **Left:** a per-mailbox "backfilled" marker for the steady state. There is still about 1 policy read per run plus about 9 indexed queries per zero-access mailbox. Also left: backoff for transient failures that keep recurring.
+
+
+### 2026-10-24: Review fixes (cross-repo adversarial review)
+Batch: deletes, erasure, attestations, key handling, outbound headers (review ids 69, 71, 72, 73, 74, 80, 81, 82, 83, 84).
+- **Attachment delete (69).** `BaseScopedChildRoute.delete()` treats the delete of a model that isn't recoverable (the same `instanceof RecoverableBaseEntity` test `RepoUtils.delete()` uses) as a purge. `RepoUtils` hard-deletes such a row whatever `purge` says, so the purge steps now run for a plain `DELETE /attachments/:id` too: the legal-hold check (409), `beforePurge`/`afterPurge` (the blob is deleted and the quota refunded), and search-index removal.
+  - The old review-suite case, "a soft delete keeps both", was asserting the orphan. It now expects the blob to be gone and the bytes refunded.
+- **Erasure of attendee links (71).** `ErasureExecutionJob` purges `CalendarEventAttendeeLink` by `mailboxUid` just before the calendar events. This uses the new abstract `calendarEventAttendeeLinkClass`, which both backends set. It covers ordinary and `leftoverOnly` requests.
+  - Note: `DataExportJob` still leaves these rows out, deliberately (narrower portability scope).
+- **Matter export attestations (72).** `attestPending()` strikes recorded mailboxes off `pendingAttestationMailboxUids` as it goes, once every quarter of `attestation_grace_seconds`, with a version-checked write (`strikeOffAttestations()`). Each write renews `dateModified`, so another replica's `attestOwed()` never sees the request as overdue mid-loop. If a write fails, another replica took the request over, and this one stops.
+  - At most the entries since the last checkpoint can be recorded twice. That is the documented failed-strike-off duplicate.
+  - **Left:** a per-mailbox "already attested" lookup against the ledger before recording.
+  - The test suites' grace of -1 checkpoints after every attestation except the last, so the lease-renewal test counts one more version.
+- **Transport rules (73).** `evaluateTransportRules()` lowercases the context once for all rules (`lowerContext()`). It is lazy: a body no rule looks at is never copied. `matchesTransportRuleConditions()` still builds its own for a single call.
+- **File lock (74).** `withFileLock()` writes a token unique to each call (`pid.uuid`) and releases the lock only while it still holds that token.
+  - A stale lock is taken over by renaming it to a name that only this call uses (`takeOverStaleLock()`), and only then deleting it.
+  - If the moved file's ino or mtime isn't what was seen, it is a fresh lock: it is linked back in place.
+  - **Left:** a third process creating a lock between that rename and the link-back. This window is microseconds long and was accepted.
+- **Shared-key status (80).**
+  - `memberCertificates()` reads every member's certificate in chunked `ownerUserUid in (...)` keyset pages instead of one query per member. The rule is unchanged: the first owned mailbox by uid with an active zero-access key.
+  - `requireMailboxManager()` returns the members it read (the owner case included). The PUT/DELETE/enroll/escrow-wrap handlers pass that list to `validateMemberWraps()` and `sharedKeyStatus()`, so the ACL is read once per request.
+- **OpenPGP auto-replacement (81).** `canReplaceOpenPgpKeyAutomatically()` lets only an expired key, or one revoked as `"superseded"`, vouch for its successor.
+  - "compromised", or no stated reason, makes it a key conflict even when the key is also expired. In OpenPGP the retired key itself does the vouching, unlike an X.509 CA.
+  - The certification must be dated no later than `min(revokedAt, notAfter)`. It is checked one by one with `user.verifyCertificate()` against `otherCertifications` from the pinned key.
+  - Spec §OpenPGP pinning and the `applyDiscoveredKeys` doc were updated.
+- **Header line length (82).** `MimeHeaderUtils.safeNewHeaderLine()` folds a line longer than 998 characters (`foldHeaderLine()`, to about 78 characters, only before whitespace followed by text). Shorter lines are unchanged.
+  - `buildRapidMxKeyHeader()` now writes keydata in space-separated runs of 76, so it can fold. Every parser strips the whitespace.
+  - `prepareOutboundMime()` leaves out the Autocrypt header when the certificate is longer than `MAX_KEYDATA_LENGTH` (8192, now exported), the limit peers accept.
+  - **Left:** a token with no whitespace that is longer than 998 characters, and a long RFC 2047 encoded-word value, are still written on one line.
+- **Client key announcements (83).** `prepareOutboundMime()` drops every top-level `RapidMX-Key` and `Autocrypt` header from the raw message (`dropHeaders()`, which returns the same buffer when there are none) before adding the server's own.
+  - This covers every raw send path: assemble-raw, ActiveSync and MAPI SendMail, and scheduled sends.
+  - **server TODO:** add "autocrypt" to `BaseMailComposeRoute.isTrustHeader()`, so assemble-raw refuses it with 400. Not done in this restapi batch.
+- **Alias-contact conflicts (84).** `KeyConflict.address` (optional) records the address the observed key was checked against, when it differs from the contact's own. This is an alias mailbox's primary address.
+  - `resolve()` revalidates the conflict's key against that address.
+  - A given certificate is tried against the contact's address first. Otherwise it is checked against the conflict's address, and its own 400 applies.
+  - Conflicts recorded before this change have no `address`. For those, accepting through an alias still answers 400 until discovery records the conflict again.

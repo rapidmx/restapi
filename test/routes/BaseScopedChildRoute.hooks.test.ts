@@ -6,7 +6,7 @@
 // `onTruncateRefused()`) and their default no-op implementations, which a route that overrides none of them (Contact, Task, ...) uses. The
 // real behaviour of the overriding route (`BaseMessageRoute`) is `test/routes/messagePurgeSuite.ts`.
 import config from "../config.js";
-import { ObjectFactory } from "@rapidrest/service-core";
+import { ObjectFactory, RecoverableBaseEntity } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { BaseScopedChildRoute } from "../../src/routes/BaseScopedChildRoute.js";
 
@@ -56,7 +56,8 @@ describe("BaseScopedChildRoute purge and truncate hooks Tests", () => {
     const objectFactory: ObjectFactory = new ObjectFactory(config, Logger());
     const user: any = { uid: "user-1" };
 
-    const wire = (route: any, matched: any[]): { truncate: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> } => {
+    /** `recoverable`: whether the model has a soft delete (a plain delete of one that has none is a purge). */
+    const wire = (route: any, matched: any[], recoverable: boolean = true): { truncate: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> } => {
         const truncate = vi.fn().mockResolvedValue(undefined);
         const del = vi.fn().mockResolvedValue(undefined);
         route.repoUtils = {
@@ -64,6 +65,7 @@ describe("BaseScopedChildRoute purge and truncate hooks Tests", () => {
             findOne: vi.fn().mockResolvedValue(matched[0]),
             truncate,
             delete: del,
+            instantiateObject: () => (recoverable ? new RecoverableBaseEntity() : {}),
         };
         route.aclUtils = { hasPermission: vi.fn().mockResolvedValue(true) };
         return { truncate, delete: del };
@@ -77,6 +79,16 @@ describe("BaseScopedChildRoute purge and truncate hooks Tests", () => {
         await route.delete("msg-1", undefined, undefined, {} as any, user);
 
         expect(route.calls).toEqual(["hold:msg-1:user-1", "before:msg-1", "after:1:{\"prepared\":1}"]);
+    });
+
+    it("Runs them around a plain delete too when the model has no soft delete, since that delete is permanent.", async () => {
+        const route = objectFactory.newInstance<HookRoute>(HookRoute, { initialize: false });
+        const { delete: del } = wire(route, [{ uid: "att-1", folderUid: "folder-1" }], false);
+
+        await route.delete("att-1", undefined, undefined, {} as any, user);
+
+        expect(route.calls).toEqual(["hold:att-1:user-1", "before:att-1", "after:1:{\"prepared\":1}"]);
+        expect(del).toHaveBeenCalledWith("att-1", expect.objectContaining({ purge: true }));
     });
 
     it("Runs them around each truncate batch, then reports the total once.", async () => {

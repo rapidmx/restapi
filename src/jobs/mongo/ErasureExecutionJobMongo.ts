@@ -6,6 +6,7 @@ import { ErasureExecutionJob } from "../ErasureExecutionJob.js";
 import {
     AttachmentMongo,
     AuditLogEntryMongo,
+    CalendarEventAttendeeLinkMongo,
     CalendarEventMongo,
     CalendarShareLinkMongo,
     ContactListMongo,
@@ -42,6 +43,7 @@ export class ErasureExecutionJobMongo extends ErasureExecutionJob<DataSubjectEra
     protected contactClass: any = ContactMongo;
     protected contactListClass: any = ContactListMongo;
     protected calendarEventClass: any = CalendarEventMongo;
+    protected calendarEventAttendeeLinkClass: any = CalendarEventAttendeeLinkMongo;
     protected taskClass: any = TaskMongo;
     protected noteClass: any = NoteMongo;
     protected attachmentClass: any = AttachmentMongo;

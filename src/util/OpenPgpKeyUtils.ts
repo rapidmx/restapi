@@ -232,13 +232,16 @@ export async function parseOpenPgpContactKey(certificate: unknown, address: stri
 
 /**
  * Whether OpenPGP `observed` may replace the pinned OpenPGP key `pinned` without prompting - this format's counterpart of
- * the same-issuing-CA rule (`KeyringUtils.canReplaceAutomatically()`): `pinned` is expired or revoked at `observedAt`, and
- * `observed` is a valid key for `address` (`parseOpenPgpContactKey()`) whose user ID for `address` carries a certification
- * that verifies with `pinned`'s primary key - the key the user trusted vouches for its successor. Never throws.
+ * the same-issuing-CA rule (`KeyringUtils.canReplaceAutomatically()`): `pinned` is expired at `observedAt` or revoked as
+ * `"superseded"`, and `observed` is a valid key for `address` (`parseOpenPgpContactKey()`) whose user ID for `address` carries a
+ * certification that verifies with `pinned`'s primary key, made no later than `pinned` was retired - the key the user trusted
+ * vouches for its successor. Unlike X.509, where the issuing CA vouches, here the retired key itself does: a key revoked as
+ * `"compromised"` (or for no stated reason) may be in an attacker's hands, so it never vouches, and its successor is a key conflict
+ * for the user to decide. Never throws.
  */
 export async function canReplaceOpenPgpKeyAutomatically(pinned: PublicKey, observed: PublicKey, address: string, observedAt: number): Promise<boolean> {
     try {
-        if (!(observedAt > pinned.notAfter) && pinned.revokedAt === undefined) {
+        if (pinned.revokedAt !== undefined ? pinned.revocationReason !== "superseded" : !(observedAt > pinned.notAfter)) {
             return false;
         }
         await parseOpenPgpContactKey(observed.publicKey, address, observedAt);
@@ -247,15 +250,23 @@ export async function canReplaceOpenPgpKeyAutomatically(pinned: PublicKey, obser
             return false;
         }
         const wanted: string = address.toLowerCase();
+        const pinnedKeyIds = pinnedCert.getKeyIDs();
+        // A certification dated after the pinned key was retired vouches for nothing.
+        const retiredAt: number = Math.min(pinned.revokedAt ?? Infinity, pinned.notAfter);
         for (const user of observedCert.users) {
             if (user.userID?.email?.toLowerCase() !== wanted) {
                 continue;
             }
-            // `verifyAllCertifications` checks third-party certifications against the keys given; an expired or revoked pinned
-            // key still verifies a certification it made while it was valid.
-            const results = await orElse(user.verifyAllCertifications([pinnedCert], new Date(observedAt)), []);
-            if (results.some((result) => result.valid === true && pinnedCert.getKeyIDs().some((id) => id.equals(result.keyID)))) {
-                return true;
+            for (const certification of user.otherCertifications) {
+                const created: number | undefined = certification.created?.getTime();
+                if (created === undefined || created > retiredAt || !pinnedKeyIds.some((id) => id.equals(certification.issuerKeyID))) {
+                    continue;
+                }
+                // Checked against the pinned key as of the certification's own date (OpenPGP.js), so an expired or revoked pinned key
+                // still verifies a certification it made while it was valid.
+                if ((await orElse(user.verifyCertificate(certification, [pinnedCert as any], new Date(observedAt)), null)) === true) {
+                    return true;
+                }
             }
         }
         return false;

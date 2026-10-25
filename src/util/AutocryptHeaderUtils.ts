@@ -21,8 +21,8 @@ export interface ParsedAutocryptHeader {
 const KNOWN_ATTRIBUTES: ReadonlySet<string> = new Set(["addr", "prefer-encrypt", "keydata"]);
 const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 
-/** The longest `keydata` accepted, in base64 characters (`KeyDiscoveryClient`'s cap for a discovered key). */
-const MAX_KEYDATA_LENGTH = 8192;
+/** The longest `keydata` accepted, in base64 characters (`KeyDiscoveryClient`'s cap for a discovered key) - so a longer one isn't sent either. */
+export const MAX_KEYDATA_LENGTH = 8192;
 
 /** Width of the whitespace-separated runs `keydata` is written in (whitespace in it is ignored by every reader). */
 const FOLD_WIDTH = 76;
@@ -30,8 +30,8 @@ const FOLD_WIDTH = 76;
 /**
  * The outbound `Autocrypt` header value (Autocrypt Level 1) announcing `address`'s OpenPGP certificate `key` - the OpenPGP
  * counterpart of `RapidMX-Key`, which only ever carries the S/MIME certificate. `prefer-encrypt=mutual` is sent only for a
- * mailbox whose preference is mutual. `keydata` is written in space-separated runs: `MimeHeaderUtils.prependHeaders()` writes a
- * header on one line, and a v6 certificate keeps it well under the 998-character line limit.
+ * mailbox whose preference is mutual. `keydata` is written in space-separated runs, which `MimeHeaderUtils.prependHeaders()` folds
+ * the header at when it is longer than the 998-character line limit (a rotated key certified by its predecessor already is).
  */
 export function buildAutocryptHeader(address: string, preferEncrypt: "mutual" | "nopreference", key: PublicKey): string {
     const lines: string[] = [];

@@ -99,6 +99,41 @@ describe("TransportRuleUtils Tests", () => {
     });
 
     describe("evaluateTransportRules()", () => {
+        it("Lowercases the message's text once for every rule, still matching every field case-insensitively.", () => {
+            const bodyText = `${"x".repeat(1000)} The SECRET Word`;
+            const context = makeContext({
+                fromAddress: "Sender@Example.com",
+                headerFromAddresses: ["Boss@Example.com"],
+                subject: "Quarterly REPORT",
+                bodyText,
+                headerRecipientAddresses: ["Team@Example.com"],
+                hasAttachment: true,
+                attachmentFilenames: ["Budget.XLSX"],
+            });
+            const rules = [
+                makeRule({ sequence: 0, conditions: { bodyContains: ["secret word"] }, actions: [{ type: TransportRuleActionType.ADD_RECIPIENT, recipientAddress: "a@example.com" }] }),
+                makeRule({ sequence: 1, conditions: { bodyContains: ["nope", "the secret"] }, actions: [{ type: TransportRuleActionType.ADD_RECIPIENT, recipientAddress: "b@example.com" }] }),
+                makeRule({
+                    sequence: 2,
+                    conditions: { fromContains: ["BOSS@"], subjectContains: ["report"], recipientContains: ["team@"], attachmentNameContains: ["budget.xlsx"], bodyContains: ["WORD"] },
+                    actions: [{ type: TransportRuleActionType.ADD_RECIPIENT, recipientAddress: "c@example.com" }],
+                }),
+                makeRule({ sequence: 3, conditions: { bodyContains: ["absent"] }, actions: [{ type: TransportRuleActionType.REJECT }] }),
+            ];
+            const lower = vi.spyOn(String.prototype, "toLowerCase");
+            let result;
+            let bodyCopies: number;
+            try {
+                result = evaluateTransportRules(rules, context);
+            } finally {
+                bodyCopies = lower.mock.contexts.filter((self: any) => String(self) === bodyText).length;
+                lower.mockRestore();
+            }
+            expect(result.addRecipients).toEqual(["a@example.com", "b@example.com", "c@example.com"]);
+            expect(result.reject).toBe(false);
+            expect(bodyCopies).toBe(1);
+        });
+
         it("Skips a disabled rule even if its conditions match.", () => {
             const rules = [makeRule({ enabled: false, actions: [{ type: TransportRuleActionType.REJECT }] })];
             expect(evaluateTransportRules(rules, makeContext()).reject).toBe(false);

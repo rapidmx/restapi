@@ -59,17 +59,23 @@ const FILE_LOCK_RETRY_MS = 25;
  * serializes within one). Another process's lock is waited for (retrying every 25 ms, up to 25 s) and removed once it is older than
  * `STALE_LOCK_AGE_MS`. Throws if the lock can't be had in time. Callers hold the in-process `withLock()` first, so at most one caller per
  * process is ever waiting here.
+ *
+ * The lock holds a token unique to this call, and is released only while it still holds it, so a holder never removes a lock another
+ * process has since taken. A stale lock is taken over atomically (`takeOverStaleLock()`): of two processes that both found it stale,
+ * only one moves it away, so the other can't remove the fresh lock the first one then creates.
  */
 export async function withFileLock<T>(filePath: string, fn: () => Promise<T>, dirMode: number = 0o700): Promise<T> {
     const lockPath: string = `${filePath}.lock`;
+    const token: string = `${process.pid}.${nodeCrypto.randomUUID()}`;
     const deadline: number = Date.now() + FILE_LOCK_WAIT_MS;
     for (;;) {
-        if (await createFileExclusive(lockPath, `${process.pid}`, 0o600, dirMode)) {
+        if (await createFileExclusive(lockPath, token, 0o600, dirMode)) {
             break;
         }
         try {
-            if (Date.now() - (await fs.stat(lockPath)).mtimeMs > STALE_LOCK_AGE_MS) {
-                await fs.rm(lockPath, { force: true });
+            const observed = await fs.stat(lockPath);
+            if (Date.now() - observed.mtimeMs > STALE_LOCK_AGE_MS) {
+                await takeOverStaleLock(lockPath, observed, token);
                 continue;
             }
         } catch {
@@ -86,6 +92,43 @@ export async function withFileLock<T>(filePath: string, fn: () => Promise<T>, di
     try {
         return await fn();
     } finally {
+        await releaseFileLock(lockPath, token);
+    }
+}
+
+/**
+ * Removes the stale lock at `lockPath` that `observed` describes, by renaming it to a name of this call's own first - a rename only one
+ * process can win - and only then deleting it. If what was moved is not that lock (another process took the stale one over and
+ * created a fresh lock in between), it is linked back in place: the fresh lock stays its holder's.
+ */
+export async function takeOverStaleLock(lockPath: string, observed: { ino: number; mtimeMs: number }, token: string): Promise<void> {
+    const moved: string = `${lockPath}.${token}.stale`;
+    try {
+        await fs.rename(lockPath, moved);
+    } catch {
+        // Gone already: another process moved it (or its holder released it) first.
+        return;
+    }
+    try {
+        const stat = await fs.stat(moved);
+        if (stat.ino !== observed.ino || stat.mtimeMs !== observed.mtimeMs) {
+            try {
+                await fs.link(moved, lockPath);
+            } catch {
+                /* v8 ignore start -- only reachable when a third process creates a lock in the instant between the rename and the link. */
+                // Someone else's lock is in place already; it stays.
+                /* v8 ignore stop */
+            }
+        }
+    } finally {
+        await fs.rm(moved, { force: true });
+    }
+}
+
+/** Removes the lock at `lockPath` only while it still holds `token` - the lock this call took, not one another process has since. */
+async function releaseFileLock(lockPath: string, token: string): Promise<void> {
+    const held: string | undefined = await fs.readFile(lockPath, "utf-8").catch(() => undefined);
+    if (held === token) {
         await fs.rm(lockPath, { force: true });
     }
 }

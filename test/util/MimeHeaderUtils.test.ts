@@ -5,6 +5,7 @@
 import {
     checkOriginatorHeaders,
     containsCalendarContent,
+    dropHeaders,
     extractHeader,
     extractHeaders,
     extractOriginatorHeaders,
@@ -199,6 +200,40 @@ describe("MimeHeaderUtils Tests", () => {
 
             expect(result).toContain("From: sender@example.com");
             expect(result).toContain("Body");
+        });
+
+        it("Folds a header longer than the 998-character line limit at its whitespace, and leaves a shorter one on one line.", () => {
+            const raw = Buffer.from("From: sender@example.com\r\n\r\nBody\r\n");
+            const runs: string = Array.from({ length: 20 }, (_, i) => String.fromCharCode(65 + i).repeat(76)).join(" ");
+            const value = `addr=sender@example.com; keydata= ${runs}`;
+
+            const result = prependHeaders(raw, [{ name: "Autocrypt", value }, { name: "X-Short", value: "a  b" }]);
+            const header: string = result.toString("binary").split("\r\n\r\n")[0];
+
+            const lines: string[] = header.split("\r\n");
+            expect(lines.every((line) => line.length <= 78)).toBe(true);
+            // The Autocrypt header's continuation lines each start with the whitespace it was folded at.
+            expect(lines.filter((line) => /^ \S/.test(line)).length).toBeGreaterThanOrEqual(20);
+            expect(extractHeader(result, "Autocrypt")).toBe(value);
+            expect(header).toContain("\r\nX-Short: a  b\r\n");
+            // A run with no whitespace can't be folded: it stays whole.
+            const token = "Z".repeat(1200);
+            expect(extractHeader(prependHeaders(raw, [{ name: "X-Token", value: token }]), "X-Token")).toBe(token);
+        });
+    });
+
+    describe("dropHeaders()", () => {
+        it("Drops every top-level header named, folded lines included, and keeps the rest and the body.", () => {
+            const raw = Buffer.from("Autocrypt: addr=a@example.com;\r\n keydata=QUFB\r\nFrom: a@example.com\r\nrapidmx-key : x\r\nSubject: Hi\r\n\r\nAutocrypt: in the body\r\n");
+
+            const result: string = dropHeaders(raw, ["autocrypt", "rapidmx-key"]).toString();
+
+            expect(result).toBe("From: a@example.com\r\nSubject: Hi\r\n\r\nAutocrypt: in the body\r\n");
+        });
+
+        it("Returns the message itself when it has none of them.", () => {
+            const raw = Buffer.from("From: a@example.com\r\n\r\nBody\r\n");
+            expect(dropHeaders(raw, ["autocrypt"])).toBe(raw);
         });
     });
 

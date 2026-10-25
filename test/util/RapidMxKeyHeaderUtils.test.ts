@@ -43,7 +43,9 @@ describe("parseRapidMxKeyHeader() Tests", () => {
         const key = { publicKey: keydata, type: "x509", useType: "encrypt" as const, fingerprint: "f", notBefore: 0, notAfter: 1 };
 
         const withFormat = buildRapidMxKeyHeader("alice@example.com", "mutual", key, "openpgp");
-        expect(withFormat).toBe(`addr=alice@example.com; prefer-encrypt=mutual; _prefer-format=openpgp; type=x509; keydata=${keydata}`);
+        // keydata in space-separated runs of 76, so a long header can be folded; the parser strips them.
+        expect(withFormat).toBe(`addr=alice@example.com; prefer-encrypt=mutual; _prefer-format=openpgp; type=x509; keydata=${keydata.match(/.{1,76}/g)!.join(" ")}`);
+        expect(parseRapidMxKeyHeader([withFormat], "alice@example.com")?.publicKey.publicKey).toBe(keydata);
         expect(parseRapidMxKeyHeader([withFormat], "alice@example.com")?.preferFormat).toBe("openpgp");
 
         const without = buildRapidMxKeyHeader("alice@example.com", "mutual", key);

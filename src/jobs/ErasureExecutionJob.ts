@@ -67,7 +67,7 @@ const ATTEMPT_REASON = /^Erasure attempt (\d+) /;
  * an orphaned folder after its owning mailbox is gone would be a real data-hygiene gap for a feature whose
  * whole point is leaving no trace). Verified against every interface in `models/types.ts` that declares a
  * `mailboxUid` field, this also purges `FocusedInboxOverride`/`TaskList`/`Label`/`MailFilterRule`/
- * `MailSignature`/`OofReplySuppression`/`Correspondent`/plugin `@MailboxScopedData()` models/`QuarantineEntry`/
+ * `MailSignature`/`OofReplySuppression`/`Correspondent`/`CalendarEventAttendeeLink`/plugin `@MailboxScopedData()` models/`QuarantineEntry`/
  * `IngestQueueEntry` (each carries real personal data - sender addresses, a signature's name/contact
  * details, filter-rule conditions naming other people - that would otherwise
  * silently survive an "erasure" that reports itself complete), and `DataExportRequest`/
@@ -116,6 +116,8 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
     protected abstract contactClass: any;
     protected abstract contactListClass: any;
     protected abstract calendarEventClass: any;
+    /** Each attendee's personalized meeting link of the mailbox's events (an attendee's address and join URL), erased with them. */
+    protected abstract calendarEventAttendeeLinkClass: any;
     protected abstract taskClass: any;
     protected abstract noteClass: any;
     protected abstract attachmentClass: any;
@@ -240,6 +242,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             this.contactClass,
             this.contactListClass,
             this.calendarEventClass,
+            this.calendarEventAttendeeLinkClass,
             this.taskClass,
             this.noteClass,
             this.folderClass,
@@ -454,6 +457,7 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
             removeFromIndex("contact"),
         );
         purgedCount += await this.purgeEntityType(this.contactListClass, request.mailboxUid);
+        purgedCount += await this.purgeEntityType(this.calendarEventAttendeeLinkClass, request.mailboxUid);
         purgedCount += await this.purgeEntityType(this.calendarEventClass, request.mailboxUid, undefined, removeFromIndex("calendarEvent"));
         purgedCount += await this.purgeEntityType(this.taskClass, request.mailboxUid, undefined, removeFromIndex("task"));
         purgedCount += await this.purgeEntityType(this.noteClass, request.mailboxUid, undefined, removeFromIndex("note"));

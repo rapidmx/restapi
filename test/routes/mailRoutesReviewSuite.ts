@@ -1113,18 +1113,19 @@ hello`));
             });
         };
 
-        it("a permanent delete removes the blob and gives the mailbox its bytes back, a soft delete keeps both", async () => {
+        it("a delete removes the blob and gives the mailbox its bytes back, with or without purge, since an attachment has no soft delete", async () => {
             const mine = await createMailbox(owner.uid, { usedBytes: 10 });
             const inbox = await createFolder(mine.uid);
             const message = await createMessage(mine, inbox.uid);
-            const soft = await attach(mine, inbox.uid, message.uid);
+            const plain = await attach(mine, inbox.uid, message.uid);
             const hard = await attach(mine, inbox.uid, message.uid);
-            expect((await auth(request(ctx.app()).delete(url(`/attachments/${soft.uid}`)), owner)).status).toBe(204);
-            expect(await ctx.blobStore().exists(soft.blobKey)).toBe(true);
-            expect((await ctx.findOne("Mailbox", mine.uid)).usedBytes).toBe(10);
+            expect((await auth(request(ctx.app()).delete(url(`/attachments/${plain.uid}`)), owner)).status).toBe(204);
+            expect(await ctx.findOne("Attachment", plain.uid)).toBeFalsy();
+            expect(await ctx.blobStore().exists(plain.blobKey)).toBe(false);
+            expect((await ctx.findOne("Mailbox", mine.uid)).usedBytes).toBe(7);
             expect((await auth(request(ctx.app()).delete(url(`/attachments/${hard.uid}?purge=true`)), owner)).status).toBe(204);
             expect(await ctx.blobStore().exists(hard.blobKey)).toBe(false);
-            expect((await ctx.findOne("Mailbox", mine.uid)).usedBytes).toBe(7);
+            expect((await ctx.findOne("Mailbox", mine.uid)).usedBytes).toBe(4);
         });
 
         it("a truncate removes the blobs and refunds, but keeps a blob another attachment still names", async () => {
@@ -1154,13 +1155,15 @@ hello`));
                 dateRangeEnd: new Date("2030-01-01"),
             });
             expect((await auth(request(ctx.app()).delete(url(`/attachments/${att.uid}?purge=true`)), owner)).status).toBe(409);
+            // A plain delete is as permanent as a purge for an attachment, so it is refused too.
+            expect((await auth(request(ctx.app()).delete(url(`/attachments/${att.uid}`)), owner)).status).toBe(409);
             expect((await auth(request(ctx.app()).delete(url(`/attachments?folderUid=${inbox.uid}`)), owner)).status).toBe(409);
             expect(await ctx.blobStore().exists(att.blobKey)).toBe(true);
             expect(await ctx.count("Attachment")).toBe(1);
             expect((await auth(request(ctx.app()).put(url(`/attachments/${att.uid}`)), owner).send({ uid: att.uid, version: att.version, filename: "renamed.txt" })).status).toBe(409);
-            // A soft delete stays recoverable, and an unchanged round trip still saves.
+            // An unchanged round trip still saves.
             expect((await auth(request(ctx.app()).put(url(`/attachments/${att.uid}`)), owner).send({ uid: att.uid, version: att.version, filename: "a.txt" })).status).toBe(200);
-            expect((await auth(request(ctx.app()).delete(url(`/attachments/${att.uid}`)), owner)).status).toBe(204);
+            expect(await ctx.count("Attachment")).toBe(1);
         });
     });
 

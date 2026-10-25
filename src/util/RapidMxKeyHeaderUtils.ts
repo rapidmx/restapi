@@ -64,12 +64,18 @@ function parseAttributes(value: string): Record<string, string> | undefined {
  * Builds the outbound `RapidMX-Key` header value announcing `address`'s current encryption key, for
  * `BaseMessageRoute.send()` to attach alongside `Disposition-Notification-To` - the inverse of
  * `parseRapidMxKeyHeader()`, emitting only the four attributes that function understands (never a signing
- * key - per the spec, this header never carries one).
+ * key - per the spec, this header never carries one). `keydata` is written in space-separated runs of 76, which every parser strips
+ * (`parseRapidMxKeyHeader()`), so `MimeHeaderUtils.prependHeaders()` can fold a header longer than the 998-character line limit
+ * (an RSA certificate's).
  */
 export function buildRapidMxKeyHeader(address: string, preferEncrypt: "mutual" | "nopreference", key: PublicKey, preferFormat?: EndToEndFormat): string {
+    const runs: string[] = [];
+    for (let i = 0; i < key.publicKey.length; i += 76) {
+        runs.push(key.publicKey.slice(i, i + 76));
+    }
     // `_prefer-format` starts with an underscore - a non-critical attribute - because a parser before it rejects the whole header
     // for any attribute it doesn't know that doesn't.
-    return `addr=${address}; prefer-encrypt=${preferEncrypt};${preferFormat ? ` _prefer-format=${preferFormat};` : ""} type=${key.type}; keydata=${key.publicKey}`;
+    return `addr=${address}; prefer-encrypt=${preferEncrypt};${preferFormat ? ` _prefer-format=${preferFormat};` : ""} type=${key.type}; keydata=${runs.join(" ")}`;
 }
 
 export function parseRapidMxKeyHeader(headerValues: string[], fromAddress: string): ParsedRapidMxKeyHeader | undefined {

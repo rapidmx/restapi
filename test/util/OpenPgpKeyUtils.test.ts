@@ -113,14 +113,21 @@ describe("OpenPgpKeyUtils", () => {
     });
 
     it("replaces a pinned key automatically only when it is retired and certified its successor", async () => {
-        const now = Date.now();
         const pinned = await openPgpKey(ADDRESS);
         const successor = await certifiedBy(await openPgpKey(ADDRESS), pinned);
         const uncertified = await openPgpKey(ADDRESS);
-        const retired = { ...pinned.key, revokedAt: now - 1000 };
+        const now = Date.now() + 1000;
+        const retired = { ...pinned.key, revokedAt: now - 1, revocationReason: "superseded" as const };
 
         expect(await canReplaceOpenPgpKeyAutomatically(retired, successor.key, ADDRESS, now)).toBe(true);
         expect(await canReplaceOpenPgpKeyAutomatically({ ...pinned.key, notAfter: now - 1 }, successor.key, ADDRESS, now)).toBe(true);
+        // A key revoked as compromised, or for no stated reason, may be an attacker's: it never vouches, even expired as well.
+        expect(await canReplaceOpenPgpKeyAutomatically({ ...retired, revocationReason: "compromised" }, successor.key, ADDRESS, now)).toBe(false);
+        expect(await canReplaceOpenPgpKeyAutomatically({ ...retired, revocationReason: undefined }, successor.key, ADDRESS, now)).toBe(false);
+        expect(await canReplaceOpenPgpKeyAutomatically({ ...retired, revocationReason: "compromised", notAfter: now - 1 }, successor.key, ADDRESS, now)).toBe(false);
+        // A certification dated after the pinned key was retired vouches for nothing.
+        expect(await canReplaceOpenPgpKeyAutomatically({ ...retired, revokedAt: now - 10 * DAY }, successor.key, ADDRESS, now)).toBe(false);
+        expect(await canReplaceOpenPgpKeyAutomatically({ ...pinned.key, notAfter: now - 10 * DAY }, successor.key, ADDRESS, now)).toBe(false);
         // Still current; not certified; certified for another address; unparseable either side.
         expect(await canReplaceOpenPgpKeyAutomatically(pinned.key, successor.key, ADDRESS, now)).toBe(false);
         expect(await canReplaceOpenPgpKeyAutomatically(retired, uncertified.key, ADDRESS, now)).toBe(false);

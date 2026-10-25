@@ -15,6 +15,7 @@ import { AttachmentSQL } from "../../../src/models/sql/AttachmentSQL.js";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { CalendarEventSQL } from "../../../src/models/sql/CalendarEventSQL.js";
 import { CalendarShareLinkSQL } from "../../../src/models/sql/CalendarShareLinkSQL.js";
+import { CalendarEventAttendeeLinkSQL } from "../../../src/models/sql/CalendarEventAttendeeLinkSQL.js";
 import { KeyVaultSQL } from "../../../src/models/sql/KeyVaultSQL.js";
 import { ZeroAccessIndexEntrySQL } from "../../../src/models/sql/ZeroAccessIndexEntrySQL.js";
 import { ZeroAccessIndexSegmentSQL } from "../../../src/models/sql/ZeroAccessIndexSegmentSQL.js";
@@ -77,6 +78,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
     let zaEntryRepo: Repository<ZeroAccessIndexEntrySQL>;
     let zaSegmentRepo: Repository<ZeroAccessIndexSegmentSQL>;
     let calendarShareLinkRepo: Repository<CalendarShareLinkSQL>;
+    let attendeeLinkRepo: Repository<CalendarEventAttendeeLinkSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
 
     const createMailbox = async (): Promise<MailboxSQL> =>
@@ -135,6 +137,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         models.set("ZeroAccessIndexEntrySQL", ZeroAccessIndexEntrySQL);
         models.set("ZeroAccessIndexSegmentSQL", ZeroAccessIndexSegmentSQL);
         models.set("CalendarShareLinkSQL", CalendarShareLinkSQL);
+        models.set("CalendarEventAttendeeLinkSQL", CalendarEventAttendeeLinkSQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");
@@ -170,6 +173,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         zaEntryRepo = conn.getRepository(ZeroAccessIndexEntrySQL);
         zaSegmentRepo = conn.getRepository(ZeroAccessIndexSegmentSQL);
         calendarShareLinkRepo = conn.getRepository(CalendarShareLinkSQL);
+        attendeeLinkRepo = conn.getRepository(CalendarEventAttendeeLinkSQL);
 
         job = await objectFactory.newInstance(ErasureExecutionJobSQL, { name: "default" });
     });
@@ -207,6 +211,7 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
             auditLogRepo,
             keyVaultRepo,
             calendarShareLinkRepo,
+            attendeeLinkRepo,
         ]) {
             await repo.clear();
         }
@@ -578,6 +583,29 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect(await keyVaultRepo.count({ where: { mailboxUid: otherMailbox.uid } })).toBe(1);
         expect(await calendarShareLinkRepo.count({ where: { folderUid: folder.uid } })).toBe(0);
         expect(await calendarShareLinkRepo.count({ where: { folderUid: otherFolder.uid } })).toBe(1);
+    });
+
+    it("Purges the CalendarEventAttendeeLinks of the mailbox, and of a deleted one's leftover data, but not another mailbox's.", async () => {
+        const mailbox = await createMailbox();
+        const otherMailbox = await createMailbox();
+        const leftoverUid = `gone-${uuid.v4()}@example.com`;
+        const link = (mailboxUid: string) =>
+            new CalendarEventAttendeeLinkSQL({ mailboxUid, calendarEventUid: uuid.v4(), attendeeAddress: "guest@outside.example", url: "https://meet.example/j/1" });
+        await attendeeLinkRepo.save(link(mailbox.uid));
+        await attendeeLinkRepo.save(link(leftoverUid));
+        await attendeeLinkRepo.save(link(otherMailbox.uid));
+        const request = await createRequest({ mailboxUid: mailbox.uid });
+        await job.run();
+        const leftover = await createRequest({ mailboxUid: leftoverUid, leftoverOnly: true });
+        await job.run();
+
+        for (const done of [request, leftover]) {
+            const updated = await requestRepo.findOne({ where: { uid: done.uid } });
+            expect(updated!.status).toBe("completed");
+        }
+        expect(await attendeeLinkRepo.count({ where: { mailboxUid: mailbox.uid } })).toBe(0);
+        expect(await attendeeLinkRepo.count({ where: { mailboxUid: leftoverUid } })).toBe(0);
+        expect(await attendeeLinkRepo.count({ where: { mailboxUid: otherMailbox.uid } })).toBe(1);
     });
 
     it("Keeps message, attachment and raw blobs another mailbox still references, deleting them once the last reference is erased.", async () => {
