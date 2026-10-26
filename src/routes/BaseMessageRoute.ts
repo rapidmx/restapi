@@ -3029,6 +3029,21 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 const row: any = await this.repoUtils!.findOne(message.uid, { ignoreACL: true, includeDeleted: true, skipCache: true });
                 return !!row && !row.zeroAccess && row.sanitizedHtmlBlobKey === key;
             },
+            // A mail-filter-rule copy names its original's key: kept while any other row does. This message doesn't count - it was just
+            // found not to name it readable.
+            discard: async () => {
+                await deleteBlobsIfUnreferenced(
+                    this.blobStore!,
+                    messageBlobReferenceSources({
+                        messageRepo: this.repoUtils,
+                        attachmentRepo: this.attachmentRepo,
+                        quarantineEntryRepo: this.quarantineEntryRepo,
+                        ingestQueueEntryRepo: this.ingestQueueEntryRepo,
+                    }),
+                    [key],
+                    { repo: this.repoUtils, uid: message.uid },
+                );
+            },
         });
         if (!html.includes("cid:")) {
             return html;

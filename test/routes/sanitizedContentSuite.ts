@@ -223,6 +223,39 @@ export function sanitizedContentSuite(ctx: SanitizedContentSuiteContext): void {
             expect(result.status).toBe(200);
             expect(await exists(key)).toBe(false);
         });
+
+        it("keeps the blob a mail-filter-rule copy still names when the original drops it while it is re-sanitized", async () => {
+            const { message, key } = await oldMessage();
+            const copy = await ctx.createMessage(mailbox.uid, inbox.uid, { sanitizedHtmlBlobKey: key, bodyBlobKey: message.bodyBlobKey });
+            const store = ctx.blobStore();
+            const exists = store.exists.bind(store);
+            // The original is purged (its row no longer naming the key) between the loader's check and its write; the copy keeps it.
+            vi.spyOn(store, "exists").mockImplementation(async (candidate: string) => {
+                if (candidate === key) {
+                    await ctx.updateMessage(message.uid, { sanitizedHtmlBlobKey: null });
+                }
+                return await exists(candidate);
+            });
+
+            expect((await get(message.uid)).status).toBe(200);
+            vi.restoreAllMocks();
+
+            expect(await exists(key)).toBe(true);
+            const served = await get(copy.uid);
+            expect(served.status).toBe(200);
+            expect(served.text).toContain("<style>.hero");
+        });
+
+        it("redoes from the raw MIME a blob that is gone while the message still names it", async () => {
+            const { message, key } = await oldMessage();
+            await ctx.blobStore().delete(key);
+
+            const result = await get(message.uid);
+
+            expect(result.status).toBe(200);
+            expect(result.text).toContain("<style>.hero");
+            expect(readSanitizerVersion((await ctx.blobStore().get(key)).toString())).toBe(SANITIZER_VERSION);
+        });
     });
 
     describe("what is unchanged", () => {

@@ -444,6 +444,34 @@ describe("AttachmentExtractionJobMongo Tests (real DB + DI)", () => {
             expect(bad!.extractedTextBlobKey ?? null).toBeNull();
         });
 
+        it("Serves an attachment never looked at before any put off while sealed, however many of those are due and older.", async () => {
+            (job as any).batchSize = 2;
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const sealed = await createMessage({ subject: "[...]", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" } });
+            const deferred: string[] = [];
+            for (let i = 0; i < 3; i++) {
+                const row = await createAttachment({
+                    messageUid: sealed.uid,
+                    dateCreated: new Date(Date.now() - (i + 1) * 60_000),
+                    extractionAttempts: 0,
+                    extractionNextAttemptAt: new Date(Date.now() - 1000),
+                });
+                deferred.push(row.uid);
+            }
+            const fresh = await createMessage();
+            const freshBlobKey = `attachments/${uuid.v4()}`;
+            await blobStore.put(freshBlobKey, Buffer.from("new mail's attachment"));
+            const newer = await createAttachment({ messageUid: fresh.uid, blobKey: freshBlobKey });
+
+            await job.run();
+
+            expect((await findAttachment(newer.uid))!.extractedTextBlobKey).toContain("attachment-text/");
+            // The one slot left went to the oldest sealed row, put off again; the others wait their turn.
+            const after = await Promise.all(deferred.map(async (uid) => await findAttachment(uid)));
+            expect(after.map((row: any) => new Date(row.extractionNextAttemptAt).getTime() > Date.now())).toEqual([false, false, true]);
+            expect(after.every((row: any) => (row.extractedTextBlobKey ?? null) === null)).toBe(true);
+        });
+
         it("Resets the parent message's SearchIndexJob retry bookkeeping along with searchIndexedAt when new text is extracted.", async () => {
             const blobStore = objectFactory.getInstance<any>("BlobStore")!;
             const blobKey = `attachments/${uuid.v4()}`;

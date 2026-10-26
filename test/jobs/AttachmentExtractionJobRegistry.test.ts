@@ -47,7 +47,7 @@ describe("AttachmentExtractionJob ExtractorRegistry Tests", () => {
         await blobStore.put("attachments/a", Buffer.from("0123456789"));
         const attachment: any = { uid: "att-1", messageUid: "msg-1", mimeType: "text/plain", blobKey: "attachments/a", sizeBytes: 10 };
         const update: any = vi.fn().mockImplementation(async (obj: any) => obj);
-        (job as any).attachmentRepo = { find: vi.fn().mockResolvedValue([attachment]), update };
+        (job as any).attachmentRepo = { find: vi.fn().mockResolvedValueOnce([attachment]).mockResolvedValue([]), update };
         (job as any).messageRepo = { findOne: vi.fn().mockResolvedValue({ uid: "msg-1", encrypted: false }) };
         return { job, blobStore, update };
     };

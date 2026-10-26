@@ -22,7 +22,14 @@ const { Config, Inject, Logger } = ObjectDecorators;
  * run per blob; in another: the same result) write the same bytes, and a blob store replaces atomically - a reader sees the old blob
  * or the new one, never a mix. The blob is only rewritten while it still exists, so a message erased meanwhile is not brought back, and
  * once rewritten it is deleted again unless the message still names it (`SanitizedBodySource.stillNamed`): zero-access sealing, a send's
- * discard and an erasure all change the row before they delete the blob, so whichever of the two deletes comes last removes it.
+ * discard and an erasure all change the row before they delete the blob, so whichever of the two deletes comes last removes it. That
+ * delete keeps a key another message still names (`SanitizedBodySource.discard` - a mail-filter-rule copy shares its original's), and
+ * when the check itself fails the blob is deleted all the same - it may be plaintext of a message sealed meanwhile - but this reader is
+ * still served what was rewritten.
+ *
+ * *Missing blob.* A blob that is gone while the message, read just before, still names it (deleted by that failed check, or lost) is
+ * redone from the raw MIME as above, without the "still exists" condition - the check after the write still removes it when the
+ * message no longer names it. Only when that can't be done is the read's error passed on.
  *
  * *Bounded.* A raw message over `maxRawBytes` is not re-parsed, and a run that takes over `timeoutMs` is left to finish in the
  * background while the reader is answered with what is stored.
@@ -47,6 +54,9 @@ export interface SanitizedBodySource {
     sanitizedHtmlBlobKey: string;
     /** Whether the message, read again, is still readable and still names `sanitizedHtmlBlobKey`; asked after the blob is rewritten. */
     stillNamed?: () => Promise<boolean>;
+    /** Deletes `sanitizedHtmlBlobKey` once the message no longer names it, unless another row still does. Without it (or when it
+     * fails) the key is deleted outright. */
+    discard?: () => Promise<void>;
 }
 
 export class SanitizedBodyLoader {
@@ -72,7 +82,20 @@ export class SanitizedBodyLoader {
 
     /** The message's sanitized HTML, current and without its version stamp. */
     public async load(message: SanitizedBodySource): Promise<string> {
-        const stored: Buffer = await this.blobStore.get(message.sanitizedHtmlBlobKey);
+        let stored: Buffer;
+        try {
+            stored = await this.blobStore.get(message.sanitizedHtmlBlobKey);
+        } catch (err) {
+            // A store that can't tell is not a missing blob.
+            if (await this.blobStore.exists(message.sanitizedHtmlBlobKey).catch(() => true)) {
+                throw err;
+            }
+            const redone: string | undefined = await this.refresh(message, true);
+            if (redone === undefined) {
+                throw err;
+            }
+            return stripSanitizerStamp(redone);
+        }
         if (readSanitizerVersion(stored) >= SANITIZER_VERSION) {
             return stripSanitizerStamp(stored.toString("utf-8"));
         }
@@ -91,14 +114,14 @@ export class SanitizedBodyLoader {
     }
 
     /** The re-sanitized HTML (stamped), or `undefined` when it could not be redone from the raw message. */
-    private async refresh(message: SanitizedBodySource): Promise<string | undefined> {
+    private async refresh(message: SanitizedBodySource, missing: boolean = false): Promise<string | undefined> {
         const key: string = message.sanitizedHtmlBlobKey;
         if ((this.failed.get(key) ?? 0) > Date.now()) {
             return undefined;
         }
         let run: Promise<string | undefined> | undefined = this.running.get(key);
         if (!run) {
-            run = this.rebuild(message).finally(() => this.running.delete(key));
+            run = this.rebuild(message, missing).finally(() => this.running.delete(key));
             this.running.set(key, run);
         }
         let timer: NodeJS.Timeout | undefined;
@@ -112,8 +135,9 @@ export class SanitizedBodyLoader {
         }
     }
 
-    /** Never rejects: whatever goes wrong is a failure to remember, not an error for the reader. */
-    private async rebuild(message: SanitizedBodySource): Promise<string | undefined> {
+    /** Never rejects: whatever goes wrong is a failure to remember, not an error for the reader. `missing`: the blob is to be written
+     * again although it no longer exists (`load()`). */
+    private async rebuild(message: SanitizedBodySource, missing: boolean): Promise<string | undefined> {
         const key: string = message.sanitizedHtmlBlobKey;
         try {
             if (!message.bodyBlobKey || (await this.blobStore.size(message.bodyBlobKey)) > this.maxRawBytes) {
@@ -121,14 +145,31 @@ export class SanitizedBodyLoader {
             }
             const html: string | undefined = await this.pipeline.sanitizeRaw(await this.blobStore.get(message.bodyBlobKey));
             // Only an existing blob is replaced: one deleted while this ran (an erasure) stays deleted.
-            if (html === undefined || !(await this.blobStore.exists(key))) {
+            if (html === undefined || (!missing && !(await this.blobStore.exists(key)))) {
                 return this.giveUp(key);
             }
             await this.blobStore.put(key, Buffer.from(html, "utf-8"), { contentType: "text/html" });
-            if (message.stillNamed && !(await message.stillNamed().catch(() => false))) {
-                // Sealed, sent or erased while this ran, after the check above: the row dropped the key, so what was just written is
-                // plaintext nothing names, which nothing else would ever delete.
+            if (!message.stillNamed) {
+                return html;
+            }
+            let named: boolean;
+            try {
+                named = await message.stillNamed();
+            } catch (err) {
+                // Unknown: the row may have been sealed meanwhile, so the plaintext just written goes. Nothing is lost - the next read
+                // redoes it while the message still names it (`load()`) - and this reader, who could read the message, gets it.
+                this.logger?.warn(`Could not tell whether message ${message.uid} still names ${key}, deleting it: ${(err as Error).message}`);
                 await this.blobStore.delete(key).catch(() => undefined);
+                return html;
+            }
+            if (!named) {
+                // Sealed, sent or erased while this ran, after the check above: the row dropped the key, so what was just written is
+                // plaintext it no longer names, which nothing else would ever delete - unless another row (a rule copy) still names it.
+                try {
+                    await (message.discard ? message.discard() : this.blobStore.delete(key));
+                } catch {
+                    await this.blobStore.delete(key).catch(() => undefined);
+                }
                 return this.giveUp(key);
             }
             return html;

@@ -554,6 +554,39 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
                 expect(stored.inviteSequenceSent).toBe(1);
                 expect(JSON.stringify(stored)).not.toContain("CANARY");
             });
+
+            it("Sends a changed description when its client raises the sequence, and nothing without it - the server can't see the change", async () => {
+                const { mailbox, row } = await organized();
+                const before = ctx.transport().sent.length;
+                const opened = { uid: row.uid, title: "CANARY Board review", location: "CANARY Room 2" };
+
+                const unsignalled = await owner(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).send({
+                    ...opened,
+                    version: row.version,
+                    description: "CANARY old agenda",
+                });
+
+                expect(unsignalled.status).toBe(200);
+                expect(ctx.transport().sent.length).toBe(before);
+                const [saved] = await ctx.findEvents(mailbox.uid);
+                expect(saved.sequence).toBe(0);
+
+                const signalled = await owner(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).send({
+                    ...opened,
+                    version: saved.version,
+                    description: "CANARY new agenda",
+                    sequence: 1,
+                });
+
+                expect(signalled.status).toBe(200);
+                const sent = ctx.transport().sent.slice(before);
+                expect(sent).toHaveLength(1);
+                expect(decoded(sent[0].raw)).toContain("DESCRIPTION:CANARY new agenda");
+                const [stored] = await ctx.findEvents(mailbox.uid);
+                expect(stored.sequence).toBe(1);
+                expect(stored.inviteSequenceSent).toBe(1);
+                expect(JSON.stringify(stored)).not.toContain("CANARY");
+            });
         });
 
         it("Keeps the title's sealed copy when an answered revision names no title, though its location goes into sealed content", async () => {

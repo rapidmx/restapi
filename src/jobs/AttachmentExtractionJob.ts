@@ -38,7 +38,8 @@ const MAX_INVALIDATE_ATTEMPTS = 3;
  * excluded from every later candidate query, so it can never occupy the head of the queue forever.
  *
  * An attachment of a message stored zero-access sealed (a sealed draft's upload) is neither extracted nor stamped, only put off
- * (`deferWhileSealed()`), so it is extracted once its message is readable outside zero-access.
+ * (`deferWhileSealed()`), so it is extracted once its message is readable outside zero-access. A put-off or failed attachment is only
+ * selected with what attachments never looked at leave of a batch (`run()`), so however many keep coming back, new ones are still reached.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -124,25 +125,32 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
         // falls back to its own default of 100 otherwise). Confirmed by real-database testing: on the SQL
         // backend, `options.limit` alone silently caps at 100 regardless of the configured batch size.
         //
-        // Candidates are an attachment that has never failed, or one that has failed fewer than `maxAttempts`
-        // times and whose backoff has elapsed - one at `maxAttempts` is excluded outright. Sorted oldest-first
-        // (with `uid` as a tiebreaker) so batches are drawn in a stable order.
+        // Candidates are an attachment never looked at, then - with what that leaves of the batch - one that has failed fewer than
+        // `maxAttempts` times or was put off while sealed (`deferWhileSealed()`) and whose backoff has elapsed; one at `maxAttempts` is
+        // excluded outright. Fresh ones first, so that rows coming back again and again (a sealed draft's attachments, every
+        // `zero_access_defer_seconds` for as long as the draft lives, usually the oldest rows there are) only ever take the capacity new
+        // attachments leave - sorted together by age, enough of them would fill every batch and no new attachment would be reached.
+        // Each tier is sorted oldest-first (with `uid` as a tiebreaker) so batches are drawn in a stable order.
         const now: Date = new Date();
-        const pending: A[] = await this.attachmentRepo.find(
-            {
-                extractedTextBlobKey: null,
-                $or: [
-                    { extractionAttempts: "null" },
-                    {
-                        extractionAttempts: `lt(${this.maxAttempts})`,
-                        extractionNextAttemptAt: `lte(${now.toISOString()})`,
-                    },
-                ],
-                sort: { dateCreated: "ASC", uid: "ASC" },
-                limit: this.batchSize,
-            } as any,
+        const fresh: A[] = await this.attachmentRepo.find(
+            { extractedTextBlobKey: null, extractionAttempts: "null", sort: { dateCreated: "ASC", uid: "ASC" }, limit: this.batchSize } as any,
             { ignoreACL: true, limit: this.batchSize },
         );
+        const room: number = this.batchSize - fresh.length;
+        const due: A[] =
+            room > 0
+                ? await this.attachmentRepo.find(
+                      {
+                          extractedTextBlobKey: null,
+                          extractionAttempts: `lt(${this.maxAttempts})`,
+                          extractionNextAttemptAt: `lte(${now.toISOString()})`,
+                          sort: { dateCreated: "ASC", uid: "ASC" },
+                          limit: room,
+                      } as any,
+                      { ignoreACL: true, limit: room },
+                  )
+                : [];
+        const pending: A[] = [...fresh, ...due];
 
         for (const attachment of pending) {
             try {

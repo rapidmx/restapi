@@ -995,6 +995,11 @@ describe("Route:CalendarEventSQL Tests", () => {
         },
         findEvent: async (uid) => (await calendarEventRepo.findOne({ where: { uid } }))!,
         shareLinksUrl: "/sql/calendar-share-links",
+        setFreeBusyVisibility: async (mailboxUid, visibility) => {
+            const mailbox: any = await mailboxRepo.findOne({ where: { uid: mailboxUid } });
+            mailbox.freeBusyVisibility = visibility;
+            await mailboxRepo.save(mailbox);
+        },
     });
 
     describe("zero-access encryption of calendar events", () => {

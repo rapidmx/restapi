@@ -194,11 +194,7 @@ async function mapInChunks<T, R>(items: T[], size: number, task: (item: T) => Pr
  * - `nobody`: only the owner and full-access delegates.
  */
 export async function lookupFreeBusy(ctx: FreeBusyLookupContext, request: FreeBusyRequest): Promise<FreeBusyResponse> {
-    const ownerUids: string[] = [...new Set([ctx.caller.uid, ctx.caller.uid.toLowerCase()])];
-    const owned: Mailbox[] = await ctx.mailboxRepo.find({ ownerUserUid: ModelUtils.literal(ownerUids, "in"), limit: 100 } as any, {
-        ignoreACL: true,
-        limit: 100,
-    });
+    const owned: Mailbox[] = await ownedMailboxes(ctx);
     const ownedUids: Set<string> = new Set(owned.map((mailbox) => mailbox.uid));
     const ownedDomains: Set<string> = new Set(owned.map((mailbox) => addressDomain(mailbox.primarySmtpAddress)));
     // Somebody the directory would answer, so that "restricted" tells them nothing they cannot already learn.
@@ -226,8 +222,32 @@ export async function lookupFreeBusy(ctx: FreeBusyLookupContext, request: FreeBu
     return { start: request.start.toISOString(), end: request.end.toISOString(), results };
 }
 
+/**
+ * Whether the caller may see `mailbox`'s free/busy, by the same rule as `lookupFreeBusy()` - for a route that shows the mailbox's busy
+ * windows some other way (the schedule on an invitation card) to a caller who may not read the calendars they come from.
+ */
+export async function mayViewFreeBusy(ctx: Pick<FreeBusyLookupContext, "caller" | "mailboxRepo" | "folderRepo" | "hasAccess">, mailbox: Mailbox): Promise<boolean> {
+    const owned: Mailbox[] = await ownedMailboxes(ctx);
+    return await mayView(
+        ctx,
+        mailbox,
+        await calendarFolderUids(ctx, mailbox.uid),
+        new Set(owned.map((row) => row.uid)),
+        new Set(owned.map((row) => addressDomain(row.primarySmtpAddress))),
+    );
+}
+
+/** The mailboxes the caller owns (at most 100). */
+async function ownedMailboxes(ctx: Pick<FreeBusyLookupContext, "caller" | "mailboxRepo">): Promise<Mailbox[]> {
+    const ownerUids: string[] = [...new Set([ctx.caller.uid, ctx.caller.uid.toLowerCase()])];
+    return await ctx.mailboxRepo.find({ ownerUserUid: ModelUtils.literal(ownerUids, "in"), limit: 100 } as any, {
+        ignoreACL: true,
+        limit: 100,
+    });
+}
+
 /** The uids of `mailboxUid`'s calendar folders that are not deleted. */
-async function calendarFolderUids(ctx: FreeBusyLookupContext, mailboxUid: string): Promise<string[]> {
+async function calendarFolderUids(ctx: Pick<FreeBusyLookupContext, "folderRepo">, mailboxUid: string): Promise<string[]> {
     const folders: { uid: string; deleted?: boolean }[] = await ctx.folderRepo.find(
         { mailboxUid: ModelUtils.literal(mailboxUid), type: ModelUtils.literal(FolderType.CALENDAR), limit: FREE_BUSY_MAX_FOLDERS } as any,
         { ignoreACL: true, limit: FREE_BUSY_MAX_FOLDERS },
@@ -237,7 +257,7 @@ async function calendarFolderUids(ctx: FreeBusyLookupContext, mailboxUid: string
 
 /** Whether the caller may see `mailbox`'s free/busy - see `lookupFreeBusy()`. */
 async function mayView(
-    ctx: FreeBusyLookupContext,
+    ctx: Pick<FreeBusyLookupContext, "hasAccess">,
     mailbox: Mailbox,
     folders: string[],
     ownedUids: ReadonlySet<string>,

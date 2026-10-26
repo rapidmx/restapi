@@ -189,15 +189,66 @@ describe("SanitizedBodyLoader", () => {
             expect(await stored()).toBe(stampSanitizedHtml(FRESH));
         });
 
-        it("deletes the blob it rewrote when the message can't be read again, and serves the stored HTML when even that delete fails", async () => {
+        it("deletes the blob it rewrote when the message can't be read again but serves this reader what it rewrote, and redoes it on the next read", async () => {
             const failing = { ...message, stillNamed: async (): Promise<boolean> => Promise.reject(new Error("database down")) };
-            expect(await loader.load(failing)).toBe(CLEAN(OLD));
+            expect(await loader.load(failing)).toBe(FRESH);
+            expect(await blobs.exists(message.sanitizedHtmlBlobKey)).toBe(false);
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("database down"));
+
+            // Still named: the missing blob is written again from the raw message, not lost.
+            expect(await loader.load({ ...message, stillNamed: async () => true })).toBe(FRESH);
+            expect(await stored()).toBe(stampSanitizedHtml(FRESH));
+            expect(sanitizeRaw).toHaveBeenCalledTimes(2);
+        });
+
+        it("leaves the delete of a key the message no longer names to its reference check, which keeps one another row still names", async () => {
+            const discard = vi.fn(async () => undefined);
+            const remove = vi.spyOn(blobs, "delete");
+
+            expect(await loader.load({ ...message, stillNamed: async () => false, discard })).toBe(CLEAN(OLD));
+            expect(discard).toHaveBeenCalledTimes(1);
+            expect(remove).not.toHaveBeenCalled();
+            expect(await blobs.exists(message.sanitizedHtmlBlobKey)).toBe(true);
+        });
+
+        it("deletes the key outright when the reference check fails, and serves the stored HTML when even that delete fails", async () => {
+            const discard = vi.fn(async () => Promise.reject(new Error("database down")));
+            expect(await loader.load({ ...message, stillNamed: async () => false, discard })).toBe(CLEAN(OLD));
             expect(await blobs.exists(message.sanitizedHtmlBlobKey)).toBe(false);
 
             const other = { ...message, uid: "msg-2", sanitizedHtmlBlobKey: "sanitized/msg-2", stillNamed: async () => false };
             await blobs.put(other.sanitizedHtmlBlobKey, Buffer.from(OLD));
             vi.spyOn(blobs, "delete").mockRejectedValueOnce(new Error("store down"));
             expect(await loader.load(other)).toBe(CLEAN(OLD));
+            const third = { ...message, uid: "msg-3", sanitizedHtmlBlobKey: "sanitized/msg-3", stillNamed: async () => Promise.reject(new Error("down")) };
+            await blobs.put(third.sanitizedHtmlBlobKey, Buffer.from(OLD));
+            vi.spyOn(blobs, "delete").mockRejectedValueOnce(new Error("store down"));
+            expect(await loader.load(third)).toBe(FRESH);
+        });
+
+        describe("a blob that is gone", () => {
+            beforeEach(async () => {
+                await blobs.delete(message.sanitizedHtmlBlobKey);
+            });
+
+            it("is redone from the raw message while the message still names it", async () => {
+                expect(await loader.load({ ...message, stillNamed: async () => true })).toBe(FRESH);
+                expect(await stored()).toBe(stampSanitizedHtml(FRESH));
+                expect(await loader.load(message)).toBe(FRESH);
+                expect(sanitizeRaw).toHaveBeenCalledTimes(1);
+            });
+
+            it("is not written back for a message that no longer names it, and the read fails as before", async () => {
+                await expect(loader.load({ ...message, stillNamed: async () => false })).rejects.toThrow();
+                expect(await blobs.exists(message.sanitizedHtmlBlobKey)).toBe(false);
+            });
+
+            it("fails the read when it can't be redone (no raw message) or the store can't tell whether it exists", async () => {
+                await expect(loader.load({ uid: "msg-1", sanitizedHtmlBlobKey: message.sanitizedHtmlBlobKey })).rejects.toThrow();
+                vi.spyOn(blobs, "exists").mockRejectedValueOnce(new Error("store down"));
+                await expect(loader.load({ uid: "msg-4", bodyBlobKey: message.bodyBlobKey, sanitizedHtmlBlobKey: "sanitized/msg-4" })).rejects.toThrow();
+                expect(sanitizeRaw).not.toHaveBeenCalled();
+            });
         });
 
         it("answers with the stored HTML, sanitized again, when the re-sanitization takes too long, and lets it finish for the next reader", async () => {

@@ -55,6 +55,7 @@ import {
     FREE_BUSY_MAX_ATTEMPTS,
     FREE_BUSY_WINDOW_SECONDS,
     lookupFreeBusy,
+    mayViewFreeBusy,
     parseFreeBusyRequest,
     type FreeBusyResponse,
 } from "../util/FreeBusyLookupUtils.js";
@@ -645,8 +646,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (existing && this.isSchedulingRelevantChange(existing, obj)) {
             (obj as any).sequence = existing.sequence + 1;
         } else if (existing && (existing as any).sealedContent && !(typeof (obj as any).sequence === "number" && (obj as any).sequence > existing.sequence)) {
-            // Content sealed whole: the server can't see a change of its location, so a client that opened it raises the sequence itself
-            // when it changes it. Any other value it sends (the one it read back) is dropped, never lowering the stored one.
+            // Content sealed whole: the server can't see a change of its location or description (`keepSealed()` nulls both before
+            // `changesInvitation()` compares them), so a client that opened it raises the sequence itself when it changes either. Any other
+            // value it sends (the one it read back) is dropped, never lowering the stored one.
             delete (obj as any).sequence;
         }
         const stored: T = await super.update(id, obj, req, user);
@@ -1265,8 +1267,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * gets a partial schedule, never a failure - it only decorates the card.
      *
      * Each event is shown as the caller may see it on its calendar: in a calendar they can't read (a grantee of the Inbox alone) only as
-     * a busy window without a title, which free/busy already shows; a private or confidential one, to a reader without `UPDATE` on its
-     * calendar, as `BUSY_TITLE` (`redactReadRecords()`). The owner and delegates with `UPDATE` see every title.
+     * a busy window without a title, and only when the mailbox's free/busy would show it to them (`mayViewFreeBusy()`, the owner's
+     * `freeBusyVisibility`) - otherwise not at all; a private or confidential one, to a reader without `UPDATE` on its calendar, as
+     * `BUSY_TITLE` (`redactReadRecords()`). The owner and delegates with `UPDATE` see every title.
      */
     private async loadSchedule(context: InviteContext): Promise<InviteScheduleEntry[]> {
         const { mailbox, parsed, addresses, user } = context;
@@ -1303,12 +1306,27 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                 }
                 return access.get(folderUid)!;
             };
+            // Asked once, and only for a row in a calendar the caller can't read. `user` is set: `loadInvite()` found them access to the message.
+            let freeBusy: Promise<boolean> | undefined;
+            const showsFreeBusy = (): Promise<boolean> =>
+                (freeBusy ??= mayViewFreeBusy(
+                    {
+                        caller: user!,
+                        mailboxRepo: this.mailboxRepo!,
+                        folderRepo: this.folderRepo!,
+                        hasAccess: (uid, action) => this.hasMailAccess(user, uid, action),
+                    },
+                    mailbox,
+                ));
             const entries: InviteScheduleEntry[] = [];
             for (const row of rows.values()) {
                 if (row.icalUid === own || row.status === CalendarEventStatus.CANCELLED) {
                     continue;
                 }
                 const seen: { read: boolean; details: boolean } = await accessTo(row.folderUid);
+                if (!seen.read && !(await showsFreeBusy())) {
+                    continue;
+                }
                 const title: string = !seen.read ? "" : hidesDetailsFromReaders(row) && !seen.details ? BUSY_TITLE : (row.title ?? "");
                 const isMaster: boolean = !!row.recurrenceRule && !row.recurrenceId;
                 const exclude: Date[] | undefined = isMaster

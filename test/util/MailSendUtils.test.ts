@@ -499,6 +499,27 @@ describe("prepareOutboundMime() and seedReceiptStatus() Tests", () => {
         expect(own.toString("binary").split("\r\n\r\n")[0].split("\r\n").every((line) => line.length <= 998)).toBe(true);
     });
 
+    it("announces no key for a sender address that isn't ASCII, which the headers could only carry as an unparseable encoded word", async () => {
+        const pgp = { useType: "encrypt", type: "openpgp", publicKey: "B".repeat(1500), notBefore: 1, notAfter: Date.now() + 60_000 };
+        const x509 = { useType: "encrypt", type: "x509", publicKey: "S0VZ", notBefore: 1, notAfter: Date.now() + 60_000 };
+        const injected = Buffer.from("Autocrypt: addr=sender@example.com; keydata= QUZBS0U=\r\n" + raw.toString("binary"), "binary");
+
+        const sent: Buffer = (
+            await prepareOutboundMime({
+                raw: injected,
+                message: { ...message, from: { address: "josé@example.com" } },
+                mailbox: mailbox({ keys: [pgp, x509], encryptPreference: { preferEncrypt: "mutual" } }),
+                domainUtils: domainUtilsOf(),
+                dnsResolver: new StaticDnsResolver(),
+            })
+        ).raw;
+
+        expect(extractHeaders(sent, "Autocrypt")).toEqual([]);
+        expect(extractHeaders(sent, "RapidMX-Key")).toEqual([]);
+        expect(sent.toString("binary")).not.toContain("=?UTF-8?");
+        expect(sent.toString()).toContain("Hello world");
+    });
+
     it("advertises the owner's preferred format in the RapidMX-Key header - OpenPGP only with an OpenPGP key to use", async () => {
         const key = { useType: "encrypt", type: "x509", publicKey: "S0VZ", notBefore: 1, notAfter: Date.now() + 60_000 };
         const pgp = { useType: "encrypt", type: "openpgp", publicKey: "UEdQ", notBefore: 1, notAfter: Date.now() + 60_000 };

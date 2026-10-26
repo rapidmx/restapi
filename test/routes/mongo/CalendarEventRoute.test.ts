@@ -1009,6 +1009,11 @@ describe("Route:CalendarEventMongo Tests", () => {
         },
         findEvent: async (uid) => (await calendarEventRepo.findOne({ uid } as any))!,
         shareLinksUrl: "/mongo/calendar-share-links",
+        setFreeBusyVisibility: async (mailboxUid, visibility) => {
+            const mailbox: any = await mailboxRepo.findOne({ uid: mailboxUid } as any);
+            mailbox.freeBusyVisibility = visibility;
+            await mailboxRepo.save(mailbox);
+        },
     });
 
     describe("zero-access encryption of calendar events", () => {

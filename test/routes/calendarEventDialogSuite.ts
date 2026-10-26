@@ -21,6 +21,8 @@ export interface CalendarEventDialogSuiteContext extends CalendarInviteSuiteCont
     grantFolder: (folderUid: string, userUid: string, actions: string[]) => Promise<void>;
     findEvent: (uid: string) => Promise<any>;
     shareLinksUrl: string;
+    /** Sets the mailbox's `freeBusyVisibility` (before anything has read the mailbox). */
+    setFreeBusyVisibility: (mailboxUid: string, visibility: string) => Promise<void>;
 }
 
 const HOUR = 60 * 60 * 1000;
@@ -455,9 +457,15 @@ export function calendarEventDialogSuite(ctx: CalendarEventDialogSuiteContext): 
         });
 
         describe("the schedule around an invitation in a shared Inbox", () => {
-            /** The owner's Inbox shared with `other` (`inboxActions`), an invitation in it, and two events around its time in the Calendar. */
-            const invited = async (inboxActions: string[], calendarActions?: string[]) => {
+            /**
+             * The owner's Inbox shared with `other` (`inboxActions`), an invitation in it, and two events around its time in the Calendar,
+             * whose free/busy the owner shows to `visibility` (`other` owns no mailbox, so the default `domain` hides it from them).
+             */
+            const invited = async (inboxActions: string[], calendarActions?: string[], visibility?: string) => {
                 const { mailbox, calendar, me } = await setup();
+                if (visibility) {
+                    await ctx.setFreeBusyVisibility(mailbox.uid, visibility);
+                }
                 const inbox = await ctx.createFolder(mailbox.uid, FolderType.INBOX);
                 await ctx.grantFolder(inbox.uid, ctx.otherUid, inboxActions);
                 if (calendarActions) {
@@ -504,8 +512,8 @@ export function calendarEventDialogSuite(ctx: CalendarEventDialogSuiteContext): 
             };
             const titles = (result: any): string[] => result.body.schedule.map((entry: any) => entry.title).sort();
 
-            it("Gives a grantee of the Inbox alone the busy windows without a title, and the owner every title.", async () => {
-                const url = await invited(["read", "list"]);
+            it("Gives a grantee of the Inbox alone the busy windows without a title when free/busy shows them, and the owner every title.", async () => {
+                const url = await invited(["read", "list"], undefined, "everyone");
 
                 const shown = await other(request(ctx.app()).get(url));
 
@@ -513,6 +521,25 @@ export function calendarEventDialogSuite(ctx: CalendarEventDialogSuiteContext): 
                 expect(titles(shown)).toEqual(["", ""]);
                 expect(shown.body.schedule.every((entry: any) => entry.busy)).toBe(true);
                 expect(titles(await owner(request(ctx.app()).get(url)))).toEqual(["Team lunch", "Termination meeting"]);
+            });
+
+            it("Gives a grantee of the Inbox alone no busy windows when the owner's free/busy doesn't show them to that grantee.", async () => {
+                for (const visibility of ["nobody", "shared", undefined]) {
+                    const url = await invited(["read", "list"], undefined, visibility);
+
+                    const shown = await other(request(ctx.app()).get(url));
+
+                    expect(shown.status).toBe(200);
+                    expect(shown.body.schedule).toEqual([]);
+                    expect(titles(await owner(request(ctx.app()).get(url)))).toEqual(["Team lunch", "Termination meeting"]);
+                }
+            });
+
+            it("Gives the busy windows of a calendar shared for free/busy only, without a title, under shared visibility.", async () => {
+                const shown = await other(request(ctx.app()).get(await invited(["read", "list"], ["freebusy"], "shared")));
+
+                expect(shown.status).toBe(200);
+                expect(titles(shown)).toEqual(["", ""]);
             });
 
             it("Shows a confidential event to a reader of the calendar without UPDATE as a busy block, and in full with UPDATE.", async () => {

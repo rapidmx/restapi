@@ -327,10 +327,13 @@ export async function prepareOutboundMime(args: {
     // The owner's preferred format rides along - OpenPGP only while there is an OpenPGP key to use.
     const preferFormat = mailbox?.encryptPreference?.preferFormat;
     const advertisedFormat = preferFormat === "smime" || (preferFormat === "openpgp" && activeOpenPgpKey) ? preferFormat : undefined;
-    if (activeEncryptKey) {
+    // Only for an ASCII address: `prependHeaders()` writes a value with anything else as one RFC 2047 encoded word, which neither folds
+    // (no whitespace - a certificate's line runs past RFC 5322's 998 characters) nor parses (`addr=` and every attribute are inside it).
+    const announcesKeys: boolean = /^[\x21-\x7E]+$/.test(message.from.address);
+    if (activeEncryptKey && announcesKeys) {
         raw = prependHeaders(raw, [{ name: "RapidMX-Key", value: buildRapidMxKeyHeader(message.from.address, preferEncrypt, activeEncryptKey, advertisedFormat) }]);
     }
-    if (activeOpenPgpKey && activeOpenPgpKey.publicKey.length <= MAX_KEYDATA_LENGTH) {
+    if (activeOpenPgpKey && announcesKeys && activeOpenPgpKey.publicKey.length <= MAX_KEYDATA_LENGTH) {
         raw = prependHeaders(raw, [{ name: AUTOCRYPT_HEADER, value: buildAutocryptHeader(message.from.address, preferEncrypt, activeOpenPgpKey) }]);
     }
     return { raw, attachesReceiptRequest };
