@@ -247,6 +247,27 @@ export function backgroundSendRouteSuite(ctx: BackgroundSendRouteSuiteContext): 
             // A message held for a time the user chose is not "already on its way": sending it now is refused, as it always was.
             expect((await post(message.uid)).status).toBe(409);
         });
+
+        it("sends a queued or claimed message back to the search index, its retries reset, as any folder move is", async () => {
+            const stamped = { searchIndexedAt: new Date(Date.now() - 60_000), searchIndexAttempts: 2, searchIndexError: "earlier" };
+            const later = await draft(["recipient@example.com"], stamped);
+            expect((await ctx.findMessage(later.uid)).searchIndexedAt).toBeTruthy();
+            await post(later.uid, { background: true, scheduledSendTime: new Date(Date.now() + 3_600_000).toISOString() });
+            const queued = await ctx.findMessage(later.uid);
+            expect(queued.folderUid).toBe((await ctx.findFolder(mailbox.uid, FolderType.OUTBOX))!.uid);
+            expect([queued.searchIndexedAt ?? null, queued.searchIndexAttempts ?? null, queued.searchIndexError ?? null]).toEqual([null, null, null]);
+
+            // Sent now and waiting on the mail system: claimed into Outbox, unstamped.
+            hold();
+            const now = await draft(["recipient@example.com"], stamped);
+            const sending = post(now.uid, {}).then((result: any) => result);
+            await vi.waitFor(() => expect(ctx.transport().inFlight).toBe(1), wait);
+            const claimed = await ctx.findMessage(now.uid);
+            expect(claimed.scheduledSendLeaseExpiresAt).toBeTruthy();
+            expect([claimed.searchIndexedAt ?? null, claimed.searchIndexAttempts ?? null, claimed.searchIndexError ?? null]).toEqual([null, null, null]);
+            letGo();
+            expect((await sending).status).toBe(200);
+        });
     });
 
     describe("repeating a request", () => {

@@ -1357,6 +1357,11 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                         scheduledSendAttempts: null,
                         scheduledSendError: null,
                         scheduledSendLeaseExpiresAt: null,
+                        // A folder move, re-indexed as `prepareUpdate()` does for one (this write bypasses it). In a zero-access mailbox
+                        // the readable send copy is indexed as metadata only (`SearchIndexJob`), replacing any older readable document
+                        // it had - one from before the mailbox turned zero-access, which a send-assemble's kept stamp would otherwise
+                        // leave in place until the sealed Sent copy is filed.
+                        ...SEARCH_REINDEX,
                     } as any,
                     message,
                     { user, ignoreACL: true },
@@ -1403,6 +1408,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 folderUid: outbox.uid,
                 scheduledSendTime: null,
                 scheduledSendLeaseExpiresAt: leaseExpiresAt,
+                // Re-indexed as the queued move above is.
+                ...SEARCH_REINDEX,
             } as any,
             message,
             { user, ignoreACL: true },
