@@ -58,6 +58,9 @@ describe("Route:KeyDiscoverySQL Tests", () => {
     });
 
     afterAll(async () => {
+        // The SQL test database outlives this file: a verified domain left in it (the WKD suite's) restricts the next file's mailbox
+        // addresses to that domain, a 400 on creating one at example.com.
+        await domainRepo?.clear();
         await server.stop();
         await objectFactory.destroy();
     });
